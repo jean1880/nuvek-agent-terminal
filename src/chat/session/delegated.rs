@@ -266,8 +266,14 @@ impl Inner {
 
     /// [`Self::wake_busy`]'s first reason, for the journal.
     fn wake_blocker(&self) -> Option<&'static str> {
+        self.turn_blocker(false)
+    }
+
+    /// What keeps a turn nobody typed from starting now. `restart`: a process that exited on
+    /// its own may be started again for it (a thread continuing after its usage limit).
+    pub(super) fn turn_blocker(&self, restart: bool) -> Option<&'static str> {
         let state = self.state.borrow();
-        let process_gone = !state.alive && !self.suspended.get();
+        let process_gone = !state.alive && !self.suspended.get() && !restart;
         let reasons = [
             (state.running_turn, "a turn is running"),
             (process_gone, "the agent process is gone"),
@@ -424,7 +430,7 @@ impl Inner {
 
     /// Whether a line written just now reached a process that can take it. Nothing runs between
     /// a synchronous write and this check, so a process that can take writes now took that line.
-    fn wrote_now(&self) -> bool {
+    pub(super) fn wrote_now(&self) -> bool {
         self.proc.borrow().as_ref().is_some_and(|p| p.can_write())
     }
 

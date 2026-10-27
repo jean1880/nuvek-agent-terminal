@@ -38,9 +38,11 @@ use tracing::{debug, info, warn};
 mod agy_transcript;
 mod codex_policy;
 mod delegated;
+mod limit;
 mod reply_questions;
 
 pub(crate) use delegated::{HeldNews, TakenNews, WakeOutcome};
+pub(crate) use limit::ContinueOutcome;
 
 use super::{ChatBackend, EnvelopeSink, SessionStatus};
 use crate::agent_proc::{

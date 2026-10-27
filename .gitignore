@@ -1,0 +1,43 @@
+/target
+
+# Scratch diffs from refactors — never an artifact worth tracking.
+*.patch
+
+# Runtime logs. startup.log was tracked by accident (a stale artifact from the
+# pre-rename "Gemini Terminal" era, not a fixture); logs are never artifacts.
+*.log
+
+# OS / editor cruft and local env files
+.DS_Store
+._*
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Rust build artifacts
+/target/
+# Built packages (packaging/build-*.sh, the release workflow)
+/dist/
+**/*.rs.bk
+*.pdb
+
+# Repository-owned QA helpers use Python's standard library.
+__pycache__/
+
+# Agent overlays and local settings
+.claude/
+.gemini/skills/
+
+# Graphify knowledge graph: a local artefact, rebuilt by graphify-build
+graphify-out/
+
+# Agent plans are never part of the repository (make lint enforces it)
+/plans/

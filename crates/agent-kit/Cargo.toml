@@ -1,0 +1,26 @@
+[package]
+name = "agent-kit"
+version = "1.0.0"
+edition = "2021"
+authors = ["Jean-Luc Desroches <jean1880@users.noreply.github.com>"]
+license = "MIT"
+repository = "https://github.com/jean1880/nuvek-agent-terminal"
+description = "GTK-free git, checkpoint and session logic for agent-terminal"
+publish = false
+
+[dependencies]
+agent-core = { path = "../agent-core" }
+rusqlite = { version = "0.40", features = ["bundled", "backup"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+libc = "0.2"
+ureq = { version = "3.4.2", default-features = false, features = ["rustls", "json"] }
+
+[features]
+# Hermetic git fixture helpers (`agent_kit::test_support`) for dependents' tests. Off by
+# default; enable it only from `[dev-dependencies]`, never in a shipped build.
+test-support = []
+
+[dev-dependencies]
+tempfile = "3"

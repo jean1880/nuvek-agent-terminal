@@ -1,0 +1,1968 @@
+//! The thread sidebar's pure logic: which rows show, grouped and ordered how, with which badge
+//! and relative time. No GTK, so it is tested without a display.
+
+use agent_core::adapter::{Driver, Mode};
+use agent_core::event::{Event, ItemKind, TurnState};
+
+/// What a sidebar row opens.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RowKey {
+    /// A chat thread in the store.
+    Thread(String),
+    /// A 2.x terminal page, by its tab key.
+    Terminal(u64),
+}
+
+/// A row's state badge, in priority order: only the most urgent one shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Badge {
+    NeedsApproval,
+    RateLimited,
+    Running,
+    /// The main agent is idle but background work (sub-agents, background commands) still runs:
+    /// the thread is not finished.
+    Background,
+    Unread,
+}
+
+impl Badge {
+    pub fn css_class(self) -> &'static str {
+        match self {
+            Badge::NeedsApproval => "badge-approval",
+            Badge::RateLimited => "badge-limited",
+            Badge::Running => "badge-running",
+            Badge::Background => "badge-background",
+            Badge::Unread => "badge-unread",
+        }
+    }
+
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            Badge::NeedsApproval => "Needs your approval",
+            Badge::RateLimited => "Rate limited",
+            Badge::Running => "Working",
+            Badge::Background => "Background tasks running",
+            Badge::Unread => "New activity",
+        }
+    }
+}
+
+/// The badge for a thread's state, or none. `background`: background tasks still run.
+pub fn badge_for(
+    running: bool,
+    background: bool,
+    approval: bool,
+    rate_limited: bool,
+    unread: bool,
+) -> Option<Badge> {
+    [
+        (approval, Badge::NeedsApproval),
+        (rate_limited, Badge::RateLimited),
+        (running, Badge::Running),
+        (background, Badge::Background),
+        (unread, Badge::Unread),
+    ]
+    .into_iter()
+    .find_map(|(on, badge)| on.then_some(badge))
+}
+
+/// Most task names a tooltip lists, and the most characters of each.
+const TOOLTIP_TASKS: usize = 5;
+const TOOLTIP_TASK_CHARS: usize = 60;
+
+/// A row's tooltip for its background work: "N background tasks running" and their names (the
+/// first few, each cut short). Empty when nothing runs.
+pub fn background_tooltip(descriptions: &[String]) -> String {
+    let head = match descriptions.len() {
+        0 => return String::new(),
+        1 => "1 background task running".to_owned(),
+        n => format!("{n} background tasks running"),
+    };
+    let names: Vec<String> = descriptions
+        .iter()
+        .filter(|d| !d.is_empty())
+        .take(TOOLTIP_TASKS)
+        .map(|d| match d.char_indices().nth(TOOLTIP_TASK_CHARS) {
+            Some((cut, _)) => format!("{}…", &d[..cut]),
+            None => d.clone(),
+        })
+        .collect();
+    if names.is_empty() {
+        head
+    } else {
+        format!("{head}: {}", names.join(", "))
+    }
+}
+
+/// Whether `row` glows: it waits for an approval and you are not looking at it (another thread
+/// is shown, or the window is not focused).
+pub fn needs_attention(row: &SidebarRow, shown: Option<&RowKey>, window_focused: bool) -> bool {
+    row.badge == Some(Badge::NeedsApproval) && (shown != Some(&row.key) || !window_focused)
+}
+
+/// Whether closing a thread would cut work short: a turn running, background work (sub-agents,
+/// background commands) still going, or an answer awaited.
+pub fn is_busy(running: bool, background: bool, approval: bool) -> bool {
+    running || background || approval
+}
+
+/// Approvals, questions and forms that delegated sub-agents wait on, per sub-agent, so the
+/// root thread asks for the user as it would for its own. A resolution names its request when it
+/// has one; without one, everything that sub-agent waits on is withdrawn.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ChildAsks {
+    asks: std::collections::HashSet<(String, String)>,
+}
+
+impl ChildAsks {
+    pub fn requested(&mut self, worker: &str, request: Option<&str>) {
+        self.asks
+            .insert((worker.to_owned(), request.unwrap_or_default().to_owned()));
+    }
+
+    pub fn resolved(&mut self, worker: &str, request: Option<&str>) {
+        match request {
+            Some(request) => {
+                self.asks.remove(&(worker.to_owned(), request.to_owned()));
+                // A request recorded without its id is withdrawn by any resolution.
+                self.asks.remove(&(worker.to_owned(), String::new()));
+            }
+            None => self.worker_ended(worker),
+        }
+    }
+
+    /// The sub-agent's turn or process ended: nothing it asked can still be answered.
+    pub fn worker_ended(&mut self, worker: &str) {
+        self.asks.retain(|(w, _)| w != worker);
+    }
+
+    /// Keeps only what the listed (still active) sub-agents wait on.
+    pub fn retain_workers(&mut self, active: &[&str]) {
+        self.asks.retain(|(w, _)| active.contains(&w.as_str()));
+    }
+
+    pub fn any(&self) -> bool {
+        !self.asks.is_empty()
+    }
+}
+
+/// Why a switch must ask before it stops this thread's work. `delegated`: sub-agents the
+/// thread started through delegation are still at work.
+pub fn busy_reason(
+    running: bool,
+    background: usize,
+    delegated: bool,
+    approval: bool,
+) -> Option<String> {
+    if !is_busy(running, background > 0 || delegated, approval) {
+        return None;
+    }
+    let mut reasons = Vec::new();
+    if running {
+        reasons.push("The running turn will be interrupted".to_owned());
+    }
+    match background {
+        0 => {}
+        1 => reasons.push("1 background task will stop".to_owned()),
+        n => reasons.push(format!("{n} background tasks will stop")),
+    }
+    if delegated {
+        reasons.push("Its sub-agents' work will stop".to_owned());
+    }
+    if approval {
+        reasons
+            .push("The approval or question waiting for your answer will be cancelled".to_owned());
+    }
+    Some(format!("{}.", reasons.join(". ")))
+}
+
+/// Where an open thread's agent process is, as the sidebar shows it. Presentation only, derived
+/// by [`thread_activity`] from state the window and session already hold; nothing decides on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadActivity {
+    /// The page is being built, or its agent is starting (or resuming) and has not reported its
+    /// session yet: the row spins.
+    Starting,
+    /// The agent is up.
+    Live,
+    /// The agent was stopped to save memory; the next message resumes it. The row says "Paused".
+    Paused,
+}
+
+impl ThreadActivity {
+    /// The row's words for it, if it shows any.
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            Self::Starting => "Starting the agent",
+            Self::Live => "Agent running",
+            Self::Paused => "Paused to save memory; resumes when you send",
+        }
+    }
+}
+
+/// The activity of a thread's agent. `preparing`: the window is building the page or starting
+/// its session; `alive`, `starting` and `suspended`: what the session says of its process (all
+/// false with no session). `None`: no agent to speak of (a closed or unbuilt page, an agent that
+/// is not installed, a process that exited).
+pub fn thread_activity(
+    preparing: bool,
+    alive: bool,
+    starting: bool,
+    suspended: bool,
+) -> Option<ThreadActivity> {
+    if suspended && !alive {
+        Some(ThreadActivity::Paused)
+    } else if preparing || (alive && starting) {
+        Some(ThreadActivity::Starting)
+    } else if alive {
+        Some(ThreadActivity::Live)
+    } else {
+        None
+    }
+}
+
+/// The empty state's offer to reopen the `n` threads open when the app last closed, or `None`
+/// when there are none to reopen.
+pub fn reopen_offer(n: usize) -> Option<String> {
+    match n {
+        0 => None,
+        1 => Some("Reopen 1 thread from your last session".to_owned()),
+        n => Some(format!("Reopen {n} threads from your last session")),
+    }
+}
+
+/// The toast after the agents' own recent sessions were listed as threads: how many, and from
+/// which agents (each named once, in the order first met). `None` when none were added.
+pub fn sessions_added_toast(drivers: &[Driver]) -> Option<String> {
+    let mut names: Vec<&str> = Vec::new();
+    for d in drivers {
+        let name = d.info().label;
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    let agents = match names.as_slice() {
+        [] => return None,
+        [one] => (*one).to_owned(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    };
+    Some(match drivers.len() {
+        1 => format!("Added 1 recent session from {agents}"),
+        n => format!("Added {n} recent sessions from {agents}"),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenState {
+    Closed,
+    Here,
+    Elsewhere,
+}
+
+impl OpenState {
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Closed => "Closed",
+            Self::Here => "Open",
+            Self::Elsewhere => "Open in another window",
+        }
+    }
+}
+
+/// Whether a finished turn means the thread is finished: nothing left in the background. A
+/// turn that ends with background work still going is not announced; the turn Claude runs to
+/// read that work's result is.
+pub fn turn_finishes_thread(background: bool) -> bool {
+    !background
+}
+
+/// Whether a finish held back by [`turn_finishes_thread`] is due now: the background work is
+/// gone and no turn runs. Claude usually runs a turn to read the results (which clears the hold
+/// and finishes the thread itself), but not always: a failed or stopped turn, or a background
+/// command it does not report on, leaves only this.
+pub fn held_finish_due(held: bool, running: bool, background: bool) -> bool {
+    held && !running && !background
+}
+
+/// The tooltip of a spinning row: its badge's, plus what runs in the background.
+pub fn row_tooltip(badge: Badge, background: &[String]) -> String {
+    match (badge, background.is_empty()) {
+        (Badge::Background, true) => badge.tooltip().to_owned(),
+        (Badge::Background, false) => background_tooltip(background),
+        (_, true) => badge.tooltip().to_owned(),
+        (_, false) => format!("{}; {}", badge.tooltip(), background_tooltip(background)),
+    }
+}
+
+/// The window-close question's title for `n` busy threads.
+pub fn stop_heading(n: usize) -> String {
+    match n {
+        1 => "Stop 1 running thread and close?".to_owned(),
+        n => format!("Stop {n} running threads and close?"),
+    }
+}
+
+/// What happened to a thread that may need the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attention {
+    /// An approval or a question is waiting.
+    Asked,
+    /// An approval ran out (agy denies after its deadline): the card is gone.
+    Expired,
+    /// A turn finished.
+    TurnDone,
+}
+
+/// How the window reacts to an [`Attention`] event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reaction {
+    /// Leave the thread unread (a sidebar mark that outlives the event).
+    pub unread: bool,
+    /// Raise a desktop notification.
+    pub notify: bool,
+}
+
+/// The reaction to `event` on a thread that is `shown` (selected) in a window that is
+/// `focused`. Looking at it means both; anything else needs a trace. A request for the user is
+/// always announced when they are not looking, a finished turn only when `notify_on_bell`.
+pub fn react(event: Attention, shown: bool, focused: bool, notify_on_bell: bool) -> Reaction {
+    let looking = shown && focused;
+    match event {
+        // The glow covers a shown thread, so unread only marks what is out of view.
+        Attention::Asked => Reaction {
+            unread: !shown,
+            notify: !looking,
+        },
+        Attention::Expired => Reaction {
+            unread: !looking,
+            notify: false,
+        },
+        Attention::TurnDone => Reaction {
+            unread: !looking,
+            notify: !looking && notify_on_bell,
+        },
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarRow {
+    pub key: RowKey,
+    pub title: String,
+    /// The working directory; rows are grouped by it.
+    pub folder: String,
+    /// Last activity, milliseconds since the epoch.
+    pub updated_ms: i64,
+    /// `None`: a terminal page.
+    pub driver: Option<Driver>,
+    pub badge: Option<Badge>,
+    /// Where an open thread's agent process is ([`thread_activity`]); `None` for the rest.
+    pub activity: Option<ThreadActivity>,
+    /// What runs in the background (sub-agents, background commands), for the row's tooltip.
+    pub background: Vec<String>,
+    /// Where the thread's page is open, if anywhere.
+    pub open: OpenState,
+    /// Archived threads are hidden unless the sidebar's "Show archived" toggle is on.
+    pub archived: bool,
+}
+
+/// Rows matching `query` (case-insensitive, on title and folder), grouped by folder. Groups are
+/// ordered by their newest row and rows newest first, so the folder being worked in is on top.
+/// Archived rows are left out unless `show_archived` (or the thread is open in this window).
+pub fn group_rows(
+    rows: Vec<SidebarRow>,
+    query: &str,
+    show_archived: bool,
+) -> Vec<(String, Vec<SidebarRow>)> {
+    let query = query.trim().to_lowercase();
+    let mut groups: Vec<(String, Vec<SidebarRow>)> = Vec::new();
+    for row in rows.into_iter().filter(|r| {
+        (show_archived || !r.archived || r.open != OpenState::Closed)
+            && (query.is_empty()
+                || r.title.to_lowercase().contains(&query)
+                || r.folder.to_lowercase().contains(&query))
+    }) {
+        match groups.iter_mut().find(|(f, _)| *f == row.folder) {
+            Some((_, list)) => list.push(row),
+            None => groups.push((row.folder.clone(), vec![row])),
+        }
+    }
+    for (_, list) in &mut groups {
+        list.sort_by_key(|r| std::cmp::Reverse(r.updated_ms));
+    }
+    groups.sort_by(|a, b| {
+        let newest = |g: &[SidebarRow]| g.first().map_or(i64::MIN, |r| r.updated_ms);
+        newest(&b.1).cmp(&newest(&a.1))
+    });
+    groups
+}
+
+/// Whether a row is live work: a turn running, background work going, an approval waiting or a
+/// rate limit holding it. These sit in the sidebar's own "Active" section.
+pub fn is_active(row: &SidebarRow) -> bool {
+    matches!(
+        row.badge,
+        Some(Badge::NeedsApproval | Badge::RateLimited | Badge::Running | Badge::Background)
+    )
+}
+
+/// The sidebar's two sections: the active threads ([`is_active`]) on their own, most urgent
+/// first (an approval, a rate limit, then working, then background work) and newest within each;
+/// then every other thread grouped by folder as [`group_rows`] does, ordered by the newest of
+/// what is left. The same search and archive filter applies to both, and an active thread is
+/// listed once, in the active section only.
+pub fn sidebar_sections(
+    rows: Vec<SidebarRow>,
+    query: &str,
+    show_archived: bool,
+) -> (Vec<SidebarRow>, Vec<(String, Vec<SidebarRow>)>) {
+    let mut active = Vec::new();
+    let mut groups: Vec<(String, Vec<SidebarRow>)> = group_rows(rows, query, show_archived)
+        .into_iter()
+        .filter_map(|(folder, list)| {
+            let (live, rest): (Vec<_>, Vec<_>) = list.into_iter().partition(is_active);
+            active.extend(live);
+            (!rest.is_empty()).then_some((folder, rest))
+        })
+        .collect();
+    // An active row that left a group may have been what put it on top.
+    groups.sort_by_key(|(_, list)| {
+        std::cmp::Reverse(list.first().map_or(i64::MIN, |r| r.updated_ms))
+    });
+    active.sort_by(|a, b| a.badge.cmp(&b.badge).then(b.updated_ms.cmp(&a.updated_ms)));
+    (active, groups)
+}
+
+/// A folder group as the sidebar draws it: its header, and the rows under it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderGroup {
+    pub folder: String,
+    /// The rows drawn under the header: all of them when expanded, else only the shown row.
+    pub rows: Vec<SidebarRow>,
+    pub expanded: bool,
+    /// Rows the collapsed header hides.
+    pub hidden: usize,
+}
+
+/// Folds the folder groups: each is collapsed unless the user expanded it (`expanded`) or a
+/// search is on (its matches must be seen). A collapsed group still draws the `selected` row,
+/// so the thread on screen never vanishes from the list.
+pub fn fold_groups(
+    groups: Vec<(String, Vec<SidebarRow>)>,
+    expanded: &std::collections::HashSet<String>,
+    searching: bool,
+    selected: Option<&RowKey>,
+) -> Vec<FolderGroup> {
+    groups
+        .into_iter()
+        .map(|(folder, rows)| {
+            let open = searching || expanded.contains(&folder);
+            let total = rows.len();
+            let rows: Vec<SidebarRow> = if open {
+                rows
+            } else {
+                rows.into_iter()
+                    .filter(|r| Some(&r.key) == selected)
+                    .collect()
+            };
+            FolderGroup {
+                hidden: total - rows.len(),
+                folder,
+                rows,
+                expanded: open,
+            }
+        })
+        .collect()
+}
+
+/// Everything one sidebar redraw depends on, apart from the clock: the sections, which row is
+/// shown, whether the window has focus (it decides which rows glow) and the search text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarModel {
+    pub active: Vec<SidebarRow>,
+    pub groups: Vec<FolderGroup>,
+    pub selected: Option<RowKey>,
+    pub focused: bool,
+    pub query: String,
+}
+
+impl SidebarModel {
+    /// The rows in the order the list draws them: the active section, then each folder group.
+    pub fn rows(&self) -> impl Iterator<Item = &SidebarRow> {
+        self.active
+            .iter()
+            .chain(self.groups.iter().flat_map(|g| g.rows.iter()))
+    }
+}
+
+/// How much of the list must be redrawn to go from the last model to the next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Redraw {
+    /// The same rows in the same order: keep every widget (only the age labels, which follow the
+    /// clock, are brought up to date).
+    InPlace,
+    /// The rows are the same but the shown row or the window focus changed: keep the widgets,
+    /// restyle the glow and the selection.
+    Restyle,
+    /// The rows (or the search) changed, or nothing is drawn yet: rebuild the list.
+    Rebuild,
+}
+
+/// What the next redraw has to do, given the model that is on screen.
+pub fn redraw_for(drawn: Option<&SidebarModel>, next: &SidebarModel) -> Redraw {
+    let Some(drawn) = drawn else {
+        return Redraw::Rebuild;
+    };
+    if drawn.active != next.active || drawn.groups != next.groups || drawn.query != next.query {
+        Redraw::Rebuild
+    } else if drawn.selected != next.selected || drawn.focused != next.focused {
+        Redraw::Restyle
+    } else {
+        Redraw::InPlace
+    }
+}
+
+/// A compact age: `now`, `5m`, `3h`, `2d`, `6w`.
+pub fn relative_time(now_ms: i64, then_ms: i64) -> String {
+    let secs = (now_ms - then_ms).max(0) / 1000;
+    match secs {
+        s if s < 60 => "now".to_owned(),
+        s if s < 3_600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3_600),
+        s if s < 14 * 86_400 => format!("{}d", s / 86_400),
+        s => format!("{}w", s / (7 * 86_400)),
+    }
+}
+
+/// A thread title from its first message: the first non-blank line, at most 60 characters.
+/// The name a thread is shown under: its title, or "New thread" while it has none.
+pub fn display_title(title: &str) -> &str {
+    if title.is_empty() {
+        "New thread"
+    } else {
+        title
+    }
+}
+
+pub fn thread_title(text: &str) -> String {
+    const MAX: usize = 60;
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or_default();
+    if line.chars().count() <= MAX {
+        return line.to_owned();
+    }
+    let cut: String = line.chars().take(MAX - 1).collect();
+    format!("{}…", cut.trim_end())
+}
+
+/// What a resumed native session becomes. A Claude or agy session is resumed as a chat
+/// thread whose provider thread carries the native id; any other CLI's session can only be
+/// resumed in a terminal page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeAs {
+    Chat { driver: Driver, native_id: String },
+    Terminal,
+}
+
+pub fn resume_as(driver: Option<Driver>, session_id: &str) -> ResumeAs {
+    match driver {
+        Some(driver) => ResumeAs::Chat {
+            driver,
+            native_id: session_id.to_owned(),
+        },
+        None => ResumeAs::Terminal,
+    }
+}
+
+/// The store's provider-thread model, where `"default"` means "the CLI's own default".
+pub fn stored_model(model: Option<&str>) -> Option<String> {
+    model
+        .filter(|m| !m.is_empty() && *m != "default")
+        .map(str::to_owned)
+}
+
+/// The agent a handoff with no named target goes to: the next one after `from` in
+/// [`Driver::ALL`] order (wrapping) that `usable` accepts. `None` when there is no other usable
+/// agent.
+pub fn handoff_target(from: Driver, usable: impl Fn(Driver) -> bool) -> Option<Driver> {
+    let all = Driver::ALL;
+    let at = all.iter().position(|d| *d == from)?;
+    (1..all.len())
+        .map(|step| all[(at + step) % all.len()])
+        .find(|d| usable(*d))
+}
+
+/// Whether a thread whose user chose `wanted` (unknown: `None`) forbids edits nobody approved.
+/// Only Accept edits allows them; Ask and Plan (read-only, as far as the user is concerned) both
+/// forbid them, and an unknown mode is treated as forbidding them, the safe guess.
+pub fn forbids_unasked_edits(wanted: Option<Mode>) -> bool {
+    wanted != Some(Mode::AcceptEdits)
+}
+
+/// The agent an automatic handoff from `from` lands on (a rate-limit or unavailable banner, a
+/// bare `/handoff`), and whether it would edit files unasked. While `agy_cannot_ask` (the thread
+/// forbids unasked edits, see [`forbids_unasked_edits`], and agy's approval hook is not proven),
+/// agy is skipped: it would apply edits on its own, in every mode, Plan included. It is still
+/// returned, flagged, when no other agent is usable, so the caller can say so and confirm rather
+/// than offer nothing.
+pub fn safe_handoff_target(
+    from: Driver,
+    usable: impl Fn(Driver) -> bool,
+    agy_cannot_ask: bool,
+) -> Option<(Driver, bool)> {
+    let unasked = |d: Driver| agy_cannot_ask && d == Driver::Agy;
+    handoff_target(from, |d| usable(d) && !unasked(d))
+        .map(|d| (d, false))
+        .or_else(|| handoff_target(from, &usable).map(|d| (d, unasked(d))))
+}
+
+/// Whether `event` shows a rate-limited agent answering again, so its banner (and its
+/// "Continue in …") can go: an item of its own, or a turn that completed with output. A turn
+/// merely starting is not: Claude starts one itself to read a finished task, and a retry the
+/// limit refuses starts one too; hiding the banner then took the offer away (2026-10-11). Only a
+/// top-level item counts: a sub-agent started before the limit can still stream under it.
+pub fn limit_over(event: &Event) -> bool {
+    match event {
+        Event::ItemStarted {
+            kind, parent: None, ..
+        } => *kind != ItemKind::UserMessage,
+        Event::TurnCompleted {
+            state: TurnState::Completed,
+            usage: Some(usage),
+            ..
+        } => usage.output_tokens > 0,
+        _ => false,
+    }
+}
+
+/// The "Continue in a new thread with…" button for a target from [`safe_handoff_target`].
+pub fn continue_label(target: Driver, unasked: bool) -> String {
+    if unasked {
+        format!("Continue in {} (edits without asking)", target.info().label)
+    } else {
+        format!("Continue in {}", target.info().label)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The thread context menu
+// ---------------------------------------------------------------------------------------------
+
+/// What a thread-menu entry does. Encoded into one string target of the `win.thread-menu`
+/// action ([`ThreadAction::encode`]), so the menu holds data and no closures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadAction {
+    /// A NEW thread on `driver` (same folder), seeded with this thread's handoff.
+    ContinueIn {
+        thread: String,
+        driver: Driver,
+        model: Option<String>,
+        effort: Option<String>,
+    },
+    /// This thread, in place, moved to `driver`/`model`/`effort` like the header's picker.
+    SwitchTo {
+        thread: String,
+        driver: Driver,
+        model: Option<String>,
+        effort: Option<String>,
+    },
+    Fork(String),
+    Compact(String),
+    Rename(String),
+    Archive(String),
+    Unarchive(String),
+    Delete(String),
+    OpenFolder(String),
+    ReviewEnvironment(String),
+    CopyId(String),
+}
+
+/// Separates the fields of an encoded [`ThreadAction`] (never part of an id, model or effort).
+const SEP: char = '\u{1f}';
+
+impl ThreadAction {
+    /// `kind SEP thread [SEP driver SEP model SEP effort]`; an absent model or effort is empty.
+    pub fn encode(&self) -> String {
+        let simple = |kind: &str, thread: &str| format!("{kind}{SEP}{thread}");
+        let full = |kind: &str,
+                    thread: &str,
+                    driver: Driver,
+                    model: &Option<String>,
+                    effort: &Option<String>| {
+            format!(
+                "{kind}{SEP}{thread}{SEP}{}{SEP}{}{SEP}{}",
+                driver.info().key,
+                model.as_deref().unwrap_or(""),
+                effort.as_deref().unwrap_or("")
+            )
+        };
+        match self {
+            Self::ContinueIn {
+                thread,
+                driver,
+                model,
+                effort,
+            } => full("continue", thread, *driver, model, effort),
+            Self::SwitchTo {
+                thread,
+                driver,
+                model,
+                effort,
+            } => full("switch", thread, *driver, model, effort),
+            Self::Fork(t) => simple("fork", t),
+            Self::Compact(t) => simple("compact", t),
+            Self::Rename(t) => simple("rename", t),
+            Self::Archive(t) => simple("archive", t),
+            Self::Unarchive(t) => simple("unarchive", t),
+            Self::Delete(t) => simple("delete", t),
+            Self::OpenFolder(t) => simple("folder", t),
+            Self::ReviewEnvironment(t) => simple("review-environment", t),
+            Self::CopyId(t) => simple("copy-id", t),
+        }
+    }
+
+    /// The inverse of [`Self::encode`]; `None` for anything else.
+    pub fn decode(text: &str) -> Option<Self> {
+        let mut parts = text.split(SEP);
+        let kind = parts.next()?;
+        let thread = parts.next().filter(|t| !t.is_empty())?.to_owned();
+        let rest: Vec<&str> = parts.collect();
+        let non_empty = |s: &&str| !s.is_empty();
+        let agent = |rest: &[&str]| -> Option<(Driver, Option<String>, Option<String>)> {
+            let [driver, model, effort] = rest else {
+                return None;
+            };
+            Some((
+                parse_driver(driver)?,
+                Some(*model).filter(non_empty).map(str::to_owned),
+                Some(*effort).filter(non_empty).map(str::to_owned),
+            ))
+        };
+        let simple = |action: Self| rest.is_empty().then_some(action);
+        match kind {
+            "continue" => agent(&rest).map(|(driver, model, effort)| Self::ContinueIn {
+                thread,
+                driver,
+                model,
+                effort,
+            }),
+            "switch" => agent(&rest).map(|(driver, model, effort)| Self::SwitchTo {
+                thread,
+                driver,
+                model,
+                effort,
+            }),
+            "fork" => simple(Self::Fork(thread)),
+            "compact" => simple(Self::Compact(thread)),
+            "rename" => simple(Self::Rename(thread)),
+            "archive" => simple(Self::Archive(thread)),
+            "unarchive" => simple(Self::Unarchive(thread)),
+            "delete" => simple(Self::Delete(thread)),
+            "folder" => simple(Self::OpenFolder(thread)),
+            "review-environment" => simple(Self::ReviewEnvironment(thread)),
+            "copy-id" => simple(Self::CopyId(thread)),
+            _ => None,
+        }
+    }
+}
+
+/// One entry of a thread's context menu, before it becomes a `gio::Menu`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuEntry {
+    Item {
+        label: String,
+        action: ThreadAction,
+        enabled: bool,
+    },
+    Submenu {
+        label: String,
+        enabled: bool,
+        entries: Vec<MenuEntry>,
+    },
+    /// A group set off by a separator.
+    Section(Vec<MenuEntry>),
+}
+
+/// An enabled agent and the models the catalogue lists for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuAgent {
+    pub driver: Driver,
+    pub models: Vec<agent_core::catalog::CatalogModel>,
+}
+
+/// Everything the thread menu depends on.
+#[derive(Debug, Clone)]
+pub struct ThreadMenuInput {
+    pub thread: String,
+    pub archived: bool,
+    /// The thread has at least one message to hand over ("Continue in a new thread with…" needs one).
+    pub has_messages: bool,
+    /// Only enabled (and installed) agents appear.
+    pub agents: Vec<MenuAgent>,
+}
+
+/// The agents a menu offers: every driver `usable` accepts (see `availability`), in registry
+/// order, each with the catalogue models listed for it. A cached model list of an agent that is
+/// not usable is kept in the catalogue but never shown.
+pub fn menu_agents(
+    catalog: &[agent_core::catalog::CatalogModel],
+    usable: impl Fn(Driver) -> bool,
+) -> Vec<MenuAgent> {
+    Driver::ALL
+        .into_iter()
+        .filter(|d| usable(*d))
+        .map(|driver| MenuAgent {
+            driver,
+            models: catalog
+                .iter()
+                .filter(|m| m.driver == driver)
+                .cloned()
+                .collect(),
+        })
+        .collect()
+}
+
+/// The model and effort to hand to `switch` for a catalogue row at `effort`: agy folds the effort
+/// into the model id, the others take it separately.
+fn model_choice(
+    model: &agent_core::catalog::CatalogModel,
+    effort: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let effort = effort.filter(|e| model.efforts.iter().any(|x| x == e));
+    (Some(model.model_id_for(effort)), effort.map(str::to_owned))
+}
+
+/// An agent's submenu: its default model first, then every model (a model with efforts is a
+/// submenu of them, the model's own default marked).
+fn agent_entries(
+    agent: &MenuAgent,
+    enabled: bool,
+    action: impl Fn(Driver, Option<String>, Option<String>) -> ThreadAction,
+) -> Vec<MenuEntry> {
+    let mut entries = vec![MenuEntry::Item {
+        label: "Default model".to_owned(),
+        action: action(agent.driver, None, None),
+        enabled,
+    }];
+    for m in &agent.models {
+        if m.efforts.is_empty() {
+            let (model, effort) = model_choice(m, None);
+            entries.push(MenuEntry::Item {
+                label: m.display.clone(),
+                action: action(agent.driver, model, effort),
+                enabled,
+            });
+            continue;
+        }
+        let default = m.default_effort();
+        let mut efforts = vec![MenuEntry::Item {
+            label: "Default effort".to_owned(),
+            action: action(agent.driver, Some(m.model_id_for(None)), None),
+            enabled,
+        }];
+        for e in &m.efforts {
+            let (model, effort) = model_choice(m, Some(e));
+            efforts.push(MenuEntry::Item {
+                label: if default == Some(e.as_str()) {
+                    format!("{e} (default)")
+                } else {
+                    e.clone()
+                },
+                action: action(agent.driver, model, effort),
+                enabled,
+            });
+        }
+        entries.push(MenuEntry::Submenu {
+            label: m.display.clone(),
+            enabled,
+            entries: efforts,
+        });
+    }
+    entries
+}
+
+/// The right-click menu of a thread: continue it in another agent (a new thread), switch it in
+/// place, then rename / archive / delete, then open its folder and copy its id.
+pub fn thread_menu(input: &ThreadMenuInput) -> Vec<MenuEntry> {
+    let by_agent =
+        |label: &str,
+         enabled: bool,
+         action: &dyn Fn(Driver, Option<String>, Option<String>) -> ThreadAction| {
+            MenuEntry::Submenu {
+                label: label.to_owned(),
+                enabled: enabled && !input.agents.is_empty(),
+                entries: input
+                    .agents
+                    .iter()
+                    .map(|agent| MenuEntry::Submenu {
+                        label: agent.driver.info().label.to_owned(),
+                        enabled,
+                        entries: agent_entries(agent, enabled, action),
+                    })
+                    .collect(),
+            }
+        };
+    let thread = input.thread.clone();
+    let t = thread.clone();
+    let continue_in = by_agent(
+        "Continue in a new thread with…",
+        input.has_messages,
+        &move |driver, model, effort| ThreadAction::ContinueIn {
+            thread: t.clone(),
+            driver,
+            model,
+            effort,
+        },
+    );
+    let t = thread.clone();
+    let switch_to = by_agent(
+        "Switch agent (stops the current turn)",
+        true,
+        &move |driver, model, effort| ThreadAction::SwitchTo {
+            thread: t.clone(),
+            driver,
+            model,
+            effort,
+        },
+    );
+    let item = |label: &str, action: ThreadAction| MenuEntry::Item {
+        label: label.to_owned(),
+        action,
+        enabled: true,
+    };
+    vec![
+        MenuEntry::Section(vec![
+            continue_in,
+            switch_to,
+            MenuEntry::Item {
+                label: "Fork thread".to_owned(),
+                action: ThreadAction::Fork(thread.clone()),
+                enabled: input.has_messages,
+            },
+            MenuEntry::Item {
+                label: "Compact into a new thread".to_owned(),
+                action: ThreadAction::Compact(thread.clone()),
+                enabled: input.has_messages,
+            },
+        ]),
+        MenuEntry::Section(vec![
+            item("Rename…", ThreadAction::Rename(thread.clone())),
+            if input.archived {
+                item("Unarchive", ThreadAction::Unarchive(thread.clone()))
+            } else {
+                item("Archive", ThreadAction::Archive(thread.clone()))
+            },
+            item("Delete…", ThreadAction::Delete(thread.clone())),
+        ]),
+        MenuEntry::Section(vec![
+            item("Open folder", ThreadAction::OpenFolder(thread.clone())),
+            MenuEntry::Item {
+                label: "Review Multi-Agent Environment…".to_owned(),
+                action: ThreadAction::ReviewEnvironment(thread.clone()),
+                enabled: !input.agents.is_empty(),
+            },
+            item("Copy thread id", ThreadAction::CopyId(thread)),
+        ]),
+    ]
+}
+
+pub fn parse_driver(name: &str) -> Option<Driver> {
+    Driver::from_key(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn switches_ask_for_every_busy_reason() {
+        for running in [false, true] {
+            for background in [0, 2] {
+                for approval in [false, true] {
+                    let reason = busy_reason(running, background, false, approval);
+                    assert_eq!(reason.is_some(), is_busy(running, background > 0, approval));
+                    if background > 0 {
+                        assert!(reason.unwrap().contains("2 background tasks will stop"));
+                    }
+                }
+            }
+        }
+        assert!(busy_reason(false, 1, false, false)
+            .unwrap()
+            .contains("1 background task will stop"));
+        // Delegated sub-agents at work, nothing else: the switch still asks, and says why.
+        assert!(busy_reason(false, 0, true, false)
+            .is_some_and(|why| why.contains("sub-agents' work will stop")));
+    }
+
+    #[test]
+    fn a_thread_open_elsewhere_has_its_own_state() {
+        assert_eq!(OpenState::Elsewhere.description(), "Open in another window");
+        assert_ne!(OpenState::Elsewhere, OpenState::Here);
+        assert_ne!(OpenState::Elsewhere, OpenState::Closed);
+        let mut elsewhere = row("t", "/r", 0);
+        elsewhere.open = OpenState::Elsewhere;
+        elsewhere.archived = true;
+        assert_eq!(group_rows(vec![elsewhere], "", false).len(), 1);
+    }
+
+    fn model_row(id: &str, badge: Option<Badge>) -> SidebarRow {
+        SidebarRow {
+            key: RowKey::Thread(id.into()),
+            title: id.into(),
+            folder: "/work".into(),
+            updated_ms: 1_000,
+            driver: None,
+            badge,
+            activity: None,
+            background: Vec::new(),
+            open: OpenState::Here,
+            archived: false,
+        }
+    }
+
+    #[test]
+    fn a_threads_activity_follows_its_agent_process() {
+        use ThreadActivity::{Live, Paused, Starting};
+        // (preparing, alive, starting, suspended) -> activity
+        let table = [
+            ((false, false, false, false), None),
+            ((true, false, false, false), Some(Starting)),
+            ((false, true, true, false), Some(Starting)),
+            ((true, true, true, false), Some(Starting)),
+            ((false, true, false, false), Some(Live)),
+            // The window is still applying what waited for the session: not up yet.
+            ((true, true, false, false), Some(Starting)),
+            ((false, false, false, true), Some(Paused)),
+            // A resume clears the pause before it spawns: a live process is never paused.
+            ((false, true, true, true), Some(Starting)),
+            ((false, true, false, true), Some(Live)),
+            // An exited process with no pause behind it: nothing to show.
+            ((false, false, true, false), None),
+        ];
+        for ((preparing, alive, starting, suspended), want) in table {
+            assert_eq!(
+                thread_activity(preparing, alive, starting, suspended),
+                want,
+                "preparing {preparing}, alive {alive}, starting {starting}, suspended {suspended}"
+            );
+        }
+        assert!(Paused.tooltip().contains("resumes when you send"));
+    }
+
+    #[test]
+    fn the_empty_state_offers_a_reopen_only_when_there_is_something_to_reopen() {
+        assert_eq!(reopen_offer(0), None);
+        assert_eq!(
+            reopen_offer(1).as_deref(),
+            Some("Reopen 1 thread from your last session")
+        );
+        assert_eq!(
+            reopen_offer(4).as_deref(),
+            Some("Reopen 4 threads from your last session")
+        );
+    }
+
+    #[test]
+    fn the_import_toast_counts_sessions_and_names_each_agent_once() {
+        let (c, a, x) = (Driver::Claude, Driver::Agy, Driver::Codex);
+        let name = |d: Driver| d.info().label;
+        assert_eq!(sessions_added_toast(&[]), None);
+        assert_eq!(
+            sessions_added_toast(&[c]).as_deref(),
+            Some(format!("Added 1 recent session from {}", name(c)).as_str())
+        );
+        assert_eq!(
+            sessions_added_toast(&[c, c, a]).as_deref(),
+            Some(format!("Added 3 recent sessions from {} and {}", name(c), name(a)).as_str())
+        );
+        assert_eq!(
+            sessions_added_toast(&[x, c, x, a]).as_deref(),
+            Some(
+                format!(
+                    "Added 4 recent sessions from {}, {} and {}",
+                    name(x),
+                    name(c),
+                    name(a)
+                )
+                .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn a_change_of_activity_redraws_the_row() {
+        let rows = vec![model_row("a", None)];
+        let drawn = model_of(rows.clone(), Some("a"), true);
+        let mut paused = rows;
+        paused[0].activity = Some(ThreadActivity::Paused);
+        assert_eq!(
+            redraw_for(Some(&drawn), &model_of(paused, Some("a"), true)),
+            Redraw::Rebuild
+        );
+    }
+
+    fn model_of(rows: Vec<SidebarRow>, selected: Option<&str>, focused: bool) -> SidebarModel {
+        let (active, groups) = sidebar_sections(rows, "", false);
+        SidebarModel {
+            active,
+            groups: fold_groups(groups, &Default::default(), true, None),
+            selected: selected.map(|id| RowKey::Thread(id.into())),
+            focused,
+            query: String::new(),
+        }
+    }
+
+    #[test]
+    fn nothing_drawn_yet_means_a_rebuild() {
+        let next = model_of(vec![model_row("a", None)], None, true);
+        assert_eq!(redraw_for(None, &next), Redraw::Rebuild);
+    }
+
+    #[test]
+    fn the_same_model_keeps_every_widget() {
+        let rows = vec![model_row("a", None), model_row("b", Some(Badge::Running))];
+        let drawn = model_of(rows.clone(), Some("a"), true);
+        assert_eq!(
+            redraw_for(Some(&drawn), &model_of(rows, Some("a"), true)),
+            Redraw::InPlace
+        );
+    }
+
+    #[test]
+    fn focus_or_the_shown_row_changing_only_restyles() {
+        let rows = vec![
+            model_row("a", Some(Badge::NeedsApproval)),
+            model_row("b", None),
+        ];
+        let drawn = model_of(rows.clone(), Some("a"), true);
+        for next in [
+            model_of(rows.clone(), Some("a"), false),
+            model_of(rows.clone(), Some("b"), true),
+            model_of(rows.clone(), None, true),
+        ] {
+            assert_eq!(redraw_for(Some(&drawn), &next), Redraw::Restyle);
+        }
+    }
+
+    #[test]
+    fn a_changed_row_or_search_rebuilds() {
+        let rows = vec![model_row("a", None), model_row("b", None)];
+        let drawn = model_of(rows.clone(), Some("a"), true);
+        // A new badge, a new title, a row less, a newer activity time (which also re-orders).
+        let mut badged = rows.clone();
+        badged[0].badge = Some(Badge::Unread);
+        let mut renamed = rows.clone();
+        renamed[1].title = "other".into();
+        let mut newer = rows.clone();
+        newer[1].updated_ms += 60_000;
+        for next in [
+            model_of(badged, Some("a"), true),
+            model_of(renamed, Some("a"), true),
+            model_of(rows[..1].to_vec(), Some("a"), true),
+            model_of(newer, Some("a"), true),
+        ] {
+            assert_eq!(redraw_for(Some(&drawn), &next), Redraw::Rebuild);
+        }
+        let mut searched = model_of(rows, Some("a"), true);
+        searched.query = "a".into();
+        assert_eq!(redraw_for(Some(&drawn), &searched), Redraw::Rebuild);
+    }
+
+    #[test]
+    fn model_rows_follow_the_drawing_order() {
+        let model = model_of(
+            vec![
+                model_row("idle", None),
+                model_row("busy", Some(Badge::Running)),
+            ],
+            None,
+            true,
+        );
+        let ids: Vec<_> = model.rows().map(|r| r.title.as_str()).collect();
+        assert_eq!(ids, ["busy", "idle"]);
+    }
+
+    #[test]
+    fn busy_means_running_or_waiting_and_the_heading_counts() {
+        assert!(!is_busy(false, false, false));
+        assert!(is_busy(true, false, false));
+        // Sub-agents or background commands still going: closing would cut them off.
+        assert!(is_busy(false, true, false));
+        assert!(is_busy(false, false, true));
+        assert_eq!(stop_heading(1), "Stop 1 running thread and close?");
+        assert_eq!(stop_heading(3), "Stop 3 running threads and close?");
+    }
+
+    #[test]
+    fn a_request_is_announced_unless_you_are_looking_at_it() {
+        let r = |shown, focused| react(Attention::Asked, shown, focused, false);
+        // Not gated on notify_on_bell (false here).
+        assert_eq!((r(false, true).notify, r(false, true).unread), (true, true));
+        assert_eq!(
+            (r(false, false).notify, r(false, false).unread),
+            (true, true)
+        );
+        // Shown but the window is away: announced, no unread (the glow carries it).
+        assert_eq!(
+            (r(true, false).notify, r(true, false).unread),
+            (true, false)
+        );
+        assert_eq!((r(true, true).notify, r(true, true).unread), (false, false));
+    }
+
+    #[test]
+    fn an_expired_approval_leaves_a_trace_unless_you_are_looking() {
+        for (shown, focused, unread) in [
+            (false, true, true),
+            (false, false, true),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            let r = react(Attention::Expired, shown, focused, true);
+            assert_eq!((r.unread, r.notify), (unread, false), "{shown} {focused}");
+        }
+    }
+
+    #[test]
+    fn a_finished_turn_is_unread_when_not_looked_at_and_notifies_only_by_setting() {
+        // A shown thread in an unfocused window keeps an unread mark.
+        assert!(react(Attention::TurnDone, true, false, false).unread);
+        assert!(!react(Attention::TurnDone, true, true, true).unread);
+        assert!(!react(Attention::TurnDone, true, true, true).notify);
+        assert!(!react(Attention::TurnDone, false, true, false).notify);
+        assert!(react(Attention::TurnDone, false, true, true).notify);
+        assert!(react(Attention::TurnDone, true, false, true).notify);
+    }
+
+    fn row(id: &str, folder: &str, at: i64) -> SidebarRow {
+        SidebarRow {
+            key: RowKey::Thread(id.into()),
+            title: format!("Thread {id}"),
+            folder: folder.into(),
+            updated_ms: at,
+            driver: Some(Driver::Claude),
+            badge: None,
+            activity: None,
+            background: Vec::new(),
+            open: OpenState::Closed,
+            archived: false,
+        }
+    }
+
+    #[test]
+    fn a_thread_waiting_for_approval_glows_only_while_you_are_away_from_it() {
+        let mut waiting = row("w", "/w", 1);
+        waiting.badge = Some(Badge::NeedsApproval);
+        let shown = |id: &str| RowKey::Thread(id.into());
+        // Another thread shown, or this one shown in an unfocused window: it glows.
+        assert!(needs_attention(&waiting, Some(&shown("other")), true));
+        assert!(needs_attention(&waiting, None, true));
+        assert!(needs_attention(&waiting, Some(&shown("w")), false));
+        // In front of you: no glow (the approval card is right there).
+        assert!(!needs_attention(&waiting, Some(&shown("w")), true));
+        // Other states never glow.
+        let mut running = row("r", "/w", 1);
+        running.badge = Some(Badge::Running);
+        assert!(!needs_attention(&running, Some(&shown("other")), false));
+        assert!(!needs_attention(&row("n", "/w", 1), None, false));
+    }
+
+    /// Folder groups start collapsed; an expanded one, or any during a search, lists every row,
+    /// and a collapsed one keeps only the thread on screen, counting the rest as hidden.
+    #[test]
+    fn folder_groups_start_collapsed_but_keep_the_shown_thread() {
+        let groups = group_rows(
+            vec![
+                row("a", "/w/one", 3),
+                row("b", "/w/one", 2),
+                row("c", "/w/two", 1),
+            ],
+            "",
+            false,
+        );
+        let shape = |folded: Vec<FolderGroup>| -> Vec<(String, bool, usize, Vec<String>)> {
+            folded
+                .into_iter()
+                .map(|g| {
+                    let ids = g.rows.iter().map(|r| r.title.clone()).collect();
+                    (g.folder, g.expanded, g.hidden, ids)
+                })
+                .collect()
+        };
+        let none = std::collections::HashSet::new();
+        assert_eq!(
+            shape(fold_groups(groups.clone(), &none, false, None)),
+            [
+                ("/w/one".into(), false, 2, vec![]),
+                ("/w/two".into(), false, 1, vec![]),
+            ],
+            "collapsed by default"
+        );
+        let shown = RowKey::Thread("b".into());
+        assert_eq!(
+            shape(fold_groups(groups.clone(), &none, false, Some(&shown)))[0],
+            ("/w/one".into(), false, 1, vec!["Thread b".into()]),
+            "the shown thread stays in its collapsed folder"
+        );
+        let one: std::collections::HashSet<String> = ["/w/one".to_owned()].into();
+        assert_eq!(
+            shape(fold_groups(groups.clone(), &one, false, None)),
+            [
+                (
+                    "/w/one".into(),
+                    true,
+                    0,
+                    vec!["Thread a".into(), "Thread b".into()]
+                ),
+                ("/w/two".into(), false, 1, vec![]),
+            ]
+        );
+        assert!(
+            fold_groups(groups, &none, true, None)
+                .iter()
+                .all(|g| g.expanded && g.hidden == 0),
+            "a search shows every match"
+        );
+    }
+
+    /// Active threads get their own section, most urgent first, and leave their folder group;
+    /// a folder left empty disappears, and the rest re-order by what is left in them. Search and
+    /// the archive toggle apply to both sections.
+    #[test]
+    fn active_threads_get_their_own_section() {
+        let id = |r: &SidebarRow| match &r.key {
+            RowKey::Thread(id) => id.clone(),
+            RowKey::Terminal(_) => "t".into(),
+        };
+        let with = |mut r: SidebarRow, badge: Badge| {
+            r.badge = Some(badge);
+            r
+        };
+        let rows = vec![
+            with(row("run-old", "/w/one", 10), Badge::Running),
+            with(row("ask", "/w/two", 5), Badge::NeedsApproval),
+            row("idle", "/w/one", 50),
+            with(row("bg", "/w/three", 60), Badge::Background),
+            with(row("unread", "/w/two", 20), Badge::Unread),
+            with(row("run-new", "/w/two", 40), Badge::Running),
+            with(row("limited", "/w/four", 1), Badge::RateLimited),
+        ];
+        let (active, groups) = sidebar_sections(rows.clone(), "", false);
+        assert_eq!(
+            active.iter().map(id).collect::<Vec<_>>(),
+            ["ask", "limited", "run-new", "run-old", "bg"],
+            "approval, rate limit, working (newest first), background"
+        );
+        let shape: Vec<(String, Vec<String>)> = groups
+            .iter()
+            .map(|(f, r)| (f.clone(), r.iter().map(id).collect()))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("/w/one".to_owned(), vec!["idle".to_owned()]),
+                ("/w/two".to_owned(), vec!["unread".to_owned()]),
+            ],
+            "unread is not active; emptied folders go; ordered by what is left"
+        );
+        assert!(!is_active(&with(row("u", "/w", 1), Badge::Unread)));
+        assert!(!is_active(&row("n", "/w", 1)));
+
+        // The search filters the active section too; nothing active: no section.
+        let (active, groups) = sidebar_sections(rows, "thread ask", false);
+        assert_eq!(active.iter().map(id).collect::<Vec<_>>(), ["ask"]);
+        assert!(groups.is_empty());
+        let (active, _) = sidebar_sections(vec![row("x", "/w", 1)], "", false);
+        assert!(active.is_empty());
+    }
+
+    #[test]
+    fn archived_rows_hide_behind_the_toggle_unless_open() {
+        let mut archived = row("old", "/w/one", 5);
+        archived.archived = true;
+        let mut open_archived = row("open", "/w/one", 6);
+        open_archived.archived = true;
+        open_archived.open = OpenState::Here;
+        let rows = vec![row("a", "/w/one", 10), archived, open_archived];
+        let ids = |groups: Vec<(String, Vec<SidebarRow>)>| -> Vec<String> {
+            groups
+                .into_iter()
+                .flat_map(|(_, r)| r)
+                .map(|r| match r.key {
+                    RowKey::Thread(id) => id,
+                    RowKey::Terminal(_) => "t".into(),
+                })
+                .collect()
+        };
+        assert_eq!(ids(group_rows(rows.clone(), "", false)), ["a", "open"]);
+        assert_eq!(
+            ids(group_rows(rows.clone(), "", true)),
+            ["a", "open", "old"]
+        );
+        // The search still applies to what is shown.
+        assert_eq!(ids(group_rows(rows, "thread old", true)), ["old"]);
+    }
+
+    #[test]
+    fn rows_group_by_folder_newest_group_and_row_first() {
+        let groups = group_rows(
+            vec![
+                row("a", "/w/one", 10),
+                row("b", "/w/two", 30),
+                row("c", "/w/one", 40),
+                row("d", "/w/two", 20),
+            ],
+            "",
+            false,
+        );
+        let shape: Vec<(&str, Vec<&str>)> = groups
+            .iter()
+            .map(|(f, rows)| {
+                (
+                    f.as_str(),
+                    rows.iter()
+                        .map(|r| match &r.key {
+                            RowKey::Thread(id) => id.as_str(),
+                            RowKey::Terminal(_) => "t",
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [("/w/one", vec!["c", "a"]), ("/w/two", vec!["b", "d"])]
+        );
+    }
+
+    #[test]
+    fn search_matches_title_or_folder_case_insensitively() {
+        let rows = vec![row("a", "/w/One", 1), row("b", "/w/two", 2)];
+        assert_eq!(group_rows(rows.clone(), "one", false).len(), 1);
+        assert_eq!(group_rows(rows.clone(), "THREAD B", false)[0].0, "/w/two");
+        assert!(group_rows(rows, "nothing", false).is_empty());
+    }
+
+    // ---- the thread menu ----
+
+    fn model(driver: Driver, id: &str, efforts: &[&str]) -> agent_core::catalog::CatalogModel {
+        agent_core::catalog::CatalogModel {
+            driver,
+            id: id.into(),
+            display: id.to_uppercase(),
+            description: None,
+            efforts: efforts.iter().map(|e| (*e).to_owned()).collect(),
+            default_effort: None,
+            via: None,
+        }
+    }
+
+    fn input(has_messages: bool, archived: bool) -> ThreadMenuInput {
+        ThreadMenuInput {
+            thread: "t1".into(),
+            archived,
+            has_messages,
+            agents: vec![
+                MenuAgent {
+                    driver: Driver::Claude,
+                    models: vec![model(Driver::Claude, "opus", &["low", "high"])],
+                },
+                MenuAgent {
+                    driver: Driver::Agy,
+                    models: vec![model(Driver::Agy, "gemini-pro", &["low", "high"])],
+                },
+                MenuAgent {
+                    driver: Driver::Codex,
+                    models: vec![model(Driver::Codex, "gpt", &[])],
+                },
+            ],
+        }
+    }
+
+    /// Every item reachable in a submenu, depth first, as (label, action).
+    fn items(entries: &[MenuEntry]) -> Vec<(String, ThreadAction, bool)> {
+        entries
+            .iter()
+            .flat_map(|e| match e {
+                MenuEntry::Item {
+                    label,
+                    action,
+                    enabled,
+                } => vec![(label.clone(), action.clone(), *enabled)],
+                MenuEntry::Submenu { entries, .. } | MenuEntry::Section(entries) => items(entries),
+            })
+            .collect()
+    }
+
+    fn submenu<'a>(entries: &'a [MenuEntry], label: &str) -> &'a MenuEntry {
+        entries
+            .iter()
+            .flat_map(|e| match e {
+                MenuEntry::Section(s) => s.iter().collect::<Vec<_>>(),
+                other => vec![other],
+            })
+            .find(|e| matches!(e, MenuEntry::Submenu { label: l, .. } if l == label))
+            .unwrap_or_else(|| panic!("no submenu {label}"))
+    }
+
+    #[test]
+    fn the_menu_offers_every_enabled_agent_with_its_models_and_efforts() {
+        let menu = thread_menu(&input(true, false));
+        let MenuEntry::Submenu {
+            entries: agents,
+            enabled,
+            ..
+        } = submenu(&menu, "Continue in a new thread with…")
+        else {
+            panic!("a submenu");
+        };
+        assert!(*enabled);
+        let labels: Vec<String> = agents
+            .iter()
+            .map(|a| match a {
+                MenuEntry::Submenu { label, .. } => label.clone(),
+                _ => panic!("agent submenus only"),
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "Claude".to_owned(),
+                "Antigravity".to_owned(),
+                "Codex".to_owned(),
+            ]
+        );
+        // Plain labels: no emoji (a PopoverMenu submenu entry draws no icon).
+        assert!(labels.iter().all(|l| l.is_ascii()));
+        let all = items(&[submenu(&menu, "Continue in a new thread with…").clone()]);
+        let claude: Vec<_> = all
+            .iter()
+            .filter(|(_, a, _)| {
+                matches!(
+                    a,
+                    ThreadAction::ContinueIn {
+                        driver: Driver::Claude,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        // Default model, the model's default effort and each effort.
+        assert_eq!(claude.len(), 4);
+        assert_eq!(claude[0].0, "Default model");
+        assert!(matches!(
+            &claude[0].1,
+            ThreadAction::ContinueIn {
+                model: None,
+                effort: None,
+                ..
+            }
+        ));
+        assert!(claude.iter().any(|(l, a, _)| l == "high"
+            && matches!(a, ThreadAction::ContinueIn { model: Some(m), effort: Some(e), .. }
+                if m == "opus" && e == "high")));
+        // agy folds the effort into the model id.
+        // (its first effort is the default when `medium` is not offered, and is marked as such)
+        assert!(all.iter().any(|(l, a, _)| l == "low (default)"
+            && matches!(a, ThreadAction::ContinueIn { driver: Driver::Agy, model: Some(m), effort: Some(e), .. }
+                if m == "gemini-pro-low" && e == "low")));
+        // A model with no efforts is a plain item.
+        assert!(all.iter().any(|(l, a, _)| l == "GPT"
+            && matches!(a, ThreadAction::ContinueIn { driver: Driver::Codex, model: Some(m), effort: None, .. }
+                if m == "gpt")));
+        // Switch uses the same agents with its own action.
+        let switch = items(&[submenu(&menu, "Switch agent (stops the current turn)").clone()]);
+        assert_eq!(switch.len(), all.len());
+        assert!(switch
+            .iter()
+            .all(|(_, a, on)| *on && matches!(a, ThreadAction::SwitchTo { .. })));
+    }
+
+    #[test]
+    fn only_usable_agents_reach_the_menu_even_when_the_catalogue_caches_their_models() {
+        let catalog = vec![
+            model(Driver::Claude, "opus", &[]),
+            model(Driver::Agy, "gemini", &[]),
+            model(Driver::Codex, "gpt", &[]),
+        ];
+        let agents = menu_agents(&catalog, |d| d != Driver::Agy);
+        assert_eq!(
+            agents.iter().map(|a| a.driver).collect::<Vec<_>>(),
+            [Driver::Claude, Driver::Codex]
+        );
+        assert!(agents.iter().all(|a| a.models.len() == 1));
+        assert!(menu_agents(&catalog, |_| false).is_empty());
+    }
+
+    #[test]
+    fn continue_is_disabled_without_messages_and_empty_without_agents() {
+        let menu = thread_menu(&input(false, false));
+        let cont = items(&[submenu(&menu, "Continue in a new thread with…").clone()]);
+        assert!(!cont.is_empty() && cont.iter().all(|(_, _, on)| !on));
+        // Switching in place does not need a history.
+        let switch = items(&[submenu(&menu, "Switch agent (stops the current turn)").clone()]);
+        assert!(switch.iter().all(|(_, _, on)| *on));
+
+        let mut none = input(true, false);
+        none.agents.clear();
+        let menu = thread_menu(&none);
+        for label in [
+            "Continue in a new thread with…",
+            "Switch agent (stops the current turn)",
+        ] {
+            assert!(matches!(
+                submenu(&menu, label),
+                MenuEntry::Submenu { enabled: false, entries, .. } if entries.is_empty()
+            ));
+        }
+    }
+
+    #[test]
+    fn archive_toggles_and_the_housekeeping_entries_are_always_there() {
+        let labels = |archived| -> Vec<String> {
+            let menu = thread_menu(&input(true, archived));
+            menu.iter()
+                .filter_map(|e| match e {
+                    MenuEntry::Section(s) => Some(s),
+                    _ => None,
+                })
+                .flat_map(|s| s.iter())
+                .filter_map(|e| match e {
+                    MenuEntry::Item { label, .. } => Some(label.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            labels(false),
+            [
+                "Fork thread",
+                "Compact into a new thread",
+                "Rename…",
+                "Archive",
+                "Delete…",
+                "Open folder",
+                "Review Multi-Agent Environment…",
+                "Copy thread id"
+            ]
+        );
+        assert_eq!(
+            labels(true),
+            [
+                "Fork thread",
+                "Compact into a new thread",
+                "Rename…",
+                "Unarchive",
+                "Delete…",
+                "Open folder",
+                "Review Multi-Agent Environment…",
+                "Copy thread id"
+            ]
+        );
+    }
+
+    #[test]
+    fn actions_round_trip_through_their_target_string() {
+        let actions = [
+            ThreadAction::ContinueIn {
+                thread: "t".into(),
+                driver: Driver::Codex,
+                model: Some("gpt-5-codex".into()),
+                effort: Some("high".into()),
+            },
+            ThreadAction::SwitchTo {
+                thread: "t".into(),
+                driver: Driver::Agy,
+                model: None,
+                effort: None,
+            },
+            ThreadAction::Fork("t".into()),
+            ThreadAction::Compact("t".into()),
+            ThreadAction::Rename("t".into()),
+            ThreadAction::Archive("t".into()),
+            ThreadAction::Unarchive("t".into()),
+            ThreadAction::Delete("t".into()),
+            ThreadAction::OpenFolder("t".into()),
+            ThreadAction::ReviewEnvironment("t".into()),
+            ThreadAction::CopyId("t".into()),
+        ];
+        for a in actions {
+            assert_eq!(ThreadAction::decode(&a.encode()), Some(a.clone()), "{a:?}");
+        }
+        // Garbage and malformed targets decode to nothing, never to a wrong action.
+        for bad in [
+            "",
+            "delete",
+            "delete\u{1f}",
+            "bogus\u{1f}t",
+            "delete\u{1f}t\u{1f}extra",
+            "continue\u{1f}t\u{1f}nope\u{1f}\u{1f}",
+            "continue\u{1f}t\u{1f}claude",
+        ] {
+            assert_eq!(ThreadAction::decode(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn review_targets_the_clicked_thread_without_needing_history() {
+        let mut target = input(false, false);
+        target.thread = "clicked-not-selected".into();
+        let menu = thread_menu(&target);
+        assert!(items(&menu).iter().any(|(_, action, enabled)| *enabled
+            && *action == ThreadAction::ReviewEnvironment("clicked-not-selected".into())));
+        target.agents.clear();
+        assert!(items(&thread_menu(&target))
+            .iter()
+            .any(|(_, action, enabled)| !*enabled
+                && matches!(action, ThreadAction::ReviewEnvironment(_))));
+    }
+
+    #[test]
+    fn the_most_urgent_badge_wins() {
+        assert_eq!(
+            badge_for(true, true, true, true, true),
+            Some(Badge::NeedsApproval)
+        );
+        assert_eq!(
+            badge_for(true, true, false, true, true),
+            Some(Badge::RateLimited)
+        );
+        assert_eq!(
+            badge_for(true, true, false, false, true),
+            Some(Badge::Running)
+        );
+        // The main agent is done but sub-agents still run: not finished, and not "new" yet.
+        assert_eq!(
+            badge_for(false, true, false, false, true),
+            Some(Badge::Background)
+        );
+        assert_eq!(
+            badge_for(false, false, false, false, true),
+            Some(Badge::Unread)
+        );
+        assert_eq!(badge_for(false, false, false, false, false), None);
+    }
+
+    #[test]
+    fn background_work_is_named_and_holds_the_finish() {
+        assert_eq!(
+            background_tooltip(&["Review the diff".into(), String::new()]),
+            "2 background tasks running: Review the diff"
+        );
+        assert_eq!(background_tooltip(&[]), "");
+        assert_eq!(
+            background_tooltip(&["a".into()]),
+            "1 background task running: a"
+        );
+        // Long names are cut (on a character, not a byte) and only the first few are listed.
+        let long = "é".repeat(80);
+        let tip = background_tooltip(&[long]);
+        assert!(tip.ends_with('…') && tip.chars().count() < 100, "{tip}");
+        let many: Vec<String> = (0..8).map(|i| format!("t{i}")).collect();
+        assert_eq!(
+            background_tooltip(&many),
+            "8 background tasks running: t0, t1, t2, t3, t4"
+        );
+
+        assert!(!turn_finishes_thread(true));
+        assert!(turn_finishes_thread(false));
+        // A held finish is released once the background work is gone and nothing runs.
+        assert!(held_finish_due(true, false, false));
+        assert!(!held_finish_due(true, true, false));
+        assert!(!held_finish_due(true, false, true));
+        assert!(!held_finish_due(false, false, false));
+    }
+
+    #[test]
+    fn a_spinning_row_says_what_is_running() {
+        let bg = vec!["Review the diff".to_owned()];
+        assert_eq!(row_tooltip(Badge::Running, &[]), "Working");
+        assert_eq!(
+            row_tooltip(Badge::Running, &bg),
+            "Working; 1 background task running: Review the diff"
+        );
+        assert_eq!(
+            row_tooltip(Badge::Background, &bg),
+            "1 background task running: Review the diff"
+        );
+    }
+
+    #[test]
+    fn a_row_with_only_unnamed_background_work_still_explains_its_badge() {
+        assert_eq!(
+            row_tooltip(Badge::Background, &[]),
+            "Background tasks running"
+        );
+    }
+
+    #[test]
+    fn child_asks_follow_each_sub_agent_request() {
+        let mut asks = ChildAsks::default();
+        assert!(!asks.any());
+        asks.requested("w1", Some("r1"));
+        asks.requested("w1", Some("r2"));
+        asks.requested("w2", None);
+        asks.resolved("w1", Some("r1"));
+        assert!(asks.any());
+        asks.resolved("w1", Some("r2"));
+        // An id-less request is withdrawn by any resolution from that sub-agent.
+        asks.resolved("w2", Some("x"));
+        assert!(!asks.any());
+        asks.requested("w1", Some("r1"));
+        asks.requested("w1", Some("r2"));
+        asks.resolved("w1", None);
+        assert!(!asks.any());
+        asks.requested("w1", Some("r1"));
+        asks.requested("w2", Some("r1"));
+        asks.worker_ended("w1");
+        assert!(asks.any());
+        asks.retain_workers(&["w1"]);
+        assert!(!asks.any());
+    }
+
+    #[test]
+    fn relative_times_are_compact() {
+        let now = 1_000_000_000;
+        assert_eq!(relative_time(now, now + 5), "now");
+        assert_eq!(relative_time(now, now - 5 * 60_000), "5m");
+        assert_eq!(relative_time(now, now - 3 * 3_600_000), "3h");
+        assert_eq!(relative_time(now, now - 2 * 86_400_000), "2d");
+        assert_eq!(relative_time(now, now - 21 * 86_400_000), "3w");
+    }
+
+    #[test]
+    fn titles_come_from_the_first_line_and_are_bounded() {
+        assert_eq!(thread_title("\n  fix the build \nmore"), "fix the build");
+        let long = "x".repeat(80);
+        let t = thread_title(&long);
+        assert_eq!(t.chars().count(), 60);
+        assert!(t.ends_with('…'));
+        assert_eq!(thread_title(""), "");
+    }
+
+    #[test]
+    fn resume_maps_chat_agents_to_threads_and_others_to_terminals() {
+        assert_eq!(
+            resume_as(Some(Driver::Agy), "abc"),
+            ResumeAs::Chat {
+                driver: Driver::Agy,
+                native_id: "abc".into()
+            }
+        );
+        assert_eq!(resume_as(None, "abc"), ResumeAs::Terminal);
+        assert_eq!(stored_model(Some("default")), None);
+        assert_eq!(stored_model(Some("opus")).as_deref(), Some("opus"));
+        for d in Driver::ALL {
+            assert_eq!(parse_driver(d.info().key), Some(d));
+            // Exhaustive: a new driver fails to compile until it is in Driver::ALL.
+            match d {
+                Driver::Claude | Driver::Agy | Driver::Codex => {}
+            }
+            assert_ne!(handoff_target(d, |_| true), Some(d));
+        }
+        assert_eq!(Driver::Codex.info().label, "Codex");
+    }
+
+    #[test]
+    fn an_untitled_thread_is_shown_as_new_thread() {
+        assert_eq!(display_title(""), "New thread");
+        assert_eq!(display_title("Fix the build"), "Fix the build");
+    }
+
+    /// The 2026-10-11 sequence: the limit, then a turn Claude started itself (no output), then a
+    /// retry the limit refused. None of those ends the limit; an answer does.
+    #[test]
+    fn only_an_answer_ends_a_rate_limit() {
+        use agent_core::event::Usage;
+        let completed = |output_tokens| Event::TurnCompleted {
+            state: TurnState::Completed,
+            usage: Some(Usage {
+                output_tokens,
+                ..Usage::default()
+            }),
+            cost_usd: None,
+            error: None,
+        };
+        let started = |kind| Event::ItemStarted {
+            kind,
+            title: String::new(),
+            input: None,
+            parent: None,
+        };
+        for still in [
+            Event::TurnStarted { model: None },
+            completed(0),
+            Event::TurnCompleted {
+                state: TurnState::Failed,
+                usage: None,
+                cost_usd: None,
+                error: Some("You've hit your session limit".into()),
+            },
+            started(ItemKind::UserMessage),
+            Event::Notice {
+                text: "You've hit your session limit".into(),
+            },
+        ] {
+            assert!(!limit_over(&still), "{still:?}");
+        }
+        // A sub-agent still running from before the limit is not the agent answering.
+        assert!(!limit_over(&Event::ItemStarted {
+            kind: ItemKind::AssistantMessage,
+            title: String::new(),
+            input: None,
+            parent: Some("task-1".into()),
+        }));
+        assert!(limit_over(&completed(12)));
+        assert!(limit_over(&started(ItemKind::AssistantMessage)));
+    }
+
+    #[test]
+    fn the_default_handoff_target_cycles_to_the_next_usable_agent() {
+        use Driver::{Agy, Claude, Codex};
+        let all = |_| true;
+        assert_eq!(handoff_target(Claude, all), Some(Agy));
+        assert_eq!(handoff_target(Agy, all), Some(Codex));
+        assert_eq!(handoff_target(Codex, all), Some(Claude));
+        // Skips an agent that is off or not installed, and wraps.
+        assert_eq!(handoff_target(Claude, |d| d == Codex), Some(Codex));
+        assert_eq!(handoff_target(Codex, |d| d == Agy), Some(Agy));
+        // Never itself, and nothing when it is the only one.
+        assert_eq!(handoff_target(Claude, |d| d == Claude), None);
+        assert_eq!(handoff_target(Agy, |_| false), None);
+    }
+
+    /// A thread that forbids unasked edits is not handed to an agy that would edit unasked,
+    /// unless nothing else is usable, and then it says so.
+    #[test]
+    fn an_automatic_handoff_skips_an_agy_that_would_edit_unasked() {
+        use Driver::{Agy, Claude, Codex};
+        let all = |_| true;
+        // agy can ask (or the thread allows unasked edits): the plain cycle.
+        assert_eq!(safe_handoff_target(Claude, all, false), Some((Agy, false)));
+        // agy cannot ask: skipped for the next usable agent.
+        assert_eq!(safe_handoff_target(Claude, all, true), Some((Codex, false)));
+        // agy is the only other agent: offered, flagged.
+        assert_eq!(
+            safe_handoff_target(Claude, |d| d != Codex, true),
+            Some((Agy, true))
+        );
+        // Nothing usable at all.
+        assert_eq!(safe_handoff_target(Claude, |d| d == Claude, true), None);
+        // Leaving agy is never affected.
+        assert_eq!(safe_handoff_target(Agy, all, true), Some((Codex, false)));
+        assert_eq!(continue_label(Codex, false), "Continue in Codex");
+        // Plan (read-only to the user) forbids unasked edits as much as Ask; only Accept edits
+        // allows them, and an unknown mode is treated as forbidding them.
+        assert!(forbids_unasked_edits(Some(Mode::Ask)));
+        assert!(forbids_unasked_edits(Some(Mode::Plan)));
+        assert!(forbids_unasked_edits(None));
+        assert!(!forbids_unasked_edits(Some(Mode::AcceptEdits)));
+        assert_eq!(
+            continue_label(Agy, true),
+            format!("Continue in {} (edits without asking)", Agy.info().label)
+        );
+    }
+}

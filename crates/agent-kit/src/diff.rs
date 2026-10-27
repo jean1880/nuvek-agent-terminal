@@ -1,0 +1,659 @@
+//! Pure logic for the diff panel: which two trees to compare, how to read
+//! `git diff --numstat -z`, how to colour each line of a unified diff, and how
+//! to cap a diff too large to show.
+//!
+//! Nothing here runs git; `crate::git` does, and the window renders.
+
+/// What the panel compares against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiffBase {
+    /// HEAD against the working tree as it is now (untracked files included).
+    #[default]
+    Uncommitted,
+    /// Target branch (main/master) against the working tree as it is now.
+    TargetBranch,
+    /// The tab's latest checkpoint against the one before it.
+    LastTurn,
+    /// Where the tab's first checkpoint started against the working tree now.
+    ThisTab,
+}
+
+impl DiffBase {
+    /// Dropdown order. Guarded by `all_lists_every_base_in_dropdown_order`.
+    pub const ALL: [DiffBase; 4] = [
+        DiffBase::Uncommitted,
+        DiffBase::TargetBranch,
+        DiffBase::LastTurn,
+        DiffBase::ThisTab,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DiffBase::Uncommitted => "Uncommitted",
+            DiffBase::TargetBranch => "Target branch",
+            DiffBase::LastTurn => "Last turn",
+            DiffBase::ThisTab => "This tab",
+        }
+    }
+}
+
+/// A checkpoint as the panel needs it: its commit and where it started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointCommit {
+    pub commit: String,
+    /// `None` for a checkpoint taken before the repository's first commit.
+    pub parent: Option<String>,
+}
+
+/// Why a base cannot be shown yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unavailable {
+    NoCheckpoints,
+    NoTargetBranch,
+}
+
+/// The two tree-ishes to diff for `base`.
+///
+/// `checkpoints` are the tab's, oldest first; `current` is a fresh snapshot
+/// tree of the working tree; `empty_tree` stands in for a missing parent (an
+/// unborn HEAD), since it differs between SHA-1 and SHA-256 repositories and
+/// must be asked of git rather than hard-coded.
+pub fn diff_range(
+    base: DiffBase,
+    head: Option<&str>,
+    checkpoints: &[CheckpointCommit],
+    current: &str,
+    empty_tree: &str,
+    target_branch: Option<&str>,
+) -> Result<(String, String), Unavailable> {
+    let or_empty = |rev: Option<&str>| rev.unwrap_or(empty_tree).to_string();
+    match base {
+        DiffBase::Uncommitted => Ok((or_empty(head), current.to_string())),
+        DiffBase::TargetBranch => {
+            let target = target_branch.ok_or(Unavailable::NoTargetBranch)?;
+            Ok((target.to_string(), current.to_string()))
+        }
+        DiffBase::LastTurn => {
+            let last = checkpoints.last().ok_or(Unavailable::NoCheckpoints)?;
+            Ok((or_empty(last.parent.as_deref()), last.commit.clone()))
+        }
+        DiffBase::ThisTab => {
+            let first = checkpoints.first().ok_or(Unavailable::NoCheckpoints)?;
+            Ok((or_empty(first.parent.as_deref()), current.to_string()))
+        }
+    }
+}
+
+/// One file's line counts from `git diff --numstat`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStat {
+    pub path: String,
+    /// Set for a rename or copy.
+    pub old_path: Option<String>,
+    /// `None` for a binary file, which git counts as `-`.
+    pub added: Option<u64>,
+    pub deleted: Option<u64>,
+}
+
+/// Parses `git diff --numstat -z`.
+///
+/// A plain entry is `added\tdeleted\tpath\0`. A rename leaves the path empty
+/// and follows with two more NUL-terminated fields: `added\tdeleted\t\0old\0new\0`.
+pub fn parse_numstat(bytes: &[u8]) -> Vec<FileStat> {
+    let mut fields = bytes.split(|b| *b == 0);
+    let mut stats = Vec::new();
+    while let Some(field) = fields.next() {
+        if field.is_empty() {
+            continue;
+        }
+        let text = String::from_utf8_lossy(field);
+        let mut parts = text.splitn(3, '\t');
+        let (Some(added), Some(deleted), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let count = |n: &str| n.parse::<u64>().ok();
+        let (path, old_path) = if path.is_empty() {
+            let old = fields
+                .next()
+                .map(|f| String::from_utf8_lossy(f).to_string());
+            let new = fields
+                .next()
+                .map(|f| String::from_utf8_lossy(f).to_string());
+            match (old, new) {
+                (Some(old), Some(new)) => (new, Some(old)),
+                _ => continue,
+            }
+        } else {
+            (path.to_string(), None)
+        };
+        stats.push(FileStat {
+            path,
+            old_path,
+            added: count(added),
+            deleted: count(deleted),
+        });
+    }
+    stats
+}
+
+/// Totals for the panel header: files, lines added, lines deleted.
+pub fn totals(stats: &[FileStat]) -> (usize, u64, u64) {
+    let added = stats.iter().filter_map(|s| s.added).sum();
+    let deleted = stats.iter().filter_map(|s| s.deleted).sum();
+    (stats.len(), added, deleted)
+}
+
+/// The panel header's one-line summary, e.g. `3 files, +12 −4`.
+pub fn summary(stats: &[FileStat]) -> String {
+    let (files, added, deleted) = totals(stats);
+    let noun = if files == 1 { "file" } else { "files" };
+    format!("{files} {noun}, +{added} −{deleted}")
+}
+
+/// One row of the file list, e.g. `src/a.rs  +3 −1`, `old → new  +0 −0`, or
+/// `logo.png  binary`.
+pub fn file_row(stat: &FileStat) -> String {
+    let name = match &stat.old_path {
+        Some(old) => format!("{old} → {}", stat.path),
+        None => stat.path.clone(),
+    };
+    match (stat.added, stat.deleted) {
+        (Some(added), Some(deleted)) => format!("{name}  +{added} −{deleted}"),
+        _ => format!("{name}  binary"),
+    }
+}
+
+/// The last component of a repository-relative path (`src/a.rs` → `a.rs`).
+pub fn file_name(path: &str) -> &str {
+    path.rsplit_once('/').map_or(path, |(_, name)| name)
+}
+
+/// The folder part of a repository-relative path (`src/a.rs` → `src`); `""` at the root.
+pub fn folder_of(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(folder, _)| folder)
+}
+
+/// A file's row under its folder header: its name, then `+3 −1` or `binary`. A rename names the
+/// old path in full (it may have come from another folder): `old/a.rs → b.rs  +0 −0`.
+pub fn file_label(stat: &FileStat) -> String {
+    let name = match &stat.old_path {
+        Some(old) => format!("{old} → {}", file_name(&stat.path)),
+        None => file_name(&stat.path).to_owned(),
+    };
+    match (stat.added, stat.deleted) {
+        (Some(added), Some(deleted)) => format!("{name}  +{added} −{deleted}"),
+        _ => format!("{name}  binary"),
+    }
+}
+
+/// The files of a diff grouped for the panel: `(folder, indices into stats)`. Folders sorted by
+/// path, the repository root (`""`) first; files sorted by name within each folder.
+pub fn group_by_folder(stats: &[FileStat]) -> Vec<(String, Vec<usize>)> {
+    let mut groups: std::collections::BTreeMap<&str, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (i, stat) in stats.iter().enumerate() {
+        groups.entry(folder_of(&stat.path)).or_default().push(i);
+    }
+    groups
+        .into_iter()
+        .map(|(folder, mut files)| {
+            files.sort_by(|a, b| file_name(&stats[*a].path).cmp(file_name(&stats[*b].path)));
+            (folder.to_owned(), files)
+        })
+        .collect()
+}
+
+/// A unified diff cut at each `diff --git` header: one chunk per file, in git's order, which is
+/// the order `--numstat` lists them in (so chunk `i` is `stats[i]`'s). A diff cut short by
+/// [`truncate`] has fewer chunks than files. Text before the first header (git writes none) is
+/// dropped.
+pub fn split_by_file(diff: &str) -> Vec<&str> {
+    let mut starts = Vec::new();
+    let mut offset = 0;
+    for line in diff.split_inclusive('\n') {
+        if line.starts_with("diff --git ") {
+            starts.push(offset);
+        }
+        offset += line.len();
+    }
+    starts
+        .iter()
+        .enumerate()
+        .map(|(i, &start)| &diff[start..starts.get(i + 1).copied().unwrap_or(diff.len())])
+        .collect()
+}
+
+/// How a line of a unified diff is coloured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineKind {
+    /// `diff --git …`, where each file starts.
+    File,
+    /// `index`, `---`, `+++`, mode and rename lines between a file header and
+    /// its first hunk.
+    Meta,
+    Hunk,
+    Added,
+    Removed,
+    Context,
+}
+
+/// Classifies each line of a unified diff.
+///
+/// Stateful rather than per-line: a removed line whose text starts with `--`
+/// reads `--- …`, exactly like a file's old-path line. Only lines before a
+/// file's first hunk are meta.
+pub fn classify(diff: &str) -> Vec<LineKind> {
+    let mut in_header = false;
+    diff.lines()
+        .map(|line| {
+            if line.starts_with("diff --git ") {
+                in_header = true;
+                LineKind::File
+            } else if line.starts_with("@@") {
+                in_header = false;
+                LineKind::Hunk
+            } else if in_header {
+                LineKind::Meta
+            } else if line.starts_with('+') {
+                LineKind::Added
+            } else if line.starts_with('-') {
+                LineKind::Removed
+            } else if line.starts_with('\\') {
+                // "\ No newline at end of file"
+                LineKind::Meta
+            } else {
+                LineKind::Context
+            }
+        })
+        .collect()
+}
+
+/// At most this much diff text is put in the panel.
+pub const MAX_DIFF_BYTES: usize = 1024 * 1024;
+/// At most this many lines of diff text are put in the panel.
+pub const MAX_DIFF_LINES: usize = 20_000;
+
+/// Cuts `diff` to the first `max_lines` lines and `max_bytes` bytes, never
+/// splitting a line or a character. Returns the kept text and how many lines
+/// were left out.
+pub fn truncate(diff: &str, max_bytes: usize, max_lines: usize) -> (&str, usize) {
+    let mut end = 0;
+    let mut kept = 0;
+    for line in diff.split_inclusive('\n') {
+        if kept == max_lines || end + line.len() > max_bytes {
+            break;
+        }
+        end += line.len();
+        kept += 1;
+    }
+    let total = diff.split_inclusive('\n').count();
+    (&diff[..end], total - kept)
+}
+
+fn extract_candidate_paths(
+    val: &serde_json::Value,
+    paths: &mut std::collections::BTreeSet<std::path::PathBuf>,
+) {
+    for edit in crate::editdiff::preview_from_input(val) {
+        paths.insert(std::path::PathBuf::from(edit.path));
+    }
+    const KEYS: &[&str] = &[
+        "file_path",
+        "FilePath",
+        "path",
+        "Path",
+        "file",
+        "TargetFile",
+        "target_file",
+        "AbsolutePath",
+        "absolute_path",
+        "Cwd",
+        "cwd",
+        "directory",
+        "dir",
+    ];
+    for k in KEYS {
+        if let Some(s) = val.get(*k).and_then(|v| v.as_str()) {
+            if !s.trim().is_empty() {
+                paths.insert(std::path::PathBuf::from(s));
+            }
+        }
+    }
+    if let Some(args) = val
+        .get("Arguments")
+        .or_else(|| val.get("arguments"))
+        .or_else(|| val.get("args"))
+    {
+        extract_candidate_paths(args, paths);
+    }
+    if let Some(cmd) = val
+        .get("CommandLine")
+        .or_else(|| val.get("command"))
+        .or_else(|| val.get("cmd"))
+        .and_then(|v| v.as_str())
+    {
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        for i in 0..parts.len() {
+            if parts[i] == "-C" && i + 1 < parts.len() {
+                let clean = parts[i + 1].trim_matches(|c| c == '"' || c == '\'');
+                paths.insert(std::path::PathBuf::from(clean));
+            }
+        }
+    }
+}
+
+/// Extracts all candidate file paths touched or modified by the thread's events.
+pub fn touched_paths_from_envelopes(
+    envelopes: &[agent_core::event::Envelope],
+) -> Vec<std::path::PathBuf> {
+    let mut paths = std::collections::BTreeSet::new();
+    for env in envelopes {
+        match &env.event {
+            agent_core::event::Event::SessionStarted { cwd: Some(c), .. } => {
+                paths.insert(std::path::PathBuf::from(c));
+            }
+            agent_core::event::Event::ItemStarted {
+                input: Some(val), ..
+            } => {
+                extract_candidate_paths(val, &mut paths);
+            }
+            agent_core::event::Event::ApprovalRequested { input, .. } => {
+                extract_candidate_paths(input, &mut paths);
+            }
+            _ => {}
+        }
+    }
+    paths.into_iter().collect()
+}
+
+/// Discovers the enclosing git repository root for the touched file paths, if any.
+pub fn discover_enclosing_repo(paths: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+    for path in paths {
+        let check_dir = if path.is_file() {
+            path.parent()
+        } else {
+            Some(path.as_path())
+        };
+        if let Some(dir) = check_dir {
+            if let Ok(Some(repo)) = crate::git::discover(dir) {
+                return Some(repo.toplevel);
+            }
+        }
+        if path.is_relative() {
+            if let Ok(curr) = std::env::current_dir() {
+                let joined = curr.join(path);
+                let check_dir = if joined.is_file() {
+                    joined.parent()
+                } else {
+                    Some(joined.as_path())
+                };
+                if let Some(dir) = check_dir {
+                    if let Ok(Some(repo)) = crate::git::discover(dir) {
+                        return Some(repo.toplevel);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stat(path: &str) -> FileStat {
+        FileStat {
+            path: path.to_owned(),
+            old_path: None,
+            added: Some(1),
+            deleted: Some(0),
+        }
+    }
+
+    /// Folders sorted with the root first, files by name inside each, indices back into `stats`.
+    #[test]
+    fn files_group_under_their_folder() {
+        let stats = [
+            stat("src/window/diff_panel.rs"),
+            stat("Cargo.toml"),
+            stat("src/main.rs"),
+            stat("src/window/imp.rs"),
+            stat("README.md"),
+            stat("src/config.rs"),
+        ];
+        let groups = group_by_folder(&stats);
+        let named: Vec<(&str, Vec<&str>)> = groups
+            .iter()
+            .map(|(folder, files)| {
+                (
+                    folder.as_str(),
+                    files.iter().map(|i| file_name(&stats[*i].path)).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("", vec!["Cargo.toml", "README.md"]),
+                ("src", vec!["config.rs", "main.rs"]),
+                ("src/window", vec!["diff_panel.rs", "imp.rs"]),
+            ]
+        );
+        assert!(group_by_folder(&[]).is_empty());
+    }
+
+    #[test]
+    fn file_labels_name_the_file_under_its_folder() {
+        assert_eq!(file_label(&stat("src/a.rs")), "a.rs  +1 −0");
+        let renamed = FileStat {
+            path: "src/b.rs".into(),
+            old_path: Some("old/a.rs".into()),
+            added: Some(0),
+            deleted: Some(0),
+        };
+        assert_eq!(file_label(&renamed), "old/a.rs → b.rs  +0 −0");
+        let binary = FileStat {
+            added: None,
+            deleted: None,
+            ..stat("logo.png")
+        };
+        assert_eq!(file_label(&binary), "logo.png  binary");
+    }
+
+    /// One chunk per `diff --git` header, each starting at its header, nothing lost between; a
+    /// removed line that reads like a header inside a hunk does not split.
+    #[test]
+    fn diffs_split_at_each_file_header() {
+        let a = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-x\n+y\n";
+        let b = "diff --git a/b b/b\nnew file mode 100644\n--- /dev/null\n+++ b/b\n@@ -0,0 +1 @@\n+diff --git not a header\n";
+        let text = format!("{a}{b}");
+        let chunks = split_by_file(&text);
+        assert_eq!(chunks, [a, b]);
+        assert_eq!(chunks.concat(), text);
+        assert!(split_by_file("").is_empty());
+        let no_newline = "diff --git a/a b/a\n@@ -1 +1 @@\n-x\n+y";
+        assert_eq!(split_by_file(no_newline), [no_newline]);
+    }
+
+    #[test]
+    fn all_lists_every_base_in_dropdown_order() {
+        // Adding a variant must fail to compile here until ALL is updated.
+        for (i, base) in DiffBase::ALL.iter().enumerate() {
+            let expected = match base {
+                DiffBase::Uncommitted => 0,
+                DiffBase::TargetBranch => 1,
+                DiffBase::LastTurn => 2,
+                DiffBase::ThisTab => 3,
+            };
+            assert_eq!(i, expected);
+        }
+    }
+
+    fn cp(commit: &str, parent: Option<&str>) -> CheckpointCommit {
+        CheckpointCommit {
+            commit: commit.into(),
+            parent: parent.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn ranges_follow_the_base() {
+        let cps = [cp("c1", Some("head")), cp("c2", Some("c1"))];
+        let range = |base, head, cps: &[CheckpointCommit]| {
+            diff_range(base, head, cps, "now", "E", Some("target"))
+        };
+        assert_eq!(
+            range(DiffBase::Uncommitted, Some("head"), &cps),
+            Ok(("head".into(), "now".into()))
+        );
+        assert_eq!(
+            range(DiffBase::TargetBranch, Some("head"), &cps),
+            Ok(("target".into(), "now".into()))
+        );
+        assert_eq!(
+            range(DiffBase::LastTurn, Some("head"), &cps),
+            Ok(("c1".into(), "c2".into()))
+        );
+        assert_eq!(
+            range(DiffBase::ThisTab, Some("head"), &cps),
+            Ok(("head".into(), "now".into()))
+        );
+    }
+
+    #[test]
+    fn a_missing_parent_or_head_diffs_against_the_empty_tree() {
+        let cps = [cp("c1", None)];
+        let range = |base, head| diff_range(base, head, &cps, "now", "E", Some("target"));
+        assert_eq!(
+            range(DiffBase::Uncommitted, None),
+            Ok(("E".into(), "now".into()))
+        );
+        assert_eq!(
+            range(DiffBase::TargetBranch, None),
+            Ok(("target".into(), "now".into()))
+        );
+        assert_eq!(
+            range(DiffBase::LastTurn, None),
+            Ok(("E".into(), "c1".into()))
+        );
+        assert_eq!(
+            range(DiffBase::ThisTab, None),
+            Ok(("E".into(), "now".into()))
+        );
+    }
+
+    #[test]
+    fn checkpoint_bases_need_a_checkpoint() {
+        for base in [DiffBase::LastTurn, DiffBase::ThisTab] {
+            assert_eq!(
+                diff_range(base, Some("h"), &[], "now", "E", None),
+                Err(Unavailable::NoCheckpoints)
+            );
+        }
+        assert_eq!(
+            diff_range(DiffBase::TargetBranch, Some("h"), &[], "now", "E", None),
+            Err(Unavailable::NoTargetBranch)
+        );
+    }
+
+    #[test]
+    fn numstat_reads_plain_binary_and_renamed_entries() {
+        let raw = b"3\t1\tsrc/a.rs\0-\t-\tlogo.png\x000\t0\t\0old name.txt\0new name.txt\0";
+        assert_eq!(
+            parse_numstat(raw),
+            vec![
+                FileStat {
+                    path: "src/a.rs".into(),
+                    old_path: None,
+                    added: Some(3),
+                    deleted: Some(1),
+                },
+                FileStat {
+                    path: "logo.png".into(),
+                    old_path: None,
+                    added: None,
+                    deleted: None,
+                },
+                FileStat {
+                    path: "new name.txt".into(),
+                    old_path: Some("old name.txt".into()),
+                    added: Some(0),
+                    deleted: Some(0),
+                },
+            ]
+        );
+        assert_eq!(totals(&parse_numstat(raw)), (3, 3, 1));
+        assert!(parse_numstat(b"").is_empty());
+    }
+
+    #[test]
+    fn summary_and_rows_read_naturally() {
+        let raw = b"3\t1\tsrc/a.rs\0-\t-\tlogo.png\x000\t0\t\0old.txt\0new.txt\0";
+        let stats = parse_numstat(raw);
+        assert_eq!(summary(&stats), "3 files, +3 −1");
+        assert_eq!(summary(&stats[..1]), "1 file, +3 −1");
+        assert_eq!(file_row(&stats[0]), "src/a.rs  +3 −1");
+        assert_eq!(file_row(&stats[1]), "logo.png  binary");
+        assert_eq!(file_row(&stats[2]), "old.txt → new.txt  +0 −0");
+    }
+
+    #[test]
+    fn a_removed_line_that_looks_like_a_header_is_still_removed() {
+        let diff = "diff --git a/x b/x\nindex 1..2 100644\n--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n--- not a header\n+++ nor this\n ctx\n\\ No newline at end of file\n";
+        assert_eq!(
+            classify(diff),
+            vec![
+                LineKind::File,
+                LineKind::Meta,
+                LineKind::Meta,
+                LineKind::Meta,
+                LineKind::Hunk,
+                LineKind::Removed,
+                LineKind::Added,
+                LineKind::Context,
+                LineKind::Meta,
+            ]
+        );
+    }
+
+    #[test]
+    fn truncation_keeps_whole_lines_and_counts_the_rest() {
+        let diff = "a\nbb\nccc\n";
+        assert_eq!(truncate(diff, 100, 100), (diff, 0));
+        assert_eq!(truncate(diff, 100, 2), ("a\nbb\n", 1));
+        assert_eq!(truncate(diff, 6, 100), ("a\nbb\n", 1));
+        // A multi-byte line that does not fit is dropped whole, never split.
+        let wide = "é\n日本語\n";
+        assert_eq!(truncate(wide, 5, 100), ("é\n", 1));
+    }
+
+    #[test]
+    fn touched_paths_extracted_from_events() {
+        use agent_core::event::{Envelope, Event, ItemKind};
+        let env1 = Envelope::new(Event::ItemStarted {
+            kind: ItemKind::FileChange,
+            title: "edit".into(),
+            input: Some(serde_json::json!({"file_path": "src/foo.rs"})),
+            parent: None,
+        });
+        let env2 = Envelope::new(Event::ApprovalRequested {
+            tool: "write_to_file".into(),
+            title: None,
+            input: serde_json::json!({"TargetFile": "/path/to/bar.rs"}),
+            reason: None,
+            options: vec![],
+            response: agent_core::event::ResponseCapability::Live,
+            remembers: None,
+        });
+        let paths = touched_paths_from_envelopes(&[env1, env2]);
+        assert_eq!(
+            paths,
+            vec![
+                std::path::PathBuf::from("/path/to/bar.rs"),
+                std::path::PathBuf::from("src/foo.rs")
+            ]
+        );
+    }
+}

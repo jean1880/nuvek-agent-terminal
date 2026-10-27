@@ -1,0 +1,779 @@
+/* agent-terminal chat view.
+ *
+ * Colours are the theme's named colours (the at_ names, defined per theme in src/palette.rs), so the
+ * selected theme restyles the chat too. The agent colours are not themed, because they
+ * identify the agent in every theme: @brand_claude, @brand_agy and @brand_codex, defined by
+ * src/brand.rs from DriverInfo::accent_hex in agent-core (the app icon's dots). Text tints
+ * are the accent mixed 40% toward white: mix(@brand_claude, white, 0.4).
+ */
+
+.chat-view {
+    background-color: @at_bg;
+    color: @at_fg;
+}
+
+/* ---------------------------------------------------------------- motion */
+/* Hover and state changes ease rather than snap: colour and opacity only, never size or spacing,
+   so nothing relays out mid-transition (the transcript's stick-to-bottom reads the layout). GTK
+   drops every CSS transition and animation when the desktop turns animations off. */
+.chat-view button,
+.chat-view .tool-card,
+.chat-view .approval-card,
+.chat-view .question-card,
+.chat-view .form-card,
+.chat-view .composer,
+.chat-view textview.composer-view,
+.chat-panel button,
+.chat-panel list.boxed-list row {
+    transition-property: background-color, border-color, color, opacity, box-shadow, outline-color;
+    transition-duration: 150ms;
+    transition-timing-function: ease-out;
+}
+/* Something still settling (a reconnect, a switch waiting for its turn). */
+@keyframes pulse {
+    0% { opacity: 1; }
+    50% { opacity: 0.35; }
+    100% { opacity: 1; }
+}
+/* A pending switch can wait a whole turn: it pulses a few times to be noticed, then rests. */
+.agent-chip.pending .chip-model,
+.pending-mode { animation: pulse 1400ms ease-in-out 3; }
+
+/* ---------------------------------------------------------------- header strip */
+
+.chat-header {
+    padding: 8px 16px;
+    background-color: @at_bg_deep;
+    border-bottom: 1px solid @at_border;
+}
+/* The header's narrowest breakpoint (header.rs). */
+.chat-header.compact { padding: 8px 8px; }
+
+.agent-chip {
+    padding: 4px 12px 4px 10px;
+    border-radius: 999px;
+    background-color: @at_surface_raised;
+    border: 1px solid @at_border_strong;
+    box-shadow: none;
+}
+.agent-chip:hover { background-color: @at_surface_strong; }
+.agent-chip .chip-agent { color: @at_fg_strong; font-weight: 700; }
+.agent-chip .chip-model { color: @at_fg_dim; font-family: monospace; font-size: 0.9em; }
+
+.accent-dot { font-size: 0.8em; color: @at_accent; }
+.accent-claude .accent-dot { color: @brand_claude; }
+.accent-agy .accent-dot { color: @brand_agy; }
+.agent-chip.accent-claude { border-color: alpha(@brand_claude, 0.45); }
+.agent-chip.accent-agy { border-color: alpha(@brand_agy, 0.45); }
+.accent-codex .accent-dot { color: @brand_codex; }
+.agent-chip.accent-codex { border-color: alpha(@brand_codex, 0.45); }
+
+.mode-dropdown > button {
+    border-radius: 999px;
+    padding: 2px 10px;
+    background-color: transparent;
+    border: 1px solid @at_border;
+    color: @at_fg;
+}
+/* Dangerous permissive mode: set apart by a divider in the list, and in danger colours (with
+   a warning icon and its own words, never by colour alone) wherever it shows. */
+.mode-dropdown.mode-danger > button {
+    background-color: alpha(@at_danger, 0.16);
+    border-color: alpha(@at_danger, 0.6);
+    color: @at_danger_soft;
+}
+/* The labels too: the window's own label colour would otherwise win over the inherited one. */
+.mode-dropdown.mode-danger > button label,
+.mode-dropdown .mode-danger-row,
+.mode-dropdown .mode-danger-row label { color: @at_danger_soft; font-weight: 700; }
+.mode-dropdown .mode-divider { margin: 4px 0; }
+
+.activity .activity-text { color: @at_fg_dim; font-size: 0.9em; }
+/* Only background work left (sub-agents, background commands): the sidebar's background colour. */
+.activity.activity-background spinner,
+.activity.activity-background .activity-text { color: @at_info; }
+.activity.activity-finished .activity-text { color: alpha(@at_fg_dim, 0.7); }
+/* Paused to save memory: nothing is wrong, so the quiet colour, in italics to read as a state. */
+.activity.activity-paused .activity-text { color: @at_fg_soft; font-style: italic; }
+
+.usage-indicator { padding: 2px 8px; border-radius: 8px; }
+.usage-bar { min-height: 4px; }
+/* min-width: Adwaita gives every progress trough 150 px, which outweighs the bar's own width
+   request and made each agent's meter (and the sidebar holding two) far wider than drawn. */
+.usage-bar trough { min-height: 4px; min-width: 24px; background-color: alpha(@at_fg, 0.15); border-radius: 2px; }
+.usage-bar progress { min-height: 4px; border-radius: 2px; background-color: @at_success; }
+.usage-bar.usage-warn progress { background-color: @at_warning; }
+.usage-bar.usage-crit progress { background-color: @at_danger; }
+/* An Aging reading (freshness.rs): never the healthy green, and the whole meter muted. */
+.usage-bar.usage-stale progress { background-color: @at_fg_dim; }
+.usage-stale-meter { opacity: 0.6; }
+.usage-text { font-family: monospace; font-size: 0.85em; color: @at_fg_dim; }
+.model-footer-text { font-size: 0.85em; }
+.model-footer-text.stale { font-style: italic; }
+.subagent-button { padding: 2px 8px; border-radius: 8px; }
+.subagent-count { font-size: 0.85em; color: @at_fg; }
+.subagent-name { font-weight: 600; color: @at_fg_strong; }
+.subagent-status, .subagent-task { font-size: 0.85em; }
+.subagent-panel-title { font-weight: 700; font-size: 1.15em; color: @at_fg_strong; }
+.subagent-text { color: @at_fg; }
+/* The sticky running-sub-agents card above the composer (subagent_shelf.rs). */
+.subagent-shelf-row { padding: 6px 10px; }
+.subagent-shelf .subagent-list { background-color: transparent; }
+.subagent-now { font-family: monospace; font-size: 0.85em; color: @at_fg_soft; margin-left: 24px; }
+.approval-remembers { font-size: 0.85em; }
+.usage-text.usage-tag { font-size: 0.75em; color: @at_fg_dim; min-width: 2.2em; }
+.usage-text.usage-warn { color: @at_warning; }
+.usage-text.usage-crit { color: @at_danger; }
+.usage-agent { font-weight: 700; color: @at_fg_strong; }
+.usage-window { color: @at_fg; font-size: 0.95em; }
+.usage-resets, .usage-account { font-size: 0.85em; }
+.usage-popover contents { background-color: @at_surface; color: @at_fg; }
+.gauge { padding: 2px 8px; border-radius: 8px; }
+.gauge .gauge-text { color: @at_fg_dim; font-family: monospace; font-size: 0.85em; }
+
+levelbar.context-level trough {
+    min-height: 6px;
+    border-radius: 999px;
+    background-color: mix(@at_surface_strong, @at_border_strong, 0.5);
+    padding: 0;
+}
+levelbar.context-level block.filled,
+levelbar.context-level block.ok { background-color: @at_accent; border-radius: 999px; }
+levelbar.context-level block.warn { background-color: @at_warning; border-radius: 999px; }
+levelbar.context-level block.hot { background-color: @at_danger; border-radius: 999px; }
+levelbar.context-level block.empty { background-color: transparent; }
+
+/* ---------------------------------------------------------------- transcript */
+
+.transcript-scroller { background-color: @at_bg; }
+.transcript { padding: 24px 24px 18px 24px; }
+
+.transcript-empty .empty-title { font-size: 1.4em; font-weight: 700; color: @at_fg_strong; }
+.transcript-empty .empty-hint { color: @at_fg_dim; }
+
+.jump-button { min-width: 36px; min-height: 36px; }
+
+/* user bubble */
+.user-row { margin-left: 96px; }
+.user-bubble {
+    background-image: linear-gradient(135deg, @at_accent_surface, mix(@at_accent_surface, @at_surface_strong, 0.5));
+    color: @at_fg_strong;
+    padding: 10px 15px;
+    border-radius: 18px 18px 6px 18px;
+    border: 1px solid alpha(@at_accent, 0.25);
+}
+/* the prompt a busy switch sent for the user: a marker, not their bubble */
+.user-row.switch-continuation { margin-left: 0; }
+.continuation-marker {
+    color: @at_fg_dim;
+    font-size: 0.92em;
+    font-style: italic;
+    padding: 4px 12px;
+    border-radius: 999px;
+    border: 1px dashed alpha(@at_accent, 0.35);
+}
+.user-row.queued .user-bubble {
+    background-image: linear-gradient(135deg, alpha(@at_surface_strong, 0.6), alpha(@at_surface, 0.8));
+    color: @at_fg_dim;
+    border: 1px dashed alpha(@at_accent, 0.45);
+    opacity: 0.85;
+}
+
+/* assistant message */
+.assistant-row {
+    padding: 2px 0 2px 16px;
+    border-left: 2px solid alpha(@at_accent, 0.6);
+}
+.assistant-row.accent-claude { border-left-color: alpha(@brand_claude, 0.75); }
+.assistant-row.accent-agy { border-left-color: alpha(@brand_agy, 0.75); }
+.assistant-row.accent-codex { border-left-color: alpha(@brand_codex, 0.75); }
+.assistant-head .agent-name { color: @at_fg_dim; font-weight: 700; font-size: 0.85em; letter-spacing: 0.02em; }
+.stream-caret { color: @at_accent; }
+.accent-claude .stream-caret { color: @brand_claude; }
+.accent-agy .stream-caret { color: @brand_agy; }
+.accent-codex .stream-caret { color: @brand_codex; }
+
+.md-text { color: mix(@at_fg_strong, @at_fg, 0.4); line-height: 1.45; }
+.md-heading { color: @at_fg_strong; margin-top: 4px; }
+.md-quote {
+    color: @at_fg_soft;
+    padding: 4px 0 4px 12px;
+    border-left: 3px solid @at_border_strong;
+    font-style: italic;
+}
+.md-list { color: mix(@at_fg_strong, @at_fg, 0.4); }
+separator.md-rule { background-color: @at_border; margin: 4px 0; }
+
+.code-block {
+    background-color: @at_bg_deep;
+    border: 1px solid @at_border;
+    border-radius: 10px;
+}
+.code-header {
+    padding: 2px 4px 2px 12px;
+    background-color: @at_bg_sunken;
+    border-bottom: 1px solid @at_surface_raised;
+    border-radius: 10px 10px 0 0;
+}
+.code-lang { color: @at_fg_dim; font-family: monospace; font-size: 0.8em; }
+.code-copy { min-height: 28px; min-width: 28px; padding: 2px; color: @at_fg_dim; }
+.section-more { min-height: 28px; padding: 0 8px; font-size: 0.8em; color: @at_fg_dim; }
+.card-section .card-error { padding: 8px 10px; }
+textview.code-view, textview.code-view text {
+    background-color: @at_bg_deep;
+    color: mix(@at_fg_strong, @at_fg, 0.4);
+    font-family: monospace;
+    font-size: 0.92em;
+}
+.code-block scrolledwindow { border-radius: 0 0 10px 10px; }
+
+/* reasoning */
+.reasoning-toggle { padding: 2px 8px; border-radius: 8px; color: @at_fg_dim; }
+.reasoning-toggle:hover { color: @at_fg_dim; }
+.reasoning-title { color: @at_fg_dim; font-style: italic; }
+/* Not shared by the model: a closed line, quieter than a block with text to open. */
+.reasoning-unavailable .reasoning-toggle:disabled { opacity: 0.75; }
+.reasoning-text {
+    color: @at_fg_dim;
+    font-style: italic;
+    padding: 6px 12px 4px 30px;
+}
+
+/* ---------------------------------------------------------------- cards */
+
+.card {
+    background-color: @at_surface;
+    border: 1px solid @at_border;
+    border-radius: 12px;
+}
+
+.tool-card .card-header {
+    padding: 8px 12px;
+    border-radius: 11px;
+    min-height: 0;
+}
+.tool-card .card-header:hover { background-color: alpha(@at_fg_strong, 0.03); }
+.tool-card .card-title { color: @at_fg_strong; font-weight: 700; }
+.tool-card .card-summary { color: @at_fg_dim; font-family: monospace; font-size: 0.9em; }
+.tool-card .kind-icon { color: @at_fg_dim; }
+.tool-card .chevron { color: @at_fg_faint; }
+.tool-card .status-icon { color: @at_success; }
+.tool-card.status-failed { border-color: alpha(@at_danger, 0.45); }
+.tool-card.status-failed .status-icon { color: @at_danger; }
+.tool-card.status-declined .status-icon { color: @at_warning; }
+.tool-card.status-interrupted .status-icon { color: @at_fg_dim; }
+.tool-card.status-running { border-color: alpha(@at_accent, 0.4); }
+
+.status-badge {
+    font-size: 0.75em;
+    font-weight: 700;
+    padding: 1px 8px;
+    border-radius: 999px;
+    background-color: alpha(@at_danger, 0.15);
+    color: @at_danger_soft;
+}
+.status-declined .status-badge { background-color: alpha(@at_warning, 0.15); color: @at_warning_soft; }
+.status-interrupted .status-badge { background-color: alpha(@at_fg_dim, 0.15); color: @at_fg_soft; }
+
+.card-body { padding: 4px 14px 14px 14px; }
+.diff-bar { padding: 0 12px 8px 12px; }
+.diff-section { padding: 0 14px 14px 14px; }
+.card-section .section-title {
+    color: @at_fg_dim;
+    font-size: 0.75em;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+}
+.mono-scroller {
+    background-color: @at_bg_deep;
+    border: 1px solid @at_surface_raised;
+    border-radius: 8px;
+}
+.mono-text {
+    font-family: monospace;
+    font-size: 0.88em;
+    color: @at_fg;
+    padding: 8px 10px;
+}
+.card-error { color: @at_danger_soft; font-family: monospace; font-size: 0.88em; }
+.card-children {
+    padding: 4px 0 2px 12px;
+    border-left: 2px solid @at_border;
+}
+.card-children .card { background-color: @at_bg_sunken; }
+
+/* approval */
+.approval-card {
+    padding: 14px 16px;
+    border-color: alpha(@at_warning, 0.5);
+    background-image: linear-gradient(180deg, alpha(@at_warning, 0.06), alpha(@at_warning, 0.0) 60%);
+}
+.approval-card .approval-icon { color: @at_warning; }
+.approval-card .approval-title { color: @at_fg_strong; font-weight: 700; font-size: 1.05em; }
+.approval-card .approval-reason { color: @at_fg_dim; }
+.approval-card .approval-input {
+    background-color: @at_bg_deep;
+    border: 1px solid @at_surface_raised;
+    border-radius: 8px;
+}
+.approval-card.resolved, .approval-card.expired {
+    border-color: @at_border;
+    background-image: none;
+}
+.approval-card.resolved .approval-icon { color: @at_success; }
+.approval-card.expired .approval-icon { color: @at_fg_faint; }
+.approval-outcome { color: @at_fg_dim; font-style: italic; }
+.approval-card.resolved .approval-outcome { color: @at_success; font-style: normal; font-weight: 700; }
+.approval-card.resolved.denied .approval-icon,
+.approval-card.resolved.denied .approval-outcome { color: @at_danger; }
+/* a warning is shown in words and in a tinted box, never by colour alone */
+.approval-warning {
+    padding: 8px 12px;
+    border-radius: 8px;
+    font-weight: 600;
+    color: mix(@at_warning, @at_fg_strong, 0.4);
+    background-color: alpha(@at_warning, 0.14);
+    border-left: 3px solid @at_warning;
+}
+.approval-note { font-size: 0.88em; }
+/* a git or gh command's operation, above the command line */
+.git-summary {
+    padding: 10px 12px;
+    border-radius: 8px;
+    background-color: @at_bg_deep;
+    border: 1px solid @at_surface_raised;
+}
+.git-summary .git-op-title { color: @at_fg_strong; font-weight: 700; }
+.git-summary .git-op-icon { color: @at_accent; }
+.git-badge {
+    padding: 1px 8px;
+    border-radius: 999px;
+    font-size: 0.82em;
+    font-weight: 600;
+    background-color: @at_surface_raised;
+    color: @at_fg_dim;
+}
+.git-badge.git-reach-read { color: @at_success; background-color: alpha(@at_success, 0.14); }
+.git-badge.git-reach-local { color: @at_accent; background-color: alpha(@at_accent, 0.14); }
+.git-badge.git-reach-remote { color: @at_warning; background-color: alpha(@at_warning, 0.16); }
+.git-detail-label { font-size: 0.9em; }
+.git-uncertain { font-size: 0.88em; }
+
+button.pill { padding: 6px 16px; border-radius: 999px; }
+.chat-view button.suggested-action {
+    background-color: @at_accent;
+    color: @at_bg;
+    font-weight: 700;
+}
+.chat-view button.suggested-action:hover { background-color: @at_accent_hover; }
+.chat-view button.destructive-action {
+    background-color: alpha(@at_danger, 0.16);
+    color: @at_danger_soft;
+}
+.chat-view button.destructive-action:hover { background-color: alpha(@at_danger, 0.26); }
+
+/* question */
+.question-card {
+    padding: 14px 16px;
+    border-color: alpha(@at_info, 0.45);
+    background-image: linear-gradient(180deg, alpha(@at_info, 0.06), alpha(@at_info, 0.0) 60%);
+}
+.question-card.resolved { border-color: @at_border; background-image: none; }
+.question-heading { color: @at_fg_strong; font-weight: 700; }
+.question-chip {
+    font-size: 0.75em;
+    font-weight: 700;
+    padding: 1px 8px;
+    border-radius: 999px;
+    background-color: alpha(@at_info, 0.14);
+    color: mix(@at_info, @at_fg_strong, 0.4);
+}
+.question-text { color: mix(@at_fg_strong, @at_fg, 0.4); }
+.question-hint { color: @at_fg_dim; font-size: 0.85em; }
+togglebutton.option-button, button.option-button {
+    padding: 8px 14px;
+    border-radius: 10px;
+    background-color: @at_surface_raised;
+    border: 1px solid @at_border_strong;
+}
+.option-button:checked {
+    background-color: alpha(@at_info, 0.18);
+    border-color: @at_info;
+}
+/* quick replies: suggestions under a reply, muted so they never read as a question to answer */
+.quick-replies { margin: 0 4px 4px 4px; }
+.quick-replies-label { color: @at_fg_dim; font-size: 0.85em; }
+button.quick-reply {
+    padding: 4px 12px;
+    border-radius: 999px;
+    background-color: transparent;
+    border-color: @at_border;
+}
+button.quick-reply:hover { background-color: alpha(@at_accent, 0.08); border-color: @at_border_strong; }
+.quick-reply .option-label { color: @at_fg_soft; font-weight: 400; }
+button.flat.quick-reply-action {
+    color: @at_fg_dim;
+    font-size: 0.8em;
+    font-weight: 400;
+    min-height: 0;
+    min-width: 0;
+    padding: 0 6px;
+    background: none;
+    box-shadow: none;
+}
+button.flat.quick-reply-action:hover { color: @at_fg_soft; text-decoration: underline; background: none; }
+.quick-reply:focus-visible, .quick-reply-action:focus-visible { outline: 2px solid @at_accent; outline-offset: -2px; }
+.option-label { color: @at_fg_strong; font-weight: 600; }
+.option-desc { color: @at_fg_dim; font-size: 0.85em; }
+
+/* button rows wrap; their wrappers add no padding of their own */
+.approval-card flowboxchild, .form-card flowboxchild { padding: 0; }
+
+/* a tool server's form or link: the server's words are quoted, the fields sit below */
+.form-card .form-message { font-style: normal; color: @at_fg_soft; }
+.form-field-label { color: @at_fg_strong; font-weight: 600; }
+.form-required {
+    font-size: 0.75em;
+    font-weight: 700;
+    padding: 1px 8px;
+    border-radius: 999px;
+    background-color: alpha(@at_fg_dim, 0.18);
+    color: @at_fg_soft;
+}
+.form-error { color: @at_danger_soft; font-size: 0.9em; font-weight: 600; }
+.form-note { color: @at_fg_dim; font-size: 0.88em; }
+.form-host { color: @at_fg_strong; }
+.form-card.resolved, .form-card.expired { border-color: @at_border; background-image: none; }
+.form-card.resolved .approval-outcome { color: @at_success; font-style: normal; font-weight: 700; }
+.form-card.resolved.declined .approval-outcome,
+.form-card.expired .approval-outcome { color: @at_fg_dim; font-weight: 600; }
+
+/* header: the user's session-long grants to Codex */
+.extra-access { color: @at_warning; font-size: 0.9em; }
+.extra-access-title { color: @at_fg_strong; font-weight: 700; }
+
+/* notices, errors, dividers */
+.notice-row {
+    padding: 8px 12px;
+    border-radius: 10px;
+    background-color: alpha(@at_accent, 0.06);
+}
+.notice-row .notice-icon { color: @at_fg_dim; }
+.notice-text { color: @at_fg_soft; font-size: 0.92em; }
+.notice-row.warning { background-color: alpha(@at_warning, 0.08); }
+.notice-row.warning .notice-icon, .notice-row.warning .notice-text { color: @at_warning_soft; }
+
+.error-row {
+    padding: 10px 14px;
+    border-radius: 10px;
+    background-color: alpha(@at_danger, 0.09);
+    border: 1px solid alpha(@at_danger, 0.35);
+    color: @at_danger_soft;
+}
+.error-row .error-title { color: @at_danger_soft; font-weight: 700; }
+.error-row .error-text { color: @at_danger_text; }
+
+.divider { margin: 6px 0; }
+.divider separator { background-color: @at_border; min-height: 1px; }
+.divider-pill {
+    padding: 3px 12px;
+    border-radius: 999px;
+    border: 1px solid @at_border;
+    background-color: mix(@at_bg_sunken, @at_surface, 0.5);
+}
+.divider-text { color: @at_fg_dim; font-size: 0.85em; }
+.switch-divider.accent-claude .divider-pill { border-color: alpha(@brand_claude, 0.6); background-color: alpha(@brand_claude, 0.08); }
+.switch-divider.accent-agy .divider-pill { border-color: alpha(@brand_agy, 0.6); background-color: alpha(@brand_agy, 0.08); }
+.switch-divider.accent-claude separator { background-color: alpha(@brand_claude, 0.35); }
+.switch-divider.accent-agy separator { background-color: alpha(@brand_agy, 0.35); }
+.switch-divider.accent-codex .divider-pill { border-color: alpha(@brand_codex, 0.6); background-color: alpha(@brand_codex, 0.08); }
+.switch-divider.accent-codex separator { background-color: alpha(@brand_codex, 0.35); }
+.switch-divider .divider-text { color: @at_fg_strong; font-weight: 600; }
+.compaction-divider .divider-text { font-style: italic; }
+
+/* ---------------------------------------------------------------- bottom: plan + composer */
+
+.chat-bottom {
+    padding: 8px 24px 16px 24px;
+    background-color: @at_bg;
+}
+
+/* The agent at work (thinking.rs): the app icon's three cursor dots, bouncing in turn as on
+   the startup splash (window/loading.css), just above the composer. */
+@keyframes thinking-bounce {
+    0% { transform: none; }
+    15% { transform: translateY(-5px) scale(1.12, 0.92); }
+    30% { transform: translateY(1px) scale(0.94, 1.06); }
+    40% { transform: none; }
+    100% { transform: none; }
+}
+.thinking-strip { padding: 2px 6px 0 6px; min-height: 22px; }
+/* The app icon's dots (brand.rs `dots`): each in its agent's colour; `set_lead` lights the agent
+   at work and dims the others, easing between the two so a switch reads as the light moving. */
+.brand-dot {
+    border-radius: 9999px;
+    transition-property: opacity;
+    transition-duration: 150ms;
+    transition-timing-function: ease-out;
+}
+.brand-dot.dot-claude { background-color: @brand_claude; }
+.brand-dot.dot-agy { background-color: @brand_agy; }
+.brand-dot.dot-codex { background-color: @brand_codex; }
+.brand-dot.dimmed { opacity: 0.3; }
+.thinking-dot {
+    min-width: 7px;
+    min-height: 7px;
+    animation: thinking-bounce 1800ms ease-in-out infinite;
+}
+.thinking-dot.dot-agy { animation-delay: 150ms; }
+.thinking-dot.dot-codex { animation-delay: 300ms; }
+/* Every agent at work is lit (brand.rs `set_working`): the thread's own, and each agent its
+   running sub-agents are on; the rest are dimmed. The thread's own agent hops a little higher. */
+@keyframes thinking-bounce-lead {
+    0% { transform: none; }
+    15% { transform: translateY(-7px) scale(1.18, 0.9); }
+    30% { transform: translateY(1px) scale(0.92, 1.08); }
+    40% { transform: none; }
+    100% { transform: none; }
+}
+.thinking-dot.lead { animation-name: thinking-bounce-lead; }
+/* Usage still loading (brand.rs `drip`): one droplet, never two, on one 1800 ms beat.
+     0-4 %   it forms at the top of the loop;
+     4-54 %  it goes once round counter-clockwise, easing out of and into the top;
+     54 %    it hands over, in place, to the falling droplet (the loop's goes out);
+     54-60 % it hangs at the top;
+     60-74 % it falls as under gravity (distance ∝ time²), stretching as it speeds up;
+     74-77 % it breaks the surface and is gone;
+     75-97 % the ripple, a ring squashed flat (a circle seen in perspective, like water), spreads
+             and fades; only then does the next droplet form.
+   The ripple sits low: fully spread (8 × 1.1 by 8 × 0.42 = 8.8 × 3.36 px) its bottom edge meets
+   the bottom of the 14 px mark, so its centre is 12.3 px down, 5.3 px below the middle. Each
+   phase is written out as keyframes (linear between them; the loop's easing is a smoothstep
+   sampled at fifths). A transform is drawn, not laid out. */
+@keyframes drip-spin {
+    0% { opacity: 0; transform: rotate(0deg); }
+    4% { opacity: 1; transform: rotate(0deg); }
+    14% { opacity: 1; transform: rotate(-37.4deg); }
+    24% { opacity: 1; transform: rotate(-126.7deg); }
+    34% { opacity: 1; transform: rotate(-233.3deg); }
+    44% { opacity: 1; transform: rotate(-322.6deg); }
+    54% { opacity: 1; transform: rotate(-360deg); }
+    54.5% { opacity: 0; transform: rotate(-360deg); }
+    100% { opacity: 0; transform: rotate(-360deg); }
+}
+@keyframes drip-fall {
+    0% { opacity: 0; transform: translateY(0) scale(1, 1); }
+    54% { opacity: 0; transform: translateY(0) scale(1, 1); }
+    54.5% { opacity: 1; transform: translateY(0) scale(1, 1); }
+    60% { opacity: 1; transform: translateY(0) scale(1, 1); }
+    64.9% { opacity: 1; transform: translateY(1.3px) scale(0.9, 1.15); }
+    69.1% { opacity: 1; transform: translateY(4.6px) scale(0.85, 1.25); }
+    71.9% { opacity: 1; transform: translateY(7.8px) scale(0.8, 1.35); }
+    74% { opacity: 1; transform: translateY(10.8px) scale(0.8, 1.35); }
+    77% { opacity: 0; transform: translateY(10.8px) scale(1.6, 0.4); }
+    100% { opacity: 0; transform: translateY(10.8px) scale(1.6, 0.4); }
+}
+@keyframes drip-ripple {
+    0% { opacity: 0; transform: translateY(5.3px) scale(0.15, 0.06); }
+    74% { opacity: 0; transform: translateY(5.3px) scale(0.15, 0.06); }
+    75% { opacity: 1; transform: translateY(5.3px) scale(0.25, 0.1); }
+    97% { opacity: 0; transform: translateY(5.3px) scale(1.1, 0.42); }
+    100% { opacity: 0; transform: translateY(5.3px) scale(1.1, 0.42); }
+}
+.brand-drip { min-width: 14px; min-height: 14px; }
+.brand-drip .drip-orbit {
+    min-width: 14px;
+    min-height: 14px;
+    animation: drip-spin 1800ms linear infinite;
+}
+.brand-drip .drip-drop { min-width: 3px; min-height: 3px; }
+/* At rest (animations off) only the loop's droplet shows, at the top. */
+.brand-drip .drip-fall {
+    opacity: 0;
+    animation: drip-fall 1800ms linear infinite;
+}
+.drip-ripple {
+    min-width: 8px;
+    min-height: 8px;
+    border: 1.5px solid;
+    border-radius: 9999px;
+    opacity: 0;
+    animation: drip-ripple 1800ms linear infinite;
+}
+.drip-ripple.dot-claude { border-color: @brand_claude; }
+.drip-ripple.dot-agy { border-color: @brand_agy; }
+.drip-ripple.dot-codex { border-color: @brand_codex; }
+/* A new thread's empty transcript: the dots at rest, the thread's agent lit. */
+.transcript-empty .brand-dots { margin-bottom: 6px; }
+.transcript-empty .brand-dot { min-width: 10px; min-height: 10px; }
+/* A row arriving live (transcript.rs `entrance`): your message, or the first row of the reply,
+   fades in; never a replayed row. Opacity only: the stick-to-bottom reads the layout. */
+@keyframes row-enter {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+.row-enter { animation: row-enter 180ms ease-out; }
+/* An agent switch's divider settles into place once: its pill pops in, in the new agent's
+   colours. A transform is drawn, not laid out, so nothing below it moves. */
+@keyframes divider-settle {
+    0% { opacity: 0; transform: scale(0.9); }
+    60% { opacity: 1; transform: scale(1.04); }
+    100% { opacity: 1; transform: none; }
+}
+.divider-settle .divider-pill { animation: divider-settle 320ms ease-out; }
+.thinking-text { color: mix(@at_fg_soft, @at_fg_dim, 0.5); font-size: 0.9em; }
+
+.plan-card {
+    background-color: @at_surface;
+    border: 1px solid @at_border;
+    border-radius: 12px;
+}
+.plan-toggle { padding: 6px 12px; border-radius: 11px; }
+.plan-title { color: @at_fg_strong; font-weight: 700; font-size: 0.9em; }
+.plan-steps { padding: 0 14px 10px 14px; }
+.plan-step .step-glyph { min-width: 16px; color: @at_fg_faint; }
+.plan-step .step-text { color: @at_fg; }
+.plan-step.step-active .step-glyph { color: @at_accent; }
+.plan-step.step-active .step-text { color: @at_fg_strong; font-weight: 600; }
+.plan-step.step-done .step-glyph { color: @at_success; }
+.plan-step.step-done .step-text { color: @at_fg_dim; }
+
+/* sticky interruption shelf */
+.interruption-shelf {
+    padding: 8px 14px;
+    border-radius: 12px;
+    background-color: @at_surface_raised;
+    border: 1px solid alpha(@at_warning, 0.45);
+    background-image: linear-gradient(180deg, alpha(@at_warning, 0.10), alpha(@at_warning, 0.02) 100%);
+    box-shadow: 0 4px 12px alpha(#000000, 0.35);
+}
+.chat-bottom .small .interruption-shelf button.pill {
+    padding: 6px 8px;
+    min-height: 32px;
+}
+.interruption-shelf.is-question {
+    border-color: alpha(@at_info, 0.45);
+    background-image: linear-gradient(180deg, alpha(@at_info, 0.10), alpha(@at_info, 0.02) 100%);
+}
+.interruption-icon {
+    color: @at_warning;
+    font-size: 1.2em;
+}
+.interruption-shelf.is-question .interruption-icon {
+    color: @at_info;
+}
+.interruption-title {
+    color: @at_fg_strong;
+    font-weight: 700;
+    font-size: 0.95em;
+}
+.interruption-preview {
+    color: @at_fg_soft;
+    font-family: monospace;
+    font-size: 0.88em;
+}
+
+.composer {
+    padding: 6px 6px 6px 6px;
+    border-radius: 16px;
+    background-color: mix(@at_surface, @at_surface_raised, 0.4);
+    border: 1px solid @at_border_strong;
+}
+.composer:hover { border-color: @at_border_hover; }
+.composer:focus-within { border-color: alpha(@at_accent, 0.7); }
+/* The typing area itself is an inset field, a shade lighter than the bar around it, so it
+   reads as the place to click. */
+textview.composer-view {
+    background-color: @at_surface_strong;
+    border-radius: 11px;
+}
+.composer-field { border-radius: 11px; }
+textview.composer-view:hover { background-color: mix(@at_surface_strong, @at_border_strong, 0.4); }
+textview.composer-view:focus-within { background-color: mix(@at_surface_strong, @at_border_strong, 0.6); }
+textview.composer-view text {
+    background-color: transparent;
+    color: @at_fg_strong;
+    caret-color: @at_accent;
+    font-size: 1.02em;
+}
+.composer-placeholder { color: @at_fg_soft; }
+button.send-button {
+    min-width: 36px;
+    min-height: 36px;
+    background-color: @at_accent;
+    color: @at_bg;
+}
+button.send-button:hover { background-color: @at_accent_hover; }
+button.send-button.stop { background-color: @at_danger; color: @at_bg; }
+
+/* typeahead */
+popover.typeahead > contents {
+    padding: 4px;
+    border-radius: 12px;
+    background-color: mix(@at_surface, @at_surface_raised, 0.4);
+    border: 1px solid @at_border_strong;
+    box-shadow: 0 8px 28px alpha(black, 0.45);
+}
+.typeahead-list { background-color: transparent; }
+.typeahead-list row { border-radius: 8px; padding: 0; }
+.typeahead-list row:selected { background-color: alpha(@at_accent, 0.2); }
+.typeahead-row { padding: 6px 10px; }
+.typeahead-name { color: @at_fg_strong; font-family: monospace; font-weight: 700; }
+.typeahead-hint { color: @at_fg_dim; font-family: monospace; font-size: 0.9em; }
+.typeahead-desc { color: @at_fg_dim; font-size: 0.9em; }
+.kind-badge {
+    font-size: 0.7em;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 6px;
+    min-width: 34px;
+}
+.badge-app { background-color: alpha(@at_accent, 0.18); color: @at_accent_hover; }
+.badge-agent { background-color: alpha(@brand_claude, 0.18); color: mix(@brand_claude, white, 0.4); }
+.badge-skill { background-color: alpha(@at_success, 0.16); color: @at_success_soft; }
+.badge-file { background-color: alpha(@at_info, 0.16); color: mix(@at_info, @at_fg_strong, 0.4); }
+
+/* panels */
+dialog.chat-panel sheet,
+dialog.chat-panel floating-sheet > sheet,
+dialog.chat-panel bottom-sheet > sheet,
+.chat-panel toolbarview { background-color: @at_surface; color: @at_fg; }
+.chat-panel headerbar { background-color: transparent; box-shadow: none; color: @at_fg_strong; }
+.chat-panel list.boxed-list { background-color: @at_surface_raised; border-radius: 12px; }
+.chat-panel list.boxed-list row { color: @at_fg_strong; }
+.chat-panel list.boxed-list row .subtitle { color: @at_fg_dim; }
+.chat-panel list.boxed-list row:hover { background-color: alpha(@at_accent, 0.08); }
+.chat-panel .model-group { color: @at_fg_dim; font-weight: 700; font-size: 0.85em; letter-spacing: 0.06em; }
+.chat-panel .model-via { color: @at_warning; font-size: 0.8em; }
+.chat-panel list.boxed-list row.current-model { background-color: alpha(@at_accent, 0.18); }
+.chat-panel statuspage .title { color: @at_fg_strong; }
+.chat-panel image.accent { color: @at_accent; }
+.chat-panel button.suggested-action { background-color: @at_accent; color: @at_bg; font-weight: 700; }
+.chat-panel button.suggested-action:hover { background-color: @at_accent_hover; }
+.chat-panel statuspage image { color: @at_fg_dim; }
+.chat-panel .mcp-dot { font-size: 0.8em; }
+.chat-panel .mcp-ok { color: @at_success; }
+.chat-panel .mcp-pending { color: @at_warning; }
+.chat-panel .mcp-off { color: @at_fg_faint; }
+.chat-panel .mcp-bad { color: @at_danger; }
+/* A reconnect in flight (panels.rs `show_reconnecting`): the dot pulses until the list reloads. */
+.chat-panel .mcp-reconnecting { animation: pulse 900ms ease-in-out infinite; }
+.chat-panel .context-big { font-size: 1.6em; font-weight: 700; color: @at_fg_strong; font-family: monospace; }
+.chat-panel .json-row .subtitle { font-family: monospace; }
+
+/* keyboard focus: one visible ring on every custom-drawn button */
+.tool-card .card-header:focus-visible,
+.reasoning-toggle:focus-visible,
+.plan-toggle:focus-visible,
+.option-button:focus-visible,
+.agent-chip:focus-visible,
+.subagent-button:focus-visible,
+.usage-indicator:focus-visible,
+.gauge:focus-visible,
+.code-copy:focus-visible,
+.section-more:focus-visible,
+.jump-button:focus-visible,
+.send-button:focus-visible {
+    outline: 2px solid @at_accent;
+    outline-offset: -2px;
+}

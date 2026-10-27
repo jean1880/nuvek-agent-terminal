@@ -1,0 +1,1839 @@
+//! A scripted fake backend for screenshots and manual review without real agents
+//! (`agent-terminal --chat-demo`).
+//!
+//! It replays a canned envelope script that covers every row type (streaming text, reasoning,
+//! tool cards including a failed and a declined one, subagent nesting, approvals, a question,
+//! the plan, compaction, a model switch, a provider switch, a notice and a turn error), echoes
+//! prompts, and answers every control with canned data.
+//!
+//! `AGENT_TERMINAL_DEMO_STRESS=<n>` preloads `n` mixed items first (a transcript stress test).
+//!
+//! `AGENT_TERMINAL_DEMO_THREADS=1` runs the full window on a throwaway in-memory thread store
+//! filled by [`seed_demo_threads`] instead of the real one, and lists none of the agents' own
+//! sessions: a sidebar fit for screenshots, with nothing of the user's in it. No thread starts
+//! an agent session (each plays this script); detection and the usage probes still run.
+
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
+use std::rc::{Rc, Weak};
+use std::time::Duration;
+
+use agent_core::adapter::{Control, Driver, Mode};
+use agent_core::caps::Capabilities;
+use agent_core::event::{
+    Account, AgentCommand, AgentCommandKind, Decision, Envelope, Event, ItemKind, ItemStatus,
+    PlanStep, Question, QuestionOption, QuotaWindow, ResponseCapability, StepStatus, StreamKind,
+    TurnState,
+};
+use agent_core::quota::epoch_to_rfc3339;
+use gtk4::glib;
+use gtk4::prelude::*;
+use serde_json::{json, Value};
+
+use super::ChatView;
+use crate::account_status::AccountStatus;
+use crate::chat::{
+    ChatBackend, DiffAsk, DiffReply, DiffSource, EnvelopeSink, ModelSource, SessionStatus,
+};
+use agent_core::catalog::{parse_agy_models, CatalogModel};
+
+/// One script step.
+// A demo script holds a few dozen steps; boxing every envelope would buy nothing.
+#[allow(clippy::large_enum_variant)]
+enum Step {
+    Emit(Envelope),
+    Wait(u32),
+    /// The thread moves to another agent (what a handoff does to `status()`).
+    SetDriver(Driver, Option<String>),
+    SetRunning(bool),
+}
+
+pub struct DemoBackend {
+    sink: RefCell<Option<EnvelopeSink>>,
+    status: RefCell<SessionStatus>,
+    queue: RefCell<VecDeque<Step>>,
+    pumping: Cell<bool>,
+    seq: Cell<u64>,
+    mcp: RefCell<Vec<(String, bool)>>,
+    me: RefCell<Weak<DemoBackend>>,
+}
+
+/// The demo backend. Connect it to a view with [`DemoBackend::connect`] after building the view
+/// (`ChatView::new` takes the backend, and the backend needs the view's sink).
+pub fn demo_backend() -> Rc<DemoBackend> {
+    let b = Rc::new(DemoBackend {
+        sink: RefCell::new(None),
+        status: RefCell::new(SessionStatus {
+            driver: Driver::Claude,
+            model: Some("claude-opus-5-5".into()),
+            pending_model: None,
+            effort: Some("medium".into()),
+            mode: Mode::Ask,
+            running_turn: false,
+            alive: true,
+            capabilities: Capabilities::claude(),
+            commands: demo_commands(),
+        }),
+        queue: RefCell::new(VecDeque::new()),
+        pumping: Cell::new(false),
+        seq: Cell::new(0),
+        mcp: RefCell::new(vec![
+            ("git".into(), true),
+            ("browser".into(), true),
+            ("project-graph".into(), false),
+        ]),
+        me: RefCell::new(Weak::new()),
+    });
+    *b.me.borrow_mut() = Rc::downgrade(&b);
+    b
+}
+
+struct DemoDiffs;
+
+impl DiffSource for DemoDiffs {
+    fn load(&self, ask: DiffAsk, done: Box<dyn FnOnce(DiffReply)>) {
+        // The fixture's proposed edit is sufficient; never read or alter a live checkout.
+        done(agent_kit::filediff::shown_for_item(None, &ask.input));
+    }
+
+    fn open_external(&self, _ask: DiffAsk) {
+        tracing::info!("chat demo: external diff requested; no process launched");
+    }
+}
+
+/// Supplies in-memory diffs and optional deterministic review disclosures. A scene is part
+/// of the fixture, not interaction with a real session: `diff`, `workers`, `usage`, or `queue`.
+pub fn configure_demo_view(view: &ChatView) {
+    view.set_diff_source(Rc::new(DemoDiffs));
+    let Ok(scene) = std::env::var("AGENT_TERMINAL_DEMO_SCENE") else {
+        return;
+    };
+    let weak = view.downgrade();
+    glib::timeout_add_local_once(Duration::from_secs(3), move || {
+        let Some(view) = weak.upgrade() else { return };
+        let Some(inner) = view.inner() else { return };
+        match scene.as_str() {
+            "usage" => {
+                if let Some(usage) = inner.usage.borrow().as_ref() {
+                    usage.widget().popup();
+                }
+            }
+            "workers" => inner.subagent_shelf.set_expanded(true),
+            "diff" => {
+                inner.transcript.expand_demo_changes("demo-edit");
+            }
+            _ => {}
+        }
+    });
+}
+
+/// A fixed model list for `--chat-demo`: both agents, with an agy route to Claude models.
+pub struct DemoModels;
+
+impl DemoModels {
+    pub fn list() -> Vec<CatalogModel> {
+        let efforts = || ["low", "medium", "high"].map(str::to_owned).to_vec();
+        let claude = |id: &str, display: &str, desc: &str, efforts| CatalogModel {
+            driver: Driver::Claude,
+            id: id.into(),
+            display: display.into(),
+            description: Some(desc.into()),
+            efforts,
+            default_effort: None,
+            via: None,
+        };
+        let mut models = vec![
+            claude(
+                "claude-opus-5-5",
+                "Opus 5.5",
+                "Most capable, for complex work",
+                efforts(),
+            ),
+            claude(
+                "claude-sonnet-5-5",
+                "Sonnet 5.5",
+                "Fast and capable for everyday tasks",
+                efforts(),
+            ),
+            claude(
+                "claude-haiku-5",
+                "Haiku 5",
+                "Fastest, for quick answers",
+                Vec::new(),
+            ),
+        ];
+        // agy lists one id per effort; the catalog folds them into one row per model.
+        models.extend(parse_agy_models(
+            "gemini-3.8-flash-high\tGemini 3.8 Flash (High)\n\
+             gemini-3.8-flash-medium\tGemini 3.8 Flash (Medium)\n\
+             gemini-3.8-flash-low\tGemini 3.8 Flash (Low)\n\
+             gemini-3.1-pro-high\tGemini 3.1 Pro (High)\n\
+             gemini-3.1-pro-low\tGemini 3.1 Pro (Low)\n\
+             claude-opus-5-5-high\tClaude Opus 5.5 (High)\n\
+             claude-opus-5-5-medium\tClaude Opus 5.5 (Medium)\n\
+             claude-opus-5-5-low\tClaude Opus 5.5 (Low)\n\
+             claude-sonnet-5-5-medium\tClaude Sonnet 5.5 (Medium)\n\
+             claude-sonnet-5-5-high\tClaude Sonnet 5.5 (High)\n\
+             gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n",
+        ));
+        models
+    }
+}
+
+impl ModelSource for DemoModels {
+    fn models(&self) -> Vec<CatalogModel> {
+        Self::list()
+    }
+
+    fn connect_changed(&self, _f: Box<dyn Fn()>) -> u64 {
+        0
+    }
+
+    fn disconnect(&self, _id: u64) {}
+}
+
+/// Static account and quota data for `--chat-demo`: one agent in the amber, one in the red. The
+/// `usage` scene also shows Codex still loading, its probe never ending.
+pub fn demo_account_status() -> Rc<AccountStatus> {
+    let status = Rc::new(AccountStatus::new());
+    observe_demo_quota(&status);
+    if std::env::var("AGENT_TERMINAL_DEMO_SCENE").as_deref() == Ok("usage") {
+        status.set_probing(Driver::Codex, true);
+    }
+    status
+}
+
+/// Feeds `status` the demo's accounts and quota windows (Claude and agy).
+pub fn observe_demo_quota(status: &AccountStatus) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
+    let window = |group: Option<&str>, label: &str, used: f64, in_secs: i64| QuotaWindow {
+        group: group.map(str::to_owned),
+        label: label.into(),
+        used,
+        resets_at: Some(epoch_to_rfc3339(now + in_secs)),
+    };
+    let account = |label: &str, plan: Option<&str>, provider: &str| Account {
+        label: label.into(),
+        plan: plan.map(str::to_owned),
+        provider: Some(provider.into()),
+    };
+    let quota = |account, windows| Envelope::new(Event::QuotaUpdated { account, windows });
+    status.observe(
+        Driver::Claude,
+        &quota(
+            Some(account(
+                "user@example.com",
+                Some("Claude Pro"),
+                "firstParty",
+            )),
+            vec![
+                window(None, "5-hour", 0.42, 3 * 3600 + 47 * 60),
+                window(None, "Weekly", 0.78, 3 * 86_400 + 10 * 3600),
+                window(None, "Weekly (Fable)", 0.0, 3 * 86_400 + 10 * 3600),
+            ],
+        ),
+    );
+    status.observe(
+        Driver::Agy,
+        &quota(
+            Some(account("user@example.com", None, "Google")),
+            vec![
+                window(
+                    Some("Gemini Models"),
+                    "Weekly",
+                    0.14,
+                    3 * 86_400 + 10 * 3600,
+                ),
+                window(Some("Gemini Models"), "5-hour", 0.93, 55 * 60),
+                window(Some("Claude and GPT models"), "Weekly", 0.0, 6 * 86_400),
+                window(Some("Claude and GPT models"), "5-hour", 0.0, 5 * 3600),
+            ],
+        ),
+    );
+}
+
+fn demo_commands() -> Vec<AgentCommand> {
+    let cmd = |name: &str, desc: &str, hint: Option<&str>, kind| AgentCommand {
+        name: name.into(),
+        description: Some(desc.into()),
+        argument_hint: hint.map(str::to_owned),
+        kind,
+    };
+    vec![
+        cmd(
+            "review",
+            "Review a pull request",
+            Some("<pr>"),
+            AgentCommandKind::Command,
+        ),
+        cmd(
+            "security-review",
+            "Security review of pending changes",
+            None,
+            AgentCommandKind::Command,
+        ),
+        cmd(
+            "init",
+            "Write an AGENTS.md for this repo",
+            None,
+            AgentCommandKind::Command,
+        ),
+        cmd(
+            "doctor",
+            "Diagnose the installation",
+            None,
+            AgentCommandKind::TerminalOnly,
+        ),
+        cmd(
+            "pdf",
+            "Read and write PDF files",
+            None,
+            AgentCommandKind::Skill,
+        ),
+        cmd(
+            "rust-craftsman",
+            "Idiomatic, gated Rust",
+            None,
+            AgentCommandKind::Skill,
+        ),
+    ]
+}
+
+impl DemoBackend {
+    pub fn connect(&self, sink: EnvelopeSink) {
+        *self.sink.borrow_mut() = Some(sink);
+    }
+
+    fn next_id(&self, prefix: &str) -> String {
+        self.seq.set(self.seq.get() + 1);
+        format!("{prefix}-{}", self.seq.get())
+    }
+
+    fn emit_now(&self, env: &Envelope) {
+        let sink = self.sink.borrow().clone();
+        if let Some(sink) = sink {
+            sink(env);
+        }
+    }
+
+    fn push(&self, steps: impl IntoIterator<Item = Step>) {
+        self.queue.borrow_mut().extend(steps);
+        self.pump();
+    }
+
+    /// Plays queued steps on the main loop, one timeout per wait.
+    fn pump(&self) {
+        if self.pumping.replace(true) {
+            return;
+        }
+        loop {
+            let step = self.queue.borrow_mut().pop_front();
+            match step {
+                None => {
+                    self.pumping.set(false);
+                    return;
+                }
+                Some(Step::Emit(env)) => self.emit_now(&env),
+                Some(Step::SetDriver(driver, model)) => {
+                    let mut s = self.status.borrow_mut();
+                    s.driver = driver;
+                    s.model = model;
+                    s.capabilities = Capabilities::of(driver);
+                }
+                Some(Step::SetRunning(r)) => self.status.borrow_mut().running_turn = r,
+                Some(Step::Wait(ms)) => {
+                    let me = self.me.borrow().clone();
+                    glib::timeout_add_local_once(Duration::from_millis(u64::from(ms)), move || {
+                        if let Some(me) = me.upgrade() {
+                            me.pumping.set(false);
+                            me.pump();
+                        }
+                    });
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Plays the full demo script.
+    pub fn play_script(&self) {
+        let scene = std::env::var("AGENT_TERMINAL_DEMO_SCENE").unwrap_or_default();
+        self.push(if scene == "diff" {
+            diff_review_script()
+        } else if scene == "queue" {
+            queue_script()
+        } else if scene == "git" {
+            git_script()
+        } else if scene == "requests" || scene == "requests-risky" {
+            requests_script(scene == "requests-risky")
+        } else if matches!(scene.as_str(), "workers" | "usage")
+            || std::env::var("AGENT_TERMINAL_DEMO_CODEX_WORKERS").as_deref() == Ok("1")
+        {
+            codex_worker_script()
+        } else {
+            script()
+        });
+    }
+
+    /// Every envelope the script emits, in order and at once (for replay): a thread with a
+    /// gauge, sub-agents, a plan, and an approval and a question left open.
+    #[cfg(test)]
+    pub fn script_envelopes() -> Vec<Envelope> {
+        script()
+            .into_iter()
+            .filter_map(|step| match step {
+                Step::Emit(env) => Some(env),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `n` mixed stored items for [`ChatView::replay`], for the transcript stress test.
+    pub fn stress_history(n: usize) -> Vec<Envelope> {
+        (0..n).flat_map(stress_item).collect()
+    }
+
+    fn reply_turn(&self, text: &str) {
+        let user = self.next_id("user");
+        let reply = self.next_id("reply");
+        let mut steps = vec![
+            Step::Emit(started(&user, ItemKind::UserMessage, "", None, None)),
+            Step::Emit(snapshot(&user, StreamKind::Assistant, text)),
+            Step::SetRunning(true),
+            Step::Emit(Envelope::new(Event::TurnStarted { model: None })),
+            Step::Wait(250),
+        ];
+        let body = if text.starts_with('/') {
+            format!(
+                "*(demo)* `{}` would be sent to the agent as a slash command.",
+                text.split_whitespace().next().unwrap_or(text)
+            )
+        } else {
+            format!(
+                "This is the **demo backend**, so nothing ran. You said:\n\n> {}\n\n\
+                 Try `/` for commands, `@` for files, or `/model` to open the picker.",
+                text.lines().next().unwrap_or("")
+            )
+        };
+        steps.push(Step::Emit(started(
+            &reply,
+            ItemKind::AssistantMessage,
+            "",
+            None,
+            None,
+        )));
+        steps.extend(stream(&reply, StreamKind::Assistant, &body, 6, 30));
+        steps.push(Step::Emit(completed(
+            &reply,
+            ItemStatus::Completed,
+            None,
+            None,
+        )));
+        steps.push(Step::SetRunning(false));
+        steps.push(Step::Emit(turn_done(TurnState::Completed, None)));
+        self.push(steps);
+    }
+
+    fn control_reply(&self, control: &Control) -> Value {
+        let driver = self.status.borrow().driver;
+        match control {
+            Control::ListModels => match driver {
+                Driver::Claude => json!({"models": [
+                    {"value": "claude-opus-5-5", "displayName": "Opus 5.5", "description": "Most capable, for complex work"},
+                    {"value": "claude-sonnet-5-5", "displayName": "Sonnet 5.5", "description": "Fast and capable for everyday tasks"},
+                    {"value": "claude-haiku-5", "displayName": "Haiku 5", "description": "Fastest, for quick answers"}
+                ]}),
+                Driver::Agy => json!([
+                    {"id": "gemini-3.1-pro", "display": "Gemini 3.1 Pro"},
+                    {"id": "gemini-3.1-pro-low", "display": "Gemini 3.1 Pro (low)"},
+                    {"id": "gemini-3-flash", "display": "Gemini 3 Flash"}
+                ]),
+                Driver::Codex => json!([
+                    {"id": "gpt-5-codex", "display": "GPT-5 Codex"}
+                ]),
+            },
+            Control::McpStatus => {
+                let servers: Vec<Value> = self
+                    .mcp
+                    .borrow()
+                    .iter()
+                    .map(|(name, on)| {
+                        if *on {
+                            json!({"name": name, "status": "connected",
+                                   "serverInfo": {"name": format!("{name}-mcp"), "version": "1.4.0"}})
+                        } else {
+                            json!({"name": name, "status": "disabled"})
+                        }
+                    })
+                    .collect();
+                json!({ "mcpServers": servers })
+            }
+            Control::McpToggle { server, enabled } => {
+                for (name, on) in self.mcp.borrow_mut().iter_mut() {
+                    if name == server {
+                        *on = *enabled;
+                    }
+                }
+                Value::Null
+            }
+            Control::McpReconnect { .. } => Value::Null,
+            Control::GetSettings => json!({
+                "effective": {
+                    "model": "claude-opus-5-5",
+                    "permissions": {"defaultMode": "default", "allow": ["Bash(cargo test:*)", "Read"]},
+                    "env": {"RUST_LOG": "info"},
+                    "includeCoAuthoredBy": false,
+                    "statusLine": {"type": "command", "command": "~/.claude/statusline.sh"}
+                },
+                "sources": ["user", "project"]
+            }),
+            Control::FileSuggestions { query } => {
+                let files = [
+                    "src/main.rs",
+                    "src/config.rs",
+                    "src/chat/view.rs",
+                    "src/chat/mod.rs",
+                    "crates/agent-core/src/event.rs",
+                    "crates/agent-core/src/commands.rs",
+                    "AGENTS.md",
+                    "Cargo.toml",
+                ];
+                let q = query.to_lowercase();
+                let hits: Vec<&str> = files
+                    .iter()
+                    .copied()
+                    .filter(|f| f.to_lowercase().contains(&q))
+                    .collect();
+                json!(hits)
+            }
+            Control::ContextUsage => json!({
+                "totalTokens": 64_210, "maxTokens": 200_000, "autoCompactThreshold": 160_000,
+                "categories": [
+                    {"name": "System prompt", "tokens": 3_120},
+                    {"name": "Tools", "tokens": 11_840},
+                    {"name": "MCP tools", "tokens": 6_400},
+                    {"name": "Messages", "tokens": 42_850}
+                ]
+            }),
+            Control::Usage => json!({
+                "session": {"input_tokens": 182_400, "output_tokens": 9_310, "cost_usd": 1.42},
+                "quota": {"five_hour": {"used_percent": 38, "resets_at": "16:00"},
+                          "weekly": {"used_percent": 12, "resets_at": "Mon 09:00"}}
+            }),
+            Control::TaskOutput { .. } => json!({
+                "output": "   Compiling agent-core v0.1.0\n   Compiling agent-terminal v1.0.0\n",
+                "total_bytes": 64, "truncated": false
+            }),
+        }
+    }
+}
+
+impl ChatBackend for DemoBackend {
+    fn send_prompt(&self, text: &str) {
+        self.reply_turn(text);
+    }
+
+    fn interrupt(&self) {
+        // Drop whatever the current turn still had queued, then close it as interrupted.
+        let running = self.status.borrow().running_turn;
+        if !running {
+            return;
+        }
+        self.queue.borrow_mut().clear();
+        self.status.borrow_mut().running_turn = false;
+        self.push([Step::Emit(turn_done(TurnState::Interrupted, None))]);
+    }
+
+    fn respond_approval(&self, request: &str, decision: Decision) {
+        self.push([
+            Step::Wait(300),
+            Step::Emit(Envelope::new(Event::ApprovalResolved { decision }).request(request)),
+        ]);
+    }
+
+    fn respond_form(
+        &self,
+        request: &str,
+        action: agent_core::form::FormAction,
+        content: Option<Value>,
+    ) -> bool {
+        // The demo never keeps what was typed: only the outcome comes back.
+        let _ = content;
+        self.push([
+            Step::Wait(300),
+            Step::Emit(Envelope::new(Event::FormResolved { action }).request(request)),
+        ]);
+        true
+    }
+
+    fn answer_questions(&self, request: &str, answers: Value) {
+        let summary = answers
+            .as_object()
+            .map(|m| {
+                m.iter()
+                    .map(|(q, a)| format!("{q} → {}", a.as_str().unwrap_or("")))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        self.push([
+            Step::Wait(300),
+            Step::Emit(Envelope::new(Event::QuestionResolved { answered: true }).request(request)),
+            Step::Emit(Envelope::new(Event::Notice {
+                text: format!("Answers sent:\n{summary}"),
+            })),
+        ]);
+    }
+
+    fn switch(&self, driver: Driver, model: Option<String>, effort: Option<String>) {
+        let current = self.status.borrow().driver;
+        if driver == current {
+            let model = model.unwrap_or_else(|| "default".into());
+            {
+                let mut status = self.status.borrow_mut();
+                status.model = Some(model.clone());
+                if effort.is_some() {
+                    status.effort = effort;
+                }
+            }
+            self.push([
+                Step::Emit(Envelope::new(Event::ModelChanged {
+                    model: model.clone(),
+                })),
+                Step::Emit(Envelope::new(Event::Notice {
+                    text: format!("Set model to {model}"),
+                })),
+            ]);
+        } else {
+            let model = model.or_else(|| {
+                Some(match driver {
+                    Driver::Claude => "claude-opus-5-5".into(),
+                    Driver::Agy => "gemini-3.1-pro-high".into(),
+                    Driver::Codex => "gpt-5-codex".into(),
+                })
+            });
+            self.status.borrow_mut().effort = effort;
+            self.push([
+                Step::SetDriver(driver, model.clone()),
+                Step::Emit(Envelope::new(Event::SessionStarted {
+                    native_id: self.next_id("native"),
+                    model,
+                    cwd: None,
+                })),
+            ]);
+        }
+    }
+
+    fn reload_session(&self) {}
+
+    fn set_mode(&self, mode: Mode) {
+        self.status.borrow_mut().mode = mode;
+        self.push([Step::Emit(Envelope::new(Event::ModeChanged { mode }))]);
+    }
+
+    fn control(&self, control: Control) -> String {
+        let id = self.next_id("ctl");
+        let ok = Some(self.control_reply(&control));
+        self.push([
+            Step::Wait(180),
+            Step::Emit(Envelope::new(Event::ControlResult { ok, error: None }).request(&id)),
+        ]);
+        id
+    }
+
+    fn status(&self) -> SessionStatus {
+        self.status.borrow().clone()
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Script helpers
+// ---------------------------------------------------------------------------------------------
+
+fn started(
+    id: &str,
+    kind: ItemKind,
+    title: &str,
+    input: Option<Value>,
+    parent: Option<&str>,
+) -> Envelope {
+    Envelope::item_started(id, kind, title, input, parent)
+}
+
+fn snapshot(id: &str, stream: StreamKind, text: &str) -> Envelope {
+    Envelope::snapshot(id, stream, text)
+}
+
+fn completed(id: &str, status: ItemStatus, output: Option<&str>, error: Option<&str>) -> Envelope {
+    Envelope::item_completed(id, status, output, error)
+}
+
+fn turn_done(state: TurnState, error: Option<&str>) -> Envelope {
+    Envelope::turn_completed(state, error)
+}
+
+/// Streams `text` as deltas of about `chunk` words every `ms` milliseconds.
+fn stream(id: &str, stream: StreamKind, text: &str, chunk: usize, ms: u32) -> Vec<Step> {
+    let mut steps = Vec::new();
+    let mut buf = String::new();
+    let mut words = 0;
+    for piece in text.split_inclusive(' ') {
+        buf.push_str(piece);
+        words += 1;
+        if words >= chunk {
+            steps.push(Step::Emit(Envelope::delta(
+                id,
+                stream,
+                std::mem::take(&mut buf),
+            )));
+            steps.push(Step::Wait(ms));
+            words = 0;
+        }
+    }
+    if !buf.is_empty() {
+        steps.push(Step::Emit(Envelope::delta(id, stream, buf)));
+    }
+    steps
+}
+
+// Script data: one positional call per card reads better than a builder here.
+#[allow(clippy::too_many_arguments)]
+fn tool(
+    id: &str,
+    kind: ItemKind,
+    title: &str,
+    input: Value,
+    parent: Option<&str>,
+    status: ItemStatus,
+    output: Option<&str>,
+    error: Option<&str>,
+    ms: u32,
+) -> Vec<Step> {
+    vec![
+        Step::Emit(started(id, kind, title, Some(input), parent)),
+        Step::Wait(ms),
+        Step::Emit(completed(id, status, output, error)),
+        Step::Wait(120),
+    ]
+}
+
+const ANSWER: &str = "## Atomic config writes\n\n\
+The loader now writes through a **temp file in the same directory**, calls `sync_all`, and \
+renames it over the old file, so a crash can never leave a half-written config.\n\n\
+What changed:\n\n\
+1. `save()` goes through a new `write_atomic()` helper.\n\
+2. The temp file is created `0600`, so secrets in the config are never world-readable.\n\
+3. A failed rename removes the temp file instead of leaving litter behind.\n\n\
+```rust\nfn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {\n    \
+let dir = path.parent().unwrap_or(Path::new(\".\"));\n    \
+let mut tmp = tempfile::NamedTempFile::new_in(dir)?;\n    \
+tmp.write_all(bytes)?;\n    tmp.as_file().sync_all()?;\n    \
+tmp.persist(path).map_err(|e| e.error)?;\n    Ok(())\n}\n```\n\n\
+| Check | Result |\n|---|---|\n| `cargo test -p agent-kit` | 48 passed |\n| clippy | clean |\n\n\
+> The one place that still writes in place is the **legacy migration**; it runs once and is \
+covered by `migration_is_atomic`.\n\n\
+See the [Rust docs on `File::sync_all`](https://doc.rust-lang.org/std/fs/struct.File.html#method.sync_all) \
+for why the sync comes before the rename.";
+
+fn script() -> Vec<Step> {
+    let mut s = vec![
+        Step::Emit(Envelope::new(Event::SessionStarted {
+            native_id: "demo-session".into(),
+            model: Some("claude-opus-5-5".into()),
+            cwd: Some("~/git/agent-terminal".into()),
+        })),
+        Step::Emit(Envelope::new(Event::ModeChanged { mode: Mode::Ask })),
+        Step::Emit(Envelope::new(Event::UsageUpdated {
+            used: 18_400,
+            max: Some(200_000),
+            auto_compact_at: Some(160_000),
+        })),
+        Step::Emit(started("u1", ItemKind::UserMessage, "", None, None)),
+        Step::Emit(snapshot(
+            "u1",
+            StreamKind::Assistant,
+            "Make config writes atomic, and add a test that proves a crash mid-write can't corrupt it.",
+        )),
+        Step::SetRunning(true),
+        Step::Emit(Envelope::new(Event::TurnStarted {
+            model: Some("claude-opus-5-5".into()),
+        })),
+        Step::Wait(200),
+        Step::Emit(started("th1", ItemKind::Reasoning, "", None, None)),
+    ];
+    s.extend(stream(
+        "th1",
+        StreamKind::Reasoning,
+        "The user wants atomic writes. First find every place the config is written, then \
+         replace in-place writes with temp-file + rename. A test can simulate a crash by \
+         dropping the temp file before persist.",
+        5,
+        25,
+    ));
+    s.push(Step::Emit(completed(
+        "th1",
+        ItemStatus::Completed,
+        None,
+        None,
+    )));
+    s.push(Step::Emit(started(
+        "a1",
+        ItemKind::AssistantMessage,
+        "",
+        None,
+        None,
+    )));
+    s.extend(stream(
+        "a1",
+        StreamKind::Assistant,
+        "I'll start by finding every place the config is written.",
+        4,
+        30,
+    ));
+    s.push(Step::Emit(completed(
+        "a1",
+        ItemStatus::Completed,
+        None,
+        None,
+    )));
+    // A completed Codex-style web-search card: its action is shown as the query, not an empty
+    // search glyph. The live adapter normalises action.queries into this shape.
+    s.extend(tool(
+        "t-web",
+        ItemKind::WebSearch,
+        "Rust atomic file replace guarantees",
+        json!({"query": "Rust atomic file replace guarantees"}),
+        None,
+        ItemStatus::Completed,
+        Some("Rust documentation and platform notes found."),
+        None,
+        250,
+    ));
+    s.push(Step::Emit(Envelope::new(Event::PlanUpdated {
+        steps: vec![
+            PlanStep {
+                text: "Find every config writer".into(),
+                status: StepStatus::InProgress,
+            },
+            PlanStep {
+                text: "Route writes through write_atomic()".into(),
+                status: StepStatus::Pending,
+            },
+            PlanStep {
+                text: "Add a crash-safety test".into(),
+                status: StepStatus::Pending,
+            },
+        ],
+    })));
+    // A subagent with nested tool cards.
+    s.push(Step::Emit(started(
+        "task1",
+        ItemKind::Subagent,
+        "Explore",
+        Some(json!({"description": "Find every config writer", "subagent_type": "Explore"})),
+        None,
+    )));
+    s.extend(tool(
+        "t-grep",
+        ItemKind::Command,
+        "Bash",
+        json!({"command": "rg -n 'fs::write|File::create' src/"}),
+        Some("task1"),
+        ItemStatus::Completed,
+        Some("src/config.rs:412:    fs::write(&path, toml)?;\nsrc/config.rs:977:    let mut f = File::create(&legacy)?;"),
+        None,
+        350,
+    ));
+    s.extend(tool(
+        "t-read",
+        ItemKind::FileRead,
+        "Read",
+        json!({"file_path": "src/config.rs"}),
+        Some("task1"),
+        ItemStatus::Completed,
+        Some("1180 lines"),
+        None,
+        250,
+    ));
+    s.push(Step::Emit(completed(
+        "task1",
+        ItemStatus::Completed,
+        Some("Two writers: Config::save (src/config.rs:412) and the legacy migration (src/config.rs:977)."),
+        None,
+    )));
+    s.push(Step::Emit(Envelope::new(Event::PlanUpdated {
+        steps: vec![
+            PlanStep {
+                text: "Find every config writer".into(),
+                status: StepStatus::Completed,
+            },
+            PlanStep {
+                text: "Route writes through write_atomic()".into(),
+                status: StepStatus::InProgress,
+            },
+            PlanStep {
+                text: "Add a crash-safety test".into(),
+                status: StepStatus::Pending,
+            },
+        ],
+    })));
+    // An approval that the "user" answers.
+    s.push(Step::Emit(
+        Envelope::new(Event::ApprovalRequested {
+            tool: "Edit".into(),
+            title: Some("Edit src/config.rs".into()),
+            input: json!({"file_path": "src/config.rs", "old_string": "fs::write(&path, toml)?;", "new_string": "write_atomic(&path, toml.as_bytes())?;"}),
+            reason: Some("Ask mode: edits need your approval.".into()),
+            options: vec![Decision::Allow, Decision::AllowForSession, Decision::Deny],
+            response: ResponseCapability::Live,
+            remembers: None,
+        })
+        .request("ap1"),
+    ));
+    s.push(Step::Wait(700));
+    s.push(Step::Emit(
+        Envelope::new(Event::ApprovalResolved {
+            decision: Decision::AllowForSession,
+        })
+        .request("ap1"),
+    ));
+    s.extend(tool(
+        "t-edit",
+        ItemKind::FileChange,
+        "Edit",
+        json!({"file_path": "src/config.rs", "old_string": "fs::write(&path, toml)?;", "new_string": "write_atomic(&path, toml.as_bytes())?;"}),
+        None,
+        ItemStatus::Completed,
+        Some("@@ -409,7 +409,7 @@\n-    fs::write(&path, toml)?;\n+    write_atomic(&path, toml.as_bytes())?;"),
+        None,
+        300,
+    ));
+    s.extend(tool(
+        "t-env",
+        ItemKind::FileChange,
+        "Write",
+        json!({"file_path": ".env"}),
+        None,
+        ItemStatus::Declined,
+        None,
+        Some("The user denied writing .env."),
+        200,
+    ));
+    s.extend(tool(
+        "t-test",
+        ItemKind::Command,
+        "Bash",
+        json!({"command": "cargo test -p agent-kit config::"}),
+        None,
+        ItemStatus::Failed,
+        Some("running 12 tests\ntest config::tests::save_is_atomic ... FAILED\n\nfailures:\n    tempfile not found in scope"),
+        Some("exit status 101"),
+        450,
+    ));
+    s.extend(tool(
+        "t-mcp",
+        ItemKind::McpTool,
+        "git · diff",
+        json!({"path": "src/config.rs"}),
+        None,
+        ItemStatus::Completed,
+        Some("1 file changed, 24 insertions(+), 3 deletions(-)"),
+        None,
+        200,
+    ));
+    s.push(Step::Emit(started(
+        "a2",
+        ItemKind::AssistantMessage,
+        "",
+        None,
+        None,
+    )));
+    s.extend(stream("a2", StreamKind::Assistant, ANSWER, 5, 22));
+    s.push(Step::Emit(completed(
+        "a2",
+        ItemStatus::Completed,
+        None,
+        None,
+    )));
+    s.push(Step::Emit(Envelope::new(Event::PlanUpdated {
+        steps: vec![
+            PlanStep {
+                text: "Find every config writer".into(),
+                status: StepStatus::Completed,
+            },
+            PlanStep {
+                text: "Route writes through write_atomic()".into(),
+                status: StepStatus::Completed,
+            },
+            PlanStep {
+                text: "Add a crash-safety test".into(),
+                status: StepStatus::InProgress,
+            },
+        ],
+    })));
+    s.push(Step::SetRunning(false));
+    s.push(Step::Emit(turn_done(TurnState::Completed, None)));
+    s.push(Step::Emit(Envelope::new(Event::UsageUpdated {
+        used: 64_210,
+        max: Some(200_000),
+        auto_compact_at: Some(160_000),
+    })));
+    s.push(Step::Wait(300));
+    s.push(Step::Emit(Envelope::new(Event::Compacted {
+        manual: true,
+        before: 21_478,
+        after: Some(2_082),
+    })));
+    s.push(Step::Emit(Envelope::new(Event::ModelChanged {
+        model: "claude-sonnet-5-5".into(),
+    })));
+    s.push(Step::Emit(Envelope::new(Event::Notice {
+        text: "Set model to claude-sonnet-5-5".into(),
+    })));
+    s.push(Step::Emit(Envelope::new(Event::RateLimited {
+        resets_at: Some("16:00".into()),
+        detail: None,
+    })));
+    // A question.
+    s.push(Step::Emit(started(
+        "u2",
+        ItemKind::UserMessage,
+        "",
+        None,
+        None,
+    )));
+    s.push(Step::Emit(snapshot(
+        "u2",
+        StreamKind::Assistant,
+        "Ask me before you pick a test approach.",
+    )));
+    s.push(Step::Emit(
+        Envelope::new(Event::QuestionRequested {
+            source: Default::default(),
+            questions: vec![
+                Question {
+                    id: "q1".into(),
+                    header: "Approach".into(),
+                    question: "How should the crash be simulated?".into(),
+                    options: vec![
+                        QuestionOption {
+                            label: "Drop before persist".into(),
+                            description: Some("Fast, no processes".into()),
+                        },
+                        QuestionOption {
+                            label: "Kill a child process".into(),
+                            description: Some("Closest to a real crash".into()),
+                        },
+                    ],
+                    multi_select: false,
+                },
+                Question {
+                    id: "q2".into(),
+                    header: "Coverage".into(),
+                    question: "Which writers should the test cover?".into(),
+                    options: vec![
+                        QuestionOption {
+                            label: "Config::save".into(),
+                            description: None,
+                        },
+                        QuestionOption {
+                            label: "Legacy migration".into(),
+                            description: None,
+                        },
+                        QuestionOption {
+                            label: "Theme export".into(),
+                            description: None,
+                        },
+                    ],
+                    multi_select: true,
+                },
+            ],
+        })
+        .request("qq1"),
+    ));
+    s.push(Step::Wait(400));
+    // Provider switch to agy, a reply, then a failing turn and a pending approval.
+    s.push(Step::SetDriver(
+        Driver::Agy,
+        Some("gemini-3.1-pro-high".into()),
+    ));
+    s.push(Step::Emit(Envelope::new(Event::SessionStarted {
+        native_id: "agy-conv".into(),
+        model: Some("gemini-3.1-pro-high".into()),
+        cwd: None,
+    })));
+    s.push(Step::Emit(started(
+        "u3",
+        ItemKind::UserMessage,
+        "",
+        None,
+        None,
+    )));
+    s.push(Step::Emit(snapshot(
+        "u3",
+        StreamKind::Assistant,
+        "Clean the build directory, then summarise what's left to do.",
+    )));
+    s.push(Step::SetRunning(true));
+    s.push(Step::Emit(Envelope::new(Event::TurnStarted {
+        model: None,
+    })));
+    s.push(Step::Emit(started(
+        "a3",
+        ItemKind::AssistantMessage,
+        "",
+        None,
+        None,
+    )));
+    s.extend(stream(
+        "a3",
+        StreamKind::Assistant,
+        "Picking up from the handoff: the atomic writer is in, and the **crash-safety test** is \
+         still open. I'll clean `target/` first.",
+        4,
+        30,
+    ));
+    s.push(Step::Emit(completed(
+        "a3",
+        ItemStatus::Completed,
+        None,
+        None,
+    )));
+    s.push(Step::Emit(
+        Envelope::new(Event::ApprovalRequested {
+            tool: "run_command".into(),
+            title: Some("Run cargo clean".into()),
+            input: json!({"CommandLine": "cargo clean", "Cwd": "~/git/agent-terminal"}),
+            reason: None,
+            options: vec![
+                Decision::Allow,
+                Decision::AllowForSession,
+                Decision::AllowAlways,
+                Decision::Deny,
+                Decision::Cancel,
+            ],
+            response: ResponseCapability::Live,
+            remembers: Some("“Always allow” saves: `cargo clean` in ~/git/agent-terminal".into()),
+        })
+        .request("ap2"),
+    ));
+    s.push(Step::SetRunning(false));
+    s.push(Step::Emit(turn_done(
+        TurnState::Failed,
+        Some("agy: quota exhausted for gemini-3.1-pro (resets 16:00)"),
+    )));
+    s
+}
+
+/// Reproducible worker-wait scene with no processes, accounts or filesystem changes.
+fn diff_review_script() -> Vec<Step> {
+    vec![
+        Step::Emit(Envelope::new(Event::TurnStarted { model: None })),
+        Step::Emit(started("demo-diff-intro", ItemKind::AssistantMessage, "", None, None)),
+        Step::Emit(snapshot("demo-diff-intro", StreamKind::Assistant, "The two edits below use one **Show changes** disclosure. Raw tool details remain separate.")),
+        Step::Emit(completed("demo-diff-intro", ItemStatus::Completed, None, None)),
+        Step::Emit(started("demo-edit", ItemKind::FileChange, "src/config.rs (+1 more)", Some(json!([
+            {"path":"src/config.rs","kind":{"type":"update"},"diff":"@@ -1 +1 @@\n-fs::write(&path, toml)?;\n+write_atomic(&path, toml.as_bytes())?;\n"},
+            {"path":"src/config_test.rs","kind":{"type":"update"},"diff":"@@ -1 +1 @@\n-assert!(path.exists());\n+assert_eq!(read_config(&path)?, expected);\n"}
+        ])), None)),
+        Step::Emit(completed("demo-edit", ItemStatus::Completed, None, None)),
+        Step::Emit(Envelope::turn_completed(TurnState::Completed, None)),
+    ]
+}
+
+/// `AGENT_TERMINAL_DEMO_SCENE=requests`: a Codex turn stopped on a permission request, a form
+/// and a sign-in link, each left open to read and try. `requests-risky` swaps the request for
+/// one that reaches the whole filesystem and one the card cannot read, for the same review.
+fn requests_script(risky: bool) -> Vec<Step> {
+    use agent_core::form::{ChoiceOption, FieldInput, Form, FormField};
+    let options = |labels: &[&str]| -> Vec<ChoiceOption> {
+        labels
+            .iter()
+            .map(|l| ChoiceOption {
+                value: l.to_lowercase().replace(' ', "-"),
+                label: (*l).to_owned(),
+            })
+            .collect()
+    };
+    let field = |name: &str, title: Option<&str>, about: Option<&str>, required, input| FormField {
+        name: name.into(),
+        title: title.map(str::to_owned),
+        description: about.map(str::to_owned),
+        required,
+        input,
+    };
+    let mut s = vec![
+        Step::SetDriver(Driver::Codex, Some("gpt-5-codex".into())),
+        Step::Emit(Envelope::new(Event::SessionStarted {
+            native_id: "codex-requests".into(),
+            model: Some("gpt-5-codex".into()),
+            cwd: None,
+        })),
+        Step::Emit(started("rq-user", ItemKind::UserMessage, "", None, None)),
+        Step::Emit(snapshot(
+            "rq-user",
+            StreamKind::Assistant,
+            "Set up the release build, create the repository and sign in to the registry.",
+        )),
+        Step::SetRunning(true),
+        Step::Emit(Envelope::new(Event::TurnStarted { model: None })),
+        Step::Emit(started(
+            "rq-reply",
+            ItemKind::AssistantMessage,
+            "",
+            None,
+            None,
+        )),
+        Step::Emit(snapshot(
+            "rq-reply",
+            StreamKind::Assistant,
+            "Three things need you before I can go on: the build wants to write outside the \
+             project, the **github** tool server wants some details, and the registry wants you \
+             to sign in.",
+        )),
+        Step::Emit(completed("rq-reply", ItemStatus::Completed, None, None)),
+    ];
+    let permission = if risky {
+        json!({
+            "cwd": "~/git/agent-terminal", "reason": "Clean every stale build output",
+            "renderable": true, "session_allowed": false,
+            "warning": "This includes your home folder.",
+            "entries": [
+                {"access": "write", "target": {"kind": "special", "name": "root", "path": null}},
+                {"access": "deny", "target": {"kind": "path", "path": "~/.ssh"}}
+            ],
+            "network": null, "requested": {}
+        })
+    } else {
+        json!({
+            "cwd": "~/git/agent-terminal", "reason": "The release build keeps its cache outside the project",
+            "renderable": true, "session_allowed": true, "warning": null,
+            "entries": [
+                {"access": "write", "target": {"kind": "path", "path": "~/.cache/agent-terminal-build"}},
+                {"access": "write", "target": {"kind": "special", "name": "slash_tmp", "path": null}},
+                {"access": "read", "target": {"kind": "glob", "pattern": "~/git/shared-assets/**/*.svg"}},
+                {"access": "deny", "target": {"kind": "path", "path": "~/git/agent-terminal/.git"}}
+            ],
+            "network": true, "requested": {}
+        })
+    };
+    let (title, options_of) = if risky {
+        (
+            "Codex asks to write to 1 place",
+            vec![Decision::Allow, Decision::Deny, Decision::Cancel],
+        )
+    } else {
+        (
+            "Codex asks to write to 2 places, read 1 place and use the network",
+            vec![
+                Decision::Allow,
+                Decision::AllowForSession,
+                Decision::Deny,
+                Decision::Cancel,
+            ],
+        )
+    };
+    s.push(Step::Emit(
+        Envelope::new(Event::ApprovalRequested {
+            tool: "codex_permissions".into(),
+            title: Some(title.into()),
+            input: permission,
+            reason: None,
+            options: options_of,
+            response: ResponseCapability::Live,
+            remembers: None,
+        })
+        .request("rq-permission"),
+    ));
+    if risky {
+        s.push(Step::Emit(
+            Envelope::new(Event::ApprovalRequested {
+                tool: "codex_permissions".into(),
+                title: Some("Codex asks for extra permissions".into()),
+                input: json!({
+                    "cwd": "~/git/agent-terminal", "renderable": false,
+                    "entries": [{"access": "read", "target": {"kind": "future-kind"}}],
+                    "requested": {"fileSystem": {"entries": [{"access": "read", "path": {"type": "future-kind"}}]}}
+                }),
+                reason: Some("A newer Codex described this in a way agent-terminal does not know".into()),
+                options: vec![Decision::Deny, Decision::Cancel],
+                response: ResponseCapability::Live,
+                remembers: None,
+            })
+            .request("rq-unreadable"),
+        ));
+    }
+    s.push(Step::Emit(
+        Envelope::new(Event::FormRequested {
+            server: "github".into(),
+            message: "I need a few details to create the repository.".into(),
+            form: Form::Fields {
+                fields: vec![
+                    field(
+                        "repo_name",
+                        None,
+                        Some("Lowercase letters, digits and dashes."),
+                        true,
+                        FieldInput::Text {
+                            format: None,
+                            min_length: Some(3),
+                            max_length: Some(40),
+                            default: None,
+                        },
+                    ),
+                    field(
+                        "visibility",
+                        None,
+                        None,
+                        true,
+                        FieldInput::Choice {
+                            options: options(&["Public", "Private", "Internal"]),
+                            multi: false,
+                            min_items: None,
+                            max_items: None,
+                            default: Vec::new(),
+                        },
+                    ),
+                    field(
+                        "license",
+                        None,
+                        None,
+                        false,
+                        FieldInput::Choice {
+                            options: options(&[
+                                "MIT",
+                                "Apache 2.0",
+                                "GPL 3",
+                                "LGPL 3",
+                                "BSD 2",
+                                "BSD 3",
+                                "MPL 2.0",
+                                "Unlicense",
+                            ]),
+                            multi: false,
+                            min_items: None,
+                            max_items: None,
+                            default: Vec::new(),
+                        },
+                    ),
+                    field(
+                        "topics",
+                        None,
+                        None,
+                        false,
+                        FieldInput::Choice {
+                            options: options(&["GTK", "Rust", "Terminal", "AI", "Packaging"]),
+                            multi: true,
+                            min_items: Some(1),
+                            max_items: Some(3),
+                            default: Vec::new(),
+                        },
+                    ),
+                    field(
+                        "initial_commit",
+                        Some("Create an initial commit"),
+                        None,
+                        false,
+                        FieldInput::Boolean { default: None },
+                    ),
+                    field(
+                        "team_size",
+                        None,
+                        None,
+                        false,
+                        FieldInput::Number {
+                            integer: true,
+                            minimum: Some(1.0),
+                            maximum: Some(50.0),
+                            default: None,
+                        },
+                    ),
+                ],
+            },
+        })
+        .request("rq-form"),
+    ));
+    s.push(Step::Emit(
+        Envelope::new(Event::FormRequested {
+            server: "registry".into(),
+            message: "Sign in to publish the package.".into(),
+            form: Form::Link {
+                url: if risky {
+                    "http://192.0.2.50:8080/device?user_code=WXYZ-1234".into()
+                } else {
+                    "https://registry.example.com/login/device?user_code=WXYZ-1234".into()
+                },
+            },
+        })
+        .request("rq-link"),
+    ));
+    s
+}
+
+/// `AGENT_TERMINAL_DEMO_SCENE=queue`: a turn still running, two prompts waiting behind it
+/// (one long), and the reply growing above them. The queue stays pinned under the reply.
+fn queue_script() -> Vec<Step> {
+    let queued = |id: &str, text: &str| {
+        [
+            Step::Emit(started(
+                id,
+                ItemKind::UserMessage,
+                "queued",
+                Some(json!({"queued": true})),
+                None,
+            )),
+            Step::Emit(snapshot(id, StreamKind::Assistant, text)),
+        ]
+    };
+    let mut s = vec![
+        Step::Emit(Envelope::new(Event::TurnStarted { model: None })),
+        Step::Emit(started(
+            "queue-reply",
+            ItemKind::AssistantMessage,
+            "",
+            None,
+            None,
+        )),
+        Step::Emit(snapshot(
+            "queue-reply",
+            StreamKind::Assistant,
+            "Working through the first request. Your next prompts are queued below.",
+        )),
+        Step::SetRunning(true),
+    ];
+    s.extend(queued("queue-1", "Then run the full test suite."));
+    s.extend(queued(
+        "queue-2",
+        &format!(
+            "After that, summarise every change {}.",
+            "in detail ".repeat(30)
+        ),
+    ));
+    s.push(Step::Emit(snapshot(
+        "queue-reply",
+        StreamKind::Assistant,
+        "Working through the first request. Your next prompts are queued below.\n\nStill going: the reply keeps growing while the queue stays pinned under it.",
+    )));
+    s
+}
+
+/// `AGENT_TERMINAL_DEMO_SCENE=git`: a Claude turn stopped on git and GitHub CLI approvals, each
+/// read as its operation: a commit with a heredoc message, a plain push, a force push and a pull
+/// request.
+fn git_script() -> Vec<Step> {
+    let ask = |id: &str, command: &str| {
+        Step::Emit(
+            Envelope::new(Event::ApprovalRequested {
+                tool: "Bash".into(),
+                title: None,
+                input: json!({"command": command}),
+                reason: None,
+                options: vec![
+                    Decision::Allow,
+                    Decision::AllowForSession,
+                    Decision::AllowAlways,
+                    Decision::Deny,
+                ],
+                response: ResponseCapability::Live,
+                remembers: None,
+            })
+            .request(id),
+        )
+    };
+    vec![
+        Step::Emit(started("git-user", ItemKind::UserMessage, "", None, None)),
+        Step::Emit(snapshot(
+            "git-user",
+            StreamKind::Assistant,
+            "Commit the config fix, push it and open the pull request.",
+        )),
+        Step::SetRunning(true),
+        Step::Emit(Envelope::new(Event::TurnStarted { model: None })),
+        ask(
+            "git-commit",
+            "git commit -m \"$(cat <<'EOF'\nfix(config): write settings atomically\n\nA crash \
+             mid-write left a truncated config.json.\nEOF\n)\"",
+        ),
+        ask("git-push", "git push -u origin fix/atomic-config"),
+        ask("git-force", "git push --force origin main"),
+        ask(
+            "gh-pr",
+            "gh pr create --title \"fix(config): write settings atomically\" --body \"Closes \
+             #42\" --base master --draft",
+        ),
+    ]
+}
+
+/// The queue scene's envelopes at once (tests).
+#[cfg(test)]
+pub fn queue_envelopes() -> Vec<Envelope> {
+    queue_script()
+        .into_iter()
+        .filter_map(|step| match step {
+            Step::Emit(env) => Some(env),
+            _ => None,
+        })
+        .collect()
+}
+
+fn codex_worker_script() -> Vec<Step> {
+    use agent_core::event::{WorkerSnapshot, WorkerState};
+    let workers = vec![
+        WorkerSnapshot {
+            id: "demo-designer".into(),
+            name: Some("Mira".into()),
+            task: Some("Review composer controls and spacing".into()),
+            state: WorkerState::Running,
+            activity: Some("Inspecting the file-change card".into()),
+            delegation: None,
+        },
+        WorkerSnapshot {
+            id: "demo-accessibility".into(),
+            name: Some("Ellis".into()),
+            task: Some("Check keyboard focus and readable text".into()),
+            state: WorkerState::Running,
+            activity: None,
+            delegation: None,
+        },
+        WorkerSnapshot {
+            id: "demo-engineer".into(),
+            name: Some("Rowan".into()),
+            task: Some("Trace Codex worker events".into()),
+            state: WorkerState::Completed,
+            activity: Some("Worker IDs and lifecycle verified".into()),
+            delegation: None,
+        },
+        WorkerSnapshot {
+            id: "demo-closed".into(),
+            name: Some("Previous reviewer".into()),
+            task: Some("Review the earlier implementation".into()),
+            state: WorkerState::Closed,
+            activity: None,
+            delegation: None,
+        },
+    ];
+    vec![
+        Step::SetDriver(Driver::Codex, Some("demo-model".into())),
+        Step::SetRunning(true),
+        Step::Emit(Envelope::new(Event::SessionStarted { native_id: "demo-codex".into(), model: Some("demo-model".into()), cwd: Some("~/projects/demo".into()) })),
+        Step::Emit(Envelope::new(Event::TurnStarted { model: Some("demo-model".into()) })),
+        Step::Emit(started("worker-demo-prompt", ItemKind::UserMessage, "", None, None)),
+        Step::Emit(snapshot("worker-demo-prompt", StreamKind::Assistant, "Review the application with the designer leading.")),
+        Step::Emit(started("worker-demo-response", ItemKind::AssistantMessage, "", None, None)),
+        Step::Emit(snapshot("worker-demo-response", StreamKind::Assistant, "I’m waiting for **Mira** and **Ellis** to finish their reviews. **Rowan** has completed the protocol check; the earlier reviewer is closed.")),
+        Step::Emit(completed("worker-demo-response", ItemStatus::Completed, None, None)),
+        Step::Emit(Envelope::new(Event::WorkersUpdated { workers, waiting_for: vec!["demo-designer".into(), "demo-accessibility".into()] })),
+    ]
+}
+
+/// One stress item (several envelopes): user, assistant, tool and reasoning in rotation.
+fn stress_item(i: usize) -> Vec<Envelope> {
+    let id = format!("s{i}");
+    match i % 4 {
+        0 => vec![
+            started(&id, ItemKind::UserMessage, "", None, None),
+            snapshot(
+                &id,
+                StreamKind::Assistant,
+                &format!("Stress prompt number {i}"),
+            ),
+        ],
+        1 => vec![
+            started(&id, ItemKind::AssistantMessage, "", None, None),
+            snapshot(
+                &id,
+                StreamKind::Assistant,
+                &format!("Reply **{i}** with `code` and a list:\n\n- one\n- two"),
+            ),
+            completed(&id, ItemStatus::Completed, None, None),
+        ],
+        2 => vec![
+            started(
+                &id,
+                ItemKind::Command,
+                "Bash",
+                Some(json!({"command": format!("echo {i}")})),
+                None,
+            ),
+            completed(&id, ItemStatus::Completed, Some(&i.to_string()), None),
+        ],
+        _ => vec![
+            started(&id, ItemKind::Reasoning, "", None, None),
+            snapshot(&id, StreamKind::Reasoning, "Thinking about the next step."),
+            completed(&id, ItemStatus::Completed, None, None),
+        ],
+    }
+}
+
+/// `agent-terminal --chat-demo`: a window holding only a [`ChatView`] on the demo backend.
+pub fn run() -> glib::ExitCode {
+    let app = adw::Application::builder()
+        .application_id("ca.nuvek.AgentTerminal.ChatDemo")
+        .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.connect_activate(|app| {
+        crate::icons::register();
+        // The app's own colours (and dark scheme), as a window gets them, so the demo looks
+        // like the app it stands in for.
+        crate::palette::apply(crate::config::ThemeChoice::default());
+        // Every agent installed, as the scripted threads assume: the usage indicator lists only
+        // ready agents, and would otherwise stay empty.
+        for driver in Driver::ALL {
+            crate::availability::AgentAvailability::shared().set(
+                driver,
+                crate::availability::Availability::Ready("/usr/bin/agent".into()),
+            );
+        }
+        let backend = demo_backend();
+        let view = ChatView::new(backend.clone());
+        backend.connect(view.sink());
+        view.set_model_source(Rc::new(DemoModels));
+        view.set_account_status(demo_account_status());
+        configure_demo_view(&view);
+        view.connect_action(|action| tracing::info!(?action, "chat demo: view action"));
+
+        let toolbar = adw::ToolbarView::new();
+        let header = adw::HeaderBar::new();
+        header.set_title_widget(Some(&adw::WindowTitle::new(
+            "Atomic config writes",
+            "~/git/agent-terminal",
+        )));
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&view));
+
+        let window = adw::ApplicationWindow::builder()
+            .application(app)
+            .title("Agent Terminal: chat demo")
+            .default_width(1000)
+            .default_height(860)
+            .content(&toolbar)
+            .build();
+        window.present();
+        view.focus_composer();
+
+        let stress = std::env::var("AGENT_TERMINAL_DEMO_STRESS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        if stress > 0 {
+            view.replay(&DemoBackend::stress_history(stress));
+        }
+        // A short pause so the window is on screen (and a remote display attached) before the
+        // script streams.
+        glib::timeout_add_local_once(Duration::from_millis(1500), move || backend.play_script());
+    });
+    // GApplication must not see `--chat-demo` (it would reject an unknown option).
+    let argv0 = std::env::args()
+        .next()
+        .unwrap_or_else(|| "agent-terminal".into());
+    app.run_with_args(&[argv0])
+}
+
+/// Whether the window should run on [`seed_demo_threads`]' store (`AGENT_TERMINAL_DEMO_THREADS`
+/// set and not blank). Tests always run on an in-memory store of their own.
+#[cfg(not(test))]
+pub fn demo_threads_requested() -> bool {
+    std::env::var("AGENT_TERMINAL_DEMO_THREADS").is_ok_and(|v| !v.trim().is_empty())
+}
+
+/// The demo's threads: (agent, folder under the home folder, title, minutes ago), newest first.
+/// The first is the one the script's conversation fits (it starts on Claude).
+const DEMO_THREADS: [(Driver, &str, &str, i64); 7] = [
+    (
+        Driver::Claude,
+        "projects/agent-terminal",
+        "Atomic config writes",
+        0,
+    ),
+    (
+        Driver::Claude,
+        "projects/agent-terminal",
+        "Sidebar badges for rate limits",
+        25,
+    ),
+    (
+        Driver::Codex,
+        "projects/acme-api",
+        "Paginate the orders endpoint",
+        70,
+    ),
+    (
+        Driver::Claude,
+        "projects/acme-api",
+        "Fix the flaky checkout test",
+        190,
+    ),
+    (
+        Driver::Agy,
+        "projects/weather-cli",
+        "Add a --units flag",
+        1_500,
+    ),
+    (
+        Driver::Claude,
+        "projects/weather-cli",
+        "Cache API responses for ten minutes",
+        2_900,
+    ),
+    (
+        Driver::Claude,
+        "projects/dotfiles",
+        "Neovim LSP keymaps",
+        5_800,
+    ),
+];
+
+/// Fills an empty (in-memory) store with [`DEMO_THREADS`]. Each has its agent's provider thread
+/// but no native session (nothing to import from the real home) and no events: opening any of
+/// them plays the demo script live ([`play_demo`]). The provider thread is not made active,
+/// which would date the thread "now"; the sidebar takes the agent from it all the same. Folders
+/// are under `home`, so the sidebar shows them as `~/projects/…`.
+pub fn seed_demo_threads(
+    store: &agent_kit::store::Store,
+    home: &str,
+) -> Result<(), agent_kit::store::StoreError> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(0));
+    for (driver, folder, title, minutes) in DEMO_THREADS {
+        let cwd = format!("{}/{folder}", home.trim_end_matches('/'));
+        let thread = store.create_thread_at(&cwd, Some(title), now_ms - minutes * 60_000)?;
+        store.add_provider_thread(&thread, driver.info().key, "default")?;
+    }
+    Ok(())
+}
+
+thread_local! {
+    /// The demo backends playing into thread views, kept for the life of the process (a view
+    /// holds only their sink).
+    static PLAYING: RefCell<Vec<Rc<DemoBackend>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// In the demo window, the backend a thread's view runs on in place of an agent session (no
+/// thread starts an agent; the app's own probes still run); `None` in the real one.
+#[cfg(not(test))]
+pub fn demo_thread_backend() -> Option<Rc<DemoBackend>> {
+    demo_threads_requested().then(demo_backend)
+}
+
+/// Plays the demo script live into `sink`, the view `backend` drives, and keeps the backend for
+/// the life of the process.
+pub fn play_demo(backend: Rc<DemoBackend>, sink: EnvelopeSink) {
+    backend.connect(sink);
+    backend.play_script();
+    PLAYING.with(|p| p.borrow_mut().push(backend));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every approval in the git scene gets a reading, and only the force push is warned about.
+    #[test]
+    fn the_git_scene_reads_every_command() {
+        use crate::chat::view::model::{Body, Transcript};
+        let mut t = Transcript::new();
+        for step in git_script() {
+            if let Step::Emit(env) = step {
+                t.apply(&env, Driver::Claude);
+            }
+        }
+        for (id, warned) in [
+            ("git-commit", false),
+            ("git-push", false),
+            ("git-force", true),
+            ("gh-pr", false),
+        ] {
+            let Body::Approval(a) = &t.get(&format!("approval:{id}")).expect(id).body else {
+                panic!("{id} is not an approval");
+            };
+            let reading =
+                crate::chat::view::git_card::reading(&a.tool, &a.input).expect("a reading");
+            assert_eq!(reading.destructive(), warned, "{id}");
+        }
+    }
+
+    /// The request scenes leave a permission request, a form and a link open, all answerable,
+    /// and the risky variant's unreadable request is still only refusable.
+    #[test]
+    fn the_requests_scenes_leave_every_card_open_and_answerable() {
+        use crate::chat::view::model::{Body, FormState, Transcript};
+        for risky in [false, true] {
+            let mut t = Transcript::new();
+            for step in requests_script(risky) {
+                if let Step::Emit(env) = step {
+                    t.apply(&env, Driver::Codex);
+                }
+            }
+            for id in ["form:rq-form", "form:rq-link"] {
+                match &t.get(id).expect("card").body {
+                    Body::Form(f) => assert_eq!(f.state, FormState::Pending, "{id}"),
+                    _ => panic!("{id} is not a form"),
+                }
+            }
+            let permission = match &t.get("approval:rq-permission").expect("card").body {
+                Body::Approval(a) => crate::chat::view::permission::Request::parse(&a.input),
+                _ => panic!("not an approval"),
+            };
+            assert!(permission.renderable);
+            assert_eq!(permission.reaches_everything(), risky);
+            assert_eq!(t.get("approval:rq-unreadable").is_some(), risky);
+        }
+    }
+
+    #[test]
+    fn review_diff_scene_contains_real_in_memory_changes() {
+        let mut found = false;
+        for step in diff_review_script() {
+            if let Step::Emit(Envelope {
+                event:
+                    Event::ItemStarted {
+                        kind: ItemKind::FileChange,
+                        input: Some(input),
+                        ..
+                    },
+                ..
+            }) = step
+            {
+                let shown =
+                    agent_kit::filediff::shown_for_item(None, &input).expect("fixture diff");
+                assert_eq!(shown.files, ["src/config.rs", "src/config_test.rs"]);
+                assert!(shown.text.contains("-fs::write") && shown.text.contains("+write_atomic"));
+                assert_eq!(shown.origin, agent_kit::filediff::Origin::AgentEdit);
+                found = true;
+            }
+        }
+        assert!(
+            found,
+            "review scene must exercise the actual changes loader"
+        );
+    }
+
+    /// The demo store lists every demo thread, newest first, with the scripted one on top (it
+    /// plays live, so it stores nothing); folders sit under the given home.
+    #[test]
+    fn the_demo_store_lists_the_demo_threads() {
+        let store = agent_kit::store::Store::open_in_memory().expect("store");
+        seed_demo_threads(&store, "/home/someone/").expect("seeded");
+        let threads = store.list_threads(false).expect("listed");
+        assert_eq!(threads.len(), DEMO_THREADS.len());
+        assert_eq!(threads[0].title, DEMO_THREADS[0].2);
+        assert!(threads
+            .iter()
+            .all(|t| t.cwd.starts_with("/home/someone/projects/")));
+        assert!(!store.has_messages(&threads[0].id).expect("read"));
+    }
+
+    #[test]
+    fn demo_models_cover_both_agents_and_a_via_route() {
+        let m = DemoModels.models();
+        assert!(m.iter().any(|m| m.driver == Driver::Claude));
+        assert!(m.iter().any(|m| m.driver == Driver::Agy));
+        let via: Vec<_> = m.iter().filter(|m| m.via.is_some()).collect();
+        assert_eq!(via.len(), 3);
+        assert!(via.iter().all(|m| m.driver == Driver::Agy));
+        assert!(m.iter().any(|m| !m.efforts.is_empty()));
+    }
+}

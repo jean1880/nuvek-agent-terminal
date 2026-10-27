@@ -1,0 +1,1023 @@
+//! The sub-agent explorer: a header button listing every sub-agent the thread started (nested ones
+//! included; running ones first) with its live status, and a dialog that shows one of them on its own: what it was
+//! asked, every step it took (the same cards as the transcript) and what it reported.
+//!
+//! Both update in place, like the transcript: the list rebuilds its rows only when the set of
+//! sub-agents changes and otherwise just sets their labels; the panel keeps one widget per step,
+//! adds the steps that are new and updates the ones that changed, so scrolling, selection and
+//! an expanded card survive a running sub-agent. Its cards send their events (expand, approve,
+//! load a diff) through the view's own row sink, exactly like the transcript's.
+
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::{Rc, Weak};
+
+use adw::prelude::AdwDialogExt;
+use gtk4::prelude::*;
+
+use super::cards::{label, wrap_words, wrapping, Row, RowSink};
+#[cfg(test)]
+use super::model::ToolStatus;
+use super::model::{Body, SubagentSummary, Transcript};
+use super::panels::{follow_dialog, padded, popover_list, scrolled};
+use super::transcript::CHILD_CAP;
+
+/// `running`, `done · 12 steps`.
+pub fn status_text(s: &SubagentSummary) -> String {
+    let state = s.state_label();
+    match s.steps {
+        0 => state.to_owned(),
+        1 => format!("{state} · 1 step"),
+        n => format!("{state} · {n} steps"),
+    }
+}
+
+fn provenance_text(value: &agent_core::delegation::identity::ValueProvenance) -> String {
+    use agent_core::delegation::identity::Provenance;
+    match value.source {
+        Provenance::ProviderReported => value.effective.as_deref().unwrap_or("unknown").to_owned(),
+        Provenance::ProviderAccepted => format!(
+            "{} (accepted; effective unknown)",
+            value.requested.as_deref().unwrap_or("unknown")
+        ),
+        Provenance::LaunchConfigured => format!(
+            "{} (configured; effective unknown)",
+            value.requested.as_deref().unwrap_or("unknown")
+        ),
+        Provenance::Unsupported => format!(
+            "{} (unsupported)",
+            value.requested.as_deref().unwrap_or("unknown")
+        ),
+        Provenance::Unknown => "unknown".to_owned(),
+    }
+}
+
+pub(super) fn identity_text(agent: &SubagentSummary) -> String {
+    let provider = agent
+        .driver
+        .map(|driver| driver.info().label)
+        .unwrap_or("Provider unknown");
+    match &agent.delegation {
+        Some(delegation) => format!(
+            "{provider} · {} · model {} · effort {}",
+            match delegation.origin {
+                agent_core::event::WorkerOrigin::Supervised => "supervised",
+                agent_core::event::WorkerOrigin::Native => "native",
+                agent_core::event::WorkerOrigin::Root => "root",
+            },
+            provenance_text(&delegation.model),
+            provenance_text(&delegation.effort)
+        ),
+        // The provider reports the model a native sub-agent runs on, never its effort.
+        None => format!(
+            "{provider} · native · model {} · effort {}",
+            agent
+                .reported_model
+                .clone()
+                .unwrap_or_else(|| requested_text(agent.requested_model.as_deref())),
+            requested_text(agent.requested_effort.as_deref())
+        ),
+    }
+}
+
+/// A value the parent asked for, which the provider never confirmed.
+fn requested_text(value: Option<&str>) -> String {
+    match value {
+        Some(value) => format!("{value} (requested; effective unknown)"),
+        None => "unknown".to_owned(),
+    }
+}
+
+pub(super) fn set_brand(image: &gtk4::Image, driver: Option<agent_core::adapter::Driver>) {
+    // Existing brand CSS tints `.accent-dot` below the provider's enclosing box.
+    let accent_owner = image.parent().unwrap_or_else(|| image.clone().upcast());
+    image.add_css_class("accent-dot");
+    for driver in agent_core::adapter::Driver::ALL {
+        accent_owner.remove_css_class(driver.info().accent_class);
+    }
+    if let Some(driver) = driver {
+        image.set_from_gicon(&crate::icons::driver_icon(driver));
+        accent_owner.add_css_class(driver.info().accent_class);
+        image.set_tooltip_text(Some(driver.info().label));
+        image.set_visible(true);
+    } else {
+        image.set_visible(false);
+    }
+}
+
+/// The explorer's order: running sub-agents first, then the finished ones, each in the order they
+/// began.
+pub fn running_first(agents: &[SubagentSummary]) -> Vec<SubagentSummary> {
+    let mut ordered = agents.to_vec();
+    ordered.sort_by_key(|a| {
+        if a.active() {
+            0
+        } else if a.finished() {
+            2
+        } else {
+            1
+        }
+    });
+    ordered
+}
+
+/// How many of `agents` are active, finished, and neither (status unknown).
+pub(super) fn counts<'a>(
+    agents: impl IntoIterator<Item = &'a SubagentSummary>,
+) -> (usize, usize, usize) {
+    let (mut active, mut finished, mut total) = (0usize, 0usize, 0usize);
+    for agent in agents {
+        total += 1;
+        active += usize::from(agent.active());
+        finished += usize::from(agent.finished());
+    }
+    (active, finished, total.saturating_sub(active + finished))
+}
+
+/// An empty brand mark of `size` pixels, for [`set_brand`] to fill.
+pub(super) fn brand_slot(size: i32) -> gtk4::Image {
+    let image = gtk4::Image::new();
+    image.set_pixel_size(size);
+    image
+}
+
+/// The header button's text: how many sub-agents, and how many of them still run.
+pub fn count_text(agents: &[SubagentSummary]) -> String {
+    let (active, finished, unknown) = counts(agents);
+    let known = format!("{active} active · {finished} finished");
+    if unknown == 0 {
+        known
+    } else {
+        format!("{known} · {unknown} unknown")
+    }
+}
+
+/// The labels of one list row, set in place.
+struct ListRow {
+    row: gtk4::ListBoxRow,
+    name: gtk4::Label,
+    status: gtk4::Label,
+    task: gtk4::Label,
+    identity: gtk4::Label,
+    brand: gtk4::Image,
+}
+
+impl ListRow {
+    fn new() -> (gtk4::ListBoxRow, Self) {
+        let b = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+        b.add_css_class("subagent-row");
+        b.set_margin_top(6);
+        b.set_margin_bottom(6);
+        b.set_margin_start(10);
+        b.set_margin_end(10);
+        let top = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let brand = brand_slot(14);
+        top.append(&brand);
+        let name = label("", &["subagent-name"]);
+        wrapping(&name);
+        // A wrapping label's minimum is one character: without a floor, a narrow list squeezed
+        // `senior-engineer` into a column of letters beside its status.
+        name.set_width_chars(16);
+        name.set_max_width_chars(30);
+        top.append(&name);
+        let status = label("", &["subagent-status", "dim-label"]);
+        top.append(&status);
+        b.append(&top);
+        let task = label("", &["subagent-task", "dim-label"]);
+        task.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        // The list takes its rows' natural width: a long task must not widen it past this.
+        task.set_max_width_chars(48);
+        b.append(&task);
+        let identity = label("", &["dim-label"]);
+        wrap_words(&identity);
+        identity.set_max_width_chars(48);
+        b.append(&identity);
+        let row = gtk4::ListBoxRow::new();
+        row.set_child(Some(&b));
+        (
+            row.clone(),
+            Self {
+                row,
+                name,
+                status,
+                task,
+                identity,
+                brand,
+            },
+        )
+    }
+
+    fn set(&self, agent: &SubagentSummary) {
+        set_if_changed(&self.name, &agent.name);
+        set_brand(&self.brand, agent.driver);
+        set_if_changed(&self.identity, &identity_text(agent));
+        set_if_changed(&self.status, &status_text(agent));
+        set_if_changed(&self.task, agent.task_text());
+        let short_id: String = agent
+            .id
+            .chars()
+            .rev()
+            .take(8)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        self.row.update_property(&[
+            gtk4::accessible::Property::Label(&format!("{}; worker {short_id}", agent.name)),
+            gtk4::accessible::Property::Description(&format!(
+                "{}; {}",
+                status_text(agent),
+                agent.task_text()
+            )),
+        ]);
+    }
+}
+
+/// Leaves a label alone when its text is already right (no relayout while it streams, no lost
+/// selection).
+pub(super) fn set_if_changed(l: &gtk4::Label, text: &str) {
+    if l.text() != text {
+        l.set_text(text);
+    }
+}
+
+/// The header's "Sub-agents" button and its list.
+pub struct SubagentButton {
+    root: gtk4::MenuButton,
+    count: gtk4::Label,
+    list: gtk4::ListBox,
+    popover: gtk4::Popover,
+    /// The ids behind the list's rows, in order, and their labels.
+    rows: RefCell<Vec<(String, ListRow)>>,
+    /// Each row's group, in order: what the list's header function heads them with.
+    groups: Rc<RefCell<Vec<&'static str>>>,
+}
+
+/// The group a sub-agent is listed under.
+fn group(agent: &SubagentSummary) -> &'static str {
+    if agent.active() {
+        "Active"
+    } else if agent.finished() {
+        "History"
+    } else {
+        "Status unknown"
+    }
+}
+
+/// Heads each row that starts a group with its name. A list box places and draws a row's header
+/// only from its header function: one set on the row from outside was never shown, which left
+/// a blank gap above each group.
+fn head_groups(list: &gtk4::ListBox, groups: Rc<RefCell<Vec<&'static str>>>) {
+    list.set_header_func(move |row, before| {
+        let groups = groups.borrow();
+        let at = |row: &gtk4::ListBoxRow| {
+            usize::try_from(row.index())
+                .ok()
+                .and_then(|i| groups.get(i).copied())
+        };
+        let group = at(row).filter(|g| before.and_then(at) != Some(*g));
+        let Some(group) = group else {
+            row.set_header(None::<&gtk4::Widget>);
+            return;
+        };
+        if let Some(heading) = row.header().and_downcast::<gtk4::Label>() {
+            set_if_changed(&heading, group);
+            return;
+        }
+        let heading = gtk4::Label::builder()
+            .label(group)
+            .accessible_role(gtk4::AccessibleRole::Heading)
+            .xalign(0.0)
+            .css_classes(["heading"])
+            .margin_top(10)
+            .margin_bottom(6)
+            .margin_start(10)
+            .build();
+        row.set_header(Some(&heading));
+    });
+}
+
+impl SubagentButton {
+    /// `open` is called with a sub-agent's item id when its row is chosen.
+    pub fn new(open: impl Fn(&str) + 'static) -> Rc<Self> {
+        let root = gtk4::MenuButton::new();
+        root.add_css_class("flat");
+        root.add_css_class("subagent-button");
+        root.set_tooltip_text(Some("Sub-agents this thread started"));
+        let inner = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        inner.append(&gtk4::Image::from_icon_name(crate::icons::SUBAGENT_ICON));
+        let count = label("", &["subagent-count"]);
+        count.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        count.set_max_width_chars(22);
+        inner.append(&count);
+        root.set_child(Some(&inner));
+        root.set_visible(false);
+
+        let (list, popover) = popover_list(420);
+        let groups = Rc::default();
+        head_groups(&list, Rc::clone(&groups));
+        popover.add_css_class("subagent-popover");
+        root.set_popover(Some(&popover));
+
+        let this = Rc::new(Self {
+            root,
+            count,
+            list,
+            popover,
+            rows: RefCell::new(Vec::new()),
+            groups,
+        });
+        let weak = Rc::downgrade(&this);
+        this.list.connect_row_activated(move |_, row| {
+            let Some(this) = weak.upgrade() else { return };
+            let id = usize::try_from(row.index())
+                .ok()
+                .and_then(|i| this.rows.borrow().get(i).map(|(id, _)| id.clone()));
+            if let Some(id) = id {
+                this.popover.popdown();
+                open(&id);
+            }
+        });
+        this
+    }
+
+    pub fn widget(&self) -> &gtk4::MenuButton {
+        &self.root
+    }
+
+    /// Shows the sub-agents it is given, in that order (the view passes all of them, running
+    /// first); hidden while there are none. Rows are rebuilt only when the set or order of
+    /// sub-agents changes; otherwise their labels are set in place.
+    pub fn set(&self, agents: &[SubagentSummary]) {
+        self.root.set_visible(!agents.is_empty());
+        let counts = count_text(agents);
+        set_if_changed(&self.count, &counts);
+        self.root
+            .set_tooltip_text(Some(&format!("Workers: {counts}; show all workers")));
+        self.root
+            .update_property(&[gtk4::accessible::Property::Label(&format!(
+                "Workers: {counts}; show all workers"
+            ))]);
+        // Before any row is added: the list's header function reads it.
+        *self.groups.borrow_mut() = agents.iter().map(group).collect();
+        let same = {
+            let rows = self.rows.borrow();
+            rows.len() == agents.len() && rows.iter().zip(agents).all(|((id, _), a)| *id == a.id)
+        };
+        if !same {
+            let focused = self.list.root().and_then(|r| r.focus()).and_then(|focus| {
+                self.rows
+                    .borrow()
+                    .iter()
+                    .find(|(_, labels)| {
+                        focus.is_ancestor(&labels.row)
+                            || focus == labels.row.clone().upcast::<gtk4::Widget>()
+                    })
+                    .map(|(id, _)| id.clone())
+            });
+            while let Some(child) = self.list.first_child() {
+                self.list.remove(&child);
+            }
+            let mut rows = Vec::with_capacity(agents.len());
+            for agent in agents {
+                let (row, labels) = ListRow::new();
+                self.list.append(&row);
+                rows.push((agent.id.clone(), labels));
+            }
+            *self.rows.borrow_mut() = rows;
+            if let Some(id) = focused {
+                if let Some((_, row)) = self.rows.borrow().iter().find(|(key, _)| *key == id) {
+                    row.row.grab_focus();
+                } else {
+                    self.root.grab_focus();
+                }
+            }
+        }
+        for ((_, labels), agent) in self.rows.borrow().iter().zip(agents) {
+            labels.set(agent);
+        }
+        // The headings follow the groups (a worker finishing moves to History in place).
+        self.list.invalidate_headers();
+    }
+
+    /// Each listed row's status text, in order (tests).
+    #[cfg(test)]
+    pub fn statuses(&self) -> Vec<String> {
+        self.rows
+            .borrow()
+            .iter()
+            .map(|(_, r)| r.status.text().to_string())
+            .collect()
+    }
+
+    /// Whether it shows, its count text and the listed ids (tests).
+    #[cfg(test)]
+    pub fn state(&self) -> (bool, String, Vec<String>) {
+        (
+            self.root.is_visible(),
+            self.count.text().to_string(),
+            self.rows
+                .borrow()
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect(),
+        )
+    }
+}
+
+/// One sub-agent on its own, in a dialog that follows it until closed.
+pub struct SubagentPanel {
+    dialog: adw::Dialog,
+    id: String,
+    sink: RowSink,
+    title: gtk4::Label,
+    status: gtk4::Label,
+    asked: gtk4::Box,
+    asked_text: gtk4::Label,
+    /// Where the sub-agent's own steps go, in order.
+    steps: gtk4::Box,
+    empty: gtk4::Label,
+    reported: gtk4::Box,
+    reported_text: gtk4::Label,
+    error: gtk4::Box,
+    error_text: gtk4::Label,
+    identity: gtk4::Label,
+    controls: gtk4::Box,
+    brand: gtk4::Image,
+    /// One row per step (nested steps included), built once and then updated.
+    rows: RefCell<HashMap<String, Row>>,
+    /// Per list of steps (the sub-agent's, or a card's), keyed by its owner: the index of the
+    /// first step built, and the button that builds the earlier ones. A list builds its newest
+    /// [`CHILD_CAP`] steps when the panel first shows it; later steps are added as they come.
+    earlier: RefCell<HashMap<String, (usize, gtk4::Button)>>,
+    /// Lists whose earlier steps the user asked for.
+    uncapped: RefCell<HashSet<String>>,
+    /// Lists synced at least once.
+    seen: RefCell<HashSet<String>>,
+    /// Brings the panel up to date from its owner's model (see [`Self::set_refresher`]).
+    refresher: RefCell<Option<Rc<dyn Fn()>>>,
+    this: Weak<Self>,
+}
+
+impl SubagentPanel {
+    pub fn new(id: &str, sink: RowSink) -> Rc<Self> {
+        let title = label("", &["subagent-panel-title"]);
+        wrap_words(&title);
+        let status = label("", &["dim-label"]);
+        let head = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+        let title_line = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let brand = brand_slot(18);
+        title_line.append(&brand);
+        title_line.append(&title);
+        head.append(&title_line);
+        head.append(&status);
+        let identity = label("", &["dim-label"]);
+        wrap_words(&identity);
+        head.append(&identity);
+        let controls = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+        head.append(&controls);
+        let body = padded(&head);
+        body.add_css_class("transcript");
+        let (asked, asked_text) = section("Asked to");
+        body.append(&asked);
+        let steps = gtk4::Box::new(gtk4::Orientation::Vertical, 14);
+        body.append(&steps);
+        let empty = label("No steps yet.", &["dim-label"]);
+        body.append(&empty);
+        let (reported, reported_text) = section("Reported");
+        body.append(&reported);
+        let (error, error_text) = section("Error");
+        body.append(&error);
+
+        let scroller = scrolled(&body);
+        // Opens on the sub-agent's latest step and follows it live.
+        super::follow::follow_end(&scroller);
+        let dialog = follow_dialog("", 760, 640, &scroller);
+        Rc::new_cyclic(|this| Self {
+            dialog,
+            id: id.to_owned(),
+            sink,
+            title,
+            status,
+            asked,
+            asked_text,
+            steps,
+            empty,
+            reported,
+            reported_text,
+            error,
+            error_text,
+            identity,
+            controls,
+            brand,
+            rows: RefCell::new(HashMap::new()),
+            earlier: RefCell::new(HashMap::new()),
+            uncapped: RefCell::new(HashSet::new()),
+            seen: RefCell::new(HashSet::new()),
+            refresher: RefCell::new(None),
+            this: this.clone(),
+        })
+    }
+
+    /// How the panel asks its owner for a refresh, once the user asked for earlier steps (the
+    /// panel holds no model of its own).
+    pub(super) fn set_refresher(&self, refresh: impl Fn() + 'static) {
+        *self.refresher.borrow_mut() = Some(Rc::new(refresh));
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn dialog(&self) -> &adw::Dialog {
+        &self.dialog
+    }
+
+    /// Brings the panel up to date: new steps are added, `changed` ones (ids the view flushed)
+    /// are updated, and the header and sections are set in place. Never rebuilds what is there.
+    pub fn refresh(
+        &self,
+        model: &Transcript,
+        summary: Option<&SubagentSummary>,
+        changed: &[String],
+    ) {
+        let Some(item) = model.get(&self.id) else {
+            set_if_changed(&self.status, "This sub-agent is no longer in the thread.");
+            return;
+        };
+        if let Some(s) = summary {
+            if self.dialog.title() != s.name {
+                self.dialog.set_title(&s.name);
+            }
+            set_if_changed(&self.title, &s.name);
+            set_if_changed(&self.status, &status_text(s));
+            set_if_changed(&self.identity, &identity_text(s));
+            set_brand(&self.brand, s.driver);
+        }
+        let Body::Tool(tool) = &item.body else {
+            return;
+        };
+        // An agent launched from the shell was asked through its command line.
+        let launched = super::model::shell_launch(tool).and_then(|launch| launch.task);
+        let prompt = tool
+            .input
+            .as_ref()
+            .and_then(|i| i.get("prompt"))
+            .and_then(serde_json::Value::as_str)
+            .or(launched.as_deref())
+            .unwrap_or("")
+            .trim();
+        set_if_changed(&self.asked_text, prompt);
+        self.asked.set_visible(!prompt.is_empty());
+
+        self.sync_list(model, &self.id, &item.children, &self.steps, changed);
+        self.empty
+            .set_text(if summary.is_some_and(|s| s.lifecycle.is_some()) {
+                "Step telemetry unavailable."
+            } else {
+                "No steps yet."
+            });
+        self.empty.set_visible(item.children.is_empty());
+
+        let report = tool.output.trim();
+        set_if_changed(&self.reported_text, report);
+        self.reported.set_visible(!report.is_empty());
+        let error = tool.error.as_deref().unwrap_or("").trim();
+        set_if_changed(&self.error_text, error);
+        self.error.set_visible(!error.is_empty());
+    }
+
+    /// Adds scoped worker controls above the transcript while reusing every native card.
+    pub(super) fn add_controls(&self, widget: &impl IsA<gtk4::Widget>) {
+        self.controls.append(widget);
+    }
+
+    pub(super) fn reset_steps(&self) {
+        self.rows.borrow_mut().clear();
+        self.earlier.borrow_mut().clear();
+        self.uncapped.borrow_mut().clear();
+        self.seen.borrow_mut().clear();
+        while let Some(child) = self.steps.first_child() {
+            self.steps.remove(&child);
+        }
+    }
+
+    pub(super) fn focus_pending_card(&self, id: &str) {
+        if let Some(row) = self.rows.borrow().get(id) {
+            row.focus_pending_action();
+        }
+    }
+
+    /// A supervised worker owns its own reducer. Its turn/model/usage state never enters the
+    /// root reducer; this panel renders its top-level rows using the identical card builder.
+    pub(super) fn refresh_scoped(
+        &self,
+        model: &Transcript,
+        summary: &SubagentSummary,
+        changed: &[String],
+    ) {
+        self.dialog.set_title(&summary.name);
+        set_if_changed(&self.title, &summary.name);
+        set_if_changed(&self.status, &status_text(summary));
+        set_if_changed(&self.identity, &identity_text(summary));
+        set_brand(&self.brand, summary.driver);
+        self.asked.set_visible(false);
+        self.reported.set_visible(false);
+        self.error.set_visible(false);
+        self.empty.set_text("No activity recorded for this run.");
+        self.empty.set_visible(model.order().is_empty());
+        self.sync_list(model, &self.id, model.order(), &self.steps, changed);
+    }
+
+    /// Syncs the steps `ids` of `key` under `parent`: the first time, only the newest
+    /// [`CHILD_CAP`] of them are built, under a button that builds the rest; once the user asked
+    /// for those, they are built in place above the others.
+    fn sync_list(
+        &self,
+        model: &Transcript,
+        key: &str,
+        ids: &[String],
+        parent: &gtk4::Box,
+        changed: &[String],
+    ) {
+        if self.seen.borrow_mut().insert(key.to_owned()) {
+            let from = ids.len().saturating_sub(CHILD_CAP);
+            if from > 0 && !self.uncapped.borrow().contains(key) {
+                let button = self.earlier_button(key, from);
+                parent.prepend(&button);
+                self.earlier
+                    .borrow_mut()
+                    .insert(key.to_owned(), (from, button));
+            }
+        }
+        let shown = self.earlier.borrow().get(key).cloned();
+        let from = match shown {
+            Some((from, button)) if self.uncapped.borrow().contains(key) => {
+                self.earlier.borrow_mut().remove(key);
+                let mut after: gtk4::Widget = button.clone().upcast();
+                let mut first = None;
+                for id in &ids[..from.min(ids.len())] {
+                    self.sync(model, id, parent, changed);
+                    if let Some(w) = self.rows.borrow().get(id).map(Row::widget) {
+                        parent.reorder_child_after(&w, Some(&after));
+                        first.get_or_insert(w.clone());
+                        after = w;
+                    }
+                }
+                if button.is_focus() {
+                    if let Some(w) = first {
+                        w.child_focus(gtk4::DirectionType::TabForward);
+                    }
+                }
+                parent.remove(&button);
+                from.min(ids.len())
+            }
+            Some((from, _)) => from.min(ids.len()),
+            None => 0,
+        };
+        for id in &ids[from..] {
+            self.sync(model, id, parent, changed);
+        }
+    }
+
+    /// The button above a list's built steps that builds the `count` earlier ones.
+    fn earlier_button(&self, key: &str, count: usize) -> gtk4::Button {
+        let steps = if count == 1 { "step" } else { "steps" };
+        let button = gtk4::Button::with_label(&format!("{count} earlier {steps}"));
+        button.add_css_class("flat");
+        button.add_css_class("earlier-steps");
+        button.set_halign(gtk4::Align::Start);
+        button.set_tooltip_text(Some("Show the steps before these"));
+        button.update_property(&[gtk4::accessible::Property::Label(&format!(
+            "Show {count} earlier {steps}"
+        ))]);
+        let weak = self.this.clone();
+        let key = key.to_owned();
+        button.connect_clicked(move |_| {
+            let Some(panel) = weak.upgrade() else {
+                return;
+            };
+            panel.uncapped.borrow_mut().insert(key.clone());
+            let refresh = panel.refresher.borrow().clone();
+            if let Some(refresh) = refresh {
+                refresh();
+            }
+        });
+        button
+    }
+
+    /// Builds `id` under `parent` the first time it is seen, else updates it when it changed;
+    /// then the same for its own children.
+    fn sync(&self, model: &Transcript, id: &str, parent: &gtk4::Box, changed: &[String]) {
+        let Some(item) = model.get(id) else { return };
+        let built = self.rows.borrow().contains_key(id);
+        if !built {
+            let row = Row::build(item, &self.sink);
+            parent.append(&row.widget());
+            self.rows.borrow_mut().insert(id.to_owned(), row);
+        } else if changed.iter().any(|c| c == id) {
+            if let Some(row) = self.rows.borrow().get(id) {
+                row.update(item);
+            }
+        }
+        let children_box = self
+            .rows
+            .borrow()
+            .get(id)
+            .and_then(|r| r.children_box().cloned());
+        if let Some(children) = children_box {
+            self.sync_list(model, id, &item.children, &children, changed);
+        }
+    }
+
+    /// Hands a computed diff to the panel's copy of a file-change card, when it shows one.
+    pub fn show_diff(&self, id: &str, reply: &crate::chat::DiffReply) {
+        if let Some(Row::Tool(card)) = self.rows.borrow().get(id) {
+            card.show_diff(reply);
+        }
+    }
+
+    /// How many step rows the panel holds, nested ones included (tests).
+    #[cfg(test)]
+    pub fn steps_shown(&self) -> usize {
+        self.rows.borrow().len()
+    }
+
+    /// The same widget is kept for a step across refreshes (tests).
+    #[cfg(test)]
+    pub fn row_widget(&self, id: &str) -> Option<gtk4::Widget> {
+        self.rows.borrow().get(id).map(Row::widget)
+    }
+}
+
+fn section(title: &str) -> (gtk4::Box, gtk4::Label) {
+    let b = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+    b.add_css_class("card-section");
+    b.append(&label(title, &["section-title"]));
+    let body = label("", &["subagent-text"]);
+    wrapping(&body);
+    body.set_selectable(true);
+    body.set_xalign(0.0);
+    b.append(&body);
+    b.set_visible(false);
+    (b, body)
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_and_accepted_identity_never_claim_an_effective_value() {
+        use agent_core::delegation::identity::{Provenance, ValueProvenance};
+        let mut value = ValueProvenance {
+            requested: Some("requested-model".into()),
+            effective: Some("unconfirmed-effective".into()),
+            source: Provenance::LaunchConfigured,
+        };
+        assert_eq!(
+            provenance_text(&value),
+            "requested-model (configured; effective unknown)"
+        );
+        value.source = Provenance::ProviderAccepted;
+        assert_eq!(
+            provenance_text(&value),
+            "requested-model (accepted; effective unknown)"
+        );
+        value.source = Provenance::ProviderReported;
+        assert_eq!(provenance_text(&value), "unconfirmed-effective");
+        value.source = Provenance::Unknown;
+        assert_eq!(provenance_text(&value), "unknown");
+    }
+
+    /// A long sub-agent's panel opens on its newest steps; "earlier steps" builds the rest in
+    /// place above them; steps arriving later are added.
+    pub(crate) fn a_long_sub_agent_opens_on_its_newest_steps() {
+        use agent_core::adapter::Driver;
+        use agent_core::event::{Envelope, ItemKind};
+        let model = Rc::new(RefCell::new(Transcript::new()));
+        let started = |id: &str, kind: ItemKind, parent: Option<&str>| {
+            model.borrow_mut().apply(
+                &Envelope::item_started(id, kind, format!("echo {id}"), None, parent),
+                Driver::Claude,
+            );
+        };
+        started("agent", ItemKind::Subagent, None);
+        for c in 0..100 {
+            started(&format!("c{c}"), ItemKind::Command, Some("agent"));
+        }
+        let panel = SubagentPanel::new("agent", Rc::new(|_| {}));
+        let (weak, shared) = (Rc::downgrade(&panel), model.clone());
+        panel.set_refresher(move || {
+            if let Some(panel) = weak.upgrade() {
+                panel.refresh(&shared.borrow(), None, &[]);
+            }
+        });
+        panel.refresh(&model.borrow(), None, &[]);
+        assert_eq!(panel.steps_shown(), CHILD_CAP);
+        assert!(panel.row_widget("c99").is_some() && panel.row_widget("c59").is_none());
+        started("c100", ItemKind::Command, Some("agent"));
+        panel.refresh(&model.borrow(), None, &[]);
+        assert!(panel.row_widget("c100").is_some(), "a new step is added");
+        let (count, button) = panel
+            .earlier
+            .borrow()
+            .get("agent")
+            .cloned()
+            .expect("button");
+        assert_eq!(count, 100 - CHILD_CAP);
+        assert_eq!(
+            button.label().as_deref(),
+            Some(format!("{count} earlier steps").as_str())
+        );
+        button.emit_clicked();
+        assert_eq!(panel.steps_shown(), 101, "every step, once asked");
+        let order: Vec<gtk4::Widget> = ["c0", "c1", "c60", "c100"]
+            .iter()
+            .filter_map(|id| panel.row_widget(id))
+            .collect();
+        assert_eq!(order.len(), 4);
+        let index = |w: &gtk4::Widget| {
+            let mut n = 0;
+            let mut at = panel.steps.first_child();
+            while let Some(c) = at {
+                if &c == w {
+                    return n;
+                }
+                n += 1;
+                at = c.next_sibling();
+            }
+            usize::MAX
+        };
+        assert!(
+            order.windows(2).all(|p| index(&p[0]) < index(&p[1])),
+            "in order"
+        );
+        assert!(panel.earlier.borrow().is_empty() && !button.is_ancestor(&panel.steps));
+    }
+
+    pub(crate) fn worker_group_updates_without_rebuilding_its_row() {
+        let button = SubagentButton::new(|_| {});
+        let mut worker = agent("same-worker", ToolStatus::Running);
+        button.set(&[worker.clone()]);
+        let first = button.list.row_at_index(0).expect("worker row");
+        let header = || {
+            first
+                .header()
+                .expect("group heading")
+                .downcast::<gtk4::Label>()
+                .expect("heading")
+                .text()
+                .to_string()
+        };
+        assert_eq!(header(), "Active");
+        // In the list, so it is drawn: a header set on a row from outside the list's header
+        // function had no parent and showed as a blank gap.
+        assert_eq!(
+            first.header().and_then(|h| h.parent()).as_ref(),
+            Some(button.list.upcast_ref::<gtk4::Widget>()),
+            "the group heading is placed in the list"
+        );
+        worker.lifecycle = Some(agent_core::event::WorkerState::Completed);
+        button.set(&[worker]);
+        assert_eq!(
+            button.list.row_at_index(0).as_ref(),
+            Some(&first),
+            "the same worker retains its widget"
+        );
+        assert_eq!(
+            header(),
+            "History",
+            "completion updates grouping even when order is unchanged"
+        );
+    }
+
+    /// Regression: the list was as wide as its minimum, one character for a wrapping name, so
+    /// `senior-engineer` ran down the popover a letter per line beside its status. The list now
+    /// takes the rows' natural width (the whole name and its status on one line), and a name
+    /// squeezed anyway keeps a floor of several characters. Needs GTK (the window smoke test runs
+    /// it, through `chat::view::tests::ui_checks`).
+    pub(crate) fn names_are_never_squeezed_into_a_column() {
+        let button = SubagentButton::new(|_| {});
+        let mut worker = agent("w1", ToolStatus::Completed);
+        worker.name = "senior-engineer".to_owned();
+        worker.task = "Senior-engineer seat round 1: ".repeat(10);
+        worker.steps = 44;
+        button.set(&[worker]);
+        let rows = button.rows.borrow();
+        let labels = &rows[0].1;
+        let width = |w: &gtk4::Widget| w.measure(gtk4::Orientation::Horizontal, -1);
+        let scroller = button.popover.child().expect("the popover's scroller");
+        let (_, list_natural, _, _) = width(&scroller);
+        let (name_min, name_natural, _, _) = width(labels.name.upcast_ref());
+        let (_, status_natural, _, _) = width(labels.status.upcast_ref());
+        assert!(
+            list_natural >= name_natural + status_natural,
+            "the list ({list_natural}px) leaves the name ({name_natural}px) and its status \
+             ({status_natural}px) a line"
+        );
+        let letter = label("m", &["subagent-name"]);
+        let (_, letter_width, _, _) = width(letter.upcast_ref());
+        assert!(
+            name_min >= 8 * letter_width,
+            "a squeezed name keeps several characters ({name_min}px, one is {letter_width}px)"
+        );
+        let (_, task_natural, _, _) = width(labels.task.upcast_ref());
+        assert!(
+            task_natural < 60 * letter_width,
+            "a long task does not stretch the list ({task_natural}px)"
+        );
+    }
+
+    fn agent(id: &str, status: ToolStatus) -> SubagentSummary {
+        SubagentSummary {
+            id: id.to_owned(),
+            name: "Explore".to_owned(),
+            task: String::new(),
+            status,
+            steps: 0,
+            lifecycle: None,
+            activity: None,
+            driver: None,
+            delegation: None,
+            requested_model: None,
+            requested_effort: None,
+            reported_model: None,
+        }
+    }
+
+    #[test]
+    fn a_native_sub_agent_shows_the_model_and_effort_its_parent_asked_for() {
+        let mut native = agent("n", ToolStatus::Running);
+        native.driver = Some(agent_core::adapter::Driver::Claude);
+        assert_eq!(
+            identity_text(&native),
+            "Claude · native · model unknown · effort unknown"
+        );
+        native.requested_model = Some("sonnet".into());
+        native.requested_effort = Some("high".into());
+        assert_eq!(
+            identity_text(&native),
+            "Claude · native · model sonnet (requested; effective unknown) · effort high \
+             (requested; effective unknown)"
+        );
+    }
+
+    #[test]
+    fn a_native_sub_agent_shows_the_model_its_provider_reported() {
+        let mut native = agent("n", ToolStatus::Running);
+        native.driver = Some(agent_core::adapter::Driver::Claude);
+        native.requested_model = Some("sonnet".into());
+        native.requested_effort = Some("high".into());
+        native.reported_model = Some("claude-sonnet-5-5".into());
+        assert_eq!(
+            identity_text(&native),
+            "Claude · native · model claude-sonnet-5-5 · effort high (requested; effective unknown)"
+        );
+        native.requested_effort = None;
+        assert_eq!(
+            identity_text(&native),
+            "Claude · native · model claude-sonnet-5-5 · effort unknown"
+        );
+    }
+
+    #[test]
+    fn running_sub_agents_come_first_and_finished_ones_stay_listed() {
+        let all = [
+            agent("a", ToolStatus::Completed),
+            agent("b", ToolStatus::Running),
+            agent("c", ToolStatus::Failed),
+            agent("d", ToolStatus::Running),
+        ];
+        let ids: Vec<_> = running_first(&all).into_iter().map(|a| a.id).collect();
+        assert_eq!(ids, ["b", "d", "a", "c"]);
+        assert_eq!(count_text(&all), "2 active · 2 finished");
+        assert_eq!(count_text(&all[..1]), "0 active · 1 finished");
+        assert_eq!(count_text(&all[2..3]), "0 active · 1 finished");
+        assert_eq!(count_text(&all[1..2]), "1 active · 0 finished");
+        assert_eq!(status_text(&all[0]), "completed");
+        assert_eq!(status_text(&all[1]), "running");
+    }
+
+    #[test]
+    fn counts_follow_worker_lifecycle_instead_of_a_completed_collaboration_call() {
+        use agent_core::event::WorkerState;
+        let mut worker = agent("worker", ToolStatus::Completed);
+        worker.lifecycle = Some(WorkerState::Waiting);
+        assert_eq!(count_text(&[worker.clone()]), "1 active · 0 finished");
+        worker.lifecycle = Some(WorkerState::Unknown);
+        assert_eq!(
+            count_text(&[worker.clone()]),
+            "0 active · 0 finished · 1 unknown"
+        );
+        worker.lifecycle = Some(WorkerState::Completed);
+        assert_eq!(status_text(&worker), "completed");
+        assert_eq!(count_text(&[worker.clone()]), "0 active · 1 finished");
+        worker.lifecycle = Some(WorkerState::Closed);
+        assert_eq!(
+            status_text(&worker),
+            "closed",
+            "completion and closure stay distinct"
+        );
+    }
+}

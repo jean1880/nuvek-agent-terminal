@@ -1,0 +1,152 @@
+[package]
+name = "agent-terminal"
+version = "1.0.0"
+
+edition = "2021"
+# The gtk4-rs 0.11 / gtk-rs 0.22 crates require 1.92 (std::fs::File::lock, used by the
+# approval rules store, needs only 1.89).
+rust-version = "1.92"
+authors = ["Jean-Luc Desroches <jean1880@users.noreply.github.com>"]
+description = "A native GTK4 chat front end for Claude, Antigravity and Codex"
+license = "MIT"
+repository = "https://github.com/jean1880/nuvek-agent-terminal"
+homepage = "https://github.com/jean1880/nuvek-agent-terminal"
+readme = "README.md"
+keywords = ["gtk4", "libadwaita", "ai", "claude", "terminal"]
+categories = ["gui", "development-tools"]
+# Shipped as distribution packages, never to crates.io (its path crates are unpublished too).
+publish = false
+
+[workspace]
+# The root package is the GTK app; the pure and git logic live in crates/.
+members = ["crates/*"]
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+# Markdown for assistant messages, and the reply-question reader in agent-core. Default
+# features off: no HTML renderer, no getopts binary.
+pulldown-cmark = { version = "0.13", default-features = false }
+
+[dependencies]
+# glib, gio and gdk4 are deliberately NOT direct dependencies: every use in this
+# crate goes through the gtk4 re-exports (gtk4::glib, gtk4::gio, gtk4::gdk), so
+# naming them here only creates a second place for versions to drift out of step
+# with whatever gtk4 itself pulls in.
+#
+# Version features are opt-in — the crates' baseline is GTK 4.0 / libadwaita 1.0 —
+# so these two lines are what actually set the minimum system libraries:
+#   v4_10 → GTK 4.10, for gtk4::FileDialog
+#   v1_5  → libadwaita 1.5, for adw::AlertDialog and adw::PreferencesDialog
+#   v0_72 → VTE 0.72, for Terminal::text_range_format (quota markers read from
+#           the bottom rows instead of copying the whole scrollback)
+# All are satisfied by Ubuntu 24.04 (VTE 0.76) and newer.
+gtk4 = { version = "0.11", features = ["v4_10"] }
+vte4 = { version = "0.10", features = ["v0_72"], optional = true }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+# The chat composer (and code blocks). v5_12 pairs with GTK 4.10; GtkSourceView 5.12+ is on
+# Ubuntu 24.04 and newer.
+sourceview5 = { version = "0.11", features = ["v5_12", "gtk_v4_10"] }
+pulldown-cmark = { workspace = true }
+agent-core = { path = "crates/agent-core" }
+agent-kit = { path = "crates/agent-kit" }
+tracing = { workspace = true }
+# For setsid(2) and kill(2) on the agent's process group (agent_proc); not a GTK crate.
+libc = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-journald = { version = "0.3", optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Only the headless --cross-agent-mcp process runs Tokio; the GUI retains GIO.
+rmcp = { version = "=3.5.1", default-features = false, features = ["server", "transport-io"] }
+tokio = { version = "1", default-features = false, features = ["rt", "time", "io-std", "io-util", "net", "sync"] }
+
+[features]
+default = ["terminal", "journald"]
+terminal = ["dep:vte4"]
+journald = ["dep:tracing-journald"]
+
+[build-dependencies]
+# Compiles assets/icons into a GResource (needs glib-compile-resources on PATH). 0.22 pairs
+# with gtk4 0.11's glib 0.22.
+glib-build-tools = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
+agent-kit = { path = "crates/agent-kit", features = ["test-support"] }
+
+# The bundled SQLite is C compiled at the profile's opt-level; unoptimised it made the store's
+# equivalence tests take ~50 s each. Our own code stays at debug opt-level, so this changes
+# no test's behaviour, only how fast SQLite runs under it.
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+
+# `make bench`: optimised like release, but without LTO's long single-unit builds, and with
+# symbols kept so a failing measurement's backtrace is readable.
+[profile.measure]
+inherits = "release"
+lto = false
+codegen-units = 16
+strip = false
+debug = "line-tables-only"
+
+[package.metadata.deb]
+maintainer = "Jean-Luc Desroches <jean1880@users.noreply.github.com>"
+copyright = "2026, Jean-Luc Desroches"
+license-file = ["LICENSE", "0"]
+# $auto runs dpkg-shlibdeps against the built binary, so it derives libadwaita-1-0,
+# libvte-2.91-gtk4-0 and the rest with proper version constraints. Listing them by
+# hand as well only produced duplicate entries with weaker bounds.
+depends = "$auto"
+# Without this, cargo-deb uses README.md as the extended description and the whole
+# document — markdown, code fences and all — lands in the control file.
+extended-description = """
+A native GTK4/libadwaita front end for AI coding agents. Chat threads drive
+Claude, Antigravity (agy) and Codex headless: one model picker across agents,
+switching model or agent mid-thread with a redacted handoff, approval cards
+with the proposed diff, per-turn file diffs, slash-command typeahead, usage
+and account indicators, and checkpoints with undo. A VTE terminal drawer and
+terminal threads remain for any other CLI."""
+section = "utils"
+priority = "optional"
+# postrm: says where each user's data stays (a package never touches a home folder).
+maintainer-scripts = "packaging/debian/"
+assets = [
+    ["target/release/agent-terminal", "usr/bin/agent-terminal", "755"],
+    ["assets/ca.nuvek.AgentTerminal.desktop", "usr/share/applications/ca.nuvek.AgentTerminal.desktop", "644"],
+    ["assets/ca.nuvek.AgentTerminal.svg", "usr/share/icons/hicolor/scalable/apps/ca.nuvek.AgentTerminal.svg", "644"],
+    ["assets/icons/scalable/apps/ca.nuvek.AgentTerminal-symbolic.svg", "usr/share/icons/hicolor/symbolic/apps/ca.nuvek.AgentTerminal-symbolic.svg", "644"],
+]
+
+# Fedora/RPM, built with cargo-generate-rpm (the release workflow's rpm job). The same files as
+# the .deb; runtime requirements are derived from the built binary (auto-req), like $auto above.
+[package.metadata.generate-rpm]
+summary = "A native GTK4 chat front end for Claude, Antigravity and Codex"
+license = "MIT"
+# Epoch 1 keeps every release newer than the 3.x packages installed before the version numbering
+# restarted at 1.0.0. Keep it in step with the deb version (packaging/build-deb.sh) and the PKGBUILD.
+epoch = 1
+# %postun: $1 is 0 on erase, 1 on upgrade. The same text as packaging/debian/postrm.
+post_uninstall_script = '''
+if [ "$1" = 0 ]; then
+cat <<'EOF'
+Agent Terminal was removed. Unless you removed it with `agent-terminal --uninstall`, each
+user's configuration and data are still in their home folder:
+  ~/.config/agent-terminal  ~/.local/state/agent-terminal  ~/.cache/agent-terminal
+Delete those folders to remove them.
+EOF
+fi
+'''
+assets = [
+    { source = "target/release/agent-terminal", dest = "/usr/bin/agent-terminal", mode = "755" },
+    { source = "assets/ca.nuvek.AgentTerminal.desktop", dest = "/usr/share/applications/ca.nuvek.AgentTerminal.desktop", mode = "644" },
+    { source = "assets/ca.nuvek.AgentTerminal.svg", dest = "/usr/share/icons/hicolor/scalable/apps/ca.nuvek.AgentTerminal.svg", mode = "644" },
+    { source = "assets/icons/scalable/apps/ca.nuvek.AgentTerminal-symbolic.svg", dest = "/usr/share/icons/hicolor/symbolic/apps/ca.nuvek.AgentTerminal-symbolic.svg", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/licenses/agent-terminal/LICENSE", mode = "644", doc = true },
+]

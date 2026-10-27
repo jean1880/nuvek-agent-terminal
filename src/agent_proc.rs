@@ -1,0 +1,1082 @@
+//! Transport for one agent process, on the GTK main loop (gio, no threads, no tokio).
+//!
+//! [`AgentProcess`] spawns the agent with `gio::SubprocessLauncher`, reads its stdout and stderr
+//! line by line with `DataInputStream::read_line_future` inside `glib::spawn_future_local`, queues
+//! stdin writes in order, and reports the exit once both pipes have drained (so the last frames
+//! always reach the adapter before `SessionExited`). Nothing here blocks the main thread and
+//! nothing panics on an I/O error: a failure is logged and surfaces as an exit.
+//!
+//! Logging never includes argv, prompt or frame bodies (they may hold secrets); only the program's
+//! file name, the pid and the exit code.
+
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
+use std::ffi::OsStr;
+use std::path::Path;
+use std::rc::Rc;
+use std::time::Duration;
+
+use gtk4::gio::{self, prelude::*};
+use gtk4::glib;
+use tracing::{debug, info, warn};
+
+const IO_PRIORITY: glib::Priority = glib::Priority::DEFAULT;
+const SIGINT: i32 = 2;
+const SIGTERM: i32 = 15;
+const SIGKILL: i32 = 9;
+/// How long a process may ignore SIGTERM before it is killed.
+const TERM_GRACE: Duration = Duration::from_secs(3);
+/// After the process exits, how long a pipe held open by a grandchild may delay the exit report.
+const EXIT_DRAIN: Duration = Duration::from_secs(2);
+/// How long quitting the app waits for its agents to leave after SIGTERM.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+/// The longest a stopped agent can take to be reported gone, by design: it ignores SIGTERM for
+/// the whole [`TERM_GRACE`] before SIGKILL, then its pipes take the whole [`EXIT_DRAIN`]. A test
+/// that waits for a stop must allow more than this, or the designed fallback reads as a hang.
+#[cfg(test)]
+pub(crate) const STOP_WORST_CASE: Duration =
+    Duration::from_secs(TERM_GRACE.as_secs() + EXIT_DRAIN.as_secs());
+
+thread_local! {
+    /// Process groups of the agents not yet seen to exit, for [`terminate_all`].
+    static LIVE: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
+}
+
+/// What to run.
+#[derive(Debug, Clone, Default)]
+pub struct SpawnSpec {
+    /// Program first. Looked up in `PATH` when it has no slash.
+    pub argv: Vec<String>,
+    pub cwd: Option<String>,
+    /// Added to the user's own environment (which is inherited), overriding on conflict.
+    pub env: Vec<(String, String)>,
+    /// Removed from the inherited environment before `env` is applied (a launching agent
+    /// session's own markers, the config's `clear_env`).
+    pub unset: Vec<String>,
+}
+
+type ExitCallback = Box<dyn FnOnce(Option<i32>)>;
+type PhaseCallback = Rc<dyn Fn(StopPhase)>;
+
+/// How far an agent process is through being stopped, for a caller watching it leave
+/// ([`ExitWatch`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopPhase {
+    /// Running, and nobody asked it to stop.
+    Running,
+    /// Sent SIGTERM; waiting for it to leave on its own.
+    Stopping,
+    /// It ignored SIGTERM past the grace (or the user would not wait): sent SIGKILL.
+    Killing,
+    /// Gone (reaped).
+    Exited,
+}
+
+struct Shared {
+    subprocess: gio::Subprocess,
+    /// The process id, which is also its process group id (it is a session leader).
+    pid: Option<i32>,
+    stdin: Option<gio::OutputStream>,
+    queue: RefCell<VecDeque<String>>,
+    pumping: Cell<bool>,
+    stdin_dead: Cell<bool>,
+    exited: Cell<bool>,
+    readers_open: Cell<u8>,
+    /// `Some` once the process has been reaped; the inner option is the exit code.
+    exit_code: Cell<Option<Option<i32>>>,
+    on_exit: RefCell<Option<ExitCallback>>,
+    name: String,
+    /// SIGTERM was sent ([`terminate`]).
+    stopping: Cell<bool>,
+    /// SIGKILL was sent.
+    killed: Cell<bool>,
+    /// Told of every phase change ([`ExitWatch::connect_phase`]); dropped once it has exited.
+    watchers: RefCell<Vec<PhaseCallback>>,
+}
+
+impl Shared {
+    fn phase(&self) -> StopPhase {
+        if self.exited.get() {
+            StopPhase::Exited
+        } else if self.killed.get() {
+            StopPhase::Killing
+        } else if self.stopping.get() {
+            StopPhase::Stopping
+        } else {
+            StopPhase::Running
+        }
+    }
+
+    /// Tells the watchers the current phase. Cloned out first: a watcher may connect another.
+    fn notify(&self) {
+        let phase = self.phase();
+        let watchers: Vec<PhaseCallback> = if phase == StopPhase::Exited {
+            std::mem::take(&mut *self.watchers.borrow_mut())
+        } else {
+            self.watchers.borrow().clone()
+        };
+        for watcher in watchers {
+            watcher(phase);
+        }
+    }
+
+    /// SIGKILL to the group now, once: not when it is already gone (its pid could be reused),
+    /// nor again when it was already sent (SIGKILL cannot be ignored; the exit is on its way).
+    fn kill(&self) {
+        if self.exited.get() || self.killed.replace(true) {
+            return;
+        }
+        self.signal(SIGKILL);
+        self.notify();
+    }
+
+    /// Signals the agent's whole process group; falls back to the agent alone.
+    ///
+    /// Ceiling: a tool child that called `setsid` itself (a daemon) is in another group and is
+    /// not reached, and once the agent has exited and been reaped nothing is signalled (its
+    /// pid could be reused). Upgrade path: a cgroup (`systemd-run --user --scope`).
+    fn signal(&self, signal: i32) {
+        if let Some(pid) = self.pid {
+            // SAFETY: kill(2) with a negative pid signals that process group; no memory is touched.
+            if unsafe { libc::kill(-pid, signal) } == 0 {
+                return;
+            }
+        }
+        self.subprocess.send_signal(signal);
+    }
+
+    fn reader_done(&self) {
+        self.readers_open
+            .set(self.readers_open.get().saturating_sub(1));
+        if self.readers_open.get() == 0 {
+            self.finish();
+        }
+    }
+
+    /// Reports the exit once, when the process is reaped (pipes drained or the drain window over).
+    fn finish(&self) {
+        let Some(code) = self.exit_code.get() else {
+            return;
+        };
+        let callback = self.on_exit.borrow_mut().take();
+        if let Some(callback) = callback {
+            callback(code);
+        }
+    }
+}
+
+/// This process's id, read before forking for [`die_with_app`].
+fn app_pid() -> libc::pid_t {
+    // A pid fits pid_t (the kernel's own type); never 0 for a running process.
+    libc::pid_t::try_from(std::process::id()).unwrap_or(0)
+}
+
+/// Runs in the forked child, before exec (so async-signal-safe calls only): the child is sent
+/// SIGTERM when the app dies, however it dies. [`terminate_all`] runs only on a clean shutdown;
+/// after a crash an agent left running keeps working on its own, with no window to report to
+/// (one went on editing and committing in a repo after the app aborted).
+///
+/// Linux sends the signal when the *thread* that forked exits, not the process. Every spawn here
+/// is on the main thread (`AgentProcess` is not `Send`, and side processes run on the main
+/// context), which lives as long as the app. Elsewhere this does nothing.
+fn die_with_app(parent: libc::pid_t) {
+    #[cfg(target_os = "linux")]
+    // SAFETY: prctl, getppid and _exit are async-signal-safe and touch no shared memory.
+    unsafe {
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong);
+        // The app died between the fork and here: no signal will come, so do not start.
+        if libc::getppid() != parent {
+            libc::_exit(1);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = parent;
+}
+
+/// A running agent. Dropping it terminates the process (SIGTERM, then SIGKILL after a grace).
+pub struct AgentProcess {
+    shared: Rc<Shared>,
+}
+
+impl AgentProcess {
+    /// Starts the process. `on_stdout` / `on_stderr` get each line without its newline;
+    /// `on_exit` is called exactly once with the exit code (`None` when killed by a signal),
+    /// after both pipes reached EOF. All callbacks run on the main thread.
+    pub fn spawn(
+        spec: &SpawnSpec,
+        on_stdout: impl Fn(&str) + 'static,
+        on_stderr: impl Fn(&str) + 'static,
+        on_exit: impl FnOnce(Option<i32>) + 'static,
+    ) -> Result<Self, String> {
+        let Some(program) = spec.argv.first() else {
+            return Err("empty command line".to_owned());
+        };
+        let name = Path::new(program)
+            .file_name()
+            .map_or_else(|| program.clone(), |n| n.to_string_lossy().into_owned());
+        let launcher = gio::SubprocessLauncher::new(
+            gio::SubprocessFlags::STDIN_PIPE
+                | gio::SubprocessFlags::STDOUT_PIPE
+                | gio::SubprocessFlags::STDERR_PIPE,
+        );
+        if let Some(cwd) = &spec.cwd {
+            launcher.set_cwd(cwd);
+        }
+        // Own session and process group, so the agent's tool children can be signalled with it
+        // (and a terminal Ctrl-C aimed at the app does not reach them). `setsid` is
+        // async-signal-safe, which is all the post-fork child may call.
+        let parent = app_pid();
+        launcher.set_child_setup(move || {
+            // SAFETY: setsid(2) takes no arguments and touches no memory.
+            unsafe {
+                libc::setsid();
+            }
+            die_with_app(parent);
+        });
+        for key in &spec.unset {
+            launcher.unsetenv(key);
+        }
+        use_shell_path(&launcher);
+        for (key, value) in &spec.env {
+            launcher.setenv(key, value, true);
+        }
+        let argv: Vec<&OsStr> = spec.argv.iter().map(|a| OsStr::new(a.as_str())).collect();
+        let subprocess = launcher
+            .spawn(&argv)
+            .map_err(|e| format!("could not start {name}: {}", e.message()))?;
+        let (Some(stdout), Some(stderr)) = (subprocess.stdout_pipe(), subprocess.stderr_pipe())
+        else {
+            subprocess.force_exit();
+            return Err(format!("{name} started without its output pipes"));
+        };
+        info!(
+            program = %name,
+            pid = subprocess.identifier().as_deref().unwrap_or("?"),
+            "agent process started"
+        );
+
+        let pid = subprocess
+            .identifier()
+            .and_then(|id| id.parse::<i32>().ok())
+            .filter(|p| *p > 1);
+        if let Some(pid) = pid {
+            LIVE.with(|l| l.borrow_mut().push(pid));
+        }
+        let shared = Rc::new(Shared {
+            pid,
+            stdin: subprocess.stdin_pipe(),
+            subprocess,
+            queue: RefCell::new(VecDeque::new()),
+            pumping: Cell::new(false),
+            stdin_dead: Cell::new(false),
+            exited: Cell::new(false),
+            readers_open: Cell::new(2),
+            exit_code: Cell::new(None),
+            on_exit: RefCell::new(Some(Box::new(on_exit))),
+            name,
+            stopping: Cell::new(false),
+            killed: Cell::new(false),
+            watchers: RefCell::new(Vec::new()),
+        });
+        spawn_reader(shared.clone(), stdout, Box::new(on_stdout), "stdout");
+        spawn_reader(shared.clone(), stderr, Box::new(on_stderr), "stderr");
+        spawn_waiter(shared.clone());
+        Ok(Self { shared })
+    }
+
+    pub fn is_alive(&self) -> bool {
+        !self.shared.exited.get()
+    }
+
+    /// Whether a line written now is queued for the agent: it is alive and no earlier write to
+    /// its stdin failed. A queued line may still fail later, in the pipe.
+    pub fn can_write(&self) -> bool {
+        !self.shared.exited.get() && !self.shared.stdin_dead.get()
+    }
+
+    /// The process id (also its process group id), when the spawn reported one.
+    pub fn pid(&self) -> Option<i32> {
+        self.shared.pid
+    }
+
+    /// Queues one line for stdin (a newline is appended). Writes happen in call order.
+    pub fn write_line(&self, line: &str) {
+        let shared = &self.shared;
+        if shared.exited.get() || shared.stdin_dead.get() {
+            debug!(program = %shared.name, "dropping a write to a dead agent");
+            return;
+        }
+        let mut buf = String::with_capacity(line.len() + 1);
+        buf.push_str(line);
+        buf.push('\n');
+        shared.queue.borrow_mut().push_back(buf);
+        pump(shared);
+    }
+
+    /// SIGINT (what agy treats as "stop this turn"; it then exits).
+    pub fn interrupt(&self) {
+        if self.is_alive() {
+            self.shared.signal(SIGINT);
+        }
+    }
+
+    /// SIGTERM, then SIGKILL if it is still there after a short grace.
+    pub fn terminate(&self) {
+        terminate(&self.shared);
+    }
+
+    /// A handle that follows this process to its exit, and outlives this value: dropping the
+    /// `AgentProcess` starts its termination, and the watch sees it through.
+    pub fn exit_watch(&self) -> ExitWatch {
+        ExitWatch {
+            shared: self.shared.clone(),
+        }
+    }
+}
+
+/// Follows one agent process until it has exited: its [`StopPhase`], a callback on each change,
+/// and an immediate kill. Closing the window waits on these instead of blocking in
+/// [`terminate_all`].
+#[derive(Clone)]
+pub struct ExitWatch {
+    shared: Rc<Shared>,
+}
+
+impl ExitWatch {
+    pub fn phase(&self) -> StopPhase {
+        self.shared.phase()
+    }
+
+    /// `f` is called on the main thread with every later phase, ending with
+    /// [`StopPhase::Exited`] (after which it is dropped). Not called for the current phase.
+    pub fn connect_phase(&self, f: impl Fn(StopPhase) + 'static) {
+        if !self.shared.exited.get() {
+            self.shared.watchers.borrow_mut().push(Rc::new(f));
+        }
+    }
+
+    /// SIGKILL to the process group now, without waiting out the grace.
+    pub fn kill_now(&self) {
+        if !self.shared.exited.get() {
+            warn!(program = %self.shared.name, "killing an agent without waiting for it");
+        }
+        self.shared.kill();
+    }
+}
+
+impl Drop for AgentProcess {
+    fn drop(&mut self) {
+        terminate(&self.shared);
+    }
+}
+
+fn terminate(shared: &Rc<Shared>) {
+    // Already gone, or already on its way out (a second terminate would arm a second timer).
+    if shared.exited.get() || shared.stopping.get() || shared.killed.get() {
+        return;
+    }
+    shared.stopping.set(true);
+    shared.signal(SIGTERM);
+    shared.notify();
+    let shared = shared.clone();
+    glib::spawn_future_local(async move {
+        glib::timeout_future(TERM_GRACE).await;
+        if !shared.exited.get() && !shared.killed.get() {
+            warn!(program = %shared.name, "agent ignored SIGTERM; killing it");
+            shared.kill();
+        }
+    });
+}
+
+/// Stops every agent this app started, for its shutdown: SIGTERM to each process group, a wait of
+/// at most [`SHUTDOWN_GRACE`], then SIGKILL to the groups whose agent is still running. Blocks:
+/// the main loop is over by then, so [`terminate`]'s timer would never fire (and agents run in
+/// their own session, so nothing else would stop them).
+///
+/// A group is signalled only while a process with the leader's pid exists (running, or a zombie
+/// no one reaps once the loop is over, which keeps its pid reserved). Ceilings: a leader GLib
+/// reaped just before quitting, whose pid was reused within that instant, would be hit; a tool
+/// child that left the group (`setsid`) is not reached (see [`Shared::signal`]).
+pub fn terminate_all() {
+    let groups = LIVE.with(|l| std::mem::take(&mut *l.borrow_mut()));
+    let signal_group = |pid: i32, signal: i32| {
+        // SAFETY: kill(2) with a negative pid signals that process group; no memory is touched.
+        unsafe { libc::kill(-pid, signal) };
+    };
+    let groups: Vec<i32> = groups
+        .into_iter()
+        .filter(|pid| leader_state(*pid).is_some())
+        .collect();
+    if groups.is_empty() {
+        return;
+    }
+    info!(count = groups.len(), "stopping agents on quit");
+    for pid in &groups {
+        signal_group(*pid, SIGTERM);
+    }
+    let deadline = std::time::Instant::now() + SHUTDOWN_GRACE;
+    let running = |pid: &i32| leader_state(*pid).is_some_and(|s| s != 'Z');
+    while groups.iter().any(running) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    for pid in &groups {
+        match leader_state(*pid) {
+            None => {}
+            Some(state) => {
+                if state != 'Z' {
+                    warn!(pid, "agent ignored SIGTERM on quit; killing it");
+                }
+                // Also takes any tool child still in the group with it.
+                signal_group(*pid, SIGKILL);
+            }
+        }
+    }
+}
+
+/// How many agents [`terminate_all`] would still have to stop (tests).
+#[cfg(test)]
+pub(crate) fn live_agents() -> usize {
+    LIVE.with(|l| l.borrow().len())
+}
+
+/// The state letter (`R`, `S`, `Z`, …) of `pid` from `/proc`; `None` once it has been reaped.
+fn leader_state(pid: i32) -> Option<char> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit(')').next()?.trim_start().chars().next()
+}
+
+fn spawn_reader(
+    shared: Rc<Shared>,
+    stream: gio::InputStream,
+    on_line: Box<dyn Fn(&str)>,
+    label: &'static str,
+) {
+    glib::spawn_future_local(async move {
+        let data = gio::DataInputStream::new(&stream);
+        loop {
+            match data.read_line_future(IO_PRIORITY).await {
+                Ok(Some(bytes)) => {
+                    let line = String::from_utf8_lossy(&bytes);
+                    on_line(line.trim_end_matches('\r'));
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    warn!(program = %shared.name, pipe = label, error = %e.message(), "read failed");
+                    break;
+                }
+            }
+        }
+        shared.reader_done();
+    });
+}
+
+fn spawn_waiter(shared: Rc<Shared>) {
+    glib::spawn_future_local(async move {
+        let code = match shared.subprocess.wait_future().await {
+            Ok(()) if shared.subprocess.has_exited() => Some(shared.subprocess.exit_status()),
+            Ok(()) => None,
+            Err(e) => {
+                warn!(program = %shared.name, error = %e.message(), "wait failed");
+                None
+            }
+        };
+        info!(program = %shared.name, code = ?code, "agent process exited");
+        if let Some(pid) = shared.pid {
+            LIVE.with(|l| l.borrow_mut().retain(|p| *p != pid));
+        }
+        shared.exited.set(true);
+        shared.queue.borrow_mut().clear();
+        shared.exit_code.set(Some(code));
+        shared.notify();
+        if shared.readers_open.get() == 0 {
+            shared.finish();
+        } else {
+            // A grandchild may still hold a pipe open; do not wait for it forever.
+            glib::timeout_future(EXIT_DRAIN).await;
+            shared.finish();
+        }
+    });
+}
+
+fn pump(shared: &Rc<Shared>) {
+    if shared.pumping.replace(true) {
+        return;
+    }
+    let shared = shared.clone();
+    glib::spawn_future_local(async move {
+        loop {
+            let next = shared.queue.borrow_mut().pop_front();
+            let (Some(buf), Some(stdin)) = (next, shared.stdin.clone()) else {
+                break;
+            };
+            let failure = match stdin.write_all_future(buf.into_bytes(), IO_PRIORITY).await {
+                Ok((_, _, None)) => None,
+                Ok((_, _, Some(e))) | Err((_, e)) => Some(e),
+            };
+            if let Some(e) = failure {
+                warn!(program = %shared.name, error = %e.message(), "write to the agent failed");
+                shared.stdin_dead.set(true);
+                shared.queue.borrow_mut().clear();
+                break;
+            }
+        }
+        shared.pumping.set(false);
+    });
+}
+
+/// How long `agy models` / `agy -p /usage` may take (shared by the catalogue and the usage probe).
+pub const AGY_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The environment an agent's processes get beyond the user's own: what its profile adds (the env
+/// file) and what the app removes (`clear_env`, an approval socket inherited from a launching
+/// session). Threads, side processes and the background probes all use the same value, so the
+/// model list and usage indicator come from the account a thread would use.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AgentEnv {
+    pub env: Vec<(String, String)>,
+    pub unset: Vec<String>,
+}
+
+/// Gives a launch the user's shell `PATH` (when it has been read), so an agent's tools find what
+/// the user's terminal finds. Set before the profile's own variables, which win.
+fn use_shell_path(launcher: &gio::SubprocessLauncher) {
+    if let Some(path) = crate::utils::known_shell_path() {
+        launcher.setenv("PATH", path, true);
+    }
+}
+
+impl AgentEnv {
+    fn apply(&self, launcher: &gio::SubprocessLauncher) {
+        for key in &self.unset {
+            launcher.unsetenv(key);
+        }
+        use_shell_path(launcher);
+        for (key, value) in &self.env {
+            launcher.setenv(key, value, true);
+        }
+    }
+}
+
+/// Runs a one-shot side process (agy `-p /model --output-format json`, `agy models`) and returns
+/// its stdout and whether it exited with status 0. A failure to start is `("<reason>", false)`; a
+/// timeout with nothing printed is `("timed out", false)`. See [`run_side_full`].
+pub async fn run_side(
+    argv: Vec<String>,
+    cwd: Option<String>,
+    env: &AgentEnv,
+    timeout: Duration,
+) -> (String, bool) {
+    let out = run_side_full(argv, cwd, env, timeout).await;
+    if out.timed_out && out.stdout.trim().is_empty() {
+        return ("timed out".to_owned(), false);
+    }
+    (out.stdout, out.ok)
+}
+
+/// What a side process printed, and how it ended.
+#[derive(Debug, Default)]
+pub struct SideOutput {
+    pub stdout: String,
+    pub stderr: String,
+    /// It exited with status 0 (never after a timeout).
+    pub ok: bool,
+    /// It was still running at the timeout, and was killed.
+    pub timed_out: bool,
+}
+
+/// How long a killed side process's pipes may stay open (a helper it started holding them).
+const PIPE_GRACE: Duration = Duration::from_secs(1);
+/// The most of each stream a side process keeps; the rest is read and dropped.
+const SIDE_OUTPUT_CAP: usize = 1 << 20;
+
+/// [`run_side`] with both streams, read as they arrive: a process killed at `timeout` still
+/// leaves what it printed. agy, signed out, prints its login prompt on stderr and then waits for
+/// a browser login; that prompt is the only sign of it.
+///
+/// Its stdin is `/dev/null` (never the app's), and it is killed when `timeout` passes.
+pub async fn run_side_full(
+    argv: Vec<String>,
+    cwd: Option<String>,
+    env: &AgentEnv,
+    timeout: Duration,
+) -> SideOutput {
+    let Some(program) = argv.first() else {
+        return SideOutput {
+            stdout: "empty command line".to_owned(),
+            ..SideOutput::default()
+        };
+    };
+    let name = Path::new(program)
+        .file_name()
+        .map_or_else(|| program.clone(), |n| n.to_string_lossy().into_owned());
+    // Neither STDIN_PIPE nor STDIN_INHERIT: GIO gives the child /dev/null.
+    let launcher = gio::SubprocessLauncher::new(
+        gio::SubprocessFlags::STDOUT_PIPE | gio::SubprocessFlags::STDERR_PIPE,
+    );
+    let parent = app_pid();
+    launcher.set_child_setup(move || die_with_app(parent));
+    if let Some(cwd) = &cwd {
+        launcher.set_cwd(cwd);
+    }
+    env.apply(&launcher);
+    let args: Vec<&OsStr> = argv.iter().map(|a| OsStr::new(a.as_str())).collect();
+    let subprocess = match launcher.spawn(&args) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(program = %name, error = %e.message(), "side process did not start");
+            return SideOutput {
+                stdout: format!("could not start {name}: {}", e.message()),
+                ..SideOutput::default()
+            };
+        }
+    };
+    // Both pipes drain at once (one left full would stall the child); each ends at EOF. What
+    // arrives goes straight into a shared buffer, so a pipe a helper holds open past the grace
+    // still yields what was printed before.
+    let read = |pipe: Option<gio::InputStream>| {
+        let buf = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&buf);
+        let handle = glib::spawn_future_local(async move {
+            let Some(pipe) = pipe else { return };
+            while let Ok(chunk) = pipe.read_bytes_future(8192, glib::Priority::DEFAULT).await {
+                if chunk.is_empty() {
+                    break;
+                }
+                let mut sink = sink.borrow_mut();
+                let room = SIDE_OUTPUT_CAP.saturating_sub(sink.len());
+                sink.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            }
+        });
+        (handle, buf)
+    };
+    let stdout = read(subprocess.stdout_pipe());
+    let stderr = read(subprocess.stderr_pipe());
+    let timed_out = match glib::future_with_timeout(timeout, subprocess.wait_future()).await {
+        Err(_) => true,
+        Ok(Err(e)) => {
+            warn!(program = %name, error = %e.message(), "waiting for a side process failed");
+            false
+        }
+        Ok(Ok(())) => false,
+    };
+    if timed_out {
+        warn!(program = %name, "side process timed out; killing it");
+        subprocess.force_exit();
+    }
+    // A reader still waiting after the grace is stopped (which cancels its read), not left to
+    // run for as long as the helper lives.
+    let collect = |(mut handle, buf): (glib::JoinHandle<()>, Rc<RefCell<Vec<u8>>>)| async move {
+        if glib::future_with_timeout(PIPE_GRACE, &mut handle)
+            .await
+            .is_err()
+        {
+            handle.abort();
+        }
+        let text = String::from_utf8_lossy(&buf.borrow()).into_owned();
+        text
+    };
+    let (stdout, stderr) = (collect(stdout).await, collect(stderr).await);
+    SideOutput {
+        stdout,
+        stderr,
+        ok: !timed_out && subprocess.is_successful(),
+        timed_out,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{in_loop, pump_until};
+
+    fn sh(script: &str) -> SpawnSpec {
+        SpawnSpec {
+            argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
+            ..SpawnSpec::default()
+        }
+    }
+
+    type Lines = Rc<RefCell<Vec<String>>>;
+    type Exit = Rc<Cell<Option<Option<i32>>>>;
+
+    fn start(spec: &SpawnSpec) -> (AgentProcess, Lines, Lines, Exit) {
+        let out: Lines = Rc::default();
+        let err: Lines = Rc::default();
+        let exit: Exit = Rc::default();
+        let (o, e, x) = (out.clone(), err.clone(), exit.clone());
+        let proc = AgentProcess::spawn(
+            spec,
+            move |l| o.borrow_mut().push(l.to_owned()),
+            move |l| e.borrow_mut().push(l.to_owned()),
+            move |c| x.set(Some(c)),
+        )
+        .expect("spawn");
+        (proc, out, err, exit)
+    }
+
+    #[test]
+    fn lines_round_trip_in_order_and_exit_reports_the_code() {
+        in_loop(|ctx| {
+            let (proc, out, err, exit) = start(&sh(
+                "while read l; do echo \"out:$l\"; echo \"err:$l\" >&2; [ \"$l\" = bye ] && exit 3; done",
+            ));
+            for l in ["one", "two", "bye"] {
+                proc.write_line(l);
+            }
+            assert!(pump_until(ctx, 10, || exit.get().is_some()), "no exit");
+            assert_eq!(exit.get(), Some(Some(3)));
+            assert_eq!(*out.borrow(), ["out:one", "out:two", "out:bye"]);
+            assert_eq!(*err.borrow(), ["err:one", "err:two", "err:bye"]);
+            assert!(!proc.is_alive());
+            // A write after the exit is dropped quietly.
+            proc.write_line("late");
+        });
+    }
+
+    #[test]
+    fn interrupt_and_terminate_stop_the_process() {
+        in_loop(|ctx| {
+            // A harness may start the tests with SIGINT ignored (inherited by every child);
+            // the interrupt half can only be observed when it is not.
+            let sigint_ignored = std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find_map(|l| l.strip_prefix("SigIgn:"))
+                        .and_then(|h| u64::from_str_radix(h.trim(), 16).ok())
+                })
+                .is_some_and(|mask| mask & 0x2 != 0);
+            if !sigint_ignored {
+                let (proc, _, _, exit) = start(&sh("exec sleep 30"));
+                proc.interrupt();
+                assert!(pump_until(ctx, 10, || exit.get().is_some()));
+                // Killed by a signal: no exit code.
+                assert_eq!(exit.get(), Some(None));
+            }
+
+            let (proc, _, _, exit) = start(&sh("exec sleep 30"));
+            proc.terminate();
+            assert!(pump_until(ctx, 10, || exit.get().is_some()));
+            assert_eq!(exit.get(), Some(None));
+        });
+    }
+
+    /// Whether `pid` is gone (or only a zombie waiting to be reaped).
+    fn is_gone(pid: i32) -> bool {
+        leader_state(pid).is_none_or(|s| s == 'Z')
+    }
+
+    #[test]
+    fn quitting_stops_every_agent_even_one_that_ignores_sigterm() {
+        in_loop(|ctx| {
+            let (polite, out, _, _) = start(&sh("echo $$; exec sleep 30"));
+            // SIGTERM ignored, inherited by its sleep too: only the SIGKILL ends it.
+            let (stubborn, out2, _, _) =
+                start(&sh("trap '' TERM; echo $$; while :; do sleep 1; done"));
+            assert!(pump_until(ctx, 10, || !out.borrow().is_empty()
+                && !out2.borrow().is_empty()));
+            let pids: Vec<i32> = [&out, &out2]
+                .iter()
+                .map(|o| o.borrow()[0].parse().expect("pid"))
+                .collect();
+            let started = std::time::Instant::now();
+            // The main loop is not running here, as at shutdown.
+            terminate_all();
+            assert!(started.elapsed() < SHUTDOWN_GRACE + Duration::from_secs(1));
+            for pid in pids {
+                assert!(
+                    pump_until(ctx, 10, || is_gone(pid)),
+                    "agent {pid} outlived quit"
+                );
+            }
+            // Nothing is left to stop.
+            assert!(LIVE.with(|l| l.borrow().is_empty()));
+            drop((polite, stubborn));
+        });
+    }
+
+    /// Closing the window waits on these watches: they must report SIGTERM, the SIGKILL that
+    /// follows the grace for an agent that ignores it, and the exit, and leave nothing for
+    /// `terminate_all` to wait on.
+    #[test]
+    fn an_exit_watch_follows_a_stubborn_agent_through_the_kill_to_its_exit() {
+        in_loop(|ctx| {
+            let (proc, out, _, _) = start(&sh("trap '' TERM; echo ready; exec sleep 30"));
+            assert!(pump_until(ctx, 10, || !out.borrow().is_empty()));
+            let watch = proc.exit_watch();
+            assert_eq!(watch.phase(), StopPhase::Running);
+            let seen: Rc<RefCell<Vec<StopPhase>>> = Rc::default();
+            let s = seen.clone();
+            watch.connect_phase(move |p| s.borrow_mut().push(p));
+            let started = std::time::Instant::now();
+            // As closing a thread does: the process is dropped, the watch sees it out.
+            drop(proc);
+            assert_eq!(watch.phase(), StopPhase::Stopping);
+            assert!(pump_until(ctx, 10, || watch.phase() == StopPhase::Exited));
+            assert!(
+                started.elapsed() >= TERM_GRACE,
+                "killed before the grace: {:?}",
+                started.elapsed()
+            );
+            assert_eq!(
+                *seen.borrow(),
+                [StopPhase::Stopping, StopPhase::Killing, StopPhase::Exited]
+            );
+            // Nothing is left alive, so quitting has nothing to wait for.
+            assert_eq!(live_agents(), 0);
+            let quit = std::time::Instant::now();
+            terminate_all();
+            assert!(quit.elapsed() < Duration::from_millis(500));
+        });
+    }
+
+    #[test]
+    fn kill_now_does_not_wait_out_the_grace() {
+        in_loop(|ctx| {
+            let (proc, out, _, _) = start(&sh("trap '' TERM; echo ready; exec sleep 30"));
+            assert!(pump_until(ctx, 10, || !out.borrow().is_empty()));
+            let watch = proc.exit_watch();
+            let started = std::time::Instant::now();
+            drop(proc);
+            watch.kill_now();
+            assert_eq!(watch.phase(), StopPhase::Killing);
+            assert!(pump_until(ctx, 10, || watch.phase() == StopPhase::Exited));
+            assert!(started.elapsed() < TERM_GRACE, "{:?}", started.elapsed());
+            // Killing what is gone is a no-op, not a signal to a reused pid.
+            watch.kill_now();
+            assert_eq!(watch.phase(), StopPhase::Exited);
+        });
+    }
+
+    #[test]
+    fn terminate_all_returns_at_once_when_nothing_is_alive() {
+        in_loop(|ctx| {
+            let (proc, _, _, exit) = start(&sh("exit 0"));
+            assert!(pump_until(ctx, 10, || exit.get().is_some()));
+            assert_eq!(live_agents(), 0, "an exited agent is not waited on");
+            let started = std::time::Instant::now();
+            terminate_all();
+            // Far below the grace it would otherwise poll for (a loaded CI runner is slow).
+            assert!(started.elapsed() < Duration::from_millis(500));
+            drop(proc);
+        });
+    }
+
+    #[test]
+    fn terminate_takes_the_agents_tool_children_with_it() {
+        in_loop(|ctx| {
+            // The "agent" starts a background child, reports its pid, and waits.
+            let (proc, out, _, exit) = start(&sh("sleep 60 & echo $!; wait"));
+            assert!(pump_until(ctx, 10, || !out.borrow().is_empty()));
+            let child: i32 = out.borrow()[0].parse().expect("child pid");
+            assert!(!is_gone(child), "child should be running");
+            proc.terminate();
+            assert!(pump_until(ctx, 10, || exit.get().is_some()));
+            assert!(
+                pump_until(ctx, 10, || is_gone(child)),
+                "the tool child outlived the agent"
+            );
+        });
+    }
+
+    #[test]
+    fn extra_env_and_cwd_apply_and_the_rest_is_inherited() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let mut spec =
+                sh("echo \"$AT_TEST_VAR\"; pwd; [ -n \"$PATH\" ] && echo path-inherited");
+            spec.cwd = Some(tmp.path().to_string_lossy().into_owned());
+            spec.env = vec![("AT_TEST_VAR".into(), "hello".into())];
+            let (_proc, out, _, exit) = start(&spec);
+            assert!(pump_until(ctx, 10, || exit.get().is_some()));
+            let want_dir = std::fs::canonicalize(tmp.path()).expect("canon");
+            let got = out.borrow().clone();
+            assert_eq!(got[0], "hello");
+            assert_eq!(
+                std::fs::canonicalize(&got[1]).expect("canon"),
+                want_dir,
+                "{got:?}"
+            );
+            assert_eq!(got[2], "path-inherited");
+        });
+    }
+
+    #[test]
+    fn a_missing_program_is_an_error_not_a_panic() {
+        in_loop(|_| {
+            let spec = SpawnSpec {
+                argv: vec!["/nonexistent/agent".into()],
+                ..SpawnSpec::default()
+            };
+            assert!(AgentProcess::spawn(&spec, |_| {}, |_| {}, |_| {}).is_err());
+            assert!(AgentProcess::spawn(&SpawnSpec::default(), |_| {}, |_| {}, |_| {}).is_err());
+        });
+    }
+
+    fn side(script: &str, env: AgentEnv, timeout: Duration) -> (String, bool) {
+        let script = script.to_owned();
+        in_loop(|ctx| {
+            let out: Rc<RefCell<Option<(String, bool)>>> = Rc::default();
+            let o = out.clone();
+            glib::spawn_future_local(async move {
+                let got = run_side(
+                    vec!["/bin/sh".into(), "-c".into(), script],
+                    None,
+                    &env,
+                    timeout,
+                )
+                .await;
+                *o.borrow_mut() = Some(got);
+            });
+            assert!(pump_until(ctx, 15, || out.borrow().is_some()), "no result");
+            let got = out.borrow_mut().take().expect("result");
+            got
+        })
+    }
+
+    #[test]
+    fn a_side_process_that_outlives_its_timeout_is_killed() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let pidfile = dir.path().join("pid");
+        let script = format!("echo $$ > '{}'; exec sleep 60", pidfile.display());
+        let started = std::time::Instant::now();
+        let (text, ok) = side(&script, AgentEnv::default(), Duration::from_millis(400));
+        assert!(!ok);
+        assert_eq!(text, "timed out");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("pid file")
+            .trim()
+            .parse()
+            .expect("pid");
+        // The kill is asynchronous (SIGKILL, then the reaper): give it a moment.
+        let mut gone = false;
+        for _ in 0..50 {
+            if is_gone(pid) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(gone, "the timed-out child kept running");
+    }
+
+    #[test]
+    fn a_side_process_reads_end_of_file_not_the_apps_stdin_and_gets_the_agent_env() {
+        let env = AgentEnv {
+            env: vec![("AT_SIDE_VAR".into(), "set".into())],
+            unset: vec!["HOME".into()],
+        };
+        // `read` returns at once only when stdin is closed or null.
+        let (out, ok) = side(
+            "read x; echo \"eof:$AT_SIDE_VAR:${HOME-unset}\"",
+            env,
+            Duration::from_secs(10),
+        );
+        assert!(ok, "{out}");
+        assert_eq!(out.trim(), "eof:set:unset");
+    }
+
+    /// agy, signed out, prints its login prompt on stderr and waits: killed at the timeout, the
+    /// prompt must survive (it is the only sign the agent needs a login).
+    #[test]
+    fn a_timed_out_side_process_keeps_what_it_printed() {
+        in_loop(|ctx| {
+            let got: Rc<RefCell<Option<SideOutput>>> = Rc::default();
+            let g = got.clone();
+            glib::spawn_future_local(async move {
+                let out = run_side_full(
+                    vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "echo 'Authentication required.' >&2; echo partial; exec sleep 30".into(),
+                    ],
+                    None,
+                    &AgentEnv::default(),
+                    Duration::from_millis(800),
+                )
+                .await;
+                *g.borrow_mut() = Some(out);
+            });
+            assert!(pump_until(ctx, 10, || got.borrow().is_some()));
+            let out = got.borrow_mut().take().unwrap();
+            assert!(out.timed_out && !out.ok);
+            assert_eq!(out.stderr.trim(), "Authentication required.");
+            assert_eq!(out.stdout.trim(), "partial");
+        });
+    }
+
+    /// The browser agy opens to sign in inherits its pipes and outlives it: the output must
+    /// still come back, after the grace rather than when the helper exits.
+    #[test]
+    fn a_helper_holding_the_pipes_neither_hides_the_output_nor_holds_the_result() {
+        in_loop(|ctx| {
+            let got: Rc<RefCell<Option<SideOutput>>> = Rc::default();
+            let g = got.clone();
+            let started = std::time::Instant::now();
+            glib::spawn_future_local(async move {
+                let out = run_side_full(
+                    vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "echo 'Authentication required.' >&2; echo partial; sleep 6 & exec sleep 30"
+                            .into(),
+                    ],
+                    None,
+                    &AgentEnv::default(),
+                    Duration::from_millis(500),
+                )
+                .await;
+                *g.borrow_mut() = Some(out);
+            });
+            assert!(pump_until(ctx, 10, || got.borrow().is_some()));
+            assert!(
+                started.elapsed() < Duration::from_secs(4),
+                "waited for the helper"
+            );
+            let out = got.borrow_mut().take().unwrap();
+            assert!(out.timed_out && !out.ok);
+            assert_eq!(out.stderr.trim(), "Authentication required.");
+            assert_eq!(out.stdout.trim(), "partial");
+        });
+    }
+
+    #[test]
+    fn run_side_captures_stdout_and_success() {
+        in_loop(|ctx| {
+            let result: Rc<RefCell<Vec<(String, bool)>>> = Rc::default();
+            for script in ["echo hi; exit 0", "echo oops; exit 2"] {
+                let r = result.clone();
+                glib::spawn_future_local(async move {
+                    let got = run_side(
+                        vec!["/bin/sh".into(), "-c".into(), script.into()],
+                        None,
+                        &AgentEnv::default(),
+                        Duration::from_secs(10),
+                    )
+                    .await;
+                    r.borrow_mut().push(got);
+                });
+            }
+            let r = result.clone();
+            glib::spawn_future_local(async move {
+                let got = run_side(
+                    vec!["/nonexistent/x".into()],
+                    None,
+                    &AgentEnv::default(),
+                    Duration::from_secs(10),
+                )
+                .await;
+                r.borrow_mut().push(got);
+            });
+            assert!(pump_until(ctx, 10, || result.borrow().len() == 3));
+            let mut got = result.borrow().clone();
+            got.sort();
+            assert!(got.contains(&("hi\n".to_owned(), true)), "{got:?}");
+            assert!(got.contains(&("oops\n".to_owned(), false)), "{got:?}");
+            assert!(got
+                .iter()
+                .any(|(s, ok)| !ok && s.contains("could not start")));
+        });
+    }
+}

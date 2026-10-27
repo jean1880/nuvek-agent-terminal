@@ -1,0 +1,7286 @@
+//! OpenAI Codex adapter: `codex app-server`, a JSON-RPC-shaped protocol over stdio NDJSON.
+//!
+//! A pure, sans-I/O state machine, like [`crate::claude`] and [`crate::agy`]. Frames are
+//! `{id,method,params}` requests, `{method,params}` notifications and `{id,result|error}`
+//! responses, WITHOUT a `"jsonrpc"` field, one per line.
+//!
+//! # Provenance
+//!
+//! Real frames are recorded under `tests/fixtures/real/codex/` (codex-cli 0.161.0); the older
+//! `tests/fixtures/codex-synthetic-turn.ndjson` is SYNTHETIC. The mapping was built against
+//! **codex-cli 0.160.1** and re-verified live against 0.161.0 (`tests/qa/live_smoke.py`): the method registry, the enums
+//! (`AskForApproval`, `ApprovalsReviewer`, `SandboxPolicy`, `ReasoningSummary`, the approval
+//! decisions) and `Model` were cross-checked against the JSON Schema that binary generates
+//! (`codex app-server generate-json-schema`, stable surface; it writes files only). The struct
+//! detail comes from the upstream protocol source, `openai/codex`
+//! `codex-rs/app-server-protocol/src/protocol/` at HEAD:
+//!
+//! - `common.rs`: the method registry (`client_request_definitions!`, `server_request_definitions!`,
+//!   `server_notification_definitions!`): `initialize`, `thread/start`, `thread/resume`,
+//!   `thread/compact/start`, `turn/start`, `turn/interrupt`, `model/list`; the server requests
+//!   `item/commandExecution/requestApproval` and `item/fileChange/requestApproval`; the
+//!   notifications used below.
+//! - `v1.rs`: `InitializeParams` (`clientInfo{name,title,version}`, optional `capabilities`).
+//! - `v2/thread.rs`: `ThreadStartParams`, `ThreadResumeParams` (`excludeTurns`),
+//!   `ThreadStartResponse`, `ThreadTokenUsageUpdatedNotification`, `ThreadTokenUsage`.
+//! - `v2/turn.rs`: `TurnStartParams`, `TurnInterruptParams`, `UserInput`, `TurnStatus`,
+//!   `TurnPlanUpdatedNotification`.
+//! - `v2/thread_data.rs`: `Thread`, `Turn`, `TurnError`.
+//! - `v2/item.rs`: `ThreadItem` (internally tagged by `type`), the approval params and decision
+//!   enums, the item delta notifications, `CommandExecutionStatus` / `PatchApplyStatus`.
+//! - `v2/shared.rs`: `AskForApproval` (kebab-case: `untrusted`, `on-request`, `never`),
+//!   `ApprovalsReviewer` (`user`), `SandboxMode`.
+//! - `v2/permissions.rs`: `SandboxPolicy` (tag `type`: `readOnly`, `workspaceWrite`, ...).
+//! - `v2/model.rs`: `ModelListParams`, `Model`, `ModelListResponse`.
+//! - `v2/notification.rs`: `ErrorNotification` (`willRetry`), `ServerRequestResolvedNotification`.
+//!
+//! The one thing taken from T3 Code (MIT, Copyright (c) 2026 T3 Tools Inc.,
+//! `CodexAdapterV2.ts`) rather than the protocol crate is the `tools.update_plan.enabled` thread
+//! config (Codex 0.152 made the `update_plan` tool opt-in; without it `turn/plan/updated` never
+//! fires), the runtime-mode table's starting point, and always sending `approvalsReviewer`.
+//!
+//! # Handshake
+//!
+//! `handshake()` returns three lines at once: the `initialize` request, the `initialized`
+//! notification and `thread/start` (or `thread/resume` when [`OpenSession::resume`] is set). The
+//! adapter cannot write after reading (a `feed` returns events, not writes), so the sequence is
+//! pipelined; the server handles one connection's messages in order. No experimental API is
+//! used, so `initialize` carries no `capabilities`.
+//!
+//! The session the adapter was given in [`Adapter::argv`] is remembered (behind a `Mutex`,
+//! because `argv` takes `&self`) and read by `handshake()` and by every `turn/start`.
+//!
+//! # Prompts and the outbox
+//!
+//! `turn/start` needs the thread id, which arrives in the `thread/start` response. A prompt encoded
+//! earlier is queued and written when the response is fed. Writes and events the adapter
+//! produces outside a call's return value (that flush, replies to server requests the app cannot
+//! serve, the answer to `Control::ContextUsage`, `ModelChanged` / `ModeChanged`) go to
+//! [`Adapter::drain_outbox`], which the transport calls after every `encode` / `feed`.
+//!
+//! # Modes (`approvalPolicy` + `sandboxPolicy`, sent on every `turn/start`)
+//!
+//! | [`Mode`]      | approvalPolicy | sandboxPolicy       | Effect                                  |
+//! |---------------|----------------|---------------------|-----------------------------------------|
+//! | `Ask`         | `untrusted`    | `readOnly`          | only known-safe reads run unasked; every edit and other command asks |
+//! | `AcceptEdits` | `untrusted`    | `workspaceWrite`    | every edit and other command asks; the app answers in-workspace edits itself, so shell still asks |
+//! | `Plan`        | `never`        | `readOnly`          | cannot write and never asks (T3 Code has no read-only row; this is the strictest the enums allow without the experimental `collaborationMode`) |
+//! | `Bypass`      | `never`        | `dangerFullAccess`  | runs everything unasked and unsandboxed (dangerous permissive mode; session-only) |
+//!
+//! `Ask` is T3's `approval-required` row. `AcceptEdits` is not T3's `auto-accept-edits`
+//! (`on-request`, under which Codex runs shell commands unasked):
+//! (`untrusted-workspacewrite.jsonl`) showed that on `untrusted` + `workspaceWrite` both edits and
+//! shell ask, and an `accept` applies the edit. The app's session accepts edits whose
+//! every path is inside the workspace and not sensitive.
+//!
+//! # Known limits (each with its upgrade path)
+//!
+//! - `model/list` reads one page of up to [`MODEL_PAGE`] models; follow `nextCursor` if a catalogue
+//!   ever exceeds that.
+//! - The legacy `execCommandApproval` / `applyPatchApproval` server requests (turns started over
+//!   the pre-v2 API) are not served: turns here always use `turn/start`, which only raises the
+//!   v2 requests. They get a JSON-RPC error reply so the server never waits on them.
+//! - `item/tool/call` is answered with a JSON-RPC error and a [`Event::Notice`]; map it once the
+//!   UI has a place for it. `item/tool/requestUserInput` is mapped to the native question card.
+//! - Approval decisions that carry a payload (`acceptWithExecpolicyAmendment`,
+//!   `applyNetworkPolicyAmendment`) and `acceptForSession` are never sent: session and always
+//!   scope of commands and edits are agent-terminal's own rules, answered with a plain
+//!   `accept`.
+//!
+//! # Permission requests (`item/permissions/requestApproval`)
+//!
+//! Mapped to an [`Event::ApprovalRequested`] with tool `codex_permissions` (see
+//! [`permissions`] for the `input` shape). The request is typed entry by entry; one that cannot
+//! be typed exactly is unrenderable and offers only Deny and Stop turn. Allow sends the grant
+//! rebuilt from the typed entries with `scope: "turn"`, Allow for session the same with
+//! `scope: "session"` (Codex's own grant, kept by the app-server process until it exits; nothing
+//! on disk); Deny grants nothing (`{"permissions": {}}`, the protocol has no refusal value);
+//! Stop turn grants nothing, then sends `turn/interrupt` when the request belongs to the active
+//! turn. `strictAutoReview` is never sent (its behaviour is unverified). No Always allow: the
+//! app keeps no rule for these. The session narrows Allow for session further (home, root,
+//! Codex's own folder, sensitive paths) because only it knows those places.
+//!
+//! # MCP forms (`mcpServer/elicitation/request`)
+//!
+//! `mode: "form"` becomes [`Event::FormRequested`] with [`crate::form::Form::Fields`] (the
+//! server's field order is read from the raw frame); `mode: "url"` with a plain web link becomes
+//! [`crate::form::Form::Link`]. The adapter declines, with a notice naming the server and the
+//! reason, a form it cannot show safely (see [`elicitation`]); `openai/form` / `openaiForm` are
+//! declined as not shown yet. Declined, never errored: the server and the turn carry on.
+//! [`Command::SubmitForm`] sends exactly what [`crate::form::answer`] returns; Cancel also stops
+//! the turn, but only when the form named the active turn. A form without a `turnId` is not
+//! tied to any turn: a turn ending does not expire it, and answering it never interrupts one.
+//! An open form expires (resolved as [`crate::form::FormAction::Cancel`], nothing sent) when the
+//! server resolves it elsewhere, its turn ends, its worker closes or the process exits. The
+//! session emits `FormResolved` for an answer the adapter accepted; the adapter never does. An
+//! MCP tool-call approval is the one form that is not shown as a form (next section).
+//!
+//! # MCP tool-call approvals
+//!
+//! Codex asks to approve an MCP tool call as an MCP form of its own: no fields,
+//! `_meta.codex_approval_kind: "mcp_tool_call"` (`tests/fixtures/real/codex/
+//! mcp-tool-approval-accept.jsonl`). It is mapped to an [`Event::ApprovalRequested`] with tool
+//! `mcp__<server>__<tool>`, the name Claude's calls carry, so the app's rules answer it the same
+//! way. The form names no item; the `mcpToolCall` item Codex starts just before it does
+//! ([`CodexAdapter::on_mcp_tool_approval`]). Allow, Allow for session and Always allow send
+//! `{"action": "accept", "content": {}}` (never `_meta.persist`: those scopes are the app's);
+//! Deny sends `decline` (Codex tells the model the user rejected the call); Stop turn
+//! sends `cancel` and interrupts the turn. It expires like any approval.
+//!
+//! stderr (Codex's tracing output) is ignored.
+
+mod elicitation;
+mod permissions;
+
+pub use permissions::{clip, is_plain_absolute, sentence};
+
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::{Mutex, MutexGuard};
+
+use serde_json::{json, Map, Value};
+
+use crate::adapter::{
+    Action, Adapter, AdapterError, Command, Control, Driver, Mode, OpenSession, Outbox,
+};
+use crate::caps::Capabilities;
+use crate::event::{
+    Decision, Envelope, Event, ItemKind, ItemStatus, PlanStep, Question, QuestionOption,
+    QuestionSource, ReasoningLabel, ReasoningState, ResponseCapability, StepStatus, StreamKind,
+    TurnState, Usage, WorkerSnapshot, WorkerState,
+};
+
+/// A Codex reasoning item's state: Codex shares a summary of its reasoning (label "summary").
+fn reasoning_state(state: ReasoningState) -> Envelope {
+    Envelope::new(Event::Reasoning {
+        state,
+        label: ReasoningLabel::Summary,
+    })
+}
+
+/// Page size asked of `model/list`.
+const MODEL_PAGE: u32 = 200;
+
+// Bound retired-turn history on long-lived connections; settled active-turn requests retire
+// with their scope, so delayed frames do not require keeping the entire conversation here.
+const TURN_TOMBSTONE_LIMIT: usize = 128;
+
+/// How many answered turnless requests are remembered against retransmission.
+const TURNLESS_SETTLED_LIMIT: usize = 256;
+
+/// Notifications that carry nothing the UI renders (bookkeeping, or covered by another frame):
+/// dropped without an [`Event::Unknown`], which would only add noise to every turn.
+const QUIET: &[&str] = &[
+    "thread/name/updated",
+    "thread/settings/updated",
+    "thread/compacted",
+    "skills/changed",
+    "account/updated",
+    "account/rateLimits/updated",
+    "mcpServer/startupStatus/updated",
+    "remoteControl/status/changed",
+    "hook/started",
+    "hook/completed",
+    "turn/diff/updated",
+    "item/reasoning/textDelta",
+    "item/commandExecution/terminalInteraction",
+    "item/mcpToolCall/progress",
+    "item/autoApprovalReview/started",
+    "item/autoApprovalReview/completed",
+];
+
+/// A request this adapter sent and has not seen answered.
+#[derive(Debug, Clone)]
+enum Pending {
+    Initialize,
+    /// Bound child startup waits for the effective MCP names, without exposing the config.
+    ChildConfig {
+        method: String,
+        params: Value,
+    },
+    /// A delegation root's `config/read`, for the user's own developer instructions, which its
+    /// `thread/start` or `thread/resume` (`method`, `params`) adds the delegation note to.
+    RootConfig {
+        method: String,
+        params: Value,
+    },
+    /// `thread/start` or `thread/resume`.
+    ThreadStart,
+    TurnStart(SubmittedModel),
+    Compact,
+    Interrupt,
+    /// `turn/steer` carrying this text: refused (the turn ended first), it starts a turn of its
+    /// own instead.
+    Steer(String),
+    /// A delegated `turn/steer` ([`Command::DelegatedSteer`]): its outcome is a
+    /// `ControlResult` for this tag, and a refusal starts nothing.
+    DelegatedSteer(String),
+    /// `model/list`, answering the control with this id.
+    Models(String),
+}
+
+/// The selection actually written to one `turn/start`, independent of later picker changes.
+#[derive(Debug, Clone)]
+struct SubmittedModel {
+    model: Option<String>,
+    effort: Option<String>,
+    revision: u64,
+}
+
+impl SubmittedModel {
+    fn selection_key(&self) -> Option<String> {
+        (self.revision != 0).then(|| format!("codex-model-{}", self.revision))
+    }
+}
+
+/// An unanswered approval server request.
+#[derive(Debug, Clone)]
+struct PendingApproval {
+    /// The JSON-RPC id to put in the response, verbatim (number or string).
+    rpc_id: Value,
+    item: String,
+    scope: RequestScope,
+    /// The decisions the server offered (`availableDecisions`, or all of ours when it named
+    /// none we know). A decision outside this is refused rather than sent.
+    options: Vec<Decision>,
+    /// A permission request: the grant an Allow sends (rebuilt from the typed entries the card
+    /// showed). `None` for command and patch approvals, which answer with a decision.
+    grant: Option<Value>,
+    /// An MCP tool-call approval, which Codex asks as a form: answered with an elicitation
+    /// `action`, not a decision.
+    form: bool,
+}
+
+/// An open `mcpToolCall` item: Codex starts it before it asks to approve the call, and the
+/// approval form names no item, so the card and the app's rules take the tool from here.
+#[derive(Debug, Clone)]
+struct McpCall {
+    thread: Option<String>,
+    server: String,
+    tool: String,
+    arguments: Value,
+}
+
+/// What an approval card shows besides its options, which come from its [`PendingApproval`].
+struct ApprovalCard {
+    tool: String,
+    title: Option<String>,
+    input: Value,
+    reason: Option<String>,
+    remembers: Option<String>,
+}
+
+/// An unanswered MCP form (`mcpServer/elicitation/request`).
+#[derive(Debug, Clone)]
+struct PendingForm {
+    /// The JSON-RPC id to put in the response, verbatim (number or string).
+    rpc_id: Value,
+    /// The thread and the turn the request named; `turn` is `None` for a turnless form, which
+    /// no turn's end expires and whose Cancel interrupts nothing.
+    scope: RequestScope,
+    /// The fields an Accept is judged against; `None` for a link.
+    fields: Option<Vec<crate::form::FormField>>,
+}
+
+/// An unanswered `request_user_input` server request.
+#[derive(Debug, Clone)]
+struct PendingQuestion {
+    /// The JSON-RPC id to put in the response, verbatim (number or string).
+    rpc_id: Value,
+    item: String,
+    scope: RequestScope,
+    /// The app-server question ids, paired with the unique text shown by the shared card UI.
+    keys: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RequestScope {
+    thread: Option<String>,
+    turn: Option<String>,
+}
+
+pub struct CodexAdapter {
+    caps: Capabilities,
+    client_version: String,
+    /// The session given to [`Adapter::argv`].
+    session: Mutex<Option<OpenSession>>,
+    next_id: u64,
+    pending: HashMap<u64, Pending>,
+    startup_failed: bool,
+    /// The process answered `initialize` with a result ([`Adapter::handshake_answered`]).
+    initialized: bool,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+    turn_open: bool,
+    /// An interrupt was sent for the open turn, so an exit before it ends is expected.
+    interrupt_sent: bool,
+    model: Option<String>,
+    /// An explicit launch model or later choice must survive the initial thread response.
+    /// That response reports startup state separately from the selected turn default.
+    model_selected_during_start: bool,
+    selection_revision: u64,
+    confirmed_revision: u64,
+    accepted_revision: Option<u64>,
+    confirmed_model: Option<String>,
+    confirmed_effort: Option<String>,
+    effective_selection: Option<SubmittedModel>,
+    /// Reasoning effort sent on every `turn/start` (`low`/`medium`/`high`/...; a model-advertised
+    /// string). Seeded from `OpenSession::effort`, changed by `Command::SetModel { effort }`
+    /// (per turn: no respawn).
+    effort: Option<String>,
+    mode: Mode,
+    /// Policy sent for the active or pending turn. Selecting a new default cannot mutate it.
+    effective_mode: Option<Mode>,
+    cwd: Option<String>,
+    /// Prompts encoded before the thread id arrived.
+    queued: VecDeque<String>,
+    outbox: Outbox,
+    approvals: HashMap<String, PendingApproval>,
+    questions: HashMap<String, PendingQuestion>,
+    forms: HashMap<String, PendingForm>,
+    /// Settled turnless request keys, oldest first (see `remember_settled_request`).
+    turnless_settled: VecDeque<String>,
+    /// Keep every settled identity until its turn ends, then retire that scope. Retention
+    /// grows with active work, not connection lifetime; evicting an active identity would
+    /// make an old answer valid again. Child scopes retire only with child terminal evidence.
+    settled_requests: HashMap<String, RequestScope>,
+    ended_turns: HashSet<RequestScope>,
+    ended_turn_order: VecDeque<RequestScope>,
+    /// Ids of items started and not yet completed, in start order.
+    open_items: Vec<String>,
+    /// Accumulated streamed text per open message item (snapshot fallback).
+    texts: HashMap<String, String>,
+    /// Accumulated reasoning summary per open reasoning item.
+    reasoning: HashMap<String, String>,
+    /// The `changes` of each open `fileChange` item: its approval request carries no path or
+    /// diff, so the card and the app's rules take them from here.
+    file_changes: HashMap<String, Value>,
+    /// Each open `mcpToolCall` item, by item id.
+    mcp_calls: HashMap<String, McpCall>,
+    /// While a `thread/resume` is unanswered: the `thread/start` params to fall back on when it
+    /// finds no rollout (a thread that never completed a turn has none).
+    resume_fallback: Option<Value>,
+    /// Worker identity is a thread id, independent of collaboration operation/item ids.
+    workers: BTreeMap<String, WorkerSnapshot>,
+    /// Current child turn ids: unscoped child requests must never borrow the parent's id.
+    worker_turns: HashMap<String, String>,
+    /// Open explicit wait operations, keyed by item id (several can target one worker).
+    worker_waits: BTreeMap<String, Vec<String>>,
+    /// Latest cumulative thread usage, and the cumulative usage when the last turn ended.
+    usage_total: Option<Usage>,
+    usage_base: Usage,
+    /// Context occupancy and window from the last `thread/tokenUsage/updated`.
+    context: Option<(u64, Option<u64>)>,
+    /// A `/compact` was requested, so the coming `contextCompaction` item is manual.
+    compact_pending: bool,
+    /// A supervised delegation child: its policies come from [`child_mode_policy`].
+    child: bool,
+}
+
+impl Default for CodexAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CodexAdapter {
+    pub fn new() -> Self {
+        Self {
+            caps: Capabilities::codex(),
+            client_version: env!("CARGO_PKG_VERSION").to_owned(),
+            session: Mutex::new(None),
+            next_id: 0,
+            pending: HashMap::new(),
+            startup_failed: false,
+            initialized: false,
+            thread_id: None,
+            turn_id: None,
+            turn_open: false,
+            interrupt_sent: false,
+            model: None,
+            model_selected_during_start: false,
+            selection_revision: 0,
+            confirmed_revision: 0,
+            accepted_revision: None,
+            confirmed_model: None,
+            confirmed_effort: None,
+            effective_selection: None,
+            effort: None,
+            mode: Mode::default(),
+            effective_mode: None,
+            cwd: None,
+            queued: VecDeque::new(),
+            outbox: Outbox::default(),
+            approvals: HashMap::new(),
+            questions: HashMap::new(),
+            forms: HashMap::new(),
+            turnless_settled: VecDeque::new(),
+            settled_requests: HashMap::new(),
+            ended_turns: HashSet::new(),
+            ended_turn_order: VecDeque::new(),
+            open_items: Vec::new(),
+            texts: HashMap::new(),
+            reasoning: HashMap::new(),
+            file_changes: HashMap::new(),
+            mcp_calls: HashMap::new(),
+            resume_fallback: None,
+            workers: BTreeMap::new(),
+            worker_turns: HashMap::new(),
+            worker_waits: BTreeMap::new(),
+            usage_total: None,
+            usage_base: Usage::default(),
+            context: None,
+            compact_pending: false,
+            child: false,
+        }
+    }
+
+    /// The `(approvalPolicy, sandboxPolicy)` this adapter sends for `mode`: a root's
+    /// [`mode_policy`], or a supervised child's [`child_mode_policy`].
+    fn policy(&self, mode: Mode) -> (&'static str, Value) {
+        if self.child {
+            child_mode_policy(mode)
+        } else {
+            mode_policy(mode)
+        }
+    }
+
+    /// Sets the thread id directly (used by transcript importers).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_thread_id(&mut self, thread_id: String) {
+        self.thread_id = Some(thread_id);
+    }
+
+    /// The version reported in `initialize`'s `clientInfo` (default: this crate's version; the
+    /// app passes its own).
+    pub fn client_version(mut self, version: impl Into<String>) -> Self {
+        self.client_version = version.into();
+        self
+    }
+
+    fn session(&self) -> MutexGuard<'_, Option<OpenSession>> {
+        // A poisoned lock only means another thread panicked while holding it; the data is
+        // plain and still valid.
+        self.session.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn worker(&mut self, id: &str) -> &mut WorkerSnapshot {
+        self.workers
+            .entry(id.to_owned())
+            .or_insert_with(|| WorkerSnapshot {
+                id: id.to_owned(),
+                name: None,
+                task: None,
+                state: WorkerState::Unknown,
+                activity: None,
+                delegation: None,
+            })
+    }
+
+    fn waiting_for(&self) -> Vec<String> {
+        let mut ids: Vec<_> = self.worker_waits.values().flatten().cloned().collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    fn emit_workers(&self, out: &mut Vec<Envelope>) {
+        out.push(Envelope::new(Event::WorkersUpdated {
+            workers: self.workers.values().cloned().collect(),
+            waiting_for: self.waiting_for(),
+        }));
+    }
+
+    fn clear_worker_waits(&mut self, out: &mut Vec<Envelope>) {
+        if !self.worker_waits.is_empty() {
+            self.worker_waits.clear();
+            self.emit_workers(out);
+        }
+    }
+
+    fn finish_effective_mode(&mut self, out: &mut Vec<Envelope>) {
+        self.effective_selection = None;
+        if self
+            .effective_mode
+            .take()
+            .is_some_and(|mode| mode != self.mode)
+        {
+            out.push(Envelope::new(Event::ModeChanged { mode: self.mode }));
+        }
+    }
+
+    fn confirm_submitted_model(&mut self, submitted: &SubmittedModel, out: &mut Vec<Envelope>) {
+        if submitted.revision < self.confirmed_revision
+            || self.accepted_revision == Some(submitted.revision)
+        {
+            return;
+        }
+        self.accepted_revision = Some(submitted.revision);
+        if submitted.revision == self.confirmed_revision
+            && submitted.model == self.confirmed_model
+            && submitted.effort == self.confirmed_effort
+        {
+            return;
+        }
+        self.confirmed_revision = submitted.revision;
+        self.confirmed_model = submitted.model.clone();
+        self.confirmed_effort = submitted.effort.clone();
+        if let Some(model) = &submitted.model {
+            let mut event = Envelope::new(Event::ModelChanged {
+                model: model.clone(),
+            });
+            event.request = submitted.selection_key();
+            out.push(event);
+        }
+    }
+
+    fn selection_is_unconfirmed(&self, submitted: &SubmittedModel) -> bool {
+        submitted.revision >= self.confirmed_revision
+            && self.accepted_revision != Some(submitted.revision)
+            && (submitted.revision > self.confirmed_revision
+                || submitted.model != self.confirmed_model
+                || submitted.effort != self.confirmed_effort)
+    }
+
+    /// A patch approval's card title, from the paths of the item that started it.
+    fn file_change_title(&self, params: &Value) -> String {
+        let paths: Vec<&str> = s(params, "itemId")
+            .and_then(|id| self.file_changes.get(id))
+            .and_then(Value::as_array)
+            .map(|c| c.iter().filter_map(|ch| s(ch, "path")).collect())
+            .unwrap_or_default();
+        match paths.as_slice() {
+            [] => "Apply file changes".to_owned(),
+            [one] => format!("Edit {one}"),
+            [first, rest @ ..] => format!("Edit {first} (+{} more)", rest.len()),
+        }
+    }
+
+    fn fail_startup(&mut self, message: String, out: &mut Vec<Envelope>) {
+        if self.startup_failed {
+            return;
+        }
+        self.startup_failed = true;
+        let submitted =
+            !self.queued.is_empty() || self.effective_selection.is_some() || self.turn_open;
+        self.queued.clear();
+        self.outbox.actions.clear();
+        self.thread_id = None;
+        self.turn_id = None;
+        self.turn_open = false;
+        if let Some(model) = &self.model {
+            let mut event = Envelope::new(Event::ModelChangeFailed {
+                model: model.clone(),
+                message: message.clone(),
+            });
+            if self.selection_revision != 0 {
+                event.request = Some(format!("codex-model-{}", self.selection_revision));
+            }
+            out.push(event);
+        }
+        out.push(Envelope::new(Event::Error {
+            message: message.clone(),
+        }));
+        if submitted {
+            out.push(Envelope::new(Event::TurnCompleted {
+                state: TurnState::Failed,
+                usage: None,
+                cost_usd: None,
+                error: Some(message),
+            }));
+        }
+        self.finish_effective_mode(out);
+    }
+
+    /// Verified against the installed app-server schema: operation statuses and agent statuses
+    /// are different enums. Preserve worker ids/statuses even when no nickname was reported.
+    fn track_collaboration(&mut self, item: &Value, completed: bool, out: &mut Vec<Envelope>) {
+        if s(item, "type") != Some("collabAgentToolCall") {
+            return;
+        }
+        let before = (self.workers.clone(), self.worker_waits.clone());
+        let tool = s(item, "tool").unwrap_or_default();
+        let receivers: Vec<String> = strings(item, "receiverThreadIds")
+            .into_iter()
+            .filter(|id| !id.is_empty())
+            .collect();
+        let prompt = s(item, "prompt").filter(|p| !p.trim().is_empty());
+        for id in &receivers {
+            let worker = self.worker(id);
+            // A message is not necessarily a new task. These operations actually assign work.
+            if matches!(tool, "spawnAgent" | "sendInput" | "followupTask") {
+                if let Some(prompt) = prompt {
+                    if worker.task.as_deref() != Some(prompt) {
+                        worker.activity = None;
+                    }
+                    worker.task = Some(prompt.to_owned());
+                }
+            }
+        }
+        if let Some(states) = item.get("agentsStates").and_then(Value::as_object) {
+            for (id, state) in states {
+                if id.is_empty() {
+                    continue;
+                }
+                let worker = self.worker(id);
+                set_worker_state(worker, collab_worker_state(s(state, "status")));
+                if let Some(message) = s(state, "message").filter(|m| !m.trim().is_empty()) {
+                    worker.activity = Some(message.to_owned());
+                }
+            }
+        }
+        if let Some(id) = s(item, "id") {
+            if tool == "wait" && !completed && s(item, "status") == Some("inProgress") {
+                self.worker_waits.insert(id.to_owned(), receivers);
+            } else {
+                self.worker_waits.remove(id);
+            }
+        }
+        if before != (self.workers.clone(), self.worker_waits.clone()) {
+            self.emit_workers(out);
+        }
+    }
+
+    /// Child notifications cannot change the main thread's turn id, reasoning or quota. Scope
+    /// child metadata by a verified parent id (including nested workers) or a known receiver.
+    fn worker_notification(
+        &mut self,
+        method: &str,
+        params: &Value,
+        out: &mut Vec<Envelope>,
+    ) -> bool {
+        if method == "thread/started" {
+            let thread = params.get("thread").unwrap_or(&Value::Null);
+            let Some(id) = s(thread, "id") else {
+                return true;
+            };
+            let spawn = thread
+                .get("source")
+                .and_then(|s| s.get("subAgent"))
+                .and_then(|s| s.get("thread_spawn"));
+            let parent = s(thread, "parentThreadId").or_else(|| {
+                spawn
+                    .and_then(|s| s.get("parent_thread_id"))
+                    .and_then(Value::as_str)
+            });
+            let ours = self.workers.contains_key(id)
+                || parent.is_some_and(|p| {
+                    self.thread_id.as_deref() == Some(p) || self.workers.contains_key(p)
+                });
+            if ours {
+                let before = self.workers.clone();
+                let worker = self.worker(id);
+                let nickname = s(thread, "agentNickname").or_else(|| {
+                    spawn
+                        .and_then(|s| s.get("agent_nickname"))
+                        .and_then(Value::as_str)
+                });
+                let role = s(thread, "agentRole").or_else(|| {
+                    spawn
+                        .and_then(|s| s.get("agent_role"))
+                        .and_then(Value::as_str)
+                });
+                if let Some(name) = nickname
+                    .filter(|n| !n.trim().is_empty())
+                    .or_else(|| role.filter(|r| worker.name.is_none() && !r.trim().is_empty()))
+                {
+                    worker.name = Some(name.to_owned());
+                }
+                set_worker_state(worker, thread_worker_state(thread.get("status")));
+                if before != self.workers {
+                    self.emit_workers(out);
+                }
+            }
+            return true;
+        }
+        let Some(id) = s(params, "threadId") else {
+            return false;
+        };
+        if self.thread_id.as_deref() == Some(id) {
+            if method == "thread/closed" {
+                self.clear_worker_waits(out);
+                return true;
+            }
+            return method == "thread/status/changed";
+        }
+        if !self.workers.contains_key(id) {
+            // Notifications about unrelated threads share this transport on newer servers.
+            return self.thread_id.is_some();
+        }
+        let before = (self.workers.clone(), self.worker_waits.clone());
+        match method {
+            "thread/status/changed" => {
+                set_worker_state(self.worker(id), thread_worker_state(params.get("status")));
+            }
+            "thread/closed" => {
+                self.retire_thread_requests(id, out);
+                self.worker_turns.remove(id);
+                self.worker(id).state = WorkerState::Closed;
+            }
+            "turn/started" => {
+                let scope = self.notification_turn_scope(params);
+                if self.ended_turns.contains(&scope) {
+                    return true;
+                }
+                if let Some(turn) = scope.turn {
+                    self.worker_turns.insert(id.to_owned(), turn);
+                }
+                self.worker(id).state = WorkerState::Running;
+            }
+            "turn/completed" => {
+                let turn = params.get("turn").unwrap_or(&Value::Null);
+                let scope = self.notification_turn_scope(params);
+                if self.ended_turns.contains(&scope) {
+                    return true;
+                }
+                if self
+                    .worker_turns
+                    .get(id)
+                    .zip(scope.turn.as_ref())
+                    .is_some_and(|(active, ended)| active != ended)
+                {
+                    return true;
+                }
+                self.retire_turn_requests(scope, out);
+                self.worker_turns.remove(id);
+                let state = match s(turn, "status") {
+                    Some("completed") => WorkerState::Completed,
+                    Some("interrupted") => WorkerState::Stopped,
+                    Some("failed") => WorkerState::Failed,
+                    _ => WorkerState::Unknown,
+                };
+                set_worker_state(self.worker(id), state);
+            }
+            "item/started" | "item/completed" => {
+                let item = params.get("item").unwrap_or(&Value::Null);
+                self.track_collaboration(item, method == "item/completed", out);
+                let (kind, title, _) = item_info(item);
+                if !matches!(kind, ItemKind::AssistantMessage | ItemKind::Reasoning) {
+                    self.worker(id).activity = Some(title);
+                }
+            }
+            _ => {}
+        }
+        if before != (self.workers.clone(), self.worker_waits.clone()) {
+            self.emit_workers(out);
+        }
+        true
+    }
+
+    /// Records a request and returns its line.
+    fn request(&mut self, pending: Pending, method: &str, params: Value) -> String {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.pending.insert(id, pending);
+        json!({"id": id, "method": method, "params": params}).to_string()
+    }
+
+    fn write(&mut self, line: String) {
+        self.outbox.actions.push(Action::Write(vec![line]));
+    }
+
+    fn emit(&mut self, event: Event) {
+        self.outbox.events.push(Envelope::new(event));
+    }
+
+    fn turn_start_line(&mut self, thread: &str, text: &str) -> String {
+        // Capture before writing: the user can change the picker before turn/started arrives.
+        if self.effective_mode.is_none() {
+            self.effective_mode = Some(self.mode);
+        }
+        let (approval, sandbox) = self.policy(self.mode);
+        let mut params = Map::new();
+        params.insert("threadId".into(), json!(thread));
+        params.insert("input".into(), json!([{"type": "text", "text": text}]));
+        if let Some(cwd) = &self.cwd {
+            params.insert("cwd".into(), json!(cwd));
+        }
+        if let Some(model) = &self.model {
+            params.insert("model".into(), json!(model));
+        }
+        if let Some(effort) = &self.effort {
+            params.insert("effort".into(), json!(effort));
+        }
+        params.insert("approvalPolicy".into(), json!(approval));
+        // Always explicit: omitting it leaves a previously set reviewer in effect.
+        params.insert("approvalsReviewer".into(), json!("user"));
+        params.insert("sandboxPolicy".into(), sandbox);
+        // The model catalogue can default summaries to "none"; ask for them every turn.
+        params.insert("summary".into(), json!("detailed"));
+        let submitted = SubmittedModel {
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+            revision: self.selection_revision,
+        };
+        if self.effective_selection.is_none() {
+            self.effective_selection = Some(submitted.clone());
+        }
+        self.request(
+            Pending::TurnStart(submitted),
+            "turn/start",
+            Value::Object(params),
+        )
+    }
+
+    // ---- items ----
+
+    fn start_item(
+        &mut self,
+        out: &mut Vec<Envelope>,
+        id: &str,
+        kind: ItemKind,
+        title: String,
+        input: Option<Value>,
+    ) {
+        crate::adapter::start_open_item(&mut self.open_items, out, id, kind, title, input);
+    }
+
+    fn complete_item(
+        &mut self,
+        out: &mut Vec<Envelope>,
+        id: &str,
+        status: ItemStatus,
+        output: Option<String>,
+        error: Option<String>,
+    ) {
+        self.open_items.retain(|i| i != id);
+        self.texts.remove(id);
+        self.reasoning.remove(id);
+        out.push(
+            Envelope::new(Event::ItemCompleted {
+                status,
+                output,
+                error,
+            })
+            .item(id),
+        );
+    }
+
+    fn close_all(&mut self, out: &mut Vec<Envelope>) {
+        for id in std::mem::take(&mut self.open_items) {
+            // An item cut short never completes: its patch must not outlive it.
+            self.file_changes.remove(&id);
+            self.mcp_calls.remove(&id);
+            for (stream, text) in [
+                (StreamKind::Assistant, self.texts.remove(&id)),
+                (StreamKind::Reasoning, self.reasoning.remove(&id)),
+            ] {
+                if let Some(text) = text.filter(|t| !t.is_empty()) {
+                    out.push(Envelope::new(Event::ContentSnapshot { stream, text }).item(&id));
+                }
+            }
+            out.push(
+                Envelope::new(Event::ItemCompleted {
+                    status: ItemStatus::Interrupted,
+                    output: None,
+                    error: None,
+                })
+                .item(id),
+            );
+        }
+    }
+
+    fn on_item_started(&mut self, params: &Value, out: &mut Vec<Envelope>) {
+        let Some(item) = params.get("item") else {
+            out.push(Envelope::new(Event::Unknown));
+            return;
+        };
+        let Some(id) = s(item, "id") else {
+            out.push(Envelope::new(Event::Unknown));
+            return;
+        };
+        if is_silent_item(item) {
+            return;
+        }
+        self.track_collaboration(item, false, out);
+        let (kind, title, input) = item_info(item);
+        if kind == ItemKind::FileChange {
+            if let Some(changes) = input.clone().filter(Value::is_array) {
+                self.file_changes.insert(id.to_owned(), changes);
+            }
+        }
+        if s(item, "type") == Some("mcpToolCall") {
+            if let (Some(server), Some(tool)) = (s(item, "server"), s(item, "tool")) {
+                self.mcp_calls.insert(
+                    id.to_owned(),
+                    McpCall {
+                        thread: s(params, "threadId").map(str::to_owned),
+                        server: server.to_owned(),
+                        tool: tool.to_owned(),
+                        arguments: item.get("arguments").cloned().unwrap_or(Value::Null),
+                    },
+                );
+            }
+        }
+        self.start_item(out, id, kind, title, input);
+    }
+
+    fn on_item_completed(&mut self, params: &Value, out: &mut Vec<Envelope>) {
+        let Some(item) = params.get("item") else {
+            out.push(Envelope::new(Event::Unknown));
+            return;
+        };
+        let Some(id) = s(item, "id") else {
+            out.push(Envelope::new(Event::Unknown));
+            return;
+        };
+        if s(item, "type") == Some("contextCompaction") {
+            out.push(Envelope::new(Event::Compacted {
+                manual: std::mem::take(&mut self.compact_pending),
+                before: self.context.map_or(0, |(used, _)| used),
+                after: None,
+            }));
+            return;
+        }
+        if is_silent_item(item) {
+            return;
+        }
+        self.track_collaboration(item, true, out);
+        self.file_changes.remove(id);
+        self.mcp_calls.remove(id);
+        let (kind, title, input) = item_info(item);
+        if matches!(kind, ItemKind::WebSearch | ItemKind::FileChange)
+            && self.open_items.iter().any(|open| open == id)
+        {
+            // Completed metadata is authoritative: file changes can start with no patch.
+            // The reducer refines a matching ItemStarted without creating another card.
+            out.push(
+                Envelope::new(Event::ItemStarted {
+                    kind,
+                    title,
+                    input,
+                    parent: None,
+                })
+                .item(id),
+            );
+        } else {
+            self.start_item(out, id, kind, title, input);
+        }
+        // The completed item is authoritative: its text replaces whatever streamed.
+        let streamed_text = self.texts.get(id).cloned();
+        let streamed_reasoning = self.reasoning.get(id).cloned();
+        let snapshot = match s(item, "type") {
+            Some("agentMessage" | "plan") => s(item, "text")
+                .map(str::to_owned)
+                .or(streamed_text)
+                .map(|t| (StreamKind::Assistant, t)),
+            Some("reasoning") => {
+                let summary = strings(item, "summary");
+                let content = strings(item, "content");
+                let text = if !summary.is_empty() {
+                    summary.join("\n\n")
+                } else if !content.is_empty() {
+                    content.join("\n\n")
+                } else {
+                    streamed_reasoning.unwrap_or_default()
+                };
+                Some((StreamKind::Reasoning, text))
+            }
+            _ => None,
+        };
+        let shared = snapshot.as_ref().is_some_and(|(_, t)| !t.trim().is_empty());
+        if let Some((stream, text)) = snapshot.filter(|(_, t)| !t.is_empty()) {
+            out.push(Envelope::new(Event::ContentSnapshot { stream, text }).item(id));
+        }
+        if s(item, "type") == Some("reasoning") {
+            // A reasoning item with no summary is one the model did not share.
+            out.push(
+                reasoning_state(if shared {
+                    ReasoningState::Complete
+                } else {
+                    ReasoningState::Unavailable
+                })
+                .item(id),
+            );
+        }
+        let (status, output, error) = item_result(item);
+        self.complete_item(out, id, status, output, error);
+    }
+
+    fn on_text_delta(
+        &mut self,
+        params: &Value,
+        stream: StreamKind,
+        out: &mut Vec<Envelope>,
+    ) -> bool {
+        let (Some(id), Some(delta)) = (s(params, "itemId"), s(params, "delta")) else {
+            return false;
+        };
+        if self.thread_id.is_none() {
+            return false;
+        }
+        let (kind, title) = match stream {
+            StreamKind::Reasoning => (ItemKind::Reasoning, "reasoning"),
+            _ => (ItemKind::AssistantMessage, "assistant"),
+        };
+        self.start_item(out, id, kind, title.to_owned(), None);
+        if stream == StreamKind::Reasoning && !self.reasoning.contains_key(id) {
+            // Codex shares a summary of its reasoning, streamed.
+            out.push(reasoning_state(ReasoningState::Streaming).item(id));
+        }
+        let acc = match stream {
+            StreamKind::Reasoning => &mut self.reasoning,
+            _ => &mut self.texts,
+        };
+        acc.entry(id.to_owned()).or_default().push_str(delta);
+        out.push(
+            Envelope::new(Event::ContentDelta {
+                stream,
+                text: delta.to_owned(),
+            })
+            .item(id),
+        );
+        true
+    }
+
+    // ---- notifications ----
+
+    fn on_notification(&mut self, method: &str, params: &Value, out: &mut Vec<Envelope>) {
+        if self.startup_failed {
+            return;
+        }
+        if self.worker_notification(method, params, out) {
+            return;
+        }
+        match method {
+            "turn/started" => {
+                let scope = self.notification_turn_scope(params);
+                if self.ended_turns.contains(&scope) {
+                    return;
+                }
+                self.clear_worker_waits(out);
+                if self.effective_mode.is_none() {
+                    self.effective_mode = Some(self.mode);
+                }
+                self.turn_open = true;
+                self.interrupt_sent = false;
+                if let Some(turn) = s(params.get("turn").unwrap_or(&Value::Null), "id") {
+                    self.turn_id = Some(turn.to_owned());
+                }
+                let submitted = self.effective_selection.clone();
+                if let Some(selection) = &submitted {
+                    self.confirm_submitted_model(selection, out);
+                }
+                out.push(Envelope::new(Event::TurnStarted {
+                    model: submitted.map_or_else(|| self.confirmed_model.clone(), |s| s.model),
+                }));
+            }
+            "turn/completed" => self.on_turn_completed(params, out),
+            "item/started" => self.on_item_started(params, out),
+            "item/completed" => self.on_item_completed(params, out),
+            "item/agentMessage/delta" | "item/plan/delta" => {
+                if !self.on_text_delta(params, StreamKind::Assistant, out) {
+                    out.push(Envelope::new(Event::Unknown));
+                }
+            }
+            "item/reasoning/summaryTextDelta" => {
+                if !self.on_text_delta(params, StreamKind::Reasoning, out) {
+                    out.push(Envelope::new(Event::Unknown));
+                }
+            }
+            "item/reasoning/summaryPartAdded" => {
+                // A new summary part: separate it from the text already shown.
+                if let Some(id) = s(params, "itemId") {
+                    let has_text = self.reasoning.get(id).is_some_and(|t| !t.is_empty());
+                    if has_text {
+                        self.reasoning
+                            .entry(id.to_owned())
+                            .or_default()
+                            .push_str("\n\n");
+                        out.push(
+                            Envelope::new(Event::ContentDelta {
+                                stream: StreamKind::Reasoning,
+                                text: "\n\n".to_owned(),
+                            })
+                            .item(id),
+                        );
+                    }
+                }
+            }
+            "item/commandExecution/outputDelta" => {
+                match (s(params, "itemId"), s(params, "delta")) {
+                    (Some(id), Some(delta)) => out.push(
+                        Envelope::new(Event::ContentDelta {
+                            stream: StreamKind::ToolOutput,
+                            text: delta.to_owned(),
+                        })
+                        .item(id),
+                    ),
+                    _ => out.push(Envelope::new(Event::Unknown)),
+                }
+            }
+            "item/fileChange/patchUpdated" => {
+                if let Some(id) = s(params, "itemId") {
+                    if let Some(changes) = params.get("changes").filter(|c| c.is_array()) {
+                        if let Some(known) = self.file_changes.get_mut(id) {
+                            known.clone_from(changes);
+                        }
+                    }
+                    let diff = params
+                        .get("changes")
+                        .and_then(Value::as_array)
+                        .map(|c| {
+                            c.iter()
+                                .filter_map(|ch| s(ch, "diff"))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .unwrap_or_default();
+                    if !diff.is_empty() {
+                        out.push(
+                            Envelope::new(Event::ContentSnapshot {
+                                stream: StreamKind::ToolInput,
+                                text: diff,
+                            })
+                            .item(id),
+                        );
+                    }
+                }
+            }
+            "turn/plan/updated" => {
+                if self.stale_explicit_turn(params) {
+                    return;
+                }
+                let steps = params
+                    .get("plan")
+                    .and_then(Value::as_array)
+                    .map(|plan| {
+                        plan.iter()
+                            .map(|p| PlanStep {
+                                text: s(p, "step").unwrap_or_default().to_owned(),
+                                status: match s(p, "status") {
+                                    Some("completed") => StepStatus::Completed,
+                                    Some("inProgress") => StepStatus::InProgress,
+                                    _ => StepStatus::Pending,
+                                },
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                out.push(Envelope::new(Event::PlanUpdated { steps }));
+            }
+            "thread/tokenUsage/updated" => self.on_token_usage(params, out),
+            "account/rateLimits/updated" => {
+                // A sparse rolling update; the app merges windows by (group, label).
+                let windows = crate::quota::codex_rate_limits(params);
+                if !windows.is_empty() {
+                    out.push(Envelope::new(Event::QuotaUpdated {
+                        account: None,
+                        windows,
+                    }));
+                }
+            }
+            "serverRequest/resolved" => {
+                // Resolved by something other than our answer (the turn was interrupted).
+                let approval = self
+                    .approvals
+                    .iter()
+                    .find(|(_, pending)| Some(&pending.rpc_id) == params.get("requestId"))
+                    .map(|(key, _)| key.clone());
+                if let Some((key, p)) = approval
+                    .and_then(|key| self.approvals.remove(&key).map(|pending| (key, pending)))
+                {
+                    self.remember_settled_request(key.clone(), p.scope.clone());
+                    out.push(
+                        Envelope::new(Event::ApprovalExpired)
+                            .item(p.item)
+                            .request(key),
+                    );
+                }
+                let question = self
+                    .questions
+                    .iter()
+                    .find(|(_, pending)| Some(&pending.rpc_id) == params.get("requestId"))
+                    .map(|(key, _)| key.clone());
+                if let Some((key, p)) = question
+                    .and_then(|key| self.questions.remove(&key).map(|pending| (key, pending)))
+                {
+                    self.remember_settled_request(key.clone(), p.scope.clone());
+                    out.push(
+                        Envelope::new(Event::QuestionResolved { answered: false })
+                            .item(p.item)
+                            .request(key),
+                    );
+                }
+                let request_id = params.get("requestId").cloned();
+                self.expire_forms(|p| Some(&p.rpc_id) == request_id.as_ref(), out);
+            }
+            "model/rerouted" => match s(params, "toModel") {
+                Some(model) => {
+                    let selection_key = self
+                        .effective_selection
+                        .as_ref()
+                        .and_then(SubmittedModel::selection_key);
+                    self.confirmed_model = Some(model.to_owned());
+                    if let Some(selection) = &mut self.effective_selection {
+                        self.confirmed_revision = self.confirmed_revision.max(selection.revision);
+                        self.accepted_revision = Some(selection.revision);
+                        self.confirmed_effort = selection.effort.clone();
+                        if selection.revision == self.selection_revision {
+                            self.model = Some(model.to_owned());
+                        }
+                        selection.model = Some(model.to_owned());
+                    } else {
+                        self.model = Some(model.to_owned());
+                    }
+                    let mut event = Envelope::new(Event::ModelChanged {
+                        model: model.to_owned(),
+                    });
+                    event.request = selection_key;
+                    out.push(event);
+                }
+                None => out.push(Envelope::new(Event::Unknown)),
+            },
+            "error" => {
+                let message = params
+                    .get("error")
+                    .and_then(|e| s(e, "message"))
+                    .unwrap_or("codex reported an error")
+                    .to_owned();
+                if params.get("willRetry").and_then(Value::as_bool) == Some(true) {
+                    out.push(Envelope::new(Event::Notice {
+                        text: format!("Codex is retrying: {message}"),
+                    }));
+                } else {
+                    self.clear_worker_waits(out);
+                    out.push(Envelope::new(Event::Error { message }));
+                }
+            }
+            "warning" => match s(params, "message") {
+                Some(text) => out.push(Envelope::new(Event::Notice {
+                    text: text.to_owned(),
+                })),
+                None => out.push(Envelope::new(Event::Unknown)),
+            },
+            m if QUIET.contains(&m) => {}
+            _ => out.push(Envelope::new(Event::Unknown)),
+        }
+    }
+
+    fn on_turn_completed(&mut self, params: &Value, out: &mut Vec<Envelope>) {
+        let turn = params.get("turn").unwrap_or(&Value::Null);
+        let scope = self.notification_turn_scope(params);
+        if self.ended_turns.contains(&scope) {
+            return; // also protects the gap before the next turn/started supplies its id
+        }
+        if self
+            .turn_id
+            .as_deref()
+            .zip(scope.turn.as_deref())
+            .is_some_and(|(active, ended)| active != ended)
+        {
+            return; // a late terminal notification cannot close the active turn
+        }
+        self.retire_turn_requests(scope, out);
+        self.clear_worker_waits(out);
+        // Anything still open when the turn ends was cut short.
+        self.close_all(out);
+        let message = turn
+            .get("error")
+            .and_then(|e| s(e, "message"))
+            .map(str::to_owned);
+        let state = match s(turn, "status") {
+            Some("completed") => TurnState::Completed,
+            Some("interrupted") => TurnState::Interrupted,
+            _ => TurnState::Failed,
+        };
+        let error = match state {
+            TurnState::Failed => Some(message.unwrap_or_else(|| "codex turn failed".to_owned())),
+            _ => None,
+        };
+        let usage = self.usage_total.clone().and_then(|total| {
+            let delta = Usage {
+                input_tokens: total
+                    .input_tokens
+                    .saturating_sub(self.usage_base.input_tokens),
+                output_tokens: total
+                    .output_tokens
+                    .saturating_sub(self.usage_base.output_tokens),
+                cached_input_tokens: total
+                    .cached_input_tokens
+                    .saturating_sub(self.usage_base.cached_input_tokens),
+                reasoning_tokens: total
+                    .reasoning_tokens
+                    .saturating_sub(self.usage_base.reasoning_tokens),
+            };
+            self.usage_base = total;
+            (delta != Usage::default()).then_some(delta)
+        });
+        self.turn_open = false;
+        self.turn_id = None;
+        self.interrupt_sent = false;
+        // A requested compaction completes (and takes the flag) within its turn; a turn that
+        // ended, failed or was interrupted without one leaves no manual compaction coming.
+        self.compact_pending = false;
+        out.push(Envelope::new(Event::TurnCompleted {
+            state,
+            usage,
+            cost_usd: None,
+            error,
+        }));
+        self.finish_effective_mode(out);
+    }
+
+    /// Expire only this turn's unanswered requests, including requests with no item/started.
+    fn retire_turn_requests(&mut self, scope: RequestScope, out: &mut Vec<Envelope>) {
+        remember_bounded(
+            &mut self.ended_turns,
+            &mut self.ended_turn_order,
+            scope.clone(),
+            TURN_TOMBSTONE_LIMIT,
+        );
+        for (key, pending) in take_sorted_where(&mut self.approvals, |p| p.scope == scope) {
+            out.push(
+                Envelope::new(Event::ApprovalExpired)
+                    .item(pending.item)
+                    .request(key),
+            );
+        }
+        for (key, pending) in take_sorted_where(&mut self.questions, |p| p.scope == scope) {
+            out.push(
+                Envelope::new(Event::QuestionResolved { answered: false })
+                    .item(pending.item)
+                    .request(key),
+            );
+        }
+        // A turnless form belongs to no turn, so no turn's end (not even one with no id) takes it.
+        if scope.turn.is_some() {
+            self.expire_forms(|p| p.scope == scope, out);
+        }
+        self.settled_requests.retain(|_, settled| *settled != scope);
+    }
+
+    /// Expires the open forms `which` picks, in key order: each card closes as cancelled, and
+    /// nothing is sent (the server has resolved it, or the connection is gone).
+    fn expire_forms(&mut self, which: impl Fn(&PendingForm) -> bool, out: &mut Vec<Envelope>) {
+        for (key, form) in take_sorted_where(&mut self.forms, which) {
+            self.remember_settled_request(key.clone(), form.scope);
+            out.push(
+                Envelope::new(Event::FormResolved {
+                    action: crate::form::FormAction::Cancel,
+                })
+                .request(key),
+            );
+        }
+    }
+
+    fn retire_thread_requests(&mut self, thread: &str, out: &mut Vec<Envelope>) {
+        let scopes: HashSet<RequestScope> = self
+            .approvals
+            .values()
+            .map(|p| p.scope.clone())
+            .chain(self.questions.values().map(|p| p.scope.clone()))
+            .chain(self.settled_requests.values().cloned())
+            .filter(|scope| scope.thread.as_deref() == Some(thread))
+            .collect();
+        let mut scopes: Vec<_> = scopes.into_iter().collect();
+        scopes.sort_by(|a, b| a.turn.cmp(&b.turn));
+        for scope in scopes {
+            self.retire_turn_requests(scope, out);
+        }
+        // The thread is gone: its forms go too, turnless ones included.
+        self.expire_forms(|p| p.scope.thread.as_deref() == Some(thread), out);
+    }
+
+    fn on_token_usage(&mut self, params: &Value, out: &mut Vec<Envelope>) {
+        let Some(usage) = params.get("tokenUsage") else {
+            out.push(Envelope::new(Event::Unknown));
+            return;
+        };
+        if let Some(total) = usage.get("total") {
+            self.usage_total = Some(usage_of(total));
+        }
+        let used = usage
+            .get("last")
+            .and_then(|l| num(l, "totalTokens"))
+            .unwrap_or(0);
+        let max = num(usage, "modelContextWindow");
+        self.context = Some((used, max));
+        out.push(Envelope::new(Event::UsageUpdated {
+            used,
+            max,
+            auto_compact_at: None,
+        }));
+    }
+
+    // ---- server requests ----
+
+    /// Remembers an answered or expired request so a retransmission cannot revive it. A turn's
+    /// requests are forgotten when the turn retires; a turnless one (a form with no `turnId`)
+    /// never retires, so only the latest [`TURNLESS_SETTLED_LIMIT`] are kept.
+    fn remember_settled_request(&mut self, key: String, scope: RequestScope) {
+        if scope.turn.is_none() {
+            self.turnless_settled.push_back(key.clone());
+            while self.turnless_settled.len() > TURNLESS_SETTLED_LIMIT {
+                if let Some(oldest) = self.turnless_settled.pop_front() {
+                    if self
+                        .settled_requests
+                        .get(&oldest)
+                        .is_some_and(|s| s.turn.is_none())
+                    {
+                        self.settled_requests.remove(&oldest);
+                    }
+                }
+            }
+        }
+        self.settled_requests.insert(key, scope);
+    }
+
+    fn request_scope(&self, params: &Value) -> RequestScope {
+        let thread = s(params, "threadId").or(self.thread_id.as_deref());
+        let turn = s(params, "turnId").or_else(|| {
+            if thread == self.thread_id.as_deref() {
+                self.turn_id.as_deref()
+            } else {
+                thread.and_then(|thread| self.worker_turns.get(thread).map(String::as_str))
+            }
+        });
+        RequestScope {
+            thread: thread.map(str::to_owned),
+            turn: turn.map(str::to_owned),
+        }
+    }
+
+    fn notification_turn_scope(&self, params: &Value) -> RequestScope {
+        let mut scope = self.request_scope(params);
+        scope.turn = s(params.get("turn").unwrap_or(&Value::Null), "id")
+            .map(str::to_owned)
+            .or(scope.turn);
+        scope
+    }
+
+    fn stale_explicit_turn(&self, params: &Value) -> bool {
+        let scope = self.request_scope(params);
+        let active = if scope.thread == self.thread_id {
+            self.turn_id.as_deref()
+        } else {
+            scope
+                .thread
+                .as_deref()
+                .and_then(|thread| self.worker_turns.get(thread).map(String::as_str))
+        };
+        self.ended_turns.contains(&scope)
+            || scope.thread.as_deref().is_some_and(|thread| {
+                self.workers
+                    .get(thread)
+                    .is_some_and(|worker| worker.state == WorkerState::Closed)
+            })
+            || s(params, "turnId")
+                .zip(active)
+                .is_some_and(|(requested, active)| requested != active)
+    }
+
+    /// RPC ids belong to one app-server connection and restart at zero. The transcript
+    /// persists across connections, so its request identity must also name the native
+    /// turn/item. Keep the original typed RPC id separately for responses and resolution.
+    fn server_request_key(&self, id: &Value, method: &str, params: &Value) -> String {
+        let scope = self.request_scope(params);
+        format!(
+            "codex:{method}:{}",
+            json!([scope.thread, scope.turn, s(params, "itemId"), id])
+        )
+    }
+
+    fn on_server_request(
+        &mut self,
+        id: &Value,
+        method: &str,
+        params: &Value,
+        raw: &str,
+        out: &mut Vec<Envelope>,
+    ) {
+        if method == "mcpServer/elicitation/request" {
+            let order = elicitation::property_order(raw);
+            self.on_elicitation(id, params, order.as_deref(), out);
+            return;
+        }
+        if self.stale_explicit_turn(params) {
+            return; // an unseen old request must not create a live interruption
+        }
+        if method == "item/permissions/requestApproval" {
+            self.on_permissions_request(id, method, params, out);
+            return;
+        }
+        if method == "item/tool/requestUserInput" {
+            let key = self.server_request_key(id, method, params);
+            if self.settled_requests.contains_key(&key) {
+                return;
+            }
+            let item = s(params, "itemId").unwrap_or_default().to_owned();
+            let mut questions: Vec<Question> = params
+                .get("questions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|question| Question {
+                    id: s(question, "id").unwrap_or_default().to_owned(),
+                    header: s(question, "header").unwrap_or_default().to_owned(),
+                    question: s(question, "question").unwrap_or_default().to_owned(),
+                    options: question
+                        .get("options")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|option| {
+                            let label = s(option, "label")?.to_owned();
+                            if label.trim().is_empty() {
+                                return None;
+                            }
+                            Some(QuestionOption {
+                                label,
+                                description: s(option, "description").map(str::to_owned),
+                            })
+                        })
+                        .collect(),
+                    multi_select: false,
+                })
+                .filter(|question| !question.id.is_empty() && !question.question.is_empty())
+                .collect();
+            if questions.is_empty() || questions.iter().any(|q| q.options.is_empty()) {
+                self.write(
+                    json!({"id": id, "error": {
+                        "code": -32602,
+                        "message": "requestUserInput must contain usable questions with selectable options; free-text-only questions are not supported",
+                    }})
+                    .to_string(),
+                );
+                out.push(Envelope::new(Event::Notice {
+                    text: "Codex requested user input without usable questions and selectable options; it was refused because free-text-only questions cannot be answered here."
+                        .to_owned(),
+                }));
+                return;
+            }
+            disambiguate_question_texts(&mut questions);
+            self.questions.insert(
+                key.clone(),
+                PendingQuestion {
+                    rpc_id: id.clone(),
+                    item: item.clone(),
+                    scope: self.request_scope(params),
+                    keys: questions
+                        .iter()
+                        .map(|question| (question.id.clone(), question.question.clone()))
+                        .collect(),
+                },
+            );
+            out.push(
+                Envelope::new(Event::QuestionRequested {
+                    questions,
+                    source: QuestionSource::Agent,
+                })
+                .item(item)
+                .request(key),
+            );
+            return;
+        }
+        let (tool, title, all_decisions) = match method {
+            "item/commandExecution/requestApproval" => (
+                "command_execution",
+                s(params, "command").map(str::to_owned),
+                true,
+            ),
+            "item/fileChange/requestApproval" => (
+                "file_change",
+                Some(
+                    s(params, "reason")
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| self.file_change_title(params)),
+                ),
+                true,
+            ),
+            _ => {
+                // Not served: reply with an error so the server does not wait on us forever.
+                self.write(
+                    json!({"id": id, "error": {
+                        "code": -32601,
+                        "message": format!("agent-terminal does not handle {method}"),
+                    }})
+                    .to_string(),
+                );
+                out.push(Envelope::new(Event::Notice {
+                    text: format!("Codex asked for {method}, which agent-terminal does not support yet; it was refused."),
+                }));
+                return;
+            }
+        };
+        let key = self.server_request_key(id, method, params);
+        if self.settled_requests.contains_key(&key) {
+            return;
+        }
+        let item = s(params, "itemId").unwrap_or_default().to_owned();
+        let remembers = if method == "item/commandExecution/requestApproval" {
+            let command = s(params, "command");
+            let cwd = s(params, "cwd");
+            match (command, cwd) {
+                (Some(cmd), Some(cwd)) => Some(format!("`{cmd}` in {cwd}")),
+                (Some(cmd), None) => Some(format!("`{cmd}`")),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let mut options = match params.get("availableDecisions").and_then(Value::as_array) {
+            Some(list) if all_decisions => {
+                let mut options: Vec<Decision> = Vec::new();
+                for d in list
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter_map(decision_of)
+                {
+                    if !options.contains(&d) {
+                        options.push(d);
+                    }
+                }
+                if options.is_empty() {
+                    ALL_DECISIONS.to_vec()
+                } else {
+                    options
+                }
+            }
+            _ => ALL_DECISIONS.to_vec(),
+        };
+        // "Allow for session" and "Always allow" are the app's: each is a plain
+        // `accept` on the wire plus a rule the app records, so they are offered wherever the
+        // server offers `accept`. `acceptForSession` and `acceptWithExecpolicyAmendment` (which
+        // would write Codex's own rules) are never sent. The app narrows these to what a rule
+        // can describe. A `fileChange` request has no `availableDecisions`.
+        if let Some(pos) = options.iter().position(|d| *d == Decision::Allow) {
+            for (offset, d) in [Decision::AllowAlways, Decision::AllowForSession]
+                .into_iter()
+                .enumerate()
+            {
+                if !options.contains(&d) {
+                    options.insert(pos + 1 + offset, d);
+                }
+            }
+        }
+        // Deny is always `decline`, offered or not: recorded frames show Codex accepts it (the item ends
+        // `declined` and the turn continues). Stop turn (`cancel`) stays a separate choice.
+        if !options.contains(&Decision::Deny) {
+            let at = options
+                .iter()
+                .position(|d| *d == Decision::Cancel)
+                .unwrap_or(options.len());
+            options.insert(at, Decision::Deny);
+        }
+        // A patch approval names no file: its changes come from the item that started it.
+        let mut input = params.clone();
+        if method == "item/fileChange/requestApproval" {
+            if let (Some(obj), Some(changes)) =
+                (input.as_object_mut(), self.file_changes.get(&item))
+            {
+                obj.entry("changes").or_insert_with(|| changes.clone());
+            }
+        }
+        let pending = PendingApproval {
+            rpc_id: id.clone(),
+            item,
+            scope: self.request_scope(params),
+            options,
+            grant: None,
+            form: false,
+        };
+        let card = ApprovalCard {
+            tool: tool.to_owned(),
+            title,
+            input,
+            reason: s(params, "reason").map(str::to_owned),
+            remembers,
+        };
+        self.publish_approval(key, pending, card, out);
+    }
+
+    /// Registers `pending` under `key` and shows its card, which offers exactly the options the
+    /// pending request accepts. The caller has worked out the options and validated the request.
+    fn publish_approval(
+        &mut self,
+        key: String,
+        pending: PendingApproval,
+        card: ApprovalCard,
+        out: &mut Vec<Envelope>,
+    ) {
+        let item = pending.item.clone();
+        let options = pending.options.clone();
+        self.approvals.insert(key.clone(), pending);
+        out.push(
+            Envelope::new(Event::ApprovalRequested {
+                tool: card.tool,
+                title: card.title,
+                input: card.input,
+                reason: card.reason,
+                options,
+                response: ResponseCapability::Live,
+                remembers: card.remembers,
+            })
+            .item(item)
+            .request(key),
+        );
+    }
+
+    /// `item/permissions/requestApproval`: a card the user answers (see the module docs).
+    fn on_permissions_request(
+        &mut self,
+        id: &Value,
+        method: &str,
+        params: &Value,
+        out: &mut Vec<Envelope>,
+    ) {
+        let key = self.server_request_key(id, method, params);
+        if self.settled_requests.contains_key(&key) {
+            return;
+        }
+        let item = s(params, "itemId").unwrap_or_default().to_owned();
+        let parsed = permissions::parse(params, self.cwd.as_deref());
+        // No Always allow: the app keeps no rule for a permission grant.
+        let options = if parsed.renderable {
+            vec![
+                Decision::Allow,
+                Decision::AllowForSession,
+                Decision::Deny,
+                Decision::Cancel,
+            ]
+        } else {
+            vec![Decision::Deny, Decision::Cancel]
+        };
+        let pending = PendingApproval {
+            rpc_id: id.clone(),
+            item,
+            scope: self.request_scope(params),
+            options,
+            grant: Some(parsed.grant),
+            form: false,
+        };
+        let card = ApprovalCard {
+            tool: PERMISSIONS_TOOL.to_owned(),
+            title: Some(parsed.title),
+            input: parsed.input,
+            reason: s(params, "reason").map(str::to_owned),
+            remembers: None,
+        };
+        self.publish_approval(key, pending, card, out);
+    }
+
+    /// `mcpServer/elicitation/request`: a form card, or a decline with a notice.
+    fn on_elicitation(
+        &mut self,
+        id: &Value,
+        params: &Value,
+        order: Option<&[String]>,
+        out: &mut Vec<Envelope>,
+    ) {
+        let turn = s(params, "turnId").map(str::to_owned);
+        let thread = s(params, "threadId")
+            .or(self.thread_id.as_deref())
+            .map(str::to_owned);
+        // Only a form that names a turn can be stale by turn; a turnless one is not tied to any.
+        let stale = (turn.is_some() && self.stale_explicit_turn(params))
+            || thread.as_deref().is_some_and(|t| {
+                self.workers
+                    .get(t)
+                    .is_some_and(|w| w.state == WorkerState::Closed)
+            });
+        if stale {
+            // Nobody will see it, but its tool call still waits: decline it so it carries on.
+            self.write(json!({"id": id, "result": {"action": "decline"}}).to_string());
+            return;
+        }
+        let scope = RequestScope { thread, turn };
+        let key = format!(
+            "codex:mcpServer/elicitation/request:{}",
+            json!([
+                scope.thread,
+                scope.turn,
+                s(params, "serverName"),
+                s(params, "elicitationId"),
+                id
+            ])
+        );
+        if self.settled_requests.contains_key(&key)
+            || self.forms.contains_key(&key)
+            || self.approvals.contains_key(&key)
+        {
+            return; // answered, declined or already shown
+        }
+        if is_mcp_tool_approval(params) {
+            self.on_mcp_tool_approval(id, params, key, scope, out);
+            return;
+        }
+        let server = elicitation::server_name(params);
+        match elicitation::parse(params, order) {
+            elicitation::Elicitation::Show { message, form } => {
+                let fields = match &form {
+                    crate::form::Form::Fields { fields } => Some(fields.clone()),
+                    _ => None,
+                };
+                self.forms.insert(
+                    key.clone(),
+                    PendingForm {
+                        rpc_id: id.clone(),
+                        scope,
+                        fields,
+                    },
+                );
+                out.push(
+                    Envelope::new(Event::FormRequested {
+                        server,
+                        message,
+                        form,
+                    })
+                    .request(key),
+                );
+            }
+            elicitation::Elicitation::Decline { reason, link } => {
+                self.write(json!({"id": id, "result": {"action": "decline"}}).to_string());
+                self.remember_settled_request(key, scope);
+                let text = match link {
+                    Some(url) => refused_link_notice(&server, &reason, &url),
+                    None => format!("The {server} tool server {reason}; it was declined."),
+                };
+                out.push(Envelope::new(Event::Notice { text }));
+            }
+        }
+    }
+
+    /// An MCP tool-call approval (see [`is_mcp_tool_approval`]): an approval card, like a
+    /// command's, so the app's rules can answer it. The tool comes from the one open
+    /// `mcpToolCall` item of that thread and server whose tool the message names in Codex's own
+    /// words. With none or several, or a second request for the same item, the card carries
+    /// [`MCP_UNRESOLVED_TOOL`], which no rule matches.
+    ///
+    /// Codex asks once per call, before the server runs it, but a tool server can send a form
+    /// with the same `_meta` while its call runs. A call names the tool of one approval only, so
+    /// a later one is shown unresolved. One a server sends in Codex's exact words during a call
+    /// Codex did not ask about (its approval mode or annotations let it run) is still named, and
+    /// a rule for that tool accepts it: an empty accept, to a server the rule already lets run.
+    fn on_mcp_tool_approval(
+        &mut self,
+        id: &Value,
+        params: &Value,
+        key: String,
+        scope: RequestScope,
+        out: &mut Vec<Envelope>,
+    ) {
+        let server = s(params, "serverName").unwrap_or_default();
+        let message = s(params, "message").unwrap_or_default();
+        let mut calls = self.mcp_calls.iter().filter(|(_, call)| {
+            call.server == server
+                && call.thread.as_deref() == scope.thread.as_deref()
+                && message == mcp_approval_question(&call.server, &call.tool)
+        });
+        let item = match (calls.next(), calls.next()) {
+            (Some((item, _)), None) => Some(item.clone()),
+            _ => None,
+        };
+        let call = item.and_then(|item| self.mcp_calls.remove(&item).map(|call| (item, call)));
+        // A rule names `mcp__<server>__<tool>` and splits at the first `__` after the prefix.
+        let (item, tool, input) = match call {
+            Some((item, call)) if !call.server.is_empty() && !call.server.contains("__") => (
+                item,
+                format!("mcp__{}__{}", call.server, call.tool),
+                call.arguments,
+            ),
+            other => (
+                other.map(|(item, _)| item).unwrap_or_default(),
+                MCP_UNRESOLVED_TOOL.to_owned(),
+                params
+                    .pointer("/_meta/tool_params")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ),
+        };
+        let pending = PendingApproval {
+            rpc_id: id.clone(),
+            item,
+            scope,
+            options: ALL_DECISIONS.to_vec(),
+            grant: None,
+            form: true,
+        };
+        let card = ApprovalCard {
+            tool,
+            title: s(params, "message").map(|m| clip(&permissions::visible(m), MCP_TITLE_MAX)),
+            input,
+            reason: None,
+            remembers: None,
+        };
+        self.publish_approval(key, pending, card, out);
+    }
+
+    /// `turn/interrupt` for the active turn, when `scope` is that turn; `None` otherwise (a
+    /// request of another thread, a turnless form, or no turn running).
+    fn interrupt_scope(&mut self, scope: &RequestScope) -> Option<String> {
+        let thread = self.thread_id.clone()?;
+        let turn = self.turn_id.clone()?;
+        if scope.thread.as_deref() != Some(thread.as_str())
+            || scope.turn.as_deref() != Some(turn.as_str())
+        {
+            return None;
+        }
+        let mut updates = Vec::new();
+        self.clear_worker_waits(&mut updates);
+        self.outbox.events.extend(updates);
+        self.interrupt_sent = true;
+        Some(self.request(
+            Pending::Interrupt,
+            "turn/interrupt",
+            json!({"threadId": thread, "turnId": turn}),
+        ))
+    }
+
+    /// `Command::SubmitForm`: checked in full before anything is removed or written.
+    fn submit_form(
+        &mut self,
+        request: String,
+        action: crate::form::FormAction,
+        content: Option<Value>,
+    ) -> Result<Vec<Action>, AdapterError> {
+        use crate::form::FormAction;
+        let Some(form) = self.forms.get(&request) else {
+            return Err(AdapterError::Invalid(format!(
+                "no pending Codex form {request}"
+            )));
+        };
+        let result = match action {
+            FormAction::Accept => match &form.fields {
+                Some(fields) => {
+                    let sent =
+                        crate::form::answer(fields, content.as_ref().unwrap_or(&Value::Null))
+                            .map_err(|errors| {
+                                AdapterError::Invalid(format!(
+                                    "the form answer was not sent: {}",
+                                    errors
+                                        .iter()
+                                        .map(|e| e.message.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(" ")
+                                ))
+                            })?;
+                    json!({"action": "accept", "content": sent})
+                }
+                None if content.as_ref().is_some_and(|c| !c.is_null()) => {
+                    return Err(AdapterError::Invalid(
+                        "a link form takes no content".to_owned(),
+                    ));
+                }
+                None => json!({"action": "accept"}),
+            },
+            FormAction::Decline => json!({"action": "decline"}),
+            FormAction::Cancel => json!({"action": "cancel"}),
+        };
+        let Some(form) = self.forms.remove(&request) else {
+            return Err(AdapterError::Invalid(format!(
+                "no pending Codex form {request}"
+            )));
+        };
+        self.remember_settled_request(request, form.scope.clone());
+        Ok(self.scoped_reply(
+            &form.rpc_id,
+            result,
+            &form.scope,
+            action == FormAction::Cancel,
+        ))
+    }
+
+    /// The reply to server request `rpc_id`, followed, when `interrupt` is set, by a
+    /// `turn/interrupt` of `scope`'s turn if that is the active one (never another turn).
+    fn scoped_reply(
+        &mut self,
+        rpc_id: &Value,
+        result: Value,
+        scope: &RequestScope,
+        interrupt: bool,
+    ) -> Vec<Action> {
+        let mut lines = vec![json!({"id": rpc_id, "result": result}).to_string()];
+        if interrupt {
+            lines.extend(self.interrupt_scope(scope));
+        }
+        vec![Action::Write(lines)]
+    }
+
+    // ---- responses ----
+
+    fn on_response(&mut self, id: &Value, frame: &Value, out: &mut Vec<Envelope>) {
+        let Some(pending) = id.as_u64().and_then(|n| self.pending.remove(&n)) else {
+            out.push(Envelope::new(Event::Unknown));
+            return;
+        };
+        if self.startup_failed
+            && matches!(
+                pending,
+                Pending::Initialize
+                    | Pending::ChildConfig { .. }
+                    | Pending::RootConfig { .. }
+                    | Pending::ThreadStart
+                    | Pending::TurnStart(_)
+            )
+        {
+            return;
+        }
+        let result = frame.get("result");
+        let error = frame
+            .get("error")
+            .map(|e| s(e, "message").map_or_else(|| e.to_string(), str::to_owned));
+        match (pending, result, error) {
+            (Pending::Initialize, Some(_), None) => self.initialized = true,
+            (Pending::ChildConfig { method, mut params }, Some(result), _) => {
+                let names = result
+                    .get("config")
+                    .and_then(Value::as_object)
+                    .and_then(|config| match config.get("mcp_servers") {
+                        None | Some(Value::Null) => Some(Vec::new()),
+                        Some(Value::Object(servers)) => {
+                            Some(servers.keys().cloned().collect::<Vec<_>>())
+                        }
+                        _ => None,
+                    });
+                let Some(mut names) = names else {
+                    self.fail_startup(
+                        "Could not inspect Codex's effective MCP configuration.".into(),
+                        out,
+                    );
+                    return;
+                };
+                let effective_names: HashSet<String> = names.iter().cloned().collect();
+                names.extend(
+                    crate::delegation::launch::CODEX_BUILTIN_SERVERS
+                        .iter()
+                        .map(|s| (*s).to_owned()),
+                );
+                if names.len() > 256
+                    || names.iter().any(|name| {
+                        name.is_empty()
+                            || name.len() > 128
+                            || !name
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+                    })
+                {
+                    self.fail_startup(
+                        "Codex's MCP server names cannot be isolated safely.".into(),
+                        out,
+                    );
+                    return;
+                }
+                let Some(config) = params.get_mut("config").and_then(Value::as_object_mut) else {
+                    self.fail_startup("Missing delegated Codex launch configuration.".into(), out);
+                    return;
+                };
+                let inert_command = config.get("mcp_servers.agent_terminal.command").cloned();
+                for name in names
+                    .into_iter()
+                    .filter(|name| name != crate::delegation::SERVER_NAME)
+                {
+                    config.insert(format!("mcp_servers.{name}.enabled"), Value::Bool(false));
+                    if !effective_names.contains(&name) {
+                        // Codex validates a transport even on a disabled entry. A built-in
+                        // absent from config gets our inert, credential-free bridge transport;
+                        // if `enabled=false` is ever ignored, read-back rejects its name.
+                        if let Some(command) = &inert_command {
+                            config.insert(format!("mcp_servers.{name}.command"), command.clone());
+                            config.insert(
+                                format!("mcp_servers.{name}.args"),
+                                json!([crate::delegation::BRIDGE_ARG]),
+                            );
+                        }
+                    }
+                }
+                config.insert("features.multi_agent".into(), Value::Bool(false));
+                config.insert("features.multi_agent_v2".into(), Value::Bool(false));
+                self.launch_configured_thread(&method, params);
+            }
+            // The note is a hint: an unreadable config starts the thread without it, rather than
+            // failing (and the user's own instructions are never replaced by it alone).
+            (Pending::RootConfig { method, mut params }, result, _) => {
+                if let Some(result) = result {
+                    let own = result
+                        .pointer("/config/developer_instructions")
+                        .and_then(Value::as_str);
+                    if let Some(map) = params.as_object_mut() {
+                        map.insert(
+                            "developerInstructions".into(),
+                            json!(crate::delegation::launch::codex_root_instructions(own)),
+                        );
+                    }
+                }
+                self.launch_configured_thread(&method, params);
+            }
+            (Pending::ChildConfig { .. }, None, _) => {
+                self.fail_startup(
+                    "Could not inspect Codex's effective MCP configuration.".into(),
+                    out,
+                );
+            }
+            (Pending::ThreadStart, Some(result), _) => {
+                self.resume_fallback = None;
+                self.on_thread_ready(result, out);
+            }
+            (Pending::ThreadStart, None, Some(error))
+                if self.resume_fallback.is_some()
+                    && error.to_ascii_lowercase().contains("no rollout found") =>
+            {
+                // The thread never completed a turn, so Codex kept nothing to resume. Start a
+                // new one; the app carries the thread's history into it. The text is
+                // Codex 0.161's, seen live: fail_startup surfaced it as
+                // "Could not switch to …: no rollout found for thread id …" and "Turn failed: no
+                // rollout found for thread id …". Any other resume error still fails startup.
+                if let Some(params) = self.resume_fallback.take() {
+                    let line = self.request(Pending::ThreadStart, "thread/start", params);
+                    self.write(line);
+                }
+                out.push(Envelope::new(Event::Notice {
+                    text: "Codex kept no saved session for this thread (it ended before a turn \
+                           completed), so a new Codex session started. The thread's history \
+                           goes with your next message."
+                        .to_owned(),
+                }));
+            }
+            (Pending::TurnStart(submitted), Some(result), _) => {
+                self.confirm_submitted_model(&submitted, out);
+                if self.turn_id.is_none() {
+                    self.turn_id = result
+                        .get("turn")
+                        .and_then(|t| s(t, "id"))
+                        .map(str::to_owned);
+                }
+            }
+            (Pending::Models(control), Some(result), _) => out.push(
+                Envelope::new(Event::ControlResult {
+                    ok: Some(models_of(result)),
+                    error: None,
+                })
+                .request(control),
+            ),
+            (Pending::Models(control), None, error) => out.push(
+                Envelope::new(Event::ControlResult {
+                    ok: None,
+                    error: Some(error.unwrap_or_else(|| "model/list failed".to_owned())),
+                })
+                .request(control),
+            ),
+            (Pending::TurnStart(submitted), None, error) => {
+                let message = error.unwrap_or_else(|| "turn/start failed".to_owned());
+                if self.selection_is_unconfirmed(&submitted) {
+                    if let Some(model) = &submitted.model {
+                        let mut event = Envelope::new(Event::ModelChangeFailed {
+                            model: model.clone(),
+                            message: message.clone(),
+                        });
+                        event.request = submitted.selection_key();
+                        out.push(event);
+                    }
+                    if submitted.revision == self.selection_revision {
+                        self.model = self.confirmed_model.clone();
+                        self.effort = self.confirmed_effort.clone();
+                    }
+                }
+                out.push(Envelope::new(Event::Error {
+                    message: message.clone(),
+                }));
+                // No `turn/started` will follow; end the turn the UI began when it sent this.
+                if !self.turn_open {
+                    out.push(Envelope::new(Event::TurnCompleted {
+                        state: TurnState::Failed,
+                        usage: None,
+                        cost_usd: None,
+                        error: Some(message),
+                    }));
+                    self.finish_effective_mode(out);
+                }
+            }
+            (Pending::Initialize, _, error) | (Pending::ThreadStart, None, error) => {
+                self.fail_startup(
+                    error.unwrap_or_else(|| "Codex thread startup failed".to_owned()),
+                    out,
+                );
+            }
+            (Pending::Compact, None, error) => {
+                // Refused: no manual compaction is coming, so a later automatic one is not one.
+                self.compact_pending = false;
+                out.push(Envelope::new(Event::Error {
+                    message: error.unwrap_or_else(|| "request failed".to_owned()),
+                }));
+            }
+            // A delegated steer never falls back to a new turn: the supervisor hears the outcome
+            // and decides (a strict `this_run` refusal is `stale_run`).
+            (Pending::DelegatedSteer(tag), Some(_), _) => out.push(
+                Envelope::new(Event::ControlResult {
+                    ok: Some(json!({"steered": true})),
+                    error: None,
+                })
+                .request(tag),
+            ),
+            (Pending::DelegatedSteer(tag), None, error) => out.push(
+                Envelope::new(Event::ControlResult {
+                    ok: None,
+                    error: Some(error.unwrap_or_else(|| "turn/steer failed".to_owned())),
+                })
+                .request(tag),
+            ),
+            // Taken into the running turn: Codex reports it like any input of that turn.
+            (Pending::Steer(_), Some(_), _) => {}
+            // Refused: the turn ended (or another began) before it arrived. The message is not
+            // lost: it starts a turn of its own, as it would have from the queue.
+            (Pending::Steer(text), None, error) => {
+                if let Some(thread) = self.thread_id.clone() {
+                    let line = self.turn_start_line(&thread, &text);
+                    self.write(line);
+                    out.push(Envelope::new(Event::Notice {
+                        text: "Codex finished its turn before your message reached it, so it \
+                               went as a new message."
+                            .to_owned(),
+                    }));
+                } else {
+                    out.push(Envelope::new(Event::Error {
+                        message: error.unwrap_or_else(|| "turn/steer failed".to_owned()),
+                    }));
+                }
+            }
+            // An interrupt with no turn to stop, or an acknowledged compact: nothing to show.
+            (Pending::Interrupt | Pending::Compact, _, _) => {}
+        }
+    }
+
+    /// Sends the `thread/start` or `thread/resume` a launch configuration was read for. A
+    /// resume keeps a fresh-start copy of `params`, used if Codex kept nothing to resume.
+    fn launch_configured_thread(&mut self, method: &str, params: Value) {
+        if method == "thread/resume" {
+            let mut fallback = params.clone();
+            if let Some(map) = fallback.as_object_mut() {
+                map.remove("threadId");
+                map.remove("excludeTurns");
+            }
+            self.resume_fallback = Some(fallback);
+        }
+        let line = self.request(Pending::ThreadStart, method, params);
+        self.write(line);
+    }
+
+    fn on_thread_ready(&mut self, result: &Value, out: &mut Vec<Envelope>) {
+        if self.startup_failed {
+            return;
+        }
+        let Some(thread) = result
+            .get("thread")
+            .and_then(|t| s(t, "id"))
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+        else {
+            self.fail_startup("thread/start returned no thread id".to_owned(), out);
+            return;
+        };
+        self.thread_id = Some(thread.clone());
+        let startup_model = s(result, "model").map(str::to_owned);
+        self.confirmed_model = startup_model.clone();
+        let startup_effort = self.session().as_ref().and_then(|s| s.effort.clone());
+        self.confirmed_effort = startup_effort;
+        if !self.model_selected_during_start {
+            if let Some(model) = &startup_model {
+                self.model = Some(model.clone());
+            }
+        }
+        self.model_selected_during_start = false;
+        out.push(Envelope::new(Event::SessionStarted {
+            native_id: thread.clone(),
+            model: startup_model,
+            cwd: s(result, "cwd").map(str::to_owned),
+        }));
+        while let Some(text) = self.queued.pop_front() {
+            let line = self.turn_start_line(&thread, &text);
+            self.write(line);
+        }
+    }
+}
+
+impl Adapter for CodexAdapter {
+    fn driver(&self) -> Driver {
+        Driver::Codex
+    }
+
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+
+    /// `<program> <extra_args> app-server`. The session is remembered for [`Adapter::handshake`]
+    /// and every later `turn/start` (cwd, model, mode, resume id).
+    fn argv(&self, session: &OpenSession) -> Vec<String> {
+        *self.session() = Some(session.clone());
+        let mut argv = vec![session.program.clone()];
+        argv.extend(session.extra_args.iter().cloned());
+        if self.child {
+            argv.extend(
+                ["--disable", "multi_agent", "--disable", "multi_agent_v2"].map(str::to_owned),
+            );
+        }
+        argv.push("app-server".to_owned());
+        argv
+    }
+
+    fn handshake(&mut self) -> Vec<String> {
+        let session = self.session().clone();
+        // A new process: forget the last one's connection state. Queued prompts survive.
+        self.next_id = 0;
+        self.pending.clear();
+        self.startup_failed = false;
+        self.initialized = false;
+        self.thread_id = None;
+        self.model_selected_during_start = false;
+        self.selection_revision = 0;
+        self.confirmed_revision = 0;
+        self.accepted_revision = None;
+        self.confirmed_model = None;
+        self.confirmed_effort = None;
+        self.effective_selection = None;
+        self.turn_id = None;
+        self.turn_open = false;
+        self.effective_mode = None;
+        self.interrupt_sent = false;
+        self.approvals.clear();
+        self.questions.clear();
+        self.forms.clear();
+        self.settled_requests.clear();
+        self.turnless_settled.clear();
+        self.ended_turns.clear();
+        self.ended_turn_order.clear();
+        self.open_items.clear();
+        self.texts.clear();
+        self.reasoning.clear();
+        self.file_changes.clear();
+        self.mcp_calls.clear();
+        self.resume_fallback = None;
+        // Reconnecting the same thread forgets live certainty, not its worker history. A newly
+        // constructed adapter knows only workers observed on this connection; replaying UI
+        // consumers preserve previously stored identities absent from these snapshots.
+        for worker in self.workers.values_mut() {
+            if matches!(
+                worker.state,
+                WorkerState::Starting | WorkerState::Running | WorkerState::Waiting
+            ) {
+                worker.state = WorkerState::Unknown;
+            }
+        }
+        self.worker_waits.clear();
+        self.worker_turns.clear();
+        self.usage_total = None;
+        self.usage_base = Usage::default();
+        self.context = None;
+        self.compact_pending = false;
+        self.outbox = Outbox::default();
+        if let Some(s) = &session {
+            self.model = s.model.clone();
+            self.model_selected_during_start = s.model.is_some();
+            self.effort = s.effort.clone();
+            self.mode = s.mode;
+            self.cwd = Some(s.cwd.clone()).filter(|c| !c.is_empty());
+        }
+
+        let version = self.client_version.clone();
+        let init = self.request(
+            Pending::Initialize,
+            "initialize",
+            json!({"clientInfo": {
+                "name": "agent-terminal",
+                "title": "Agent Terminal",
+                "version": version,
+            }}),
+        );
+        let initialized = json!({"method": "initialized"}).to_string();
+
+        let mut params = Map::new();
+        if let Some(cwd) = &self.cwd {
+            params.insert("cwd".into(), json!(cwd));
+        }
+        if let Some(model) = &self.model {
+            params.insert("model".into(), json!(model));
+        }
+        params.insert("approvalsReviewer".into(), json!("user"));
+        let mut config = Map::new();
+        config.insert("tools.update_plan.enabled".into(), Value::Bool(true));
+        let binding = session.as_ref().and_then(|s| s.delegation.as_ref());
+        if let Some(binding) = binding {
+            config.extend(binding.codex_thread_config(std::process::id()));
+        }
+        params.insert("config".into(), Value::Object(config));
+        if self.child {
+            // A supervised child asks for its policy on the thread too, so the thread's result
+            // reads back exactly what was requested (`readback::codex_requested`).
+            let (approval, sandbox) = child_mode_policy(self.mode);
+            params.insert("approvalPolicy".into(), json!(approval));
+            if let Some(name) = sandbox_mode_name(&sandbox) {
+                params.insert("sandbox".into(), json!(name));
+            }
+        }
+        let bound_child = self.child && binding.is_some();
+        let resume = session.as_ref().and_then(|s| s.resume.clone());
+        let method = match resume {
+            Some(id) => {
+                self.resume_fallback = Some(Value::Object(params.clone()));
+                params.insert("threadId".into(), json!(id));
+                // The app keeps its own transcript; do not have the server send the history.
+                params.insert("excludeTurns".into(), json!(true));
+                "thread/resume"
+            }
+            None => "thread/start",
+        };
+        let thread = if bound_child {
+            self.request(
+                Pending::ChildConfig {
+                    method: method.to_owned(),
+                    params: Value::Object(params),
+                },
+                "config/read",
+                json!({"includeLayers": false, "cwd": self.cwd}),
+            )
+        } else if binding.is_some() {
+            // A delegation root is told about the other agents (`launch::ROOT_PROMPT`), after
+            // whatever developer instructions the user's own config gives it.
+            self.request(
+                Pending::RootConfig {
+                    method: method.to_owned(),
+                    params: Value::Object(params),
+                },
+                "config/read",
+                json!({"includeLayers": false, "cwd": self.cwd}),
+            )
+        } else {
+            self.request(Pending::ThreadStart, method, Value::Object(params))
+        };
+        vec![init, initialized, thread]
+    }
+
+    fn handshake_answered(&self) -> bool {
+        self.initialized && !self.startup_failed
+    }
+
+    fn prompt_starts_turn(&self, text: &str) -> bool {
+        !text.trim().eq_ignore_ascii_case("/compact")
+    }
+
+    fn discard_queued_prompts(&mut self) {
+        self.queued.clear();
+    }
+
+    fn encode(&mut self, command: Command) -> Result<Vec<Action>, AdapterError> {
+        if self.startup_failed
+            && matches!(&command, Command::Prompt { .. } | Command::SetModel { .. })
+        {
+            return Err(AdapterError::Invalid(
+                "Codex thread startup failed; restart the session before sending another prompt or model choice".to_owned(),
+            ));
+        }
+        match command {
+            Command::Prompt { text } => {
+                if !self.prompt_starts_turn(&text) {
+                    let Some(thread) = self.thread_id.clone() else {
+                        return Err(AdapterError::Invalid(
+                            "the Codex thread is not started yet".to_owned(),
+                        ));
+                    };
+                    self.compact_pending = true;
+                    let line = self.request(
+                        Pending::Compact,
+                        "thread/compact/start",
+                        json!({"threadId": thread}),
+                    );
+                    return Ok(vec![Action::Write(vec![line])]);
+                }
+                match self.thread_id.clone() {
+                    Some(thread) => {
+                        let line = self.turn_start_line(&thread, &text);
+                        Ok(vec![Action::Write(vec![line])])
+                    }
+                    None => {
+                        self.queued.push_back(text);
+                        Ok(Vec::new())
+                    }
+                }
+            }
+            Command::Steer { text } => {
+                // Into the running turn, pinned to it: Codex refuses the steer if that turn is no
+                // longer the active one, and the refusal starts a turn instead (`on_response`).
+                // With no turn running there is nothing to steer: it is a prompt.
+                let (Some(thread), Some(turn)) = (self.thread_id.clone(), self.turn_id.clone())
+                else {
+                    return self.encode(Command::Prompt { text });
+                };
+                let line = self.request(
+                    Pending::Steer(text.clone()),
+                    "turn/steer",
+                    json!({
+                        "threadId": thread,
+                        "expectedTurnId": turn,
+                        "input": [{"type": "text", "text": text}],
+                    }),
+                );
+                Ok(vec![Action::Write(vec![line])])
+            }
+            Command::DelegatedSteer { text, turn, tag } => {
+                // Pinned to `turn`, with no fallback: Codex refuses it unless `turn` is the
+                // active one, and the refusal is reported for `tag`, never sent as a new turn.
+                let Some(thread) = self.thread_id.clone() else {
+                    return Err(AdapterError::Invalid(
+                        "the Codex thread is not started yet".to_owned(),
+                    ));
+                };
+                let line = self.request(
+                    Pending::DelegatedSteer(tag),
+                    "turn/steer",
+                    json!({
+                        "threadId": thread,
+                        "expectedTurnId": turn,
+                        "input": [{"type": "text", "text": text}],
+                    }),
+                );
+                Ok(vec![Action::Write(vec![line])])
+            }
+            Command::Interrupt => {
+                let mut updates = Vec::new();
+                self.clear_worker_waits(&mut updates);
+                self.outbox.events.extend(updates);
+                let (Some(thread), Some(turn)) = (self.thread_id.clone(), self.turn_id.clone())
+                else {
+                    return Ok(Vec::new()); // nothing running: a no-op, like Esc at an idle prompt
+                };
+                self.interrupt_sent = true;
+                let line = self.request(
+                    Pending::Interrupt,
+                    "turn/interrupt",
+                    json!({"threadId": thread, "turnId": turn}),
+                );
+                Ok(vec![Action::Write(vec![line])])
+            }
+            Command::Approve {
+                request,
+                decision,
+                updated_input,
+                ..
+            } => {
+                // Checked before it is removed: a refused decision leaves the request answerable.
+                // `decline` is never refused: Codex accepts it unoffered.
+                let rewritten = match self.approvals.get(&request) {
+                    None => {
+                        return Err(AdapterError::Invalid(format!(
+                            "no pending approval {request}"
+                        )));
+                    }
+                    Some(pending)
+                        if decision != Decision::Deny && !pending.options.contains(&decision) =>
+                    {
+                        return Err(AdapterError::Invalid(format!(
+                            "Codex did not offer {} for approval {request}",
+                            decision_wire(decision)
+                        )));
+                    }
+                    // A permission grant may name its paths by where they really lead (the
+                    // card showed both); nothing else about it can change.
+                    Some(PendingApproval {
+                        grant: Some(grant), ..
+                    }) => match &updated_input {
+                        Some(paths) => Some(
+                            permissions::rewrite_paths(grant, paths)
+                                .map_err(AdapterError::Invalid)?,
+                        ),
+                        None => None,
+                    },
+                    Some(_) => None,
+                };
+                let Some(approval) = self.approvals.remove(&request) else {
+                    return Err(AdapterError::Invalid(format!(
+                        "no pending approval {request}"
+                    )));
+                };
+                self.remember_settled_request(request, approval.scope.clone());
+                if approval.form {
+                    // `persist` is never sent: session and always scope are the app's.
+                    let result = match decision {
+                        Decision::Allow | Decision::AllowForSession | Decision::AllowAlways => {
+                            json!({"action": "accept", "content": {}})
+                        }
+                        Decision::Deny => json!({"action": "decline"}),
+                        Decision::Cancel => json!({"action": "cancel"}),
+                    };
+                    return Ok(self.scoped_reply(
+                        &approval.rpc_id,
+                        result,
+                        &approval.scope,
+                        decision == Decision::Cancel,
+                    ));
+                }
+                let Some(grant) = rewritten.or(approval.grant) else {
+                    let line = json!({
+                        "id": approval.rpc_id,
+                        "result": {"decision": decision_wire(decision)},
+                    })
+                    .to_string();
+                    return Ok(vec![Action::Write(vec![line])]);
+                };
+                // A permission request: the grant the card showed, or nothing. The options check
+                // above already refused Always (never offered) and Allow on an unrenderable one.
+                let result = match decision {
+                    Decision::Allow => json!({"permissions": grant, "scope": "turn"}),
+                    Decision::AllowForSession => json!({"permissions": grant, "scope": "session"}),
+                    Decision::AllowAlways | Decision::Deny | Decision::Cancel => {
+                        json!({"permissions": {}})
+                    }
+                };
+                // No refusal value stops a turn here, so Stop turn interrupts it, as the
+                // command approval's `cancel` does.
+                Ok(self.scoped_reply(
+                    &approval.rpc_id,
+                    result,
+                    &approval.scope,
+                    decision == Decision::Cancel,
+                ))
+            }
+            Command::Answer { request, answers } => {
+                let Some(question) = self.questions.get(&request).cloned() else {
+                    return Err(AdapterError::Invalid(format!(
+                        "no pending Codex question {request}"
+                    )));
+                };
+                let Some(selected) = answers.as_object() else {
+                    return Err(AdapterError::Invalid(
+                        "question answers must be an object".to_owned(),
+                    ));
+                };
+                let mut mapped = Map::new();
+                for (id, text) in question.keys {
+                    let Some(answer) = selected.get(&text).and_then(Value::as_str) else {
+                        return Err(AdapterError::Invalid(format!(
+                            "missing answer for Codex question {text:?}"
+                        )));
+                    };
+                    mapped.insert(id, json!({"answers": [answer]}));
+                }
+                let line = json!({
+                    "id": question.rpc_id,
+                    "result": {"answers": mapped},
+                })
+                .to_string();
+                self.questions.remove(&request);
+                self.remember_settled_request(request, question.scope);
+                Ok(vec![Action::Write(vec![line])])
+            }
+            Command::SetModel { model, effort } => {
+                // Applied by the next `turn/start`; no restart. `None` keeps the effort.
+                self.model_selected_during_start = self.thread_id.is_none();
+                self.selection_revision = self.selection_revision.saturating_add(1);
+                if effort.is_some() {
+                    self.effort = effort;
+                }
+                self.model = Some(model.clone());
+                self.outbox.events.push(
+                    Envelope::new(Event::ModelChangeRequested { model })
+                        .request(format!("codex-model-{}", self.selection_revision)),
+                );
+                Ok(Vec::new())
+            }
+            Command::SetMode { mode } => {
+                if self.mode == mode {
+                    return Ok(Vec::new());
+                }
+                self.mode = mode;
+                if let Some(effective) = self.effective_mode.filter(|effective| *effective != mode)
+                {
+                    self.emit(Event::ModeChangeDeferred {
+                        requested: mode,
+                        effective,
+                    });
+                    self.emit(Event::Notice { text: format!(
+                        "{} applies to the next turn. This turn keeps {}; its pending approvals still need an answer.",
+                        mode.label(), effective.label()
+                    ) });
+                } else {
+                    // Selecting the effective mode cancels any deferred selection.
+                    self.emit(Event::ModeChanged { mode });
+                }
+                Ok(Vec::new())
+            }
+            Command::SubmitForm {
+                request,
+                action,
+                content,
+            } => self.submit_form(request, action, content),
+            Command::Control { id, control } => match control {
+                Control::ListModels => {
+                    let line = self.request(
+                        Pending::Models(id),
+                        "model/list",
+                        json!({"limit": MODEL_PAGE}),
+                    );
+                    Ok(vec![Action::Write(vec![line])])
+                }
+                Control::ContextUsage => {
+                    let event = match self.context {
+                        Some((used, max)) => Event::ControlResult {
+                            ok: Some(json!({"used": used, "max": max})),
+                            error: None,
+                        },
+                        None => Event::ControlResult {
+                            ok: None,
+                            error: Some("Codex has not reported token usage yet".to_owned()),
+                        },
+                    };
+                    self.outbox.events.push(Envelope::new(event).request(id));
+                    Ok(Vec::new())
+                }
+                _ => Err(AdapterError::Unsupported(
+                    "this control is not offered by Codex",
+                )),
+            },
+        }
+    }
+
+    fn feed(&mut self, line: &str) -> Vec<Envelope> {
+        let line = line.trim();
+        crate::adapter::map_json_frame(line, |raw| {
+            let id = raw.get("id").filter(|v| !v.is_null()).cloned();
+            let method = raw.get("method").and_then(Value::as_str).map(str::to_owned);
+            let params = raw.get("params").cloned().unwrap_or(Value::Null);
+            let mut out = Vec::new();
+            match (method, id) {
+                // The original frame text: an elicitation's property order is read from it.
+                (Some(method), Some(id)) => {
+                    self.on_server_request(&id, &method, &params, line, &mut out)
+                }
+                (Some(method), None) => self.on_notification(&method, &params, &mut out),
+                (None, Some(id)) => self.on_response(&id, raw, &mut out),
+                (None, None) => out.push(Envelope::new(Event::Unknown)),
+            }
+            out
+        })
+    }
+
+    fn feed_stderr(&mut self, _line: &str) -> Vec<Envelope> {
+        Vec::new()
+    }
+
+    fn feed_side(&mut self, _id: &str, _stdout: &str, _success: bool) -> Vec<Envelope> {
+        Vec::new() // Codex runs no side processes
+    }
+
+    fn on_exit(&mut self, code: Option<i32>) -> Vec<Envelope> {
+        self.settled_requests.clear();
+        self.turnless_settled.clear();
+        self.worker_turns.clear();
+        let expected = self.interrupt_sent;
+        let mut out = Vec::new();
+        self.clear_worker_waits(&mut out);
+        let mut changed = false;
+        for worker in self.workers.values_mut() {
+            if matches!(
+                worker.state,
+                WorkerState::Starting | WorkerState::Running | WorkerState::Waiting
+            ) {
+                // Losing this connection is not evidence that the child was closed.
+                worker.state = WorkerState::Unknown;
+                changed = true;
+            }
+        }
+        if changed {
+            self.emit_workers(&mut out);
+        }
+        self.close_all(&mut out);
+        for (request, approval) in take_sorted_where(&mut self.approvals, |_| true) {
+            out.push(
+                Envelope::new(Event::ApprovalExpired)
+                    .item(approval.item)
+                    .request(request),
+            );
+        }
+        for (request, question) in take_sorted_where(&mut self.questions, |_| true) {
+            out.push(
+                Envelope::new(Event::QuestionResolved { answered: false })
+                    .item(question.item)
+                    .request(request),
+            );
+        }
+        self.expire_forms(|_| true, &mut out);
+        let mut controls: Vec<String> = self
+            .pending
+            .drain()
+            .filter_map(|(_, p)| match p {
+                Pending::Models(id) => Some(id),
+                _ => None,
+            })
+            .collect();
+        controls.sort();
+        for id in controls {
+            out.push(
+                Envelope::new(Event::ControlResult {
+                    ok: None,
+                    error: Some("agent exited".to_owned()),
+                })
+                .request(id),
+            );
+        }
+        if std::mem::take(&mut self.turn_open) {
+            out.push(Envelope::new(Event::TurnCompleted {
+                state: if expected {
+                    TurnState::Interrupted
+                } else {
+                    TurnState::Failed
+                },
+                usage: None,
+                cost_usd: None,
+                error: (!expected).then(|| format!("codex exited unexpectedly (code {code:?})")),
+            }));
+        }
+        self.thread_id = None;
+        self.turn_id = None;
+        self.finish_effective_mode(&mut out);
+        self.interrupt_sent = false;
+        self.outbox.actions.clear(); // writes to a dead process
+        out.push(Envelope::new(Event::SessionExited { code, expected }));
+        out
+    }
+
+    fn drain_outbox(&mut self) -> Outbox {
+        std::mem::take(&mut self.outbox)
+    }
+
+    /// The `sandboxPolicy` sent on the active or pending `turn/start` (else the one the next
+    /// turn gets): `workspaceWrite` lets Codex write, and so rename, inside the workspace.
+    fn workspace_writable(&self) -> Option<bool> {
+        let mode = self.effective_mode.unwrap_or(self.mode);
+        let sandbox = self.policy(mode).1;
+        Some(sandbox["type"] == "workspaceWrite" || sandbox["type"] == "dangerFullAccess")
+    }
+
+    fn active_turn(&self) -> Option<String> {
+        self.turn_id.clone().filter(|_| self.turn_open)
+    }
+
+    fn supervise_as_child(&mut self) {
+        self.child = true;
+    }
+}
+
+/// The approval tool name of a Codex permission request. The session keeps no rule for it and
+/// never answers it on its own.
+pub const PERMISSIONS_TOOL: &str = "codex_permissions";
+
+/// The approval tool name of an MCP tool-call approval whose tool could not be told apart: the
+/// card is shown, and no rule matches it.
+pub const MCP_UNRESOLVED_TOOL: &str = "codex_mcp_tool_call";
+
+/// Codex's question for a tool server's call (codex-rs `build_mcp_tool_approval_fallback_message`).
+/// A connector or a message template words it otherwise; such a request is shown unresolved.
+fn mcp_approval_question(server: &str, tool: &str) -> String {
+    format!("Allow the {server} MCP server to run tool \"{tool}\"?")
+}
+
+/// An MCP tool-call approval's title (Codex's question) is cut to this many characters.
+const MCP_TITLE_MAX: usize = 300;
+
+/// Codex asks to approve an MCP tool call with an `mcpServer/elicitation/request` of its own
+/// (codex-rs `mcp_tool_call.rs`, `build_mcp_tool_approval_elicitation_request`): a form with
+/// no fields whose `_meta.codex_approval_kind` is `mcp_tool_call`. One with fields stays a form.
+/// Codex does not strip that key from a form a tool server sends itself (`codex-mcp`
+/// `elicitation.rs`); see [`CodexAdapter::on_mcp_tool_approval`] for how that is contained.
+fn is_mcp_tool_approval(params: &Value) -> bool {
+    s(params, "mode") == Some("form")
+        && params
+            .pointer("/_meta/codex_approval_kind")
+            .and_then(Value::as_str)
+            == Some("mcp_tool_call")
+        && params
+            .pointer("/requestedSchema/properties")
+            .and_then(Value::as_object)
+            .is_some_and(Map::is_empty)
+}
+
+/// The notice for a link a tool server asked the user to open that is not offered: the server,
+/// why, the link as inert text (anything but printable ASCII escaped, at most 300 characters),
+/// and what the user can do.
+pub fn refused_link_notice(server: &str, why: &str, url: &str) -> String {
+    use std::fmt::Write as _;
+    let mut shown = String::new();
+    for c in url.chars().take(300) {
+        if c.is_ascii_graphic() {
+            shown.push(c);
+        } else {
+            // Writing to a String cannot fail.
+            let _ = write!(shown, "\\u{{{:x}}}", c as u32);
+        }
+    }
+    if url.chars().nth(300).is_some() {
+        shown.push('…');
+    }
+    format!(
+        "The {server} tool server {why}, so it was declined. The link: {shown}\nOpen it yourself \
+         only if you trust it, then tell the agent."
+    )
+}
+
+const ALL_DECISIONS: [Decision; 5] = [
+    Decision::Allow,
+    Decision::AllowAlways,
+    Decision::AllowForSession,
+    Decision::Deny,
+    Decision::Cancel,
+];
+
+/// Removes the entries of `pending` that `matches` picks and returns them in key order, so what
+/// they emit is deterministic. What the caller then does with them (tombstones, which forms a
+/// scope covers) is its own policy.
+fn take_sorted_where<T>(
+    pending: &mut HashMap<String, T>,
+    matches: impl Fn(&T) -> bool,
+) -> Vec<(String, T)> {
+    let mut keys: Vec<String> = pending
+        .iter()
+        .filter(|(_, p)| matches(p))
+        .map(|(key, _)| key.clone())
+        .collect();
+    keys.sort();
+    keys.into_iter()
+        .filter_map(|key| pending.remove(&key).map(|p| (key, p)))
+        .collect()
+}
+
+fn remember_bounded<T: Clone + Eq + std::hash::Hash>(
+    keys: &mut HashSet<T>,
+    order: &mut VecDeque<T>,
+    key: T,
+    limit: usize,
+) {
+    if keys.insert(key.clone()) {
+        order.push_back(key);
+        if order.len() > limit {
+            if let Some(oldest) = order.pop_front() {
+                keys.remove(&oldest);
+            }
+        }
+    }
+}
+
+/// `approvalPolicy` and `sandboxPolicy` for a mode (see the module's mode table). Public so the
+/// delegation read-back compares against exactly what a launch requests.
+pub fn mode_policy(mode: Mode) -> (&'static str, Value) {
+    match mode {
+        Mode::Ask => ("untrusted", json!({"type": "readOnly"})),
+        Mode::AcceptEdits => ("untrusted", json!({"type": "workspaceWrite"})),
+        Mode::Plan => ("never", json!({"type": "readOnly"})),
+        Mode::Bypass => ("never", json!({"type": "dangerFullAccess"})),
+    }
+}
+
+/// `approvalPolicy` and `sandboxPolicy` for a supervised delegation child. Unlike a
+/// root's Ask, a child's Ask and Accept edits write inside the sandbox (its cwd is its own
+/// worktree lease) while every write and command still asks (`untrusted`). Plan is read-only. A
+/// child never runs Bypass; asked anyway, it gets Plan's policy, never full access.
+pub fn child_mode_policy(mode: Mode) -> (&'static str, Value) {
+    match mode {
+        Mode::Ask | Mode::AcceptEdits => ("untrusted", json!({"type": "workspaceWrite"})),
+        Mode::Plan | Mode::Bypass => ("never", json!({"type": "readOnly"})),
+    }
+}
+
+/// The `thread/start` `sandbox` mode name of a `sandboxPolicy` (`readOnly` is `read-only`).
+fn sandbox_mode_name(policy: &Value) -> Option<&'static str> {
+    match policy.get("type").and_then(Value::as_str)? {
+        "readOnly" => Some("read-only"),
+        "workspaceWrite" => Some("workspace-write"),
+        "dangerFullAccess" => Some("danger-full-access"),
+        _ => None,
+    }
+}
+
+/// The wire name of a decision (`CommandExecutionApprovalDecision` / `FileChangeApprovalDecision`).
+fn decision_wire(decision: Decision) -> &'static str {
+    match decision {
+        // Session and Always scope are agent-terminal's: on the wire they are an accept.
+        Decision::Allow | Decision::AllowForSession | Decision::AllowAlways => "accept",
+        Decision::Deny => "decline",
+        Decision::Cancel => "cancel",
+    }
+}
+
+/// The plain decisions the app maps from `availableDecisions`. `acceptForSession` is not one:
+/// session scope is the app's, and it is never sent.
+fn decision_of(wire: &str) -> Option<Decision> {
+    match wire {
+        "accept" => Some(Decision::Allow),
+        "decline" => Some(Decision::Deny),
+        "cancel" => Some(Decision::Cancel),
+        _ => None,
+    }
+}
+
+/// Items the app already shows itself (its own prompt) or that have no card.
+fn is_silent_item(item: &Value) -> bool {
+    matches!(s(item, "type"), Some("userMessage" | "contextCompaction"))
+}
+
+/// Kind, card title and input of a started item.
+fn item_info(item: &Value) -> (ItemKind, String, Option<Value>) {
+    let ty = s(item, "type").unwrap_or("item");
+    match ty {
+        "agentMessage" => (ItemKind::AssistantMessage, "assistant".to_owned(), None),
+        "plan" => (ItemKind::AssistantMessage, "plan".to_owned(), None),
+        "reasoning" => (ItemKind::Reasoning, "reasoning".to_owned(), None),
+        "commandExecution" => {
+            let command = s(item, "command").unwrap_or("command").to_owned();
+            let mut input = json!({"command": command, "cwd": item.get("cwd")});
+            // Codex's own reading of the command titles the card
+            // (`tool_title::from_command_actions`); the wrapped command is unwrapped for display.
+            if let Some(actions) = item
+                .get("commandActions")
+                .filter(|a| a.as_array().is_some_and(|a| !a.is_empty()))
+            {
+                input["commandActions"] = actions.clone();
+            }
+            (ItemKind::Command, command, Some(input))
+        }
+        "fileChange" => {
+            let changes = item.get("changes").cloned().unwrap_or(Value::Null);
+            let paths: Vec<&str> = changes
+                .as_array()
+                .map(|c| c.iter().filter_map(|ch| s(ch, "path")).collect())
+                .unwrap_or_default();
+            let title = match paths.as_slice() {
+                [] => "file change".to_owned(),
+                [one] => (*one).to_owned(),
+                [first, rest @ ..] => format!("{first} (+{} more)", rest.len()),
+            };
+            (ItemKind::FileChange, title, Some(changes))
+        }
+        "mcpToolCall" => (
+            ItemKind::McpTool,
+            format!(
+                "{}.{}",
+                s(item, "server").unwrap_or("mcp"),
+                s(item, "tool").unwrap_or("tool")
+            ),
+            item.get("arguments").cloned(),
+        ),
+        "dynamicToolCall" => (
+            ItemKind::Tool,
+            s(item, "tool").unwrap_or("tool").to_owned(),
+            item.get("arguments").cloned(),
+        ),
+        "webSearch" => {
+            let (title, input) = web_search_details(item);
+            (ItemKind::WebSearch, title, input)
+        }
+        "collabAgentToolCall" => (
+            ItemKind::Tool,
+            s(item, "tool").unwrap_or("subagent").to_owned(),
+            Some(
+                json!({"prompt": item.get("prompt"), "receiverThreadIds": item.get("receiverThreadIds")}),
+            ),
+        ),
+        // Legacy activity cards lack verified worker identity/lifecycle; never count the card
+        // as a worker. Current workers are tracked from thread ids and agentsStates instead.
+        "subAgentActivity" => (ItemKind::Tool, "subagent activity".to_owned(), None),
+        "imageView" => (
+            ItemKind::FileRead,
+            s(item, "path").unwrap_or("image").to_owned(),
+            None,
+        ),
+        other => (ItemKind::Tool, other.to_owned(), None),
+    }
+}
+
+/// A web-search item's action moved from the legacy top-level `query` to `action` in newer
+/// Codex app-server schemas. Normalise either form so the card names the actual operation.
+fn web_search_details(item: &Value) -> (String, Option<Value>) {
+    let action = item.get("action").filter(|a| a.is_object());
+    let source = action.unwrap_or(item);
+    match action.and_then(|action| s(action, "type")) {
+        Some("search") | None => {
+            let queries: Vec<String> = source
+                .get("queries")
+                .and_then(Value::as_array)
+                .map(|queries| {
+                    queries
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let query = s(source, "query")
+                .map(str::to_owned)
+                .or_else(|| queries.first().cloned());
+            let title = match (&query, queries.len()) {
+                (Some(query), 0 | 1) => query.clone(),
+                (Some(query), count) => format!("{query} (+{} more)", count - 1),
+                (None, _) => "web search".to_owned(),
+            };
+            let input = query.map(|query| json!({"query": query, "queries": queries}));
+            (title, input)
+        }
+        Some("open_page") => {
+            let url = s(source, "url").map(str::to_owned);
+            let title = url
+                .as_deref()
+                .map(|url| format!("Open {url}"))
+                .unwrap_or_else(|| "open web page".to_owned());
+            (title, url.map(|url| json!({"url": url})))
+        }
+        Some("find_in_page") => {
+            let url = s(source, "url").map(str::to_owned);
+            let pattern = s(source, "pattern").map(str::to_owned);
+            let title = match (&pattern, &url) {
+                (Some(pattern), Some(url)) => format!("Find {pattern:?} in {url}"),
+                (Some(pattern), None) => format!("Find {pattern:?}"),
+                (None, Some(url)) => format!("Find in {url}"),
+                (None, None) => "find in web page".to_owned(),
+            };
+            let mut input = Map::new();
+            if let Some(url) = url {
+                input.insert("url".to_owned(), Value::String(url));
+            }
+            if let Some(pattern) = pattern {
+                input.insert("pattern".to_owned(), Value::String(pattern));
+            }
+            let input = (!input.is_empty()).then_some(Value::Object(input));
+            (title, input)
+        }
+        Some(_) => ("web search".to_owned(), None),
+    }
+}
+
+/// Status, output and error of a completed item.
+fn item_result(item: &Value) -> (ItemStatus, Option<String>, Option<String>) {
+    let status = match s(item, "status") {
+        Some("completed") => ItemStatus::Completed,
+        Some("failed") => ItemStatus::Failed,
+        Some("declined") => ItemStatus::Declined,
+        Some(_) => ItemStatus::Interrupted,
+        None => ItemStatus::Completed,
+    };
+    match s(item, "type") {
+        Some("commandExecution") => {
+            let output = s(item, "aggregatedOutput").map(str::to_owned);
+            let error = (status == ItemStatus::Failed).then(|| {
+                item.get("exitCode")
+                    .and_then(Value::as_i64)
+                    .map_or_else(|| "command failed".to_owned(), |c| format!("exit code {c}"))
+            });
+            (status, output, error)
+        }
+        Some("fileChange") => {
+            let error = (status == ItemStatus::Failed).then(|| "patch failed to apply".to_owned());
+            (status, None, error)
+        }
+        Some("collabAgentToolCall") => (status, None, None),
+        Some("mcpToolCall") => {
+            let output = item
+                .get("result")
+                .filter(|r| !r.is_null())
+                .map(|r| content_text(r.get("content")).unwrap_or_else(|| r.to_string()));
+            let error = item
+                .get("error")
+                .filter(|e| !e.is_null())
+                .map(|e| s(e, "message").map_or_else(|| e.to_string(), str::to_owned));
+            (status, output, error)
+        }
+        Some("dynamicToolCall") => {
+            let failed = item.get("success").and_then(Value::as_bool) == Some(false);
+            (
+                if failed { ItemStatus::Failed } else { status },
+                content_text(item.get("contentItems")),
+                None,
+            )
+        }
+        _ => (
+            if status == ItemStatus::Interrupted {
+                ItemStatus::Completed
+            } else {
+                status
+            },
+            None,
+            None,
+        ),
+    }
+}
+
+fn collab_worker_state(status: Option<&str>) -> WorkerState {
+    match status {
+        Some("pendingInit") => WorkerState::Starting,
+        Some("running") => WorkerState::Running,
+        Some("interrupted") => WorkerState::Stopped,
+        Some("completed") => WorkerState::Completed,
+        Some("errored") => WorkerState::Failed,
+        Some("shutdown") => WorkerState::Closed,
+        _ => WorkerState::Unknown,
+    }
+}
+
+fn thread_worker_state(status: Option<&Value>) -> WorkerState {
+    let Some(status) = status else {
+        return WorkerState::Unknown;
+    };
+    match s(status, "type") {
+        Some("active") => {
+            if strings(status, "activeFlags")
+                .iter()
+                .any(|flag| matches!(flag.as_str(), "waitingOnApproval" | "waitingOnUserInput"))
+            {
+                WorkerState::Waiting
+            } else {
+                WorkerState::Running
+            }
+        }
+        Some("systemError") => WorkerState::Failed,
+        // idle/notLoaded neither prove task success nor explicit worker closure.
+        _ => WorkerState::Unknown,
+    }
+}
+
+fn set_worker_state(worker: &mut WorkerSnapshot, state: WorkerState) {
+    if state != WorkerState::Unknown
+        || !matches!(
+            worker.state,
+            WorkerState::Completed
+                | WorkerState::Failed
+                | WorkerState::Stopped
+                | WorkerState::Closed
+        )
+    {
+        worker.state = state;
+    }
+}
+
+/// The `text` of each element of a content array, joined; `None` when there is none.
+fn content_text(content: Option<&Value>) -> Option<String> {
+    let text: Vec<&str> = content?
+        .as_array()?
+        .iter()
+        .filter_map(|c| s(c, "text"))
+        .collect();
+    (!text.is_empty()).then(|| text.join("\n"))
+}
+
+/// One selectable model from `model/list` (`Model` in `v2/model.rs`). Shaped for the catalogue
+/// (id, display, description, efforts); the model catalogue maps it onto `catalog::CatalogModel`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CodexModel {
+    /// The `model` slug to send in `turn/start` (not the catalogue row's own `id`).
+    pub id: String,
+    pub display: String,
+    pub description: String,
+    /// `supportedReasoningEfforts[].reasoningEffort`, in the server's order.
+    pub efforts: Vec<String>,
+    pub default_effort: Option<String>,
+    pub is_default: bool,
+}
+
+/// `model/list` result → the visible models (`hidden: true` rows are left out).
+pub fn parse_codex_models(result: &Value) -> Vec<CodexModel> {
+    result
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|data| {
+            data.iter()
+                .filter(|m| m.get("hidden").and_then(Value::as_bool) != Some(true))
+                .filter_map(|m| {
+                    let id = s(m, "model").or_else(|| s(m, "id"))?;
+                    Some(CodexModel {
+                        id: id.to_owned(),
+                        display: s(m, "displayName").unwrap_or(id).to_owned(),
+                        description: s(m, "description").unwrap_or_default().to_owned(),
+                        efforts: m
+                            .get("supportedReasoningEfforts")
+                            .and_then(Value::as_array)
+                            .map(|e| {
+                                e.iter()
+                                    .filter_map(|o| s(o, "reasoningEffort"))
+                                    .map(str::to_owned)
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        default_effort: s(m, "defaultReasoningEffort").map(str::to_owned),
+                        is_default: m.get("isDefault").and_then(Value::as_bool) == Some(true),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn models_of(result: &Value) -> Value {
+    serde_json::to_value(parse_codex_models(result)).unwrap_or(Value::Null)
+}
+
+/// Answers use the shown text. Reserve original texts too, so a suffix cannot take the key of
+/// a later question already named, for example, "Continue? (2)".
+fn disambiguate_question_texts(questions: &mut [Question]) {
+    let originals: HashSet<String> = questions.iter().map(|q| q.question.clone()).collect();
+    let mut shown = HashSet::new();
+    for question in questions {
+        if shown.insert(question.question.clone()) {
+            continue;
+        }
+        let mut suffix = 2;
+        loop {
+            let text = format!("{} ({suffix})", question.question);
+            if !originals.contains(&text) && shown.insert(text.clone()) {
+                question.question = text;
+                break;
+            }
+            suffix += 1;
+        }
+    }
+}
+
+/// A `TokenUsageBreakdown`: `inputTokens` includes cached input and `outputTokens` includes
+/// reasoning output (OpenAI convention), which is the canonical convention too.
+fn usage_of(breakdown: &Value) -> Usage {
+    Usage {
+        input_tokens: num(breakdown, "inputTokens").unwrap_or(0),
+        output_tokens: num(breakdown, "outputTokens").unwrap_or(0),
+        cached_input_tokens: num(breakdown, "cachedInputTokens").unwrap_or(0),
+        reasoning_tokens: num(breakdown, "reasoningOutputTokens").unwrap_or(0),
+    }
+}
+
+fn s<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+    v.get(key).and_then(Value::as_str)
+}
+
+fn num(v: &Value, key: &str) -> Option<u64> {
+    v.get(key).and_then(Value::as_u64)
+}
+
+fn strings(v: &Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{records, Malformed};
+
+    const TURN: &str = include_str!("../tests/fixtures/codex-synthetic-turn.ndjson");
+
+    fn session(mode: Mode, resume: Option<&str>) -> OpenSession {
+        OpenSession {
+            program: "/usr/bin/codex".into(),
+            extra_args: vec!["-c".into(), "model_reasoning_effort=high".into()],
+            cwd: "/work/repo".into(),
+            model: Some("gpt-5-codex".into()),
+            effort: None,
+            mode,
+            resume: resume.map(str::to_owned),
+            new_session_id: None,
+            approval_hook: false,
+            delegation: None,
+        }
+    }
+
+    /// A started adapter: argv and handshake done, the thread/start response fed.
+    fn started(mode: Mode) -> CodexAdapter {
+        let mut a = CodexAdapter::new().client_version("0.1.0");
+        a.argv(&session(mode, None));
+        a.handshake();
+        let ev = a.feed(
+            r#"{"id":2,"result":{"thread":{"id":"th-1"},"model":"gpt-5-codex","cwd":"/work/repo"}}"#,
+        );
+        assert!(matches!(ev[0].event, Event::SessionStarted { .. }));
+        a
+    }
+
+    fn writes(actions: &[Action]) -> Vec<Value> {
+        actions
+            .iter()
+            .flat_map(|a| match a {
+                Action::Write(lines) => lines.clone(),
+                other => panic!("expected a write, got {other:?}"),
+            })
+            .map(|l| serde_json::from_str(&l).expect("json line"))
+            .collect()
+    }
+
+    fn one_write(actions: Vec<Action>) -> Value {
+        let mut w = writes(&actions);
+        assert_eq!(w.len(), 1, "{w:?}");
+        w.remove(0)
+    }
+
+    /// The one line a prompt writes. Encodes only: nothing is fed or drained.
+    fn prompt(adapter: &mut CodexAdapter, text: &str) -> Value {
+        one_write(
+            adapter
+                .encode(Command::Prompt { text: text.into() })
+                .expect("prompt"),
+        )
+    }
+
+    /// Frames follow the installed app-server JSON schema; no provider prompt is needed.
+    #[test]
+    fn collaboration_frames_publish_workers_and_explicit_waits() {
+        let mut a = started(Mode::Ask);
+        let out = a.feed(&json!({"method":"item/started", "params":{
+            "threadId":"th-1", "turnId":"tu-1", "item":{
+                "type":"collabAgentToolCall", "id":"spawn-1", "tool":"spawnAgent",
+                "status":"inProgress", "senderThreadId":"th-1", "receiverThreadIds":["worker-1"],
+                "prompt":"Review configuration", "agentsStates":{"worker-1":{"status":"pendingInit"}}
+            }
+        }}).to_string());
+        let workers = out
+            .iter()
+            .map(|e| serde_json::to_value(&e.event).expect("json"))
+            .find(|e| e["type"] == "workers_updated")
+            .expect("worker snapshot");
+        assert_eq!(workers["workers"][0]["id"], "worker-1");
+        assert_eq!(workers["workers"][0]["task"], "Review configuration");
+        assert_eq!(workers["workers"][0]["state"], "starting");
+    }
+
+    #[test]
+    fn completed_file_change_refines_its_initial_empty_changes() {
+        let mut a = started(Mode::Ask);
+        a.feed(r#"{"method":"item/started","params":{"threadId":"th-1","turnId":"tu","item":{"type":"fileChange","id":"edit","status":"inProgress","changes":[]}}}"#);
+        let changes = json!([{"path":"src/a.rs","kind":{"type":"update"},"diff":"@@ -1 +1 @@\n-old\n+new\n"}]);
+        let out = a.feed(&json!({"method":"item/completed","params":{"threadId":"th-1","turnId":"tu","item":{"type":"fileChange","id":"edit","status":"completed","changes":changes}}}).to_string());
+        assert!(out.iter().any(|e| matches!(&e.event, Event::ItemStarted {kind: ItemKind::FileChange, input: Some(input), ..} if *input == changes)), "completed changes must replace the empty start");
+    }
+
+    #[test]
+    fn a_question_without_options_is_refused_instead_of_stranding_the_user() {
+        let mut a = started(Mode::Ask);
+        let out = a.feed(r#"{"id":"question-1","method":"item/tool/requestUserInput","params":{"threadId":"th-1","turnId":"tu","itemId":"q","questions":[{"id":"q1","header":"Choice","question":"What should change?","options":[]}]}}"#);
+        assert!(!out
+            .iter()
+            .any(|e| matches!(e.event, Event::QuestionRequested { .. })));
+        let wire = writes(&a.drain_outbox().actions);
+        assert_eq!(wire[0]["error"]["code"], -32602);
+        assert!(wire[0]["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("options"));
+    }
+
+    const WORKERS: &str = include_str!("../tests/fixtures/codex-schema-workers.ndjson");
+
+    #[test]
+    fn schema_workers_keep_identity_across_operations_and_close_only_explicitly() {
+        let mut a = started(Mode::Ask);
+        a.feed(
+            r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"parent-turn"}}}"#,
+        );
+        let mut snapshots = Vec::new();
+        for (i, line) in WORKERS.lines().enumerate() {
+            let out = a.feed(line);
+            snapshots.extend(out.iter().filter_map(|e| match &e.event {
+                Event::WorkersUpdated {
+                    workers,
+                    waiting_for,
+                } => Some((workers.clone(), waiting_for.clone())),
+                _ => None,
+            }));
+            assert!(
+                !out.iter().any(|e| matches!(
+                    e.event,
+                    Event::ItemStarted {
+                        kind: ItemKind::Subagent,
+                        ..
+                    }
+                )),
+                "operations must not count as workers"
+            );
+            let worker = a.workers.get("worker-1").expect("worker");
+            match i {
+                1 => assert_eq!(worker.name.as_deref(), Some("Mira")),
+                2 => assert_eq!(
+                    worker.state,
+                    WorkerState::Running,
+                    "spawn call complete is not worker complete"
+                ),
+                3 => assert_eq!(a.waiting_for(), ["worker-1"]),
+                4 => assert!(
+                    out.is_empty(),
+                    "child reasoning must not enter the parent's transcript"
+                ),
+                5 => assert_eq!(worker.state, WorkerState::Waiting),
+                6 => {
+                    assert_eq!(worker.state, WorkerState::Completed);
+                    assert_eq!(a.turn_id.as_deref(), Some("parent-turn"));
+                    assert!(a.turn_open, "worker turn must not end the parent turn");
+                }
+                7 => {
+                    assert_eq!(worker.state, WorkerState::Completed);
+                    assert!(a.waiting_for().is_empty());
+                }
+                8 => {
+                    assert_eq!(worker.task.as_deref(), Some("Review settings"));
+                    assert_eq!(
+                        worker.activity, None,
+                        "new assignment clears the old result"
+                    );
+                }
+                9 | 11 => assert_eq!(
+                    worker.state,
+                    WorkerState::Running,
+                    "operation completion is not closure"
+                ),
+                12 | 13 => assert_eq!(worker.state, WorkerState::Closed),
+                14 => assert_eq!(a.turn_id.as_deref(), Some("parent-turn")),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            a.workers.len(),
+            2,
+            "one entry per worker thread, not per operation"
+        );
+        assert_eq!(a.workers["worker-2"].state, WorkerState::Unknown);
+        // Canonical snapshots replay by replacement; no native frames are needed to recover
+        // identities/history, and future builds can add metadata without breaking the store.
+        let mut replay = BTreeMap::new();
+        for (workers, _) in snapshots {
+            let env = Envelope::new(Event::WorkersUpdated {
+                workers,
+                waiting_for: Vec::new(),
+            });
+            let encoded = serde_json::to_string(&env).expect("serialize");
+            let decoded: Envelope = serde_json::from_str(&encoded).expect("decode");
+            if let Event::WorkersUpdated { workers, .. } = decoded.event {
+                replay = workers.into_iter().map(|w| (w.id.clone(), w)).collect();
+            }
+        }
+        assert_eq!(replay, a.workers);
+    }
+
+    fn waiting_adapter() -> CodexAdapter {
+        let mut a = started(Mode::Ask);
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-1"}}}"#);
+        for line in WORKERS.lines().take(4) {
+            a.feed(line);
+        }
+        assert_eq!(a.waiting_for(), ["worker-1"]);
+        a
+    }
+
+    #[test]
+    fn explicit_waits_clear_on_cancellation_failure_interrupt_and_exit() {
+        for status in ["completed", "failed", "interrupted"] {
+            let mut a = waiting_adapter();
+            let out = a.feed(&json!({"method":"item/completed","params":{"threadId":"th-1","turnId":"tu-1","item":{
+                "type":"collabAgentToolCall","id":"wait-1","tool":"wait","status":status,
+                "senderThreadId":"th-1","receiverThreadIds":["worker-1"],"prompt":null,"agentsStates":{}
+            }}}).to_string());
+            assert!(a.waiting_for().is_empty());
+            assert!(out.iter().any(|e| matches!(&e.event, Event::WorkersUpdated { waiting_for, .. } if waiting_for.is_empty())));
+            assert_eq!(a.workers["worker-1"].state, WorkerState::Running);
+        }
+        let mut a = waiting_adapter();
+        a.encode(Command::Interrupt).expect("interrupt");
+        assert!(a.waiting_for().is_empty());
+        assert!(a.drain_outbox().events.iter().any(|e| matches!(&e.event, Event::WorkersUpdated { waiting_for, .. } if waiting_for.is_empty())));
+        let mut a = waiting_adapter();
+        a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"failed","error":{"message":"quota"}}}}"#);
+        assert!(a.waiting_for().is_empty());
+        let mut a = waiting_adapter();
+        a.on_exit(Some(1));
+        assert!(a.waiting_for().is_empty());
+        assert_eq!(
+            a.workers["worker-1"].state,
+            WorkerState::Unknown,
+            "connection loss does not close the child"
+        );
+    }
+
+    #[test]
+    fn worker_schema_states_and_nested_metadata_have_safe_fallbacks() {
+        for (wire, state) in [
+            ("pendingInit", WorkerState::Starting),
+            ("running", WorkerState::Running),
+            ("interrupted", WorkerState::Stopped),
+            ("completed", WorkerState::Completed),
+            ("errored", WorkerState::Failed),
+            ("shutdown", WorkerState::Closed),
+            ("notFound", WorkerState::Unknown),
+            ("future-state", WorkerState::Unknown),
+        ] {
+            assert_eq!(collab_worker_state(Some(wire)), state);
+        }
+        let mut a = waiting_adapter();
+        a.feed(r#"{"method":"thread/started","params":{"thread":{"id":"nested","source":{"subAgent":{"thread_spawn":{"parent_thread_id":"worker-1","depth":2,"agent_nickname":null,"agent_role":"reviewer"}}},"status":{"type":"notLoaded"}}}}"#);
+        assert_eq!(a.workers["nested"].name.as_deref(), Some("reviewer"));
+        assert_eq!(a.workers["nested"].state, WorkerState::Unknown);
+        a.feed(r#"{"method":"thread/closed","params":{"threadId":"th-1"}}"#);
+        assert!(a.waiting_for().is_empty());
+        assert_eq!(
+            a.workers["worker-1"].state,
+            WorkerState::Running,
+            "closing parent isn't proof child closed"
+        );
+    }
+
+    #[test]
+    fn partially_unanswerable_question_batch_is_refused_whole() {
+        let mut a = started(Mode::Ask);
+        let out = a.feed(&json!({"id":55,"method":"item/tool/requestUserInput","params":{
+            "threadId":"th-1","turnId":"tu","itemId":"q","questions":[
+                {"id":"a","header":"A","question":"One?","options":[{"label":"Yes","description":"Continue"}]},
+                {"id":"b","header":"B","question":"Two?","options":[{"label":" "},{"description":"No label"}]}
+            ]}}).to_string());
+        assert!(!out
+            .iter()
+            .any(|e| matches!(e.event, Event::QuestionRequested { .. })));
+        assert!(a.questions.is_empty());
+        assert_eq!(writes(&a.drain_outbox().actions)[0]["id"], 55);
+    }
+
+    /// A message during a turn goes into it through `turn/steer`, pinned to that turn (frames
+    /// follow codex-cli 0.161.0's schema: threadId, expectedTurnId, input). Refused because the
+    /// turn ended first, it starts a turn of its own with a notice; with no turn running, a steer
+    /// is a prompt.
+    #[test]
+    fn a_message_mid_turn_steers_it_and_a_refused_steer_starts_a_turn() {
+        let mut a = started(Mode::Ask);
+        let idle = one_write(
+            a.encode(Command::Steer {
+                text: "hello".into(),
+            })
+            .expect("no turn: a prompt"),
+        );
+        assert_eq!(idle["method"], "turn/start");
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu"}}}"#);
+
+        let steer = one_write(
+            a.encode(Command::Steer {
+                text: "also check the tests".into(),
+            })
+            .expect("steer"),
+        );
+        assert_eq!(steer["method"], "turn/steer");
+        assert_eq!(steer["params"]["threadId"], "th-1");
+        assert_eq!(steer["params"]["expectedTurnId"], "tu");
+        assert_eq!(steer["params"]["input"][0]["text"], "also check the tests");
+
+        // Accepted: nothing to show, nothing written.
+        let id = steer["id"].clone();
+        let out = a.feed(&json!({"id": id, "result": {"turnId": "tu"}}).to_string());
+        assert!(out.is_empty(), "{out:?}");
+        assert!(a.drain_outbox().actions.is_empty());
+
+        // Refused: the same text starts a turn, and the user is told.
+        let again = one_write(
+            a.encode(Command::Steer {
+                text: "one more thing".into(),
+            })
+            .expect("steer"),
+        );
+        let out = a.feed(
+            &json!({"id": again["id"], "error": {"code": -32600, "message": "expected turn mismatch"}})
+                .to_string(),
+        );
+        assert!(
+            out.iter().any(
+                |e| matches!(&e.event, Event::Notice { text } if text.contains("new message"))
+            ),
+            "{out:?}"
+        );
+        let started = writes(&a.drain_outbox().actions);
+        assert_eq!(started.len(), 1, "{started:?}");
+        assert_eq!(started[0]["method"], "turn/start");
+        assert_eq!(started[0]["params"]["input"][0]["text"], "one more thing");
+    }
+
+    /// A delegated steer is pinned to the turn it names and never falls back: accepted, it is an
+    /// `ok` for its tag; refused, it is an `error` for its tag, and no turn is started.
+    #[test]
+    fn a_delegated_steer_reports_its_outcome_and_a_refusal_starts_no_turn() {
+        let mut a = started(Mode::Ask);
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu"}}}"#);
+        assert_eq!(a.active_turn().as_deref(), Some("tu"));
+        let steer = one_write(
+            a.encode(Command::DelegatedSteer {
+                text: "from the parent".into(),
+                turn: "tu".into(),
+                tag: "op-1".into(),
+            })
+            .expect("steer"),
+        );
+        assert_eq!(steer["method"], "turn/steer");
+        assert_eq!(steer["params"]["expectedTurnId"], "tu");
+        let out = a.feed(&json!({"id": steer["id"], "result": {"turnId": "tu"}}).to_string());
+        assert!(
+            out.iter().any(|e| e.request.as_deref() == Some("op-1")
+                && matches!(
+                    &e.event,
+                    Event::ControlResult {
+                        ok: Some(_),
+                        error: None
+                    }
+                )),
+            "{out:?}"
+        );
+
+        let refused = one_write(
+            a.encode(Command::DelegatedSteer {
+                text: "too late".into(),
+                turn: "an-old-turn".into(),
+                tag: "op-2".into(),
+            })
+            .expect("steer"),
+        );
+        let out = a.feed(
+            &json!({"id": refused["id"], "error": {"code": -32600, "message": "expected turn mismatch"}})
+                .to_string(),
+        );
+        assert!(
+            out.iter().any(|e| e.request.as_deref() == Some("op-2")
+                && matches!(
+                    &e.event,
+                    Event::ControlResult {
+                        ok: None,
+                        error: Some(_)
+                    }
+                )),
+            "{out:?}"
+        );
+        assert!(
+            !out.iter().any(|e| matches!(e.event, Event::Notice { .. })),
+            "{out:?}"
+        );
+        assert!(
+            a.drain_outbox().actions.is_empty(),
+            "a refused delegated steer starts no turn"
+        );
+    }
+
+    #[test]
+    fn a_delegated_steer_before_the_thread_exists_is_refused() {
+        let mut a = CodexAdapter::new();
+        a.argv(&session(Mode::Ask, None));
+        a.handshake();
+        assert!(matches!(
+            a.encode(Command::DelegatedSteer {
+                text: "x".into(),
+                turn: "tu".into(),
+                tag: "op".into(),
+            }),
+            Err(AdapterError::Invalid(_))
+        ));
+    }
+
+    /// A supervised Ask or Accept-edits child writes inside its sandbox and still asks;
+    /// Plan is read-only, and Bypass never gives a child full access. Roots are unchanged.
+    #[test]
+    fn child_mode_policy_maps_ask_and_accept_edits_to_workspace_write() {
+        for mode in [Mode::Ask, Mode::AcceptEdits] {
+            assert_eq!(
+                child_mode_policy(mode),
+                ("untrusted", json!({"type": "workspaceWrite"}))
+            );
+        }
+        assert_eq!(
+            child_mode_policy(Mode::Plan),
+            ("never", json!({"type": "readOnly"}))
+        );
+        assert_eq!(
+            child_mode_policy(Mode::Bypass),
+            ("never", json!({"type": "readOnly"}))
+        );
+        assert_eq!(
+            mode_policy(Mode::Ask),
+            ("untrusted", json!({"type": "readOnly"}))
+        );
+    }
+
+    #[test]
+    fn a_supervised_child_requests_its_policy_at_thread_start_and_on_every_turn() {
+        let mut child = CodexAdapter::new();
+        child.supervise_as_child();
+        let argv = child.argv(&session(Mode::Ask, None));
+        assert!(argv.ends_with(&[
+            "--disable".into(),
+            "multi_agent".into(),
+            "--disable".into(),
+            "multi_agent_v2".into(),
+            "app-server".into()
+        ]));
+        let lines = child.handshake();
+        let start: Value = serde_json::from_str(&lines[2]).expect("thread/start");
+        assert_eq!(start["params"]["approvalPolicy"], "untrusted");
+        assert_eq!(start["params"]["sandbox"], "workspace-write");
+        child.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"}}}"#);
+        let turn = prompt(&mut child, "task");
+        assert_eq!(turn["params"]["approvalPolicy"], "untrusted");
+        assert_eq!(turn["params"]["sandboxPolicy"]["type"], "workspaceWrite");
+        assert_eq!(child.workspace_writable(), Some(true));
+
+        // A root asks for nothing at thread start and keeps Ask read-only.
+        let mut root = CodexAdapter::new();
+        root.argv(&session(Mode::Ask, None));
+        let lines = root.handshake();
+        let start: Value = serde_json::from_str(&lines[2]).expect("thread/start");
+        assert!(start["params"].get("approvalPolicy").is_none());
+        assert!(start["params"].get("sandbox").is_none());
+        assert_eq!(root.workspace_writable(), Some(false));
+    }
+
+    fn bound_session(resume: Option<&str>) -> OpenSession {
+        let mut open = session(Mode::Ask, resume);
+        open.delegation = Some(crate::delegation::DelegationBinding {
+            command: "/usr/bin/agent-terminal".into(),
+            endpoint: "/run/user/1000/agent-terminal/delegation-42.sock".into(),
+            instance: crate::delegation::InstanceNonce::from_bytes([1; 16]),
+            token: crate::delegation::CapabilityToken::from_random([2; 32]),
+        });
+        open
+    }
+
+    #[test]
+    fn a_bound_child_disables_effective_ambient_servers_and_resends_overlay_on_resume() {
+        for resume in [None, Some("saved-thread")] {
+            let mut child = CodexAdapter::new();
+            child.supervise_as_child();
+            child.argv(&bound_session(resume));
+            let lines = child.handshake();
+            let query: Value = serde_json::from_str(&lines[2]).expect("config/read");
+            assert_eq!(query["method"], "config/read");
+            child.feed(
+                &json!({"id": query["id"], "result": {"config": {"mcp_servers": {
+                    "ambient": {"command": "other"}, "agent_terminal": {"command": "old"}
+                }}}})
+                .to_string(),
+            );
+            let start = one_write(child.drain_outbox().actions);
+            assert_eq!(
+                start["method"],
+                if resume.is_some() {
+                    "thread/resume"
+                } else {
+                    "thread/start"
+                }
+            );
+            let config = &start["params"]["config"];
+            assert_eq!(config["mcp_servers.ambient.enabled"], false);
+            assert_eq!(config["mcp_servers.codex_apps.enabled"], false);
+            assert_eq!(
+                config["mcp_servers.codex_apps.command"],
+                "/usr/bin/agent-terminal"
+            );
+            assert_eq!(
+                config["mcp_servers.codex_apps.args"],
+                json!(["--cross-agent-mcp"])
+            );
+            assert!(config.get("mcp_servers.codex_apps.env").is_none());
+            assert!(config.get("mcp_servers.agent_terminal.enabled").is_none());
+            assert_eq!(
+                config["mcp_servers.agent_terminal.command"],
+                "/usr/bin/agent-terminal"
+            );
+            assert_eq!(
+                config["mcp_servers.agent_terminal.default_tools_approval_mode"],
+                "approve"
+            );
+            assert_eq!(config["features.multi_agent"], false);
+            assert_eq!(config["features.multi_agent_v2"], false);
+            assert_eq!(start["params"]["sandbox"], "workspace-write");
+            if resume.is_some() {
+                child.feed(&json!({"id":start["id"],"error":{"message":"no rollout found for thread id saved-thread"}}).to_string());
+                let fallback = one_write(child.drain_outbox().actions);
+                assert_eq!(fallback["method"], "thread/start");
+                assert_eq!(fallback["params"]["config"], *config);
+                assert!(fallback["params"].get("threadId").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn a_bound_child_refuses_unreadable_or_malformed_effective_configuration() {
+        for response in [
+            json!({"error":{"message":"unsupported"}}),
+            json!({"result":{}}),
+            json!({"result":{"config":{"mcp_servers":[]}}}),
+        ] {
+            let mut child = CodexAdapter::new();
+            child.supervise_as_child();
+            child.argv(&bound_session(None));
+            let lines = child.handshake();
+            let query: Value = serde_json::from_str(&lines[2]).expect("query");
+            let mut response = response;
+            response["id"] = query["id"].clone();
+            let events = child.feed(&response.to_string());
+            assert!(events
+                .iter()
+                .any(|env| matches!(env.event, Event::Error { .. })));
+            assert!(child.drain_outbox().actions.is_empty());
+            assert!(child
+                .encode(Command::Prompt {
+                    text: "never run".into()
+                })
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn a_bound_root_keeps_ambient_servers_and_reapplies_its_bridge_on_resume() {
+        use crate::delegation::launch::ROOT_PROMPT;
+        for resume in [None, Some("saved-thread")] {
+            let mut root = CodexAdapter::new();
+            root.argv(&bound_session(resume));
+            let lines = root.handshake();
+            // It reads its effective config first, to keep the user's developer instructions.
+            let query: Value = serde_json::from_str(&lines[2]).expect("config/read");
+            assert_eq!(query["method"], "config/read");
+            root.feed(
+                &json!({"id": query["id"], "result": {"config": {
+                    "developer_instructions": "Be terse."
+                }}})
+                .to_string(),
+            );
+            let start = one_write(root.drain_outbox().actions);
+            assert_eq!(
+                start["params"]["developerInstructions"],
+                format!("Be terse.\n\n{ROOT_PROMPT}"),
+                "the user's own instructions, then the note"
+            );
+            assert_eq!(
+                start["method"],
+                if resume.is_some() {
+                    "thread/resume"
+                } else {
+                    "thread/start"
+                }
+            );
+            let config = &start["params"]["config"];
+            assert_eq!(
+                config["mcp_servers.agent_terminal.args"],
+                json!(["--cross-agent-mcp"])
+            );
+            assert!(config.get("mcp_servers.codex_apps.enabled").is_none());
+        }
+        // An unreadable config is no reason to fail: the thread starts without the note.
+        let mut root = CodexAdapter::new();
+        root.argv(&bound_session(None));
+        let lines = root.handshake();
+        let query: Value = serde_json::from_str(&lines[2]).expect("config/read");
+        root.feed(&json!({"id": query["id"], "error": {"message": "nope"}}).to_string());
+        let start = one_write(root.drain_outbox().actions);
+        assert_eq!(start["method"], "thread/start");
+        assert!(start["params"].get("developerInstructions").is_none());
+        // An unbound root is told nothing: it has no delegation tools to point to.
+        let mut plain = CodexAdapter::new();
+        plain.argv(&session(Mode::Ask, None));
+        let lines = plain.handshake();
+        let start: Value = serde_json::from_str(&lines[2]).expect("start");
+        assert_eq!(start["method"], "thread/start");
+        assert!(start["params"].get("developerInstructions").is_none());
+    }
+
+    #[test]
+    fn changing_mode_mid_turn_does_not_claim_the_current_sandbox_changed() {
+        let mut a = started(Mode::Ask);
+        let first = prompt(&mut a, "Review");
+        assert_eq!(first["params"]["sandboxPolicy"]["type"], "readOnly");
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu"}}}"#);
+        a.encode(Command::SetMode {
+            mode: Mode::AcceptEdits,
+        })
+        .expect("mode");
+        let out = a.drain_outbox().events;
+        assert!(
+            !out.iter()
+                .any(|e| matches!(e.event, Event::ModeChanged { .. })),
+            "running mode cannot change without a policy write"
+        );
+        let deferred = out
+            .iter()
+            .map(|e| serde_json::to_value(&e.event).expect("json"))
+            .find(|e| e["type"] == "mode_change_deferred")
+            .expect("deferred");
+        assert_eq!(deferred["effective"], "ask");
+        assert_eq!(deferred["requested"], "accept_edits");
+        let ended = a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu","status":"completed"}}}"#);
+        assert!(ended.iter().any(|e| matches!(
+            e.event,
+            Event::ModeChanged {
+                mode: Mode::AcceptEdits
+            }
+        )));
+        let next = prompt(&mut a, "Edit");
+        assert_eq!(next["params"]["sandboxPolicy"]["type"], "workspaceWrite");
+        assert_eq!(next["params"]["approvalPolicy"], "untrusted");
+    }
+
+    #[test]
+    fn deferred_modes_preserve_accept_edits_cancel_and_apply_only_to_the_next_turn() {
+        let mut a = started(Mode::AcceptEdits);
+        a.encode(Command::Prompt {
+            text: "Edit".into(),
+        })
+        .expect("prompt");
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu"}}}"#);
+        a.encode(Command::SetMode { mode: Mode::Plan })
+            .expect("mode");
+        assert_eq!(a.effective_mode, Some(Mode::AcceptEdits));
+        assert!(a.drain_outbox().events.iter().any(|e| matches!(
+            e.event,
+            Event::ModeChangeDeferred {
+                requested: Mode::Plan,
+                effective: Mode::AcceptEdits
+            }
+        )));
+        a.encode(Command::SetMode { mode: Mode::Plan })
+            .expect("repeat");
+        assert!(
+            a.drain_outbox().events.is_empty(),
+            "no repeated notice for unchanged request"
+        );
+        a.encode(Command::SetMode {
+            mode: Mode::AcceptEdits,
+        })
+        .expect("cancel");
+        assert_eq!(
+            a.drain_outbox().events,
+            [Envelope::new(Event::ModeChanged {
+                mode: Mode::AcceptEdits
+            })]
+        );
+        a.encode(Command::SetMode { mode: Mode::Plan })
+            .expect("plan");
+        a.drain_outbox();
+        a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu","status":"interrupted"}}}"#);
+        assert_eq!(a.effective_mode, None);
+        let next = prompt(&mut a, "Plan");
+        assert_eq!(next["params"]["sandboxPolicy"]["type"], "readOnly");
+        assert_eq!(next["params"]["approvalPolicy"], "never");
+    }
+
+    #[test]
+    fn mode_change_during_pending_start_is_deferred_and_failed_start_clears_it() {
+        let mut a = started(Mode::Ask);
+        let start = prompt(&mut a, "Review");
+        a.encode(Command::SetMode {
+            mode: Mode::AcceptEdits,
+        })
+        .expect("mode");
+        assert_eq!(a.effective_mode, Some(Mode::Ask));
+        assert!(a.drain_outbox().events.iter().any(|e| matches!(
+            e.event,
+            Event::ModeChangeDeferred {
+                effective: Mode::Ask,
+                ..
+            }
+        )));
+        let out = a.feed(&json!({"id":start["id"],"error":{"message":"start failed"}}).to_string());
+        assert_eq!(a.effective_mode, None);
+        assert!(out.iter().any(|e| matches!(
+            e.event,
+            Event::TurnCompleted {
+                state: TurnState::Failed,
+                ..
+            }
+        )));
+        assert!(
+            out.iter().any(|e| matches!(
+                e.event,
+                Event::ModeChanged {
+                    mode: Mode::AcceptEdits
+                }
+            )),
+            "now idle: selected next-turn default is available"
+        );
+    }
+
+    #[test]
+    fn reconnect_preserves_worker_history_without_claiming_live_activity() {
+        let mut a = waiting_adapter();
+        let closed = WorkerSnapshot {
+            id: "closed".into(),
+            name: Some("Finished reviewer".into()),
+            task: None,
+            state: WorkerState::Closed,
+            activity: None,
+            delegation: None,
+        };
+        a.workers.insert(closed.id.clone(), closed.clone());
+        a.handshake();
+        assert!(a.waiting_for().is_empty());
+        assert_eq!(a.workers["worker-1"].state, WorkerState::Unknown);
+        assert_eq!(a.workers["closed"], closed);
+    }
+
+    /// Short, comparable name of an envelope.
+    fn tag(e: &Envelope) -> String {
+        let item = e.item.as_deref().unwrap_or("");
+        match &e.event {
+            Event::SessionStarted { .. } => "session_started".into(),
+            Event::SessionExited { .. } => "session_exited".into(),
+            Event::TurnStarted { .. } => "turn_started".into(),
+            Event::TurnCompleted { state, .. } => format!("turn_completed:{state:?}"),
+            Event::ItemStarted { kind, .. } => format!("item_started:{item}:{kind:?}"),
+            Event::ItemCompleted { status, .. } => format!("item_completed:{item}:{status:?}"),
+            Event::ContentDelta { stream, .. } => format!("delta:{item}:{stream:?}"),
+            Event::ContentSnapshot { stream, .. } => format!("snapshot:{item}:{stream:?}"),
+            Event::ApprovalRequested { .. } => format!("approval:{item}"),
+            Event::ApprovalExpired => format!("approval_expired:{item}"),
+            Event::UsageUpdated { .. } => "usage".into(),
+            Event::PlanUpdated { .. } => "plan".into(),
+            Event::Unknown => "unknown".into(),
+            other => format!("{other:?}"),
+        }
+    }
+
+    // ---- synthetic replay ----
+
+    /// Replays the fixture: `out` frames are fed; each `in` frame must be exactly what the adapter
+    /// wrote at that point (handshake, the queued prompt, the approval answer).
+    fn replay(fixture: &str) -> Vec<Envelope> {
+        let mut a = CodexAdapter::new().client_version("0.1.0");
+        a.argv(&session(Mode::Ask, None));
+        let mut wrote: VecDeque<Value> = a
+            .handshake()
+            .iter()
+            .map(|l| serde_json::from_str(l).expect("handshake line"))
+            .collect();
+        // The user types before the thread exists: queued, flushed by the thread/start response.
+        assert!(a
+            .encode(Command::Prompt {
+                text: "list the files".into()
+            })
+            .expect("queue")
+            .is_empty());
+        let mut events = Vec::new();
+        let mut last_request: Option<String> = None;
+        for rec in records(fixture, Malformed::Panic) {
+            let frame = &rec["frame"];
+            match rec["dir"].as_str() {
+                Some("out") => {
+                    let ev = a.feed(&frame.to_string());
+                    if let Some(req) = ev.iter().find_map(|e| {
+                        matches!(e.event, Event::ApprovalRequested { .. })
+                            .then(|| e.request.clone())
+                            .flatten()
+                    }) {
+                        last_request = Some(req);
+                    }
+                    events.extend(ev);
+                    let outbox = a.drain_outbox();
+                    wrote.extend(writes(&outbox.actions));
+                    events.extend(outbox.events);
+                }
+                Some("in") => {
+                    if frame.get("method").is_none() {
+                        // The app answers the approval.
+                        let decision = match frame["result"]["decision"].as_str() {
+                            Some("accept") => Decision::Allow,
+                            Some("acceptForSession") => Decision::AllowForSession,
+                            Some("decline") => Decision::Deny,
+                            _ => Decision::Cancel,
+                        };
+                        let actions = a
+                            .encode(approve_cmd(
+                                last_request.as_deref().expect("approval seen"),
+                                decision,
+                            ))
+                            .expect("approve");
+                        wrote.extend(writes(&actions));
+                    }
+                    let expected = wrote.pop_front().expect("adapter wrote nothing");
+                    assert_eq!(&expected, frame, "t_ms {}", rec["t_ms"]);
+                }
+                _ => {}
+            }
+        }
+        assert!(wrote.is_empty(), "unmatched writes: {wrote:?}");
+        events
+    }
+
+    #[test]
+    fn synthetic_turn_maps_to_the_canonical_sequence() {
+        let ev = replay(TURN);
+        let tags: Vec<String> = ev.iter().map(tag).collect();
+        assert_eq!(
+            tags,
+            [
+                "session_started",
+                "turn_started",
+                "item_started:rs_1:Reasoning",
+                "Reasoning { state: Streaming, label: Summary }",
+                "delta:rs_1:Reasoning",
+                "delta:rs_1:Reasoning",
+                "snapshot:rs_1:Reasoning",
+                "Reasoning { state: Complete, label: Summary }",
+                "item_completed:rs_1:Completed",
+                "item_started:msg_1:AssistantMessage",
+                "delta:msg_1:Assistant",
+                "delta:msg_1:Assistant",
+                "snapshot:msg_1:Assistant",
+                "item_completed:msg_1:Completed",
+                "item_started:cmd_1:Command",
+                "approval:cmd_1",
+                "delta:cmd_1:ToolOutput",
+                "item_completed:cmd_1:Completed",
+                "usage",
+                "item_started:msg_2:AssistantMessage",
+                "delta:msg_2:Assistant",
+                "snapshot:msg_2:Assistant",
+                "item_completed:msg_2:Completed",
+                "turn_completed:Completed",
+            ]
+        );
+        assert!(
+            matches!(&ev[0].event, Event::SessionStarted { native_id, model: Some(m), cwd: Some(c) }
+            if native_id == "019a0000-0000-7000-8000-000000000001" && m == "gpt-5-codex" && c == "/work/repo")
+        );
+        assert!(
+            matches!(&ev[1].event, Event::TurnStarted { model: Some(m) } if m == "gpt-5-codex")
+        );
+        // The reasoning summary is the snapshot, not the sum of its deltas' framing.
+        assert!(
+            matches!(&ev[6].event, Event::ContentSnapshot { text, .. } if text == "**Planning** the listing")
+        );
+        let approval = &ev[15];
+        assert!(approval.request.as_deref().is_some_and(|request| {
+            request.starts_with("codex:item/commandExecution/requestApproval:")
+        }));
+        assert!(matches!(&approval.event, Event::ApprovalRequested {
+            tool, title: Some(t), reason: Some(r), options, response: ResponseCapability::Live, input,
+            remembers: Some(ref rem)
+        } if tool == "command_execution" && t == "ls -la" && r.contains("outside")
+            && options == &ALL_DECISIONS.to_vec() && input["command"] == "ls -la" && rem.contains("ls -la")));
+        assert!(
+            matches!(&ev[17].event, Event::ItemCompleted { output: Some(o), error: None, .. }
+            if o.starts_with("total 8"))
+        );
+        assert!(matches!(
+            &ev[18].event,
+            Event::UsageUpdated {
+                used: 1500,
+                max: Some(272000),
+                ..
+            }
+        ));
+        match &ev[23].event {
+            Event::TurnCompleted {
+                state: TurnState::Completed,
+                usage: Some(u),
+                error: None,
+                ..
+            } => assert_eq!(
+                u,
+                &Usage {
+                    input_tokens: 1200,
+                    output_tokens: 300,
+                    cached_input_tokens: 1000,
+                    reasoning_tokens: 120
+                }
+            ),
+            other => panic!("expected TurnCompleted, got {other:?}"),
+        }
+        // `raw` rides on the first envelope of a frame only.
+        assert!(ev[0].raw.is_some() && ev[1].raw.is_some());
+    }
+
+    // ---- argv, handshake, modes ----
+
+    #[test]
+    fn argv_is_program_extra_args_then_app_server() {
+        let a = CodexAdapter::new();
+        assert_eq!(
+            a.argv(&session(Mode::Ask, None)),
+            [
+                "/usr/bin/codex",
+                "-c",
+                "model_reasoning_effort=high",
+                "app-server"
+            ]
+        );
+        assert_eq!(a.driver(), Driver::Codex);
+        assert!(a.capabilities().model_switch_in_session);
+    }
+
+    #[test]
+    fn handshake_is_initialize_initialized_and_thread_start() {
+        let mut a = CodexAdapter::new().client_version("3.0.0");
+        a.argv(&session(Mode::Ask, None));
+        let lines: Vec<Value> = a
+            .handshake()
+            .iter()
+            .map(|l| serde_json::from_str(l).expect("json"))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                json!({"id": 1, "method": "initialize", "params": {"clientInfo": {
+                    "name": "agent-terminal", "title": "Agent Terminal", "version": "3.0.0"}}}),
+                json!({"method": "initialized"}),
+                json!({"id": 2, "method": "thread/start", "params": {
+                    "cwd": "/work/repo",
+                    "model": "gpt-5-codex",
+                    "approvalsReviewer": "user",
+                    "config": {"tools.update_plan.enabled": true}}}),
+            ]
+        );
+        // No frame carries a "jsonrpc" field.
+        assert!(lines.iter().all(|l| l.get("jsonrpc").is_none()));
+    }
+
+    #[test]
+    fn only_a_successful_initialize_result_answers_the_handshake() {
+        let start = || {
+            let mut a = CodexAdapter::new().client_version("3.0.0");
+            a.argv(&session(Mode::Ask, None));
+            a.handshake();
+            a
+        };
+        let mut a = start();
+        assert!(!a.handshake_answered());
+        // Blank or malformed output and another request's result answer nothing.
+        for line in ["", "not json", r#"{"method":"thread/started","params":{}}"#] {
+            a.feed(line);
+        }
+        assert!(!a.handshake_answered());
+        // A refused initialize.
+        a.feed(r#"{"id":1,"error":{"message":"unsupported client"}}"#);
+        assert!(!a.handshake_answered());
+
+        let mut a = start();
+        a.feed(r#"{"id":1,"result":{},"error":{"message":"failed"}}"#);
+        assert!(!a.handshake_answered(), "an error cannot also be a success");
+
+        // Success is silent: no event says the agent is up, only this.
+        let mut a = start();
+        let events = a.feed(r#"{"id":1,"result":{"userAgent":"codex"}}"#);
+        assert!(events.is_empty(), "{events:?}");
+        assert!(a.handshake_answered());
+        // A new process must answer again.
+        a.handshake();
+        assert!(!a.handshake_answered());
+    }
+
+    #[test]
+    fn handshake_resumes_when_asked() {
+        let mut a = CodexAdapter::new();
+        a.argv(&session(Mode::Ask, Some("th-9")));
+        let lines = a.handshake();
+        let thread: Value = serde_json::from_str(&lines[2]).expect("json");
+        assert_eq!(
+            thread,
+            json!({"id": 2, "method": "thread/resume", "params": {
+                "threadId": "th-9",
+                "excludeTurns": true,
+                "cwd": "/work/repo",
+                "model": "gpt-5-codex",
+                "approvalsReviewer": "user",
+                "config": {"tools.update_plan.enabled": true}}})
+        );
+    }
+
+    /// A resume of a thread that never completed a turn finds no rollout. The adapter
+    /// starts a new thread with the same settings (and says so) instead of failing, and a prompt
+    /// queued meanwhile goes to the new thread. Any other resume error still fails startup.
+    #[test]
+    fn a_resume_with_no_rollout_starts_a_new_thread() {
+        let mut a = CodexAdapter::new();
+        a.argv(&session(Mode::Ask, Some("th-gone")));
+        a.handshake();
+        assert!(a
+            .encode(Command::Prompt { text: "hi".into() })
+            .expect("queued")
+            .is_empty());
+        let ev = a.feed(
+            r#"{"id":2,"error":{"code":-32600,"message":"no rollout found for thread id th-gone"}}"#,
+        );
+        assert!(
+            ev.iter().any(
+                |e| matches!(&e.event, Event::Notice { text } if text.contains("new Codex session"))
+            ),
+            "{ev:?}"
+        );
+        assert!(!ev.iter().any(|e| matches!(e.event, Event::Error { .. })));
+        let start = writes(&a.drain_outbox().actions);
+        assert_eq!(start.len(), 1, "{start:?}");
+        assert_eq!(start[0]["method"], "thread/start");
+        assert_eq!(start[0]["params"]["cwd"], "/work/repo");
+        assert!(start[0]["params"].get("threadId").is_none());
+        assert!(start[0]["params"].get("excludeTurns").is_none());
+        let id = start[0]["id"].clone();
+        let ev = a.feed(&json!({"id": id, "result": {"thread": {"id": "th-new"}}}).to_string());
+        assert!(
+            matches!(&ev[0].event, Event::SessionStarted { native_id, .. } if native_id == "th-new")
+        );
+        let turn = writes(&a.drain_outbox().actions);
+        assert_eq!(turn[0]["method"], "turn/start");
+        assert_eq!(turn[0]["params"]["threadId"], "th-new");
+
+        // Not a missing rollout: startup fails as before, and a fresh start never falls back.
+        let mut a = CodexAdapter::new();
+        a.argv(&session(Mode::Ask, Some("th-1")));
+        a.handshake();
+        let ev = a.feed(r#"{"id":2,"error":{"code":-32600,"message":"permission denied"}}"#);
+        assert!(ev.iter().any(|e| matches!(e.event, Event::Error { .. })));
+        assert!(writes(&a.drain_outbox().actions).is_empty());
+        let mut a = CodexAdapter::new();
+        a.argv(&session(Mode::Ask, None));
+        a.handshake();
+        let ev = a.feed(r#"{"id":2,"error":{"message":"no rollout found for thread id x"}}"#);
+        assert!(ev.iter().any(|e| matches!(e.event, Event::Error { .. })));
+    }
+
+    #[test]
+    fn a_stopped_queued_prompt_is_replaced_by_one_continuation_on_the_resumed_model() {
+        let mut a = CodexAdapter::new();
+        a.argv(&session(Mode::Ask, Some("th-1")));
+        a.handshake();
+        assert!(a
+            .encode(Command::Prompt {
+                text: "original work".into()
+            })
+            .expect("queue original")
+            .is_empty());
+        a.discard_queued_prompts();
+        a.on_exit(None);
+        let mut resumed = session(Mode::Ask, Some("th-1"));
+        resumed.model = Some("selected".into());
+        resumed.effort = Some("high".into());
+        a.argv(&resumed);
+        let handshake = a.handshake();
+        let resume: Value = serde_json::from_str(&handshake[2]).expect("resume request");
+        assert_eq!(resume["method"], "thread/resume");
+        assert_eq!(resume["params"]["threadId"], "th-1");
+        assert_eq!(resume["params"]["model"], "selected");
+        assert!(a
+            .encode(Command::Prompt {
+                text: "continue the interrupted work".into()
+            })
+            .expect("queue continuation")
+            .is_empty());
+        a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"},"model":"selected"}}"#);
+        let flushed = writes(&a.drain_outbox().actions);
+        assert_eq!(
+            flushed.len(),
+            1,
+            "stopped work must not be replayed alongside continuation"
+        );
+        assert_eq!(flushed[0]["params"]["model"], "selected");
+        assert_eq!(flushed[0]["params"]["effort"], "high");
+        assert_eq!(
+            flushed[0]["params"]["input"][0]["text"],
+            "continue the interrupted work"
+        );
+        assert!(!a.prompt_starts_turn(" /COMPACT "));
+        assert!(a.prompt_starts_turn("/review"));
+    }
+
+    #[test]
+    fn an_initial_turn_confirms_or_rejects_its_model_when_startup_omits_it() {
+        for success in [false, true] {
+            let mut a = CodexAdapter::new();
+            a.argv(&session(Mode::Ask, Some("th-1")));
+            a.handshake();
+            a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"}}}"#);
+            let sent = prompt(&mut a, "continue");
+            let response = if success {
+                json!({"id":sent["id"],"result":{"turn":{"id":"tu"}}})
+            } else {
+                json!({"id":sent["id"],"error":{"message":"model unavailable"}})
+            };
+            let events = a.feed(&response.to_string());
+            if success {
+                assert!(events.iter().any(
+                    |e| matches!(&e.event, Event::ModelChanged { model } if model == "gpt-5-codex")
+                        && e.request.is_none()
+                ));
+                let started = a.feed(
+                    r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu"}}}"#,
+                );
+                assert!(!started
+                    .iter()
+                    .any(|e| matches!(e.event, Event::ModelChanged { .. })));
+            } else {
+                assert!(events.iter().any(|e| matches!(&e.event, Event::ModelChangeFailed { model, .. } if model == "gpt-5-codex") && e.request.is_none()));
+                assert!(events.iter().any(|e| matches!(
+                    e.event,
+                    Event::TurnCompleted {
+                        state: TurnState::Failed,
+                        ..
+                    }
+                )));
+            }
+        }
+    }
+
+    #[test]
+    fn startup_failure_discards_queued_work_and_late_responses_cannot_restart_it() {
+        for resume in [None, Some("th-1")] {
+            for failure in [
+                r#"{"id":1,"error":{"message":"initialize denied"}}"#,
+                r#"{"id":2,"error":{"message":"thread denied"}}"#,
+                r#"{"id":2,"result":{"thread":{}}}"#,
+            ] {
+                let mut a = CodexAdapter::new();
+                a.argv(&session(Mode::Ask, resume));
+                a.handshake();
+                a.encode(Command::Prompt {
+                    text: "continue".into(),
+                })
+                .expect("queue");
+                let events = a.feed(failure);
+                assert!(events
+                    .iter()
+                    .any(|e| matches!(e.event, Event::Error { .. })));
+                assert!(events.iter().any(|e| matches!(&e.event, Event::ModelChangeFailed { model, .. } if model == "gpt-5-codex")));
+                assert!(events.iter().any(|e| matches!(
+                    e.event,
+                    Event::TurnCompleted {
+                        state: TurnState::Failed,
+                        ..
+                    }
+                )));
+                let late =
+                    a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"},"model":"gpt-5-codex"}}"#);
+                assert!(!late
+                    .iter()
+                    .any(|e| matches!(e.event, Event::SessionStarted { .. })));
+                assert!(a.drain_outbox().actions.is_empty());
+                assert!(a
+                    .encode(Command::Prompt {
+                        text: "stale retry".into()
+                    })
+                    .is_err());
+                a.argv(&session(Mode::Ask, resume));
+                a.handshake();
+                a.encode(Command::Prompt {
+                    text: "fresh retry".into(),
+                })
+                .expect("queue fresh retry");
+                a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"},"model":"gpt-5-codex"}}"#);
+                let sent = writes(&a.drain_outbox().actions);
+                assert_eq!(sent.len(), 1);
+                assert_eq!(sent[0]["params"]["input"][0]["text"], "fresh retry");
+            }
+        }
+    }
+
+    #[test]
+    fn a_late_initialize_failure_invalidates_a_submitted_turn() {
+        let mut a = CodexAdapter::new();
+        a.argv(&session(Mode::Ask, Some("th-1")));
+        a.handshake();
+        a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"}}}"#);
+        let sent = prompt(&mut a, "continue");
+        let failed = a.feed(r#"{"id":1,"error":{"message":"initialize denied"}}"#);
+        assert!(failed.iter().any(|e| matches!(
+            e.event,
+            Event::TurnCompleted {
+                state: TurnState::Failed,
+                ..
+            }
+        )));
+        let late = a.feed(&json!({"id":sent["id"],"result":{"turn":{"id":"tu"}}}).to_string());
+        assert!(late.is_empty());
+        let started =
+            a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu"}}}"#);
+        assert!(started.is_empty());
+    }
+
+    #[test]
+    fn an_initial_turn_reroute_is_not_overwritten_by_its_original_acceptance() {
+        let mut a = CodexAdapter::new();
+        a.argv(&session(Mode::Ask, Some("th-1")));
+        a.handshake();
+        a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"}}}"#);
+        let sent = prompt(&mut a, "continue");
+        let reroute = a.feed(r#"{"method":"model/rerouted","params":{"threadId":"th-1","turnId":"tu","toModel":"fallback"}}"#);
+        assert!(matches!(&reroute[0].event, Event::ModelChanged { model } if model == "fallback"));
+        assert!(reroute[0].request.is_none());
+        let ack = a.feed(&json!({"id":sent["id"],"result":{"turn":{"id":"tu"}}}).to_string());
+        assert!(!ack
+            .iter()
+            .any(|e| matches!(e.event, Event::ModelChanged { .. })));
+        assert_eq!(a.confirmed_model.as_deref(), Some("fallback"));
+    }
+
+    #[test]
+    fn an_explicit_launch_model_is_used_for_continuation_when_startup_reports_the_old_model() {
+        for resume in [None, Some("th-1")] {
+            let mut a = CodexAdapter::new();
+            let mut open = session(Mode::Ask, resume);
+            open.model = Some("selected".into());
+            open.effort = Some("high".into());
+            a.argv(&open);
+            a.handshake();
+            a.encode(Command::Prompt {
+                text: "continue".into(),
+            })
+            .expect("queue continuation");
+            let events = a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"},"model":"old"}}"#);
+            assert!(
+                matches!(&events[0].event, Event::SessionStarted { model: Some(model), .. } if model == "old")
+            );
+            let flushed = writes(&a.drain_outbox().actions);
+            assert_eq!(flushed.len(), 1);
+            assert_eq!(flushed[0]["params"]["model"], "selected");
+            assert_eq!(flushed[0]["params"]["effort"], "high");
+            let accepted =
+                a.feed(&json!({"id":flushed[0]["id"],"result":{"turn":{"id":"tu"}}}).to_string());
+            assert!(accepted.iter().any(
+                |e| matches!(&e.event, Event::ModelChanged { model } if model == "selected")
+                    && e.request.is_none()
+            ));
+            let started = a.feed(
+                r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu"}}}"#,
+            );
+            assert!(!started
+                .iter()
+                .any(|e| matches!(e.event, Event::ModelChanged { .. })));
+        }
+        let mut a = CodexAdapter::new();
+        let mut open = session(Mode::Ask, None);
+        open.model = None;
+        a.argv(&open);
+        a.handshake();
+        a.encode(Command::Prompt {
+            text: "use default".into(),
+        })
+        .expect("queue default");
+        a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"},"model":"reported-default"}}"#);
+        let flushed = writes(&a.drain_outbox().actions);
+        assert_eq!(flushed[0]["params"]["model"], "reported-default");
+    }
+
+    #[test]
+    fn a_model_selected_during_thread_start_survives_the_original_model_response() {
+        for resume in [None, Some("th-1")] {
+            let mut a = CodexAdapter::new();
+            a.argv(&session(Mode::Ask, resume));
+            a.handshake();
+            a.encode(Command::SetModel {
+                model: "gpt-5.5".into(),
+                effort: Some("high".into()),
+            })
+            .expect("select");
+            a.drain_outbox();
+            assert!(a
+                .encode(Command::Prompt {
+                    text: "queued".into()
+                })
+                .expect("queue")
+                .is_empty());
+            let events =
+                a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"},"model":"gpt-5-codex"}}"#);
+            assert!(matches!(&events[0].event,
+                Event::SessionStarted { model: Some(model), .. } if model == "gpt-5-codex"));
+            let flushed = writes(&a.drain_outbox().actions);
+            assert_eq!(flushed[0]["params"]["model"], "gpt-5.5");
+            assert_eq!(flushed[0]["params"]["effort"], "high");
+            let next = prompt(&mut a, "next");
+            assert_eq!(next["params"]["model"], "gpt-5.5");
+        }
+    }
+
+    #[test]
+    fn a_prompt_before_the_thread_exists_is_queued_then_flushed_in_order() {
+        let mut a = CodexAdapter::new();
+        a.argv(&session(Mode::Ask, None));
+        a.handshake();
+        for text in ["one", "two"] {
+            assert!(a
+                .encode(Command::Prompt { text: text.into() })
+                .expect("queue")
+                .is_empty());
+        }
+        assert!(a.drain_outbox().is_empty());
+        a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"},"model":"m"}}"#);
+        let flushed = writes(&a.drain_outbox().actions);
+        let texts: Vec<&str> = flushed
+            .iter()
+            .map(|w| w["params"]["input"][0]["text"].as_str().expect("text"))
+            .collect();
+        assert_eq!(texts, ["one", "two"]);
+        assert_eq!(flushed[0]["params"]["threadId"], "th-1");
+        assert!(a.drain_outbox().is_empty(), "drained once");
+    }
+
+    #[test]
+    fn prompt_encodes_turn_start_with_the_mode_policy() {
+        let table = [
+            (Mode::Ask, "untrusted", json!({"type": "readOnly"})),
+            (
+                Mode::AcceptEdits,
+                "untrusted",
+                json!({"type": "workspaceWrite"}),
+            ),
+            (Mode::Plan, "never", json!({"type": "readOnly"})),
+            (Mode::Bypass, "never", json!({"type": "dangerFullAccess"})),
+        ];
+        for (mode, approval, sandbox) in table {
+            let mut a = started(mode);
+            let w = prompt(&mut a, "hi");
+            assert_eq!(
+                w,
+                json!({"id": 3, "method": "turn/start", "params": {
+                    "threadId": "th-1",
+                    "input": [{"type": "text", "text": "hi"}],
+                    "cwd": "/work/repo",
+                    "model": "gpt-5-codex",
+                    "approvalPolicy": approval,
+                    "approvalsReviewer": "user",
+                    "sandboxPolicy": sandbox,
+                    "summary": "detailed"}}),
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_and_mode_apply_on_the_next_turn_and_emit_events() {
+        let mut a = started(Mode::Ask);
+        assert!(a
+            .encode(Command::SetModel {
+                model: "gpt-5.5".into(),
+                effort: None
+            })
+            .expect("ok")
+            .is_empty());
+        assert!(a
+            .encode(Command::SetMode {
+                mode: Mode::AcceptEdits
+            })
+            .expect("ok")
+            .is_empty());
+        let outbox = a.drain_outbox();
+        assert!(outbox.actions.is_empty());
+        assert_eq!(
+            outbox.events,
+            vec![
+                Envelope::new(Event::ModelChangeRequested {
+                    model: "gpt-5.5".into()
+                })
+                .request("codex-model-1"),
+                Envelope::new(Event::ModeChanged {
+                    mode: Mode::AcceptEdits
+                }),
+            ]
+        );
+        let w = prompt(&mut a, "x");
+        assert_eq!(w["params"]["model"], "gpt-5.5");
+        assert_eq!(w["params"]["approvalPolicy"], "untrusted");
+        assert_eq!(
+            w["params"]["sandboxPolicy"],
+            json!({"type": "workspaceWrite"})
+        );
+    }
+
+    #[test]
+    fn model_confirmation_uses_the_submitted_choice_and_requires_backend_acceptance() {
+        for notification_first in [false, true] {
+            let mut a = started(Mode::Ask);
+            a.encode(Command::SetModel {
+                model: "selected".into(),
+                effort: Some("high".into()),
+            })
+            .expect("select");
+            let requested = a.drain_outbox();
+            let selection_key = requested.events[0].request.clone();
+            assert_eq!(selection_key.as_deref(), Some("codex-model-1"));
+            assert!(
+                matches!(&requested.events[0].event, Event::ModelChangeRequested { model } if model == "selected")
+            );
+            assert!(!requested
+                .events
+                .iter()
+                .any(|e| matches!(e.event, Event::ModelChanged { .. })));
+            let sent = prompt(&mut a, "first");
+            a.encode(Command::SetModel {
+                model: "newer".into(),
+                effort: Some("low".into()),
+            })
+            .expect("select newer");
+            a.drain_outbox();
+            let response = json!({"id":sent["id"],"result":{"turn":{"id":"tu"}}}).to_string();
+            let notification =
+                r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu"}}}"#;
+            let frames = if notification_first {
+                [notification, response.as_str()]
+            } else {
+                [response.as_str(), notification]
+            };
+            let events: Vec<_> = frames.into_iter().flat_map(|frame| a.feed(frame)).collect();
+            assert!(events
+                .iter()
+                .filter(|e| matches!(e.event, Event::ModelChanged { .. }))
+                .all(|e| e.request == selection_key));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(
+                        |e| matches!(&e.event, Event::ModelChanged { model } if model == "selected")
+                    )
+                    .count(),
+                1
+            );
+            assert!(events.iter().any(|e| matches!(&e.event, Event::TurnStarted { model: Some(model) } if model == "selected")));
+            assert!(!events
+                .iter()
+                .any(|e| matches!(&e.event, Event::ModelChanged { model } if model == "newer")));
+            let next = prompt(&mut a, "next");
+            assert_eq!(next["params"]["model"], "newer");
+            assert_eq!(next["params"]["effort"], "low");
+        }
+    }
+
+    #[test]
+    fn a_rejected_model_restores_confirmed_settings_without_overwriting_a_newer_choice() {
+        for newer in [false, true] {
+            let mut a = started(Mode::Ask);
+            a.encode(Command::SetModel {
+                model: "invalid".into(),
+                effort: Some("high".into()),
+            })
+            .expect("select");
+            a.drain_outbox();
+            let sent = prompt(&mut a, "first");
+            if newer {
+                a.encode(Command::SetModel {
+                    model: "newer".into(),
+                    effort: Some("low".into()),
+                })
+                .expect("select newer");
+                a.drain_outbox();
+            }
+            let events = a.feed(
+                &json!({"id":sent["id"],"error":{"code":-32600,"message":"no such model"}})
+                    .to_string(),
+            );
+            assert!(events.iter().any(|e| matches!(&e.event, Event::ModelChangeFailed { model, message } if model == "invalid" && message == "no such model")));
+            assert!(!events
+                .iter()
+                .any(|e| matches!(e.event, Event::ModelChanged { .. })));
+            assert!(events.iter().any(|e| matches!(
+                e.event,
+                Event::TurnCompleted {
+                    state: TurnState::Failed,
+                    ..
+                }
+            )));
+            let next = prompt(&mut a, "next");
+            assert_eq!(
+                next["params"]["model"],
+                if newer { "newer" } else { "gpt-5-codex" }
+            );
+            if newer {
+                assert_eq!(next["params"]["effort"], "low");
+            } else {
+                assert!(next["params"].get("effort").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn rejection_restores_the_last_accepted_model_and_effort() {
+        let mut a = started(Mode::Ask);
+        a.encode(Command::SetModel {
+            model: "accepted".into(),
+            effort: Some("high".into()),
+        })
+        .expect("select");
+        a.drain_outbox();
+        let sent = prompt(&mut a, "first");
+        a.feed(&json!({"id":sent["id"],"result":{"turn":{"id":"tu"}}}).to_string());
+        a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu","status":"completed"}}}"#);
+        a.encode(Command::SetModel {
+            model: "invalid".into(),
+            effort: Some("low".into()),
+        })
+        .expect("select invalid");
+        a.drain_outbox();
+        let sent = prompt(&mut a, "second");
+        a.feed(&json!({"id":sent["id"],"error":{"message":"no such model"}}).to_string());
+        let next = prompt(&mut a, "retry");
+        assert_eq!(next["params"]["model"], "accepted");
+        assert_eq!(next["params"]["effort"], "high");
+    }
+
+    #[test]
+    fn a_reroute_confirms_the_active_turn_without_overwriting_a_later_choice() {
+        let mut a = started(Mode::Ask);
+        a.encode(Command::SetModel {
+            model: "selected".into(),
+            effort: Some("high".into()),
+        })
+        .expect("select");
+        a.drain_outbox();
+        let sent = prompt(&mut a, "first");
+        a.encode(Command::SetModel {
+            model: "newer".into(),
+            effort: Some("low".into()),
+        })
+        .expect("select newer");
+        a.drain_outbox();
+        let events = a.feed(r#"{"method":"model/rerouted","params":{"threadId":"th-1","turnId":"tu","fromModel":"selected","toModel":"fallback","reason":"x"}}"#);
+        assert_eq!(events[0].request.as_deref(), Some("codex-model-1"));
+        assert!(matches!(&events[0].event, Event::ModelChanged { model } if model == "fallback"));
+        let ack = a.feed(&json!({"id":sent["id"],"result":{"turn":{"id":"tu"}}}).to_string());
+        assert!(!ack
+            .iter()
+            .any(|e| matches!(e.event, Event::ModelChanged { .. })));
+        let started =
+            a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu"}}}"#);
+        assert!(
+            matches!(&started[0].event, Event::TurnStarted { model: Some(model) } if model == "fallback")
+        );
+        let next = prompt(&mut a, "next");
+        assert_eq!(next["params"]["model"], "newer");
+        assert_eq!(next["params"]["effort"], "low");
+    }
+
+    #[test]
+    fn repeated_model_choices_have_distinct_acceptance_and_rejection_keys() {
+        for success in [false, true] {
+            let mut a = started(Mode::Ask);
+            a.encode(Command::SetModel {
+                model: "same".into(),
+                effort: Some("high".into()),
+            })
+            .expect("first choice");
+            let first_key = a.drain_outbox().events[0].request.clone();
+            let sent = prompt(&mut a, "first");
+            for (model, effort) in [("other", "high"), ("same", "low")] {
+                a.encode(Command::SetModel {
+                    model: model.into(),
+                    effort: Some(effort.into()),
+                })
+                .expect("later choice");
+            }
+            let latest_key = a
+                .drain_outbox()
+                .events
+                .last()
+                .expect("latest request")
+                .request
+                .clone();
+            assert_eq!(first_key.as_deref(), Some("codex-model-1"));
+            assert_eq!(latest_key.as_deref(), Some("codex-model-3"));
+            let response = if success {
+                json!({"id":sent["id"],"result":{"turn":{"id":"tu"}}})
+            } else {
+                json!({"id":sent["id"],"error":{"message":"refused"}})
+            };
+            let events = a.feed(&response.to_string());
+            let ack = events
+                .iter()
+                .find(|e| {
+                    matches!(
+                        e.event,
+                        Event::ModelChanged { .. } | Event::ModelChangeFailed { .. }
+                    )
+                })
+                .expect("selection acknowledgement");
+            assert_eq!(ack.request, first_key);
+            assert_ne!(ack.request, latest_key);
+            let next = prompt(&mut a, "next");
+            assert_eq!(next["params"]["model"], "same");
+            assert_eq!(next["params"]["effort"], "low");
+        }
+    }
+
+    #[test]
+    fn effort_rides_on_every_turn_start() {
+        let mut a = started(Mode::Ask);
+        let w = prompt(&mut a, "a");
+        assert!(w["params"].get("effort").is_none());
+        a.encode(Command::SetModel {
+            model: "gpt-5-codex".into(),
+            effort: Some("high".into()),
+        })
+        .expect("set");
+        let w = prompt(&mut a, "b");
+        assert_eq!(w["params"]["effort"], "high");
+        // `None` keeps the effort; no respawn is asked for.
+        let actions = a
+            .encode(Command::SetModel {
+                model: "gpt-5.5".into(),
+                effort: None,
+            })
+            .expect("set");
+        assert!(actions.is_empty());
+        let w = prompt(&mut a, "c");
+        assert_eq!(w["params"]["effort"], "high");
+    }
+
+    #[test]
+    fn a_rate_limit_notification_becomes_a_quota_update() {
+        let mut a = started(Mode::Ask);
+        let ev = a.feed(
+            r#"{"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":42,"windowDurationMins":300,"resetsAt":1790000000}}}}"#,
+        );
+        match &ev[0].event {
+            Event::QuotaUpdated { account, windows } => {
+                assert!(account.is_none());
+                assert_eq!(windows.len(), 1);
+                assert_eq!(
+                    (windows[0].label.as_str(), windows[0].used),
+                    ("5-hour", 0.42)
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // Nothing usable in it: no event, not an Unknown.
+        assert!(a
+            .feed(r#"{"method":"account/rateLimits/updated","params":{"rateLimits":{}}}"#)
+            .is_empty());
+    }
+
+    #[test]
+    fn the_session_effort_seeds_turn_start() {
+        let mut a = CodexAdapter::new();
+        let mut s = session(Mode::Ask, None);
+        s.effort = Some("low".into());
+        a.argv(&s);
+        a.handshake();
+        a.feed(r#"{"id":2,"result":{"thread":{"id":"th-1"}}}"#);
+        let w = prompt(&mut a, "a");
+        assert_eq!(w["params"]["effort"], "low");
+    }
+
+    // ---- interrupt, approvals, controls ----
+
+    #[test]
+    fn interrupt_needs_a_running_turn() {
+        let mut a = started(Mode::Ask);
+        assert!(a.encode(Command::Interrupt).expect("no-op").is_empty());
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-1"}}}"#);
+        let w = one_write(a.encode(Command::Interrupt).expect("ok"));
+        assert_eq!(
+            w,
+            json!({"id": 3, "method": "turn/interrupt", "params": {"threadId": "th-1", "turnId": "tu-1"}})
+        );
+        // The process survives an interrupt; the turn ends with status "interrupted".
+        let ev = a.feed(
+            r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"interrupted","error":null}}}"#,
+        );
+        assert!(matches!(
+            ev.last().expect("events").event,
+            Event::TurnCompleted {
+                state: TurnState::Interrupted,
+                error: None,
+                ..
+            }
+        ));
+        assert!(a.encode(Command::Interrupt).expect("idle again").is_empty());
+    }
+
+    fn approval_request(id: &str, method: &str) -> String {
+        format!(
+            r#"{{"id":{id},"method":"{method}","params":{{"threadId":"th-1","turnId":"tu-1","itemId":"it-1","startedAtMs":1,"reason":"why","command":"rm x"}}}}"#
+        )
+    }
+
+    #[test]
+    fn approve_answers_the_server_request_with_the_mapped_decision() {
+        for (decision, wire) in [
+            (Decision::Allow, "accept"),
+            (Decision::AllowForSession, "accept"),
+            (Decision::AllowAlways, "accept"),
+            (Decision::Deny, "decline"),
+            (Decision::Cancel, "cancel"),
+        ] {
+            let mut a = started(Mode::Ask);
+            let ev = a.feed(&approval_request(
+                "17",
+                "item/commandExecution/requestApproval",
+            ));
+            let request = ev[0].request.clone().expect("canonical request");
+            assert_ne!(request, "17");
+            let w = one_write(a.encode(approve_cmd(&request, decision)).expect("approve"));
+            assert_eq!(w, json!({"id": 17, "result": {"decision": wire}}));
+            // Answered once: a second answer is invalid, and nothing expires at exit.
+            assert!(matches!(
+                a.encode(approve_cmd(&request, decision)),
+                Err(AdapterError::Invalid(_))
+            ));
+            assert!(!a
+                .on_exit(Some(0))
+                .iter()
+                .any(|e| matches!(e.event, Event::ApprovalExpired)));
+        }
+    }
+
+    #[test]
+    fn reused_rpc_ids_without_items_are_scoped_to_the_active_turn() {
+        for rpc_id in 0..4 {
+            let frame = json!({
+                "id": rpc_id,
+                "method": "item/commandExecution/requestApproval",
+                "params": {"command": "git fetch", "reason": "Network access"},
+            })
+            .to_string();
+            let mut old = started(Mode::Ask);
+            old.turn_id = Some("old-turn".into());
+            let old_request = old.feed(&frame)[0].request.clone().expect("old request");
+            let mut resumed = started(Mode::Ask);
+            resumed.turn_id = Some("new-turn".into());
+            let first = resumed.feed(&frame);
+            let request = first[0].request.clone().expect("new request");
+            assert_ne!(
+                request,
+                rpc_id.to_string(),
+                "historical unscoped ids differ"
+            );
+            assert_ne!(
+                request, old_request,
+                "new connections cannot hide a new turn"
+            );
+            assert_eq!(
+                resumed.feed(&frame)[0].request,
+                Some(request.clone()),
+                "a retransmitted pending request keeps its identity"
+            );
+            assert_eq!(resumed.approvals.len(), 1);
+            assert_eq!(
+                one_write(
+                    resumed
+                        .encode(approve_cmd(&request, Decision::Allow))
+                        .expect("approve resumed request")
+                ),
+                json!({"id": rpc_id, "result": {"decision": "accept"}}),
+            );
+        }
+    }
+
+    #[test]
+    fn request_identity_preserves_rpc_type_and_native_question_scope() {
+        let mut a = started(Mode::Ask);
+        let command = "item/commandExecution/requestApproval";
+        let params = json!({"threadId": "thread", "turnId": "turn", "itemId": "item"});
+        let numeric = a.server_request_key(&json!(0), command, &params);
+        let string = a.server_request_key(&json!("0"), command, &params);
+        assert_ne!(numeric, string);
+        assert_ne!(
+            numeric,
+            a.server_request_key(&json!(0), "item/fileChange/requestApproval", &params)
+        );
+
+        let question = |turn: &str| {
+            json!({"id": 0, "method": "item/tool/requestUserInput", "params": {
+                "threadId": "thread", "turnId": turn,
+                "questions": [{"id": "choice", "question": "Continue?",
+                    "options": [{"label": "Yes"}, {"label": "No"}]}],
+            }})
+            .to_string()
+        };
+        let old = a.feed(&question("old"))[0]
+            .request
+            .clone()
+            .expect("old question");
+        a.handshake();
+        let new = a.feed(&question("new"))[0]
+            .request
+            .clone()
+            .expect("new question");
+        assert_ne!(old, new);
+        let resolved = a.feed(
+            r#"{"method":"serverRequest/resolved","params":{"threadId":"thread","requestId":0}}"#,
+        );
+        assert_eq!(resolved[0].request.as_deref(), Some(new.as_str()));
+        assert_eq!(
+            resolved[0].event,
+            Event::QuestionResolved { answered: false }
+        );
+        assert!(a.questions.is_empty());
+    }
+
+    #[test]
+    fn a_string_request_id_is_echoed_verbatim_and_file_changes_are_approvals_too() {
+        let mut a = started(Mode::Ask);
+        let ev = a.feed(&approval_request(
+            "\"req-a\"",
+            "item/fileChange/requestApproval",
+        ));
+        assert!(
+            matches!(&ev[0].event, Event::ApprovalRequested { tool, title: Some(t), .. }
+            if tool == "file_change" && t == "why")
+        );
+        let request = ev[0].request.clone().expect("canonical request");
+        assert_ne!(request, "req-a");
+        let w = one_write(
+            a.encode(approve_cmd(&request, Decision::Allow))
+                .expect("approve"),
+        );
+        assert_eq!(w, json!({"id": "req-a", "result": {"decision": "accept"}}));
+    }
+
+    #[test]
+    fn available_decisions_limit_the_options() {
+        let mut a = started(Mode::Ask);
+        let ev = a.feed(
+            r#"{"id":5,"method":"item/commandExecution/requestApproval","params":{"itemId":"i","availableDecisions":["accept",{"acceptWithExecpolicyAmendment":{"execpolicyAmendment":["ls"]}},"cancel"]}}"#,
+        );
+        assert!(
+            matches!(&ev[0].event, Event::ApprovalRequested { options, .. }
+            if options == &vec![Decision::Allow, Decision::AllowAlways, Decision::AllowForSession, Decision::Deny, Decision::Cancel])
+        );
+    }
+
+    const W0_SHELL: &str =
+        include_str!("../../../tests/fixtures/real/codex/ask-shell-decline.jsonl");
+    const W0_EDIT: &str = include_str!("../../../tests/fixtures/real/codex/ask-edit-decline.jsonl");
+
+    fn w0_request(fixture: &str, method: &str) -> String {
+        records(fixture, Malformed::Skip)
+            .into_iter()
+            .find(|rec| rec["frame"]["method"] == method)
+            .expect("W0 approval frame")["frame"]
+            .to_string()
+    }
+
+    /// (`codex/ask-shell-decline.jsonl`): the server offers `accept`, an execpolicy amendment
+    /// and `cancel`, never `acceptForSession`. "Allow for session" and "Always allow" are offered
+    /// by the app and both go out as a plain `accept`; the amendment is never sent.
+    #[test]
+    fn w0_session_and_always_answer_a_plain_accept() {
+        let frame = w0_request(W0_SHELL, "item/commandExecution/requestApproval");
+        for decision in [Decision::AllowForSession, Decision::AllowAlways] {
+            let mut a = started(Mode::Ask);
+            let ev = a.feed(&frame);
+            let request = ev[0].request.clone().expect("request");
+            match &ev[0].event {
+                Event::ApprovalRequested { options, input, .. } => {
+                    assert_eq!(
+                        options,
+                        &[
+                            Decision::Allow,
+                            Decision::AllowAlways,
+                            Decision::AllowForSession,
+                            Decision::Deny,
+                            Decision::Cancel
+                        ]
+                    );
+                    assert_eq!(input["command"], "/usr/bin/zsh -lc 'ls -la'");
+                }
+                other => panic!("{other:?}"),
+            }
+            let w = one_write(a.encode(approve_cmd(&request, decision)).expect("answer"));
+            assert_eq!(w, json!({"id": 0, "result": {"decision": "accept"}}));
+        }
+        // A file change names no decisions: the plain ones, Session and Always included.
+        let mut a = started(Mode::Ask);
+        let ev = a.feed(&w0_request(W0_EDIT, "item/fileChange/requestApproval"));
+        assert!(
+            matches!(&ev[0].event, Event::ApprovalRequested { options, .. } if options == &ALL_DECISIONS.to_vec())
+        );
+    }
+
+    fn approve_cmd(request: &str, decision: Decision) -> Command {
+        Command::Approve {
+            request: request.to_owned(),
+            decision,
+            updated_input: None,
+            message: None,
+        }
+    }
+
+    #[test]
+    fn command_execution_approval_offers_allow_always_when_command_present() {
+        let mut a = started(Mode::Ask);
+        let ev = a.feed(
+            r#"{"id":6,"method":"item/commandExecution/requestApproval","params":{"itemId":"i","command":"git status","cwd":"/repo","availableDecisions":["accept","acceptForSession","decline","cancel"]}}"#,
+        );
+        let req = ev[0].request.clone().expect("request");
+        match &ev[0].event {
+            Event::ApprovalRequested {
+                options, remembers, ..
+            } => {
+                assert_eq!(remembers.as_deref(), Some("`git status` in /repo"));
+                assert!(options.contains(&Decision::AllowAlways));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        let w = one_write(
+            a.encode(approve_cmd(&req, Decision::AllowAlways))
+                .expect("allow always"),
+        );
+        assert_eq!(w, json!({"id": 6, "result": {"decision": "accept"}}));
+    }
+
+    #[test]
+    fn a_command_approval_without_a_folder_still_says_what_it_would_remember() {
+        let mut a = started(Mode::Ask);
+        let ev = a.feed(
+            r#"{"id":7,"method":"item/commandExecution/requestApproval","params":{"itemId":"i","command":"cargo test","availableDecisions":["accept","decline"]}}"#,
+        );
+        assert!(
+            matches!(&ev[0].event, Event::ApprovalRequested { remembers: Some(r), .. } if r == "`cargo test`"),
+            "{ev:?}"
+        );
+    }
+
+    #[test]
+    fn a_question_needs_both_an_id_and_its_text() {
+        // Without an id the answer could not be sent back; without text there is nothing to
+        // ask. Either makes the question unusable, and a request with none usable is refused.
+        for question in [
+            r#"{"id":"","header":"H","question":"Pick one","options":[{"label":"A"}]}"#,
+            r#"{"id":"q1","header":"H","question":"","options":[{"label":"A"}]}"#,
+        ] {
+            let mut a = started(Mode::Ask);
+            let out = a.feed(&format!(
+                r#"{{"id":"question-2","method":"item/tool/requestUserInput","params":{{"threadId":"th-1","turnId":"tu","itemId":"q","questions":[{question}]}}}}"#
+            ));
+            assert!(
+                !out.iter()
+                    .any(|e| matches!(e.event, Event::QuestionRequested { .. })),
+                "{question}: {out:?}"
+            );
+            assert_eq!(
+                writes(&a.drain_outbox().actions)[0]["error"]["code"],
+                -32602
+            );
+        }
+    }
+
+    #[test]
+    fn a_decision_the_server_did_not_offer_is_refused_and_the_request_stays_open() {
+        let mut a = started(Mode::Ask);
+        let ev = a.feed(
+            r#"{"id":5,"method":"item/commandExecution/requestApproval","params":{"itemId":"i","availableDecisions":["decline","cancel"]}}"#,
+        );
+        let request = ev[0].request.clone().expect("canonical request");
+        let approve = |decision| approve_cmd(&request, decision);
+        assert!(matches!(
+            a.encode(approve(Decision::Allow)),
+            Err(AdapterError::Invalid(m)) if m.contains("accept")
+        ));
+        // Still pending: an offered decision goes through.
+        let w = one_write(a.encode(approve(Decision::Deny)).expect("offered"));
+        assert_eq!(w, json!({"id": 5, "result": {"decision": "decline"}}));
+    }
+
+    /// A patch whose item never completes (the turn was interrupted or failed, or the process
+    /// exited) leaves no stored change behind for a later approval to borrow.
+    #[test]
+    fn file_changes_of_items_cut_short_are_dropped() {
+        let begin = |a: &mut CodexAdapter, id: &str| {
+            a.feed(
+                &json!({"method": "item/started", "params": {"threadId": "th-1", "turnId": "tu",
+                "item": {"type": "fileChange", "id": id, "status": "inProgress",
+                    "changes": [{"path": "/w/a", "kind": {"type": "update"}, "diff": "@@"}]}}})
+                .to_string(),
+            );
+        };
+        for end in ["interrupted", "failed"] {
+            let mut a = started(Mode::Ask);
+            a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu"}}}"#);
+            begin(&mut a, "p1");
+            assert!(a.file_changes.contains_key("p1"));
+            a.feed(
+                &json!({"method": "turn/completed", "params": {"threadId": "th-1",
+                "turn": {"id": "tu", "status": end}}})
+                .to_string(),
+            );
+            assert!(a.file_changes.is_empty(), "{end}");
+        }
+        let mut a = started(Mode::Ask);
+        begin(&mut a, "p2");
+        a.on_exit(Some(1));
+        assert!(a.file_changes.is_empty(), "exit");
+    }
+
+    /// The frames from a fixture, replayed: server frames are fed (collecting the events),
+    /// the recorded prompt is encoded so the turn/start reply matches, and the replay stops
+    /// after the first frame with method `until`. Returns the adapter, the events up to there
+    /// and the server frames after it.
+    fn w0_replay(fixture: &str, until: &str) -> (CodexAdapter, Vec<Envelope>, Vec<String>) {
+        let mut a = CodexAdapter::new().client_version("0.1.0");
+        a.argv(&session(Mode::Ask, None));
+        a.handshake();
+        let mut events = Vec::new();
+        let mut rest = Vec::new();
+        let mut reached = false;
+        for rec in records(fixture, Malformed::Skip) {
+            let frame = &rec["frame"];
+            if reached {
+                if rec["dir"] == "out" {
+                    rest.push(frame.to_string());
+                }
+                continue;
+            }
+            match (rec["dir"].as_str(), frame["method"].as_str()) {
+                (Some("in"), Some("turn/start")) => {
+                    let text = frame["params"]["input"][0]["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned();
+                    a.encode(Command::Prompt { text }).expect("prompt");
+                    a.drain_outbox();
+                }
+                (Some("out"), method) => {
+                    events.extend(a.feed(&frame.to_string()));
+                    a.drain_outbox();
+                    reached = method == Some(until);
+                }
+                _ => {}
+            }
+        }
+        assert!(reached, "the fixture has no {until} frame");
+        (a, events, rest)
+    }
+
+    fn feed_all(a: &mut CodexAdapter, frames: &[String]) -> Vec<Envelope> {
+        frames.iter().flat_map(|f| a.feed(f)).collect()
+    }
+
+    /// `ask-shell-decline.jsonl` and `ask-edit-decline.jsonl`: Deny sends
+    /// `decline` though neither request offers it, the item ends `declined` and the turn goes
+    /// on to complete; Stop turn sends `cancel`. The patch approval, which names no file,
+    /// shows the change its `item/started` frame carried.
+    #[test]
+    fn w0_deny_sends_decline_and_stop_sends_cancel() {
+        for (fixture, method) in [
+            (W0_SHELL, "item/commandExecution/requestApproval"),
+            (W0_EDIT, "item/fileChange/requestApproval"),
+        ] {
+            let (mut a, events, rest) = w0_replay(fixture, method);
+            let card = events
+                .iter()
+                .rev()
+                .find(|e| matches!(e.event, Event::ApprovalRequested { .. }))
+                .expect("card");
+            let Event::ApprovalRequested { options, .. } = &card.event else {
+                unreachable!()
+            };
+            assert!(options.contains(&Decision::Deny) && options.contains(&Decision::Cancel));
+            let request = card.request.clone().expect("request");
+            let w = one_write(
+                a.encode(approve_cmd(&request, Decision::Deny))
+                    .expect("deny"),
+            );
+            assert_eq!(w["result"], json!({"decision": "decline"}), "{method}");
+            let after = feed_all(&mut a, &rest);
+            assert!(
+                after.iter().any(|e| matches!(
+                    e.event,
+                    Event::ItemCompleted {
+                        status: ItemStatus::Declined,
+                        ..
+                    }
+                )),
+                "{method}: the item ends declined"
+            );
+            assert!(
+                after.iter().any(|e| matches!(
+                    e.event,
+                    Event::TurnCompleted {
+                        state: TurnState::Completed,
+                        ..
+                    }
+                )),
+                "{method}: the turn continues to completion"
+            );
+
+            let (mut a, events, _) = w0_replay(fixture, method);
+            let request = events
+                .iter()
+                .rev()
+                .find_map(|e| match e.event {
+                    Event::ApprovalRequested { .. } => e.request.clone(),
+                    _ => None,
+                })
+                .expect("request");
+            let w = one_write(
+                a.encode(approve_cmd(&request, Decision::Cancel))
+                    .expect("stop"),
+            );
+            assert_eq!(w["result"], json!({"decision": "cancel"}), "{method}");
+        }
+
+        let (_, events, _) = w0_replay(W0_EDIT, "item/fileChange/requestApproval");
+        let Some(Event::ApprovalRequested { title, input, .. }) = events
+            .iter()
+            .rev()
+            .map(|e| &e.event)
+            .find(|e| matches!(e, Event::ApprovalRequested { .. }))
+        else {
+            panic!("no edit card");
+        };
+        let path = input["changes"][0]["path"]
+            .as_str()
+            .expect("the change's path");
+        assert!(path.ends_with(".txt"), "{path}");
+        assert!(input["changes"][0]["diff"]
+            .as_str()
+            .is_some_and(|d| d.contains("@@")));
+        assert_eq!(title.as_deref(), Some(format!("Edit {path}").as_str()));
+    }
+
+    #[test]
+    fn a_request_resolved_elsewhere_expires_the_approval() {
+        let mut a = started(Mode::Ask);
+        let requested = a.feed(&approval_request(
+            "3",
+            "item/commandExecution/requestApproval",
+        ));
+        let ev = a.feed(
+            r#"{"method":"serverRequest/resolved","params":{"threadId":"th-1","requestId":3}}"#,
+        );
+        assert_eq!(ev[0].event, Event::ApprovalExpired);
+        assert_eq!(ev[0].request, requested[0].request);
+        assert_eq!(ev[0].item.as_deref(), Some("it-1"));
+    }
+
+    #[test]
+    fn a_duplicate_after_answer_cannot_restore_an_approval_but_a_new_turn_can_reuse_its_id() {
+        let mut a = started(Mode::Ask);
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-1"}}}"#);
+        let frame = approval_request("0", "item/commandExecution/requestApproval");
+        let request = a.feed(&frame)[0].request.clone().expect("request");
+        let approve = |request: String| approve_cmd(&request, Decision::Allow);
+        assert_eq!(
+            one_write(a.encode(approve(request.clone())).expect("answer")),
+            json!({"id": 0, "result": {"decision": "accept"}})
+        );
+        assert!(a.feed(&frame).is_empty(), "a late retransmission is inert");
+        assert!(
+            a.encode(approve(request)).is_err(),
+            "no second wire response"
+        );
+        a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"completed"}}}"#);
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-2"}}}"#);
+        let next = a.feed(&frame.replace("tu-1", "tu-2"))[0]
+            .request
+            .clone()
+            .expect("next request");
+        assert_eq!(
+            one_write(a.encode(approve(next)).expect("new turn answer")),
+            json!({"id": 0, "result": {"decision": "accept"}})
+        );
+    }
+
+    #[test]
+    fn a_terminal_turn_expires_its_requests_and_late_frames_cannot_touch_the_next_turn() {
+        let mut a = started(Mode::Ask);
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-1"}}}"#);
+        let approval = approval_request("0", "item/commandExecution/requestApproval");
+        let question = r#"{"id":"0","method":"item/tool/requestUserInput","params":{"threadId":"th-1","turnId":"tu-1","itemId":"q","questions":[{"id":"choice","question":"Continue?","options":[{"label":"Yes"},{"label":"No"}]}]}}"#;
+        let approval_key = a.feed(&approval)[0].request.clone().expect("approval");
+        let question_key = a.feed(question)[0].request.clone().expect("question");
+        let completed = r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"interrupted"}}}"#;
+        let ended = a.feed(completed);
+        assert!(ended.iter().any(
+            |e| e.request.as_ref() == Some(&approval_key) && e.event == Event::ApprovalExpired
+        ));
+        assert!(ended
+            .iter()
+            .any(|e| e.request.as_ref() == Some(&question_key)
+                && e.event == Event::QuestionResolved { answered: false }));
+        assert!(a.feed(&approval).is_empty());
+        assert!(a.feed(question).is_empty());
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-2"}}}"#);
+        let next_frame = approval.replace("tu-1", "tu-2");
+        let next = a.feed(&next_frame)[0].request.clone().expect("new request");
+        assert!(
+            a.feed(completed).is_empty(),
+            "old completion cannot finish the new turn"
+        );
+        assert!(a.approvals.contains_key(&next));
+        let resolved =
+            r#"{"method":"serverRequest/resolved","params":{"threadId":"th-1","requestId":0}}"#;
+        assert_eq!(a.feed(resolved)[0].request.as_ref(), Some(&next));
+        assert!(a.feed(resolved).is_empty(), "resolution is idempotent");
+        assert!(
+            a.feed(&next_frame).is_empty(),
+            "expired duplicate cannot restore the request"
+        );
+    }
+
+    #[test]
+    fn late_unseen_requests_for_a_completed_turn_are_inert_before_and_during_the_next_turn() {
+        let mut a = started(Mode::Ask);
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-1"}}}"#);
+        a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"completed"}}}"#);
+        let old_approval = approval_request("0", "item/commandExecution/requestApproval");
+        let old_question = json!({"id": "0", "method": "item/tool/requestUserInput", "params": {
+            "threadId": "th-1", "turnId": "tu-1", "itemId": "late-question",
+            "questions": [{"id": "choice", "question": "Continue?", "options": [{"label": "Yes"}]}],
+        }})
+        .to_string();
+        for late in [&old_approval, &old_question] {
+            assert!(
+                a.feed(late).is_empty(),
+                "an unseen request cannot revive a completed turn"
+            );
+        }
+        a.encode(Command::Prompt {
+            text: "next".into(),
+        })
+        .expect("prompt");
+        for late in [&old_approval, &old_question] {
+            assert!(a.feed(late).is_empty(), "pending start is protected too");
+        }
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-2"}}}"#);
+        for late in [&old_approval, &old_question] {
+            assert!(
+                a.feed(late).is_empty(),
+                "an old request cannot interrupt the new turn"
+            );
+        }
+        let next = a.feed(&old_approval.replace("tu-1", "tu-2"));
+        assert!(
+            matches!(next[0].event, Event::ApprovalRequested { .. }),
+            "raw id reuse remains valid"
+        );
+        assert_eq!(
+            one_write(
+                a.encode(approve_cmd(
+                    next[0].request.as_deref().expect("current request"),
+                    Decision::Allow
+                ))
+                .expect("approve current")
+            ),
+            json!({"id": 0, "result": {"decision": "accept"}})
+        );
+    }
+
+    #[test]
+    fn late_duplicate_completion_during_a_pending_start_keeps_the_next_turn_effective_policy() {
+        let mut a = started(Mode::Ask);
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-1"}}}"#);
+        let completed = r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"completed"}}}"#;
+        a.feed(completed);
+        a.encode(Command::Prompt {
+            text: "next".into(),
+        })
+        .expect("next prompt");
+        a.encode(Command::SetMode {
+            mode: Mode::AcceptEdits,
+        })
+        .expect("defer mode");
+        a.drain_outbox();
+        assert!(
+            a.feed(completed).is_empty(),
+            "a duplicate cannot finish the pending turn"
+        );
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-2"}}}"#);
+        a.encode(Command::SetMode { mode: Mode::Plan })
+            .expect("defer again");
+        assert!(
+            a.drain_outbox().events.iter().any(|e| e.event
+                == Event::ModeChangeDeferred {
+                    requested: Mode::Plan,
+                    effective: Mode::Ask,
+                }),
+            "the pending turn retains the policy actually sent on its wire"
+        );
+    }
+
+    #[test]
+    fn request_and_turn_duplicate_protection_is_bounded_on_a_long_lived_connection() {
+        let mut a = started(Mode::Ask);
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"many-requests"}}}"#);
+        let mut last = String::new();
+        let mut first = None;
+        for item in 0..1100 {
+            last = json!({"id": 0, "method": "item/commandExecution/requestApproval", "params": {
+                "threadId": "th-1", "turnId": "many-requests", "itemId": format!("item-{item}"), "command": "printf synthetic",
+            }}).to_string();
+            let request = a.feed(&last)[0]
+                .request
+                .clone()
+                .expect("new item uses the same raw id");
+            if item == 0 {
+                first = Some((last.clone(), request.clone()));
+            }
+            a.encode(approve_cmd(&request, Decision::Allow))
+                .expect("approve");
+        }
+        assert_eq!(
+            a.settled_requests.len(),
+            1100,
+            "active identities cannot be evicted"
+        );
+        assert!(
+            a.feed(&last).is_empty(),
+            "settled requests stay protected throughout their active turn"
+        );
+        let (first_frame, first_key) = first.expect("first request");
+        let current = a.feed(&last.replace("item-1099", "current-item"))[0]
+            .request
+            .clone()
+            .expect("pending current item");
+        assert!(
+            a.feed(&first_frame).is_empty(),
+            "the first answered request cannot revive after 1,024 answers"
+        );
+        assert!(
+            a.encode(approve_cmd(&first_key, Decision::Allow)).is_err(),
+            "an old answer cannot approve current wire id 0"
+        );
+        assert!(a.encode(approve_cmd(&current, Decision::Allow)).is_ok());
+        a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"many-requests","status":"completed"}}}"#);
+        assert!(
+            a.settled_requests.is_empty(),
+            "terminal scope releases active-turn identities"
+        );
+        for turn in 0..TURN_TOMBSTONE_LIMIT + 10 {
+            let id = format!("turn-{turn}");
+            a.feed(&json!({"method": "turn/started", "params": {"threadId": "th-1", "turn": {"id": id}}}).to_string());
+            a.feed(&json!({"method": "turn/completed", "params": {"threadId": "th-1", "turn": {"id": id, "status": "completed"}}}).to_string());
+        }
+        assert_eq!(a.ended_turns.len(), TURN_TOMBSTONE_LIMIT);
+        assert_eq!(a.ended_turn_order.len(), TURN_TOMBSTONE_LIMIT);
+        a.encode(Command::Prompt {
+            text: "next".into(),
+        })
+        .expect("next prompt");
+        let last_completed =
+            json!({"method": "turn/completed", "params": {"threadId": "th-1", "turn": {
+                "id": format!("turn-{}", TURN_TOMBSTONE_LIMIT + 9), "status": "completed",
+            }}})
+            .to_string();
+        assert!(
+            a.feed(&last_completed).is_empty(),
+            "recent terminal turns stay protected at the cap"
+        );
+        a.feed(
+            r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"new-turn"}}}"#,
+        );
+        assert!(
+            matches!(
+                a.feed(&last.replace("many-requests", "new-turn"))[0].event,
+                Event::ApprovalRequested { .. }
+            ),
+            "the cap never turns a new scoped request into a duplicate"
+        );
+    }
+
+    #[test]
+    fn a_child_request_survives_parent_completion_and_retires_only_its_own_scope() {
+        let mut a = started(Mode::Ask);
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-1"}}}"#);
+        a.feed(r#"{"method":"thread/started","params":{"thread":{"id":"child","parentThreadId":"th-1","status":{"type":"active"}}}}"#);
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"child","turn":{"id":"tu-1"}}}"#);
+        let parent = approval_request("0", "item/commandExecution/requestApproval");
+        let child =
+            approval_request("1", "item/commandExecution/requestApproval").replace("th-1", "child");
+        let parent_key = a.feed(&parent)[0].request.clone().expect("parent");
+        let child_key = a.feed(&child)[0].request.clone().expect("child");
+        assert!(
+            a.feed(&child.replace("tu-1", "unseen-old-child-turn"))
+                .is_empty(),
+            "known child active scope rejects explicit old turns too"
+        );
+        a.encode(approve_cmd(&child_key, Decision::Allow))
+            .expect("answer child");
+        let completed = r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"completed"}}}"#;
+        assert!(a
+            .feed(completed)
+            .iter()
+            .any(|e| e.event == Event::ApprovalExpired && e.request.as_ref() == Some(&parent_key)));
+        assert_eq!(
+            a.settled_requests.len(),
+            1,
+            "parent terminal must retain child's settled request"
+        );
+        assert!(
+            a.feed(&child).is_empty(),
+            "child duplicate is still protected"
+        );
+        let question = json!({"id": "q", "method": "item/tool/requestUserInput", "params": {
+            "threadId": "child", "turnId": "tu-1", "itemId": "child-q",
+            "questions": [{"id": "choice", "question": "Continue?", "options": [{"label": "Yes"}]}],
+        }})
+        .to_string();
+        let key = a.feed(&question)[0]
+            .request
+            .clone()
+            .expect("child question remains live");
+        assert!(a
+            .encode(Command::Answer {
+                request: key,
+                answers: json!({"Continue?": "Yes"})
+            })
+            .is_ok());
+        a.feed(&completed.replace("th-1", "child"));
+        assert!(
+            a.settled_requests.is_empty(),
+            "child terminal releases only child scope"
+        );
+        assert!(
+            a.feed(&question.replace("child-q", "unseen-child-q"))
+                .is_empty(),
+            "late child request cannot revive after terminal"
+        );
+    }
+
+    #[test]
+    fn late_plan_notifications_cannot_revive_an_ended_turn_or_change_the_next_plan() {
+        let mut a = started(Mode::Ask);
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-1"}}}"#);
+        let plan = json!({"method": "turn/plan/updated", "params": {
+            "threadId": "th-1", "turnId": "tu-1", "plan": [{"step": "Current work", "status": "pending"}],
+        }}).to_string();
+        assert!(matches!(a.feed(&plan)[0].event, Event::PlanUpdated { .. }));
+        a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"completed"}}}"#);
+        assert!(a.feed(&plan).is_empty(), "ended plan remains history");
+        a.encode(Command::Prompt {
+            text: "next".into(),
+        })
+        .expect("next prompt");
+        assert!(
+            a.feed(&plan).is_empty(),
+            "pending next turn cannot revive old plan"
+        );
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-2"}}}"#);
+        assert!(a.feed(&plan).is_empty(), "new turn cannot receive old plan");
+        assert!(
+            a.feed(&plan.replace("tu-1", "unknown-turn")).is_empty(),
+            "explicit non-current plan is refused"
+        );
+        assert!(
+            matches!(
+                a.feed(&plan.replace("tu-1", "tu-2"))[0].event,
+                Event::PlanUpdated { .. }
+            ),
+            "current plan remains usable"
+        );
+    }
+
+    #[test]
+    fn closing_a_child_expires_its_requests_and_unscoped_ids_use_the_child_turn() {
+        let mut a = started(Mode::Ask);
+        a.feed(
+            r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"parent-turn"}}}"#,
+        );
+        a.feed(r#"{"method":"thread/started","params":{"thread":{"id":"child","parentThreadId":"th-1","status":{"type":"active"}}}}"#);
+        a.feed(
+            r#"{"method":"turn/started","params":{"threadId":"child","turn":{"id":"child-turn"}}}"#,
+        );
+        let parent = json!({"id": 0, "method": "item/commandExecution/requestApproval", "params": {
+            "threadId": "th-1", "command": "printf parent",
+        }})
+        .to_string();
+        let parent_key = a.feed(&parent)[0].request.clone().expect("parent request");
+        let child = json!({"id": 1, "method": "item/commandExecution/requestApproval", "params": {
+            "threadId": "child", "itemId": "child-item", "command": "printf child",
+        }})
+        .to_string();
+        let child_key = a.feed(&child)[0].request.clone().expect("child request");
+        assert!(child_key.contains("child-turn") && !child_key.contains("parent-turn"));
+        a.encode(approve_cmd(&child_key, Decision::Allow))
+            .expect("settled child request");
+        let pending = a.feed(&child.replace("child-item", "child-pending"))[0]
+            .request
+            .clone()
+            .expect("pending child");
+        let question = json!({"id": "q", "method": "item/tool/requestUserInput", "params": {
+            "threadId": "child", "itemId": "child-q", "questions": [{"id": "choice", "question": "Continue?", "options": [{"label": "Yes"}]}],
+        }}).to_string();
+        let question_key = a.feed(&question)[0]
+            .request
+            .clone()
+            .expect("child question");
+        let closed = a.feed(r#"{"method":"thread/closed","params":{"threadId":"child"}}"#);
+        assert!(closed
+            .iter()
+            .any(|e| e.request.as_ref() == Some(&pending) && e.event == Event::ApprovalExpired));
+        assert!(closed
+            .iter()
+            .any(|e| e.request.as_ref() == Some(&question_key)
+                && e.event == Event::QuestionResolved { answered: false }));
+        assert!(
+            a.settled_requests.is_empty(),
+            "closed child releases its settled scopes"
+        );
+        assert!(a
+            .feed(&child.replace("child-item", "unseen-after-close"))
+            .is_empty());
+        assert!(a.feed(&question).is_empty());
+        assert!(
+            a.encode(approve_cmd(&parent_key, Decision::Allow)).is_ok(),
+            "parent remains answerable"
+        );
+        assert!(
+            a.feed(&parent).is_empty(),
+            "unscoped parent duplicate uses its active turn"
+        );
+        a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"parent-turn","status":"completed"}}}"#);
+        assert!(a.settled_requests.is_empty());
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"next-parent-turn"}}}"#);
+        assert_ne!(
+            a.feed(&parent)[0].request.as_ref(),
+            Some(&parent_key),
+            "unscoped raw id reuse follows the next native turn"
+        );
+    }
+
+    #[test]
+    fn request_user_input_becomes_a_question_card_and_answers_with_question_ids() {
+        let mut a = started(Mode::Ask);
+        let ev = a.feed(
+            r#"{"id":9,"method":"item/tool/requestUserInput","params":{"itemId":"ask-1","questions":[{"id":"confirm","header":"Preview","question":"Start the preview?","options":[{"label":"Allow","description":"Launch it"},{"label":"Cancel","description":"Do not launch it"}]}]}}"#,
+        );
+        assert!(matches!(
+            &ev[0].event,
+            Event::QuestionRequested { questions, .. }
+                if questions[0].id == "confirm" && questions[0].options[0].label == "Allow"
+        ));
+        let request = ev[0].request.clone().expect("canonical request");
+        assert_ne!(request, "9");
+        let w = one_write(
+            a.encode(Command::Answer {
+                request: request.clone(),
+                answers: json!({"Start the preview?": "Allow"}),
+            })
+            .expect("answer"),
+        );
+        assert_eq!(
+            w,
+            json!({"id": 9, "result": {"answers": {"confirm": {"answers": ["Allow"]}}}})
+        );
+        assert!(matches!(
+            a.encode(Command::Answer {
+                request,
+                answers: json!({"Start the preview?": "Allow"}),
+            }),
+            Err(AdapterError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn question_text_suffixes_preserve_originals_and_other_fields() {
+        let texts = ["Même?", "Même?", "Même? (2)", "Même?", "Même? (2)"];
+        let mut questions: Vec<Question> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| Question {
+                id: i.to_string(),
+                header: format!("Header {i}"),
+                question: (*text).to_owned(),
+                options: vec![QuestionOption {
+                    label: "Yes".into(),
+                    description: Some("Continue".into()),
+                }],
+                multi_select: false,
+            })
+            .collect();
+        let originals = questions.clone();
+        disambiguate_question_texts(&mut questions);
+        for ((question, mut expected), text) in questions.iter().zip(originals).zip([
+            "Même?",
+            "Même? (3)",
+            "Même? (2)",
+            "Même? (4)",
+            "Même? (2) (2)",
+        ]) {
+            expected.question = text.to_owned();
+            assert_eq!(question, &expected);
+        }
+        let shown = questions.clone();
+        disambiguate_question_texts(&mut questions);
+        assert_eq!(questions, shown, "unique texts stay unchanged");
+        disambiguate_question_texts(&mut []);
+    }
+
+    #[test]
+    fn duplicate_codex_question_texts_get_their_own_answers() {
+        let mut a = started(Mode::Ask);
+        let ev = a.feed(&json!({"id": 9, "method": "item/tool/requestUserInput", "params": {
+            "itemId": "ask-1", "questions": [
+                {"id": "first", "question": "Continue?", "options": [{"label": "Yes"}, {"label": "No"}]},
+                {"id": "second", "question": "Continue?", "options": [{"label": "Yes"}, {"label": "No"}]},
+                {"id": "third", "question": "Continue?", "options": [{"label": "Yes"}, {"label": "No"}]}
+            ]
+        }}).to_string());
+        let Event::QuestionRequested { questions, .. } = &ev[0].event else {
+            panic!("expected questions");
+        };
+        let answer = one_write(a.encode(Command::Answer {
+            request: ev[0].request.clone().expect("request"),
+            answers: json!({"Continue?": "Yes", "Continue? (2)": "No", "Continue? (3)": "Other"}),
+        }).expect("answer"));
+        assert_eq!(
+            answer,
+            json!({"id": 9, "result": {"answers": {
+                "first": {"answers": ["Yes"]}, "second": {"answers": ["No"]}, "third": {"answers": ["Other"]}
+            }}})
+        );
+        assert_eq!(
+            questions
+                .iter()
+                .map(|q| q.question.as_str())
+                .collect::<Vec<_>>(),
+            ["Continue?", "Continue? (2)", "Continue? (3)"]
+        );
+        assert!(questions.iter().all(|q| !q.multi_select));
+    }
+
+    #[test]
+    fn duplicate_codex_questions_do_not_collide_with_existing_suffixes() {
+        let mut a = started(Mode::Ask);
+        let texts = [
+            "Continue?",
+            "Continue?",
+            "Continue? (2)",
+            "Continue?",
+            "Continue? (2)",
+        ];
+        let ev = a.feed(
+            &json!({"id": "q", "method": "item/tool/requestUserInput", "params": {
+                "itemId": "ask-1", "questions": texts.iter().enumerate().map(|(i, text)| {
+                    json!({"id": i.to_string(), "question": text, "options": [{"label": "Yes"}]})
+                }).collect::<Vec<_>>()
+            }})
+            .to_string(),
+        );
+        let Event::QuestionRequested { questions, .. } = &ev[0].event else {
+            panic!("expected questions");
+        };
+        assert_eq!(
+            questions
+                .iter()
+                .map(|q| q.question.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Continue?",
+                "Continue? (3)",
+                "Continue? (2)",
+                "Continue? (4)",
+                "Continue? (2) (2)"
+            ]
+        );
+        let answers: Map<String, Value> = questions
+            .iter()
+            .enumerate()
+            .map(|(i, q)| (q.question.clone(), json!(format!("answer {i}"))))
+            .collect();
+        let answer = one_write(
+            a.encode(Command::Answer {
+                request: ev[0].request.clone().expect("request"),
+                answers: Value::Object(answers),
+            })
+            .expect("answer"),
+        );
+        for i in 0..texts.len() {
+            assert_eq!(
+                answer["result"]["answers"][i.to_string()]["answers"],
+                json!([format!("answer {i}")])
+            );
+        }
+    }
+
+    #[test]
+    fn list_models_and_context_usage_controls() {
+        let mut a = started(Mode::Ask);
+        let w = one_write(
+            a.encode(Command::Control {
+                id: "m1".into(),
+                control: Control::ListModels,
+            })
+            .expect("ok"),
+        );
+        assert_eq!(
+            w,
+            json!({"id": 3, "method": "model/list", "params": {"limit": 200}})
+        );
+        let ev = a.feed(
+            r#"{"id":3,"result":{"data":[{"id":"a","model":"gpt-5-codex","displayName":"GPT-5 Codex","description":"d","supportedReasoningEfforts":[{"reasoningEffort":"low","description":"x"},{"reasoningEffort":"high","description":"y"}],"defaultReasoningEffort":"low","hidden":false,"isDefault":true},{"id":"b","model":"old","displayName":"Old","hidden":true,"isDefault":false}],"nextCursor":null}}"#,
+        );
+        assert_eq!(ev[0].request.as_deref(), Some("m1"));
+        assert!(
+            matches!(&ev[0].event, Event::ControlResult { ok: Some(v), error: None }
+            if v == &json!([{"id": "gpt-5-codex", "display": "GPT-5 Codex", "description": "d",
+                "efforts": ["low", "high"], "default_effort": "low", "is_default": true}]))
+        );
+
+        // Context usage: unknown first, then from the last tokenUsage.
+        let ask = |a: &mut CodexAdapter| {
+            assert!(a
+                .encode(Command::Control {
+                    id: "c".into(),
+                    control: Control::ContextUsage
+                })
+                .expect("ok")
+                .is_empty());
+            a.drain_outbox().events
+        };
+        let first = ask(&mut a);
+        assert!(matches!(
+            &first[0].event,
+            Event::ControlResult {
+                ok: None,
+                error: Some(_)
+            }
+        ));
+        a.feed(
+            r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"th-1","turnId":"tu","tokenUsage":{"total":{"totalTokens":9,"inputTokens":5,"cachedInputTokens":0,"outputTokens":4,"reasoningOutputTokens":0},"last":{"totalTokens":7,"inputTokens":4,"cachedInputTokens":0,"outputTokens":3,"reasoningOutputTokens":0},"modelContextWindow":1000}}}"#,
+        );
+        let second = ask(&mut a);
+        assert_eq!(second[0].request.as_deref(), Some("c"));
+        assert!(
+            matches!(&second[0].event, Event::ControlResult { ok: Some(v), .. }
+            if v == &json!({"used": 7, "max": 1000}))
+        );
+
+        assert!(matches!(
+            a.encode(Command::Control {
+                id: "x".into(),
+                control: Control::McpStatus
+            }),
+            Err(AdapterError::Unsupported(_))
+        ));
+        assert!(matches!(
+            a.encode(Command::Answer {
+                request: "r".into(),
+                answers: Value::Null
+            }),
+            Err(AdapterError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn compact_prompt_becomes_thread_compact_start() {
+        let mut a = started(Mode::Ask);
+        let w = prompt(&mut a, " /Compact ");
+        assert_eq!(
+            w,
+            json!({"id": 3, "method": "thread/compact/start", "params": {"threadId": "th-1"}})
+        );
+        let ev = a.feed(
+            r#"{"method":"item/completed","params":{"threadId":"th-1","turnId":"tu","completedAtMs":1,"item":{"type":"contextCompaction","id":"cc1"}}}"#,
+        );
+        assert!(matches!(
+            ev[0].event,
+            Event::Compacted {
+                manual: true,
+                after: None,
+                ..
+            }
+        ));
+        // Not yet started: nothing to compact.
+        let mut b = CodexAdapter::new();
+        assert!(matches!(
+            b.encode(Command::Prompt {
+                text: "/compact".into()
+            }),
+            Err(AdapterError::Invalid(_))
+        ));
+        // A longer text that merely starts with it is a normal prompt.
+        let w = prompt(&mut a, "/compact please");
+        assert_eq!(w["method"], "turn/start");
+    }
+
+    #[test]
+    fn an_accepted_compact_that_ends_without_compacting_leaves_nothing_manual() {
+        for status in [
+            r#""status":"failed","error":{"message":"boom"}"#,
+            r#""status":"interrupted""#,
+            r#""status":"completed""#,
+        ] {
+            let mut a = started(Mode::Ask);
+            let w = prompt(&mut a, "/compact");
+            a.feed(&json!({"id": w["id"], "result": {}}).to_string());
+            a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"cu"}}}"#);
+            a.feed(&format!(
+                r#"{{"method":"turn/completed","params":{{"threadId":"th-1","turn":{{"id":"cu",{status}}}}}}}"#
+            ));
+            let ev = a.feed(
+                r#"{"method":"item/completed","params":{"threadId":"th-1","turnId":"tu","completedAtMs":1,"item":{"type":"contextCompaction","id":"cc1"}}}"#,
+            );
+            assert!(
+                matches!(ev[0].event, Event::Compacted { manual: false, .. }),
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_compact_does_not_make_a_later_automatic_compaction_manual() {
+        let mut a = started(Mode::Ask);
+        let w = prompt(&mut a, "/compact");
+        let ev = a.feed(&json!({"id": w["id"], "error": {"message": "no"}}).to_string());
+        assert!(matches!(&ev[0].event, Event::Error { .. }));
+        let ev = a.feed(
+            r#"{"method":"item/completed","params":{"threadId":"th-1","turnId":"tu","completedAtMs":1,"item":{"type":"contextCompaction","id":"cc1"}}}"#,
+        );
+        assert!(matches!(
+            ev[0].event,
+            Event::Compacted { manual: false, .. }
+        ));
+    }
+
+    // ---- notifications ----
+
+    #[test]
+    fn items_map_to_kinds_titles_and_results() {
+        let mut a = started(Mode::Ask);
+        let item = |ty: &str, extra: &str| {
+            format!(
+                r#"{{"method":"item/completed","params":{{"threadId":"th-1","turnId":"tu","completedAtMs":1,"item":{{"type":"{ty}","id":"{ty}-1"{extra}}}}}}}"#
+            )
+        };
+        // Never started: the completion opens the card first.
+        let ev = a.feed(&item(
+            "commandExecution",
+            r#","command":"false","cwd":"/w","status":"failed","exitCode":1,"aggregatedOutput":"nope""#,
+        ));
+        assert!(
+            matches!(&ev[0].event, Event::ItemStarted { kind: ItemKind::Command, title, .. } if title == "false")
+        );
+        assert!(
+            matches!(&ev[1].event, Event::ItemCompleted { status: ItemStatus::Failed, output: Some(o), error: Some(e) }
+            if o == "nope" && e == "exit code 1")
+        );
+
+        let ev = a.feed(&item(
+            "commandExecution",
+            r#","command":"rm x","cwd":"/w","status":"declined""#,
+        ));
+        assert!(matches!(
+            ev[1].event,
+            Event::ItemCompleted {
+                status: ItemStatus::Declined,
+                ..
+            }
+        ));
+
+        let ev = a.feed(&item(
+            "fileChange",
+            r#","status":"completed","changes":[{"path":"a.rs","kind":{"type":"update"},"diff":"@@"},{"path":"b.rs","kind":{"type":"add"},"diff":"+x"}]"#,
+        ));
+        assert!(
+            matches!(&ev[0].event, Event::ItemStarted { kind: ItemKind::FileChange, title, .. }
+            if title == "a.rs (+1 more)")
+        );
+
+        let ev = a.feed(&item(
+            "mcpToolCall",
+            r#","server":"fs","tool":"read","status":"completed","arguments":{"p":1},"result":{"content":[{"type":"text","text":"hello"}]},"error":null"#,
+        ));
+        assert!(
+            matches!(&ev[0].event, Event::ItemStarted { kind: ItemKind::McpTool, title, input: Some(i), .. }
+            if title == "fs.read" && i["p"] == 1)
+        );
+        assert!(
+            matches!(&ev[1].event, Event::ItemCompleted { status: ItemStatus::Completed, output: Some(o), .. } if o == "hello")
+        );
+
+        let ev = a.feed(&item("webSearch", r#","query":"rust""#));
+        assert!(
+            matches!(&ev[0].event, Event::ItemStarted { kind: ItemKind::WebSearch, title, input: Some(i), .. }
+            if title == "rust" && i["query"] == "rust")
+        );
+
+        let ev = a.feed(&item(
+            "webSearch",
+            r#","action":{"type":"search","queries":["Rust 1.91","Rust release notes"]}"#,
+        ));
+        assert!(
+            matches!(&ev[0].event, Event::ItemStarted { kind: ItemKind::WebSearch, title, input: Some(i), .. }
+            if title == "Rust 1.91 (+1 more)" && i["query"] == "Rust 1.91" && i["queries"][1] == "Rust release notes")
+        );
+
+        let ev = a.feed(&item("somethingNew", ""));
+        assert!(
+            matches!(&ev[0].event, Event::ItemStarted { kind: ItemKind::Tool, title, .. } if title == "somethingNew")
+        );
+
+        // The app shows its own prompt; Codex's echo of it is dropped.
+        assert!(a.feed(&item("userMessage", r#","content":[]"#)).is_empty());
+    }
+
+    #[test]
+    fn completed_web_search_refines_a_started_card_with_its_action() {
+        let mut a = started(Mode::Ask);
+        let started = a.feed(
+            r#"{"method":"item/started","params":{"threadId":"th-1","turnId":"tu","startedAtMs":1,"item":{"type":"webSearch","id":"ws-1","status":"inProgress"}}}"#,
+        );
+        assert!(
+            matches!(&started[0].event, Event::ItemStarted { title, input: None, .. } if title == "web search")
+        );
+
+        let done = a.feed(
+            r#"{"method":"item/completed","params":{"threadId":"th-1","turnId":"tu","completedAtMs":2,"item":{"type":"webSearch","id":"ws-1","status":"completed","action":{"type":"open_page","url":"https://doc.rust-lang.org"}}}}"#,
+        );
+        assert!(
+            matches!(&done[0].event, Event::ItemStarted { title, input: Some(i), .. }
+            if title == "Open https://doc.rust-lang.org" && i["url"] == "https://doc.rust-lang.org")
+        );
+        assert!(matches!(
+            done[1].event,
+            Event::ItemCompleted {
+                status: ItemStatus::Completed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn reasoning_parts_are_separated_and_the_completed_summary_wins() {
+        let mut a = started(Mode::Ask);
+        let delta = |idx: u32, text: &str| {
+            format!(
+                r#"{{"method":"item/reasoning/summaryTextDelta","params":{{"threadId":"th-1","turnId":"tu","itemId":"rs","delta":"{text}","summaryIndex":{idx}}}}}"#
+            )
+        };
+        let first = a.feed(&delta(0, "first"));
+        // One Streaming state, labelled "summary", when the first words arrive.
+        let summary = |state| Event::Reasoning {
+            state,
+            label: crate::event::ReasoningLabel::Summary,
+        };
+        assert!(first
+            .iter()
+            .any(|e| e.event == summary(ReasoningState::Streaming)));
+        let part = a.feed(
+            r#"{"method":"item/reasoning/summaryPartAdded","params":{"threadId":"th-1","turnId":"tu","itemId":"rs","summaryIndex":1}}"#,
+        );
+        assert!(
+            matches!(&part[0].event, Event::ContentDelta { stream: StreamKind::Reasoning, text } if text == "\n\n")
+        );
+        let second = a.feed(&delta(1, "second"));
+        assert!(
+            !second
+                .iter()
+                .any(|e| matches!(e.event, Event::Reasoning { .. })),
+            "said once per item"
+        );
+        let done = a.feed(
+            r#"{"method":"item/completed","params":{"threadId":"th-1","turnId":"tu","completedAtMs":1,"item":{"type":"reasoning","id":"rs","summary":["first","second"],"content":[]}}}"#,
+        );
+        assert!(
+            matches!(&done[0].event, Event::ContentSnapshot { stream: StreamKind::Reasoning, text } if text == "first\n\nsecond")
+        );
+        assert_eq!(done[1].event, summary(ReasoningState::Complete));
+        // A reasoning item with no summary at all was not shared.
+        let bare = a.feed(
+            r#"{"method":"item/completed","params":{"threadId":"th-1","turnId":"tu","completedAtMs":1,"item":{"type":"reasoning","id":"rs2","summary":[],"content":[]}}}"#,
+        );
+        assert!(bare
+            .iter()
+            .any(|e| e.event == summary(ReasoningState::Unavailable)
+                && e.item.as_deref() == Some("rs2")));
+    }
+
+    /// The recorded command item carries its `commandActions` on, and titles through the shared
+    /// grammar: the wrapped `/usr/bin/zsh -lc 'ls -la'` is `Run ls -la` (its one `listFiles`
+    /// action has no path); a `read` action titles `Read <path>`.
+    #[test]
+    fn w0_command_items_title_through_the_shared_grammar() {
+        let item = records(W0_SHELL, Malformed::Skip)
+            .into_iter()
+            .find_map(|r| {
+                let item = &r["frame"]["params"]["item"];
+                (item["type"] == "commandExecution").then(|| item.clone())
+            })
+            .expect("W0 commandExecution item");
+        let (kind, title, input) = item_info(&item);
+        assert_eq!(
+            input.as_ref().unwrap()["commandActions"],
+            item["commandActions"]
+        );
+        assert_eq!(
+            crate::tool_title::classify(kind, &title, input.as_ref()).text(),
+            "Run ls -la"
+        );
+        let mut read = item.clone();
+        read["commandActions"] =
+            json!([{"type": "read", "command": "cat a.rs", "name": "a.rs", "path": "/w/a.rs"}]);
+        let (kind, title, input) = item_info(&read);
+        assert_eq!(
+            crate::tool_title::classify(kind, &title, input.as_ref()).text(),
+            "Read /w/a.rs"
+        );
+    }
+
+    #[test]
+    fn plan_updates_errors_and_reroutes() {
+        let mut a = started(Mode::Ask);
+        let ev = a.feed(
+            r#"{"method":"turn/plan/updated","params":{"threadId":"th-1","turnId":"tu","explanation":null,"plan":[{"step":"a","status":"completed"},{"step":"b","status":"inProgress"},{"step":"c","status":"pending"}]}}"#,
+        );
+        assert!(matches!(&ev[0].event, Event::PlanUpdated { steps }
+            if steps.iter().map(|s| s.status).collect::<Vec<_>>()
+                == [StepStatus::Completed, StepStatus::InProgress, StepStatus::Pending]));
+        let ev = a.feed(
+            r#"{"method":"error","params":{"error":{"message":"rate limited"},"willRetry":true,"threadId":"th-1","turnId":"tu"}}"#,
+        );
+        assert!(matches!(&ev[0].event, Event::Notice { text } if text.contains("rate limited")));
+        let ev = a.feed(
+            r#"{"method":"error","params":{"error":{"message":"boom"},"willRetry":false,"threadId":"th-1","turnId":"tu"}}"#,
+        );
+        assert!(matches!(&ev[0].event, Event::Error { message } if message == "boom"));
+        let ev = a.feed(
+            r#"{"method":"model/rerouted","params":{"threadId":"th-1","turnId":"tu","fromModel":"a","toModel":"b","reason":"x"}}"#,
+        );
+        assert!(matches!(&ev[0].event, Event::ModelChanged { model } if model == "b"));
+    }
+
+    #[test]
+    fn turn_usage_is_the_delta_of_the_cumulative_total() {
+        let mut a = started(Mode::Ask);
+        let usage = |total_in: u64, total_out: u64| {
+            format!(
+                r#"{{"method":"thread/tokenUsage/updated","params":{{"threadId":"th-1","turnId":"tu","tokenUsage":{{"total":{{"totalTokens":0,"inputTokens":{total_in},"cachedInputTokens":0,"outputTokens":{total_out},"reasoningOutputTokens":0}},"last":{{"totalTokens":1,"inputTokens":1,"cachedInputTokens":0,"outputTokens":0,"reasoningOutputTokens":0}},"modelContextWindow":null}}}}}}"#
+            )
+        };
+        let done = r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu","status":"completed","error":null}}}"#;
+        a.feed(&usage(100, 10));
+        let first = a.feed(done);
+        assert!(
+            matches!(&first[0].event, Event::TurnCompleted { usage: Some(u), .. }
+            if u.input_tokens == 100 && u.output_tokens == 10)
+        );
+        a.feed(&usage(130, 25));
+        let second = a.feed(&done.replace("\"tu\"", "\"tu-2\""));
+        assert!(
+            matches!(&second[0].event, Event::TurnCompleted { usage: Some(u), .. }
+            if u.input_tokens == 30 && u.output_tokens == 15)
+        );
+        // No usage reported in a turn: none claimed.
+        let third = a.feed(&done.replace("\"tu\"", "\"tu-3\""));
+        assert!(matches!(
+            &third[0].event,
+            Event::TurnCompleted { usage: None, .. }
+        ));
+    }
+
+    #[test]
+    fn a_failed_turn_carries_its_error_and_cuts_open_items_short() {
+        let mut a = started(Mode::Ask);
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu"}}}"#);
+        a.feed(
+            r#"{"method":"item/agentMessage/delta","params":{"threadId":"th-1","turnId":"tu","itemId":"m","delta":"partial"}}"#,
+        );
+        let ev = a.feed(
+            r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu","status":"failed","error":{"message":"quota","codexErrorInfo":null}}}}"#,
+        );
+        let tags: Vec<String> = ev.iter().map(tag).collect();
+        assert_eq!(
+            tags,
+            [
+                "snapshot:m:Assistant",
+                "item_completed:m:Interrupted",
+                "turn_completed:Failed"
+            ]
+        );
+        assert!(
+            matches!(&ev[2].event, Event::TurnCompleted { error: Some(e), .. } if e == "quota")
+        );
+    }
+
+    #[test]
+    fn a_rejected_turn_start_fails_the_turn_the_ui_began() {
+        let mut a = started(Mode::Ask);
+        a.encode(Command::Prompt { text: "x".into() }).expect("ok");
+        let ev = a.feed(r#"{"id":3,"error":{"code":-32600,"message":"no such model"}}"#);
+        assert!(matches!(&ev[0].event, Event::Error { message } if message == "no such model"));
+        assert!(matches!(
+            &ev[1].event,
+            Event::TurnCompleted {
+                state: TurnState::Failed,
+                ..
+            }
+        ));
+    }
+
+    // ---- exit and bad input ----
+
+    #[test]
+    fn on_exit_closes_items_expires_approvals_and_ends_the_turn() {
+        let mut a = started(Mode::Ask);
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu"}}}"#);
+        a.feed(
+            r#"{"method":"item/started","params":{"threadId":"th-1","turnId":"tu","startedAtMs":1,"item":{"type":"commandExecution","id":"c1","command":"sleep 9","cwd":"/w","status":"inProgress","commandActions":[]}}}"#,
+        );
+        a.feed(
+            &approval_request("4", "item/commandExecution/requestApproval").replace("tu-1", "tu"),
+        );
+        a.encode(Command::Control {
+            id: "m".into(),
+            control: Control::ListModels,
+        })
+        .expect("ok");
+        let ev = a.on_exit(Some(1));
+        let tags: Vec<String> = ev.iter().map(tag).collect();
+        assert_eq!(
+            tags,
+            [
+                "item_completed:c1:Interrupted",
+                "approval_expired:it-1",
+                "ControlResult { ok: None, error: Some(\"agent exited\") }",
+                "turn_completed:Failed",
+                "session_exited"
+            ]
+        );
+        assert!(
+            matches!(&ev[3].event, Event::TurnCompleted { error: Some(e), .. } if e.contains("unexpectedly"))
+        );
+        assert!(matches!(
+            ev[4].event,
+            Event::SessionExited {
+                code: Some(1),
+                expected: false
+            }
+        ));
+
+        // After an interrupt the exit is expected and the turn is Interrupted.
+        let mut a = started(Mode::Ask);
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu"}}}"#);
+        a.encode(Command::Interrupt).expect("ok");
+        let ev = a.on_exit(Some(130));
+        assert!(matches!(
+            ev[0].event,
+            Event::TurnCompleted {
+                state: TurnState::Interrupted,
+                error: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ev[1].event,
+            Event::SessionExited { expected: true, .. }
+        ));
+    }
+
+    #[test]
+    fn bad_input_is_unknown_never_a_panic() {
+        let mut a = CodexAdapter::new();
+        let ev = a.feed("not json");
+        assert_eq!(ev[0].event, Event::Unknown);
+        assert_eq!(ev[0].raw, Some(Value::String("not json".into())));
+        assert_eq!(a.feed("{}")[0].event, Event::Unknown);
+        assert_eq!(
+            a.feed(r#"{"method":"from/thefuture","params":{}}"#)[0].event,
+            Event::Unknown
+        );
+        assert!(a.feed(r#"{"method":"from/thefuture","params":{}}"#)[0]
+            .raw
+            .is_some());
+        // A response nobody asked for.
+        assert_eq!(a.feed(r#"{"id":99,"result":{}}"#)[0].event, Event::Unknown);
+        // Bookkeeping notifications are quiet.
+        assert!(a
+            .feed(r#"{"method":"thread/started","params":{}}"#)
+            .is_empty());
+        assert!(a.feed("  ").is_empty());
+        assert!(a.feed_stderr("INFO noise").is_empty());
+        assert!(a.feed_side("x", "", true).is_empty());
+        // Malformed params of a known method.
+        assert_eq!(
+            a.feed(r#"{"method":"item/started","params":{}}"#)[0].event,
+            Event::Unknown
+        );
+    }
+
+    #[test]
+    fn capabilities_match_the_protocol() {
+        let c = Capabilities::codex();
+        assert!(c.model_switch_in_session && c.live_approvals && c.interrupt_keeps_process);
+        assert!(c.streams_text && c.streams_reasoning && c.plan_mode);
+        assert!(c.model_list && c.context_usage);
+        assert!(c.questions && c.forms);
+        assert!(!c.file_suggestions && !c.mcp_panel && !c.settings_panel && !c.usage);
+        assert_eq!(c.compact_command.as_deref(), Some("/compact"));
+    }
+
+    // ---- permission requests ----
+
+    /// A started adapter with turn `tu-1` running.
+    fn in_turn() -> CodexAdapter {
+        let mut a = started(Mode::Ask);
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-1"}}}"#);
+        a.drain_outbox();
+        a
+    }
+
+    fn permissions_frame(id: u64, permissions: Value) -> String {
+        json!({"id": id, "method": "item/permissions/requestApproval", "params": {
+            "threadId": "th-1", "turnId": "tu-1", "itemId": "perm-1", "startedAtMs": 1,
+            "cwd": "/work/repo", "reason": "build needs the cache", "permissions": permissions,
+        }})
+        .to_string()
+    }
+
+    fn card(events: &[Envelope]) -> (String, Option<String>, Value, Vec<Decision>) {
+        match events.first().map(|e| (&e.event, e.request.clone())) {
+            Some((
+                Event::ApprovalRequested {
+                    tool,
+                    title,
+                    input,
+                    options,
+                    remembers,
+                    ..
+                },
+                Some(request),
+            )) => {
+                assert_eq!(tool, PERMISSIONS_TOOL);
+                assert!(remembers.is_none(), "no rule is ever described");
+                (request, title.clone(), input.clone(), options.clone())
+            }
+            other => panic!("expected a permission card, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_permission_request_is_a_card_whose_grant_is_what_it_shows() {
+        let asked = json!({
+            "fileSystem": {
+                "write": ["cache"],
+                "entries": [{"access": "read", "path": {"type": "glob_pattern", "pattern": "/opt/sdk/**"}}],
+            },
+            "network": {"enabled": true},
+        });
+        for (decision, scope) in [
+            (Decision::Allow, "turn"),
+            (Decision::AllowForSession, "session"),
+        ] {
+            let mut a = in_turn();
+            let (request, title, input, options) =
+                card(&a.feed(&permissions_frame(9, asked.clone())));
+            assert_eq!(
+                options,
+                [
+                    Decision::Allow,
+                    Decision::AllowForSession,
+                    Decision::Deny,
+                    Decision::Cancel
+                ]
+            );
+            assert_eq!(
+                title.as_deref(),
+                Some("Codex asks to write to /work/repo/cache, read files matching /opt/sdk/** and use the network")
+            );
+            assert_eq!(input["renderable"], true);
+            assert_eq!(
+                input["requested"], asked,
+                "the raw request rides along for Details"
+            );
+            assert!(
+                matches!(
+                    a.encode(approve_cmd(&request, Decision::AllowAlways)),
+                    Err(AdapterError::Invalid(_))
+                ),
+                "no Always allow"
+            );
+            let w = one_write(a.encode(approve_cmd(&request, decision)).expect("allow"));
+            assert_eq!(
+                w,
+                json!({"id": 9, "result": {"scope": scope, "permissions": {
+                    "fileSystem": {
+                        "write": ["/work/repo/cache"],
+                        "entries": [{"access": "read", "path": {"type": "glob_pattern", "pattern": "/opt/sdk/**"}}],
+                    },
+                    "network": {"enabled": true},
+                }}})
+            );
+            // Grant equals shown: every granted path is one the card listed.
+            assert_eq!(
+                input["entries"][0]["target"]["path"],
+                w["result"]["permissions"]["fileSystem"]["write"][0]
+            );
+            assert!(w["result"].get("strictAutoReview").is_none());
+        }
+    }
+
+    #[test]
+    fn deny_grants_nothing_and_stop_turn_grants_nothing_then_interrupts() {
+        let asked = json!({"network": {"enabled": true}});
+        let mut a = in_turn();
+        let (request, ..) = card(&a.feed(&permissions_frame(3, asked.clone())));
+        let w = one_write(
+            a.encode(approve_cmd(&request, Decision::Deny))
+                .expect("deny"),
+        );
+        assert_eq!(w, json!({"id": 3, "result": {"permissions": {}}}));
+
+        let mut a = in_turn();
+        let (request, ..) = card(&a.feed(&permissions_frame(4, asked)));
+        let w = writes(
+            &a.encode(approve_cmd(&request, Decision::Cancel))
+                .expect("stop"),
+        );
+        assert_eq!(w[0], json!({"id": 4, "result": {"permissions": {}}}));
+        assert_eq!(w[1]["method"], "turn/interrupt");
+        assert_eq!(
+            w[1]["params"],
+            json!({"threadId": "th-1", "turnId": "tu-1"})
+        );
+        assert_eq!(w.len(), 2);
+    }
+
+    #[test]
+    fn an_unrenderable_permission_request_can_only_be_denied() {
+        let mut a = in_turn();
+        let (request, title, input, options) = card(&a.feed(&permissions_frame(
+            5,
+            json!({"fileSystem": {"entries": [{"access": "write", "path": {"type": "special",
+                "value": {"kind": "unknown", "path": "/", "subpath": null}}}]}}),
+        )));
+        assert_eq!(options, [Decision::Deny, Decision::Cancel]);
+        assert_eq!(input["renderable"], false);
+        assert!(title.is_some_and(|t| !t.contains("write")));
+        for refused in [Decision::Allow, Decision::AllowForSession] {
+            assert!(matches!(
+                a.encode(approve_cmd(&request, refused)),
+                Err(AdapterError::Invalid(_))
+            ));
+        }
+        let w = one_write(
+            a.encode(approve_cmd(&request, Decision::Deny))
+                .expect("deny"),
+        );
+        assert_eq!(w, json!({"id": 5, "result": {"permissions": {}}}));
+    }
+
+    #[test]
+    fn a_permission_request_expires_with_its_turn_like_any_approval() {
+        let mut a = in_turn();
+        let (request, ..) =
+            card(&a.feed(&permissions_frame(6, json!({"network": {"enabled": true}}))));
+        let out = a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"interrupted"}}}"#);
+        assert!(out
+            .iter()
+            .any(|e| e.event == Event::ApprovalExpired && e.request.as_deref() == Some(&request)));
+        assert!(a.encode(approve_cmd(&request, Decision::Allow)).is_err());
+    }
+
+    // ---- forms ----
+
+    fn form_frame(id: Value, turn: Option<&str>, mode_fields: Value) -> String {
+        let mut params = json!({"serverName": "github", "threadId": "th-1", "turnId": turn,
+                                "message": "Which repository?"});
+        for (k, v) in mode_fields.as_object().expect("fields") {
+            params[k] = v.clone();
+        }
+        json!({"id": id, "method": "mcpServer/elicitation/request", "params": params}).to_string()
+    }
+
+    fn repo_form() -> Value {
+        json!({"mode": "form", "requestedSchema": {"type": "object", "required": ["repo"],
+        "properties": {
+            "repo": {"type": "string", "oneOf": [{"const": "a/b", "title": "A B"}, {"const": "c/d", "title": "C D"}]},
+            "private": {"type": "boolean"},
+        }}})
+    }
+
+    fn form_request(events: &[Envelope]) -> (String, crate::form::Form) {
+        match events.first() {
+            Some(Envelope {
+                event:
+                    Event::FormRequested {
+                        server,
+                        message,
+                        form,
+                    },
+                request: Some(request),
+                ..
+            }) => {
+                assert_eq!(server, "github");
+                assert_eq!(message, "Which repository?");
+                (request.clone(), form.clone())
+            }
+            other => panic!("expected a form, got {other:?}"),
+        }
+    }
+
+    fn submit(request: &str, action: crate::form::FormAction, content: Option<Value>) -> Command {
+        Command::SubmitForm {
+            request: request.to_owned(),
+            action,
+            content,
+        }
+    }
+
+    #[test]
+    fn a_form_is_shown_and_accept_sends_exactly_the_checked_answer() {
+        use crate::form::{FieldInput, Form, FormAction};
+        let mut a = in_turn();
+        let (request, form) =
+            form_request(&a.feed(&form_frame(json!(11), Some("tu-1"), repo_form())));
+        let Form::Fields { fields } = form else {
+            panic!("fields")
+        };
+        // (`json!` sorts keys, so this frame's order is alphabetical; `elicitation` tests order.)
+        assert_eq!(fields[0].name, "private");
+        assert!(matches!(
+            fields[0].input,
+            FieldInput::Boolean { default: None }
+        ));
+        assert_eq!(fields[1].name, "repo");
+        assert!(fields[1].required);
+        // An answer the form would refuse is never sent, and the form stays answerable.
+        for bad in [
+            None,
+            Some(json!({"repo": "x/y"})),
+            Some(json!({"repo": "a/b", "token": "t"})),
+        ] {
+            assert!(matches!(
+                a.encode(submit(&request, FormAction::Accept, bad)),
+                Err(AdapterError::Invalid(_))
+            ));
+        }
+        assert!(a.drain_outbox().is_empty(), "nothing written");
+        let w = one_write(
+            a.encode(submit(
+                &request,
+                FormAction::Accept,
+                Some(json!({"repo": "a/b", "private": null})),
+            ))
+            .expect("accept"),
+        );
+        assert_eq!(
+            w,
+            json!({"id": 11, "result": {"action": "accept", "content": {"repo": "a/b"}}})
+        );
+        assert!(
+            a.drain_outbox().events.is_empty(),
+            "the session resolves the card, not the adapter"
+        );
+        assert!(a
+            .encode(submit(&request, FormAction::Decline, None))
+            .is_err());
+        assert!(
+            a.feed(&form_frame(json!(11), Some("tu-1"), repo_form()))
+                .is_empty(),
+            "a retransmitted answered form is inert"
+        );
+    }
+
+    #[test]
+    fn decline_and_cancel_answer_and_cancel_stops_only_its_own_turn() {
+        use crate::form::FormAction;
+        let mut a = in_turn();
+        let (request, _) =
+            form_request(&a.feed(&form_frame(json!("f"), Some("tu-1"), repo_form())));
+        let w = one_write(
+            a.encode(submit(&request, FormAction::Decline, None))
+                .expect("decline"),
+        );
+        assert_eq!(w, json!({"id": "f", "result": {"action": "decline"}}));
+
+        let mut a = in_turn();
+        let (request, _) = form_request(&a.feed(&form_frame(json!(2), Some("tu-1"), repo_form())));
+        let w = writes(
+            &a.encode(submit(&request, FormAction::Cancel, None))
+                .expect("cancel"),
+        );
+        assert_eq!(w[0], json!({"id": 2, "result": {"action": "cancel"}}));
+        assert_eq!(w[1]["method"], "turn/interrupt");
+
+        // Turnless: cancelled without touching the running turn, and no turn's end expires it.
+        let mut a = in_turn();
+        let (request, _) = form_request(&a.feed(&form_frame(json!(3), None, repo_form())));
+        let ended = a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"completed"}}}"#);
+        assert!(!ended
+            .iter()
+            .any(|e| matches!(e.event, Event::FormResolved { .. })));
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-2"}}}"#);
+        let w = one_write(
+            a.encode(submit(&request, FormAction::Cancel, None))
+                .expect("cancel"),
+        );
+        assert_eq!(w, json!({"id": 3, "result": {"action": "cancel"}}));
+        assert!(a.turn_id.as_deref() == Some("tu-2") && !a.interrupt_sent);
+    }
+
+    #[test]
+    fn open_forms_expire_with_their_turn_their_resolution_and_the_process() {
+        use crate::form::FormAction;
+        let expired = |out: &[Envelope], request: &str| {
+            out.iter().any(|e| {
+                e.event
+                    == Event::FormResolved {
+                        action: FormAction::Cancel,
+                    }
+                    && e.request.as_deref() == Some(request)
+            })
+        };
+        let mut a = in_turn();
+        let (request, _) = form_request(&a.feed(&form_frame(json!(1), Some("tu-1"), repo_form())));
+        let out = a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"completed"}}}"#);
+        assert!(expired(&out, &request));
+        assert!(a
+            .encode(submit(&request, FormAction::Decline, None))
+            .is_err());
+
+        let mut a = in_turn();
+        let (request, _) = form_request(&a.feed(&form_frame(json!(7), None, repo_form())));
+        let out = a.feed(
+            r#"{"method":"serverRequest/resolved","params":{"threadId":"th-1","requestId":7}}"#,
+        );
+        assert!(expired(&out, &request));
+
+        let mut a = in_turn();
+        let (request, _) = form_request(&a.feed(&form_frame(json!(8), None, repo_form())));
+        assert!(expired(&a.on_exit(Some(0)), &request));
+    }
+
+    #[test]
+    fn a_link_form_is_accepted_without_content() {
+        use crate::form::{Form, FormAction};
+        let mut a = in_turn();
+        let (request, form) = form_request(&a.feed(&form_frame(
+            json!(4),
+            None,
+            json!({"mode": "url", "url": "https://example.com/auth", "elicitationId": "e1"}),
+        )));
+        assert_eq!(
+            form,
+            Form::Link {
+                url: "https://example.com/auth".into()
+            }
+        );
+        assert!(a
+            .encode(submit(&request, FormAction::Accept, Some(json!({"x": 1}))))
+            .is_err());
+        let w = one_write(
+            a.encode(submit(&request, FormAction::Accept, None))
+                .expect("done"),
+        );
+        assert_eq!(w, json!({"id": 4, "result": {"action": "accept"}}));
+    }
+
+    #[test]
+    fn a_form_the_adapter_cannot_show_is_declined_with_a_notice_naming_the_server() {
+        let cases = [
+            (
+                json!({"mode": "form", "requestedSchema": {"type": "object", "properties": {
+                    "password": {"type": "string"}}}}),
+                "never passes secrets",
+            ),
+            (
+                json!({"mode": "openai/form", "requestedSchema": {}}),
+                "cannot show yet",
+            ),
+            (
+                json!({"mode": "url", "url": "javascript:alert(1)\u{202e}", "elicitationId": "e"}),
+                "Open it yourself only if you trust it",
+            ),
+        ];
+        for (fields, says) in cases {
+            let mut a = in_turn();
+            let out = a.feed(&form_frame(json!(5), Some("tu-1"), fields.clone()));
+            let text = match out.as_slice() {
+                [Envelope {
+                    event: Event::Notice { text },
+                    ..
+                }] => text.clone(),
+                other => panic!("{other:?}"),
+            };
+            assert!(text.starts_with("The github tool server "), "{text}");
+            assert!(text.contains(says), "{text}");
+            assert!(
+                !text.contains('\u{202e}'),
+                "the refused link is inert text: {text}"
+            );
+            let outbox = a.drain_outbox();
+            assert_eq!(
+                writes(&outbox.actions),
+                [json!({"id": 5, "result": {"action": "decline"}})]
+            );
+            assert!(
+                a.feed(&form_frame(json!(5), Some("tu-1"), fields))
+                    .is_empty(),
+                "a declined request is settled"
+            );
+        }
+        assert!(
+            refused_link_notice("s", "why", "https://x/\u{202e}").contains("https://x/\\u{202e}")
+        );
+        let long = refused_link_notice("s", "why", &format!("https://x/{}", "a".repeat(1_000)));
+        assert!(long.contains("a…\n"), "the link is cut at 300 characters");
+    }
+
+    /// A form nobody will see (its turn ended, or its worker closed) is still answered, so the
+    /// tool call that raised it does not wait for its own timeout.
+    #[test]
+    fn a_form_for_an_ended_turn_is_declined_not_dropped() {
+        let mut a = in_turn();
+        a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"completed"}}}"#);
+        a.drain_outbox();
+        assert!(a
+            .feed(&form_frame(json!(9), Some("tu-1"), repo_form()))
+            .is_empty());
+        assert_eq!(
+            writes(&a.drain_outbox().actions),
+            [json!({"id": 9, "result": {"action": "decline"}})]
+        );
+    }
+
+    /// Turnless forms never retire with a turn, so their settled keys are bounded.
+    #[test]
+    fn settled_turnless_forms_are_bounded() {
+        use crate::form::FormAction;
+        let mut a = in_turn();
+        for id in 0..(TURNLESS_SETTLED_LIMIT + 50) {
+            let (request, _) = form_request(&a.feed(&form_frame(json!(id), None, repo_form())));
+            a.encode(submit(&request, FormAction::Decline, None))
+                .expect("decline");
+        }
+        assert_eq!(a.turnless_settled.len(), TURNLESS_SETTLED_LIMIT);
+        assert_eq!(a.settled_requests.len(), TURNLESS_SETTLED_LIMIT);
+        // The newest are still protected against retransmission.
+        let last = TURNLESS_SETTLED_LIMIT + 49;
+        assert!(a
+            .feed(&form_frame(json!(last), None, repo_form()))
+            .is_empty());
+    }
+
+    /// The session sends a granted path by where it really leads (`updated_input`); a rename the
+    /// grant does not hold is refused and the request stays answerable.
+    #[test]
+    fn an_allow_can_name_a_granted_path_by_where_it_leads() {
+        let mut a = in_turn();
+        let (request, ..) = card(&a.feed(&permissions_frame(
+            12,
+            json!({"fileSystem": {"write": ["out"]}}),
+        )));
+        let approve = |paths: Value| Command::Approve {
+            request: request.clone(),
+            decision: Decision::AllowForSession,
+            updated_input: Some(paths),
+            message: None,
+        };
+        assert!(matches!(
+            a.encode(approve(json!({"/elsewhere": "/x"}))),
+            Err(AdapterError::Invalid(_))
+        ));
+        let w = one_write(
+            a.encode(approve(json!({"/work/repo/out": "/data/real-out"})))
+                .expect("allow"),
+        );
+        assert_eq!(
+            w,
+            json!({"id": 12, "result": {"scope": "session",
+                "permissions": {"fileSystem": {"write": ["/data/real-out"]}}}})
+        );
+    }
+
+    /// The session judges renames against the sandbox the running turn was sent, not the mode
+    /// picked since: a switch mid-turn applies from the next turn.
+    #[test]
+    fn workspace_writability_follows_the_live_turns_sandbox() {
+        let mut a = started(Mode::Ask);
+        assert_eq!(a.workspace_writable(), Some(false));
+        a.encode(Command::Prompt { text: "go".into() })
+            .expect("prompt");
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-1"}}}"#);
+        a.encode(Command::SetMode {
+            mode: Mode::AcceptEdits,
+        })
+        .expect("mode");
+        assert_eq!(
+            a.workspace_writable(),
+            Some(false),
+            "this turn keeps readOnly"
+        );
+        a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"completed"}}}"#);
+        assert_eq!(a.workspace_writable(), Some(true), "the next turn writes");
+        let mut b = started(Mode::AcceptEdits);
+        b.encode(Command::Prompt { text: "go".into() })
+            .expect("prompt");
+        b.encode(Command::SetMode { mode: Mode::Ask })
+            .expect("mode");
+        assert_eq!(
+            b.workspace_writable(),
+            Some(true),
+            "the pending turn was sent workspaceWrite"
+        );
+    }
+
+    // ---- MCP tool-call approvals ----
+
+    const MCP_APPROVAL: &str =
+        include_str!("../../../tests/fixtures/real/codex/mcp-tool-approval-accept.jsonl");
+
+    /// A frame of the recorded run, on this test's thread and turn.
+    fn mcp_fixture_frame(method: &str, kind: Option<&str>) -> String {
+        records(MCP_APPROVAL, Malformed::Skip)
+            .into_iter()
+            .find(|rec| {
+                rec["frame"]["method"] == method
+                    && kind.is_none_or(|k| rec["frame"]["params"]["item"]["type"] == k)
+            })
+            .expect("recorded frame")["frame"]
+            .to_string()
+            .replace("01a12bc8-a5ec-7133-8050-de4203b15e38", "th-1")
+            .replace("01a12bc8-a7ca-7f82-965c-8f794a2d49a9", "tu-1")
+    }
+
+    fn mcp_call_started(item: &str, server: &str, tool: &str) -> String {
+        json!({"method": "item/started", "params": {"threadId": "th-1", "turnId": "tu-1",
+            "item": {"type": "mcpToolCall", "id": item, "server": server, "tool": tool,
+                     "status": "inProgress", "arguments": {"q": item}}}})
+        .to_string()
+    }
+
+    fn mcp_approval_frame(id: u64, server: &str) -> String {
+        json!({"id": id, "method": "mcpServer/elicitation/request", "params": {
+            "threadId": "th-1", "turnId": "tu-1", "serverName": server, "mode": "form",
+            "_meta": {"codex_approval_kind": "mcp_tool_call", "persist": ["session", "always"],
+                      "tool_params": {"from": "meta"}},
+            "message": format!("Allow the {server} MCP server to run tool \"t\"?"),
+            "requestedSchema": {"type": "object", "properties": {}}}})
+        .to_string()
+    }
+
+    fn approval_card(events: &[Envelope]) -> (String, String, String, Value) {
+        let e = events
+            .iter()
+            .find(|e| matches!(e.event, Event::ApprovalRequested { .. }))
+            .unwrap_or_else(|| panic!("expected an approval card, got {events:?}"));
+        let Event::ApprovalRequested { tool, input, .. } = &e.event else {
+            unreachable!()
+        };
+        (
+            e.request.clone().expect("request"),
+            e.item.clone().unwrap_or_default(),
+            tool.clone(),
+            input.clone(),
+        )
+    }
+
+    /// The recorded run: the item starts, then Codex asks with a fieldless form. It is an
+    /// approval card named like Claude's MCP calls, never a form, and Allow (whatever its
+    /// scope) answers exactly what the recorded run sent.
+    #[test]
+    fn a_recorded_mcp_tool_approval_is_an_approval_card_for_the_call() {
+        for decision in [
+            Decision::Allow,
+            Decision::AllowForSession,
+            Decision::AllowAlways,
+        ] {
+            let mut a = in_turn();
+            a.feed(&mcp_fixture_frame("item/started", Some("mcpToolCall")));
+            let ev = a.feed(&mcp_fixture_frame("mcpServer/elicitation/request", None));
+            assert!(!ev
+                .iter()
+                .any(|e| matches!(e.event, Event::FormRequested { .. })));
+            let (request, item, tool, input) = approval_card(&ev);
+            assert_eq!(tool, "mcp__ollama__ollama_ps");
+            assert_eq!(item, "exec-5ab2070a-a435-4dd8-8b94-5fa3b20ebd21");
+            assert_eq!(input, json!({}));
+            assert!(
+                matches!(&ev[0].event, Event::ApprovalRequested { options, title, .. }
+                if *options == ALL_DECISIONS.to_vec()
+                    && title.as_deref() == Some("Allow the ollama MCP server to run tool \"ollama_ps\"?"))
+            );
+            let w = one_write(a.encode(approve_cmd(&request, decision)).expect("allow"));
+            assert_eq!(
+                w,
+                json!({"id": 0, "result": {"action": "accept", "content": {}}})
+            );
+            assert!(
+                a.encode(approve_cmd(&request, Decision::Deny)).is_err(),
+                "answered once"
+            );
+        }
+    }
+
+    #[test]
+    fn deny_declines_and_stop_turn_cancels_and_interrupts() {
+        let mut a = in_turn();
+        a.feed(&mcp_call_started("c1", "s", "t"));
+        let (request, ..) = approval_card(&a.feed(&mcp_approval_frame(3, "s")));
+        let w = one_write(
+            a.encode(approve_cmd(&request, Decision::Deny))
+                .expect("deny"),
+        );
+        assert_eq!(w, json!({"id": 3, "result": {"action": "decline"}}));
+
+        let mut a = in_turn();
+        a.feed(&mcp_call_started("c1", "s", "t"));
+        let (request, ..) = approval_card(&a.feed(&mcp_approval_frame(4, "s")));
+        let w = writes(
+            &a.encode(approve_cmd(&request, Decision::Cancel))
+                .expect("cancel"),
+        );
+        assert_eq!(w[0], json!({"id": 4, "result": {"action": "cancel"}}));
+        assert_eq!(w[1]["method"], "turn/interrupt");
+    }
+
+    /// The tool is named only from the one open call of that server whose tool the message
+    /// names in Codex's words: none, several, another tool, other words, a server name a rule
+    /// could not split, or a second request for the same call leave it unresolved, shown with
+    /// the form's own parameters and matched by no rule.
+    #[test]
+    fn an_mcp_tool_approval_names_its_tool_only_when_one_call_is_certain() {
+        let unresolved = |a: &mut CodexAdapter, frame: &str| {
+            let (_, _, tool, input) = approval_card(&a.feed(frame));
+            assert_eq!(tool, MCP_UNRESOLVED_TOOL, "{frame}");
+            assert_eq!(input, json!({"from": "meta"}));
+        };
+        let mut a = in_turn();
+        unresolved(&mut a, &mcp_approval_frame(1, "s"));
+        a.feed(&mcp_call_started("c1", "s", "t"));
+        a.feed(&mcp_call_started("c2", "s", "t"));
+        unresolved(&mut a, &mcp_approval_frame(2, "s"));
+        a.feed(&mcp_call_started("c3", "a__b", "t"));
+        unresolved(&mut a, &mcp_approval_frame(3, "a__b"));
+
+        // The one open call is of another tool, or the words are not Codex's.
+        let mut a = in_turn();
+        a.feed(&mcp_call_started("c1", "s", "u"));
+        unresolved(&mut a, &mcp_approval_frame(1, "s"));
+        a.feed(&mcp_call_started("c2", "s2", "t"));
+        let reworded = mcp_approval_frame(2, "s2").replace("Allow the", "Let the");
+        unresolved(&mut a, &reworded);
+        // Neither consumed its call: Codex's own request still names it.
+        let (_, item, tool, _) = approval_card(&a.feed(&mcp_approval_frame(3, "s2")));
+        assert_eq!((item.as_str(), tool.as_str()), ("c2", "mcp__s2__t"));
+
+        let mut a = in_turn();
+        a.feed(&mcp_call_started("c1", "s", "t"));
+        a.feed(&mcp_call_started("c2", "other", "t"));
+        let (_, item, tool, input) = approval_card(&a.feed(&mcp_approval_frame(1, "s")));
+        assert_eq!((item.as_str(), tool.as_str()), ("c1", "mcp__s__t"));
+        assert_eq!(input, json!({"q": "c1"}));
+        unresolved(&mut a, &mcp_approval_frame(2, "s"));
+
+        // A completed call names nothing.
+        let mut a = in_turn();
+        a.feed(&mcp_call_started("c1", "s", "t"));
+        a.feed(r#"{"method":"item/completed","params":{"threadId":"th-1","turnId":"tu-1","item":{"type":"mcpToolCall","id":"c1","server":"s","tool":"t","status":"completed"}}}"#);
+        unresolved(&mut a, &mcp_approval_frame(1, "s"));
+    }
+
+    #[test]
+    fn other_codex_forms_stay_forms() {
+        let mut a = in_turn();
+        let mut frame: Value = serde_json::from_str(&mcp_approval_frame(1, "s")).expect("frame");
+        frame["params"]["requestedSchema"]["properties"] = json!({"why": {"type": "string"}});
+        let ev = a.feed(&frame.to_string());
+        assert!(matches!(ev[0].event, Event::FormRequested { .. }), "{ev:?}");
+        frame["id"] = json!(2);
+        frame["params"]["requestedSchema"]["properties"] = json!({});
+        frame["params"]["_meta"]["codex_approval_kind"] = json!("browser_auth");
+        let ev = a.feed(&frame.to_string());
+        assert!(matches!(ev[0].event, Event::FormRequested { .. }), "{ev:?}");
+    }
+
+    #[test]
+    fn an_mcp_tool_approval_expires_like_any_approval() {
+        let mut a = in_turn();
+        a.feed(&mcp_call_started("c1", "s", "t"));
+        let (request, ..) = approval_card(&a.feed(&mcp_approval_frame(7, "s")));
+        assert!(
+            a.feed(&mcp_approval_frame(7, "s")).is_empty(),
+            "a retransmission is not a second card"
+        );
+        let out = a.feed(
+            r#"{"method":"serverRequest/resolved","params":{"threadId":"th-1","requestId":7}}"#,
+        );
+        assert!(out
+            .iter()
+            .any(|e| e.event == Event::ApprovalExpired && e.request.as_deref() == Some(&request)));
+        assert!(a.encode(approve_cmd(&request, Decision::Allow)).is_err());
+
+        let mut a = in_turn();
+        let (request, ..) = approval_card(&a.feed(&mcp_approval_frame(8, "s")));
+        let out = a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"interrupted"}}}"#);
+        assert!(out
+            .iter()
+            .any(|e| e.event == Event::ApprovalExpired && e.request.as_deref() == Some(&request)));
+    }
+}

@@ -1,0 +1,1119 @@
+//! The composer: a GtkSourceView prompt with a typeahead popover.
+//!
+//! # Typeahead: a custom popover, not `GtkSourceCompletion`
+//!
+//! GtkSourceCompletion was the plan's first choice and was rejected after trying it on paper
+//! against what the composer needs:
+//! - its providers re-filter and re-sort proposals themselves, while ranking must be
+//!   `agent_core::commands` (T3's scoring, built-ins first, shadowing rules);
+//! - choosing a built-in must *run* it locally and never insert text, which fights the
+//!   proposal-activation model;
+//! - `@file` replies arrive asynchronously as `ControlResult` envelopes keyed by request id,
+//!   which needs the debounce and stale-reply cancellation done here anyway;
+//! - each provider and proposal is a GObject subclass, which is a lot of ceremony for a list.
+//!
+//! So the popover is a plain `gtk4::Popover` holding a `ListBox`, never taking focus from the
+//! text view, with all decisions (keys, insertion, stale replies) in the pure
+//! [`super::typeahead`] module.
+
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+use std::time::Duration;
+
+use agent_core::commands::{
+    builtins, completion_items, detect_trigger, CompletionItem, CompletionKind, Trigger,
+    TriggerKind,
+};
+use gtk4::prelude::*;
+use gtk4::{gdk, glib};
+use sourceview5::prelude::*;
+
+use super::cards::{label, wrap_words};
+use super::typeahead::{apply_completion, Key, KeyOutcome, LatestRequest, Popup};
+
+/// Debounce for `@file` suggestions (a round trip to the agent CLI).
+const FILE_DEBOUNCE: Duration = Duration::from_millis(120);
+
+fn keys_pass_to_ime(preedit_active: bool, key: Key) -> bool {
+    preedit_active
+        && matches!(
+            key,
+            Key::Enter | Key::Up | Key::Down | Key::Tab | Key::Escape
+        )
+}
+
+fn reset_preedit(active: &Cell<bool>) {
+    active.set(false);
+}
+
+/// Per-thread prompt recall. The draft is held while browsing, so Down restores exactly what
+/// the user had typed before they pressed Up.
+#[derive(Debug, Default)]
+struct PromptHistory {
+    entries: Vec<String>,
+    index: Option<usize>,
+    draft: String,
+}
+
+impl PromptHistory {
+    fn replace(&mut self, entries: Vec<String>) {
+        self.entries = entries;
+        self.reset();
+    }
+
+    fn record(&mut self, text: &str) {
+        if !text.is_empty() && self.entries.last().is_none_or(|last| last != text) {
+            self.entries.push(text.to_owned());
+        }
+        self.reset();
+    }
+
+    fn move_up(&mut self, current: &str) -> Option<&str> {
+        let index = match self.index {
+            Some(index) => index.checked_sub(1).unwrap_or(index),
+            None => {
+                self.draft = current.to_owned();
+                self.entries.len().checked_sub(1)?
+            }
+        };
+        self.index = Some(index);
+        self.entries.get(index).map(String::as_str)
+    }
+
+    fn move_down(&mut self) -> Option<&str> {
+        let index = self.index?;
+        if index + 1 < self.entries.len() {
+            let next = index + 1;
+            self.index = Some(next);
+            return self.entries.get(next).map(String::as_str);
+        }
+        self.index = None;
+        Some(&self.draft)
+    }
+
+    fn reset(&mut self) {
+        self.index = None;
+        self.draft.clear();
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::PromptHistory;
+
+    #[test]
+    fn arrows_walk_history_and_restore_the_draft() {
+        let mut history = PromptHistory::default();
+        history.record("first");
+        history.record("second");
+
+        assert_eq!(history.move_up("unfinished"), Some("second"));
+        assert_eq!(history.move_up("second"), Some("first"));
+        assert_eq!(history.move_down(), Some("second"));
+        assert_eq!(history.move_down(), Some("unfinished"));
+        assert_eq!(history.move_down(), None);
+    }
+
+    #[test]
+    fn consecutive_duplicates_do_not_fill_history() {
+        let mut history = PromptHistory::default();
+        history.record("same");
+        history.record("same");
+        assert_eq!(history.entries, ["same"]);
+    }
+}
+
+/// One row of the popup.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Entry {
+    Command(CompletionItem),
+    File(String),
+}
+
+/// What the composer asks of the view.
+pub trait ComposerHost {
+    /// Enter on a non-empty prompt (already trimmed). The host decides between a built-in and
+    /// sending it.
+    fn submit(&self, text: &str);
+    fn interrupt(&self);
+    /// Whether a turn is running (Esc interrupts, the button stops).
+    fn running(&self) -> bool;
+    /// A built-in was chosen from the popup.
+    fn run_builtin(&self, name: &str);
+    /// Candidates for a `/` or `$` trigger.
+    fn command_items(&self, trigger: &Trigger) -> Vec<CompletionItem>;
+    /// Asks for `@` suggestions; `None` when the agent cannot answer them.
+    fn request_files(&self, query: &str) -> Option<String>;
+    fn placeholder(&self) -> String;
+    /// Pulls the most recently queued prompt out of the queue to allow editing, if any.
+    fn pop_queued_prompt(&self) -> Option<String> {
+        None
+    }
+}
+
+pub struct Composer {
+    root: gtk4::Box,
+    view: sourceview5::View,
+    buffer: sourceview5::Buffer,
+    send: gtk4::Button,
+    placeholder: gtk4::Label,
+    popover: gtk4::Popover,
+    pop_scroller: gtk4::ScrolledWindow,
+    list: gtk4::ListBox,
+    popup: RefCell<Popup>,
+    entries: RefCell<Vec<Entry>>,
+    trigger: RefCell<Option<Trigger>>,
+    files: Rc<RefCell<LatestRequest>>,
+    file_timer: Rc<RefCell<Option<glib::SourceId>>>,
+    history: RefCell<PromptHistory>,
+    /// Suppresses re-triggering while the composer itself edits the buffer.
+    editing: Cell<bool>,
+    preedit_active: Cell<bool>,
+    host: RefCell<Option<std::rc::Weak<dyn ComposerHost>>>,
+}
+
+impl Composer {
+    pub fn new() -> Rc<Self> {
+        let root = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        root.add_css_class("composer");
+
+        let buffer = sourceview5::Buffer::new(None);
+        buffer.set_highlight_matching_brackets(false);
+        // Without the app's dark scheme, GtkSourceView's default draws its caret dark on our
+        // dark background, so there is no visible cursor (the CSS caret-color backs this up).
+        super::cards::apply_scheme(&buffer);
+        let view = sourceview5::View::with_buffer(&buffer);
+        view.set_wrap_mode(gtk4::WrapMode::WordChar);
+        view.set_accepts_tab(false);
+        view.set_top_margin(10);
+        view.set_bottom_margin(10);
+        view.set_left_margin(14);
+        view.set_right_margin(14);
+        view.add_css_class("composer-view");
+        view.set_hexpand(true);
+        view.update_property(&[
+            gtk4::accessible::Property::Label("Prompt"),
+            gtk4::accessible::Property::MultiLine(true),
+            gtk4::accessible::Property::Autocomplete(gtk4::AccessibleAutocomplete::List),
+            gtk4::accessible::Property::HasPopup(true),
+        ]);
+        view.update_state(&[gtk4::accessible::State::Expanded(Some(false))]);
+
+        let scroller = gtk4::ScrolledWindow::new();
+        scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+        scroller.set_propagate_natural_height(true);
+        scroller.set_max_content_height(220);
+        scroller.set_min_content_height(24);
+        scroller.set_child(Some(&view));
+        scroller.set_hexpand(true);
+        // Clip to the field's rounded corners (its tint is drawn by the view, see style.css).
+        scroller.set_overflow(gtk4::Overflow::Hidden);
+        scroller.add_css_class("composer-field");
+
+        let placeholder = label("", &["composer-placeholder"]);
+        placeholder.set_can_target(false);
+        placeholder.set_valign(gtk4::Align::Start);
+        placeholder.set_margin_top(10);
+        placeholder.set_margin_start(16);
+        placeholder.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        let overlay = gtk4::Overlay::new();
+        overlay.set_child(Some(&scroller));
+        overlay.add_overlay(&placeholder);
+        overlay.set_hexpand(true);
+        root.append(&overlay);
+
+        let send = gtk4::Button::from_icon_name("at-go-up-symbolic");
+        send.add_css_class("circular");
+        send.add_css_class("send-button");
+        send.set_valign(gtk4::Align::End);
+        send.set_tooltip_text(Some("Send (Enter)"));
+        send.update_property(&[gtk4::accessible::Property::Label("Send message")]);
+        root.append(&send);
+
+        let list = gtk4::ListBox::new();
+        list.set_selection_mode(gtk4::SelectionMode::Single);
+        list.add_css_class("typeahead-list");
+        list.set_can_focus(false);
+        list.update_property(&[gtk4::accessible::Property::Label("Prompt suggestions")]);
+        view.update_relation(&[gtk4::accessible::Relation::Controls(&[list.upcast_ref()])]);
+        let pop_scroller = gtk4::ScrolledWindow::new();
+        pop_scroller.set_policy(gtk4::PolicyType::Automatic, gtk4::PolicyType::Automatic);
+        pop_scroller.set_propagate_natural_height(true);
+        pop_scroller.set_max_content_height(300);
+        pop_scroller.set_propagate_natural_width(true);
+        pop_scroller.set_min_content_width(160);
+        pop_scroller.set_max_content_width(480);
+        list.set_size_request(320, -1);
+        pop_scroller.set_child(Some(&list));
+        let popover = gtk4::Popover::new();
+        popover.set_autohide(false);
+        popover.set_has_arrow(false);
+        popover.set_can_focus(false);
+        popover.set_position(gtk4::PositionType::Top);
+        // Left edge on the trigger rather than centred on it.
+        popover.set_halign(gtk4::Align::Start);
+        popover.add_css_class("typeahead");
+        popover.set_child(Some(&pop_scroller));
+        popover.set_parent(&view);
+
+        let composer = Rc::new(Self {
+            root,
+            view,
+            buffer,
+            send,
+            placeholder,
+            popover,
+            pop_scroller,
+            list,
+            popup: RefCell::new(Popup::default()),
+            entries: RefCell::new(Vec::new()),
+            trigger: RefCell::new(None),
+            files: Rc::new(RefCell::new(LatestRequest::default())),
+            file_timer: Rc::new(RefCell::new(None)),
+            history: RefCell::default(),
+            editing: Cell::new(false),
+            preedit_active: Cell::new(false),
+            host: RefCell::new(None),
+        });
+        composer.connect_signals();
+        composer
+    }
+
+    pub fn widget(&self) -> &gtk4::Box {
+        &self.root
+    }
+
+    pub fn set_host(&self, host: std::rc::Weak<dyn ComposerHost>) {
+        *self.host.borrow_mut() = Some(host);
+        self.refresh_placeholder();
+    }
+
+    fn host(&self) -> Option<Rc<dyn ComposerHost>> {
+        self.host.borrow().as_ref().and_then(std::rc::Weak::upgrade)
+    }
+
+    pub fn grab_focus(&self) {
+        self.view.grab_focus();
+    }
+
+    /// The popover is parented to the text view and must be unparented before it goes.
+    pub fn dispose(&self) {
+        self.cancel_file_timer();
+        if self.popover.parent().is_some() {
+            self.popover.unparent();
+        }
+    }
+
+    pub fn text(&self) -> String {
+        let (s, e) = self.buffer.bounds();
+        self.buffer.text(&s, &e, false).to_string()
+    }
+
+    pub fn set_text(&self, text: &str) {
+        self.editing.set(true);
+        self.buffer.set_text(text);
+        self.editing.set(false);
+        reset_preedit(&self.preedit_active);
+        self.refresh_placeholder();
+        self.refresh_trigger();
+    }
+
+    /// Puts a suggested reply in the box with the cursor after it, and focuses the box. Nothing
+    /// is sent. A draft already there is kept: the suggestion follows it after a space, so a
+    /// click never throws typing away.
+    pub fn fill(&self, text: &str) {
+        let draft = self.text();
+        if draft.trim().is_empty() {
+            self.set_text(text);
+        } else {
+            self.set_text(&format!("{} {text}", draft.trim_end()));
+        }
+        self.buffer.place_cursor(&self.buffer.end_iter());
+        self.view.grab_focus();
+    }
+
+    /// Whether the cursor sits after the last character (tests).
+    #[cfg(test)]
+    pub fn cursor_at_end(&self) -> bool {
+        self.buffer.cursor_position() == self.buffer.char_count()
+    }
+
+    pub fn clear(&self) {
+        self.set_text("");
+        self.close_popup();
+    }
+
+    /// Seeds recall from a thread reopened from its persisted transcript.
+    pub fn set_history(&self, entries: Vec<String>) {
+        self.history.borrow_mut().replace(entries);
+    }
+
+    /// Send ⇄ stop. `stop_note` is what stopping does to this agent when it is more than ending
+    /// the turn (agy exits, and restarts on the next message).
+    pub fn set_running(&self, running: bool, stop_note: Option<&str>) {
+        if running {
+            self.send.set_icon_name("at-media-playback-stop-symbolic");
+            self.send.add_css_class("stop");
+            let tooltip = match stop_note {
+                Some(note) => format!("Stop (Esc). {note}"),
+                None => "Stop (Esc)".to_owned(),
+            };
+            self.send.set_tooltip_text(Some(&tooltip));
+            self.send.update_property(&[
+                gtk4::accessible::Property::Label("Stop turn"),
+                gtk4::accessible::Property::Description(&tooltip),
+            ]);
+        } else {
+            self.send.set_icon_name("at-go-up-symbolic");
+            self.send.remove_css_class("stop");
+            self.send.set_tooltip_text(Some("Send (Enter)"));
+            self.send.update_property(&[
+                gtk4::accessible::Property::Label("Send message"),
+                gtk4::accessible::Property::Description("Send (Enter)"),
+            ]);
+        }
+    }
+
+    pub fn refresh_placeholder(&self) {
+        if let Some(host) = self.host() {
+            // Only on a change: this runs after every batch of events.
+            let text = host.placeholder();
+            if self.placeholder.text() != text {
+                self.placeholder.set_text(&text);
+            }
+        }
+        self.placeholder.set_visible(self.buffer.char_count() == 0);
+        self.refresh_accessibility();
+    }
+
+    /// Keep the editable field's name stable, and expose its changing hint and completion
+    /// without moving keyboard focus out of the prompt.
+    fn refresh_accessibility(&self) {
+        let mut description = format!(
+            "{} Enter sends; Shift+Enter adds a line.",
+            self.placeholder.text()
+        );
+        let popup = self.popup.borrow();
+        if popup.is_open() {
+            if let Some(entry) = self.entries.borrow().get(popup.selected()) {
+                description.push_str(&format!(
+                    " Suggestion {} of {}: {}. Up and Down choose; Tab or Enter accepts; Escape dismisses.",
+                    popup.selected() + 1,
+                    self.entries.borrow().len(),
+                    entry_description(entry)
+                ));
+            }
+        }
+        self.view.update_property(&[
+            gtk4::accessible::Property::Description(&description),
+            gtk4::accessible::Property::Placeholder(&self.placeholder.text()),
+        ]);
+        self.view
+            .update_state(&[gtk4::accessible::State::Expanded(Some(popup.is_open()))]);
+    }
+
+    /// What the placeholder currently says.
+    #[cfg(test)]
+    pub fn placeholder_text(&self) -> String {
+        self.placeholder.text().to_string()
+    }
+
+    /// Whether the send button is the stop button (tests).
+    #[cfg(test)]
+    pub fn shows_stop(&self) -> bool {
+        self.send.has_css_class("stop")
+    }
+
+    fn connect_signals(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        self.view.connect_preedit_changed(move |_, text| {
+            if let Some(c) = weak.upgrade() {
+                c.preedit_active.set(!text.is_empty());
+            }
+        });
+        let keys = gtk4::EventControllerKey::new();
+        keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let weak = Rc::downgrade(self);
+        keys.connect_key_pressed(move |_, keyval, _, state| match weak.upgrade() {
+            Some(c) => c.on_key(keyval, state),
+            None => glib::Propagation::Proceed,
+        });
+        self.view.add_controller(keys);
+
+        let weak = Rc::downgrade(self);
+        self.buffer.connect_changed(move |_| {
+            if let Some(c) = weak.upgrade() {
+                c.refresh_placeholder();
+                if !c.editing.get() {
+                    c.refresh_trigger();
+                }
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.buffer.connect_cursor_position_notify(move |_| {
+            if let Some(c) = weak.upgrade() {
+                if !c.editing.get() {
+                    c.refresh_trigger();
+                }
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.send.connect_clicked(move |_| {
+            let Some(c) = weak.upgrade() else {
+                return;
+            };
+            let Some(host) = c.host() else {
+                return;
+            };
+            if host.running() {
+                host.interrupt();
+            } else {
+                c.submit();
+            }
+            c.view.grab_focus();
+        });
+
+        let weak = Rc::downgrade(self);
+        self.list.connect_row_activated(move |_, row| {
+            if let Some(c) = weak.upgrade() {
+                let index = usize::try_from(row.index()).unwrap_or(0);
+                c.popup.borrow_mut().select(index);
+                c.accept(index);
+                c.view.grab_focus();
+            }
+        });
+
+        // Losing focus (clicking elsewhere) closes the popup.
+        let focus = gtk4::EventControllerFocus::new();
+        let weak = Rc::downgrade(self);
+        focus.connect_leave(move |_| {
+            if let Some(c) = weak.upgrade() {
+                reset_preedit(&c.preedit_active);
+                // Deferred: a click on a popup row moves focus before it activates.
+                let weak = Rc::downgrade(&c);
+                glib::timeout_add_local_once(Duration::from_millis(150), move || {
+                    if let Some(c) = weak.upgrade() {
+                        if !c.view.has_focus() {
+                            c.close_popup();
+                        }
+                    }
+                });
+            }
+        });
+        self.view.add_controller(focus);
+    }
+
+    fn on_key(&self, keyval: gdk::Key, state: gdk::ModifierType) -> glib::Propagation {
+        let key = match keyval {
+            gdk::Key::Up | gdk::Key::KP_Up => Key::Up,
+            gdk::Key::Down | gdk::Key::KP_Down => Key::Down,
+            gdk::Key::Tab | gdk::Key::ISO_Left_Tab => Key::Tab,
+            gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::ISO_Enter => Key::Enter,
+            gdk::Key::Escape => Key::Escape,
+            _ => Key::Other,
+        };
+        if keys_pass_to_ime(self.preedit_active.get(), key) {
+            return glib::Propagation::Proceed;
+        }
+        let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
+        let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+        let meta = state.contains(gdk::ModifierType::META_MASK)
+            || state.contains(gdk::ModifierType::SUPER_MASK)
+            || state.contains(gdk::ModifierType::ALT_MASK);
+        let modified = shift || ctrl || meta;
+        if !modified {
+            let token = self.current_token();
+            let outcome = self.popup.borrow_mut().key(key, &token);
+            match outcome {
+                KeyOutcome::NotHandled => {}
+                KeyOutcome::Moved(i) => {
+                    self.select_row(i);
+                    return glib::Propagation::Stop;
+                }
+                KeyOutcome::Accept(i) => {
+                    self.accept(i);
+                    return glib::Propagation::Stop;
+                }
+                KeyOutcome::Dismiss => {
+                    self.close_popup();
+                    return glib::Propagation::Stop;
+                }
+            }
+        }
+        match key {
+            Key::Up | Key::Down if !modified && !self.text().contains('\n') => {
+                let current = self.text();
+                let recalled = match key {
+                    Key::Up => {
+                        if current.trim().is_empty() {
+                            if let Some(host) = self.host() {
+                                if let Some(queued) = host.pop_queued_prompt() {
+                                    self.set_text(&queued);
+                                    return glib::Propagation::Stop;
+                                }
+                            }
+                        }
+                        self.history
+                            .borrow_mut()
+                            .move_up(&current)
+                            .map(str::to_owned)
+                    }
+                    Key::Down => self.history.borrow_mut().move_down().map(str::to_owned),
+                    _ => None,
+                };
+                if let Some(text) = recalled {
+                    self.set_text(&text);
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            }
+            Key::Enter if !shift && !ctrl && !meta => {
+                self.submit();
+                glib::Propagation::Stop
+            }
+            Key::Escape => match self.host() {
+                Some(host) if host.running() => {
+                    host.interrupt();
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            },
+            _ => glib::Propagation::Proceed,
+        }
+    }
+
+    fn submit(&self) {
+        let text = self.text();
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let Some(host) = self.host() else {
+            return;
+        };
+        let owned = trimmed.to_owned();
+        self.history.borrow_mut().record(&owned);
+        self.clear();
+        host.submit(&owned);
+    }
+
+    fn cursor_offset(&self) -> (String, usize) {
+        let text = self.text();
+        let iter = self.buffer.iter_at_mark(&self.buffer.get_insert());
+        // Char offset → byte offset.
+        let chars = usize::try_from(iter.offset()).unwrap_or(0);
+        let byte = text
+            .char_indices()
+            .nth(chars)
+            .map_or(text.len(), |(b, _)| b);
+        (text, byte)
+    }
+
+    fn current_token(&self) -> String {
+        let (text, _) = self.cursor_offset();
+        self.trigger
+            .borrow()
+            .as_ref()
+            .and_then(|t| text.get(t.range.clone()).map(str::to_owned))
+            .unwrap_or_default()
+    }
+
+    /// Re-detects the trigger under the cursor and refreshes the candidates.
+    fn refresh_trigger(&self) {
+        let (text, cursor) = self.cursor_offset();
+        let trigger = detect_trigger(&text, cursor);
+        let token = trigger
+            .as_ref()
+            .and_then(|t| text.get(t.range.clone()))
+            .unwrap_or("")
+            .to_owned();
+        let same = *self.trigger.borrow() == trigger;
+        *self.trigger.borrow_mut() = trigger.clone();
+        let Some(trigger) = trigger else {
+            self.close_popup();
+            return;
+        };
+        if same && self.popover.is_visible() {
+            return;
+        }
+        let Some(host) = self.host() else {
+            return;
+        };
+        match trigger.kind {
+            TriggerKind::Slash | TriggerKind::Skill => {
+                self.files.borrow_mut().cancel();
+                self.cancel_file_timer();
+                let entries = host
+                    .command_items(&trigger)
+                    .into_iter()
+                    .map(Entry::Command)
+                    .collect();
+                self.show_entries(entries, &token);
+            }
+            TriggerKind::File => {
+                // Debounced: each keystroke restarts the timer and drops the in-flight reply.
+                self.files.borrow_mut().cancel();
+                self.cancel_file_timer();
+                let query = trigger.query.clone();
+                let host = Rc::downgrade(&host);
+                let files = Rc::downgrade(&self.files);
+                let timer = Rc::downgrade(&self.file_timer);
+                let id = glib::timeout_add_local_once(FILE_DEBOUNCE, move || {
+                    // The source is spent: forget its id so nothing removes it twice.
+                    if let Some(timer) = timer.upgrade() {
+                        timer.borrow_mut().take();
+                    }
+                    if let (Some(host), Some(files)) = (host.upgrade(), files.upgrade()) {
+                        if let Some(id) = host.request_files(&query) {
+                            files.borrow_mut().issue(id);
+                        }
+                    }
+                });
+                *self.file_timer.borrow_mut() = Some(id);
+            }
+        }
+    }
+
+    fn cancel_file_timer(&self) {
+        if let Some(id) = self.file_timer.borrow_mut().take() {
+            id.remove();
+        }
+    }
+
+    /// A `ControlResult` for an `@file` request. Returns whether it was ours.
+    pub fn file_reply(&self, request: &str, files: Vec<String>) -> bool {
+        if !self.files.borrow_mut().accept(request) {
+            return false;
+        }
+        let token = self.current_token();
+        let still_file = matches!(&*self.trigger.borrow(), Some(t) if t.kind == TriggerKind::File);
+        if still_file {
+            self.show_entries(files.into_iter().map(Entry::File).collect(), &token);
+        }
+        true
+    }
+
+    /// The `@` rows the popup shows right now.
+    #[cfg(test)]
+    pub fn file_entries(&self) -> Vec<String> {
+        self.entries
+            .borrow()
+            .iter()
+            .filter_map(|e| match e {
+                Entry::File(path) => Some(path.clone()),
+                Entry::Command(_) => None,
+            })
+            .collect()
+    }
+
+    pub fn is_waiting_for(&self, request: &str) -> bool {
+        self.files.borrow().is_waiting_for(request)
+    }
+
+    fn show_entries(&self, entries: Vec<Entry>, token: &str) {
+        self.view
+            .reset_relation(gtk4::AccessibleRelation::ActiveDescendant);
+        while let Some(row) = self.list.row_at_index(0) {
+            self.list.remove(&row);
+        }
+        for (i, e) in entries.iter().enumerate() {
+            let row = entry_row(e);
+            row.update_relation(&[
+                gtk4::accessible::Relation::PosInSet(i32::try_from(i + 1).unwrap_or(i32::MAX)),
+                gtk4::accessible::Relation::SetSize(
+                    i32::try_from(entries.len()).unwrap_or(i32::MAX),
+                ),
+            ]);
+            self.list.append(&row);
+        }
+        let open = self.popup.borrow_mut().set_items(entries.len(), token);
+        *self.entries.borrow_mut() = entries;
+        if open {
+            self.select_row(0);
+            self.place_popover();
+            self.popover.popup();
+        } else {
+            self.close_popup();
+        }
+    }
+
+    fn place_popover(&self) {
+        // A fixed 480 px popup overflowed small windows. Its labels can shrink (their complete
+        // text is still exposed accessibly); cap the list by the actual window allocation.
+        let available = self
+            .view
+            .root()
+            .and_then(|root| root.dynamic_cast::<gtk4::Widget>().ok())
+            .map(|root| root.width() - 32)
+            .filter(|width| *width > 0)
+            .unwrap_or(320);
+        let width = available.clamp(160, 480);
+        self.list.set_size_request(width, -1);
+        self.pop_scroller.set_max_content_width(width);
+        let range_start = self.trigger.borrow().as_ref().map_or(0, |t| t.range.start);
+        let text = self.text();
+        let char_offset = text.get(..range_start).map_or(0, |s| s.chars().count());
+        let iter = self
+            .buffer
+            .iter_at_offset(i32::try_from(char_offset).unwrap_or(0));
+        let rect = self.view.iter_location(&iter);
+        let (x, y) =
+            self.view
+                .buffer_to_window_coords(gtk4::TextWindowType::Widget, rect.x(), rect.y());
+        self.popover
+            .set_pointing_to(Some(&gdk::Rectangle::new(x, y, 1, rect.height().max(1))));
+    }
+
+    fn select_row(&self, i: usize) {
+        let index = i32::try_from(i).unwrap_or(0);
+        if let Some(row) = self.list.row_at_index(index) {
+            self.list.select_row(Some(&row));
+            self.view
+                .update_relation(&[gtk4::accessible::Relation::ActiveDescendant(
+                    row.upcast_ref(),
+                )]);
+            self.refresh_accessibility();
+            // Keep the selected row in view without moving focus off the text view.
+            if let Some(bounds) = row.compute_bounds(&self.list) {
+                let adj = self.pop_scroller.vadjustment();
+                let (y, h) = (f64::from(bounds.y()), f64::from(bounds.height()));
+                if y < adj.value() {
+                    adj.set_value(y);
+                } else if y + h > adj.value() + adj.page_size() {
+                    adj.set_value(y + h - adj.page_size());
+                }
+            }
+        }
+    }
+
+    fn close_popup(&self) {
+        self.popup.borrow_mut().close();
+        self.popover.popdown();
+        self.view
+            .reset_relation(gtk4::AccessibleRelation::ActiveDescendant);
+        self.refresh_accessibility();
+        self.files.borrow_mut().cancel();
+        self.cancel_file_timer();
+    }
+
+    fn accept(&self, index: usize) {
+        let Some(entry) = self.entries.borrow().get(index).cloned() else {
+            return;
+        };
+        let Some(trigger) = self.trigger.borrow().clone() else {
+            return;
+        };
+        let (text, _) = self.cursor_offset();
+        self.close_popup();
+        match entry {
+            Entry::Command(item) if item.kind == CompletionKind::Builtin => {
+                let builtin = builtins().iter().find(|b| b.name == item.name);
+                match builtin {
+                    Some(b) if super::typeahead::runs_immediately(b) => {
+                        // Run locally; the typed trigger goes away.
+                        let (new, cursor) = apply_completion(&text, trigger.range.clone(), "");
+                        self.replace(&new, cursor);
+                        if let Some(host) = self.host() {
+                            host.run_builtin(b.name);
+                        }
+                    }
+                    _ => {
+                        // Needs an argument: complete the name and let the user type it.
+                        let (new, cursor) =
+                            apply_completion(&text, trigger.range.clone(), &item.insert_text);
+                        self.replace(&new, cursor);
+                    }
+                }
+            }
+            Entry::Command(item) => {
+                let (new, cursor) =
+                    apply_completion(&text, trigger.range.clone(), &item.insert_text);
+                self.replace(&new, cursor);
+            }
+            Entry::File(path) => {
+                let insert = format!("@{path} ");
+                let (new, cursor) = apply_completion(&text, trigger.range.clone(), &insert);
+                self.replace(&new, cursor);
+            }
+        }
+    }
+
+    fn replace(&self, text: &str, cursor_byte: usize) {
+        self.editing.set(true);
+        self.buffer.set_text(text);
+        let chars = text.get(..cursor_byte).map_or(0, |s| s.chars().count());
+        let iter = self
+            .buffer
+            .iter_at_offset(i32::try_from(chars).unwrap_or(i32::MAX));
+        self.buffer.place_cursor(&iter);
+        self.editing.set(false);
+        *self.trigger.borrow_mut() = None;
+        self.refresh_placeholder();
+    }
+}
+
+fn entry_row(entry: &Entry) -> gtk4::ListBoxRow {
+    let row = gtk4::ListBoxRow::new();
+    row.set_can_focus(false);
+    row.update_property(&[gtk4::accessible::Property::Label(&entry_description(entry))]);
+    let b = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+    b.add_css_class("typeahead-row");
+    match entry {
+        Entry::Command(item) => {
+            let (badge, sigil) = match item.kind {
+                CompletionKind::Builtin => ("app", "/"),
+                CompletionKind::Agent => ("agent", "/"),
+                CompletionKind::Skill => ("skill", "$"),
+            };
+            let badge = label(badge, &["kind-badge", &format!("badge-{badge}")]);
+            badge.set_valign(gtk4::Align::Center);
+            b.append(&badge);
+            let name = label(&format!("{sigil}{}", item.name), &["typeahead-name"]);
+            name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            name.set_max_width_chars(18);
+            b.append(&name);
+            if let Some(h) = &item.hint {
+                let hint = label(h, &["typeahead-hint"]);
+                wrap_words(&hint);
+                hint.set_max_width_chars(18);
+                b.append(&hint);
+            }
+            let d = label(&item.description, &["typeahead-desc"]);
+            d.set_hexpand(true);
+            d.set_xalign(1.0);
+            d.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            b.append(&d);
+        }
+        Entry::File(path) => {
+            let badge = label("file", &["kind-badge", "badge-file"]);
+            badge.set_valign(gtk4::Align::Center);
+            b.append(&badge);
+            let p = label(path, &["typeahead-name"]);
+            p.set_ellipsize(gtk4::pango::EllipsizeMode::Start);
+            p.set_hexpand(true);
+            b.append(&p);
+        }
+    }
+    row.set_child(Some(&b));
+    row
+}
+
+fn entry_description(entry: &Entry) -> String {
+    match entry {
+        Entry::Command(item) => {
+            let hint = item.hint.as_deref().unwrap_or("");
+            format!("{} {hint}: {}", item.insert_text, item.description)
+        }
+        Entry::File(path) => format!("File {path}"),
+    }
+}
+
+/// Candidates for a `/` or `$` trigger (wraps `completion_items` so the host stays small).
+pub fn items_for(
+    trigger: &Trigger,
+    commands: &[agent_core::event::AgentCommand],
+    caps: &agent_core::caps::Capabilities,
+) -> Vec<CompletionItem> {
+    completion_items(builtins(), commands, caps, trigger)
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "native GTK; run alone in an isolated display"]
+    fn native_preedit_clears_on_reset_submit_and_focus_leave() {
+        gtk4::init().expect("GTK init");
+        let host = Rc::new(Host::default());
+        let host_trait: Rc<dyn ComposerHost> = host.clone();
+        let composer = Composer::new();
+        composer.set_host(Rc::downgrade(&host_trait));
+        let resets: [fn(&Composer); 3] = [
+            |c| c.set_text("replacement"),
+            Composer::clear,
+            Composer::submit,
+        ];
+        for reset in resets {
+            composer.set_text("draft");
+            composer.view.emit_preedit_changed("入力");
+            assert!(composer.preedit_active.get());
+            reset(&composer);
+            assert!(!composer.preedit_active.get());
+        }
+        assert_eq!(*host.submitted.borrow(), ["draft"]);
+        composer.view.emit_preedit_changed("入力");
+        assert!(composer.preedit_active.get());
+        let controllers = composer.view.observe_controllers();
+        let focus = (0..controllers.n_items())
+            .filter_map(|i| controllers.item(i))
+            .find_map(|controller| controller.downcast::<gtk4::EventControllerFocus>().ok())
+            .expect("composer focus controller");
+        focus.emit_by_name::<()>("leave", &[]);
+        assert!(!composer.preedit_active.get());
+        composer.set_text("after focus leave");
+        assert_eq!(
+            composer.on_key(gdk::Key::Return, gdk::ModifierType::empty()),
+            glib::Propagation::Stop
+        );
+        assert_eq!(*host.submitted.borrow(), ["draft", "after focus leave"]);
+        composer.dispose();
+    }
+
+    #[test]
+    fn resetting_preedit_returns_keys_to_the_composer() {
+        let active = Cell::new(true);
+        assert!(keys_pass_to_ime(active.get(), Key::Enter));
+        reset_preedit(&active);
+        for key in [Key::Enter, Key::Up, Key::Down, Key::Tab, Key::Escape] {
+            assert!(!keys_pass_to_ime(active.get(), key));
+        }
+        reset_preedit(&active);
+        assert!(!active.get());
+    }
+
+    #[test]
+    #[ignore = "native GTK; run alone in an isolated display"]
+    fn native_preedit_signal_keeps_keys_out_of_composer_actions() {
+        gtk4::init().expect("GTK init");
+        let host = Rc::new(Host::default());
+        host.running.set(true);
+        let host_trait: Rc<dyn ComposerHost> = host.clone();
+        let composer = Composer::new();
+        composer.set_host(Rc::downgrade(&host_trait));
+        composer.set_text("draft");
+        composer.view.emit_preedit_changed("入力");
+        assert!(composer.preedit_active.get());
+        for key in [
+            gdk::Key::Return,
+            gdk::Key::KP_Enter,
+            gdk::Key::ISO_Enter,
+            gdk::Key::Up,
+            gdk::Key::KP_Up,
+            gdk::Key::Down,
+            gdk::Key::KP_Down,
+            gdk::Key::Tab,
+            gdk::Key::ISO_Left_Tab,
+            gdk::Key::Escape,
+        ] {
+            for state in [
+                gdk::ModifierType::empty(),
+                gdk::ModifierType::SHIFT_MASK,
+                gdk::ModifierType::CONTROL_MASK,
+            ] {
+                assert_eq!(composer.on_key(key, state), glib::Propagation::Proceed);
+            }
+        }
+        assert!(host.submitted.borrow().is_empty());
+        assert_eq!(host.interrupts.get(), 0);
+        assert_eq!(composer.text(), "draft");
+        composer.view.emit_preedit_changed("");
+        assert!(!composer.preedit_active.get());
+        assert_eq!(
+            composer.on_key(gdk::Key::Return, gdk::ModifierType::empty()),
+            glib::Propagation::Stop
+        );
+        assert_eq!(*host.submitted.borrow(), ["draft"]);
+        composer.dispose();
+    }
+
+    #[test]
+    fn keys_pass_through_during_preedit() {
+        for key in [Key::Enter, Key::Up, Key::Down, Key::Tab, Key::Escape] {
+            assert!(keys_pass_to_ime(true, key));
+            assert!(!keys_pass_to_ime(false, key));
+        }
+        assert!(!keys_pass_to_ime(true, Key::Other));
+    }
+
+    #[derive(Default)]
+    struct Host {
+        running: Cell<bool>,
+        interrupts: Cell<usize>,
+        submitted: RefCell<Vec<String>>,
+    }
+
+    impl ComposerHost for Host {
+        fn submit(&self, text: &str) {
+            self.submitted.borrow_mut().push(text.to_owned());
+        }
+        fn interrupt(&self) {
+            self.interrupts.set(self.interrupts.get() + 1);
+        }
+        fn running(&self) -> bool {
+            self.running.get()
+        }
+        fn run_builtin(&self, _name: &str) {}
+        fn command_items(&self, _trigger: &Trigger) -> Vec<CompletionItem> {
+            Vec::new()
+        }
+        fn request_files(&self, _query: &str) -> Option<String> {
+            None
+        }
+        fn placeholder(&self) -> String {
+            "Message Codex".to_owned()
+        }
+    }
+
+    /// Runs on the window smoke test's GTK thread. Exercise the actual button callback: a
+    /// non-empty draft previously made the visually labelled Stop button submit another turn.
+    pub(crate) fn stop_preserves_a_draft_and_completions_stay_in_the_field() {
+        let host = Rc::new(Host::default());
+        host.running.set(true);
+        let host_trait: Rc<dyn ComposerHost> = host.clone();
+        let composer = Composer::new();
+        composer.set_host(Rc::downgrade(&host_trait));
+        composer.set_running(true, None);
+        composer.set_text("Keep this unfinished draft 📝");
+        composer.send.emit_clicked();
+        assert_eq!(host.interrupts.get(), 1, "Stop interrupts the running turn");
+        assert!(
+            host.submitted.borrow().is_empty(),
+            "Stop never submits a draft"
+        );
+        assert_eq!(composer.text(), "Keep this unfinished draft 📝");
+
+        let window = gtk4::Window::new();
+        window.set_child(Some(composer.widget()));
+        window.present();
+        composer.grab_focus();
+        composer.show_entries(
+            vec![
+                Entry::File("src/one.rs".into()),
+                Entry::File("src/two.rs".into()),
+            ],
+            "@",
+        );
+        assert!(gtk4::test_accessible_has_property(
+            &composer.view,
+            gtk4::AccessibleProperty::Label
+        ));
+        assert!(gtk4::test_accessible_has_relation(
+            &composer.view,
+            gtk4::AccessibleRelation::Controls
+        ));
+        assert!(gtk4::test_accessible_has_relation(
+            &composer.view,
+            gtk4::AccessibleRelation::ActiveDescendant
+        ));
+        assert_eq!(
+            composer.on_key(gdk::Key::Down, gdk::ModifierType::empty()),
+            glib::Propagation::Stop
+        );
+        assert_eq!(composer.list.selected_row().map(|row| row.index()), Some(1));
+        assert_eq!(
+            gtk4::prelude::GtkWindowExt::focus(&window).as_ref(),
+            Some(composer.view.upcast_ref::<gtk4::Widget>())
+        );
+        composer.close_popup();
+        assert!(!gtk4::test_accessible_has_relation(
+            &composer.view,
+            gtk4::AccessibleRelation::ActiveDescendant
+        ));
+        composer.dispose();
+        window.set_child(None::<&gtk4::Widget>);
+        drop(composer);
+        window.destroy();
+    }
+}

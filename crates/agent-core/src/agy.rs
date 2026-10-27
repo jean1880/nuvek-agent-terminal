@@ -766,18 +766,14 @@ impl Adapter for AgyAdapter {
         }
     }
 
+    /// A side command is a reading, never the thread's work: it raises no `RateLimited`, which
+    /// says the agent refused a turn (and may arrive after the next turn has started). A usage
+    /// reading at 100 % is still a `QuotaUpdated`, which the window reads as out of quota.
     fn feed_side(&mut self, id: &str, stdout: &str, success: bool) -> Vec<Envelope> {
         let kind = self.side_kinds.remove(id).unwrap_or(SideKind::Json);
         let mut quota = None;
-        let mut rate_limit = None;
         let event = if !success {
             let detail = stdout.trim().lines().next().unwrap_or("").trim();
-            if crate::quota::is_rate_limit_or_quota(detail) {
-                rate_limit = Some(Event::RateLimited {
-                    resets_at: None,
-                    detail: Some(Value::String(detail.to_owned())),
-                });
-            }
             Event::ControlResult {
                 ok: None,
                 error: Some(if detail.is_empty() {
@@ -800,12 +796,6 @@ impl Adapter for AgyAdapter {
                     let doc = parse_side_json(stdout);
                     let windows = crate::quota::agy_usage(&doc);
                     if !windows.is_empty() {
-                        if let Some(w) = windows.iter().find(|w| w.used >= 1.0) {
-                            rate_limit = Some(Event::RateLimited {
-                                resets_at: w.resets_at.clone(),
-                                detail: Some(Value::String("Quota exhausted".to_owned())),
-                            });
-                        }
                         quota = Some(Event::QuotaUpdated {
                             account: None,
                             windows,
@@ -819,7 +809,6 @@ impl Adapter for AgyAdapter {
             }
         };
         let mut out = vec![Envelope::new(event).request(id)];
-        out.extend(rate_limit.map(Envelope::new));
         out.extend(quota.map(Envelope::new));
         out
     }
@@ -1913,6 +1902,30 @@ mod tests {
         assert!(
             matches!(&ev[0].event, Event::ControlResult { ok: None, error: Some(e) }
             if e == "boom")
+        );
+
+        // A reading is never a refusal: an exhausted bucket, or a /usage that failed for quota,
+        // raises no RateLimited (the exhausted bucket is still in the QuotaUpdated).
+        a.encode(Command::Control {
+            id: "x".into(),
+            control: Control::Usage,
+        })
+        .expect("ok");
+        let doc = r#"{"command":{"name":"usage","data":{"groups":[{"name":"Gemini 4 Argon","buckets":[{"window":"weekly","remaining_fraction":0.0,"reset_time":"2026-10-27T20:16:58Z"}]}]}}}"#;
+        let ev = a.feed_side("x", doc, true);
+        assert!(
+            !ev.iter()
+                .any(|e| matches!(e.event, Event::RateLimited { .. })),
+            "{ev:?}"
+        );
+        assert!(ev.iter().any(
+            |e| matches!(&e.event, Event::QuotaUpdated { windows, .. } if windows[0].used >= 1.0)
+        ));
+        let ev = a.feed_side("y", "You have exhausted your quota", false);
+        assert!(
+            !ev.iter()
+                .any(|e| matches!(e.event, Event::RateLimited { .. })),
+            "{ev:?}"
         );
     }
 

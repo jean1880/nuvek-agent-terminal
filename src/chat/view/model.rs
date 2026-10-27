@@ -2591,32 +2591,39 @@ impl Transcript {
 }
 
 fn rate_limit_notice(resets_at: Option<&str>, now: i64) -> String {
-    let local = resets_at.and_then(|at| match at.parse::<i64>() {
-        Ok(epoch) => {
-            let seconds = if at.len() == 13 && at.bytes().all(|b| b.is_ascii_digit()) {
-                epoch / 1000
-            } else {
-                epoch
-            };
-            gtk4::glib::DateTime::from_unix_local(seconds).ok()
-        }
-        Err(_) => gtk4::glib::DateTime::from_iso8601(at, None)
-            .and_then(|at| at.to_local())
-            .ok(),
-    });
-    let today = gtk4::glib::DateTime::from_unix_local(now).ok();
-    let formatted = local.and_then(|at| {
-        let same_day = today.is_some_and(|today| {
-            (at.year(), at.month(), at.day_of_month())
-                == (today.year(), today.month(), today.day_of_month())
-        });
-        at.format(if same_day { "%H:%M" } else { "%Y-%m-%d %H:%M" })
-            .ok()
-    });
+    let formatted = resets_at
+        .and_then(reset_epoch)
+        .and_then(|at| reset_clock(at, now));
     match formatted {
         Some(at) => format!("Rate limited. The quota resets at {at}."),
         None => "Rate limited by the provider.".to_owned(),
     }
+}
+
+/// A quota reset time as an agent reports it, in epoch seconds: epoch seconds or milliseconds
+/// (Claude), or RFC 3339 (agy, Codex windows).
+pub(crate) fn reset_epoch(at: &str) -> Option<i64> {
+    match at.parse::<i64>() {
+        Ok(epoch) if at.len() == 13 && at.bytes().all(|b| b.is_ascii_digit()) => Some(epoch / 1000),
+        Ok(epoch) => Some(epoch),
+        Err(_) => gtk4::glib::DateTime::from_iso8601(at, None)
+            .ok()
+            .map(|at| at.to_unix()),
+    }
+}
+
+/// `at` (epoch seconds) on the local clock: `16:40` on `now`'s day, else `2026-10-27 16:40`.
+pub(crate) fn reset_clock(at: i64, now: i64) -> Option<String> {
+    let local = gtk4::glib::DateTime::from_unix_local(at).ok()?;
+    let today = gtk4::glib::DateTime::from_unix_local(now).ok();
+    let same_day = today.is_some_and(|today| {
+        (local.year(), local.month(), local.day_of_month())
+            == (today.year(), today.month(), today.day_of_month())
+    });
+    local
+        .format(if same_day { "%H:%M" } else { "%Y-%m-%d %H:%M" })
+        .ok()
+        .map(Into::into)
 }
 
 /// Compact token count for the gauge and the compaction divider: `950`, `21k`, `1.2M`.

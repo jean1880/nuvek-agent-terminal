@@ -637,6 +637,16 @@ pub fn limit_over(event: &Event) -> bool {
     }
 }
 
+/// The wait banner's title while a thread waits for `driver`'s usage limit to reset; `clock`:
+/// the reset's local time, when known.
+pub fn limit_wait_text(driver: Driver, clock: Option<&str>) -> String {
+    let label = driver.info().label;
+    match clock {
+        Some(clock) => format!("Continues here after {label}'s limit resets at {clock}"),
+        None => format!("Continues here once {label} has usage again"),
+    }
+}
+
 /// The "Continue in a new thread with…" button for a target from [`safe_handoff_target`].
 pub fn continue_label(target: Driver, unasked: bool) -> String {
     if unasked {
@@ -1963,6 +1973,20 @@ mod tests {
         assert_eq!(
             continue_label(Agy, true),
             format!("Continue in {} (edits without asking)", Agy.info().label)
+        );
+    }
+
+    #[test]
+    fn a_limit_wait_says_when_it_continues() {
+        use Driver::Claude;
+        let label = Claude.info().label;
+        assert_eq!(
+            limit_wait_text(Claude, Some("16:40")),
+            format!("Continues here after {label}'s limit resets at 16:40")
+        );
+        assert_eq!(
+            limit_wait_text(Claude, None),
+            format!("Continues here once {label} has usage again")
         );
     }
 }

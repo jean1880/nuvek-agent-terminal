@@ -4526,6 +4526,20 @@ impl AgentTerminalWindow {
         behaviour.add(&cli_client_row);
         behaviour.add(&scrollback_row);
         behaviour.add(&suspend_row);
+        let continue_row = self.config_switch(
+            "Continue When Usage Limits Reset",
+            "A thread whose agent ran out of usage waits for its limit to reset, then restarts \
+             the agent if needed and asks it to carry on. A thread's Don't Continue cancels its \
+             wait",
+            |c| c.continue_after_limit,
+            SaveWhen::Debounced(|c, on| c.continue_after_limit = on),
+            |imp, on| {
+                if !on {
+                    imp.for_each_window(Self::cancel_limit_waits);
+                }
+            },
+        );
+        behaviour.add(&continue_row);
         let outside_row = self.config_switch(
             "Show Sessions Started Outside Agent Terminal",
             "List the agents' own recent sessions (started in a terminal or another tool) as \

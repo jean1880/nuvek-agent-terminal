@@ -691,6 +691,10 @@ pub struct TerminalConfig {
     /// its memory (an agent holds hundreds of MB); its conversation resumes with the next
     /// prompt. 0 never stops one.
     pub idle_suspend_minutes: u32,
+    /// A thread whose agent hit its usage limit continues on its own once the limit resets: its
+    /// process is started again if needed and the app asks it to carry on. On by default (an
+    /// older config opts in); a thread's "Don't continue" cancels one wait.
+    pub continue_after_limit: bool,
     /// Reopen the previous window's tabs on launch. Off by default: a restored
     /// tab gets its directory and profile back but starts a fresh conversation,
     /// so by default it only multiplies blank sessions.
@@ -1122,6 +1126,7 @@ impl Default for TerminalConfig {
             notify_on_quota: true,
             check_updates_on_startup: true,
             idle_suspend_minutes: 15,
+            continue_after_limit: true,
             restore_session: false,
             checkpoints: true,
             diff_panel_visible: false,
@@ -2301,6 +2306,22 @@ mod tests {
             .write_all(br#"{"check_updates_on_startup":false}"#)
             .unwrap();
         assert!(!TerminalConfig::load_from(&path).check_updates_on_startup);
+    }
+
+    #[test]
+    fn continuing_after_a_usage_limit_is_on_unless_turned_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"notify_on_bell":false}"#)
+            .unwrap();
+        assert!(TerminalConfig::load_from(&path).continue_after_limit);
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"continue_after_limit":false}"#)
+            .unwrap();
+        assert!(!TerminalConfig::load_from(&path).continue_after_limit);
     }
 
     #[test]

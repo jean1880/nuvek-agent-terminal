@@ -235,6 +235,21 @@ Architectural mandates, standards, and workflows for this codebase.
   store. A mode or same-agent model picked while suspended is kept for the resume (never Bypass);
   other controls say, unstored, that the agent is paused. The next prompt resumes the same native
   session (`ensure_alive`).
+- **A thread stopped by its usage limit continues once it resets, unless told not to**: with
+  `continue_after_limit` on (default; Settings → Behaviour), a root thread whose turn failed for
+  quota (never a rate limit alone, which may be a tool's own 429, nor a usage reading, which may
+  name a window the thread does not use) waits (`agent_core::limit_wait`): until the reset time a
+  rate limit in that turn gave, plus a minute, or, with none, until a prompt-less usage probe
+  taken after the limit shows every window that was exhausted when the wait started free
+  (probed at 2, 5, 10, then every 15 minutes, or just after the latest reset those windows
+  name). Readings count from when windows last arrived (`updated_at`), never an account-only
+  update. agy's `/usage` side command never raises `RateLimited`: a reading is not a refusal. The window's minute sweep (`continue_after_limits`)
+  then calls `ChatSession::continue_after_limit`, which sends the app's continue prompt as a
+  notice in the same native session, starting the process again if it is gone. Never into a
+  running turn or anything a wake waits for, never for a delegated worker, never for a root the
+  user stopped. The wait ends when the agent works again, the thread switches agent (the
+  hand-off included), the user picks "Don't Continue" on its banner, or the setting goes off.
+  `limit_wait::tests` and the session test `a_thread_continues_after_its_limit_*` prove these.
 - **Agent processes get a cleaned environment**: `clear_env` and any inherited
   approval-socket variables are removed (`SpawnSpec::unset`), then the profile's
   env file, then the approval socket.

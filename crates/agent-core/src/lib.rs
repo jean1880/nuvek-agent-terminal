@@ -22,6 +22,7 @@ pub mod form;
 pub mod git_command;
 pub mod handoff_budget;
 pub mod import;
+pub mod limit_wait;
 pub mod model_tags;
 pub mod question_extract;
 pub mod quota;

@@ -28,9 +28,11 @@ use crate::approval_server::ApprovalHandle;
 use crate::availability::{
     classify, probe_targets, unavailable_banner, AgentAvailability, Availability,
 };
+use crate::chat::session::ContinueOutcome;
 use crate::chat::session::{
     build_handoff, retired_notice, AgentLaunch, Approval, ChatSession, RetiredModel,
 };
+use crate::chat::view::model::{reset_clock, reset_epoch};
 use crate::chat::view::usage::UsageIndicator;
 use crate::chat::view::{ChatView, ViewAction};
 use crate::chat::{ChatBackend, EnvelopeSink, SessionStatus};
@@ -44,14 +46,53 @@ use crate::window::sidebar_model::{
     OpenState, Redraw, ResumeAs, RowKey, SidebarModel, SidebarRow,
 };
 use crate::window::sidebar_model::{
-    reopen_offer, sessions_added_toast, thread_activity, ThreadActivity,
+    limit_wait_text, reopen_offer, sessions_added_toast, thread_activity, ThreadActivity,
 };
+use agent_core::limit_wait::{LimitWait, Step, Window as LimitWindow};
 
 /// Removes every row of `list`, and only rows: an open thread menu is also the list's child, and
 /// `remove` refuses it, so walking `first_child` would never end.
 fn clear_rows(list: &gtk4::ListBox) {
     while let Some(row) = list.row_at_index(0) {
         list.remove(&row);
+    }
+}
+
+/// An agent's quota windows as a usage-limit wait reads them, keyed by group and label.
+fn limit_windows(windows: &[agent_core::event::QuotaWindow]) -> Vec<LimitWindow> {
+    windows
+        .iter()
+        .map(|w| LimitWindow {
+            key: format!("{}\u{1f}{}", w.group.as_deref().unwrap_or(""), w.label),
+            used: w.used,
+            resets_at: w.resets_at.as_deref().and_then(reset_epoch),
+        })
+        .collect()
+}
+
+/// When the limit a refusal reports resets (epoch seconds), when it says: only a rate limit
+/// names a time.
+fn limit_reset_of(event: &Event) -> Option<i64> {
+    match event {
+        Event::RateLimited { resets_at, .. } => resets_at.as_deref().and_then(reset_epoch),
+        _ => None,
+    }
+}
+
+/// Whether `event` says the agent refused the thread's work over its usage limit: only a turn
+/// that failed for quota. A rate limit alone is not (agy raises one for a tool's own 429, and a
+/// usage reading may name a window the thread does not use); one inside the turn only says when
+/// the limit resets.
+fn limit_refused(event: &Event) -> bool {
+    match event {
+        Event::TurnCompleted {
+            state: agent_core::event::TurnState::Failed,
+            error,
+            ..
+        } => error
+            .as_deref()
+            .is_some_and(agent_core::quota::is_rate_limit_or_quota),
+        _ => false,
     }
 }
 
@@ -697,6 +738,14 @@ pub(super) struct ChatTab {
     drawer_paned: gtk4::Paned,
     drawer_started: bool,
     rate_banner: adw::Banner,
+    /// Shown while [`Self::limit_wait`] runs: when the thread continues, and "Don't Continue".
+    wait_banner: adw::Banner,
+    /// The thread's agent hit its usage limit and the thread continues once it resets
+    /// (`continue_after_limit`); `None` when it does not wait.
+    limit_wait: Option<agent_core::limit_wait::LimitWait>,
+    /// When a rate limit inside the running turn said the limit resets: the wait its failure
+    /// starts uses it.
+    limit_reset_seen: Option<i64>,
     /// Shown when the thread's model is no longer offered by its agent.
     model_banner: adw::Banner,
     /// Shown while the thread's agent is installed but no one is signed in to it.
@@ -763,6 +812,23 @@ pub(super) struct ChatTab {
 }
 
 impl ChatTab {
+    /// The thread no longer waits for its usage limit.
+    fn end_limit_wait(&mut self) {
+        self.limit_wait = None;
+        self.wait_banner.set_revealed(false);
+    }
+
+    /// Says on the wait banner when the thread continues.
+    fn show_limit_wait(&self, now: i64) {
+        let Some(wait) = &self.limit_wait else {
+            return;
+        };
+        let clock = wait.reset().and_then(|at| reset_clock(at, now));
+        self.wait_banner
+            .set_title(&limit_wait_text(self.driver, clock.as_deref()));
+        self.wait_banner.set_revealed(true);
+    }
+
     /// Whether stopping the agent to free its memory must wait: [`Self::busy`] (a turn,
     /// background work, a question, delegated workers), or anything about to happen (a build or
     /// start, a close or switch question on screen, something waiting to be sent or applied).
@@ -2704,6 +2770,7 @@ impl AgentTerminalWindow {
                         obj.imp().refresh_sidebar();
                     }
                     obj.imp().suspend_idle_threads();
+                    obj.imp().continue_after_limits();
                     glib::ControlFlow::Continue
                 }
             ),
@@ -2751,6 +2818,146 @@ impl AgentTerminalWindow {
         }
         if paused {
             self.refresh_sidebar();
+        }
+    }
+
+    /// `thread`'s agent refused its work over its usage limit ([`limit_refused`]); `reset`: when
+    /// it said the limit resets. Unless Settings turned it off or the thread is a delegated
+    /// worker, the thread waits for the limit to be over and continues
+    /// ([`Self::continue_after_limits`]). A wait already running learns a later reset time from
+    /// another refusal only: a quota reading may name a window the thread does not use.
+    fn arm_limit_wait(&self, thread: &str, reset: Option<i64>) {
+        if !self.config.borrow().continue_after_limit {
+            return;
+        }
+        let session = self
+            .tabs
+            .borrow()
+            .iter()
+            .filter_map(|t| t.chat.as_ref())
+            .find(|c| c.thread == thread)
+            .and_then(|c| c.slot.get());
+        if session.is_none_or(|s| s.is_delegated_child()) {
+            return;
+        }
+        let now = crate::freshness::now_epoch();
+        let mut tabs = self.tabs.borrow_mut();
+        let Some(chat) = tabs
+            .iter_mut()
+            .filter_map(|t| t.chat.as_mut())
+            .find(|c| c.thread == thread)
+        else {
+            return;
+        };
+        match &mut chat.limit_wait {
+            Some(wait) => wait.learn(reset, now),
+            None => {
+                info!(
+                    "thread {thread} waits for its usage limit to reset (reset time known: {})",
+                    reset.is_some()
+                );
+                // What the agent's windows hold now names what stopped the thread.
+                let held = limit_windows(&AccountStatus::shared().snapshot(chat.driver).windows);
+                chat.limit_wait = Some(LimitWait::new(reset, now, &held));
+            }
+        }
+        chat.show_limit_wait(now);
+    }
+
+    /// "Don't Continue": `thread` stops waiting for its usage limit (until it hits it again).
+    pub(super) fn cancel_limit_wait(&self, thread: &str) {
+        let mut tabs = self.tabs.borrow_mut();
+        if let Some(chat) = tabs
+            .iter_mut()
+            .filter_map(|t| t.chat.as_mut())
+            .find(|c| c.thread == thread && c.limit_wait.is_some())
+        {
+            chat.end_limit_wait();
+            info!("thread {thread} will not continue on its own after its usage limit");
+        }
+    }
+
+    /// Settings turned continuing after a usage limit off: no thread here waits any more.
+    pub(super) fn cancel_limit_waits(&self) {
+        for chat in self
+            .tabs
+            .borrow_mut()
+            .iter_mut()
+            .filter_map(|t| t.chat.as_mut())
+        {
+            chat.end_limit_wait();
+        }
+    }
+
+    /// The minute's check of the threads waiting for a usage limit: one whose limit is over
+    /// continues (its agent is started again if it is gone); one with no reset time asks for a
+    /// prompt-less usage reading now and then. A thread that cannot take the prompt now (a turn,
+    /// a prompt or an approval in the way) is tried again on the next minute.
+    pub(super) fn continue_after_limits(&self) {
+        if !self.config.borrow().continue_after_limit || self.is_closing() {
+            return;
+        }
+        let now = crate::freshness::now_epoch();
+        let status = AccountStatus::shared();
+        let mut probe: Vec<Driver> = Vec::new();
+        let mut due: Vec<(String, Rc<ChatSession>)> = Vec::new();
+        for chat in self
+            .tabs
+            .borrow_mut()
+            .iter_mut()
+            .filter_map(|t| t.chat.as_mut())
+        {
+            let driver = chat.driver;
+            let Some(wait) = chat.limit_wait.as_mut() else {
+                continue;
+            };
+            let snap = status.snapshot(driver);
+            let windows = limit_windows(&snap.windows);
+            // When quota windows last arrived: an account-only update moves `read_at`, not this.
+            match wait.step(now, snap.updated_at.map(|at| (at, windows.as_slice()))) {
+                Step::Wait => {}
+                Step::Probe if !probe.contains(&driver) => probe.push(driver),
+                Step::Probe => {}
+                Step::Continue => {
+                    if let Some(session) = chat.slot.get() {
+                        due.push((chat.thread.clone(), session));
+                    }
+                }
+            }
+            chat.show_limit_wait(now);
+        }
+        if !probe.is_empty() {
+            let known = ModelCatalog::shared().last_targets();
+            let targets = crate::probe::ProbeTargets::new(
+                probe
+                    .into_iter()
+                    .filter_map(|d| known.get(d).map(|t| (d, t.clone())))
+                    .collect(),
+            );
+            status.refresh_if_older_than(&targets, 60, now);
+        }
+        // No borrow is held: a session may call back into the window.
+        for (thread, session) in due {
+            match session.continue_after_limit() {
+                ContinueOutcome::Started => {
+                    info!("thread {thread} continues: its usage limit has reset");
+                    self.end_limit_wait_of(&thread);
+                }
+                ContinueOutcome::Busy => {}
+                ContinueOutcome::Refused => self.end_limit_wait_of(&thread),
+            }
+        }
+    }
+
+    fn end_limit_wait_of(&self, thread: &str) {
+        if let Some(chat) = self
+            .tabs
+            .borrow_mut()
+            .iter_mut()
+            .filter_map(|t| t.chat.as_mut())
+            .find(|c| c.thread == thread)
+        {
+            chat.end_limit_wait();
         }
     }
 
@@ -4587,6 +4794,18 @@ impl AgentTerminalWindow {
                 banner.set_revealed(false);
             }
         ));
+        // Under it while the thread waits for its usage limit to reset: "Don't Continue" ends
+        // that wait (the hand-off above stays offered).
+        let wait_banner = adw::Banner::builder()
+            .use_markup(false)
+            .button_label("Don't Continue")
+            .build();
+        let thread_id = thread.to_owned();
+        wait_banner.connect_button_clicked(move |b| {
+            if let Some(obj) = window_of(b) {
+                obj.imp().cancel_limit_wait(&thread_id);
+            }
+        });
         // Another banner for a model its agent no longer offers: "Choose…" opens the picker.
         let model_banner = adw::Banner::builder()
             .use_markup(false)
@@ -4610,6 +4829,7 @@ impl AgentTerminalWindow {
         let content = Box::builder().orientation(Orientation::Vertical).build();
         content.append(&sign_in_banner);
         content.append(&rate_banner);
+        content.append(&wait_banner);
         content.append(&model_banner);
         content.append(&paned);
 
@@ -4692,6 +4912,9 @@ impl AgentTerminalWindow {
                 drawer_paned,
                 drawer_started: false,
                 rate_banner,
+                wait_banner,
+                limit_wait: None,
+                limit_reset_seen: None,
                 model_banner,
                 sign_in_banner,
                 running: false,
@@ -5327,6 +5550,9 @@ impl AgentTerminalWindow {
         // for a reopen). Not before: a switch whose agent never starts rolls back, and the old
         // agent must restart on its own profile.
         let mut clear_profile = false;
+        // The agent refused the turn over its usage limit ([`limit_refused`]): may start a wait,
+        // with the reset time a rate limit in that turn gave.
+        let refused: Option<Option<i64>>;
         enum After {
             Nothing,
             Sidebar,
@@ -5365,6 +5591,21 @@ impl AgentTerminalWindow {
                 chat.rate_limited = false;
                 chat.rate_banner.set_revealed(false);
             }
+            // The agent is at work again, or the thread runs another agent now: the limit it
+            // waited out is not this one's any more.
+            if chat.limit_wait.is_some() && (switched || limit_over(&env.event)) {
+                chat.end_limit_wait();
+            }
+            // Read before the turn's end below closes it.
+            if matches!(env.event, Event::TurnStarted { .. }) {
+                chat.limit_reset_seen = None;
+            }
+            if chat.running {
+                if let Some(reset) = limit_reset_of(&env.event) {
+                    chat.limit_reset_seen = Some(reset);
+                }
+            }
+            refused = limit_refused(&env.event).then(|| chat.limit_reset_seen.take());
             let after = match &env.event {
                 Event::TurnStarted { .. } => {
                     chat.running = true;
@@ -5595,6 +5836,9 @@ impl AgentTerminalWindow {
                     None => banner.set_button_label(None),
                 }
                 banner.set_revealed(true);
+                if let Some(reset) = refused {
+                    self.arm_limit_wait(thread, reset);
+                }
                 self.refresh_sidebar();
             }
             After::TurnDone { page, notify } => {
@@ -5975,6 +6219,8 @@ impl AgentTerminalWindow {
         let Some(slot) = self.slot_of(thread) else {
             return;
         };
+        // The work goes on in the other agent: the old one's limit is not waited out.
+        self.cancel_limit_wait(thread);
         if slot.get().is_some() {
             slot.switch(target, model, effort);
             return;
@@ -7536,6 +7782,44 @@ fn is_interruption(event: &Event) -> bool {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    /// Only a turn that failed for quota starts a usage-limit wait. A rate limit (a tool's own
+    /// 429 on agy, a usage reading), a quota error or a quota reading at 100 % never does; a rate
+    /// limit only names the reset time.
+    #[test]
+    fn only_a_turn_refused_for_quota_starts_a_limit_wait() {
+        use agent_core::event::{QuotaWindow, TurnState};
+        let limited = Event::RateLimited {
+            resets_at: Some("1793047200".into()),
+            detail: None,
+        };
+        assert!(!limit_refused(&limited));
+        assert_eq!(limit_reset_of(&limited), Some(1_793_047_200));
+        let failed = |error: &str| Event::TurnCompleted {
+            state: TurnState::Failed,
+            usage: None,
+            cost_usd: None,
+            error: Some(error.into()),
+        };
+        assert!(limit_refused(&failed("You've hit your session limit")));
+        assert!(limit_refused(&failed("You have exhausted your quota")));
+        assert!(!limit_refused(&failed("syntax error")));
+        let error = Event::Error {
+            message: "429 Too Many Requests".into(),
+        };
+        assert!(!limit_refused(&error));
+        let reading = Event::QuotaUpdated {
+            account: None,
+            windows: vec![QuotaWindow {
+                group: None,
+                label: "5-hour".into(),
+                used: 1.0,
+                resets_at: Some("2026-10-26T20:40:00Z".into()),
+            }],
+        };
+        assert!(!limit_refused(&reading));
+        assert_eq!(limit_reset_of(&reading), None);
+    }
 
     /// The file store at a path, installed as the app's (reader, path and writer) for one test.
     /// Dropping it takes all three out again, so a failing test leaves no store behind.

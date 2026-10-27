@@ -1930,6 +1930,77 @@ fn a_root_is_woken_by_news_only_when_idle_within_the_cap_and_never_after_a_stop(
     });
 }
 
+/// Continuing after a usage limit: sent with its notice when idle, never into a running turn,
+/// the process started again (same session) when it is gone, and never into a root the user
+/// stopped or a delegated worker.
+#[test]
+fn a_thread_continues_after_its_limit_only_when_idle_and_restarts_a_gone_agent() {
+    use crate::chat::session::ContinueOutcome;
+    in_loop(|ctx| {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, &dir.path().to_string_lossy());
+        let (sink, seen) = make_sink();
+        let session = ChatSession::with_options(
+            Box::new(agent_core::claude::ClaudeAdapter::new()),
+            super::idle_claude(dir.path()),
+            SessionStore::from(store),
+            thread,
+            sink,
+            Err(None),
+            minimal_env(dir.path()),
+            SessionOptions {
+                generation_base: ProcessGeneration(0),
+                hooks: None,
+                child: None,
+            },
+        );
+        let prompts =
+            || std::fs::read_to_string(dir.path().join("prompts.log")).unwrap_or_default();
+        let continued = || prompts().matches("Your usage limit has reset").count();
+        let notices = || {
+            seen.borrow()
+                .iter()
+                .filter(|e| matches!(&e.event, Event::Notice { text } if text.starts_with("Usage limit reset")))
+                .count()
+        };
+        let idle = |s: &ChatSession| s.status().alive && !s.status().running_turn;
+        assert!(!session.is_delegated_child());
+        assert!(pump_until(ctx, 10, || has(&seen, |e| matches!(
+            e,
+            Event::TurnCompleted { .. }
+        )) && idle(&session)));
+        session.send_prompt("first");
+        assert!(pump_until(ctx, 10, || idle(&session)));
+
+        // A running turn is never cut into.
+        session.send_prompt("second");
+        assert!(session.status().running_turn);
+        assert_eq!(session.continue_after_limit(), ContinueOutcome::Busy);
+        assert_eq!(notices(), 0);
+        assert!(pump_until(ctx, 10, || idle(&session)));
+
+        // Idle: sent, with its notice.
+        assert_eq!(session.continue_after_limit(), ContinueOutcome::Started);
+        assert_eq!(notices(), 1);
+        assert!(pump_until(ctx, 10, || continued() == 1));
+        assert!(pump_until(ctx, 10, || idle(&session)));
+
+        // A process that is gone is started again for it.
+        session.inner.stop_current();
+        assert!(pump_until(ctx, 10, || !session.status().alive));
+        assert_eq!(session.continue_after_limit(), ContinueOutcome::Started);
+        assert!(pump_until(ctx, 10, || continued() == 2));
+        assert!(pump_until(ctx, 10, || idle(&session)));
+
+        // A root the user stopped never continues on its own.
+        session.hold_wakes();
+        assert_eq!(session.continue_after_limit(), ContinueOutcome::Refused);
+        assert_eq!(notices(), 2);
+        session.shutdown(false);
+    });
+}
+
 /// A wake whose send is refused posts no notice (the supervisor offers it again each second,
 /// and each offer would otherwise leave one); the retry that is sent posts exactly one.
 #[test]

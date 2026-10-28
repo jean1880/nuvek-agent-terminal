@@ -1075,7 +1075,9 @@ impl Store {
                 kind: req.kind,
             }),
             seq: 0,
-            complete_now: false,
+            // A child's send to its parent is mailbox data, delivered once stored: nothing
+            // dispatches it, so its operation is done at acceptance (as an ACK is).
+            complete_now: direction == Direction::ChildToParent,
         }))
     }
 
@@ -1316,6 +1318,11 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(op.to_string()))?;
         let from: OperationState = parse_name("dispatch state", &row.dispatch_state)?;
         operation_step(from, to).map_err(|_| illegal("operation"))?;
+        // An epoch carried by a revocation applies only while it is accepted: every way out
+        // of `accepted` (reservation, failure, revocation, restart) drops it, in this unit.
+        if from == OperationState::Accepted {
+            self.delete_meta(&carried_epoch_key(&row.id))?;
+        }
         // Every stored error is scrubbed whole (message and every string of its nested details):
         // it is replayed to callers verbatim.
         let error_json = error
@@ -1404,7 +1411,6 @@ impl Store {
         let op = operation_id(&row.id)?;
         let stored = error.clone().with_detail("operation_id", row.id.as_str());
         self.step_operation(&op, OperationState::Failed, Some(&stored), now)?;
-        self.delete_meta(&carried_epoch_key(&row.id))?;
         let mut cancelled = Vec::new();
         for m in self.messages_of_operation(&row.id)? {
             // Only a delivery that would drive a child is cancelled; a child→parent entry is
@@ -1484,7 +1490,6 @@ impl Store {
             return Ok(Err(e.with_detail("operation_id", op.as_str())));
         }
         self.step_operation(op, OperationState::DispatchReserved, None, now)?;
-        self.delete_meta(&carried_epoch_key(&row.id))?;
         let messages = self.messages_of_operation(&row.id)?;
         for m in &messages {
             if !self.try_step_message(m, DeliveryState::DispatchReserved, None, now)? {
@@ -1629,10 +1634,15 @@ impl Store {
                     // An `auto` message promised no run: one its refused steer aimed at and
                     // that it then reached on the next turn is delivered, not misdelivered.
                     let auto = row.delivery_policy == name_of(&Delivery::Auto);
-                    if let (Some(t), Some(o)) = (row.target_run_id.as_deref(), observed) {
-                        if t != o && !auto {
+                    match (row.target_run_id.as_deref(), observed) {
+                        (Some(t), Some(o)) if t != o && !auto => {
                             return Err(illegal("confirmed in another run is misdelivered"));
                         }
+                        // A message pinned to a run is confirmed only in a run it names.
+                        (Some(_), None) if !auto => {
+                            return Err(illegal("a targeted message is confirmed in a run"));
+                        }
+                        _ => {}
                     }
                 }
                 _ => {}
@@ -1644,12 +1654,15 @@ impl Store {
     }
 
     /// An `auto` parent→child message whose steer the recipient's run refused after it was
-    /// written (`submitted`) waits for the recipient's next turn again (`queued_next_turn`), its
-    /// operation still `submitted`: the next delivery reserves it again and confirms it in the run
-    /// it reaches. The only way back from `submitted` (`mailbox::requeue_refused_steer`); any other
-    /// message, or a message in any other state, is refused and left unchanged. The run it was
-    /// aimed at stays recorded as accepted (a frozen fact), and a confirmation in a later run is
-    /// its delivery ([`Store::record_delegation_delivery`]).
+    /// written (`submitted`) waits for the recipient's next turn again (`queued_next_turn`), and
+    /// its operation is `accepted` again, in the same transaction: from here it is any accepted
+    /// send, so its next dispatch is reserved with every check (the epoch, a closed target), and a
+    /// revocation or a restart fails it like any other. Its epoch is the root's current one (it was
+    /// current, being in flight). The only way back from `submitted`, for either
+    /// (`mailbox::requeue_refused_steer`, `operation::requeue_refused_steer`); any other message,
+    /// or one in any other state, is refused and nothing changes. The run it was aimed at stays
+    /// recorded as accepted (a frozen fact), and a confirmation in a later run is its delivery
+    /// ([`Store::record_delegation_delivery`]).
     pub fn requeue_refused_delegation_steer(&self, m: &MessageId) -> Result<DeliveryState> {
         self.atomically(|s| {
             let row = s
@@ -1661,8 +1674,25 @@ impl Store {
             let from: DeliveryState = parse_name("delivery state", &row.delivery_state)?;
             let policy: Delivery = parse_name("delivery policy", &row.delivery_policy)?;
             let to = requeue_refused_steer(from, policy).map_err(|_| illegal("requeue"))?;
+            let op = row
+                .operation_id
+                .as_deref()
+                .and_then(|id| s.delegation_operation(id).transpose())
+                .transpose()?
+                .ok_or_else(|| illegal("a requeued steer needs its operation"))?;
+            let op_from: OperationState = parse_name("dispatch state", &op.dispatch_state)?;
+            let op_to = agent_core::delegation::operation::requeue_refused_steer(op_from)
+                .map_err(|_| illegal("requeue"))?;
             let now = s.now();
             s.set_delegation_message_delivery(m.as_str(), &name_of(&to), None, now)?;
+            s.set_delegation_dispatch_state(&op.id, &name_of(&op_to), None, None, now)?;
+            let root = s.root_row(&op.root_id)?;
+            if root.authority_epoch != op.authority_epoch {
+                s.set_meta(
+                    &carried_epoch_key(&op.id),
+                    &root.authority_epoch.to_string(),
+                )?;
+            }
             Ok(to)
         })
     }
@@ -1900,9 +1930,15 @@ impl Store {
                     out.cancelled
                         .extend(self.invalidate_operation(row, &e, now)?);
                     out.invalidated.push(operation_id(&row.id)?);
-                } else {
-                    // Its row's epoch is frozen at acceptance: the epoch it now holds is kept
-                    // beside it, and reserving its dispatch checks that one.
+                } else if (row.kind == name_of(&OperationKind::Spawn)
+                    || row.kind == name_of(&OperationKind::Send))
+                    && self.operation_epoch(row)? == root.authority_epoch
+                {
+                    // Current work for a child the event did not cover moves to the new epoch.
+                    // Its row's epoch is frozen at acceptance (a schema trigger): the epoch it now
+                    // holds is kept beside it, and reserving its dispatch checks that one. Work
+                    // already stale stays stale; cancels and closes are reserved at acceptance
+                    // and never wait here.
                     self.set_meta(
                         &carried_epoch_key(&row.id),
                         &i64_of(out.authority_epoch).to_string(),

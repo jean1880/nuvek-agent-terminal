@@ -495,11 +495,16 @@ impl Supervisor {
             w.row.state = "stopping".into();
             (w.session(), w.generation, w.pending.take())
         };
-        let pending = data.2.is_some();
         if let Some(input) = data.2 {
             self.state.borrow_mut().dispatching.remove(&input.operation);
+            if let Some(session) = &data.0 {
+                session.expire_approvals(reason);
+            }
             // One completion: the run ends interrupted, then its task's dispatch fails, in the
             // same transaction (a failed dispatch recorded first would end the run as failed).
+            // The child never got its task: it is stopped only once that end committed, since
+            // stopping now would end its startup turn, which would then pass for the task's and
+            // end the run first.
             self.complete_run_with(
                 worker,
                 agent_core::event::TurnState::Interrupted,
@@ -511,9 +516,10 @@ impl Supervisor {
                         input.operation,
                         error(ErrorCode::StaleRun, "run cancelled before dispatch"),
                     )),
-                    stop_after: false,
+                    stop_after: true,
                 },
             );
+            return;
         }
         if let Some(session) = data.0 {
             session.expire_approvals(reason);
@@ -522,10 +528,6 @@ impl Supervisor {
             let worker = worker.clone();
             let run = run.clone();
             let generation = data.1;
-            if pending {
-                session.shutdown(true);
-                return;
-            }
             gtk4::glib::spawn_future_local(async move {
                 glib::timeout_future(Duration::from_millis(500)).await;
                 if let Some(sup) = sup.upgrade() {
@@ -1740,6 +1742,20 @@ impl Supervisor {
             glib::timeout_future(Duration::from_millis(10)).await;
         }
         self.epoch_for(worker, captured)
+    }
+    /// The epoch a delivery from `from` to `target` that captured `captured` goes on under,
+    /// once a revocation being committed is known: both ends are checked against what was
+    /// captured, so a revocation covering either (the target's own exit while its parent stays
+    /// current, say) fails it before the delivery is moved on to the new epoch.
+    pub(super) async fn settled_delivery_epoch(
+        &self,
+        from: &WorkerId,
+        target: &WorkerId,
+        captured: AuthorityEpoch,
+    ) -> Result<AuthorityEpoch, ToolError> {
+        let now = self.settled_epoch_for(from, captured).await?;
+        self.epoch_for(target, captured)?;
+        Ok(now)
     }
     /// Whether a revocation of `worker`'s tree is latched and not yet committed.
     fn revoking(&self, worker: &WorkerId) -> bool {

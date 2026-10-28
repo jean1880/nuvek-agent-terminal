@@ -37,7 +37,7 @@ fn result_cap(sup: &Supervisor) -> usize {
 }
 
 /// The most result bytes a publisher keeps while a run goes on: every part's worth.
-fn result_bound(sup: &Supervisor) -> usize {
+pub(super) fn result_bound(sup: &Supervisor) -> usize {
     result_cap(sup).saturating_mul(agent_core::delegation::mailbox::MAX_RESULT_PARTS)
 }
 
@@ -77,11 +77,66 @@ pub(super) struct Publisher {
     pending: Rc<RefCell<VecDeque<PendingPublication>>>,
     pending_bytes: Rc<Cell<usize>>,
     publishing: Rc<Cell<bool>>,
-    /// The run's result so far, at most [`result_bound`] bytes.
-    result: RefCell<String>,
-    /// Result bytes past that bound, cut as they arrived.
-    result_cut: Cell<usize>,
+    /// The run's result so far: each assistant item's text, in the order the items began, at
+    /// most [`result_bound`] + [`RESULT_LOOKAHEAD`] bytes in all.
+    result: RefCell<Vec<ResultItem>>,
     failed: Rc<Cell<bool>>,
+}
+
+/// Bytes kept past [`result_bound`] so the whole text is redacted before it is cut: a secret
+/// that straddles the bound is masked whole, never left half visible.
+pub(super) const RESULT_LOOKAHEAD: usize = 256;
+
+/// One assistant item's share of a run's result.
+pub(super) struct ResultItem {
+    item: Option<String>,
+    text: String,
+    /// Bytes of it past the bound, cut as they arrived.
+    cut: usize,
+}
+
+/// Adds `text` to `item`'s share of `items` (replacing it for a snapshot), within `limit`
+/// bytes in all.
+pub(super) fn accumulate(
+    items: &mut Vec<ResultItem>,
+    item: Option<&str>,
+    text: &str,
+    replace: bool,
+    limit: usize,
+) {
+    let at = match items.iter().position(|i| i.item.as_deref() == item) {
+        Some(at) => at,
+        None => {
+            items.push(ResultItem {
+                item: item.map(str::to_owned),
+                text: String::new(),
+                cut: 0,
+            });
+            items.len() - 1
+        }
+    };
+    if replace {
+        items[at].text.clear();
+        items[at].cut = 0;
+    }
+    let used: usize = items.iter().map(|i| i.text.len()).sum();
+    let kept = agent_core::text::truncate_bytes(text, limit.saturating_sub(used));
+    let entry = &mut items[at];
+    entry.text.push_str(kept);
+    entry.cut = entry.cut.saturating_add(text.len() - kept.len());
+}
+
+/// The run's whole result, its items in order, and the bytes cut from it as it arrived.
+pub(super) fn take_result(items: &mut Vec<ResultItem>) -> (String, usize) {
+    let items = std::mem::take(items);
+    let cut = items.iter().map(|i| i.cut).sum();
+    let text = items
+        .iter()
+        .map(|i| i.text.as_str())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (text, cut)
 }
 impl Publisher {
     pub(super) fn new(supervisor: Weak<Supervisor>, worker: WorkerId) -> Self {
@@ -93,10 +148,24 @@ impl Publisher {
             pending: Rc::new(RefCell::new(VecDeque::new())),
             pending_bytes: Rc::new(Cell::new(0)),
             publishing: Rc::new(Cell::new(false)),
-            result: RefCell::new(String::new()),
-            result_cut: Cell::new(0),
+            result: RefCell::new(Vec::new()),
             failed: Rc::new(Cell::new(false)),
         }
+    }
+    /// The run's result as it stands, for tests.
+    #[cfg(test)]
+    pub(super) fn result_so_far(&self) -> String {
+        let items = self
+            .result
+            .borrow()
+            .iter()
+            .map(|i| ResultItem {
+                item: i.item.clone(),
+                text: i.text.clone(),
+                cut: i.cut,
+            })
+            .collect::<Vec<_>>();
+        take_result(&mut { items }).0
     }
     fn enqueue(&self, env: Envelope) {
         if self.failed.get() {
@@ -117,43 +186,34 @@ impl Publisher {
             .workers
             .get(&self.worker)
             .is_some_and(|w| w.pending.is_some());
+        // Each run's result starts with its turn: nothing of a run that ended another way (a
+        // cancel) is carried into the next.
+        if matches!(env.event, Event::TurnStarted { .. }) {
+            self.result.borrow_mut().clear();
+        }
         if !bootstrap {
-            let bound = result_bound(&sup);
+            let limit = result_bound(&sup).saturating_add(RESULT_LOOKAHEAD);
             let mut result = self.result.borrow_mut();
-            let added = match &env.event {
+            match &env.event {
                 Event::ContentDelta {
                     stream: StreamKind::Assistant,
                     text,
-                } => Some(text.as_str()),
+                } => accumulate(&mut result, env.item.as_deref(), text, false, limit),
+                // A snapshot replaces its own item's text only (a heal of a split secret
+                // included), never another item's of the same turn.
                 Event::ContentSnapshot {
                     stream: StreamKind::Assistant,
                     text,
-                } => {
-                    result.clear();
-                    self.result_cut.set(0);
-                    Some(text.as_str())
-                }
-                _ => None,
-            };
-            if let Some(text) = added {
-                // Kept up to every part's worth; what is past it is counted, for the last
-                // part to say how much was cut.
-                let room = bound.saturating_sub(result.len());
-                let kept = agent_core::text::truncate_bytes(text, room);
-                result.push_str(kept);
-                self.result_cut.set(
-                    self.result_cut
-                        .get()
-                        .saturating_add(text.len() - kept.len()),
-                );
+                } => accumulate(&mut result, env.item.as_deref(), text, true, limit),
+                _ => {}
             }
         }
         let mut wake_text = None;
         let completion = if !bootstrap {
             if let (Event::TurnCompleted { state, usage, .. }, Some(run)) = (&env.event, &scope.run)
             {
-                let text = std::mem::take(&mut *self.result.borrow_mut());
-                let (parts, wake) = result_messages(&sup, &text, self.result_cut.replace(0));
+                let (text, cut) = take_result(&mut self.result.borrow_mut());
+                let (parts, wake) = result_messages(&sup, &text, cut);
                 wake_text = Some(wake);
                 Some(Completion {
                     run: run.clone(),
@@ -397,6 +457,10 @@ impl ChildPublish for Publisher {
             };
         } else if matches!(env.event, Event::ItemCompleted { .. }) {
             self.flush(generation, env.item.as_deref(), false);
+        } else if matches!(env.event, Event::TurnCompleted { .. }) {
+            // What a stream still holds is released before the turn's end, even when no item
+            // completed it, so the result carries all of it.
+            self.flush(generation, None, false);
         }
         agent_kit::store::scrub_envelope(env).ok()
     }
@@ -407,6 +471,15 @@ impl ChildPublish for Publisher {
         self.flush(generation, None, true);
     }
 }
+/// Whether a control entry is a steer awaiting its run's answer, rather than a write awaiting
+/// its echo.
+fn is_steer(entry: &super::deferred::Delivery) -> bool {
+    matches!(
+        entry.input.plan,
+        agent_core::delegation::mailbox::DeliveryPlan::SteerNow(_)
+    )
+}
+
 /// A run's end, as its parent's wake says it.
 fn wake_outcome(state: TurnState) -> agent_core::delegation::wake::Outcome {
     use agent_core::delegation::wake::Outcome;
@@ -619,10 +692,12 @@ impl Supervisor {
         }
         if let Some((state, usage)) = ended {
             let _ = usage;
+            // A steer's answer may still come after its turn ended: its correlation stays
+            // until that answer or its settle deadline (`arm_steer_settle`).
             self.state
                 .borrow_mut()
                 .controls
-                .retain(|_, entry| &entry.worker != worker);
+                .retain(|_, entry| &entry.worker != worker || is_steer(entry));
             self.drain_deferred(worker);
             self.queue_wake(
                 worker,
@@ -680,7 +755,7 @@ impl Supervisor {
         self.state
             .borrow_mut()
             .controls
-            .retain(|_, entry| &entry.worker != worker);
+            .retain(|_, entry| &entry.worker != worker || is_steer(entry));
         let env = Envelope::new(Event::Notice {
             text: result
                 .clone()
@@ -713,19 +788,36 @@ impl Supervisor {
         let stored_worker = worker.clone();
         let completed_run = completion.run.clone();
         let stop_after = end.stop_after;
-        gtk4::glib::spawn_future_local(async move {
-            if let Ok(completed) = sup
-                .services
-                .durable("complete delegated run", move |s| {
-                    if s.delegation_worker(stored_worker.as_str())?
-                        .is_some_and(|w| w.state == "closed")
-                    {
-                        completion.worker_state = agent_core::event::WorkerState::Closed;
-                    }
-                    s.complete_delegation_run(&completion)
-                })
-                .await
+        let job = move |s: &agent_kit::store::Store| {
+            if s.delegation_worker(stored_worker.as_str())?
+                .is_some_and(|w| w.state == "closed")
             {
+                completion.worker_state = agent_core::event::WorkerState::Closed;
+            }
+            s.complete_delegation_run(&completion)
+        };
+        // Queued on the store writer now, not when a future first runs: anything the session
+        // publishes from here on (a turn ending in flight) is written after this end, and finds
+        // the run already settled rather than ending it first.
+        let receipt = if let Some(writer) = self.services.handle.writer() {
+            writer.durable_call("complete delegated run", job)
+        } else {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let _ = tx.send(self.services.handle.reader().atomically(job));
+            rx
+        };
+        gtk4::glib::spawn_future_local(async move {
+            let committed = gtk4::gio::spawn_blocking(move || {
+                receipt
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .map_err(|_| agent_kit::store::StoreError::WriterGone)?
+            })
+            .await
+            .unwrap_or(Err(agent_kit::store::StoreError::WriterGone));
+            if let Err(e) = &committed {
+                (sup.services.report)(&format!("Cannot save delegation control state: {e}"));
+            }
+            if let Ok(completed) = committed {
                 sup.queue_wake(
                     &worker,
                     wake_outcome(state),
@@ -751,6 +843,11 @@ impl Supervisor {
                     }
                 }
                 if stop_after {
+                    // Its startup check decides nothing now: the stop ends it unfinished, which
+                    // is not a failure of the worker, and its last events are not a run's.
+                    if let Some(w) = sup.state.borrow_mut().workers.get_mut(&worker) {
+                        w.readback.failed = true;
+                    }
                     if let Some(session) = sup.child_session(&worker) {
                         session.shutdown(true);
                     }

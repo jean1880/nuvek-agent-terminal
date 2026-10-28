@@ -2310,6 +2310,17 @@ pub(super) struct Runtime {
     /// captured that epoch or an older one is void (`Supervisor::epoch_for`), while a sibling's
     /// revocation only moves its work on to the new epoch.
     pub fences: HashMap<WorkerId, AuthorityEpoch>,
+    /// Process slots admitted but not yet holding a process, by reservation, with the worker
+    /// each launches once known (see `capacity.rs`).
+    pub launch_slots: HashMap<u64, Option<WorkerId>>,
+    pub next_launch_slot: u64,
+    /// Workers a delivery is on its way to: never paused under it (see `capacity.rs`).
+    pub delivery_holds: HashMap<WorkerId, u32>,
+    /// Test barriers: a held send's acceptance, a held launch's preparation.
+    #[cfg(test)]
+    pub hold_send_accept: Option<Rc<std::cell::Cell<bool>>>,
+    #[cfg(test)]
+    pub hold_launch: Option<Rc<std::cell::Cell<bool>>>,
 }
 impl Runtime {
     /// Whether `w` holds a capability issued under its root's current authority epoch. No

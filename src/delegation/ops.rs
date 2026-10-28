@@ -1622,6 +1622,13 @@ impl Supervisor {
         a: Accept,
         reserve: bool,
     ) -> Result<(Accepted, Option<Reserved>), ToolError> {
+        #[cfg(test)]
+        if matches!(a.request, ToolRequest::Send(_)) {
+            let hold = self.state.borrow().hold_send_accept.clone();
+            while hold.as_ref().is_some_and(|h| h.get()) {
+                glib::timeout_future(std::time::Duration::from_millis(5)).await;
+            }
+        }
         self.services
             .durable("accept delegated operation", move |s| {
                 s.atomically(|s| {

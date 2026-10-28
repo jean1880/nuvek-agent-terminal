@@ -70,7 +70,9 @@ impl Supervisor {
         if ready {
             return Ok(());
         }
-        // A worker with no process (paused, or gone) takes a slot again when it starts.
+        // A worker with no process (paused, or gone) takes a slot again when it starts: reserved
+        // now, its own until this start ends (`_slot` drops on every return), by when its
+        // process holds it.
         let restart = {
             let state = self.state.borrow();
             state
@@ -79,9 +81,14 @@ impl Supervisor {
                 .filter(|w| w.generations.is_empty())
                 .map(|w| w.root.clone())
         };
-        if let Some(root) = restart {
-            self.make_room(&root, Some(worker)).await?;
-        }
+        let _slot = match restart {
+            Some(root) => {
+                let slot = self.make_room(&root, Some(worker)).await?;
+                slot.bind(worker);
+                Some(slot)
+            }
+            None => None,
+        };
         let mut spec = self
             .state
             .borrow()
@@ -227,8 +234,9 @@ impl Supervisor {
         }
         agent_core::delegation::limits::admit_spawn(&self.limits, &self.usage(&root), false)?;
         // Every process slot taken: an idle worker is paused for this one, or the spawn is
-        // refused, saying why.
-        self.make_room(&root, None).await?;
+        // refused, saying why. The slot is this spawn's from now until its process exists or
+        // the spawn ends (`slot` drops on every return).
+        let slot = self.make_room(&root, None).await?;
         // A restricted worker's limits reach the children it starts (a root has none).
         let parent_capabilities = self
             .state
@@ -335,7 +343,7 @@ impl Supervisor {
         );
         super::attest::sanitise_identity(&mut identity);
         let plan=SpawnPlan{driver,identity,workspace,launch_json:serde_json::json!({"model":model,"effort":effort,"capabilities":capabilities,"cwd":child_cwd,"source_repo":lease_plan.as_ref().map(|l|&l.source_repo),"branch":lease_plan.as_ref().map(|l|&l.branch),"base_commit":lease_plan.as_ref().map(|l|&l.base_commit)}).to_string(),cwd:child_cwd.to_string_lossy().into_owned(),state:SpawnState::Starting,process_generation:1};
-        let accept = self.accept_request(
+        let mut accept = self.accept_request(
             caller,
             &root,
             ToolRequest::Spawn(r.clone()),
@@ -347,6 +355,9 @@ impl Supervisor {
             AcceptPlan::Spawn(Box::new(plan)),
             warnings,
         );
+        // The store admits one more process against the others: this spawn's own reserved
+        // slot is that one.
+        accept.live_processes = accept.live_processes.saturating_sub(1);
         let (accepted, _) = self.accept(accept, true).await?;
         let accepted = match accepted {
             Accepted::Replay(r) => return super::ops::replay_value(r),
@@ -364,6 +375,7 @@ impl Supervisor {
             run = ?accepted.run.as_ref().map(|r| r.to_string()),
             "delegated worker spawned"
         );
+        slot.bind(&worker);
         let lease = if let Some(plan) = lease_plan {
             match gtk4::gio::spawn_blocking(move || super::workspace::create_lease(&plan)).await {
                 Ok(Ok(l)) => Some(l),
@@ -475,6 +487,8 @@ impl Supervisor {
             }
             Err(e) => self.fail_worker(&worker, e),
         }
+        // Started (its session counts its launch until the process exists) or failed.
+        drop(slot);
         self.notify_registry();
         Ok(accepted.receipt)
     }
@@ -483,6 +497,13 @@ impl Supervisor {
         spec: &ChildSpec,
         generation: ProcessGeneration,
     ) -> Result<Approval, ToolError> {
+        #[cfg(test)]
+        {
+            let hold = self.state.borrow().hold_launch.clone();
+            while hold.as_ref().is_some_and(|h| h.get()) {
+                gtk4::glib::timeout_future(std::time::Duration::from_millis(5)).await;
+            }
+        }
         if let Some(lease) = spec.lease.clone() {
             gtk4::gio::spawn_blocking(move || super::workspace::verify_lease(&lease))
                 .await

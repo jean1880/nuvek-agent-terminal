@@ -246,7 +246,10 @@ Architectural mandates, standards, and workflows for this codebase.
   `idle_suspend_minutes` (`Supervisor::stop_idle_children`, 0 never) or when a start would pass
   `live_processes_app` (the least recently active idle worker goes first, its exit awaited; with
   none, the start is refused saying how many are idle and that `cross_agent_close` frees a
-  slot). The supervisor's own check comes first (no run, pending input, preparation, dispatch,
+  slot, retryable while a run or a stop is in progress; a stop already under way is waited for,
+  bounded). Admission reserves: an admitted start counts as a process until its own exists or it
+  fails (`LaunchSlot`), and a worker an instruction is on its way to is never paused
+  (`DeliveryHold`). The supervisor's own check comes first (no run, pending input, preparation, dispatch,
   queued delivery or open request, its process up and read back, and never with a live
   descendant), and its hooks consent with the same planned rotation, so nothing is revoked and
   the epoch is unchanged. Silent too: its next instruction resumes the same native session

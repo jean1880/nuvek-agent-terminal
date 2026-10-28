@@ -152,9 +152,12 @@ impl Default for Limits {
 pub struct Usage {
     pub active_runs_root: u32,
     pub active_runs_app: u32,
+    /// Processes up, plus slots admitted for a launch not yet holding one.
     pub live_processes: u32,
     /// Workers whose process is up with no run open.
     pub idle_workers: u32,
+    /// Processes already stopping: each frees its slot once its exit is seen.
+    pub stopping_processes: u32,
     pub pending_root: u32,
     pub pending_app: u32,
     pub waits_app: u32,
@@ -201,16 +204,19 @@ pub fn admit_spawn(l: &Limits, u: &Usage, needs_process: bool) -> Result<(), Too
 
 /// Every process slot is taken and no idle worker could be paused to free one. Names the limit,
 /// how many of those workers are idle, and what frees a slot. Retryable only while a run is in
-/// progress: once it ends, its worker may be paused for the next start.
+/// progress (once it ends, its worker may be paused for the next start) or a process is already
+/// stopping (its exit frees a slot).
 pub fn processes_full(l: &Limits, u: &Usage) -> ToolError {
-    let runs = u.active_runs_app > 0;
+    let runs = u.active_runs_app > 0 || u.stopping_processes > 0;
     let mut message = format!(
         "delegation limit reached: live_processes_app ({} of {} agent processes in use; {} of \
          their workers are idle but cannot be paused now without losing work). Closing a worker you \
          no longer need with cross_agent_close frees its slot.",
         u.live_processes, l.live_processes_app, u.idle_workers
     );
-    if runs {
+    if u.stopping_processes > 0 {
+        message.push_str(" A process already stopping frees one when it exits.");
+    } else if runs {
         message.push_str(" A run in progress may free one when it ends.");
     }
     let mut e = ToolError::new(ErrorCode::CapacityReached, message)
@@ -326,6 +332,13 @@ mod tests {
         let e = admit_spawn(&l, &running, true).expect_err("full");
         assert!(e.retryable, "a run in progress may free a slot");
         assert!(e.message.contains("7 of"), "{}", e.message);
+        let stopping = Usage {
+            stopping_processes: 1,
+            ..idle
+        };
+        let e = admit_spawn(&l, &stopping, true).expect_err("full");
+        assert!(e.retryable, "a process already stopping frees a slot");
+        assert!(e.message.contains("already stopping"), "{}", e.message);
     }
 
     #[test]

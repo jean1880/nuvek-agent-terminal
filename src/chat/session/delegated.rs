@@ -59,6 +59,18 @@ fn message_id(input: &DelegatedInput) -> Option<MessageId> {
     }
 }
 
+/// Why a turn nobody typed would start ([`Inner::turn_blocker`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TurnPurpose {
+    /// Sub-agent news. It waits for the user's next prompt to carry a pending handoff (a handoff
+    /// frames what rides with it as the user's message), never runs while the thread waits for
+    /// its usage limit, and never restarts a process that exited on its own.
+    Wake,
+    /// The thread continuing once its usage limit reset: the one turn the limit wait is for. It
+    /// carries a pending handoff itself, and starts a process that exited meanwhile again.
+    LimitContinue,
+}
+
 /// What became of sub-agent news offered to a root session ([`ChatSession::wake_with`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WakeOutcome {
@@ -233,11 +245,13 @@ impl ChatSession {
         self.inner.suspended.get()
     }
 
-    /// Ends a rebind: starts the next generation (which takes the staged binding) and sends
-    /// what was queued meanwhile.
+    /// Ends a rebind: starts the next generation (which takes the staged binding), sends the
+    /// continuation a busy switch around the rebind owes once its handoff is prepared (now, or
+    /// when that switch has read the thread), then what was queued meanwhile.
     pub(crate) fn rebind_start(&self) {
         self.inner.rebinding.set(false);
         self.inner.ensure_alive();
+        self.inner.rebind_ready();
         self.inner.dispatch_queue_after_restart();
     }
 
@@ -275,15 +289,22 @@ impl Inner {
 
     /// [`Self::wake_busy`]'s first reason, for the journal.
     fn wake_blocker(&self) -> Option<&'static str> {
-        self.turn_blocker(false)
+        self.turn_blocker(TurnPurpose::Wake)
     }
 
-    /// What keeps a turn nobody typed from starting now. `restart`: a process that exited on
-    /// its own may be started again for it (a thread continuing after its usage limit).
-    pub(super) fn turn_blocker(&self, restart: bool) -> Option<&'static str> {
+    /// What keeps a turn nobody typed, for `purpose`, from starting now. A thread waiting for
+    /// its usage limit is not woken (the limit would refuse the turn; the news reaches it after
+    /// the continuation), and a pending handoff waits for a prompt that carries it: the user's,
+    /// or the continuation's.
+    pub(super) fn turn_blocker(&self, purpose: TurnPurpose) -> Option<&'static str> {
+        let wake = purpose == TurnPurpose::Wake;
         let state = self.state.borrow();
-        let process_gone = !state.alive && !self.suspended.get() && !restart;
+        let process_gone = !state.alive && !self.suspended.get() && wake;
         let reasons = [
+            (
+                wake && self.limit_waiting.get(),
+                "the thread waits for its usage limit",
+            ),
             (state.running_turn, "a turn is running"),
             (process_gone, "the agent process is gone"),
             (
@@ -321,7 +342,7 @@ impl Inner {
             ),
             (self.rollback.borrow().is_some(), "a rollback is pending"),
             (
-                self.pending_handoff.borrow().is_some(),
+                wake && self.pending_handoff.borrow().is_some(),
                 "a handoff waits for a prompt",
             ),
             (self.handoff_in_flight.get(), "a handoff is in flight"),

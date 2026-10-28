@@ -255,11 +255,17 @@ Architectural mandates, standards, and workflows for this codebase.
   name). Readings count from when windows last arrived (`updated_at`), never an account-only
   update. agy's `/usage` side command never raises `RateLimited`: a reading is not a refusal. The window's minute sweep (`continue_after_limits`)
   then calls `ChatSession::continue_after_limit`, which sends the app's continue prompt as a
-  notice in the same native session, starting the process again if it is gone. Never into a
-  running turn or anything a wake waits for, never for a delegated worker, never for a root the
-  user stopped. The wait ends when the agent works again, the thread switches agent (the
-  hand-off included), the user picks "Don't Continue" on its banner, or the setting goes off.
-  `limit_wait::tests` and the session test `a_thread_continues_after_its_limit_*` prove these.
+  notice in the same native session, starting the process again if it is gone. A handoff still
+  waiting for a prompt rides on it and is spent as a user prompt's would be; the prompt is never
+  stored as the user's message. Never into a running turn or anything else a wake waits for
+  (`TurnPurpose::LimitContinue`), never for a delegated worker, never for a root the user
+  stopped. While the thread waits, sub-agent news does not wake it (`TurnPurpose::Wake`); it
+  arrives after the continuation. The wait ends when the agent works again, the thread switches
+  agent (the hand-off included), the user picks "Don't Continue" on its banner, or the setting
+  goes off. "Continue in …" on the limit's banner (and a bare `/handoff` while the thread is
+  stopped by its limit) switches and then continues the work in the new agent with the handoff,
+  as a busy switch does. `limit_wait::tests`, the session tests
+  `a_thread_continues_after_its_limit_*` and `continuation_tests` prove these.
 - **Agent processes get a cleaned environment**: `clear_env` and any inherited
   approval-socket variables are removed (`SpawnSpec::unset`), then the profile's
   env file, then the approval socket.

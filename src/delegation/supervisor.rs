@@ -2109,6 +2109,8 @@ mod tests {
     mod capacity_tests;
     /// Worker status, run agreement, startup deadlines and paging errors (PR-E).
     mod status_tests;
+    /// A root's busy switch continues its task once, however the switch and its rebind interleave.
+    mod switch_continuation_tests;
     /// A root is told its sub-agents' results without polling for them.
     mod wake_tests;
 }
@@ -2425,6 +2427,8 @@ impl Supervisor {
         if same_policy {
             self.rotate_before_stop(&worker, session.process_generation());
         }
+        // The stop ends a running turn as an exit would: said first, so the switch continues it.
+        session.note_switch_interrupts_turn();
         if let Some(watch) = session.rebind_stop() {
             super::capacity::wait_exit(&watch).await;
         }

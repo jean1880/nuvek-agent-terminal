@@ -285,7 +285,14 @@ pub struct TranscriptMessage {
     /// `open` until the item completes, then `completed`, `failed`,
     /// `declined` or `interrupted`.
     pub status: String,
+    /// A tool item's title in the shared card grammar (`Run cargo test`, `Edit src/lib.rs`),
+    /// read from its structured or streamed input: what a hand-off says the tool did, output
+    /// or none. Empty for every other item.
+    pub title: String,
 }
+
+/// `role` of the [`TranscriptMessage`] that carries a thread's inherited context.
+pub const INHERITED_ROLE: &str = "inherited";
 
 /// `$XDG_STATE_HOME/agent-terminal/threads.db`, falling back to
 /// `~/.local/state/agent-terminal/threads.db`. Takes the environment values so
@@ -3410,18 +3417,48 @@ impl Store {
     /// the deltas accumulated so far, later deltas append to it. Items appear
     /// in the order they first occur. `Reasoning` items are left out: a
     /// hand-off built from this must not replay the model's private thinking.
+    /// Tool items carry their title ([`TranscriptMessage::title`]).
+    ///
+    /// A thread created carrying a hand-off (a fork, a compaction) starts with
+    /// it: the first `HandoffSeeded` that carried anything, stored before the
+    /// thread's first user message, is its inherited context, and comes first
+    /// with [`INHERITED_ROLE`]. Only that one: every later seed (a switch's)
+    /// was built from this same transcript, so carrying it would repeat it.
     pub fn transcript_messages(&self, thread: &str) -> Result<Vec<TranscriptMessage>> {
         let mut out: Vec<TranscriptMessage> = Vec::new();
         let mut index: HashMap<String, usize> = HashMap::new();
+        let mut tools: HashMap<String, ToolInput> = HashMap::new();
         // Each item's id as stored, by its bounded form, and the items that completed.
         let mut items: HashMap<String, String> = HashMap::new();
         let mut completed: HashSet<String> = HashSet::new();
+        // Whether the inherited context is settled: taken, or a user message came first.
+        let mut seed_settled = false;
         let mut after = 0;
         loop {
             let batch = self.events(thread, Some(after), 1000)?;
             let Some((last, _)) = batch.last() else { break };
             after = *last;
-            for (_, env) in batch {
+            for (seq, env) in batch {
+                match &env.event {
+                    Event::HandoffSeeded {
+                        summary, carried, ..
+                    } if *carried > 0 && !seed_settled => {
+                        seed_settled = true;
+                        out.push(TranscriptMessage {
+                            role: INHERITED_ROLE.to_owned(),
+                            kind: "inherited_context".to_owned(),
+                            text: summary.clone(),
+                            item_id: format!("inherited:{seq}"),
+                            status: "completed".to_owned(),
+                            title: String::new(),
+                        });
+                    }
+                    Event::ItemStarted {
+                        kind: ItemKind::UserMessage,
+                        ..
+                    } => seed_settled = true,
+                    _ => {}
+                }
                 if let Some(item) = &env.item {
                     let key = bounded(item);
                     if matches!(env.event, Event::ItemCompleted { .. }) {
@@ -3429,7 +3466,7 @@ impl Store {
                     }
                     items.entry(key).or_insert_with(|| item.clone());
                 }
-                apply_to_transcript(&mut out, &mut index, env);
+                apply_to_transcript(&mut out, &mut index, &mut tools, env);
             }
         }
         // A turn still running: an open stream that holds text not yet published shows
@@ -3445,17 +3482,50 @@ impl Store {
                 text: HELD_PLACEHOLDER.to_owned(),
             })
             .item(item);
-            apply_to_transcript(&mut out, &mut index, env);
+            apply_to_transcript(&mut out, &mut index, &mut tools, env);
         }
         // A hand-off replays this; the model's private thinking must not travel with it.
         out.retain(|m| m.kind != "reasoning");
+        for message in out.iter_mut().filter(|m| m.role == "tool") {
+            if let Some(tool) = tools.get(&message.item_id) {
+                message.title = tool.title();
+            }
+        }
         Ok(out)
+    }
+}
+
+/// What a tool item was asked to do, as its events said it: the title is built from it once the
+/// whole transcript is read ([`ToolInput::title`]).
+struct ToolInput {
+    kind: ItemKind,
+    /// The item's own title: Claude's native tool name, agy's most telling parameter.
+    name: String,
+    input: Option<Value>,
+    /// The input as streamed (`StreamKind::ToolInput`), for an item that never stored it whole.
+    streamed: String,
+}
+
+impl ToolInput {
+    /// The tool's title in the shared card grammar (`agent_core::tool_title`): from its
+    /// structured input, else from the streamed input once it parses, else the tool alone.
+    fn title(&self) -> String {
+        let parsed;
+        let input = match &self.input {
+            Some(v) if !v.is_null() => Some(v),
+            _ => {
+                parsed = serde_json::from_str::<Value>(&self.streamed).ok();
+                parsed.as_ref()
+            }
+        };
+        agent_core::tool_title::classify(self.kind, &self.name, input).text()
     }
 }
 
 fn apply_to_transcript(
     out: &mut Vec<TranscriptMessage>,
     index: &mut HashMap<String, usize>,
+    tools: &mut HashMap<String, ToolInput>,
     env: Envelope,
 ) {
     let Some(item) = env.item else { return };
@@ -3467,13 +3537,48 @@ fn apply_to_transcript(
                 text: String::new(),
                 item_id: item.clone(),
                 status: "open".to_string(),
+                title: String::new(),
             });
             out.len() - 1
         })
     };
     match env.event {
-        Event::ItemStarted { kind, .. } => {
-            slot(out, &kind_name(kind));
+        Event::ItemStarted {
+            kind, title, input, ..
+        } => {
+            let name = kind_name(kind);
+            slot(out, &name);
+            if role_of(&name) == "tool" {
+                // A later start of the same item (input complete) refines the first.
+                let tool = tools.entry(item.clone()).or_insert_with(|| ToolInput {
+                    kind,
+                    name: String::new(),
+                    input: None,
+                    streamed: String::new(),
+                });
+                if !title.is_empty() {
+                    tool.name = title;
+                }
+                if input.as_ref().is_some_and(|v| !v.is_null()) {
+                    tool.input = input;
+                }
+            }
+        }
+        Event::ContentDelta {
+            stream: StreamKind::ToolInput,
+            text,
+        } => {
+            if let Some(tool) = tools.get_mut(&item) {
+                tool.streamed.push_str(&text);
+            }
+        }
+        Event::ContentSnapshot {
+            stream: StreamKind::ToolInput,
+            text,
+        } => {
+            if let Some(tool) = tools.get_mut(&item) {
+                tool.streamed = text;
+            }
         }
         Event::ContentDelta { stream, text } if counts_as_text(stream) => {
             let i = slot(out, "unknown");

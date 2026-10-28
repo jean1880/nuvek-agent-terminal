@@ -812,10 +812,14 @@ pub(super) struct ChatTab {
 }
 
 impl ChatTab {
-    /// The thread no longer waits for its usage limit.
+    /// The thread no longer waits for its usage limit: its session may be woken by sub-agent
+    /// news again.
     fn end_limit_wait(&mut self) {
         self.limit_wait = None;
         self.wait_banner.set_revealed(false);
+        if let Some(session) = self.slot.get() {
+            session.set_limit_wait(false);
+        }
     }
 
     /// Says on the wait banner when the thread continues.
@@ -2862,6 +2866,10 @@ impl AgentTerminalWindow {
             }
         }
         chat.show_limit_wait(now);
+        // Sub-agent news waits too: the limit would refuse the turn it started.
+        if let Some(session) = chat.slot.get() {
+            session.set_limit_wait(true);
+        }
     }
 
     /// "Don't Continue": `thread` stops waiting for its usage limit (until it hits it again).
@@ -6183,7 +6191,9 @@ impl AgentTerminalWindow {
 
     /// The banners' "Continue in" button and a bare `/handoff`: hand the thread to the next
     /// usable agent, never silently to an agy that would edit unasked (see
-    /// [`safe_handoff_target`]): that one is confirmed first.
+    /// [`safe_handoff_target`]): that one is confirmed first. While the thread is stopped by its
+    /// usage limit (its banner, or a limit wait), the new agent then continues the work with the
+    /// handoff, as a busy switch does; otherwise the handoff waits for the user's next message.
     fn continue_rate_limited(&self, thread: &str) {
         let Some(slot) = self.slot_of(thread) else {
             return;
@@ -6193,6 +6203,12 @@ impl AgentTerminalWindow {
             |d| self.agent_usable(d),
             self.agy_cannot_ask_for(thread),
         );
+        let limited = self
+            .with_chat(thread, |c| c.limit_wait.is_some() || c.rate_limited)
+            .unwrap_or(false);
+        if let (true, Some((target, _)), Some(session)) = (limited, target, slot.get()) {
+            session.continue_after_switch_to(target);
+        }
         match target {
             Some((target, false)) => self.switch_in_place(thread, target),
             Some((target, true)) => self.confirm_unasked_switch(thread, target),

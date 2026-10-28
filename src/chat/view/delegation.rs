@@ -127,6 +127,18 @@ impl Worker {
         })
     }
 
+    /// Whether `history` is still live next to `live`: its scope is the live one, or an earlier
+    /// run of the same process still has a request open that the user can answer.
+    fn keeps(&self, history: &History, live: Option<&Scope>) -> bool {
+        live.is_some_and(|live| {
+            history.scope == *live
+                || (self.summary.waiting_on_user
+                    && history.scope.generation == live.generation
+                    && history.scope.worker == live.worker
+                    && history.model.pending_interruption().is_some())
+        })
+    }
+
     fn summary(&self) -> SubagentSummary {
         let identity = self.summary.identity.as_ref();
         let delegation = identity.map(|identity| WorkerDelegation {
@@ -188,13 +200,13 @@ impl Workers {
     }
 
     fn live_histories(&self) -> impl Iterator<Item = (&Worker, &History)> {
-        self.records.iter().filter_map(|worker| {
-            let scope = worker.live_scope()?;
+        self.records.iter().flat_map(|worker| {
+            let live = worker.live_scope();
             worker
                 .histories
                 .iter()
-                .find(|history| history.scope == scope)
-                .map(|history| (worker, history))
+                .filter(move |history| worker.keeps(history, live.as_ref()))
+                .map(move |history| (worker, history))
         })
     }
 
@@ -240,8 +252,13 @@ impl Workers {
             {
                 worker.summary = summary.clone();
                 let live = worker.live_scope();
-                for history in &mut worker.histories {
-                    if Some(&history.scope) != live.as_ref()
+                let keep: Vec<bool> = worker
+                    .histories
+                    .iter()
+                    .map(|history| worker.keeps(history, live.as_ref()))
+                    .collect();
+                for (history, keep) in worker.histories.iter_mut().zip(keep) {
+                    if !keep
                         || matches!(
                             summary.state,
                             WorkerState::Closed | WorkerState::Stopped | WorkerState::Unknown
@@ -294,8 +311,13 @@ impl Workers {
         {
             record.canonical_scope = scope;
             let live = record.live_scope();
-            for history in &mut record.histories {
-                if Some(&history.scope) != live.as_ref() {
+            let keep: Vec<bool> = record
+                .histories
+                .iter()
+                .map(|history| record.keeps(history, live.as_ref()))
+                .collect();
+            for (history, keep) in record.histories.iter_mut().zip(keep) {
+                if !keep {
                     history.model.settle_stale();
                     history.model.mark_replayed();
                 } else {
@@ -1762,6 +1784,34 @@ pub(crate) mod tests {
             matches!(backend.actions.borrow().last(), Some(WorkerAction::Approve { request, decision: Decision::Allow, .. }) if request == "later")
         );
         assert_eq!(backend.actions.borrow().len(), 2);
+    }
+
+    #[test]
+    fn a_request_stays_answerable_in_a_later_run_of_the_same_process() {
+        let mut workers = Workers::default();
+        workers.registry(&[summary("w_workerAA", "r_firstRun")]);
+        feed(
+            &mut workers,
+            &scope("w_workerAA", 1, "r_firstRun"),
+            Envelope::new(Event::ApprovalRequested {
+                tool: "shell".into(),
+                title: None,
+                input: json!({"command":"true"}),
+                reason: None,
+                options: vec![Decision::Allow, Decision::Deny],
+                response: ResponseCapability::Live,
+                remembers: None,
+            })
+            .request("native-1"),
+        );
+        // The next run starts in the same process while the request is still open.
+        let mut next = summary("w_workerAA", "r_secondRun");
+        next.waiting_on_user = true;
+        workers.registry(&[next]);
+        assert_eq!(workers.needs_user(), Some(Activity::NeedsApproval));
+        // Once the worker no longer waits on the user, the old run's card is stale.
+        workers.registry(&[summary("w_workerAA", "r_secondRun")]);
+        assert_eq!(workers.needs_user(), None);
     }
 
     #[test]

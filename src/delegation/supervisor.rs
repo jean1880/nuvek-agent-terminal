@@ -2179,7 +2179,12 @@ impl TokenSlot {
 /// background work can outlive such a turn and still be waiting on the user, as the view
 /// keeps it.
 #[derive(Debug, Default)]
-pub(super) struct OpenRequests(std::collections::BTreeSet<(ProcessGeneration, String)>);
+pub(super) struct OpenRequests {
+    open: std::collections::BTreeSet<(ProcessGeneration, String)>,
+    /// The state the last run left the worker in, restored when the last request settles with
+    /// no run open (a request held it at `waiting` meanwhile).
+    pub outcome: Option<String>,
+}
 impl OpenRequests {
     /// Follows one event of `generation`'s process.
     pub fn apply(&mut self, generation: ProcessGeneration, env: &agent_core::event::Envelope) {
@@ -2193,14 +2198,14 @@ impl OpenRequests {
                 ..
             } => {
                 // A newer process asking means older ones are gone.
-                self.0.retain(|(g, _)| *g >= generation);
-                self.0.insert(key());
+                self.open.retain(|(g, _)| *g >= generation);
+                self.open.insert(key());
             }
             Event::ApprovalResolved { .. }
             | Event::ApprovalExpired
             | Event::QuestionResolved { .. }
             | Event::FormResolved { .. } => {
-                self.0.remove(&key());
+                self.open.remove(&key());
             }
             Event::TurnCompleted {
                 state: TurnState::Interrupted,
@@ -2212,15 +2217,15 @@ impl OpenRequests {
     }
     /// Forgets every request `generation`'s process made (it exited, or its turn was stopped).
     pub fn clear_generation(&mut self, generation: ProcessGeneration) {
-        self.0.retain(|(g, _)| *g != generation);
+        self.open.retain(|(g, _)| *g != generation);
     }
     /// Whether `generation`'s process has a request open.
     pub fn any_in(&self, generation: ProcessGeneration) -> bool {
-        self.0.iter().any(|(g, _)| *g == generation)
+        self.open.iter().any(|(g, _)| *g == generation)
     }
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.open.is_empty()
     }
 }
 pub(super) struct WorkerRt {

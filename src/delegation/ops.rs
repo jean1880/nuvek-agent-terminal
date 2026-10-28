@@ -607,7 +607,11 @@ impl Supervisor {
             w.row.parent_id.is_some()
                 && w.root == scope.root
                 && w.generation == scope.generation
-                && w.run.as_ref().or(w.last_run.as_ref()) == scope.run.as_ref()
+                // A request outlives the run that asked it within one process generation, so
+                // while one is open an earlier run's scope still reaches the worker. The
+                // session refuses an id that is not open; another generation never passes.
+                && (w.run.as_ref().or(w.last_run.as_ref()) == scope.run.as_ref()
+                    || w.waiting_on_user())
         })
     }
     pub(crate) fn scope_belongs_to_thread(

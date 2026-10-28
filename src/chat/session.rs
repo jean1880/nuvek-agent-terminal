@@ -996,10 +996,17 @@ impl ChatSession {
 
     /// A delegation root is about to be stopped for a switch (its rebind): a turn running now
     /// is interrupted by that switch, not finished, so the switch that follows continues it
-    /// once, as a busy switch does. Called before the stop; nothing when no turn runs.
+    /// once, as a busy switch does. Called before the stop.
+    ///
+    /// A new preparation also overtakes an earlier switch: one still reading the thread goes no
+    /// further, and the continuation it still owed (its turn was stopped, nothing continued it)
+    /// passes to the switch that follows, the newest choice.
     pub(crate) fn note_switch_interrupts_turn(&self) {
-        if self.inner.state.borrow().running_turn {
-            self.inner.switch_interrupted.set(true);
+        let inner = &self.inner;
+        inner.end_pending_switch();
+        let owed = inner.switch_continuation.borrow_mut().take().is_some();
+        if owed || inner.state.borrow().running_turn {
+            inner.switch_interrupted.set(true);
         }
     }
 
@@ -4428,10 +4435,12 @@ impl Inner {
         self.end_pending_switch();
         let revision = self.switch_revision.get().wrapping_add(1);
         self.switch_revision.set(revision);
-        self.switch_continuation.borrow_mut().take();
+        // What an overtaken switch still owed (its turn was stopped and nothing continued it)
+        // passes to this one, the newest choice: the task is continued once, here.
+        let owed = self.switch_continuation.borrow_mut().take().is_some();
         // A turn a delegation root's rebind stopped for this switch, or "Continue in": the switch
         // continues the task as a busy one does, though no turn runs now.
-        let interrupted = self.switch_interrupted.replace(false);
+        let interrupted = self.switch_interrupted.replace(false) || owed;
         let asked = self.continue_on_switch_to.take() == Some(driver);
         let (caps, current_driver, mode, status_model, current_effort, running) = {
             let adapter = self.adapter.borrow();

@@ -223,6 +223,10 @@ impl ChatSession {
     /// until [`Self::rebind_start`].
     pub(crate) fn rebind_stop(&self) -> Option<ExitWatch> {
         self.inner.rebinding.set(true);
+        // A continuation still owed waits for this rebind's end, never an earlier one's.
+        if let Some(owed) = self.inner.switch_continuation.borrow_mut().as_mut() {
+            owed.ready = false;
+        }
         let watch = self.exit_watch();
         if self.inner.state.borrow().alive || self.inner.proc.borrow().is_some() {
             self.inner.stop_current();

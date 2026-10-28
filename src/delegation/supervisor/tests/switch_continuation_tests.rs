@@ -156,6 +156,14 @@ impl Root {
     /// (`window::imp::threads::delegation::switch`): prepare the root's switch, then switch,
     /// then end the rebind, unless a later pick overtook it meanwhile.
     async fn switch_as_the_window_does(&self, sup: &Rc<Supervisor>, driver: Driver, model: &str) {
+        if self.prepare(sup, driver).await {
+            self.finish(driver, model);
+        }
+    }
+
+    /// The window's first half: a new pick, and the supervisor's preparation of it. False when
+    /// it failed or a later pick overtook it.
+    async fn prepare(&self, sup: &Rc<Supervisor>, driver: Driver) -> bool {
         let chosen = self.serial.get().wrapping_add(1);
         self.serial.set(chosen);
         let profile = Profile {
@@ -167,13 +175,13 @@ impl Root {
         };
         // Unbound (as for an agy whose hook is not proven): no binding is staged, and the stop,
         // switch and rebind run in the same order as a bound switch's.
-        if !sup
-            .prepare_root_switch(&self.thread, &profile, driver, false)
+        sup.prepare_root_switch(&self.thread, &profile, driver, false)
             .await
-            || self.serial.get() != chosen
-        {
-            return;
-        }
+            && self.serial.get() == chosen
+    }
+
+    /// The window's second half: the switch, then the end of the rebind.
+    fn finish(&self, driver: Driver, model: &str) {
         self.session.switch(driver, Some(model.into()), None);
         self.session.rebind_start();
     }
@@ -413,4 +421,77 @@ fn a_root_switch_after_the_turn_finished_continues_nothing() {
             stop(&sup).await;
         });
     }
+}
+
+/// A pick made after an earlier busy switch already ran, while that switch still reads the
+/// thread (the store writer is busy): the earlier switch goes no further, and the task it was
+/// to continue is continued once, on the later choice.
+#[test]
+fn a_pick_after_a_busy_switch_ran_continues_the_task_on_the_later_choice() {
+    in_context(async {
+        let (dir, sup, root) = harness();
+        let r = busy_root(&sup, dir.path(), &root, Storage::Writer).await;
+        r.hold_writer(800);
+        r.hold(false);
+        r.switch_as_the_window_does(&sup, Driver::Claude, "first-choice")
+            .await;
+        assert_eq!(
+            r.continuations(),
+            0,
+            "the first switch still reads the thread"
+        );
+        r.switch_as_the_window_does(&sup, Driver::Claude, "second-choice")
+            .await;
+        pump_until(|| r.continuations() == 1).await;
+        // Long past the earlier read's end too: it never continues anything.
+        glib::timeout_future(Duration::from_millis(900)).await;
+        assert_eq!(r.continuations(), 1);
+        let launches = Root::launches(&r.old);
+        assert!(
+            launches.last().is_some_and(|l| l.contains("second-choice")),
+            "{launches:?}"
+        );
+        assert!(
+            launches.iter().all(|l| !l.contains("first-choice")),
+            "{launches:?}"
+        );
+        pump_until(|| r.idle()).await;
+        r.session.shutdown(false);
+        stop(&sup).await;
+    });
+}
+
+/// The earlier switch's read finishes while the later pick's rebind holds the root (after its
+/// preparation, before its switch): that read is overtaken and continues nothing in a process
+/// that is not there; the later switch continues the task once.
+#[test]
+fn an_overtaken_switch_finishing_during_the_next_rebind_leaves_the_task_to_it() {
+    in_context(async {
+        let (dir, sup, root) = harness();
+        let r = busy_root(&sup, dir.path(), &root, Storage::Writer).await;
+        r.hold_writer(300);
+        r.hold(false);
+        r.switch_as_the_window_does(&sup, Driver::Claude, "first-choice")
+            .await;
+        assert!(r.prepare(&sup, Driver::Claude).await);
+        // Long past the earlier read's end, with the later rebind still holding the root.
+        glib::timeout_future(Duration::from_millis(700)).await;
+        assert_eq!(r.continuations(), 0);
+        assert!(
+            !r.session.status().alive,
+            "nothing started during the rebind"
+        );
+        r.finish(Driver::Claude, "second-choice");
+        pump_until(|| r.continuations() == 1).await;
+        settle().await;
+        assert_eq!(r.continuations(), 1);
+        let launches = Root::launches(&r.old);
+        assert!(
+            launches.last().is_some_and(|l| l.contains("second-choice")),
+            "{launches:?}"
+        );
+        pump_until(|| r.idle()).await;
+        r.session.shutdown(false);
+        stop(&sup).await;
+    });
 }

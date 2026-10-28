@@ -1044,7 +1044,7 @@ impl ChatSession {
     /// conversation: the next prompt starts it again, resuming the same native session. Nothing
     /// is said to the view or stored. Whether it stopped.
     pub fn suspend_if_idle(&self) -> bool {
-        self.inner.suspend()
+        self.inner.suspend(false)
     }
 
     /// Where the agent process is in its life, for the header and the sidebar (read-only).
@@ -3171,12 +3171,15 @@ impl Inner {
     /// What stops [`Self::suspend`] now, if anything (the first reason found). The process can
     /// be stopped and resumed later with nothing lost only when it is alive, has a conversation
     /// to resume (a native id, and a turn on it or a resumed start), and holds no work,
-    /// question or state that lives only in the process or in flight. Never a delegated worker,
-    /// never dangerous permissive mode (session-only: a resume would not re-enter it), and
-    /// never with session grants Codex's own process holds (they would end unannounced).
-    fn suspend_blocker(&self) -> Option<&'static str> {
+    /// question or state that lives only in the process or in flight. Never dangerous permissive
+    /// mode (session-only: a resume would not re-enter it), and never with session grants
+    /// Codex's own process holds (they would end unannounced). `worker`: the supervisor pausing
+    /// one of its delegated workers, the only way one is ever suspended (a thread's idle sweep
+    /// never stops a worker; the supervisor never stops anything else this way).
+    fn suspend_blocker(&self, worker: bool) -> Option<&'static str> {
         let state = self.state.borrow();
         let checks = [
+            (worker && self.child.is_none(), "not a delegated worker"),
             (!state.alive, "not running"),
             (state.running_turn, "a turn is running"),
             (state.mode == Mode::Bypass, "dangerous permissive mode"),
@@ -3189,7 +3192,7 @@ impl Inner {
                 !self.codex_grants.borrow().is_empty(),
                 "Codex session grants",
             ),
-            (self.child.is_some(), "a delegated worker"),
+            (!worker && self.child.is_some(), "a delegated worker"),
             (self.active_workers.get() > 0, "active provider workers"),
             (
                 !self.proc.borrow().as_ref().is_some_and(|p| p.is_alive()),
@@ -3227,11 +3230,12 @@ impl Inner {
 
     /// Stops an idle agent process to free its memory, keeping its native session so the next
     /// prompt resumes it ([`Self::ensure_alive`]). Silent: no exit reaches the view or the
-    /// store, since nothing ended for the user. A delegation root's stop is a planned rotation
-    /// its hooks agree to (nothing revoked; the next prompt rebinds quietly). False, doing
-    /// nothing, while [`Self::suspend_blocker`] names a reason or the hooks refuse.
-    fn suspend(&self) -> bool {
-        if let Some(why) = self.suspend_blocker() {
+    /// store, since nothing ended for the user. A delegation root's or delegated worker's stop
+    /// is a planned rotation its hooks agree to (nothing revoked; the next prompt or instruction
+    /// rebinds quietly). False, doing nothing, while [`Self::suspend_blocker`] names a reason or
+    /// the hooks refuse. `worker`: as for [`Self::suspend_blocker`].
+    fn suspend(&self, worker: bool) -> bool {
+        if let Some(why) = self.suspend_blocker(worker) {
             tracing::debug!(thread = %self.thread, why, "idle agent not suspended");
             return false;
         }
@@ -5993,6 +5997,7 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
+    mod capacity_tests;
     mod delegated_tests;
     mod switch_tests;
     mod teardown_tests;
@@ -6289,7 +6294,7 @@ mod tests {
                 "up once it reported"
             );
             assert_eq!(
-                session.inner.suspend_blocker(),
+                session.inner.suspend_blocker(false),
                 Some("no conversation yet to resume"),
                 "Claude's prompt-less init turn leaves no transcript to resume"
             );
@@ -6310,7 +6315,7 @@ mod tests {
             };
             let stored_before = stored();
 
-            assert_eq!(session.inner.suspend_blocker(), None);
+            assert_eq!(session.inner.suspend_blocker(false), None);
             assert!(session.suspend_if_idle(), "an idle session suspends");
             assert!(!session.status().alive);
             assert_eq!(session.lifecycle(), life(false, false, true), "paused");
@@ -6865,13 +6870,13 @@ mod tests {
             ))));
             // A session id with no prompted turn on it may name no transcript to resume.
             assert_eq!(
-                session.inner.suspend_blocker(),
+                session.inner.suspend_blocker(false),
                 Some("no conversation yet to resume")
             );
             session.send_prompt("first");
             assert!(pump_until(ctx, 10, || session.inner.has_conversation.get()
                 && !session.status().running_turn));
-            assert_eq!(session.inner.suspend_blocker(), None, "idle now");
+            assert_eq!(session.inner.suspend_blocker(false), None, "idle now");
             // Codex's own session grants would end unannounced.
             session
                 .inner
@@ -6879,7 +6884,7 @@ mod tests {
                 .borrow_mut()
                 .push("Network access".into());
             assert_eq!(
-                session.inner.suspend_blocker(),
+                session.inner.suspend_blocker(false),
                 Some("Codex session grants")
             );
             session.inner.codex_grants.borrow_mut().clear();
@@ -6902,7 +6907,7 @@ mod tests {
                 .inner
                 .emit(workers(agent_core::event::WorkerState::Running));
             assert_eq!(
-                session.inner.suspend_blocker(),
+                session.inner.suspend_blocker(false),
                 Some("active provider workers")
             );
             assert!(!session.suspend_if_idle(), "a running worker keeps it up");
@@ -6910,7 +6915,7 @@ mod tests {
                 .inner
                 .emit(workers(agent_core::event::WorkerState::Stopping));
             assert_eq!(
-                session.inner.suspend_blocker(),
+                session.inner.suspend_blocker(false),
                 Some("active provider workers"),
                 "a stop in progress is still active"
             );
@@ -6918,7 +6923,7 @@ mod tests {
                 .inner
                 .emit(workers(agent_core::event::WorkerState::Completed));
             assert_eq!(
-                session.inner.suspend_blocker(),
+                session.inner.suspend_blocker(false),
                 None,
                 "settled workers let go"
             );

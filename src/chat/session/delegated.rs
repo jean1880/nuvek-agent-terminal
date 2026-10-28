@@ -218,6 +218,15 @@ impl ChatSession {
         watch
     }
 
+    /// Pauses a delegated worker's idle process for its supervisor, keeping its native session:
+    /// the same checks as a thread's idle suspension ([`ChatSession::suspend_if_idle`]), which
+    /// never stops a worker, and the supervisor's consent through its hooks (a planned
+    /// rotation: nothing revoked, the epoch unchanged). Silent; its next instruction resumes
+    /// it. Whether it stopped.
+    pub(crate) fn suspend_child_if_idle(&self) -> bool {
+        self.inner.suspend(true)
+    }
+
     /// The process was stopped by idle suspension and has not started since: a rebind now is
     /// that resume, which the user did not ask for and has nothing to be told about.
     pub(crate) fn resumes_from_suspension(&self) -> bool {

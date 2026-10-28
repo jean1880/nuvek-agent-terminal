@@ -258,3 +258,60 @@ fn a_forks_inherited_context_survives_two_switches_once_with_the_newest_request(
     assert!(third.summary.contains("HUGE-TAIL"), "its tail is kept");
     assert!(third.summary.contains(" bytes omitted …]"));
 }
+
+/// A credential the stored tool input only holds JSON-escaped, placed where the title's target
+/// is cut: decoding rebuilds it, and the title never shows it, not even a fragment of it.
+#[test]
+fn a_tool_title_never_shows_a_decoded_credential_even_where_it_is_cut() {
+    // Built here so no credential-shaped literal sits in the source.
+    let token = format!("gh{}_{}", "p", "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dE3fG5");
+    // `g` escaped, so the stored text never holds the token as written.
+    let escaped = format!("\\u0067{}", &token[1..]);
+    let store = Store::open_in_memory().expect("store");
+    let thread = fresh(&store, "/w");
+    for pad in [120, 128, 132, 136, 139] {
+        let item = format!("cmd{pad}");
+        let streamed = format!(
+            "{{\"command\": \"echo {} {escaped} done\"}}",
+            "x".repeat(pad - 5)
+        );
+        for env in [
+            Envelope::new(Event::ItemStarted {
+                kind: ItemKind::Command,
+                title: "Bash".into(),
+                input: None,
+                parent: None,
+            }),
+            Envelope::new(Event::ContentDelta {
+                stream: StreamKind::ToolInput,
+                text: streamed,
+            }),
+            Envelope::new(Event::ItemCompleted {
+                status: ItemStatus::Completed,
+                output: None,
+                error: None,
+            }),
+        ] {
+            store
+                .append_event(&thread, None, &env.item(item.as_str()))
+                .expect("stored");
+        }
+    }
+    let messages = store.transcript_messages(&thread).expect("messages");
+    let summary = build_handoff(&messages, "t").summary;
+    for message in &messages {
+        assert!(message.title.starts_with("Run echo"), "{}", message.title);
+    }
+    let shown: String = messages
+        .iter()
+        .map(|m| m.title.as_str())
+        .chain([summary.as_str()])
+        .collect();
+    for end in 6..=token.len() {
+        assert!(
+            !shown.contains(&token[..end]),
+            "a fragment of the credential survived: {}",
+            &token[..end]
+        );
+    }
+}

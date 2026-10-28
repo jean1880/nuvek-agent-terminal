@@ -70,25 +70,25 @@ impl Supervisor {
         if ready {
             return Ok(());
         }
-        // A worker with no process (paused, or gone) takes a slot again when it starts: reserved
-        // now, its own until this start ends (`_slot` drops on every return), by when its
-        // process holds it.
+        // The start's slot, its own until this start ends (`_slot` drops on every return), by
+        // when its process holds it. A worker with no process (paused, or gone) takes one again;
+        // one whose process is still up or stopping (a pause whose exit is not seen yet) carries
+        // that process's slot over, so its exit never frees capacity this start still needs.
         let restart = {
             let state = self.state.borrow();
             state
                 .workers
                 .get(worker)
-                .filter(|w| w.generations.is_empty())
-                .map(|w| w.root.clone())
+                .map(|w| (w.root.clone(), w.generations.is_empty()))
         };
         let _slot = match restart {
-            Some(root) => {
-                let slot = self.make_room(&root, Some(worker)).await?;
-                slot.bind(worker);
-                Some(slot)
-            }
+            Some((root, true)) => Some(self.make_room(&root, Some(worker)).await?),
+            Some((_, false)) => Some(self.reserve_launch()),
             None => None,
         };
+        if let Some(slot) = &_slot {
+            slot.bind(worker);
+        }
         let mut spec = self
             .state
             .borrow()
@@ -376,6 +376,13 @@ impl Supervisor {
             "delegated worker spawned"
         );
         slot.bind(&worker);
+        #[cfg(test)]
+        {
+            let hold = self.state.borrow().hold_before_insert.clone();
+            while hold.as_ref().is_some_and(|h| h.get()) {
+                gtk4::glib::timeout_future(std::time::Duration::from_millis(5)).await;
+            }
+        }
         let lease = if let Some(plan) = lease_plan {
             match gtk4::gio::spawn_blocking(move || super::workspace::create_lease(&plan)).await {
                 Ok(Ok(l)) => Some(l),

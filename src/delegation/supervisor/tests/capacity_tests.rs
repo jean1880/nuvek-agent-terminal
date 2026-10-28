@@ -548,3 +548,145 @@ fn a_start_waits_for_a_pause_already_stopping() {
         stop(&sup).await;
     });
 }
+
+/// Pumps until `done`, failing if the delegated processes ever pass the cap meanwhile.
+async fn within_cap(sup: &Rc<Supervisor>, mut done: impl FnMut() -> bool) {
+    let cap = sup.limits.live_processes_app;
+    pump_until(|| {
+        assert!(
+            sup.live_processes() <= cap,
+            "the cap was passed: {}",
+            sup.live_processes()
+        );
+        done()
+    })
+    .await;
+}
+
+/// A spawn whose worker is accepted but not registered yet still holds its slot: a second
+/// spawn meanwhile makes room, and the processes never pass the cap.
+#[test]
+fn a_spawn_not_registered_yet_keeps_its_slot() {
+    in_context(async {
+        let (_dir, sup, root) = harness();
+        let cap = sup.limits.live_processes_app as usize;
+        let workers = full_table(&sup, &root, "unregistered").await;
+        let free = workers[cap - 1].clone();
+        idle_for(&sup, &free, 1000);
+        assert_eq!(sup.stop_idle_children(500), 1);
+        pump_until(|| !live(&sup, &free)).await;
+
+        let hold = Rc::new(std::cell::Cell::new(true));
+        sup.state.borrow_mut().hold_before_insert = Some(hold.clone());
+        let first = {
+            let (sup, root) = (sup.clone(), root.clone());
+            run_beside(async move { sup.spawn_worker(&root, spawn_request("held-first")).await })
+        };
+        pump_until(|| {
+            let state = sup.state.borrow();
+            state
+                .launch_slots
+                .values()
+                .any(|w| w.as_ref().is_some_and(|w| !state.workers.contains_key(w)))
+        })
+        .await;
+        assert_eq!(
+            sup.usage(&root).live_processes as usize,
+            cap,
+            "its slot still counts"
+        );
+        sup.state.borrow_mut().hold_before_insert = None;
+        let second = {
+            let (sup, root) = (sup.clone(), root.clone());
+            run_beside(async move { sup.spawn_worker(&root, spawn_request("second")).await })
+        };
+        // The second made room rather than taking the held one's slot.
+        pump_until(|| !live(&sup, &workers[0])).await;
+        hold.set(false);
+        let mut started = Vec::new();
+        within_cap(&sup, || {
+            for out in [&first, &second] {
+                if let Some(Ok(receipt)) = out.borrow().as_ref() {
+                    let w = spawned(receipt);
+                    if !started.contains(&w) {
+                        started.push(w);
+                    }
+                }
+            }
+            started.len() == 2 && started.iter().all(|w| live(&sup, w))
+        })
+        .await;
+        assert_eq!(sup.live_processes() as usize, cap);
+        stop(&sup).await;
+    });
+}
+
+/// An instruction that reaches a worker whose pause has not been seen to exit yet carries that
+/// process's slot over to the restart: a spawn admitted after the exit makes room instead of
+/// taking it, and the processes never pass the cap.
+#[test]
+fn a_resume_during_an_unfinished_stop_keeps_the_slot() {
+    in_context(async {
+        let (dir, sup, root) = harness();
+        let cap = sup.limits.live_processes_app as usize;
+        let workers = full_table(&sup, &root, "unfinished").await;
+        let target = workers[cap - 1].clone();
+        let hold = Rc::new(std::cell::Cell::new(true));
+        sup.state.borrow_mut().hold_launch = Some(hold.clone());
+        let session = sup.state.borrow().workers[&target].session().unwrap();
+        let input = crate::delegation::seam::DelegatedInput {
+            operation: OperationId::from_suffix("unfinishedop").unwrap(),
+            epoch: sup.epoch(&root).unwrap(),
+            source: crate::delegation::seam::InputSource::Task,
+            from: root.clone(),
+            from_label: "root".into(),
+            text: "RESUME_DURING_STOP".into(),
+            plan: agent_core::delegation::mailbox::DeliveryPlan::StartTurn,
+            tag: "unfinished".into(),
+        };
+        let mut resume = {
+            let (sup, target) = (sup.clone(), target.clone());
+            Box::pin(async move {
+                let mut input = input;
+                sup.ensure_child(&target, &mut input).await
+            })
+        };
+        // Paused, and the restart begins before the exit is seen: same turn of the main loop.
+        assert!(session.suspend_child_if_idle());
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(resume.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(live(&sup, &target), "the exit is not seen yet");
+        let resume = run_beside(resume);
+        pump_until(|| !live(&sup, &target)).await;
+        assert_eq!(
+            sup.usage(&root).live_processes as usize,
+            cap,
+            "the restart still holds the slot its stopped process had"
+        );
+
+        let spawn = {
+            let (sup, root) = (sup.clone(), root.clone());
+            run_beside(async move { sup.spawn_worker(&root, spawn_request("after-exit")).await })
+        };
+        // It made room rather than taking the restart's slot.
+        pump_until(|| !live(&sup, &workers[0])).await;
+        hold.set(false);
+        within_cap(&sup, || {
+            resume.borrow().is_some()
+                && live(&sup, &target)
+                && spawn
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|r| r.as_ref().is_ok_and(|v| live(&sup, &spawned(v))))
+        })
+        .await;
+        assert!(resume.borrow_mut().take().unwrap().is_ok());
+        assert_eq!(sup.live_processes() as usize, cap);
+        assert!(sup.state.borrow().launch_slots.is_empty());
+        let _ = dir;
+        stop(&sup).await;
+    });
+}

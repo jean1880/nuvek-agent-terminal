@@ -2321,6 +2321,9 @@ pub(super) struct Runtime {
     pub hold_send_accept: Option<Rc<std::cell::Cell<bool>>>,
     #[cfg(test)]
     pub hold_launch: Option<Rc<std::cell::Cell<bool>>>,
+    /// Test barrier: a spawn between its slot naming the worker and the worker's registration.
+    #[cfg(test)]
+    pub hold_before_insert: Option<Rc<std::cell::Cell<bool>>>,
 }
 impl Runtime {
     /// Whether `w` holds a capability issued under its root's current authority epoch. No

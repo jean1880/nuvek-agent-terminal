@@ -503,6 +503,9 @@ impl Supervisor {
             // Requests belong to a process generation, not to a run: a resolution captured
             // under an earlier run still settles its request once a later run is current.
             if current {
+                // Anything its process says is activity: a run's end and a settled request
+                // included, which leave nothing at work to stamp it later.
+                w.last_active = std::time::Instant::now();
                 w.open_requests.apply(scope.generation, &env);
                 if matches!(
                     env.event,
@@ -740,6 +743,7 @@ impl Supervisor {
                     .filter(|w| w.run.as_ref() == Some(&completed_run))
                 {
                     w.last_run = w.run.take();
+                    w.last_active = std::time::Instant::now();
                     if w.row.state != "closed" {
                         w.row.state = super::supervisor::enum_value(
                             &agent_core::delegation::lifecycle::worker_state_after(state),

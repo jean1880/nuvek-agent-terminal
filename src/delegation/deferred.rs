@@ -129,17 +129,21 @@ impl Supervisor {
                 "recipient is dispatching another entry",
             ));
         }
-        let needs_rebind = {
-            let state = self.state.borrow();
-            let w = &state.workers[&target];
-            w.row.parent_id.is_some()
-                && (w.session.is_none()
-                    || w.generations.is_empty()
-                    || !w.readback.ready
-                    || w.row.delegation_status == "rebind_required"
-                    || !state.token_current(w))
+        // From here to the delivery, the recipient is never paused to make room: the readiness
+        // read now must still hold once the acceptance is in. Dropped on every return.
+        let _hold = (direction == Direction::ParentToChild).then(|| self.hold_delivery(&target));
+        let needs_rebind = |sup: &Self| {
+            let state = sup.state.borrow();
+            state.workers.get(&target).is_some_and(|w| {
+                w.row.parent_id.is_some()
+                    && (w.session.is_none()
+                        || w.generations.is_empty()
+                        || !w.readback.ready
+                        || w.row.delegation_status == "rebind_required"
+                        || !state.token_current(w))
+            })
         };
-        let needs_queue = matches!(plan, DeliveryPlan::QueueNextTurn) || needs_rebind;
+        let needs_queue = matches!(plan, DeliveryPlan::QueueNextTurn) || needs_rebind(self);
         let live = match &plan {
             DeliveryPlan::SteerNow(r) => Some(r.clone()),
             DeliveryPlan::WriteLive { target } => target.clone(),
@@ -203,7 +207,9 @@ impl Supervisor {
             policy: r.delivery,
             reserved: !needs_queue,
         };
-        if needs_queue {
+        // A recipient whose process went away during the acceptance anyway (it exited, or was
+        // stopped) is started again through the queue, never handed a write it cannot take.
+        if needs_queue || needs_rebind(self) {
             self.state
                 .borrow_mut()
                 .deferred
@@ -332,7 +338,7 @@ impl Supervisor {
                 Ok(Ok(_)) => entry.reserved = true,
                 Ok(Err(e)) | Err(e) => {
                     if let Some(w) = self.state.borrow_mut().workers.get_mut(&entry.worker) {
-                        w.dispatching = false;
+                        w.end_dispatch();
                     }
                     self.record_fact(entry.input.operation, DispatchFact::Failed(e));
                     return;
@@ -372,7 +378,7 @@ impl Supervisor {
             },
             Err(e) => {
                 if let Some(w) = self.state.borrow_mut().workers.get_mut(&entry.worker) {
-                    w.dispatching = false;
+                    w.end_dispatch();
                 }
                 self.record_fact(entry.input.operation, DispatchFact::Failed(e));
                 return;
@@ -385,7 +391,7 @@ impl Supervisor {
             Ok(epoch) => entry.input.epoch = epoch,
             Err(e) => {
                 if let Some(w) = self.state.borrow_mut().workers.get_mut(&entry.worker) {
-                    w.dispatching = false;
+                    w.end_dispatch();
                 }
                 self.fail_dispatch(&entry, &used, e);
                 return;
@@ -398,7 +404,7 @@ impl Supervisor {
         };
         // No await from this check to the actual session write.
         if let Some(w) = self.state.borrow_mut().workers.get_mut(&entry.worker) {
-            w.dispatching = false;
+            w.end_dispatch();
         }
         if let Err(e) = self.dispatch_check(
             &entry.input.from,
@@ -514,7 +520,7 @@ impl Supervisor {
             }
             let ready = sup.ensure_child(&worker, &mut entry.input).await;
             if let Some(w) = sup.state.borrow_mut().workers.get_mut(&worker) {
-                w.dispatching = false;
+                w.end_dispatch();
             }
             if let Err(e) = ready {
                 sup.record_fact(entry.input.operation, DispatchFact::Failed(e));

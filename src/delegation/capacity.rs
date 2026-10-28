@@ -1,13 +1,23 @@
 //! Only an observed exit releases process capacity. An idle delegated worker's process can be
 //! paused to make room (least recently active first) or after being idle for the user's idle
 //! time: a lossless, silent suspension its next instruction resumes ([`Supervisor::ensure_child`]).
+//!
+//! Admission reserves: a slot admitted for a launch counts as a process from the moment it is
+//! admitted ([`LaunchSlot`]) until the launch holds one (or fails), so starts that await before
+//! their process exists can never take the same slot twice.
 use super::supervisor::{Supervisor, WorkerRt};
 use crate::agent_proc::{ExitWatch, StopPhase};
 use agent_core::delegation::limits::Usage;
 use agent_core::delegation::{ToolError, WorkerId};
 use gtk4::glib;
-use std::rc::Rc;
+use std::collections::HashSet;
+use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
+
+/// The longest an admission waits for a process already stopping to free its slot: a stop's
+/// own worst case ([`wait_exit`] kills after five seconds), with room for its exit to be seen.
+const STOPPING_WAIT: Duration = Duration::from_secs(8);
+
 pub(super) async fn wait_exit(watch: &ExitWatch) {
     let started = Instant::now();
     let mut killed = false;
@@ -19,6 +29,71 @@ pub(super) async fn wait_exit(watch: &ExitWatch) {
         glib::timeout_future(Duration::from_millis(20)).await;
     }
 }
+
+/// Runs `release` on the supervisor's state now, or, if that is borrowed (a guard dropped
+/// inside a borrow), as soon as the main context is free: a guard never leaks its claim.
+fn release(sup: &Weak<Supervisor>, release: impl FnOnce(&Supervisor) + 'static) {
+    let Some(s) = sup.upgrade() else {
+        return;
+    };
+    if s.state.try_borrow_mut().is_ok() {
+        release(&s);
+        return;
+    }
+    let sup = sup.clone();
+    glib::idle_add_local_once(move || {
+        if let Some(s) = sup.upgrade() {
+            release(&s);
+        }
+    });
+}
+
+/// One process slot admitted for a launch and not yet holding a process. Counted as a process
+/// in [`Supervisor::usage`] until dropped; once [`Self::bind`] names the worker it launches, it
+/// is counted at most once with that worker's own process or start.
+pub(super) struct LaunchSlot {
+    sup: Weak<Supervisor>,
+    id: u64,
+}
+impl LaunchSlot {
+    /// The slot is `worker`'s launch.
+    pub(super) fn bind(&self, worker: &WorkerId) {
+        if let Some(s) = self.sup.upgrade() {
+            if let Some(slot) = s.state.borrow_mut().launch_slots.get_mut(&self.id) {
+                *slot = Some(worker.clone());
+            }
+        }
+    }
+}
+impl Drop for LaunchSlot {
+    fn drop(&mut self) {
+        let id = self.id;
+        release(&self.sup, move |s| {
+            s.state.borrow_mut().launch_slots.remove(&id);
+        });
+    }
+}
+
+/// A delivery on its way to a worker: it is never paused under it ([`Supervisor::hold_delivery`]).
+pub(super) struct DeliveryHold {
+    sup: Weak<Supervisor>,
+    worker: WorkerId,
+}
+impl Drop for DeliveryHold {
+    fn drop(&mut self) {
+        let worker = self.worker.clone();
+        release(&self.sup, move |s| {
+            let mut state = s.state.borrow_mut();
+            if let Some(n) = state.delivery_holds.get_mut(&worker) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    state.delivery_holds.remove(&worker);
+                }
+            }
+        });
+    }
+}
+
 impl WorkerRt {
     /// Something of the worker's is under way: a run, input waiting for or on its way to the
     /// process, a binding being prepared, or a request put to the user.
@@ -29,13 +104,45 @@ impl WorkerRt {
             || self.dispatching
             || self.waiting_on_user()
     }
+    /// A dispatch to the worker is over, delivered or not: it was active until now.
+    pub(super) fn end_dispatch(&mut self) {
+        self.dispatching = false;
+        self.last_active = Instant::now();
+    }
 }
 impl Supervisor {
     pub(super) fn usage(&self, root: &WorkerId) -> Usage {
         let state = self.state.borrow();
         let mut u = Usage::default();
-        for w in state.workers.values().filter(|w| w.row.parent_id.is_some()) {
-            u.live_processes += w.generations.len() as u32;
+        let mut bound = HashSet::new();
+        for worker in state.launch_slots.values() {
+            match worker {
+                Some(w) => {
+                    bound.insert(w.clone());
+                }
+                None => u.live_processes += 1,
+            }
+        }
+        for (id, w) in state
+            .workers
+            .iter()
+            .filter(|(_, w)| w.row.parent_id.is_some())
+        {
+            let (alive, current) = w.session.as_ref().map_or((false, None), |s| {
+                (s.lifecycle().alive, Some(s.process_generation()))
+            });
+            // A process of a session no longer running it, or of an earlier generation, is on
+            // its way out.
+            let stopping = w
+                .generations
+                .keys()
+                .filter(|g| !alive || Some(**g) != current)
+                .count() as u32;
+            // Started, or admitted to start, with its process not spawned yet.
+            let starting = alive && current.is_some_and(|g| !w.generations.contains_key(&g));
+            let launching = u32::from(starting || bound.contains(id));
+            u.live_processes += (w.generations.len() as u32).max(launching);
+            u.stopping_processes += stopping;
             if !w.generations.is_empty() && w.run.is_none() {
                 u.idle_workers += 1;
             }
@@ -65,6 +172,31 @@ impl Supervisor {
             .map(|w| w.generations.len() as u32)
             .sum()
     }
+    /// Takes one process slot for a launch, counted from now ([`LaunchSlot`]).
+    fn reserve_launch(&self) -> LaunchSlot {
+        let mut state = self.state.borrow_mut();
+        let id = state.next_launch_slot;
+        state.next_launch_slot = id.wrapping_add(1);
+        state.launch_slots.insert(id, None);
+        LaunchSlot {
+            sup: self.weak.clone(),
+            id,
+        }
+    }
+    /// Keeps `worker` from being paused while a delivery is on its way to it, until the hold
+    /// is dropped.
+    pub(super) fn hold_delivery(&self, worker: &WorkerId) -> DeliveryHold {
+        *self
+            .state
+            .borrow_mut()
+            .delivery_holds
+            .entry(worker.clone())
+            .or_default() += 1;
+        DeliveryHold {
+            sup: self.weak.clone(),
+            worker: worker.clone(),
+        }
+    }
     /// Whether a worker below `worker` is still alive: its process up, or work under way.
     fn has_live_descendant(&self, worker: &WorkerId) -> bool {
         let below: Vec<WorkerId> = {
@@ -84,9 +216,10 @@ impl Supervisor {
         below.iter().any(|id| self.visible(worker, id, false))
     }
     /// Whether the supervisor may pause `worker`'s process: a delegated worker, not closed or
-    /// failed, with its process up and started, nothing of its at work, no input queued for it,
-    /// and no live descendant (whose link through it a stop would cut). The session has its
-    /// own checks too ([`crate::chat::session::ChatSession::suspend_child_if_idle`]).
+    /// failed, with its process up and started, nothing of its at work, no input queued or on
+    /// its way to it, and no live descendant (whose link through it a stop would cut). The
+    /// session has its own checks too
+    /// ([`crate::chat::session::ChatSession::suspend_child_if_idle`]).
     pub(super) fn child_suspendable(&self, worker: &WorkerId) -> bool {
         {
             let state = self.state.borrow();
@@ -94,7 +227,8 @@ impl Supervisor {
                 return false;
             };
             let queued = state.deferred.get(worker).is_some_and(|q| !q.is_empty())
-                || state.controls.values().any(|c| &c.worker == worker);
+                || state.controls.values().any(|c| &c.worker == worker)
+                || state.delivery_holds.contains_key(worker);
             if w.row.parent_id.is_none()
                 || matches!(w.row.state.as_str(), "closed" | "failed")
                 || w.at_work()
@@ -110,7 +244,7 @@ impl Supervisor {
     }
     /// Every worker [`Self::child_suspendable`] would pause, least recently active first, with
     /// when it was last active.
-    fn idle_children(&self) -> Vec<(WorkerId, Instant)> {
+    pub(super) fn idle_children(&self) -> Vec<(WorkerId, Instant)> {
         let candidates: Vec<(WorkerId, Instant)> = self
             .state
             .borrow()
@@ -161,20 +295,23 @@ impl Supervisor {
         }
         paused
     }
-    /// Room for one more agent process: when every slot is taken, pauses the least recently
-    /// active idle worker that can resume losslessly (never `except`, the one about to start)
-    /// and waits for its exit. Refused with [`agent_core::delegation::limits::processes_full`]
-    /// when none can be paused.
+    /// A process slot for one more launch, reserved at once ([`LaunchSlot`]): when every slot
+    /// is taken, pauses the least recently active idle worker that can resume losslessly (never
+    /// `except`, the one about to start) and waits for its exit, or waits (bounded) for a
+    /// process already stopping. Refused with [`agent_core::delegation::limits::processes_full`]
+    /// when neither frees one.
     pub(super) async fn make_room(
         self: &Rc<Self>,
         root: &WorkerId,
         except: Option<&WorkerId>,
-    ) -> Result<(), ToolError> {
+    ) -> Result<LaunchSlot, ToolError> {
         let mut tried: Vec<WorkerId> = Vec::new();
+        let started = Instant::now();
         loop {
             let usage = self.usage(root);
             if usage.live_processes < self.limits.live_processes_app {
-                return Ok(());
+                // Checked and taken with no await between: no other start can take it too.
+                return Ok(self.reserve_launch());
             }
             let next = self
                 .idle_children()
@@ -182,6 +319,11 @@ impl Supervisor {
                 .map(|(id, _)| id)
                 .find(|id| Some(id) != except && !tried.contains(id));
             let Some(worker) = next else {
+                // Another start's pause (or any stop) is under way: its exit frees a slot.
+                if usage.stopping_processes > 0 && started.elapsed() < STOPPING_WAIT {
+                    glib::timeout_future(Duration::from_millis(20)).await;
+                    continue;
+                }
                 return Err(agent_core::delegation::limits::processes_full(
                     &self.limits,
                     &usage,

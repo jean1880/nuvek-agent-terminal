@@ -1021,7 +1021,7 @@ impl ActionKind {
             t => match classify(t) {
                 ToolClass::Edit => Some(Self::Edit),
                 ToolClass::ReadOnly => Some(Self::Read),
-                _ => None,
+                ToolClass::Status | ToolClass::Exec | ToolClass::Unknown => None,
             },
         }
     }
@@ -1090,13 +1090,13 @@ impl Action {
     pub fn of(tool: &str, input: &Value) -> Option<Self> {
         let kind = ActionKind::of_tool(tool)?;
         let path = || -> Option<String> {
-            let mut named = crate::approval_server::named_paths(input)?;
-            if let Some(nb) = input.get("notebook_path") {
-                named.push(nb.as_str()?);
-            }
+            let named = crate::approval_server::named_paths(input)?;
             if named.is_empty() {
-                // A Codex patch names its files only in the changes the adapter attaches.
-                return codex_change_path(input);
+                // A Codex patch names its files only in the changes the adapter attaches; no
+                // other tool has such a fallback.
+                return (tool == "file_change")
+                    .then(|| codex_change_path(input))
+                    .flatten();
             }
             let first = *named.first()?;
             (!first.trim().is_empty() && named.iter().all(|p| *p == first))
@@ -5266,6 +5266,50 @@ mod tests {
             let rule = Rule::from_action(&edit(&p), &c).expect(&p);
             assert!(!rule.warnings(Scope::Always, Some(&c)).is_empty(), "{p}");
         }
+    }
+
+    /// agy 1.4 names its file tools `read_file` and `edit_file`, with the path in `Path`.
+    #[test]
+    fn agy_1_4_file_tools_make_path_actions() {
+        let read = serde_json::json!({"Path": "/w/a.rs", "StartLine": 1});
+        assert_eq!(
+            Action::of("read_file", &read),
+            Some(Action::Read {
+                path: "/w/a.rs".into()
+            })
+        );
+        let edit = serde_json::json!({"Path": "/w/a.rs"});
+        assert_eq!(
+            Action::of("edit_file", &edit),
+            Some(Action::Edit {
+                path: "/w/a.rs".into()
+            })
+        );
+        for tool in [
+            "send_message",
+            "manage_subagents",
+            "manage_task",
+            "schedule",
+        ] {
+            assert_eq!(Action::of(tool, &edit), None, "{tool}");
+        }
+        // Only a Codex patch falls back to its attached changes; an agy edit naming no path (or
+        // a path in an unrecognised shape) describes no action, so it asks.
+        let patch = serde_json::json!({"changes": [{"path": "/w/a.rs"}]});
+        assert_eq!(
+            Action::of("file_change", &patch),
+            Some(Action::Edit {
+                path: "/w/a.rs".into()
+            })
+        );
+        for tool in ["edit_file", "write_to_file", "read_file"] {
+            assert_eq!(Action::of(tool, &patch), None, "{tool}");
+            assert_eq!(Action::of(tool, &serde_json::json!({})), None, "{tool}");
+        }
+        let twin = serde_json::json!({"Path": "/w/a.rs", "PATH": "/home/u/.ssh/authorized_keys"});
+        assert_eq!(Action::of("edit_file", &twin), None);
+        let odd = serde_json::json!({"Path": "/w/a.rs", "path": 7});
+        assert_eq!(Action::of("edit_file", &odd), None);
     }
 
     /// A read that names a second path (a search directory) never rides on a one-path rule.

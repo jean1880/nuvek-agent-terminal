@@ -196,22 +196,54 @@ fn launch_home(
 /// [`Inner::watch_tool_step`]).
 fn canary_tools(kind: ItemKind) -> Option<&'static [&'static str]> {
     match kind {
-        ItemKind::Command => Some(&["run_command", "send_command_input"]),
+        ItemKind::Command => Some(&[
+            "run_command",
+            "send_command_input",
+            "manage_task",
+            "schedule",
+        ]),
         ItemKind::FileChange => Some(&[
             "replace_file_content",
             "multi_replace_file_content",
             "write_to_file",
+            "edit_file",
             "sed_file",
             "notebook_edit",
         ]),
         ItemKind::McpTool => Some(&["call_mcp_tool"]),
-        ItemKind::Subagent => Some(&["start_subagent", "invoke_subagent"]),
+        ItemKind::Subagent => Some(&[
+            "start_subagent",
+            "invoke_subagent",
+            "define_subagent",
+            "browser_subagent",
+            "manage_subagents",
+            "send_message",
+        ]),
         ItemKind::WebSearch => Some(&["search_web", "read_url_content"]),
         ItemKind::FileRead
         | ItemKind::Tool
         | ItemKind::UserMessage
         | ItemKind::AssistantMessage
         | ItemKind::Reasoning => None,
+    }
+}
+
+/// The tool a started step names (the adapter records the step's own tool name in its input),
+/// when it is one of the `tools` its kind is watched for.
+fn step_tool(input: Option<&serde_json::Value>, tools: &[&str]) -> Option<String> {
+    input
+        .and_then(|i| i.get("tool_name"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| tools.contains(name))
+        .map(str::to_owned)
+}
+
+/// Uses up the hook query that covers a step: one for its own tool when it names one, else one
+/// for any tool of its kind.
+fn consume_for_step(approval: &ApprovalHandle, exact: Option<&str>, tools: &[&str]) -> bool {
+    match exact {
+        Some(name) => approval.consume_query(&[name]),
+        None => approval.consume_query(tools),
     }
 }
 
@@ -2558,19 +2590,25 @@ impl Inner {
     /// tool would run unasked. So each state-changing tool step must be matched by a query the
     /// hook sent us. The query and the step travel on different channels, hence the grace.
     ///
-    /// Scope: command, file edit, MCP, subagent and web steps. Unclassified (`Tool`) steps are not
-    /// watched: agy's internal steps (finish, wait, task bookkeeping) are not known to be hooked,
-    /// and killing a healthy session over one would be worse than missing it.
+    /// Scope: command (task management and scheduling included), file edit, MCP, subagent and web
+    /// steps. Unclassified (`Tool`) steps are not watched: agy's internal steps (finish, wait) are
+    /// not known to be hooked, and killing a healthy session over one would be worse than missing
+    /// it.
     fn watch_tool_step(self: &Rc<Self>, env: &Envelope) {
         match &env.event {
-            Event::ItemStarted { kind, .. } => {
+            Event::ItemStarted { kind, input, .. } => {
                 let Some(tools) = canary_tools(*kind) else {
                     return;
                 };
                 let Some(approval) = self.approval() else {
                     return;
                 };
-                if self.adapter.borrow().driver() != Driver::Agy || approval.consume_query(tools) {
+                // The step names its tool: only a query for that very tool covers it. A step
+                // that does not name one of the kind's tools falls back to the whole group.
+                let exact = step_tool(input.as_ref(), tools);
+                if self.adapter.borrow().driver() != Driver::Agy
+                    || consume_for_step(&approval, exact.as_deref(), tools)
+                {
                     return;
                 }
                 let item_id = env.item.clone();
@@ -2594,7 +2632,10 @@ impl Inner {
                     {
                         return;
                     }
-                    if inner.approval().is_some_and(|a| a.consume_query(tools)) {
+                    if inner
+                        .approval()
+                        .is_some_and(|a| consume_for_step(&a, exact.as_deref(), tools))
+                    {
                         return;
                     }
                     if let Some(id) = &item_id {
@@ -6239,6 +6280,24 @@ mod tests {
     const FIXTURE: &str = include_str!("../../crates/agent-core/tests/fixtures/agy-edit.ndjson");
     const CONVERSATION: &str = "3af90996-e4fe-44be-8d6c-ca20da039f6f";
 
+    #[test]
+    fn the_1_4_tools_are_watched() {
+        let edits = canary_tools(ItemKind::FileChange).expect("edits are watched");
+        for tool in ["write_to_file", "edit_file"] {
+            assert!(edits.contains(&tool), "{tool}");
+        }
+        let subagents = canary_tools(ItemKind::Subagent).expect("subagents are watched");
+        for tool in [
+            "start_subagent",
+            "invoke_subagent",
+            "manage_subagents",
+            "send_message",
+        ] {
+            assert!(subagents.contains(&tool), "{tool}");
+        }
+        assert!(canary_tools(ItemKind::FileRead).is_none());
+    }
+
     pub(super) type Seen = Rc<RefCell<Vec<Envelope>>>;
 
     pub(super) fn make_sink() -> (EnvelopeSink, Seen) {
@@ -9397,6 +9456,62 @@ mod tests {
         )
     }
 
+    /// Real agy 1.4 step frames, fed through the adapter: each of these steps runs unasked if
+    /// the hook is not firing, so the canary must trip on every one of them.
+    #[test]
+    fn agy_1_4_steps_with_no_hook_query_trip_the_canary() {
+        for (tool, params) in [
+            ("edit_file", serde_json::json!({"Path": "/w/a.rs"})),
+            (
+                "manage_task",
+                serde_json::json!({"Action": "status", "TaskId": "t1"}),
+            ),
+            (
+                "manage_task",
+                serde_json::json!({"Action": "kill", "TaskId": "t1"}),
+            ),
+            (
+                "schedule",
+                serde_json::json!({"DurationSeconds": 60, "Prompt": "again"}),
+            ),
+            (
+                "send_message",
+                serde_json::json!({"Recipient": "r", "Message": "m"}),
+            ),
+            ("manage_subagents", serde_json::json!({"Action": "list"})),
+            ("define_subagent", serde_json::json!({"Name": "helper"})),
+            ("browser_subagent", serde_json::json!({"Task": "look"})),
+        ] {
+            let step = serde_json::json!({"event": "step_update", "conversation_id": "c1",
+                "step_update": {"conversation_id": "c1", "state": "RUNNING", "step_index": 1,
+                    "step_type": "tool", "tool_name": tool,
+                    "tool_info": {"parameters": params}}})
+            .to_string();
+            in_loop(|ctx| {
+                let tmp = tempfile::tempdir().expect("tmp");
+                let store = Rc::new(Store::open_in_memory().expect("store"));
+                let thread = fresh(&store, "/w");
+                let (sink, seen) = make_sink();
+                let handle = bound_handle(tmp.path());
+                let open = scripted(tmp.path(), &format!("echo '{step}'\nexec sleep 30"));
+                let session = ChatSession::new(
+                    Box::new(AgyAdapter::new("agy")),
+                    open,
+                    store,
+                    thread,
+                    sink,
+                    Some(handle),
+                );
+                session.set_canary_grace(Duration::from_millis(200));
+                assert!(
+                    pump_until(ctx, 15, || hook_missing_error(&seen)),
+                    "the canary let {tool} {params} run unasked"
+                );
+                session.shutdown(false);
+            });
+        }
+    }
+
     #[test]
     fn a_tool_with_no_hook_query_stops_agy_and_restarts_it_read_only() {
         in_loop(|ctx| {
@@ -9803,6 +9918,100 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(resolutions, [Decision::Deny]);
         });
+    }
+
+    /// Runs a hooked agy that sends `queries` (as the hook would) and then prints `steps`;
+    /// whether the canary tripped.
+    fn canary_trips(
+        queries: &[(&str, serde_json::Value)],
+        steps: &[(&str, serde_json::Value)],
+    ) -> bool {
+        let tripped = Cell::new(false);
+        in_loop(|ctx| {
+            use std::io::Write as _;
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let handle = bound_handle(tmp.path());
+            let socket = handle.socket_path().to_owned();
+            let printed: Vec<String> = steps
+                .iter()
+                .enumerate()
+                .map(|(i, (tool, params))| {
+                    let line = serde_json::json!({"event": "step_update", "conversation_id": "c1",
+                        "step_update": {"conversation_id": "c1", "state": "RUNNING",
+                            "step_index": i + 1, "step_type": "tool", "tool_name": tool,
+                            "tool_info": {"parameters": params}}});
+                    format!("echo '{line}'")
+                })
+                .collect();
+            let body = format!(
+                "while [ ! -e \"$D/go\" ]; do sleep 0.05; done\n{}\nexec sleep 30",
+                printed.join("\n")
+            );
+            let session = ChatSession::new(
+                Box::new(AgyAdapter::new("agy")),
+                scripted(tmp.path(), &body),
+                store,
+                thread,
+                sink,
+                Some(handle),
+            );
+            session.set_canary_grace(Duration::from_millis(300));
+            let mut hooks = Vec::new();
+            for (i, (tool, args)) in queries.iter().enumerate() {
+                let mut hook = std::os::unix::net::UnixStream::connect(&socket).expect("connect");
+                let query = agent_core::approval::ApprovalQuery {
+                    id: format!("h{i}"),
+                    conversation_id: "c1".into(),
+                    tool: (*tool).into(),
+                    args: args.clone(),
+                    cwd: None,
+                };
+                writeln!(
+                    hook,
+                    "{}",
+                    agent_core::approval::encode_query(&query).expect("enc")
+                )
+                .expect("send");
+                hooks.push(hook);
+            }
+            // Let the server record the queries before the steps arrive.
+            let _ = pump_until(ctx, 1, || false);
+            std::fs::write(tmp.path().join("go"), "").expect("go");
+            tripped.set(pump_until(ctx, 3, || hook_missing_error(&seen)));
+            drop(hooks);
+            session.shutdown(false);
+        });
+        tripped.get()
+    }
+
+    /// A query for one tool never covers an unhooked step of another, even one watched in the
+    /// same group; each step uses up the query for its own tool.
+    #[test]
+    fn a_hook_query_covers_only_the_step_of_its_own_tool() {
+        let run = ("run_command", serde_json::json!({"CommandLine": "ls"}));
+        let kill = serde_json::json!({"Action": "kill", "TaskId": "t1"});
+        let status = serde_json::json!({"Action": "status", "TaskId": "t1"});
+        assert!(
+            canary_trips(&[run], &[("manage_task", kill.clone())]),
+            "a run_command query covered an unhooked manage_task"
+        );
+        assert!(
+            !canary_trips(
+                &[("manage_task", kill.clone())],
+                &[("manage_task", kill.clone())]
+            ),
+            "a manage_task query did not cover its own step"
+        );
+        assert!(
+            canary_trips(
+                &[("manage_task", status.clone())],
+                &[("manage_task", status.clone()), ("manage_task", kill)]
+            ),
+            "a consumed status query covered a later unhooked kill"
+        );
     }
 
     #[test]

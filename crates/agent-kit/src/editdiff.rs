@@ -337,6 +337,7 @@ pub fn path_of(v: &Value) -> Option<&str> {
             "filepath",
             "target_file",
             "targetFile",
+            "Path",
         ],
     )
     .filter(|p| !p.trim().is_empty())

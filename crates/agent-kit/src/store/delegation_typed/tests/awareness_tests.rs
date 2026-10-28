@@ -104,6 +104,24 @@ fn a_question_page_names_the_question_and_is_an_approval() {
 }
 
 #[test]
+fn a_cut_never_lands_inside_a_redaction_marker() {
+    for pad in 215..=240 {
+        let text = format!("{}****abcd{}", "x".repeat(pad), "y".repeat(100));
+        let summary = first_line(&text, 240);
+        assert!(summary.len() <= 240, "{pad}: {} bytes", summary.len());
+        let body = summary.trim_end_matches('…');
+        match body.find("****") {
+            None => {}
+            Some(at) => assert_eq!(&body[at..at + 8], "****abcd", "pad {pad}: {body}"),
+        }
+        assert!(
+            !body.ends_with("*") && !body.ends_with("***"),
+            "pad {pad}: {body}"
+        );
+    }
+}
+
+#[test]
 fn a_form_page_names_the_form() {
     let events = page_of(
         Event::FormRequested {

@@ -159,6 +159,54 @@ fn a_failed_turn_keeps_a_background_request() {
             summary_of(&sup, &root, &worker).waiting_on_user,
             "a request a background worker made outlives a failed turn"
         );
+        assert_eq!(
+            state_of(&sup, &worker),
+            "waiting",
+            "waiting wins over the failed turn while the request is open"
+        );
+        // Another turn starts before the request is answered: still waiting.
+        {
+            let mut state = sup.state.borrow_mut();
+            let w = state.workers.get_mut(&worker).unwrap();
+            w.run = Some(agent_core::delegation::RunId::parse("r_awareRun2").unwrap());
+        }
+        feed(
+            &sup,
+            &worker,
+            Envelope::new(Event::TurnStarted { model: None }),
+        );
+        assert_eq!(state_of(&sup, &worker), "waiting");
+        feed(&sup, &worker, resolved("a"));
+        assert_eq!(state_of(&sup, &worker), "running");
+        stop(&sup).await;
+    });
+}
+
+#[test]
+fn a_resolution_from_an_earlier_run_still_settles_its_request() {
+    in_context(async {
+        let (_dir, sup, root) = harness();
+        let worker = running_worker(&sup, &root, "late").await;
+        let run_a = sup.scope(&worker).expect("scope");
+        sup.on_child_envelope(
+            &worker,
+            run_a.clone(),
+            approval("a"),
+            (1, None),
+            false,
+            None,
+        );
+        assert_eq!(state_of(&sup, &worker), "waiting");
+        // A later run is reserved in the same process before the answer is committed.
+        {
+            let mut state = sup.state.borrow_mut();
+            let w = state.workers.get_mut(&worker).unwrap();
+            w.last_run = w.run.take();
+            w.run = Some(agent_core::delegation::RunId::parse("r_awareRun2").unwrap());
+        }
+        sup.on_child_envelope(&worker, run_a, resolved("a"), (2, None), false, None);
+        assert!(!summary_of(&sup, &root, &worker).waiting_on_user);
+        assert_eq!(state_of(&sup, &worker), "running");
         stop(&sup).await;
     });
 }

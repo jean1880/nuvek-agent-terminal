@@ -2987,18 +2987,38 @@ fn first_line(text: &str, max: usize) -> String {
     let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
     let first = lines.next().unwrap_or_default();
     let more = lines.next().is_some();
-    if first.len() <= max {
-        return if more {
-            let room = truncate_bytes(first, max.saturating_sub(MARK.len()));
-            format!("{room}{MARK}")
-        } else {
-            first.to_owned()
-        };
+    if first.len() <= max && !more {
+        return first.to_owned();
     }
-    format!(
-        "{}{MARK}",
-        truncate_bytes(first, max.saturating_sub(MARK.len()))
-    )
+    let room = truncate_whole_marker(first, max.saturating_sub(MARK.len()));
+    format!("{room}{MARK}")
+}
+
+/// `text` cut to at most `max` bytes on a character boundary, and never inside a redaction
+/// marker (`****` and up to four characters after it): a cut that would split one drops the
+/// whole marker, so no half of a mask is left to read as something else.
+fn truncate_whole_marker(text: &str, max: usize) -> &str {
+    const OPEN: &str = "****";
+    let cut = truncate_bytes(text, max);
+    let end = cut.len();
+    let mut from = 0;
+    while let Some(at) = text[from..].find(OPEN) {
+        let start = from + at;
+        if start >= end {
+            break;
+        }
+        let tail_len: usize = text[start + OPEN.len()..]
+            .chars()
+            .take(4)
+            .take_while(|c| !c.is_whitespace())
+            .map(char::len_utf8)
+            .sum();
+        if end < start + OPEN.len() + tail_len {
+            return &text[..start];
+        }
+        from = start + OPEN.len();
+    }
+    cut
 }
 
 #[cfg(test)]

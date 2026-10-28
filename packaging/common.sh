@@ -25,13 +25,32 @@ stage_source() {
     cd "$WORK"
 }
 
+# The rustup installer ensure_rust runs, pinned by version and checksum per architecture
+# (static.rust-lang.org/rustup/archive/<version>/<target>/rustup-init.sha256).
+RUSTUP_VERSION="1.29.2"
+declare -A RUSTUP_SHA256=(
+    [x86_64]="5be191e8c70a5007074254cb74d78dbfdd25cd5a61c27de7b8e5410122ec24f4"
+    [aarch64]="a9c168dbea81a84671c6b7a5c1795cb0eb699020110d107ddfca427bd797e697"
+)
+
 # A current stable Rust toolchain through rustup (distribution packages lag behind the crates'
-# minimum Rust), unless one is already on PATH.
+# minimum Rust), unless one is already on PATH. The installer runs only if its checksum matches.
 ensure_rust() {
     export PATH="$HOME/.cargo/bin:$PATH"
     if ! command -v cargo >/dev/null 2>&1; then
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain stable
+        local arch init
+        arch="$(uname -m)"
+        if [[ -z "${RUSTUP_SHA256[$arch]:-}" ]]; then
+            echo "no pinned rustup-init for $arch" >&2
+            return 1
+        fi
+        init="$WORK/rustup-init"
+        curl --proto '=https' --tlsv1.2 -sSf -o "$init" \
+            "https://static.rust-lang.org/rustup/archive/$RUSTUP_VERSION/$arch-unknown-linux-gnu/rustup-init"
+        echo "${RUSTUP_SHA256[$arch]}  $init" | sha256sum --check --strict -
+        chmod +x "$init"
+        "$init" -y --profile minimal --default-toolchain stable
+        rm -f "$init"
     fi
     cargo --version
 }

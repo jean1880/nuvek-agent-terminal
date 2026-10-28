@@ -88,6 +88,8 @@ impl Inner {
                 .retain(|kept| kept.text != sent);
             return ContinueOutcome::Busy;
         }
+        // It continues where it is: a "Continue in" another agent no longer applies.
+        self.continue_on_switch_to.set(None);
         self.emit(Envelope::new(Event::Notice {
             text: CONTINUE_NOTICE.to_owned(),
         }));

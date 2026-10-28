@@ -4098,6 +4098,10 @@ impl AgentTerminalWindow {
         self.ask(dialog, "stop", move |imp, stop| {
             imp.with_chat_mut(&thread, |c| c.confirming_switch = false);
             if !stop {
+                // Not switching: a "Continue in" asked for this switch goes with it.
+                if let Some(session) = imp.slot_of(&thread).and_then(|s| s.get()) {
+                    session.forget_continue_after_switch(None);
+                }
                 return;
             }
             // The slot again: the page may have closed while the question was open.
@@ -6210,14 +6214,24 @@ impl AgentTerminalWindow {
         let limited = self
             .with_chat(thread, |c| c.limit_wait.is_some() || c.rate_limited)
             .unwrap_or(false);
-        if let (true, Some((target, _)), Some(session)) = (limited, target, slot.get()) {
-            session.continue_after_switch_to(target);
-        }
         match target {
-            Some((target, false)) => self.switch_in_place(thread, target),
-            Some((target, true)) => self.confirm_unasked_switch(thread, target),
+            Some((target, false)) => self.hand_over(thread, target, limited),
+            Some((target, true)) => self.confirm_unasked_switch(thread, target, limited),
             None => self.show_toast("No other agent is installed and enabled"),
         }
+    }
+
+    /// Switches `thread` to `target` in place; `continue_after`, its new agent then continues
+    /// the work ([`ChatSession::continue_after_switch_to`]). Asked for this one switch only: a
+    /// switch that does not reach the session (a question cancelled, a preparation that failed)
+    /// takes it back.
+    fn hand_over(&self, thread: &str, target: Driver, continue_after: bool) {
+        if continue_after {
+            if let Some(session) = self.slot_of(thread).and_then(|s| s.get()) {
+                session.continue_after_switch_to(target);
+            }
+        }
+        self.switch_in_place(thread, target);
     }
 
     /// Switches `thread` (open in this window) to `target` in place, on the agent's default model.
@@ -6439,7 +6453,7 @@ impl AgentTerminalWindow {
 
     /// Asks before handing `thread` to `target` (agy without its hook) while the thread forbids
     /// unasked edits: it would apply edits on its own. One question at a time.
-    fn confirm_unasked_switch(&self, thread: &str, target: Driver) {
+    fn confirm_unasked_switch(&self, thread: &str, target: Driver, continue_after: bool) {
         if self.unasked_prompt_open.replace(true) {
             return;
         }
@@ -6460,7 +6474,7 @@ impl AgentTerminalWindow {
         self.ask(dialog, "continue", move |imp, go| {
             imp.unasked_prompt_open.set(false);
             if go {
-                imp.switch_in_place(&thread, target);
+                imp.hand_over(&thread, target, continue_after);
             }
         });
     }

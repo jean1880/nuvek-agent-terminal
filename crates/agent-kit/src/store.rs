@@ -3509,16 +3509,46 @@ struct ToolInput {
 impl ToolInput {
     /// The tool's title in the shared card grammar (`agent_core::tool_title`): from its
     /// structured input, else from the streamed input once it parses, else the tool alone.
+    ///
+    /// Redacted before the title is built and again after. Decoding (JSON escapes, agy's extra
+    /// quotes) can rebuild a credential the stored text only held escaped, and the title cuts
+    /// long targets: cut first, a credential would be left as a fragment too short for the
+    /// redactor to recognise. So every decoded value is redacted whole before anything is cut.
     fn title(&self) -> String {
-        let parsed;
         let input = match &self.input {
-            Some(v) if !v.is_null() => Some(v),
-            _ => {
-                parsed = serde_json::from_str::<Value>(&self.streamed).ok();
-                parsed.as_ref()
-            }
-        };
-        agent_core::tool_title::classify(self.kind, &self.name, input).text()
+            Some(v) if !v.is_null() => Some(v.clone()),
+            _ => serde_json::from_str::<Value>(&self.streamed).ok(),
+        }
+        .map(|v| redact_values(&fully_decoded(v)));
+        let name = redact(&self.name);
+        redact(&agent_core::tool_title::classify(self.kind, &name, input.as_ref()).text())
+    }
+}
+
+/// `input` with agy's quoted arguments decoded until none is left (each pass takes one layer
+/// off: [`agent_core::tool_title::decode_agy_args`]), so the classifier decodes nothing more.
+fn fully_decoded(mut input: Value) -> Value {
+    for _ in 0..4 {
+        let next = agent_core::tool_title::decode_agy_args(&input);
+        if next == input {
+            break;
+        }
+        input = next;
+    }
+    input
+}
+
+/// `value` with every string in it redacted whole.
+fn redact_values(value: &Value) -> Value {
+    match value {
+        Value::String(s) => Value::String(redact(s)),
+        Value::Array(items) => Value::Array(items.iter().map(redact_values).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), redact_values(v)))
+                .collect(),
+        ),
+        other => other.clone(),
     }
 }
 

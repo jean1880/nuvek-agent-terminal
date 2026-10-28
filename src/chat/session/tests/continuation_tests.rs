@@ -301,3 +301,60 @@ fn continue_in_another_agent_starts_a_continuation_there() {
         t.session.shutdown(false);
     });
 }
+
+/// A "Continue in" that was not taken never continues a later switch: its question was
+/// cancelled, or the thread's own agent continued after its limit and completed, or the user
+/// wrote first (a message sent, queued or steered); and taking one back never takes a later one.
+#[test]
+fn a_continue_in_not_taken_never_continues_a_later_switch() {
+    in_loop(|ctx| {
+        let t = Thread::new(ctx);
+        t.session.send_prompt("first");
+        assert!(pump_until(ctx, 10, || t.idle()));
+
+        // Cancelled: taken back.
+        t.session.continue_after_switch_to(Driver::Agy);
+        t.session.forget_continue_after_switch(None);
+        assert_eq!(t.session.continue_after_switch_armed(), None);
+
+        // Only the one named is taken back.
+        t.session.continue_after_switch_to(Driver::Agy);
+        let earlier = t.session.continue_after_switch_armed();
+        t.session.continue_after_switch_to(Driver::Agy);
+        t.session.forget_continue_after_switch(earlier);
+        assert!(t.session.continue_after_switch_armed().is_some());
+
+        // The user writes first, however the message goes.
+        t.session.queue_prompt("queued");
+        assert_eq!(t.session.continue_after_switch_armed(), None);
+        t.session.continue_after_switch_to(Driver::Agy);
+        t.session.steer_prompt("steered");
+        assert_eq!(t.session.continue_after_switch_armed(), None);
+        // The queued message goes first, then this one.
+        assert!(pump_until(ctx, 10, || t.idle()
+            && t.sent_old().contains("queued")
+            && t.sent_old().contains("steered")));
+
+        // Left waiting, then the thread's own agent continues after its limit and completes.
+        t.session.continue_after_switch_to(Driver::Agy);
+        t.session.set_limit_wait(true);
+        assert_eq!(t.session.continue_after_limit(), ContinueOutcome::Started);
+        assert!(pump_until(ctx, 10, || t.idle()
+            && t.sent_old().contains("Your usage limit has reset")));
+
+        // A later idle switch continues nothing.
+        t.session.switch(Driver::Agy, None, None);
+        assert!(pump_until(ctx, 10, || t.session.status().driver
+            == Driver::Agy
+            && t.session.status().alive
+            && !t.session.inner.switch_reading.get()));
+        // Long enough for a continuation to have gone, had one been owed.
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(300) {
+            ctx.iteration(false);
+        }
+        assert!(!t.sent_new().contains("Continue the unfinished task"));
+        assert!(!t.sent_old().contains("Continue the unfinished task"));
+        t.session.shutdown(false);
+    });
+}

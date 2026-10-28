@@ -117,3 +117,14 @@ fn only_a_refused_auto_steer_goes_back_to_wait_for_the_next_turn() {
         }
     }
 }
+
+#[test]
+fn a_cap_too_small_for_a_header_and_note_still_bounds_every_part() {
+    for cap in [1, 8, 12, 40] {
+        let split = result_parts(&"z".repeat(400), cap, 0);
+        assert!(!split.parts.is_empty());
+        for part in &split.parts {
+            assert!(part.len() <= cap, "cap {cap}: {} bytes", part.len());
+        }
+    }
+}

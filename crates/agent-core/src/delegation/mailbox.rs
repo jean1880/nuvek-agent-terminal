@@ -314,6 +314,11 @@ pub fn result_parts(text: &str, cap: usize, already_cut: usize) -> ResultParts {
             last.push_str(&omission_note(omitted));
         }
     }
+    // A cap too small for a header and the note still bounds every part.
+    for part in &mut parts {
+        let end = crate::text::truncate_bytes(part, cap).len();
+        part.truncate(end);
+    }
     ResultParts { parts, omitted }
 }
 

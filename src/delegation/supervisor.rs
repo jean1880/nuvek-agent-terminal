@@ -2310,6 +2310,9 @@ pub(super) struct Runtime {
     /// captured that epoch or an older one is void (`Supervisor::epoch_for`), while a sibling's
     /// revocation only moves its work on to the new epoch.
     pub fences: HashMap<WorkerId, AuthorityEpoch>,
+    /// How long a steer waits for its run's answer before it is taken as refused; `None` is
+    /// [`super::deferred::STEER_SETTLE`] (tests shorten it).
+    pub steer_settle: Option<std::time::Duration>,
     /// Process slots admitted but not yet holding a process, by reservation, with the worker
     /// each launches once known (see `capacity.rs`).
     pub launch_slots: HashMap<u64, Option<WorkerId>>,

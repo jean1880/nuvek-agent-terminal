@@ -63,6 +63,19 @@ pub fn operation_step(
     }
 }
 
+/// The one way back an operation may take: a send whose steer the run refused after it was
+/// written (`submitted`) is accepted again, to be reserved and dispatched anew on the next turn.
+/// Not an [`operation_step`]: only the refused steer's own path takes it.
+pub fn requeue_refused_steer(from: OperationState) -> Result<OperationState, LifecycleError> {
+    match from {
+        OperationState::Submitted => Ok(OperationState::Accepted),
+        _ => Err(LifecycleError::Illegal {
+            from: WorkerState::Unknown,
+            input: "requeue_refused_steer",
+        }),
+    }
+}
+
 /// After a restart, a reservation or submission whose outcome was not recorded is `Unknown`
 /// (never re-dispatched).
 pub fn on_restart(state: OperationState) -> OperationState {

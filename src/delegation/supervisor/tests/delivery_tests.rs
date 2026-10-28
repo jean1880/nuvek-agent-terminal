@@ -691,3 +691,302 @@ fn a_childs_report_is_never_requeued() {
         stop(&sup).await;
     });
 }
+
+/// How many startup checks the fake child has been sent so far.
+fn startup_checks(dir: &std::path::Path) -> usize {
+    std::fs::read_to_string(dir.join("frames.ndjson"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.contains("\"dir\": \"in\"") && l.contains("startup check"))
+        .count()
+}
+
+/// The delivery's own target exits (its generation's revocation commits) while the delivery
+/// prepares to start it again and its parent stays current: the delivery fails, and no new
+/// process is started for it.
+#[test]
+fn a_targets_own_exit_during_preparation_fails_the_delivery() {
+    in_context(async {
+        let (dir, sup, root) = harness();
+        let worker = spawn_idle(&sup, &root, "own-exit").await;
+        let session = sup.child_session(&worker).unwrap();
+        session.shutdown(true);
+        pump_until(|| sup.state.borrow().workers[&worker].generations.is_empty()).await;
+        settled(&sup, &root).await;
+        let checks = startup_checks(dir.path());
+        let receipt = sup
+            .send_worker(&root, instruction(&worker, "start again", "own-exit-send"))
+            .await
+            .unwrap();
+        let op = receipt["operation_id"].as_str().unwrap().to_owned();
+        // Taken off the queue for its start; the target's own exit commits before it goes on.
+        assert!(sup.state.borrow().workers[&worker].dispatching);
+        sup.begin_revoke(&root, RevocationEvent::GenerationExited(worker.clone()));
+        settled(&sup, &root).await;
+        pump_until(|| dispatch(&sup, &op) == "failed").await;
+        pump_until(|| !sup.state.borrow().workers[&worker].dispatching).await;
+        glib::timeout_future(Duration::from_millis(300)).await;
+        assert!(
+            sup.state.borrow().workers[&worker].generations.is_empty(),
+            "no process was started for a delivery its target's exit revoked"
+        );
+        assert_eq!(startup_checks(dir.path()), checks);
+        stop(&sup).await;
+    });
+}
+
+/// A cancel that finds the task still pending (its child at its startup check) ends the run
+/// through the one completion, and the child is stopped only after that end committed: the
+/// run is interrupted with its reason, the task's dispatch failed, the parent told, and the
+/// worker not failed.
+#[test]
+fn a_cancel_with_the_task_still_pending_keeps_its_completion() {
+    in_context(async {
+        let (dir, sup, root) = harness();
+        std::fs::write(dir.path().join("hold-bootstrap"), "").unwrap();
+        let receipt = sup
+            .spawn_worker(&root, spawn_request("pending-cancel"))
+            .await
+            .unwrap();
+        let worker = spawned(&receipt);
+        let run = RunId::parse(receipt["run_id"].as_str().unwrap()).unwrap();
+        pump_until(|| startup_checks(dir.path()) > 0).await;
+        assert!(sup.state.borrow().workers[&worker].pending.is_some());
+        sup.cancel_bound_run(&worker, &run, "Delegated run cancelled");
+        pump_until(|| {
+            run_state(&sup, run.as_str()).is_some_and(|s| s != "reserved" && s != "starting")
+        })
+        .await;
+        let ended = sup
+            .services
+            .handle
+            .reader()
+            .delegation_run(run.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(ended.state, "interrupted");
+        assert_eq!(ended.terminal_reason.as_deref(), Some("cancelled"));
+        let op = receipt["operation_id"].as_str().unwrap();
+        pump_until(|| dispatch(&sup, op) == "failed").await;
+        connect(&sup, &root, ConnId(74)).await;
+        let page = tool(
+            &sup,
+            ConnId(74),
+            1,
+            ToolRequest::Read(ReadRequest {
+                target: Some(worker.clone()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert!(
+            page["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["kind"] == "report"
+                    && m["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("Cancelled before its turn started"))),
+            "the parent's report: {page:#}"
+        );
+        // The child never got its task: it is stopped, after the end.
+        pump_until(|| sup.state.borrow().workers[&worker].generations.is_empty()).await;
+        {
+            let state = sup.state.borrow();
+            let w = &state.workers[&worker];
+            assert_ne!(w.row.state, "failed", "{:?}", w.row.delegation_reason);
+            assert!(w.row.delegation_reason.is_none());
+        }
+        std::fs::remove_file(dir.path().join("hold-bootstrap")).unwrap();
+        stop(&sup).await;
+    });
+}
+
+/// A busy worker's steer, sent as a Codex run takes it: queued, reserved, submitted and
+/// awaiting the run's answer under `tag`.
+async fn steer_in_flight(
+    sup: &Rc<Supervisor>,
+    root: &WorkerId,
+    policy: Delivery,
+    key: &str,
+) -> (WorkerId, RunId, String, String) {
+    let worker = spawn_holding(sup, root, &format!("{key}-busy")).await;
+    let run = sup.state.borrow().workers[&worker].run.clone().unwrap();
+    // Stored as `auto` (what a refusal requeues) but queued rather than written live: a
+    // worker that takes no live input queues it for the next turn.
+    let mut request = instruction(&worker, "steer it", key);
+    if policy == Delivery::Auto {
+        request.delivery = Delivery::Auto;
+    }
+    let driver = std::mem::replace(
+        &mut sup
+            .state
+            .borrow_mut()
+            .workers
+            .get_mut(&worker)
+            .unwrap()
+            .driver,
+        Driver::Agy,
+    );
+    let receipt = sup.send_worker(root, request).await.unwrap();
+    sup.state
+        .borrow_mut()
+        .workers
+        .get_mut(&worker)
+        .unwrap()
+        .driver = driver;
+    let op = receipt["operation_id"].as_str().unwrap().to_owned();
+    let id = receipt["message_id"].as_str().unwrap().to_owned();
+    let mut entry = sup
+        .state
+        .borrow_mut()
+        .deferred
+        .get_mut(&worker)
+        .unwrap()
+        .pop_front()
+        .unwrap();
+    let store = sup.services.handle.reader();
+    store
+        .reserve_delegation_dispatch(&entry.input.operation)
+        .unwrap()
+        .unwrap();
+    store
+        .record_delegation_dispatch(
+            &entry.input.operation,
+            &agent_kit::store::delegation_typed::DispatchFact::Submitted,
+        )
+        .unwrap();
+    entry.input.plan = agent_core::delegation::mailbox::DeliveryPlan::SteerNow(run.clone());
+    entry.policy = policy;
+    entry.reserved = true;
+    sup.state
+        .borrow_mut()
+        .controls
+        .insert(format!("{key}-tag"), entry);
+    (worker, run, op, id)
+}
+
+/// A steer refused only after its turn ended is still requeued and delivered next turn: its
+/// correlation outlives the turn.
+#[test]
+fn a_refusal_after_the_turn_ended_still_requeues_the_steer() {
+    in_context(async {
+        let (_dir, sup, root) = harness();
+        let (worker, run, op, id) = steer_in_flight(&sup, &root, Delivery::Auto, "late").await;
+        sup.cancel_bound_run(&worker, &run, "Delegated run cancelled");
+        pump_until(|| sup.state.borrow().workers[&worker].run.is_none()).await;
+        assert!(
+            sup.state.borrow().controls.contains_key("late-tag"),
+            "the steer's correlation outlived its turn"
+        );
+        sup.delivery_control(&worker, &refusal("late-tag"));
+        pump_until(|| dispatch(&sup, &op) == "confirmed").await;
+        let row = message(&sup, &id);
+        assert_eq!(row.delivery_state, "provider_confirmed");
+        assert_ne!(row.recipient_run_id.as_deref(), Some(run.as_str()));
+        stop(&sup).await;
+    });
+}
+
+/// A steer no answer settles is taken as refused once its deadline passes: `auto` goes to the
+/// next turn, `this_run` fails.
+#[test]
+fn a_steer_with_no_answer_settles_by_its_deadline() {
+    for policy in [Delivery::Auto, Delivery::ThisRun] {
+        in_context(async {
+            let (_dir, sup, root) = harness();
+            sup.state.borrow_mut().steer_settle = Some(Duration::from_millis(200));
+            let (worker, run, op, id) = steer_in_flight(&sup, &root, policy, "silent").await;
+            // The deadline is armed when the steer is sent; this one was planted.
+            sup.arm_steer_settle(&worker, "silent-tag".into());
+            sup.cancel_bound_run(&worker, &run, "Delegated run cancelled");
+            let expected = if policy == Delivery::Auto {
+                "confirmed"
+            } else {
+                "failed"
+            };
+            pump_until(|| dispatch(&sup, &op) == expected).await;
+            let state = message(&sup, &id).delivery_state;
+            assert_eq!(
+                state,
+                if policy == Delivery::Auto {
+                    "provider_confirmed"
+                } else {
+                    "failed"
+                },
+                "{policy:?}"
+            );
+            stop(&sup).await;
+        });
+    }
+}
+
+/// A run's result keeps each assistant item's text in order: a snapshot (a split secret's
+/// heal) replaces only its own item.
+#[test]
+fn a_snapshot_replaces_only_its_own_items_text() {
+    use crate::delegation::publish::{accumulate, take_result};
+    let mut items = Vec::new();
+    accumulate(&mut items, Some("a"), "first draft", true, 1024);
+    accumulate(&mut items, Some("b"), "second ", false, 1024);
+    accumulate(&mut items, Some("b"), "item", false, 1024);
+    accumulate(&mut items, Some("a"), "first, healed", true, 1024);
+    assert_eq!(
+        take_result(&mut items),
+        ("first, healed\n\nsecond item".into(), 0)
+    );
+    // Past the limit, what is cut is counted.
+    accumulate(&mut items, None, &"x".repeat(30), false, 20);
+    assert_eq!(take_result(&mut items), ("x".repeat(20), 10));
+}
+
+/// Each run's result starts at its turn: nothing of an earlier run is carried into it.
+#[test]
+fn a_runs_result_starts_with_its_turn() {
+    use crate::delegation::seam::ChildPublish;
+    in_context(async {
+        let (_dir, sup, root) = harness();
+        let worker = spawn_idle(&sup, &root, "reset").await;
+        let publisher = crate::delegation::publish::Publisher::new(Rc::downgrade(&sup), worker);
+        let mut snapshot = Envelope::new(Event::ContentSnapshot {
+            stream: agent_core::event::StreamKind::Assistant,
+            text: "left from a cancelled run".into(),
+        });
+        snapshot.item = Some("a".into());
+        publisher.persist("t", None, &snapshot);
+        assert_eq!(publisher.result_so_far(), "left from a cancelled run");
+        publisher.persist(
+            "t",
+            None,
+            &Envelope::new(Event::TurnStarted {
+                model: Some("synthetic-model".into()),
+            }),
+        );
+        assert_eq!(publisher.result_so_far(), "");
+        stop(&sup).await;
+    });
+}
+
+/// A secret straddling the result's bound is redacted whole before the cut: none of it shows.
+#[test]
+fn a_secret_at_the_results_bound_is_redacted_before_it_is_cut() {
+    use crate::delegation::publish::{
+        accumulate, result_bound, result_messages, take_result, RESULT_LOOKAHEAD,
+    };
+    in_context(async {
+        let (_dir, sup, _root) = harness();
+        let bound = result_bound(&sup);
+        let secret = format!("{}_{}", "ghp", "Ab3D".repeat(9));
+        let text = format!("{}{secret} trailing words", "x".repeat(bound - 8));
+        let mut items = Vec::new();
+        accumulate(&mut items, None, &text, false, bound + RESULT_LOOKAHEAD);
+        let (whole, cut) = take_result(&mut items);
+        let (parts, _) = result_messages(&sup, &whole, cut);
+        assert!(
+            parts.iter().all(|p| !p.contains("ghp_Ab3D")),
+            "a piece of the secret survived the cut"
+        );
+        stop(&sup).await;
+    });
+}

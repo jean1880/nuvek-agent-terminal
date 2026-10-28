@@ -119,7 +119,11 @@ fn a_refused_auto_steer_waits_for_the_next_turn_and_is_confirmed_in_the_run_it_r
             .expect("requeued"),
         DeliveryState::QueuedNextTurn
     );
-    assert_eq!(op_state(&f.s, &auto.operation), "submitted");
+    assert_eq!(
+        op_state(&f.s, &auto.operation),
+        "accepted",
+        "accepted again"
+    );
     assert_eq!(delivery(&f.s, &message), ("queued_next_turn".into(), None));
     // Only once: it is no longer submitted.
     assert!(f.s.requeue_refused_delegation_steer(&message).is_err());
@@ -141,8 +145,14 @@ fn a_refused_auto_steer_waits_for_the_next_turn_and_is_confirmed_in_the_run_it_r
         updated_at: 2,
     })
     .expect("next run");
-    f.s.record_delegation_delivery(&message, DeliveryState::DispatchReserved, None)
+    // Reserved anew, with every check, and submitted again.
+    f.s.reserve_delegation_dispatch(&auto.operation)
+        .expect("s")
         .expect("reserved again");
+    assert_eq!(delivery(&f.s, &message).0, "dispatch_reserved");
+    f.s.record_delegation_dispatch(&auto.operation, &DispatchFact::Submitted)
+        .expect("submitted again");
+    assert_eq!(delivery(&f.s, &message).0, "submitted");
     f.s.record_delegation_delivery(&message, DeliveryState::ProviderConfirmed, Some(&next))
         .expect("an auto message is delivered in the run it reaches");
     f.s.record_delegation_dispatch(&auto.operation, &DispatchFact::Confirmed)
@@ -258,8 +268,9 @@ fn a_restart_fails_undispatched_work_for_a_child_and_leaves_a_childs_mailbox_alo
         e.details.as_ref().expect("details")["replayed"],
         json!(true)
     );
-    // The child's report is mailbox data: read and acknowledged, exactly as it was.
-    assert_eq!(op_state(&s, &report.operation), "accepted");
+    // The child's report is mailbox data: read and acknowledged, exactly as it was, its
+    // operation done since its acceptance.
+    assert_eq!(op_state(&s, &report.operation), "confirmed");
     let after = s
         .delegation_message(report_message.as_str())
         .expect("q")
@@ -602,4 +613,289 @@ fn a_cancel_before_the_turn_opened_ends_the_run_before_its_dispatch_fails() {
     assert!(links
         .iter()
         .any(|l| l.worker_id == child.as_str() && l.run_id.as_deref() == Some(run.as_str())));
+}
+
+/// A refused auto steer requeued, then `event` before its next turn: the accepted-again
+/// operation fails with the revocation and its message is cancelled; a retry replays the
+/// failure, never a success.
+fn requeued_then(event: impl Fn(&WorkerId) -> RevocationEvent) {
+    let f = fx();
+    let op = spawn(&f.s, &f.root.worker, "k1");
+    let (child, run) = (op.worker.expect("w"), op.run.expect("r"));
+    f.s.advance_delegation_run(&run, RunState::Running, None)
+        .expect("running");
+    let auto = send_with(&f.s, &f.root.worker, &child, "auto", Some(run), "a1");
+    let message = auto.message.clone().expect("m");
+    f.s.reserve_delegation_dispatch(&auto.operation)
+        .expect("s")
+        .expect("reserved");
+    f.s.record_delegation_dispatch(&auto.operation, &DispatchFact::Submitted)
+        .expect("submitted");
+    f.s.requeue_refused_delegation_steer(&message)
+        .expect("requeued");
+    f.s.revoke_delegation(&f.root.worker, &event(&child))
+        .expect("revoke");
+    assert_eq!(op_state(&f.s, &auto.operation), "failed");
+    assert_eq!(delivery(&f.s, &message).0, "cancelled");
+    let again = accept(
+        &f.s,
+        &f.root.worker,
+        req(
+            ToolName::CrossAgentSend,
+            json!({"target": child.as_str(), "text": "steer", "kind": "instruction",
+                   "delivery": "auto", "idempotency_key": "a1"}),
+        ),
+        Resolution::default(),
+        AcceptPlan::Send(SendPlan {
+            initial: DeliveryState::Queued,
+            target_run: None,
+        }),
+    );
+    assert!(
+        matches!(again, Ok(Accepted::Replay(ReplayOutcome::Error(_)))),
+        "{again:?}"
+    );
+}
+
+#[test]
+fn a_requeued_steer_fails_when_its_worker_is_closed() {
+    requeued_then(|child| RevocationEvent::Close(child.clone()));
+}
+
+#[test]
+fn a_requeued_steer_fails_when_its_root_is_stopped() {
+    requeued_then(|_| RevocationEvent::RootStop);
+}
+
+#[test]
+fn a_requeued_steer_fails_with_a_reason_after_a_restart() {
+    let f = fx();
+    let Fx {
+        _dir,
+        path,
+        s,
+        root,
+        ..
+    } = f;
+    let op = spawn(&s, &root.worker, "k1");
+    let (child, run) = (op.worker.expect("w"), op.run.expect("r"));
+    s.advance_delegation_run(&run, RunState::Running, None)
+        .expect("running");
+    let auto = send_with(&s, &root.worker, &child, "auto", Some(run), "a1");
+    let message = auto.message.clone().expect("m");
+    s.reserve_delegation_dispatch(&auto.operation)
+        .expect("s")
+        .expect("reserved");
+    s.record_delegation_dispatch(&auto.operation, &DispatchFact::Submitted)
+        .expect("submitted");
+    s.requeue_refused_delegation_steer(&message)
+        .expect("requeued");
+    drop(s);
+    let s = open(&path);
+    let rec = s.reconcile_delegation_after_restart().expect("reconcile");
+    assert!(rec.operations.contains(&auto.operation));
+    assert_eq!(op_state(&s, &auto.operation), "failed");
+    assert_eq!(delivery(&s, &message).0, "failed");
+    let error = s
+        .delegation_operation(auto.operation.as_str())
+        .expect("q")
+        .expect("row")
+        .error_json
+        .expect("error");
+    assert!(error.contains("restarted"), "{error}");
+}
+
+/// A requeued steer is reserved again with every check: its worker closed meanwhile (with no
+/// revocation seen yet), the reservation refuses it.
+#[test]
+fn a_requeued_steer_is_reserved_again_with_the_closed_target_check() {
+    let f = fx();
+    let op = spawn(&f.s, &f.root.worker, "k1");
+    let (child, run) = (op.worker.expect("w"), op.run.expect("r"));
+    f.s.advance_delegation_run(&run, RunState::Running, None)
+        .expect("running");
+    let auto = send_with(&f.s, &f.root.worker, &child, "auto", Some(run), "a1");
+    let message = auto.message.clone().expect("m");
+    f.s.reserve_delegation_dispatch(&auto.operation)
+        .expect("s")
+        .expect("reserved");
+    f.s.record_delegation_dispatch(&auto.operation, &DispatchFact::Submitted)
+        .expect("submitted");
+    f.s.requeue_refused_delegation_steer(&message)
+        .expect("requeued");
+    f.s.set_delegation_worker_state(child.as_str(), "closed", None, 5)
+        .expect("closed");
+    let refused = f.s.reserve_delegation_dispatch(&auto.operation).expect("s");
+    assert_eq!(refused.err().map(|e| e.code), Some(ErrorCode::WorkerClosed));
+    assert_eq!(op_state(&f.s, &auto.operation), "failed");
+}
+
+/// A message pinned to a run is confirmed only in a run: never with none named.
+#[test]
+fn a_targeted_strict_message_is_never_confirmed_without_a_run() {
+    let f = fx();
+    let op = spawn(&f.s, &f.root.worker, "k1");
+    let (child, run) = (op.worker.expect("w"), op.run.expect("r"));
+    f.s.advance_delegation_run(&run, RunState::Running, None)
+        .expect("running");
+    let strict = send_with(
+        &f.s,
+        &f.root.worker,
+        &child,
+        "this_run",
+        Some(run.clone()),
+        "s1",
+    );
+    let message = strict.message.clone().expect("m");
+    f.s.reserve_delegation_dispatch(&strict.operation)
+        .expect("s")
+        .expect("reserved");
+    f.s.record_delegation_dispatch(&strict.operation, &DispatchFact::Submitted)
+        .expect("submitted");
+    assert!(f
+        .s
+        .record_delegation_delivery(&message, DeliveryState::ProviderConfirmed, None)
+        .is_err());
+    assert_eq!(delivery(&f.s, &message).0, "submitted");
+    f.s.record_delegation_delivery(&message, DeliveryState::ProviderConfirmed, Some(&run))
+        .expect("confirmed in its run");
+}
+
+fn carried(s: &Store, op: &OperationId) -> Option<String> {
+    s.meta(&carried_epoch_key(op.as_str())).expect("meta")
+}
+
+/// Only work that was current is carried to the new epoch, and the carried epoch goes once
+/// the operation leaves `accepted`, whichever way: reserved, failed directly, revoked,
+/// abandoned by a restart, or deleted.
+#[test]
+fn a_carried_epoch_is_kept_only_for_current_work_and_dropped_whenever_it_leaves_accepted() {
+    let f = fx();
+    let closed = spawn(&f.s, &f.root.worker, "k1").worker.expect("w");
+    let sibling = spawn(&f.s, &f.root.worker, "k2").worker.expect("w");
+    let send_to = |key: &str| {
+        new_op(send(
+            &f.s,
+            &f.root.worker,
+            sibling.as_str(),
+            "instruction",
+            key,
+            key,
+        ))
+    };
+    let reserved = send_to("r1");
+    let failed = send_to("f1");
+    let revoked = send_to("v1");
+    f.s.revoke_delegation(&f.root.worker, &RevocationEvent::Close(closed))
+        .expect("close");
+    for op in [&reserved, &failed, &revoked] {
+        assert_eq!(carried(&f.s, &op.operation).as_deref(), Some("1"));
+    }
+    f.s.reserve_delegation_dispatch(&reserved.operation)
+        .expect("s")
+        .expect("carried work reserves");
+    assert_eq!(carried(&f.s, &reserved.operation), None, "reserved");
+    f.s.record_delegation_dispatch(
+        &failed.operation,
+        &DispatchFact::Failed(ToolError::new(ErrorCode::ProviderUnavailable, "gone")),
+    )
+    .expect("failed");
+    assert_eq!(carried(&f.s, &failed.operation), None, "failed directly");
+    // Stale work is not carried again by a later revocation; covered work loses its carry.
+    let stale_row =
+        f.s.delegation_operation(revoked.operation.as_str())
+            .expect("q")
+            .expect("row");
+    f.s.delete_meta(&carried_epoch_key(&stale_row.id))
+        .expect("drop");
+    let other = spawn(&f.s, &f.root.worker, "k3").worker.expect("w");
+    f.s.revoke_delegation(&f.root.worker, &RevocationEvent::Close(other))
+        .expect("close");
+    assert_eq!(
+        carried(&f.s, &revoked.operation),
+        None,
+        "stale work is not carried"
+    );
+    let current = send_to("c1");
+    f.s.revoke_delegation(
+        &f.root.worker,
+        &RevocationEvent::GenerationExited(sibling.clone()),
+    )
+    .expect("exit");
+    assert_eq!(op_state(&f.s, &current.operation), "failed");
+    assert_eq!(carried(&f.s, &current.operation), None, "revoked");
+    // A restart abandons carried work for a child and drops its carry.
+    let Fx {
+        _dir,
+        path,
+        s,
+        root,
+        ..
+    } = f;
+    let survivor = spawn(&s, &root.worker, "k4").worker.expect("w");
+    let gone = spawn(&s, &root.worker, "k5").worker.expect("w");
+    let pending = new_op(send(
+        &s,
+        &root.worker,
+        survivor.as_str(),
+        "instruction",
+        "p1",
+        "p1",
+    ));
+    s.revoke_delegation(&root.worker, &RevocationEvent::Close(gone))
+        .expect("close");
+    assert!(carried(&s, &pending.operation).is_some());
+    drop(s);
+    let s = open(&path);
+    s.reconcile_delegation_after_restart().expect("reconcile");
+    assert_eq!(op_state(&s, &pending.operation), "failed");
+    assert_eq!(carried(&s, &pending.operation), None, "restart");
+    // Deleting the thread drops what is left.
+    let kept = new_op(send(
+        &s,
+        &root.worker,
+        survivor.as_str(),
+        "instruction",
+        "d1",
+        "d1",
+    ));
+    let third = spawn(&s, &root.worker, "k6").worker.expect("w");
+    s.revoke_delegation(&root.worker, &RevocationEvent::Close(third))
+        .expect("close");
+    assert!(carried(&s, &kept.operation).is_some());
+    let rows = s.delegation_workers_of_root(&root.root).expect("workers");
+    for w in rows.iter().filter(|w| w.parent_id.is_some()) {
+        s.set_delegation_worker_state(&w.id, "closed", None, 9)
+            .expect("close");
+        if let Some(run) = s.active_delegation_run(&w.id).expect("run") {
+            s.end_delegation_run_if_open(&run.id, "interrupted", None, 9)
+                .expect("end");
+        }
+    }
+    let thread = s
+        .delegation_root_of_worker(&root.worker)
+        .expect("q")
+        .expect("root")
+        .root_thread_id;
+    s.delete_thread(&thread).expect("delete");
+    assert_eq!(carried(&s, &kept.operation), None, "deleted");
+}
+
+/// A child's report is done once stored: a later exit of that child never turns it into a
+/// failure, and a retry replays its receipt.
+#[test]
+fn a_childs_report_is_done_at_acceptance_and_survives_its_exit() {
+    let f = fx();
+    let child = spawn(&f.s, &f.root.worker, "k1").worker.expect("w");
+    let report = new_op(send(&f.s, &child, "parent", "report", "done", "r1"));
+    assert_eq!(op_state(&f.s, &report.operation), "confirmed");
+    f.s.revoke_delegation(
+        &f.root.worker,
+        &RevocationEvent::GenerationExited(child.clone()),
+    )
+    .expect("exit");
+    assert_eq!(op_state(&f.s, &report.operation), "confirmed");
+    assert_eq!(carried(&f.s, &report.operation), None);
+    let replayed = new_op_or_replay(send(&f.s, &child, "parent", "report", "done", "r1"));
+    assert_eq!(replayed["replayed"], json!(true));
 }

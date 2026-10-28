@@ -33,8 +33,8 @@ pub const DEGRADED_TOOLS: [ToolName; 1] = [ToolName::CrossAgentCapabilities];
 /// Shown in Settings → Agents and as `capabilities.delegation_scope`'s
 /// explanation.
 pub const DELEGATION_SCOPE_TEXT: &str = "Depth and mode limits apply to agents started through agent-terminal. \
-    Delegated agents cannot start their own built-in sub-agents, except Codex, whose built-in sub-agents run \
-    outside these limits (route_caveats says so). Your own sessions keep their built-in sub-agents, \
+    Claude and agy children cannot start their own built-in sub-agents; a Codex child's native workers run \
+    unsupervised, outside these limits (route_caveats says so). Your own sessions keep their built-in sub-agents, \
     which agent-terminal shows but does not limit.";
 
 impl ToolName {
@@ -99,8 +99,9 @@ impl ToolName {
                  for work that needs them — effort multiplies quota burn. \
                  usage.headroom is ok, low, exhausted or unknown: when it is low or exhausted, \
                  prefer a profile of another agent family. refresh=true reads usage again before answering (at most once a minute per \
-                 agent). Depth and mode limits apply to agents started through agent-terminal; \
-                 delegated agents cannot start their own built-in sub-agents."
+                 agent). Depth and mode limits apply to agents started through agent-terminal. \
+                 Claude and agy children cannot start built-in sub-agents; a Codex child's native \
+                 workers run unsupervised, outside these limits (route_caveats says so)."
             }
             ToolName::CrossAgentSpawn => {
                 "agent-terminal cross-agent delegation: start a supervised child agent on a task, \
@@ -108,8 +109,11 @@ impl ToolName {
                  (an isolated git worktree, or the shared tree read-only for plan). To limit the \
                  child on purpose, list what it may do in capabilities (edit, exec, network); a \
                  limit written only in the task text is not enforced. Returns a \
-                 receipt with the worker id; follow it with cross_agent_wait or cross_agent_read. \
-                 Pass an idempotency_key; retrying with the same key never starts a second agent."
+                 receipt with the worker id. You need not poll: when you are idle you are woken \
+                 with each child's result and messages. A sub-agent that spawns workers is not \
+                 woken and should cross_agent_wait for them. Use cross_agent_wait or \
+                 cross_agent_read to look sooner. Pass an idempotency_key; retrying with the \
+                 same key never starts a second agent."
             }
             ToolName::CrossAgentSend => {
                 "agent-terminal cross-agent delegation: send a message to a child worker \
@@ -127,7 +131,10 @@ impl ToolName {
             ToolName::CrossAgentWait => {
                 "agent-terminal cross-agent delegation: wait up to timeout_ms for new events or \
                  messages from your workers or mailbox, then return the same page as \
-                 cross_agent_read. A timeout never stops a worker."
+                 cross_agent_read. A timeout never stops a worker. A root is woken with its \
+                 children's results when idle, so it need not wait; a sub-agent that spawns \
+                 workers is not woken and should wait. A worker in state waiting with \
+                 waiting_on_user true needs the user, not you."
             }
             ToolName::CrossAgentList => {
                 "agent-terminal cross-agent delegation: list the workers you started (your \
@@ -143,7 +150,8 @@ impl ToolName {
             }
             ToolName::CrossAgentClose => {
                 "agent-terminal cross-agent delegation: close a worker and everything it \
-                 started, permanently. Its transcript stays readable. Pass an idempotency_key."
+                 started, permanently. Its transcript stays readable. Closing a finished worker \
+                 frees its process slot. Pass an idempotency_key."
             }
         }
     }
@@ -534,11 +542,12 @@ fn worker_summary() -> Value {
                 "paths": {"type": "array", "items": {"type": "string"}, "maxItems": 16}},
                 "required": ["code", "reason", "paths"]},
             "last_activity": {"type": ["string", "null"]},
+            "waiting_on_user": {"type": "boolean", "description": "A request (approval, question or form) is open that only the user can answer; state is waiting while the worker has a run."},
             "updated_at": {"type": "string"}
         },
         "required": ["worker_id", "parent_id", "name", "origin", "state", "run_id", "run_state",
                      "identity", "depth", "can_spawn", "controls", "task_mode", "workspace",
-                     "delegation", "last_activity", "updated_at"]
+                     "delegation", "last_activity", "waiting_on_user", "updated_at"]
     })
 }
 

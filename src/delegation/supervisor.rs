@@ -2103,6 +2103,8 @@ mod tests {
             stop(&sup).await;
         });
     }
+    /// A parent can tell a worker waiting on the user from one at work.
+    mod awareness_tests;
     /// Worker status, run agreement, startup deadlines and paging errors (PR-E).
     mod status_tests;
     /// A root is told its sub-agents' results without polling for them.
@@ -2170,6 +2172,57 @@ impl TokenSlot {
         }
     }
 }
+/// The requests a worker has put to the user that nobody has answered yet (approvals,
+/// questions and forms), keyed by the process generation that asked and the request id. A
+/// request leaves when it is answered, withdrawn or expires; a stopped turn and a process exit
+/// take every request of that generation with them. A failed or completed turn does not:
+/// background work can outlive such a turn and still be waiting on the user, as the view
+/// keeps it.
+#[derive(Debug, Default)]
+pub(super) struct OpenRequests(std::collections::BTreeSet<(ProcessGeneration, String)>);
+impl OpenRequests {
+    /// Follows one event of `generation`'s process.
+    pub fn apply(&mut self, generation: ProcessGeneration, env: &agent_core::event::Envelope) {
+        use agent_core::event::{Event, QuestionSource, TurnState};
+        let key = || (generation, env.request.clone().unwrap_or_default());
+        match &env.event {
+            Event::ApprovalRequested { .. }
+            | Event::FormRequested { .. }
+            | Event::QuestionRequested {
+                source: QuestionSource::Agent,
+                ..
+            } => {
+                // A newer process asking means older ones are gone.
+                self.0.retain(|(g, _)| *g >= generation);
+                self.0.insert(key());
+            }
+            Event::ApprovalResolved { .. }
+            | Event::ApprovalExpired
+            | Event::QuestionResolved { .. }
+            | Event::FormResolved { .. } => {
+                self.0.remove(&key());
+            }
+            Event::TurnCompleted {
+                state: TurnState::Interrupted,
+                ..
+            }
+            | Event::SessionExited { .. } => self.clear_generation(generation),
+            _ => {}
+        }
+    }
+    /// Forgets every request `generation`'s process made (it exited, or its turn was stopped).
+    pub fn clear_generation(&mut self, generation: ProcessGeneration) {
+        self.0.retain(|(g, _)| *g != generation);
+    }
+    /// Whether `generation`'s process has a request open.
+    pub fn any_in(&self, generation: ProcessGeneration) -> bool {
+        self.0.iter().any(|(g, _)| *g == generation)
+    }
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
 pub(super) struct WorkerRt {
     pub row: WorkerRow,
     pub root: WorkerId,
@@ -2202,8 +2255,14 @@ pub(super) struct WorkerRt {
     /// per run (a worker's state is inherited from its previous run until the new turn opens).
     pub opened_run: Option<RunId>,
     pub cwd: PathBuf,
+    /// Requests put to the user and not yet settled; see [`OpenRequests`].
+    pub open_requests: OpenRequests,
 }
 impl WorkerRt {
+    /// Whether the worker's current process has a request open that only the user can answer.
+    pub fn waiting_on_user(&self) -> bool {
+        self.open_requests.any_in(self.generation)
+    }
     pub fn session(&self) -> Option<Rc<ChatSession>> {
         self.session.clone().or_else(|| self.root_session.upgrade())
     }
@@ -2767,6 +2826,7 @@ impl Supervisor {
             readback: super::readback::Readback::default(),
             opened_run: None,
             cwd,
+            open_requests: OpenRequests::default(),
         }
     }
     pub(super) async fn stage(
@@ -3517,6 +3577,7 @@ impl Supervisor {
                 paths: Vec::new(),
             },
             last_activity: w.row.last_activity.clone(),
+            waiting_on_user: w.waiting_on_user(),
             updated_at: agent_core::quota::epoch_to_rfc3339(w.row.updated_at / 1000),
         };
         fit_summary(&mut summary);

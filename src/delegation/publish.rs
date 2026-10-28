@@ -373,7 +373,13 @@ pub(super) fn category(event: &Event) -> Option<EventCategory> {
         | Event::TurnCompleted { .. }
         | Event::ModeChanged { .. } => EventCategory::Lifecycle,
         Event::ItemStarted { .. } | Event::ItemCompleted { .. } => EventCategory::Activity,
-        Event::ApprovalRequested { .. } | Event::ApprovalResolved { .. } => EventCategory::Approval,
+        Event::ApprovalRequested { .. }
+        | Event::ApprovalResolved { .. }
+        | Event::ApprovalExpired
+        | Event::QuestionRequested { .. }
+        | Event::QuestionResolved { .. }
+        | Event::FormRequested { .. }
+        | Event::FormResolved { .. } => EventCategory::Approval,
         Event::DelegatedMessage { .. } => EventCategory::Message,
         Event::Error { .. } => EventCategory::Error,
         _ => return None,
@@ -446,6 +452,7 @@ impl Supervisor {
                 && w.generation == scope.generation
                 && w.run.as_ref().or(w.last_run.as_ref()) == scope.run.as_ref()
             {
+                w.open_requests.apply(scope.generation, &env);
                 match &env.event {
                     Event::TurnStarted { .. }
                         if !bootstrap && !w.readback.failed && w.run == scope.run =>
@@ -453,8 +460,21 @@ impl Supervisor {
                         w.row.state = "running".into();
                         w.opened_run = scope.run.clone();
                     }
-                    Event::ApprovalRequested { .. } => w.row.state = "waiting".into(),
-                    Event::ApprovalResolved { .. } => w.row.state = "running".into(),
+                    // Waiting while anything is still put to the user; back to running only
+                    // once the last request is settled and a run is open.
+                    Event::ApprovalRequested { .. }
+                    | Event::QuestionRequested { .. }
+                    | Event::FormRequested { .. }
+                    | Event::ApprovalResolved { .. }
+                    | Event::ApprovalExpired
+                    | Event::QuestionResolved { .. }
+                    | Event::FormResolved { .. } => {
+                        if w.waiting_on_user() {
+                            w.row.state = "waiting".into();
+                        } else if w.run.is_some() {
+                            w.row.state = "running".into();
+                        }
+                    }
                     Event::TurnCompleted { state, usage, .. }
                         if !bootstrap
                             && !w.readback.failed

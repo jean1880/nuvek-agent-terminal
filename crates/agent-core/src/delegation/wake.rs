@@ -11,8 +11,8 @@
 //! into one turn, within [`WAKE_BUDGET`]. Every text is redacted before it is cut, so a cut can
 //! never leave half a secret unmasked. A stopped or closed parent is never woken, and at most
 //! [`MAX_CONSECUTIVE_WAKES`] wakes run without the user speaking in between. A parent in
-//! dangerous permissive mode is never woken either: its thread is told what waits, and the news
-//! goes with the user's next message or once the mode is left.
+//! dangerous permissive mode is woken like any other, under the same cap on wakes without the
+//! user.
 
 use std::collections::{HashMap, VecDeque};
 

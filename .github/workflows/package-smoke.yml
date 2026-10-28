@@ -22,9 +22,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
+      # The checks run from the branch this workflow was dispatched on, never from the commit
+      # under test: that commit is only read as data (its Cargo.toml, below).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.commit }}
+          persist-credentials: false
       - name: Verify producer run
         env:
           GH_TOKEN: ${{ github.token }}
@@ -35,6 +37,13 @@ jobs:
           [[ "$EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" > producer-run.json
           python3 tests/qa/package_smoke.py verify-run producer-run.json "$EXPECTED_COMMIT"
+      - name: Read the source commit's manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_COMMIT: ${{ inputs.commit }}
+        run: |
+          gh api -H "Accept: application/vnd.github.raw" \
+            "repos/$GITHUB_REPOSITORY/contents/Cargo.toml?ref=$EXPECTED_COMMIT" > source-Cargo.toml
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: package-deb
@@ -50,7 +59,7 @@ jobs:
       - name: Check installed executable in an isolated home
         env:
           EXPECTED_COMMIT: ${{ inputs.commit }}
-        run: python3 tests/qa/package_smoke.py installed dist "$EXPECTED_COMMIT"
+        run: python3 tests/qa/package_smoke.py installed dist "$EXPECTED_COMMIT" --manifest source-Cargo.toml
       - name: Preserve package diagnostics
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -58,6 +67,7 @@ jobs:
           name: package-smoke-${{ inputs.run_id }}
           path: |
             producer-run.json
+            source-Cargo.toml
             dist/*.identity.json
             target/qa-package/
           if-no-files-found: warn

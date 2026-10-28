@@ -28,10 +28,10 @@ def verify_run(path, expected_commit):
         raise ValueError("producer must be a successful Release workflow for the exact source commit")
 
 
-def installed(directory, expected_commit):
+def installed(directory, expected_commit, manifest_path):
     artifacts = qa_env.ROOT / "target/qa-package"
     artifacts.mkdir(parents=True, exist_ok=True)
-    version = tomllib.loads((qa_env.ROOT / "Cargo.toml").read_text())["package"]["version"]
+    version = tomllib.loads(manifest_path.read_text())["package"]["version"]
     packages = sorted(directory.glob("*.deb"))
     if len(packages) != 1:
         raise ValueError("expected exactly one Debian package")
@@ -80,13 +80,15 @@ def main():
     parser.add_argument("action", choices=["verify-run", "installed"])
     parser.add_argument("path", type=Path)
     parser.add_argument("commit")
+    # The source commit's Cargo.toml, which need not be the checked-out one.
+    parser.add_argument("--manifest", type=Path, default=qa_env.ROOT / "Cargo.toml")
     args = parser.parse_args()
     if not re.fullmatch(r"[0-9a-f]{40}", args.commit):
         parser.error("expected a 40-character source commit")
     if args.action == "verify-run":
         verify_run(args.path, args.commit)
     else:
-        installed(args.path, args.commit)
+        installed(args.path, args.commit, args.manifest)
 
 
 if __name__ == "__main__":

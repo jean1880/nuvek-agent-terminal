@@ -2790,6 +2790,10 @@ impl AgentTerminalWindow {
         if minutes == 0 || self.is_closing() {
             return;
         }
+        // Delegated workers idle as long give their process slots back the same way.
+        if let Some(sup) = crate::delegation::supervisor() {
+            sup.stop_idle_children(minutes);
+        }
         let shown = self.shown_thread.borrow().clone();
         let now = std::time::Instant::now();
         // Collected first: a session stopping must not find the registry borrowed.

@@ -140,7 +140,6 @@ impl Supervisor {
     }
     /// Pauses every delegated worker idle for at least `idle_minutes` (0: never), as the idle
     /// threads of a window are. Each resumes on its next instruction. How many were paused.
-    #[cfg_attr(not(test), allow(dead_code))] // the window's minute sweep calls it
     pub(crate) fn stop_idle_children(&self, idle_minutes: u32) -> usize {
         if idle_minutes == 0 || self.state.borrow().shutting_down {
             return 0;

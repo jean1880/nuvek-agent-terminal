@@ -253,10 +253,11 @@ pub(crate) trait DelegationHooks {
     /// stop). This is NOT an observed exit: kill the token and end runs, but free no process slot
     /// and unlink nothing.
     fn process_stopping(&self, generation: ProcessGeneration);
-    /// The session wants to stop this idle root generation to free memory (idle suspension),
-    /// resuming it later. True: the stop is a planned rotation (the token ends, nothing is
-    /// revoked) and the next prompt rebinds quietly. False (the default, and with any delegated
-    /// work live): the session does not suspend.
+    /// The session wants to stop this idle generation to free memory (a root's idle suspension,
+    /// or a delegated worker paused for its process slot), resuming it later. True: the stop is
+    /// a planned rotation (the token ends, nothing is revoked) and the next prompt or instruction
+    /// rebinds quietly. False (the default, and with any delegated work live): the session does
+    /// not suspend.
     fn suspending(&self, _generation: ProcessGeneration) -> bool {
         false
     }

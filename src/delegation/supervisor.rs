@@ -2313,6 +2313,10 @@ pub(super) struct Runtime {
     /// How long a steer waits for its run's answer before it is taken as refused; `None` is
     /// [`super::deferred::STEER_SETTLE`] (tests shorten it).
     pub steer_settle: Option<std::time::Duration>,
+    /// Steers whose answer was overdue, recorded `unknown`, by correlation tag: an answer that
+    /// still comes settles them (accepted: delivered; refused: requeued). The oldest gives way
+    /// past [`super::deferred::LATE_STEERS`].
+    pub late_steers: std::collections::VecDeque<(String, super::deferred::Delivery)>,
     /// Process slots admitted but not yet holding a process, by reservation, with the worker
     /// each launches once known (see `capacity.rs`).
     pub launch_slots: HashMap<u64, Option<WorkerId>>,
@@ -3463,6 +3467,9 @@ impl Supervisor {
             state
                 .controls
                 .retain(|_, entry| !effect.kill_tokens.contains(&entry.worker));
+            state
+                .late_steers
+                .retain(|(_, entry)| !effect.kill_tokens.contains(&entry.worker));
             (sessions, conns, overlays)
         };
         for path in overlays {

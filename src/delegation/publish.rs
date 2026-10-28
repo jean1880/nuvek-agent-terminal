@@ -8,7 +8,7 @@ use agent_core::event::{Envelope, Event, StreamKind, TurnState};
 use agent_core::redact::stream::{StreamKey, StreamSanitiser};
 use agent_kit::store::delegation_typed::{Completion, LinkSpec, PublishEvent};
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::rc::{Rc, Weak};
 
 /// The event's sequence number and, for a run's completion, the parent's report message: the
@@ -73,7 +73,9 @@ pub(super) struct Publisher {
     pub supervisor: Weak<Supervisor>,
     pub worker: WorkerId,
     sanitiser: RefCell<StreamSanitiser>,
-    keys: RefCell<HashMap<(u64, String, String), StreamKey>>,
+    /// Streams the sanitiser may hold text for, in the order each was first seen: a flush
+    /// releases them in that order.
+    keys: RefCell<Vec<(StreamId, StreamKey)>>,
     pending: Rc<RefCell<VecDeque<PendingPublication>>>,
     pending_bytes: Rc<Cell<usize>>,
     publishing: Rc<Cell<bool>>,
@@ -97,6 +99,24 @@ pub(super) struct ResultItem {
 
 /// Adds `text` to `item`'s share of `items` (replacing it for a snapshot), within `limit`
 /// bytes in all.
+/// One sanitiser stream: its generation, item and stream kind.
+type StreamId = (u64, String, String);
+
+/// The item name a stream with none goes under (the sanitiser's key and the flush use it).
+const UNIDENTIFIED: &str = "unidentified";
+
+/// Gives `item` its place in `items` if it has none yet.
+pub(super) fn note_item(items: &mut Vec<ResultItem>, item: Option<&str>) {
+    let item = item.unwrap_or(UNIDENTIFIED);
+    if !items.iter().any(|i| i.item.as_deref() == Some(item)) {
+        items.push(ResultItem {
+            item: Some(item.to_owned()),
+            text: String::new(),
+            cut: 0,
+        });
+    }
+}
+
 pub(super) fn accumulate(
     items: &mut Vec<ResultItem>,
     item: Option<&str>,
@@ -104,16 +124,10 @@ pub(super) fn accumulate(
     replace: bool,
     limit: usize,
 ) {
-    let at = match items.iter().position(|i| i.item.as_deref() == item) {
-        Some(at) => at,
-        None => {
-            items.push(ResultItem {
-                item: item.map(str::to_owned),
-                text: String::new(),
-                cut: 0,
-            });
-            items.len() - 1
-        }
+    let item = item.unwrap_or(UNIDENTIFIED);
+    note_item(items, Some(item));
+    let Some(at) = items.iter().position(|i| i.item.as_deref() == Some(item)) else {
+        return;
     };
     if replace {
         items[at].text.clear();
@@ -144,7 +158,7 @@ impl Publisher {
             supervisor,
             worker,
             sanitiser: RefCell::new(StreamSanitiser::new(Default::default())),
-            keys: RefCell::new(HashMap::new()),
+            keys: RefCell::new(Vec::new()),
             pending: Rc::new(RefCell::new(VecDeque::new())),
             pending_bytes: Rc::new(Cell::new(0)),
             publishing: Rc::new(Cell::new(false)),
@@ -362,15 +376,11 @@ impl Publisher {
     fn flush(&self, generation: ProcessGeneration, item: Option<&str>, cancel: bool) {
         let keys = {
             let mut all = self.keys.borrow_mut();
-            let selected = all
-                .keys()
-                .filter(|(g, i, _)| *g == generation.0 && item.is_none_or(|x| x == i))
-                .cloned()
-                .collect::<Vec<_>>();
-            selected
+            let (selected, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut *all)
                 .into_iter()
-                .filter_map(|k| all.remove(&k))
-                .collect::<Vec<_>>()
+                .partition(|((g, i, _), _)| *g == generation.0 && item.is_none_or(|x| x == i));
+            *all = kept;
+            selected.into_iter().map(|(_, key)| key).collect::<Vec<_>>()
         };
         for key in keys {
             let out = if cancel {
@@ -418,11 +428,19 @@ impl ChildPublish for Publisher {
             &env.event
         {
             let stream = *stream;
-            let key = scope.stream_key(env.item.as_deref().unwrap_or("unidentified"), stream);
-            self.keys.borrow_mut().insert(
-                (generation.0, key.item.clone(), key.stream.clone()),
-                key.clone(),
-            );
+            let key = scope.stream_key(env.item.as_deref().unwrap_or(UNIDENTIFIED), stream);
+            {
+                let id = (generation.0, key.item.clone(), key.stream.clone());
+                let mut keys = self.keys.borrow_mut();
+                if !keys.iter().any(|(k, _)| *k == id) {
+                    keys.push((id, key.clone()));
+                }
+            }
+            // The item's place in the result is where it first appeared, before the sanitiser
+            // holds any of its text back.
+            if stream == StreamKind::Assistant {
+                note_item(&mut self.result.borrow_mut(), env.item.as_deref());
+            }
             let out = if matches!(env.event, Event::ContentSnapshot { .. }) {
                 self.sanitiser.borrow_mut().replace_snapshot(&key, text)
             } else {
@@ -842,15 +860,19 @@ impl Supervisor {
                         );
                     }
                 }
-                if stop_after {
-                    // Its startup check decides nothing now: the stop ends it unfinished, which
-                    // is not a failure of the worker, and its last events are not a run's.
-                    if let Some(w) = sup.state.borrow_mut().workers.get_mut(&worker) {
-                        w.readback.failed = true;
-                    }
-                    if let Some(session) = sup.child_session(&worker) {
-                        session.shutdown(true);
-                    }
+                // Only the generation the ended run was on is stopped, and only while it has
+                // moved on to nothing else: no newer run, and no queued work, which its next
+                // delivery starts on a fresh generation of its own instead.
+                let stop = stop_after.and_then(|generation| {
+                    let state = sup.state.borrow();
+                    let w = state.workers.get(&worker)?;
+                    let idle = w.generation == generation
+                        && w.run.is_none()
+                        && state.deferred.get(&worker).is_none_or(|q| q.is_empty());
+                    idle.then(|| w.session()).flatten()
+                });
+                if let Some(session) = stop {
+                    session.shutdown(true);
                 }
                 sup.drain_deferred(&worker);
                 sup.notify_registry();
@@ -879,6 +901,7 @@ pub(super) struct RunEnd {
         agent_core::delegation::OperationId,
         agent_core::delegation::ToolError,
     )>,
-    /// Stop the worker's session once the end committed: a child that never got its task.
-    pub stop_after: bool,
+    /// Stop the worker's session once the end committed, if it is still on this generation
+    /// with nothing newer to do: a child that never got its task.
+    pub stop_after: Option<agent_core::delegation::ProcessGeneration>,
 }

@@ -104,7 +104,8 @@ fn only_a_refused_auto_steer_goes_back_to_wait_for_the_next_turn() {
     use DeliveryState as D;
     for from in D::ALL {
         for policy in [Delivery::Auto, Delivery::NextTurn, Delivery::ThisRun] {
-            let ok = from == D::Submitted && policy == Delivery::Auto;
+            // Written (`submitted`), or overdue (`unknown`) and then refused.
+            let ok = matches!(from, D::Submitted | D::Unknown) && policy == Delivery::Auto;
             assert_eq!(
                 requeue_refused_steer(from, policy).ok(),
                 ok.then_some(D::QueuedNextTurn),
@@ -127,4 +128,18 @@ fn a_cap_too_small_for_a_header_and_note_still_bounds_every_part() {
             assert!(part.len() <= cap, "cap {cap}: {} bytes", part.len());
         }
     }
+}
+
+#[test]
+fn only_an_overdue_steer_is_confirmed_late() {
+    use DeliveryState as D;
+    for from in D::ALL {
+        assert_eq!(
+            confirm_late_steer(from).ok(),
+            (from == D::Unknown).then_some(D::ProviderConfirmed),
+            "{from:?}"
+        );
+    }
+    // No ordinary step leaves `unknown`.
+    assert!(delivery_step(D::Unknown, D::ProviderConfirmed).is_err());
 }

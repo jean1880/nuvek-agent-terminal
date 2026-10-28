@@ -122,14 +122,18 @@ impl Supervisor {
             .settled_delivery_epoch(&input.from, worker, input.epoch)
             .await?;
         self.dispatch_check(&input.from, worker, input.epoch, None)?;
-        {
+        // The new generation's startup check, set only once the old generation is gone: what
+        // the old one still says as it stops (an unfinished startup check of its own, say) is
+        // never taken for the new one's.
+        let fresh_readback = || -> Result<(), ToolError> {
             let mut state = self.state.borrow_mut();
             let w = state
                 .workers
                 .get_mut(worker)
                 .ok_or_else(|| error(ErrorCode::NotFound, "worker closed"))?;
             w.readback = super::readback::Readback::child(spec.driver, spec.mode);
-        }
+            Ok(())
+        };
         let session = if let Some(session) = session {
             self.rotate_before_stop(worker, session.process_generation());
             if let Some(watch) = session.rebind_stop() {
@@ -139,9 +143,11 @@ impl Supervisor {
                 .settled_delivery_epoch(&input.from, worker, input.epoch)
                 .await?;
             self.dispatch_check(&input.from, worker, input.epoch, None)?;
+            fresh_readback()?;
             session.rebind_start();
             session
         } else {
+            fresh_readback()?;
             self.build_child(&spec, approval)?
         };
         if spec.driver == Driver::Claude {

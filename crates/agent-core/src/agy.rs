@@ -442,7 +442,9 @@ impl AgyAdapter {
             })
             .or_else(|| info.parameters.clone());
         if let Some(p) = params.as_mut().and_then(Value::as_object_mut) {
-            if !p.contains_key("tool_name") {
+            // The step's own name, whatever the call's arguments claim (the canary reads it). An MCP
+            // call keeps its argument: that names the MCP tool, which the card shows.
+            if name != "call_mcp_tool" || !p.contains_key("tool_name") {
                 p.insert("tool_name".to_string(), Value::String(name.clone()));
             }
         }

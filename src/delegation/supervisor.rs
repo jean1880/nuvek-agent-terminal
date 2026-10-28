@@ -9,7 +9,7 @@ use crate::agent_proc::ExitWatch;
 use crate::chat::session::ChatSession;
 use crate::config::Profile;
 use agent_core::adapter::{Driver, Mode};
-use agent_core::delegation::authority::{revocation, RevocationEvent, TaskMode};
+use agent_core::delegation::authority::{revocation, RevocationEvent, RevocationScope, TaskMode};
 use agent_core::delegation::correlation::ObservedCalls;
 use agent_core::delegation::route::{RouteQuery, RouteSpec};
 use agent_core::delegation::wire::WorkerSummary;
@@ -2103,6 +2103,8 @@ mod tests {
             stop(&sup).await;
         });
     }
+    /// Delivery and completion across refusals, revocations, retries and long answers.
+    mod delivery_tests;
     /// Worker status, run agreement, startup deadlines and paging errors (PR-E).
     mod status_tests;
     /// A root is told its sub-agents' results without polling for them.
@@ -2233,6 +2235,10 @@ pub(super) struct Runtime {
     pub wakes: HashMap<WorkerId, agent_core::delegation::wake::Queue>,
     /// Roots with a wake attempt already scheduled.
     pub wake_armed: HashSet<WorkerId>,
+    /// Per worker, the newest epoch a revocation covering it was latched under: work that
+    /// captured that epoch or an older one is void (`Supervisor::epoch_for`), while a sibling's
+    /// revocation only moves its work on to the new epoch.
+    pub fences: HashMap<WorkerId, AuthorityEpoch>,
 }
 impl Runtime {
     /// Whether `w` holds a capability issued under its root's current authority epoch. No
@@ -2775,7 +2781,9 @@ impl Supervisor {
         generation: ProcessGeneration,
         profile: &Profile,
     ) -> Result<(), ToolError> {
-        let epoch = self.epoch(worker)?;
+        // Captured once; after each await it is re-read (`settled_epoch_for`): a sibling's close
+        // or exit moves it on, and only a revocation covering this worker fails the binding.
+        let mut epoch = self.epoch(worker)?;
         let (driver, role, task_mode) = {
             let state = self.state.borrow();
             let w = state
@@ -2830,7 +2838,7 @@ impl Supervisor {
                 break old;
             }
             glib::timeout_future(std::time::Duration::from_millis(10)).await;
-            self.epoch(worker)?;
+            epoch = self.settled_epoch_for(worker, epoch).await?;
         };
         if let Some(path) = old.and_then(|b| b.overlay) {
             let _ = gio::spawn_blocking(move || super::launch::unlink_overlay(&path)).await;
@@ -2847,7 +2855,8 @@ impl Supervisor {
                     "cannot prepare delegation binding",
                 )
             })?;
-        let valid = self.epoch(worker) == Ok(epoch) && self.profile_available(worker) && {
+        let current = self.settled_epoch_for(worker, epoch).await;
+        let valid = current.is_ok() && self.profile_available(worker) && {
             let state = self.state.borrow();
             state.workers.get(worker).is_some_and(|w| {
                 w.row.state != "closed"
@@ -3265,6 +3274,39 @@ impl Supervisor {
                 .map(|(id, w)| (id.clone(), w.row.parent(), w.row.task_mode_kind()))
                 .collect::<Vec<_>>();
             let effect = revocation(event, &tree);
+            // The workers the event covers: queued work and staged launches go only for them,
+            // and work they had in flight is fenced; the rest of the tree carries on.
+            let covered: HashSet<WorkerId> = match &effect.scope {
+                RevocationScope::Root => tree.iter().map(|(id, _, _)| id.clone()).collect(),
+                RevocationScope::Subtree(w) => {
+                    let mut out = HashSet::from([w.clone()]);
+                    loop {
+                        let more: Vec<WorkerId> = tree
+                            .iter()
+                            .filter(|(id, parent, _)| {
+                                !out.contains(id)
+                                    && parent.as_ref().is_some_and(|p| out.contains(p))
+                            })
+                            .map(|(id, _, _)| id.clone())
+                            .collect();
+                        if more.is_empty() {
+                            break out;
+                        }
+                        out.extend(more);
+                    }
+                }
+                RevocationScope::None => HashSet::new(),
+            };
+            if effect.bump {
+                if let Some(epoch) = state.roots.get(root).map(|r| r.row.epoch()) {
+                    let live: HashSet<WorkerId> = state.workers.keys().cloned().collect();
+                    state.fences.retain(|id, _| live.contains(id));
+                    for id in &covered {
+                        let fence = state.fences.entry(id.clone()).or_insert(epoch);
+                        *fence = (*fence).max(epoch);
+                    }
+                }
+            }
             if event.is_root_wide() {
                 if let Some(thread) = state.roots.get(root).map(|r| r.row.root_thread_id.clone()) {
                     let revision = state.preparations.entry(thread).or_default();
@@ -3290,7 +3332,11 @@ impl Supervisor {
             let mut conns = Vec::new();
             let mut overlays = Vec::new();
             if effect.bump {
-                for w in state.workers.values_mut().filter(|w| &w.root == root) {
+                for (_, w) in state
+                    .workers
+                    .iter_mut()
+                    .filter(|(id, w)| &w.root == root && covered.contains(*id))
+                {
                     if let Some(path) = w.staged.take().and_then(|b| b.overlay) {
                         overlays.push(path);
                     }
@@ -3318,9 +3364,10 @@ impl Supervisor {
                 }
             }
             state.waits.retain(|_, w| !effect.kill_tokens.contains(w));
-            state
-                .deferred
-                .retain(|worker, _| !effect.kill_tokens.contains(worker));
+            // The store cancels the covered workers' queued messages: their entries go too.
+            state.deferred.retain(|worker, _| {
+                !effect.kill_tokens.contains(worker) && !(effect.bump && covered.contains(worker))
+            });
             state
                 .controls
                 .retain(|_, entry| !effect.kill_tokens.contains(&entry.worker));
@@ -3392,13 +3439,33 @@ impl Supervisor {
         // the event names (their tokens are already gone). Every other worker of the tree keeps
         // its credential, now under the new epoch: closing one sibling must not leave the
         // others stale, every call denied. A token from an older epoch stays stale.
+        // Their queued instructions and pending tasks move with them: the store carried their
+        // accepted operations to the new epoch, and what waits in memory is stamped to match.
         if let Some((before, after)) = moved {
-            for (id, w) in state.workers.iter_mut() {
+            let Runtime {
+                workers,
+                deferred,
+                fences,
+                ..
+            } = &mut *state;
+            for (id, w) in workers.iter_mut() {
                 if &w.root != root || revoked.effect.kill_tokens.contains(id) {
                     continue;
                 }
                 if let Some(token) = w.token.as_mut().filter(|t| t.epoch == before) {
                     token.epoch = after;
+                }
+                // A worker the revocation covered keeps its fence: what it had waiting is void.
+                if fences.get(id).is_some_and(|f| *f >= before) {
+                    continue;
+                }
+                if let Some(input) = w.pending.as_mut().filter(|i| i.epoch == before) {
+                    input.epoch = after;
+                }
+                for entry in deferred.get_mut(id).into_iter().flatten() {
+                    if entry.input.epoch == before {
+                        entry.input.epoch = after;
+                    }
                 }
             }
         }

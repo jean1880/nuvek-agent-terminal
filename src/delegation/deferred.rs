@@ -14,6 +14,10 @@ use serde_json::Value;
 use std::rc::Rc;
 use tracing::{info, warn};
 
+/// The parent's report of a run cancelled before its task or message reached the agent.
+pub(super) const CANCELLED_BEFORE_ITS_TURN: &str =
+    "Cancelled before its turn started: the agent was never given this work.";
+
 /// How long a task handed to a child may wait for its turn to open (see `arm_task_start`).
 pub(super) const TASK_START_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -348,8 +352,19 @@ impl Supervisor {
             );
             return;
         };
+        // A sibling's close or exit while this waited moved the epoch on, and this with it.
+        let reserved_run = match self
+            .settled_epoch_for(&entry.input.from, entry.input.epoch)
+            .await
+        {
+            Ok(epoch) => {
+                entry.input.epoch = epoch;
+                self.reserve_run(&entry).await
+            }
+            Err(e) => Err(e),
+        };
         // The run this delivery starts, and whether it reserved that run itself.
-        let used = match self.reserve_run(&entry).await {
+        let used = match reserved_run {
             Ok(run) => Dispatch {
                 fresh: run.is_some() && run != prior,
                 run,
@@ -363,6 +378,19 @@ impl Supervisor {
                 return;
             }
         };
+        match self
+            .settled_epoch_for(&entry.input.from, entry.input.epoch)
+            .await
+        {
+            Ok(epoch) => entry.input.epoch = epoch,
+            Err(e) => {
+                if let Some(w) = self.state.borrow_mut().workers.get_mut(&entry.worker) {
+                    w.dispatching = false;
+                }
+                self.fail_dispatch(&entry, &used, e);
+                return;
+            }
+        }
         let expected = match &entry.input.plan {
             DeliveryPlan::SteerNow(r) => Some(r),
             DeliveryPlan::WriteLive { target } => target.as_ref(),
@@ -484,7 +512,7 @@ impl Supervisor {
             if let Some(w) = sup.state.borrow_mut().workers.get_mut(&worker) {
                 w.dispatching = true;
             }
-            let ready = sup.ensure_child(&worker, &entry.input).await;
+            let ready = sup.ensure_child(&worker, &mut entry.input).await;
             if let Some(w) = sup.state.borrow_mut().workers.get_mut(&worker) {
                 w.dispatching = false;
             }
@@ -507,29 +535,30 @@ impl Supervisor {
         match &env.event {
             Event::ControlResult { ok: Some(_), .. } => self.confirm_delivery(entry),
             Event::ControlResult { error: Some(_), .. } if entry.policy == DeliveryPolicy::Auto => {
+                // `auto` falls back to the next turn (`mailbox::on_steer_refused`): the message
+                // waits for it again, its operation still `submitted`, and the next delivery
+                // reserves and confirms it in the run it reaches. The requeue is written before
+                // that delivery's reservation (the store writer keeps their order).
+                let InputSource::Message { id: message, .. } = entry.input.source.clone() else {
+                    return;
+                };
                 entry.reserved = false;
                 entry.input.plan = DeliveryPlan::StartTurn;
-                let message = match &entry.input.source {
-                    InputSource::Message { id, .. } => Some(id.clone()),
-                    _ => None,
-                };
-                if let Some(message) = message {
-                    self.services
-                        .write("requeue refused steer", None, true, move |s| {
-                            s.record_delegation_delivery(
-                                &message,
-                                DeliveryState::QueuedNextTurn,
-                                None,
-                            )?;
-                            Ok(())
-                        });
-                }
+                let operation = entry.input.operation.clone();
+                self.services
+                    .write("requeue refused steer", None, true, move |s| {
+                        s.requeue_refused_delegation_steer(&message)?;
+                        Ok(())
+                    });
+                info!(%worker, %operation, "refused steer requeued for the next turn");
                 self.state
                     .borrow_mut()
                     .deferred
                     .entry(worker.clone())
                     .or_default()
                     .push_back(entry);
+                // The run that refused it may already be over: nothing else would drain it.
+                self.drain_deferred(worker);
             }
             Event::ControlResult { error: Some(_), .. } => self.record_fact(
                 entry.input.operation,
@@ -664,54 +693,45 @@ impl Supervisor {
             fact_only(e);
             return;
         }
-        // The run ends: interrupted by the cancel that stopped it, or failed with the
-        // delivery. It ends first, and the failed dispatch is recorded after it in the same
-        // transaction: recording the fact on a spawn's still-open run would otherwise end that
-        // run as `failed` and hide the cancel. A run that already ended is left as it is.
-        let (run_state, worker_state) = if stopping {
-            ("interrupted", Some("waiting"))
-        } else {
-            ("failed", None)
-        };
+        // A cancel that stopped it: the run ends interrupted as any cancelled run does, through
+        // the one completion (its end, the worker's state, the terminal event and links, the
+        // failed dispatch after the run's end, the parent's report), and the parent hears of it
+        // once that committed. A task never delivered leaves its child nothing to do: it is
+        // stopped then, never before, or a turn ending in flight would end the run first.
+        if stopping {
+            self.complete_run_with(
+                &entry.worker,
+                agent_core::event::TurnState::Interrupted,
+                None,
+                super::publish::RunEnd {
+                    reason: Some("cancelled".into()),
+                    result: Some(CANCELLED_BEFORE_ITS_TURN.into()),
+                    dispatch_failure: Some((entry.input.operation.clone(), e)),
+                    stop_after: task,
+                },
+            );
+            self.notify_registry();
+            return;
+        }
+        // Failed with the delivery. The run ends first, and the failed dispatch is recorded
+        // after it in the same transaction: recording the fact on a spawn's still-open run would
+        // otherwise end that run as `failed`. A run that already ended is left as it is.
         if let Some(w) = self.state.borrow_mut().workers.get_mut(&entry.worker) {
             w.last_run = w.run.take();
-            if let Some(state) = worker_state {
-                w.row.state = state.into();
-            }
         }
-        let worker = entry.worker.clone();
-        let reason = if stopping {
-            "cancelled".to_owned()
-        } else {
-            e.code.as_str().to_owned()
-        };
+        let reason = e.code.as_str().to_owned();
         let operation = entry.input.operation.clone();
         let fact = DispatchFact::Failed(e);
         self.services
             .write("end undelivered delegated run", None, true, move |s| {
                 s.atomically(|s| {
                     let at = super::supervisor::now();
-                    s.end_delegation_run_if_open(run.as_str(), run_state, Some(&reason), at)?;
-                    if let Some(state) = worker_state {
-                        if s.delegation_worker(worker.as_str())?
-                            .is_some_and(|w| w.state != "closed")
-                        {
-                            s.set_delegation_worker_state(worker.as_str(), state, None, at)?;
-                        }
-                    }
+                    s.end_delegation_run_if_open(run.as_str(), "failed", Some(&reason), at)?;
                     // As `record_fact` does: a fact already recorded is not recorded again.
                     s.record_delegation_dispatch_once(&operation, &fact)?;
                     Ok(())
                 })
             });
-        if stopping && task {
-            // As `cancel_bound_run` does with a task still pending: a child that never got
-            // its task is stopped. Only after the run's end is queued: stopping ends any turn
-            // in flight, whose publication would otherwise end the run first, with no reason.
-            if let Some(session) = self.child_session(&entry.worker) {
-                session.shutdown(true);
-            }
-        }
         self.notify_registry();
         if !task {
             self.drain_deferred(&entry.worker);

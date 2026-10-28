@@ -39,11 +39,16 @@ pub(super) struct ChildSpec {
     pub resume: Option<String>,
 }
 impl Supervisor {
+    /// Makes `worker` ready to take `input`, starting a new generation when it has no live
+    /// process. Every await re-reads `input.epoch` (`settled_epoch_for`): a sibling's close or
+    /// exit moves it on to the new epoch, and only a revocation covering the sender or this worker
+    /// fails the delivery.
     pub(super) async fn ensure_child(
         self: &Rc<Self>,
         worker: &WorkerId,
-        input: &DelegatedInput,
+        input: &mut DelegatedInput,
     ) -> Result<(), ToolError> {
+        input.epoch = self.settled_epoch_for(&input.from, input.epoch).await?;
         self.dispatch_check(&input.from, worker, input.epoch, None)?;
         self.epoch(worker)?;
         let (session, ready, generation) = {
@@ -92,6 +97,7 @@ impl Supervisor {
                 .insert(worker.clone(), spec.clone());
         }
         let approval = self.prepare_launch(&spec, generation).await?;
+        input.epoch = self.settled_epoch_for(&input.from, input.epoch).await?;
         self.dispatch_check(&input.from, worker, input.epoch, None)?;
         {
             let mut state = self.state.borrow_mut();
@@ -106,6 +112,7 @@ impl Supervisor {
             if let Some(watch) = session.rebind_stop() {
                 super::capacity::wait_exit(&watch).await;
             }
+            input.epoch = self.settled_epoch_for(&input.from, input.epoch).await?;
             self.dispatch_check(&input.from, worker, input.epoch, None)?;
             session.rebind_start();
             session
@@ -124,7 +131,7 @@ impl Supervisor {
         self.arm_startup(worker, generation);
         let start = std::time::Instant::now();
         loop {
-            self.epoch(worker)?;
+            input.epoch = self.settled_epoch_for(worker, input.epoch).await?;
             let (ready, failed) = {
                 let state = self.state.borrow();
                 let w = &state.workers[worker];

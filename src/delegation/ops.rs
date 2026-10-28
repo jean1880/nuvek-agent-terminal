@@ -26,6 +26,10 @@ use tracing::{info, warn};
 pub(super) const LOST_BRIDGE: &str =
     "the delegation bridge connection was lost; it rebinds before the next turn";
 
+/// Work resumed after an `await` waits at most this long for a revocation being committed
+/// before it re-reads its epoch (a durable store write; it normally takes milliseconds).
+pub(super) const REVOCATION_SETTLE: Duration = Duration::from_secs(5);
+
 /// `cross_agent_capabilities` with `refresh` waits at most this long for usage probes.
 const USAGE_REFRESH_WAIT: Duration = Duration::from_secs(20);
 
@@ -286,16 +290,16 @@ impl Supervisor {
         else {
             return Ok(None);
         };
-        let epoch = self.epoch(caller)?;
-        if expected.is_some_and(|e| e != epoch.0) {
-            return Err(error(ErrorCode::StaleEpoch, "authority epoch changed"));
-        }
+        // A used key is answered from its stored outcome whatever the epochs
+        // (`operation::idempotency`): the lookup comes first, the epoch only for an unused key.
         let principal = caller.to_string();
         let key = key.to_string();
-        let kind = OperationKind::of(request).map_or_else(
+        let kind_of = OperationKind::of(request);
+        let kind = kind_of.map_or_else(
             || "unknown".to_owned(),
             |k| super::supervisor::enum_value(&k),
         );
+        let canonical = canonical_request(request, agent_core::redact::redact);
         let row = self
             .services
             .read(move |s| s.delegation_operation_by_key(&principal, &kind, &key))
@@ -312,7 +316,18 @@ impl Supervisor {
                     "cannot read operation idempotency",
                 )
             })?;
-        let Some(row) = row else {
+        let (Some(row), Some(kind_of)) = (row, kind_of) else {
+            if let (Some(expected), Some(kind_of)) = (expected, kind_of) {
+                let epoch = self.epoch(caller)?;
+                idempotency(
+                    None,
+                    kind_of,
+                    &canonical,
+                    Some(AuthorityEpoch(expected)),
+                    epoch,
+                )
+                .map_err(|c| error(c, "authority epoch changed"))?;
+            }
             return Ok(None);
         };
         let parse = |text: &str| {
@@ -344,13 +359,13 @@ impl Supervisor {
                 })
                 .transpose()?,
         };
-        let canonical = canonical_request(request, agent_core::redact::redact);
+        // A used key never looks at the epochs, so the stored one stands in for the current.
         match idempotency(
             Some(&op),
-            op.kind,
+            kind_of,
             &canonical,
             expected.map(AuthorityEpoch),
-            epoch,
+            op.epoch,
         )
         .map_err(|c| error(c, "operation idempotency check failed"))?
         {
@@ -362,10 +377,6 @@ impl Supervisor {
             IdempotencyDecision::Conflict(_) => Err(error(
                 ErrorCode::IdempotencyConflict,
                 "idempotency key already names another request",
-            )),
-            IdempotencyDecision::StaleEpoch(_) => Err(error(
-                ErrorCode::StaleEpoch,
-                "operation belongs to an older authority epoch",
             )),
             IdempotencyDecision::New => Ok(None),
         }
@@ -487,11 +498,22 @@ impl Supervisor {
         let pending = data.2.is_some();
         if let Some(input) = data.2 {
             self.state.borrow_mut().dispatching.remove(&input.operation);
-            self.record_fact(
-                input.operation,
-                DispatchFact::Failed(error(ErrorCode::StaleRun, "run cancelled before dispatch")),
+            // One completion: the run ends interrupted, then its task's dispatch fails, in the
+            // same transaction (a failed dispatch recorded first would end the run as failed).
+            self.complete_run_with(
+                worker,
+                agent_core::event::TurnState::Interrupted,
+                None,
+                super::publish::RunEnd {
+                    reason: Some("cancelled".into()),
+                    result: Some(super::deferred::CANCELLED_BEFORE_ITS_TURN.into()),
+                    dispatch_failure: Some((
+                        input.operation,
+                        error(ErrorCode::StaleRun, "run cancelled before dispatch"),
+                    )),
+                    stop_after: false,
+                },
             );
-            self.complete_run(worker, agent_core::event::TurnState::Interrupted, None);
         }
         if let Some(session) = data.0 {
             session.expire_approvals(reason);
@@ -1634,12 +1656,8 @@ impl Supervisor {
                 "profile disabled before dispatch",
             ));
         }
-        if self.epoch(from)? != epoch {
-            return Err(error(
-                ErrorCode::StaleEpoch,
-                "authority changed before dispatch",
-            ));
-        }
+        self.epoch_for(from, epoch)?;
+        self.epoch_for(target, epoch)?;
         let state = self.state.borrow();
         let w = state
             .workers
@@ -1669,6 +1687,57 @@ impl Supervisor {
             }
         }
         Ok(())
+    }
+    /// The epoch work for `worker` that captured `captured` goes on under: the current one,
+    /// unless a revocation since then covered `worker` (its subtree's close or exit, or a
+    /// root-wide event: see `latch_revoke`'s fences), which fails it with `stale_epoch`. A
+    /// revocation of a sibling only moves the epoch on, and the work with it. Refused while a
+    /// revocation is being committed (see [`Self::settled_epoch_for`]).
+    pub(super) fn epoch_for(
+        &self,
+        worker: &WorkerId,
+        captured: AuthorityEpoch,
+    ) -> Result<AuthorityEpoch, ToolError> {
+        let now = self.epoch(worker)?;
+        if now == captured {
+            return Ok(now);
+        }
+        let fenced = self
+            .state
+            .borrow()
+            .fences
+            .get(worker)
+            .is_some_and(|f| *f >= captured);
+        if fenced || now < captured {
+            return Err(error(
+                ErrorCode::StaleEpoch,
+                "authority changed before dispatch",
+            ));
+        }
+        Ok(now)
+    }
+    /// [`Self::epoch_for`], after waiting (at most [`REVOCATION_SETTLE`]) for a revocation of
+    /// `worker`'s tree being committed: work resumed after an `await` re-reads its epoch only
+    /// once the bump it may have missed is known, rather than failing on the bump itself.
+    pub(super) async fn settled_epoch_for(
+        &self,
+        worker: &WorkerId,
+        captured: AuthorityEpoch,
+    ) -> Result<AuthorityEpoch, ToolError> {
+        let start = Instant::now();
+        while start.elapsed() < REVOCATION_SETTLE && self.revoking(worker) {
+            glib::timeout_future(Duration::from_millis(10)).await;
+        }
+        self.epoch_for(worker, captured)
+    }
+    /// Whether a revocation of `worker`'s tree is latched and not yet committed.
+    fn revoking(&self, worker: &WorkerId) -> bool {
+        let state = self.state.borrow();
+        state
+            .workers
+            .get(worker)
+            .and_then(|w| state.roots.get(&w.root))
+            .is_some_and(|r| r.revoking)
     }
     pub(super) fn record_fact(&self, op: OperationId, fact: DispatchFact) {
         self.services

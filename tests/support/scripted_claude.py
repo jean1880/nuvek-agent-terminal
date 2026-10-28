@@ -10,6 +10,12 @@ tools = sys.argv[sys.argv.index("--tools") + 1].split(",") if "--tools" in sys.a
 model = (root / "reported-model").read_text() if (root / "reported-model").exists() else "synthetic-model"
 
 
+def result_text():
+    """The task's answer: a test's own (`task-result`), else the fixed one."""
+    path = root / "task-result"
+    return path.read_text(encoding="utf-8") if path.exists() else "Synthetic delegated result."
+
+
 def record(direction, frame):
     with (root / "frames.ndjson").open("a") as log:
         log.write(json.dumps({"dir": direction, "frame": frame}) + "\n")
@@ -49,12 +55,17 @@ for line in sys.stdin:
                   "model": model, "content": [{"type": "tool_use", "id": "illegal",
                   "name": "Read", "input": {"file_path": "file"}}]}})
         else:
-            emit({"type": "assistant", "message": {"id": f"a-{turn}", "role": "assistant",
-                  "model": model, "content": [{"type": "text",
-                  "text": "OK" if bootstrap else "Synthetic delegated result."}]}})
+            answer = {"type": "assistant", "message": {"id": f"a-{turn}", "role": "assistant",
+                      "model": model, "content": [{"type": "text",
+                      "text": "OK" if bootstrap else result_text()}]}}
+            # A test's own answer is a frame of its own, so the task's text is not taken for
+            # the startup check's.
+            if (root / "task-result").exists():
+                answer["uuid"] = f"u-{turn}"
+            emit(answer)
         # A test holds the startup check open to change the world before the task is sent.
         while bootstrap and (root / "hold-bootstrap").exists():
             time.sleep(0.01)
         if "hold" not in text or bootstrap:
             emit({"type": "result", "subtype": "success", "is_error": False,
-                  "session_id": "synthetic-session", "result": "OK" if bootstrap else "Synthetic delegated result."})
+                  "session_id": "synthetic-session", "result": "OK" if bootstrap else result_text()})

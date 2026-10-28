@@ -510,6 +510,59 @@ fn a_cancel_between_taking_the_task_and_delivering_it_stays_a_cancel() {
                 w.row.delegation_reason
             );
         }
+        // It ended through the one completion: the parent's wake, a terminal event linked to
+        // the run and the parent's report, the wake only once that committed. (The wake is
+        // taken before the read below presents the report, which would settle it.)
+        pump_until(|| {
+            sup.state
+                .borrow()
+                .wakes
+                .get(&root)
+                .is_some_and(|q| q.pending() > 0)
+        })
+        .await;
+        let (items, _) = sup
+            .state
+            .borrow_mut()
+            .wakes
+            .get_mut(&root)
+            .map(|q| q.take())
+            .unwrap_or_default();
+        assert!(
+            items.iter().any(|i| i.worker == worker
+                && i.outcome == agent_core::delegation::wake::Outcome::Interrupted),
+            "the parent was not woken with the cancel"
+        );
+        connect(&sup, &root, ConnId(46)).await;
+        let page = tool(
+            &sup,
+            ConnId(46),
+            1,
+            ToolRequest::Read(ReadRequest {
+                target: Some(worker.clone()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert!(
+            page["events"].as_array().unwrap().iter().any(|e| {
+                e["category"] == "result"
+                    && e["run_id"] == run.as_str()
+                    && e["worker_id"] == worker.as_str()
+            }),
+            "no terminal event linked to the run: {page:#}"
+        );
+        let reports: Vec<&Value> = page["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["kind"] == "report" && m["from"] == worker.as_str())
+            .collect();
+        assert_eq!(reports.len(), 1, "the parent's report: {page:#}");
+        assert!(reports[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Cancelled before its turn started"));
         std::fs::remove_file(dir.path().join("hold-bootstrap")).unwrap();
         stop(&sup).await;
     });

@@ -59,7 +59,7 @@ impl DelegationHooks for Hooks {
             }
             let generation = facts.generation;
             let epoch = sup.epoch(&worker).map_err(|e| e.message)?;
-            let valid = |sup: &Supervisor| {
+            let valid = |sup: &Supervisor, epoch| {
                 let state = sup.state.borrow();
                 state
                     .workers
@@ -69,7 +69,7 @@ impl DelegationHooks for Hooks {
                         t.generation == generation && t.epoch == epoch && t.pid.is_none()
                     })
             };
-            if !valid(&sup) {
+            if !valid(&sup, epoch) {
                 return Err("delegation launch authority changed".into());
             }
             if let Err(e) = sup.check_agy_launch_facts(facts).await {
@@ -77,7 +77,14 @@ impl DelegationHooks for Hooks {
                 sup.fail_worker(&worker, e.clone());
                 return Err(e.message);
             }
-            if sup.epoch(&worker).ok() != Some(epoch) || !valid(&sup) {
+            // Re-read after the proof: a sibling's close or exit moved the epoch on and
+            // re-stamped this worker's token with it; a revocation covering this worker killed
+            // the token or fenced it, and the launch is refused.
+            let epoch = sup
+                .settled_epoch_for(&worker, epoch)
+                .await
+                .map_err(|_| "delegation launch authority changed".to_owned())?;
+            if !valid(&sup, epoch) {
                 return Err("delegation launch authority changed".into());
             }
             Ok(())

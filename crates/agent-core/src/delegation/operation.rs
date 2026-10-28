@@ -140,12 +140,14 @@ pub enum IdempotencyDecision {
     New,
     Replay(OperationId),
     Conflict(OperationId),
-    StaleEpoch(OperationId),
 }
 
-/// An `expected_epoch` that is not current is `Err(StaleEpoch)` before any
-/// lookup; a key stored under an older epoch is `StaleEpoch`; a different canonical request is
-/// `Conflict`; an identical one is `Replay`.
+/// The one replay precedence, for the supervisor and the store alike. A used key decides
+/// first, whatever the epochs: the identical canonical request is `Replay` (its stored outcome,
+/// a failure or an unknown delivery included, never a fresh success), a different one is
+/// `Conflict`. Only an unused key looks at the epoch: an `expected_epoch` that is not current is
+/// `Err(StaleEpoch)`, else it is `New`. A retry after an epoch bump therefore gets back what its
+/// first attempt did, and nothing is ever run twice.
 pub fn idempotency(
     existing: Option<&StoredOperation>,
     kind: OperationKind,
@@ -153,21 +155,16 @@ pub fn idempotency(
     expected_epoch: Option<AuthorityEpoch>,
     current: AuthorityEpoch,
 ) -> Result<IdempotencyDecision, ErrorCode> {
-    if let Some(e) = expected_epoch {
-        if e != current {
-            return Err(ErrorCode::StaleEpoch);
+    if let Some(op) = existing {
+        if op.kind != kind || &op.canonical != canonical {
+            return Ok(IdempotencyDecision::Conflict(op.id.clone()));
         }
+        return Ok(IdempotencyDecision::Replay(op.id.clone()));
     }
-    let Some(op) = existing else {
-        return Ok(IdempotencyDecision::New);
-    };
-    if op.epoch != current {
-        return Ok(IdempotencyDecision::StaleEpoch(op.id.clone()));
+    if expected_epoch.is_some_and(|e| e != current) {
+        return Err(ErrorCode::StaleEpoch);
     }
-    if op.kind != kind || &op.canonical != canonical {
-        return Ok(IdempotencyDecision::Conflict(op.id.clone()));
-    }
-    Ok(IdempotencyDecision::Replay(op.id.clone()))
+    Ok(IdempotencyDecision::New)
 }
 
 /// What a replay returns.
@@ -327,29 +324,39 @@ mod tests {
             ),
             Ok(IdempotencyDecision::Conflict(op_id()))
         );
-        // Stored under an older epoch, request with no epoch.
+        // Stored under an older epoch, the identical request replays it, with or without an
+        // expected epoch, stale or current.
+        for expected in [None, Some(AuthorityEpoch(2)), Some(AuthorityEpoch(3))] {
+            assert_eq!(
+                idempotency(
+                    Some(&op),
+                    OperationKind::Send,
+                    &same,
+                    expected,
+                    AuthorityEpoch(3)
+                ),
+                Ok(IdempotencyDecision::Replay(op_id())),
+                "{expected:?}"
+            );
+            // A changed body under the same key is a conflict, whatever the epochs.
+            assert_eq!(
+                idempotency(
+                    Some(&op),
+                    OperationKind::Send,
+                    &other,
+                    expected,
+                    AuthorityEpoch(3)
+                ),
+                Ok(IdempotencyDecision::Conflict(op_id())),
+                "{expected:?}"
+            );
+        }
+        // Another kind under the same key is a conflict too.
         assert_eq!(
-            idempotency(
-                Some(&op),
-                OperationKind::Send,
-                &same,
-                None,
-                AuthorityEpoch(3)
-            ),
-            Ok(IdempotencyDecision::StaleEpoch(op_id()))
+            idempotency(Some(&op), OperationKind::Spawn, &same, None, current),
+            Ok(IdempotencyDecision::Conflict(op_id()))
         );
-        // Both epoch and request differ: StaleEpoch wins.
-        assert_eq!(
-            idempotency(
-                Some(&op),
-                OperationKind::Send,
-                &other,
-                None,
-                AuthorityEpoch(3)
-            ),
-            Ok(IdempotencyDecision::StaleEpoch(op_id()))
-        );
-        // A stale expected epoch is refused before any lookup.
+        // Only an unused key is refused for a stale expected epoch.
         assert_eq!(
             idempotency(
                 None,
@@ -361,15 +368,34 @@ mod tests {
             Err(ErrorCode::StaleEpoch)
         );
         assert_eq!(
-            idempotency(
-                Some(&op),
-                OperationKind::Send,
-                &same,
-                Some(AuthorityEpoch(1)),
-                current
-            ),
-            Err(ErrorCode::StaleEpoch)
+            idempotency(None, OperationKind::Send, &same, Some(current), current),
+            Ok(IdempotencyDecision::New)
         );
+    }
+
+    /// A replay never manufactures a success: a failed operation replays its failure and an
+    /// unknown one stays unknown, whichever epoch the retry carries.
+    #[test]
+    fn a_replay_after_an_epoch_bump_keeps_a_failure_or_an_unknown_delivery() {
+        let mut failed = stored(OperationState::Failed);
+        failed.error = Some(ToolError::new(ErrorCode::StaleEpoch, "revoked"));
+        let decision = idempotency(
+            Some(&failed),
+            OperationKind::Send,
+            &failed.canonical,
+            Some(AuthorityEpoch(9)),
+            AuthorityEpoch(9),
+        );
+        assert_eq!(decision, Ok(IdempotencyDecision::Replay(op_id())));
+        assert!(matches!(
+            replay(&failed, false),
+            ReplayOutcome::Error(e) if e.code == ErrorCode::StaleEpoch
+        ));
+        let unknown = stored(OperationState::Unknown);
+        assert!(matches!(
+            replay(&unknown, false),
+            ReplayOutcome::DeliveryUnknown(_)
+        ));
     }
 
     #[test]

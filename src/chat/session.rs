@@ -5823,21 +5823,39 @@ fn new_fence() -> String {
     glib::uuid_string_random().replace('-', "")
 }
 
+/// What a handoff carries of one item: a tool's opens with what it did ("command: Run cargo
+/// test"), so a command with no output, or an edit whose result says nothing of its target,
+/// still shows; its output (capped later, as tool output) follows.
+fn carried_text(message: &TranscriptMessage) -> String {
+    if message.role != "tool" || message.title.trim().is_empty() {
+        return message.text.clone();
+    }
+    let line = format!("{}: {}", message.kind, message.title);
+    if message.text.trim().is_empty() {
+        line
+    } else {
+        format!("{line}\n{}", message.text)
+    }
+}
+
 /// The budgeted, fenced and redacted handoff of a thread's history. Tool items are carried as
-/// tool output (capped, untrusted); items with no text are skipped, and an item still open (its
-/// process died with it) is described as interrupted.
+/// tool output (capped, untrusted) under their title; items with nothing to say are skipped,
+/// and an item still open (its process died with it) is described as interrupted. The thread's
+/// inherited context (what a fork started from) is carried as one item.
 pub(crate) fn build_handoff(messages: &[TranscriptMessage], source: &str) -> Handoff {
     let history: Vec<HistoricalMessage> = messages
         .iter()
-        .filter(|m| !m.text.trim().is_empty())
-        .map(|m| HistoricalMessage {
+        .map(|m| (m, carried_text(m)))
+        .filter(|(_, text)| !text.trim().is_empty())
+        .map(|(m, text)| HistoricalMessage {
             role: match m.role.as_str() {
                 "user" => Role::User,
                 "tool" => Role::Tool,
+                agent_kit::store::INHERITED_ROLE => Role::Inherited,
                 _ => Role::Assistant,
             },
             kind: m.kind.clone(),
-            text: m.text.clone(),
+            text,
             item_id: m.item_id.clone(),
             status: if m.status == "open" {
                 "interrupted".to_owned()
@@ -5994,6 +6012,7 @@ mod tests {
     use std::time::Duration;
 
     mod delegated_tests;
+    mod handoff_tests;
     mod switch_tests;
     mod teardown_tests;
 
@@ -10047,6 +10066,7 @@ mod tests {
             text: text.into(),
             item_id: id.into(),
             status: status.into(),
+            title: String::new(),
         };
         let history = [
             msg("user", "user_message", "run it", "open", "u1"),

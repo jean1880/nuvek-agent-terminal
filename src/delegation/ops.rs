@@ -496,7 +496,20 @@ impl Supervisor {
             (w.session(), w.generation, w.pending.take())
         };
         if let Some(input) = data.2 {
-            self.state.borrow_mut().dispatching.remove(&input.operation);
+            // The cancel is latched now, with the task taken: its child's startup check (still
+            // running on this generation) decides nothing from here, so its end is neither the
+            // task's nor a failure of the worker, and it starts nothing.
+            {
+                let mut state = self.state.borrow_mut();
+                state.dispatching.remove(&input.operation);
+                if let Some(w) = state
+                    .workers
+                    .get_mut(worker)
+                    .filter(|w| w.generation == data.1)
+                {
+                    w.readback.failed = true;
+                }
+            }
             if let Some(session) = &data.0 {
                 session.expire_approvals(reason);
             }
@@ -516,7 +529,7 @@ impl Supervisor {
                         input.operation,
                         error(ErrorCode::StaleRun, "run cancelled before dispatch"),
                     )),
-                    stop_after: true,
+                    stop_after: Some(data.1),
                 },
             );
             return;

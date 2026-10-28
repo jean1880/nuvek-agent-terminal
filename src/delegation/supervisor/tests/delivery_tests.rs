@@ -889,37 +889,215 @@ fn a_refusal_after_the_turn_ended_still_requeues_the_steer() {
     });
 }
 
-/// A steer no answer settles is taken as refused once its deadline passes: `auto` goes to the
-/// next turn, `this_run` fails.
+/// How many times the fake child was handed the steered text.
+fn steered(dir: &std::path::Path) -> usize {
+    std::fs::read_to_string(dir.join("frames.ndjson"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.contains("\"dir\": \"in\"") && l.contains("steer it"))
+        .count()
+}
+
+/// The answer a run gives a steer it took, for the control tagged `tag`.
+fn acceptance(tag: &str) -> Envelope {
+    let mut env = Envelope::new(Event::ControlResult {
+        ok: Some(serde_json::Value::Null),
+        error: None,
+    });
+    env.request = Some(tag.to_owned());
+    env
+}
+
+/// A steer whose answer is overdue: its outcome is recorded unknown, and it is never sent
+/// again on a guess.
+async fn overdue_steer(
+    sup: &Rc<Supervisor>,
+    root: &WorkerId,
+    policy: Delivery,
+) -> (WorkerId, RunId, String, String) {
+    sup.state.borrow_mut().steer_settle = Some(Duration::from_millis(100));
+    let (worker, run, op, id) = steer_in_flight(sup, root, policy, "silent").await;
+    // The deadline is armed when the steer is sent; this one was planted.
+    sup.arm_steer_settle(&worker, "silent-tag".into());
+    pump_until(|| dispatch(sup, &op) == "unknown").await;
+    assert_eq!(message(sup, &id).delivery_state, "unknown");
+    assert!(!sup.state.borrow().controls.contains_key("silent-tag"));
+    (worker, run, op, id)
+}
+
+/// Silence is no refusal: an overdue steer is unknown, not delivered again, and a late
+/// acceptance confirms it, delivered once, in the run it was pinned to.
 #[test]
-fn a_steer_with_no_answer_settles_by_its_deadline() {
-    for policy in [Delivery::Auto, Delivery::ThisRun] {
-        in_context(async {
-            let (_dir, sup, root) = harness();
-            sup.state.borrow_mut().steer_settle = Some(Duration::from_millis(200));
-            let (worker, run, op, id) = steer_in_flight(&sup, &root, policy, "silent").await;
-            // The deadline is armed when the steer is sent; this one was planted.
-            sup.arm_steer_settle(&worker, "silent-tag".into());
-            sup.cancel_bound_run(&worker, &run, "Delegated run cancelled");
-            let expected = if policy == Delivery::Auto {
-                "confirmed"
-            } else {
-                "failed"
-            };
-            pump_until(|| dispatch(&sup, &op) == expected).await;
-            let state = message(&sup, &id).delivery_state;
-            assert_eq!(
-                state,
-                if policy == Delivery::Auto {
-                    "provider_confirmed"
-                } else {
-                    "failed"
-                },
-                "{policy:?}"
+fn an_overdue_steer_is_unknown_and_a_late_acceptance_confirms_it_once() {
+    in_context(async {
+        let (dir, sup, root) = harness();
+        let (worker, run, op, id) = overdue_steer(&sup, &root, Delivery::Auto).await;
+        // Its turn ends: nothing is redelivered on a guess.
+        sup.cancel_bound_run(&worker, &run, "Delegated run cancelled");
+        pump_until(|| sup.state.borrow().workers[&worker].run.is_none()).await;
+        glib::timeout_future(Duration::from_millis(300)).await;
+        assert_eq!(steered(dir.path()), 0, "never sent again on a guess");
+        assert_eq!(dispatch(&sup, &op), "unknown");
+        sup.delivery_control(&worker, &acceptance("silent-tag"));
+        pump_until(|| dispatch(&sup, &op) == "confirmed").await;
+        let row = message(&sup, &id);
+        assert_eq!(row.delivery_state, "provider_confirmed");
+        assert_eq!(row.recipient_run_id.as_deref(), Some(run.as_str()));
+        glib::timeout_future(Duration::from_millis(200)).await;
+        assert_eq!(
+            steered(dir.path()),
+            0,
+            "delivered once: by the steer itself"
+        );
+        stop(&sup).await;
+    });
+}
+
+/// A late refusal proves the overdue steer was not delivered: `auto` is requeued once, as a
+/// new attempt with a correlation of its own, and delivered on the next turn.
+#[test]
+fn a_late_refusal_requeues_an_overdue_steer_once_under_a_new_correlation() {
+    in_context(async {
+        let (dir, sup, root) = harness();
+        let (worker, run, op, id) = overdue_steer(&sup, &root, Delivery::Auto).await;
+        sup.delivery_control(&worker, &refusal("silent-tag"));
+        // Its run is still busy: the new attempt waits for the next turn.
+        pump_until(|| {
+            sup.state
+                .borrow()
+                .deferred
+                .get(&worker)
+                .is_some_and(|q| q.len() == 1)
+        })
+        .await;
+        let tag = sup.state.borrow().deferred[&worker][0].input.tag.clone();
+        assert_ne!(tag, "silent-tag");
+        assert_ne!(tag, op, "the new attempt has its own correlation");
+        assert_eq!(dispatch(&sup, &op), "accepted");
+        // A second late answer for the old attempt settles nothing.
+        sup.delivery_control(&worker, &refusal("silent-tag"));
+        sup.delivery_control(&worker, &acceptance("silent-tag"));
+        sup.cancel_bound_run(&worker, &run, "Delegated run cancelled");
+        pump_until(|| dispatch(&sup, &op) == "confirmed").await;
+        assert_eq!(message(&sup, &id).delivery_state, "provider_confirmed");
+        glib::timeout_future(Duration::from_millis(200)).await;
+        assert_eq!(steered(dir.path()), 1, "requeued and delivered once");
+        stop(&sup).await;
+    });
+}
+
+/// A strict steer whose answer is overdue stays unknown, whatever comes late.
+#[test]
+fn an_overdue_strict_steer_stays_unknown() {
+    in_context(async {
+        let (dir, sup, root) = harness();
+        let (worker, _run, op, _id) = overdue_steer(&sup, &root, Delivery::ThisRun).await;
+        sup.delivery_control(&worker, &refusal("silent-tag"));
+        glib::timeout_future(Duration::from_millis(200)).await;
+        assert_eq!(dispatch(&sup, &op), "unknown");
+        assert_eq!(steered(dir.path()), 0);
+        stop(&sup).await;
+    });
+}
+
+/// A cancel with the task still pending while an instruction waits for the worker: the run
+/// ends with its report, the waiting instruction runs on a fresh generation (never on the
+/// session the cancel would stop), and that newer session is neither stopped nor muted.
+#[test]
+fn a_pending_cancel_never_stops_the_newer_work_it_leaves_queued() {
+    in_context(async {
+        let (dir, sup, root) = harness();
+        std::fs::write(dir.path().join("hold-bootstrap"), "").unwrap();
+        let receipt = sup
+            .spawn_worker(&root, spawn_request("pending-queued"))
+            .await
+            .unwrap();
+        let worker = spawned(&receipt);
+        let run = RunId::parse(receipt["run_id"].as_str().unwrap()).unwrap();
+        pump_until(|| startup_checks(dir.path()) > 0).await;
+        let queued = sup
+            .send_worker(
+                &root,
+                instruction(&worker, "after the cancel", "pending-queued-send"),
+            )
+            .await
+            .unwrap();
+        let queued_op = queued["operation_id"].as_str().unwrap().to_owned();
+        assert_eq!(sup.state.borrow().deferred[&worker].len(), 1);
+        let cancelled_generation = sup.state.borrow().workers[&worker].generation;
+        sup.cancel_bound_run(&worker, &run, "Delegated run cancelled");
+        std::fs::remove_file(dir.path().join("hold-bootstrap")).unwrap();
+        pump_until(|| dispatch(&sup, &queued_op) == "confirmed").await;
+        let ended = sup
+            .services
+            .handle
+            .reader()
+            .delegation_run(run.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(ended.state, "interrupted");
+        assert_eq!(ended.terminal_reason.as_deref(), Some("cancelled"));
+        glib::timeout_future(Duration::from_millis(300)).await;
+        {
+            let state = sup.state.borrow();
+            let w = &state.workers[&worker];
+            assert!(
+                w.generation > cancelled_generation,
+                "it ran on a fresh generation"
             );
-            stop(&sup).await;
+            assert!(
+                !w.generations.is_empty(),
+                "the newer session was not stopped"
+            );
+            assert!(
+                w.readback.ready && !w.readback.failed,
+                "nor its startup check muted"
+            );
+            assert_ne!(w.row.state, "failed", "{:?}", w.row.delegation_reason);
+        }
+        stop(&sup).await;
+    });
+}
+
+/// Two items still held by the stream sanitiser at the turn's end are released in the order
+/// they began.
+#[test]
+fn items_released_at_the_turns_end_keep_their_order() {
+    use crate::delegation::seam::ChildPublish;
+    in_context(async {
+        let (_dir, sup, root) = harness();
+        let worker = spawn_idle(&sup, &root, "order").await;
+        let generation = sup.state.borrow().workers[&worker].generation;
+        let publisher =
+            crate::delegation::publish::Publisher::new(Rc::downgrade(&sup), worker.clone());
+        publisher.persist(
+            "t",
+            None,
+            &Envelope::new(Event::TurnStarted {
+                model: Some("synthetic-model".into()),
+            }),
+        );
+        for (item, text) in [("first", "alpha"), ("second", "beta"), ("first", " one")] {
+            let mut env = Envelope::new(Event::ContentDelta {
+                stream: agent_core::event::StreamKind::Assistant,
+                text: text.into(),
+            });
+            env.item = Some(item.into());
+            if let Some(out) = publisher.publish(generation, env) {
+                publisher.persist("t", None, &out);
+            }
+        }
+        // The turn ends with both still open: the flush releases them, first item first.
+        let end = Envelope::new(Event::TurnCompleted {
+            state: agent_core::event::TurnState::Completed,
+            usage: None,
+            cost_usd: None,
+            error: None,
         });
-    }
+        let _ = publisher.publish(generation, end);
+        assert_eq!(publisher.result_so_far(), "alpha one\n\nbeta");
+        stop(&sup).await;
+    });
 }
 
 /// A run's result keeps each assistant item's text in order: a snapshot (a split secret's

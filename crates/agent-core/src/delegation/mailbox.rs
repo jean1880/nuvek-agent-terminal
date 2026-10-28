@@ -230,10 +230,24 @@ pub fn requeue_refused_steer(
     policy: Delivery,
 ) -> Result<DeliveryState, LifecycleError> {
     match (from, on_steer_refused(policy)) {
-        (DeliveryState::Submitted, Ok(to)) if policy == Delivery::Auto => Ok(to),
+        (DeliveryState::Submitted | DeliveryState::Unknown, Ok(to)) if policy == Delivery::Auto => {
+            Ok(to)
+        }
         _ => Err(LifecycleError::Illegal {
             from: WorkerState::Unknown,
             input: "requeue_refused_steer",
+        }),
+    }
+}
+
+/// A steer whose answer was overdue (`unknown`) and then came, accepted: delivered
+/// (`provider_confirmed`). Not a [`delivery_step`]: only that late answer's own path takes it.
+pub fn confirm_late_steer(from: DeliveryState) -> Result<DeliveryState, LifecycleError> {
+    match from {
+        DeliveryState::Unknown => Ok(DeliveryState::ProviderConfirmed),
+        _ => Err(LifecycleError::Illegal {
+            from: WorkerState::Unknown,
+            input: "confirm_late_steer",
         }),
     }
 }

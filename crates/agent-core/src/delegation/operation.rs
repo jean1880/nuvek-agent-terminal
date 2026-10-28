@@ -64,14 +64,27 @@ pub fn operation_step(
 }
 
 /// The one way back an operation may take: a send whose steer the run refused after it was
-/// written (`submitted`) is accepted again, to be reserved and dispatched anew on the next turn.
-/// Not an [`operation_step`]: only the refused steer's own path takes it.
+/// written (`submitted`, or `unknown` once its answer was overdue) is accepted again, to be
+/// reserved and dispatched anew on the next turn. Not an [`operation_step`]: only the refused
+/// steer's own path takes it, on the run's own answer.
 pub fn requeue_refused_steer(from: OperationState) -> Result<OperationState, LifecycleError> {
     match from {
-        OperationState::Submitted => Ok(OperationState::Accepted),
+        OperationState::Submitted | OperationState::Unknown => Ok(OperationState::Accepted),
         _ => Err(LifecycleError::Illegal {
             from: WorkerState::Unknown,
             input: "requeue_refused_steer",
+        }),
+    }
+}
+
+/// A steer whose answer was overdue (`unknown`) and then came, accepted: `confirmed`. Not an
+/// [`operation_step`]: only that late answer's own path takes it.
+pub fn confirm_late_steer(from: OperationState) -> Result<OperationState, LifecycleError> {
+    match from {
+        OperationState::Unknown => Ok(OperationState::Confirmed),
+        _ => Err(LifecycleError::Illegal {
+            from: WorkerState::Unknown,
+            input: "confirm_late_steer",
         }),
     }
 }

@@ -18,9 +18,12 @@ use tracing::{info, warn};
 pub(super) const CANCELLED_BEFORE_ITS_TURN: &str =
     "Cancelled before its turn started: the agent was never given this work.";
 
-/// How long a steer may wait for the run's answer before it is taken as refused
+/// How long a steer may wait for the run's answer before its outcome is recorded unknown
 /// (see `arm_steer_settle`).
 pub(super) const STEER_SETTLE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The most overdue steers whose late answer is still awaited.
+pub(super) const LATE_STEERS: usize = 64;
 
 /// How long a task handed to a child may wait for its turn to open (see `arm_task_start`).
 pub(super) const TASK_START_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
@@ -527,20 +530,45 @@ impl Supervisor {
             return;
         };
         let entry = take_scoped_control(&mut self.state.borrow_mut().controls, worker, tag);
-        let Some(entry) = entry else {
+        if let Some(entry) = entry {
+            match &env.event {
+                Event::ControlResult { ok: Some(_), .. } => self.confirm_delivery(entry),
+                Event::ControlResult { error: Some(_), .. } => self.steer_refused(worker, entry),
+                _ => {}
+            }
+            return;
+        }
+        // An answer for a steer already recorded unknown: it settles it now.
+        let late = {
+            let mut state = self.state.borrow_mut();
+            let at = state
+                .late_steers
+                .iter()
+                .position(|(t, e)| t == tag && &e.worker == worker);
+            at.and_then(|at| state.late_steers.remove(at))
+                .map(|(_, entry)| entry)
+        };
+        let Some(entry) = late else {
             return;
         };
         match &env.event {
-            Event::ControlResult { ok: Some(_), .. } => self.confirm_delivery(entry),
-            Event::ControlResult { error: Some(_), .. } => self.steer_refused(worker, entry),
-            _ => {}
+            Event::ControlResult { ok: Some(_), .. } => self.confirm_late_steer(entry),
+            // Refused: never delivered, proven now. `auto` goes to the next turn; `this_run`
+            // stays unknown, as recorded.
+            Event::ControlResult { error: Some(_), .. } if entry.policy == DeliveryPolicy::Auto => {
+                self.steer_refused(worker, entry)
+            }
+            _ => {
+                info!(%worker, operation = %entry.input.operation,
+                    "a late answer for a strict steer; its outcome stays unknown");
+            }
         }
     }
-    /// A steer the run refused, or that no answer settled in time: `auto` falls back to the
-    /// next turn (`mailbox::on_steer_refused`): the message waits for it again, its operation
-    /// still `submitted`, and the next delivery reserves and confirms it in the run it reaches.
-    /// The requeue is written before that delivery's reservation (the store writer keeps their
-    /// order). `this_run` has no next turn: it fails.
+    /// A steer the run refused: `auto` falls back to the next turn (`mailbox::on_steer_refused`):
+    /// the message waits for it again and its operation is accepted again, durably, before it is
+    /// queued, so the next delivery reserves it with every check and confirms it in the run it
+    /// reaches. That delivery is a new attempt with a correlation of its own: a late answer for
+    /// this one can never settle it. `this_run` has no next turn: it fails.
     fn steer_refused(self: &Rc<Self>, worker: &WorkerId, mut entry: Delivery) {
         if entry.policy != DeliveryPolicy::Auto {
             self.record_fact(
@@ -554,11 +582,11 @@ impl Supervisor {
         };
         entry.reserved = false;
         entry.input.plan = DeliveryPlan::StartTurn;
+        entry.input.tag = fresh_tag(&entry.input.operation);
         let operation = entry.input.operation.clone();
         let sup = self.clone();
         let worker = worker.clone();
         gtk4::glib::spawn_future_local(async move {
-            // Durable before it is queued again: the next delivery reserves it as accepted.
             let requeued = sup
                 .services
                 .durable("requeue refused steer", move |s| {
@@ -581,8 +609,10 @@ impl Supervisor {
             sup.drain_deferred(&worker);
         });
     }
-    /// A steer's answer may come after its turn ended (the correlation outlives the turn); one
-    /// with no answer within [`STEER_SETTLE`] is taken as refused, so it never waits for ever.
+    /// A steer's answer may come after its turn ended (the correlation outlives the turn). One
+    /// with no answer within [`STEER_SETTLE`] may yet have been taken: its outcome is recorded
+    /// `unknown` (a replay says so), it is never delivered again on a guess, and its correlation
+    /// is kept for a late answer, which settles it (`delivery_control`).
     pub(super) fn arm_steer_settle(self: &Rc<Self>, worker: &WorkerId, tag: String) {
         let wait = self.state.borrow().steer_settle.unwrap_or(STEER_SETTLE);
         let sup = self.weak.clone();
@@ -593,12 +623,34 @@ impl Supervisor {
                 return;
             };
             let entry = take_scoped_control(&mut sup.state.borrow_mut().controls, &worker, &tag);
-            if let Some(entry) = entry {
-                warn!(%worker, operation = %entry.input.operation, ?wait,
-                    "a steer got no answer in time; taken as refused");
-                sup.steer_refused(&worker, entry);
+            let Some(entry) = entry else {
+                return;
+            };
+            warn!(%worker, operation = %entry.input.operation, ?wait,
+                "a steer got no answer in time; its outcome is unknown");
+            sup.record_fact(entry.input.operation.clone(), DispatchFact::Unknown);
+            let mut state = sup.state.borrow_mut();
+            if state.late_steers.len() >= LATE_STEERS {
+                state.late_steers.pop_front();
             }
+            state.late_steers.push_back((tag, entry));
         });
+    }
+    /// A late answer accepted an overdue steer: it was delivered, into the run it was pinned to.
+    fn confirm_late_steer(&self, entry: Delivery) {
+        let InputSource::Message { id, .. } = entry.input.source else {
+            return;
+        };
+        let run = match &entry.input.plan {
+            DeliveryPlan::SteerNow(run) => Some(run.clone()),
+            _ => None,
+        };
+        info!(worker = %entry.worker, operation = %entry.input.operation,
+            "an overdue steer was accepted after all");
+        self.services
+            .write("confirm overdue steer", None, true, move |s| {
+                s.confirm_late_delegation_steer(&id, run.as_ref())
+            });
     }
     fn confirm_delivery(&self, entry: Delivery) {
         // A steer the provider took was taken into the run it was pinned to, even when its
@@ -745,7 +797,7 @@ impl Supervisor {
                     reason: Some("cancelled".into()),
                     result: Some(CANCELLED_BEFORE_ITS_TURN.into()),
                     dispatch_failure: Some((entry.input.operation.clone(), e)),
-                    stop_after: task,
+                    stop_after: task.then_some(used.generation),
                 },
             );
             self.notify_registry();
@@ -841,6 +893,11 @@ impl Supervisor {
         });
     }
 }
+/// A correlation tag no earlier attempt of `operation` used.
+fn fresh_tag(operation: &agent_core::delegation::OperationId) -> String {
+    format!("{operation}#{}", gtk4::glib::uuid_string_random())
+}
+
 fn take_scoped_control(
     controls: &mut std::collections::HashMap<String, Delivery>,
     worker: &WorkerId,

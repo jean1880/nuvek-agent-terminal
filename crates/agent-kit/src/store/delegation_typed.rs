@@ -1697,6 +1697,42 @@ impl Store {
         })
     }
 
+    /// A steer whose answer was overdue (its operation and message `unknown`) was accepted
+    /// after all: the message is delivered, in `run` (a run of its recipient) when named, and
+    /// the operation confirmed, together. Anything not in that state is refused unchanged.
+    pub fn confirm_late_delegation_steer(&self, m: &MessageId, run: Option<&RunId>) -> Result<()> {
+        self.atomically(|s| {
+            let row = s
+                .delegation_message(m.as_str())?
+                .ok_or_else(|| StoreError::NotFound(m.to_string()))?;
+            let from: DeliveryState = parse_name("delivery state", &row.delivery_state)?;
+            let to = agent_core::delegation::mailbox::confirm_late_steer(from)
+                .map_err(|_| illegal("late confirmation"))?;
+            let op = row
+                .operation_id
+                .as_deref()
+                .and_then(|id| s.delegation_operation(id).transpose())
+                .transpose()?
+                .ok_or_else(|| illegal("a late confirmation needs its operation"))?;
+            let op_from: OperationState = parse_name("dispatch state", &op.dispatch_state)?;
+            let op_to = agent_core::delegation::operation::confirm_late_steer(op_from)
+                .map_err(|_| illegal("late confirmation"))?;
+            if let Some(r) = run {
+                let root = s.root_row(&row.root_id)?;
+                s.check_run_of(r, Some(&worker_id(&row.recipient_worker_id)?), &root)?;
+            }
+            let now = s.now();
+            s.set_delegation_message_delivery(
+                m.as_str(),
+                &name_of(&to),
+                run.map(RunId::as_str),
+                now,
+            )?;
+            s.set_delegation_dispatch_state(&op.id, &name_of(&op_to), None, None, now)?;
+            Ok(())
+        })
+    }
+
     /// Moves a run on (never out of a terminal state, never back to `reserved`).
     pub fn advance_delegation_run(
         &self,

@@ -1358,6 +1358,11 @@ pub struct WorkerSummary {
     pub delegation: DelegationStatus,
     /// Scrubbed, at most 512 bytes.
     pub last_activity: Option<String>,
+    /// Whether the worker has a request open that only the user can answer (an approval, a
+    /// question or a form): its state is then `waiting` while it still has a current run. A
+    /// stored summary from before this field reads as `false`.
+    #[serde(default)]
+    pub waiting_on_user: bool,
     /// RFC 3339.
     pub updated_at: String,
 }
@@ -1666,6 +1671,7 @@ pub(crate) mod fixtures {
                 paths: vec![text(c, MAX_STATUS_PATH_BYTES); MAX_STATUS_PATHS],
             },
             last_activity: Some(text(c, MAX_LAST_ACTIVITY_BYTES)),
+            waiting_on_user: true,
             updated_at: "2026-10-15T00:00:00.000000000+00:00".into(),
         }
     }

@@ -275,6 +275,13 @@ impl SubagentSummary {
         }
     }
 
+    /// A delegated worker between runs: alive and open to its parent's next message, but with
+    /// nothing running (a cancelled run leaves it here). The lists file it with the finished
+    /// ones rather than the active.
+    pub fn idle(&self) -> bool {
+        self.active() && !self.running()
+    }
+
     pub fn finished(&self) -> bool {
         match self.lifecycle {
             Some(WorkerState::Unknown) => false,
@@ -287,7 +294,12 @@ impl SubagentSummary {
         match self.lifecycle {
             Some(WorkerState::Starting) => "starting",
             Some(WorkerState::Running) => "running",
-            Some(WorkerState::Waiting) => "waiting",
+            // A delegated worker with a run open is waiting on the user; without one it is
+            // idle, between runs.
+            Some(WorkerState::Waiting) => match &self.delegation {
+                Some(d) if d.run.is_none() => "idle",
+                _ => "waiting",
+            },
             Some(WorkerState::Completed) => "completed",
             Some(WorkerState::Failed) => "failed",
             Some(WorkerState::Stopped) => "stopped",

@@ -1112,6 +1112,7 @@ pub(crate) mod tests {
             },
             delegation: DelegationStatus::new(DelegationStatusCode::Available),
             last_activity: None,
+            waiting_on_user: false,
             updated_at: "2026-10-15T00:00:00Z".into(),
         }
     }
@@ -1763,5 +1764,28 @@ pub(crate) mod tests {
             matches!(backend.actions.borrow().last(), Some(WorkerAction::Approve { request, decision: Decision::Allow, .. }) if request == "later")
         );
         assert_eq!(backend.actions.borrow().len(), 2);
+    }
+
+    #[test]
+    fn a_cancelled_worker_is_idle_and_not_counted_as_active() {
+        let mut idle = summary("w_workerAA", "r_firstRun");
+        idle.state = WorkerState::Waiting;
+        idle.run_id = None;
+        let mut asking = summary("w_workerBB", "r_secondRun");
+        asking.state = WorkerState::Waiting;
+        asking.waiting_on_user = true;
+        let mut working = summary("w_workerCC", "r_thirdRun");
+        working.state = WorkerState::Running;
+        let mut workers = Workers::default();
+        workers.registry(&[idle, asking, working]);
+        let agents = workers.summaries();
+        let labels: Vec<_> = agents.iter().map(|a| a.state_label()).collect();
+        assert_eq!(labels, ["idle", "waiting", "running"]);
+        assert!(agents[0].idle() && !agents[0].running());
+        assert!(agents[1].running() && agents[2].running());
+        assert_eq!(
+            super::super::subagents::count_text(&agents),
+            "2 active · 1 finished"
+        );
     }
 }

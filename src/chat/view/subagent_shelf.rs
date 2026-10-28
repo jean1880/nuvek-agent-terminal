@@ -130,7 +130,7 @@ impl Row {
 
     fn set(&self, agent: &SubagentSummary, now: Option<&str>) {
         super::subagents::set_brand(&self.brand, agent.driver);
-        let running = agent.active();
+        let running = agent.running();
         // The widget's own `visible`, not `is_visible()`: that is false for every row while the
         // card is collapsed, and a finished row would keep spinning once opened.
         if self.spinner.property::<bool>("visible") != running {
@@ -255,7 +255,7 @@ impl SubagentShelf {
     pub fn set(&self, model: &Transcript, agents: &[SubagentSummary]) {
         let shown: Vec<&SubagentSummary> = {
             let mut docked = self.docked.borrow_mut();
-            docked.extend(agents.iter().filter(|a| a.active()).map(|a| a.id.clone()));
+            docked.extend(agents.iter().filter(|a| a.running()).map(|a| a.id.clone()));
             agents.iter().filter(|a| docked.contains(&a.id)).collect()
         };
         self.revealer.set_reveal_child(!shown.is_empty());

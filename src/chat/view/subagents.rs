@@ -110,9 +110,9 @@ pub(super) fn set_brand(image: &gtk4::Image, driver: Option<agent_core::adapter:
 pub fn running_first(agents: &[SubagentSummary]) -> Vec<SubagentSummary> {
     let mut ordered = agents.to_vec();
     ordered.sort_by_key(|a| {
-        if a.active() {
+        if a.running() {
             0
-        } else if a.finished() {
+        } else if a.finished() || a.idle() {
             2
         } else {
             1
@@ -121,15 +121,16 @@ pub fn running_first(agents: &[SubagentSummary]) -> Vec<SubagentSummary> {
     ordered
 }
 
-/// How many of `agents` are active, finished, and neither (status unknown).
+/// How many of `agents` are at work (running), done or idle between runs, and neither (status
+/// unknown). A cancelled worker waiting for its parent's next message is idle, not active.
 pub(super) fn counts<'a>(
     agents: impl IntoIterator<Item = &'a SubagentSummary>,
 ) -> (usize, usize, usize) {
     let (mut active, mut finished, mut total) = (0usize, 0usize, 0usize);
     for agent in agents {
         total += 1;
-        active += usize::from(agent.active());
-        finished += usize::from(agent.finished());
+        active += usize::from(agent.running());
+        finished += usize::from(agent.finished() || agent.idle());
     }
     (active, finished, total.saturating_sub(active + finished))
 }
@@ -255,9 +256,9 @@ pub struct SubagentButton {
 
 /// The group a sub-agent is listed under.
 fn group(agent: &SubagentSummary) -> &'static str {
-    if agent.active() {
+    if agent.running() {
         "Active"
-    } else if agent.finished() {
+    } else if agent.finished() || agent.idle() {
         "History"
     } else {
         "Status unknown"

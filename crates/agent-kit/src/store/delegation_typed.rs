@@ -2879,6 +2879,15 @@ fn scrub_tool_error(e: &ToolError) -> Result<ToolError> {
 /// A page event's summary and state: scrubbed, at most [`MAX_EVENT_SUMMARY_BYTES`], never a
 /// token stream.
 fn event_summary(env: &Envelope) -> (String, Option<StateRef>) {
+    // Activity, questions and forms are one line a reader skims; their detail (a command's
+    // whole output, say) is in the worker's own transcript, not on the page.
+    let one_line = matches!(
+        env.event,
+        Event::ItemStarted { .. }
+            | Event::ItemCompleted { .. }
+            | Event::QuestionRequested { .. }
+            | Event::FormRequested { .. }
+    );
     let (text, state) = match &env.event {
         Event::Notice { text } => (text.clone(), None),
         Event::SessionStarted { .. } => (
@@ -2934,14 +2943,61 @@ fn event_summary(env: &Envelope) -> (String, Option<StateRef>) {
             format!("approval requested: {}", title.as_deref().unwrap_or(tool)),
             None,
         ),
+        Event::QuestionRequested { questions, .. } => (
+            match questions.first() {
+                Some(q) => format!("question: {}", q.question),
+                None => "question".to_owned(),
+            },
+            None,
+        ),
+        Event::FormRequested {
+            server, message, ..
+        } => (
+            format!(
+                "form: {}",
+                if message.trim().is_empty() {
+                    server
+                } else {
+                    message
+                }
+            ),
+            None,
+        ),
         Event::DelegatedMessage { text, .. } => (text.clone(), None),
         // Never a token stream: content is summarised by its item, not its deltas.
         Event::ContentDelta { .. } | Event::ContentSnapshot { .. } => ("activity".to_owned(), None),
         other => (super::event_kind(other), None),
     };
-    (
-        truncate_bytes(&redact(&text), MAX_EVENT_SUMMARY_BYTES).to_owned(),
-        state,
+    let text = redact(&text);
+    let summary = if one_line {
+        first_line(&text, MAX_ACTIVITY_SUMMARY_BYTES)
+    } else {
+        truncate_bytes(&text, MAX_EVENT_SUMMARY_BYTES).to_owned()
+    };
+    (summary, state)
+}
+
+/// The longest an activity, question or form summary on a page may be.
+const MAX_ACTIVITY_SUMMARY_BYTES: usize = 240;
+
+/// `text`'s first non-empty line, cut on a character boundary to `max` bytes with the cut (or
+/// any dropped lines) marked by `…`.
+fn first_line(text: &str, max: usize) -> String {
+    const MARK: &str = "…";
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let first = lines.next().unwrap_or_default();
+    let more = lines.next().is_some();
+    if first.len() <= max {
+        return if more {
+            let room = truncate_bytes(first, max.saturating_sub(MARK.len()));
+            format!("{room}{MARK}")
+        } else {
+            first.to_owned()
+        };
+    }
+    format!(
+        "{}{MARK}",
+        truncate_bytes(first, max.saturating_sub(MARK.len()))
     )
 }
 
@@ -5258,4 +5314,7 @@ mod tests {
         });
         assert!(r.is_err());
     }
+
+    /// What a parent reads of a worker's activity, questions and forms.
+    mod awareness_tests;
 }

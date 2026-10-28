@@ -315,3 +315,77 @@ fn a_tool_title_never_shows_a_decoded_credential_even_where_it_is_cut() {
         );
     }
 }
+
+/// `inner` wrapped in `layers` JSON quoting layers: the classifier and the title each take
+/// layers off, and only the innermost one decodes the escaped credential.
+fn quoted(inner: &str, layers: usize) -> String {
+    let mut out = format!("\"{inner}\"");
+    for _ in 1..layers {
+        out = serde_json::to_string(&out).expect("quoted");
+    }
+    out
+}
+
+/// A credential behind many quoting layers (its first letter escaped innermost), and one in a
+/// nested `commandActions` value, at offsets around the title's cut: no fragment of it shows.
+#[test]
+fn a_tool_title_never_shows_a_credential_behind_layers_or_nested_values() {
+    let token = format!("gh{}_{}", "p", "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dE3fG5");
+    let escaped = format!("\\u0067{}", &token[1..]);
+    let store = Store::open_in_memory().expect("store");
+    let thread = fresh(&store, "/w");
+    let mut n = 0;
+    // Past the decoding bound (10 layers) the title fails closed: the verb alone.
+    for layers in [1, 5, 6, 10] {
+        for pad in [120, 128, 132, 136, 139] {
+            let inner = format!("echo {} {escaped} done", "x".repeat(pad - 5));
+            let value = quoted(&inner, layers);
+            let inputs = [
+                json!({"tool_name": "run_command", "CommandLine": value}),
+                json!({
+                    "command": "rg",
+                    "commandActions": [{"type": "search", "query": value, "path": "."}],
+                }),
+            ];
+            for input in inputs {
+                n += 1;
+                for env in [
+                    Envelope::new(Event::ItemStarted {
+                        kind: ItemKind::Command,
+                        title: String::new(),
+                        input: Some(input.clone()),
+                        parent: None,
+                    }),
+                    Envelope::new(Event::ItemCompleted {
+                        status: ItemStatus::Completed,
+                        output: None,
+                        error: None,
+                    }),
+                ] {
+                    store
+                        .append_event(&thread, None, &env.item(format!("cmd{n}").as_str()))
+                        .expect("stored");
+                }
+            }
+        }
+    }
+    let messages = store.transcript_messages(&thread).expect("messages");
+    assert_eq!(messages.len(), n);
+    let summary = build_handoff(&messages, "t").summary;
+    let shown: String = messages
+        .iter()
+        .map(|m| m.title.as_str())
+        .chain([summary.as_str()])
+        .collect();
+    for end in 6..=token.len() {
+        assert!(
+            !shown.contains(&token[..end]),
+            "a fragment of the credential survived: {}\n{shown}",
+            &token[..end]
+        );
+    }
+    // A value with no credential still titles by what it ran.
+    assert!(messages
+        .iter()
+        .all(|m| m.title.starts_with("Run") || m.title.starts_with("Search")));
+}

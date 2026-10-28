@@ -497,6 +497,8 @@ struct Inner {
     continue_on_switch_to: Cell<Option<(Driver, u64)>>,
     /// Bumped by every "Continue in", which it names.
     continue_armed: Cell<u64>,
+    /// Bumped whenever the agent works again on its own ([`ChatSession::work_epoch`]).
+    work_epoch: Cell<u64>,
 }
 
 /// The one continuation a busy switch sends its new process, once two things are true, in
@@ -960,6 +962,7 @@ impl ChatSession {
             switch_interrupted: Cell::new(false),
             continue_on_switch_to: Cell::new(None),
             continue_armed: Cell::new(0),
+            work_epoch: Cell::new(0),
         });
         *inner.weak_self.borrow_mut() = Some(Rc::downgrade(&inner));
         inner.attach_approval();
@@ -1016,10 +1019,24 @@ impl ChatSession {
     /// "Continue in" another agent: the next switch to `driver` hands the thread over and then
     /// starts a turn with the handoff, as a busy switch does, though no turn runs now. Another
     /// switch, or the user writing first, drops it.
-    pub(crate) fn continue_after_switch_to(&self, driver: Driver) {
+    ///
+    /// `since` is [`Self::work_epoch`] when the user asked (a question may have been open
+    /// since): if the agent has continued or completed a turn meanwhile, the work it was to
+    /// continue is done, and nothing is armed. False then.
+    pub(crate) fn continue_after_switch_to(&self, driver: Driver, since: u64) -> bool {
+        if self.inner.work_epoch.get() != since {
+            return false;
+        }
         let armed = self.inner.continue_armed.get().wrapping_add(1);
         self.inner.continue_armed.set(armed);
         self.inner.continue_on_switch_to.set(Some((driver, armed)));
+        true
+    }
+
+    /// Bumped whenever the agent works again on its own: it continued after its usage limit,
+    /// or completed a turn after a prompt. What a "Continue in" asked at one value is for.
+    pub(crate) fn work_epoch(&self) -> u64 {
+        self.inner.work_epoch.get()
     }
 
     /// Which "Continue in" waits for the next switch, if one does: what a switch attempt that
@@ -4780,6 +4797,7 @@ impl Inner {
             self.limit_waiting.set(false);
             // The agent works again: a "Continue in" asked while it was stopped is moot.
             self.continue_on_switch_to.set(None);
+            self.work_epoch.set(self.work_epoch.get().wrapping_add(1));
         }
     }
 

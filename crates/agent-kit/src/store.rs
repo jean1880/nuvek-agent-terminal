@@ -3510,46 +3510,79 @@ impl ToolInput {
     /// The tool's title in the shared card grammar (`agent_core::tool_title`): from its
     /// structured input, else from the streamed input once it parses, else the tool alone.
     ///
-    /// Redacted before the title is built and again after. Decoding (JSON escapes, agy's extra
-    /// quotes) can rebuild a credential the stored text only held escaped, and the title cuts
-    /// long targets: cut first, a credential would be left as a fragment too short for the
-    /// redactor to recognise. So every decoded value is redacted whole before anything is cut.
+    /// The classifier decodes what it reads (agy's quoted arguments, a shell wrapper's body)
+    /// and cuts long targets: a credential the stored text only held escaped or split could be
+    /// rebuilt and then cut into a fragment too short for the redactor to recognise. So every
+    /// string the title may read (the name, every input value, nested ones such as Codex's
+    /// `commandActions` included) is decoded first to the end, and redacted whole. A value that
+    /// still decodes past [`DECODE_LAYERS`], or one whose shell-wrapper reading holds a
+    /// credential, fails closed: the title is the tool's verb alone, naming no value at all.
     fn title(&self) -> String {
         let input = match &self.input {
             Some(v) if !v.is_null() => Some(v.clone()),
             _ => serde_json::from_str::<Value>(&self.streamed).ok(),
-        }
-        .map(|v| redact_values(&fully_decoded(v)));
-        let name = redact(&self.name);
+        };
+        let name = safe_string(&self.name);
+        // Outer `None`: a value failed closed; inner `None`: there is no input.
+        let input = match input {
+            Some(v) => safe_value(&v).map(Some),
+            None => Some(None),
+        };
+        let (Some(name), Some(input)) = (name, input) else {
+            let bare = agent_core::tool_title::classify(self.kind, "", None);
+            return bare.kind.verb().unwrap_or("Tool").to_owned();
+        };
         redact(&agent_core::tool_title::classify(self.kind, &name, input.as_ref()).text())
     }
 }
 
-/// `input` with agy's quoted arguments decoded until none is left (each pass takes one layer
-/// off: [`agent_core::tool_title::decode_agy_args`]), so the classifier decodes nothing more.
-fn fully_decoded(mut input: Value) -> Value {
-    for _ in 0..4 {
-        let next = agent_core::tool_title::decode_agy_args(&input);
-        if next == input {
-            break;
-        }
-        input = next;
+/// Quoting layers a title value may carry (agy quotes its arguments once; nesting is rare).
+const DECODE_LAYERS: usize = 8;
+
+/// One JSON quoting layer off `s`, as the classifier takes one off (`"\"x\""` → `"x"`).
+fn unquote_once(s: &str) -> Option<String> {
+    let t = s.trim();
+    if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+        serde_json::from_str::<String>(t).ok()
+    } else {
+        None
     }
-    input
 }
 
-/// `value` with every string in it redacted whole.
-fn redact_values(value: &Value) -> Value {
-    match value {
-        Value::String(s) => Value::String(redact(s)),
-        Value::Array(items) => Value::Array(items.iter().map(redact_values).collect()),
+/// `s` decoded and redacted, for a title: every quoting layer taken off, then redacted whole.
+/// `None` (fail closed) when layers remain past [`DECODE_LAYERS`], or when the command a shell
+/// wrapper runs (what the classifier shows of one) still holds a credential once read out.
+fn safe_string(s: &str) -> Option<String> {
+    let mut decoded = s.to_owned();
+    let mut layers = 0;
+    while let Some(next) = unquote_once(&decoded) {
+        layers += 1;
+        if layers > DECODE_LAYERS {
+            return None;
+        }
+        decoded = next;
+    }
+    let redacted = redact(&decoded);
+    let shown = agent_core::tool_title::display_command(&redacted);
+    if shown != redacted.trim() && redact(&shown) != shown {
+        return None;
+    }
+    Some(redacted)
+}
+
+/// `value` with every string in it, at any depth, made [`safe_string`]; `None` when any one
+/// fails closed.
+fn safe_value(value: &Value) -> Option<Value> {
+    Some(match value {
+        Value::String(s) => Value::String(safe_string(s)?),
+        Value::Array(items) => Value::Array(items.iter().map(safe_value).collect::<Option<_>>()?),
         Value::Object(map) => Value::Object(
             map.iter()
-                .map(|(k, v)| (k.clone(), redact_values(v)))
-                .collect(),
+                .map(|(k, v)| Some((k.clone(), safe_value(v)?)))
+                .collect::<Option<_>>()?,
         ),
         other => other.clone(),
-    }
+    })
 }
 
 fn apply_to_transcript(

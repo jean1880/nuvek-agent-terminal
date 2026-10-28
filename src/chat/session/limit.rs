@@ -90,6 +90,7 @@ impl Inner {
         }
         // It continues where it is: a "Continue in" another agent no longer applies.
         self.continue_on_switch_to.set(None);
+        self.work_epoch.set(self.work_epoch.get().wrapping_add(1));
         self.emit(Envelope::new(Event::Notice {
             text: CONTINUE_NOTICE.to_owned(),
         }));

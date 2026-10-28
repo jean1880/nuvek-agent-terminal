@@ -234,7 +234,17 @@ Architectural mandates, standards, and workflows for this codebase.
   prompt-less init turn names no transcript). The stop is silent: no exit reaches the view or the
   store. A mode or same-agent model picked while suspended is kept for the resume (never Bypass);
   other controls say, unstored, that the agent is paused. The next prompt resumes the same native
-  session (`ensure_alive`).
+  session (`ensure_alive`). A delegated worker is never stopped by that sweep; only its
+  supervisor pauses it (`ChatSession::suspend_child_if_idle`, the same `suspend_blocker` checks
+  with only the delegated-worker exclusion relaxed), when it has been idle for
+  `idle_suspend_minutes` (`Supervisor::stop_idle_children`, 0 never) or when a start would pass
+  `live_processes_app` (the least recently active idle worker goes first, its exit awaited; with
+  none, the start is refused saying how many are idle and that `cross_agent_close` frees a
+  slot). The supervisor's own check comes first (no run, pending input, preparation, dispatch,
+  queued delivery or open request, its process up and read back, and never with a live
+  descendant), and its hooks consent with the same planned rotation, so nothing is revoked and
+  the epoch is unchanged. Silent too: its next instruction resumes the same native session
+  through `ensure_child`. `capacity_tests` (supervisor and session) prove these.
 - **A thread stopped by its usage limit continues once it resets, unless told not to**: with
   `continue_after_limit` on (default; Settings → Behaviour), a root thread whose turn failed for
   quota (never a rate limit alone, which may be a tool's own 429, nor a usage reading, which may

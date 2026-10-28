@@ -1167,7 +1167,7 @@ impl Supervisor {
             authority_epoch: epoch.0,
             delegation_scope: DELEGATION_SCOPE_SUPERVISED.into(),
             profiles,
-            limits: CapabilityLimits::from_limits(&self.limits),
+            limits: super::catalog_info::capability_limits(&self.limits, self.live_processes()),
             truncated: omitted.models > 0,
             omitted,
             tag_vocabulary: tags

@@ -65,6 +65,18 @@ impl Supervisor {
         if ready {
             return Ok(());
         }
+        // A worker with no process (paused, or gone) takes a slot again when it starts.
+        let restart = {
+            let state = self.state.borrow();
+            state
+                .workers
+                .get(worker)
+                .filter(|w| w.generations.is_empty())
+                .map(|w| w.root.clone())
+        };
+        if let Some(root) = restart {
+            self.make_room(&root, Some(worker)).await?;
+        }
         let mut spec = self
             .state
             .borrow()
@@ -206,7 +218,10 @@ impl Supervisor {
                 "maximum delegation depth reached",
             ));
         }
-        agent_core::delegation::limits::admit_spawn(&self.limits, &self.usage(&root), true)?;
+        agent_core::delegation::limits::admit_spawn(&self.limits, &self.usage(&root), false)?;
+        // Every process slot taken: an idle worker is paused for this one, or the spawn is
+        // refused, saying why.
+        self.make_room(&root, None).await?;
         // A restricted worker's limits reach the children it starts (a root has none).
         let parent_capabilities = self
             .state

@@ -111,20 +111,33 @@ impl DelegationHooks for Hooks {
         let Some(sup) = self.supervisor.upgrade() else {
             return false;
         };
-        // Roots only, and only with nothing delegated live: a rotation must not cut work short.
-        let thread = {
+        // Only with nothing delegated live below it: a rotation must not cut work short.
+        let (child, thread) = {
             let state = sup.state.borrow();
             let Some(w) = state.workers.get(&self.worker) else {
                 return false;
             };
-            if w.row.parent_id.is_some() || w.generation != generation {
+            if w.generation != generation {
                 return false;
             }
-            state
-                .roots
-                .get(&w.root)
-                .map(|r| r.row.root_thread_id.clone())
+            (
+                w.row.parent_id.is_some(),
+                state
+                    .roots
+                    .get(&w.root)
+                    .map(|r| r.row.root_thread_id.clone()),
+            )
         };
+        // A child pauses only when the supervisor finds it idle too (no run, no pending input,
+        // nothing put to the user, no live descendant): the same rotation as a root's, so its
+        // authority and epoch stay as they are and its next instruction resumes it.
+        if child {
+            if !sup.child_suspendable(&self.worker) {
+                return false;
+            }
+            sup.rotate_before_stop(&self.worker, generation);
+            return true;
+        }
         let Some(thread) = thread else {
             return false;
         };
@@ -518,6 +531,8 @@ impl Supervisor {
             let Some(g) = w.generations.remove(&generation) else {
                 return;
             };
+            // An exit with no `SessionExited` envelope still takes its requests with it.
+            w.open_requests.clear_generation(generation);
             let unexpected = w.token.as_ref().is_some_and(|t| t.generation == generation);
             if unexpected {
                 w.token = None;

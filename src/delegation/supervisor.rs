@@ -2105,6 +2105,8 @@ mod tests {
     }
     /// A parent can tell a worker waiting on the user from one at work.
     mod awareness_tests;
+    /// Idle workers give their process slots back, losslessly.
+    mod capacity_tests;
     /// Worker status, run agreement, startup deadlines and paging errors (PR-E).
     mod status_tests;
     /// A root is told its sub-agents' results without polling for them.
@@ -2257,6 +2259,9 @@ pub(super) struct WorkerRt {
     pub cwd: PathBuf,
     /// Requests put to the user and not yet settled; see [`OpenRequests`].
     pub open_requests: OpenRequests,
+    /// When the worker was last seen at work (or was created): an idle worker's process is
+    /// paused least recently active first, and only once idle long enough.
+    pub last_active: Instant,
 }
 impl WorkerRt {
     /// Whether the worker's current process has a request open that only the user can answer.
@@ -2827,6 +2832,7 @@ impl Supervisor {
             opened_run: None,
             cwd,
             open_requests: OpenRequests::default(),
+            last_active: Instant::now(),
         }
     }
     pub(super) async fn stage(
@@ -3515,6 +3521,12 @@ impl Supervisor {
     pub(super) fn notify_registry(&self) {
         let work = {
             let mut state = self.state.borrow_mut();
+            // Every change a worker's work makes reaches the registry: one still at work now is
+            // active now.
+            let now = Instant::now();
+            for w in state.workers.values_mut().filter(|w| w.at_work()) {
+                w.last_active = now;
+            }
             state.subscribers.retain(|(_, s)| s.strong_count() > 0);
             state
                 .subscribers

@@ -142,7 +142,10 @@ impl Supervisor {
             let starting = alive && current.is_some_and(|g| !w.generations.contains_key(&g));
             let launching = u32::from(starting || bound.contains(id));
             u.live_processes += (w.generations.len() as u32).max(launching);
-            u.stopping_processes += stopping;
+            // A stop whose slot the worker's own restart carries over frees nothing.
+            if !bound.contains(id) {
+                u.stopping_processes += stopping;
+            }
             if !w.generations.is_empty() && w.run.is_none() {
                 u.idle_workers += 1;
             }
@@ -159,6 +162,12 @@ impl Supervisor {
                 }
             }
         }
+        // A slot naming a worker not registered yet (a spawn between its acceptance and the
+        // worker's registration) is still a launch on its way.
+        u.live_processes += bound
+            .iter()
+            .filter(|w| !state.workers.contains_key(*w))
+            .count() as u32;
         u.waits_app = state.waits.len() as u32;
         u
     }
@@ -173,7 +182,7 @@ impl Supervisor {
             .sum()
     }
     /// Takes one process slot for a launch, counted from now ([`LaunchSlot`]).
-    fn reserve_launch(&self) -> LaunchSlot {
+    pub(super) fn reserve_launch(&self) -> LaunchSlot {
         let mut state = self.state.borrow_mut();
         let id = state.next_launch_slot;
         state.next_launch_slot = id.wrapping_add(1);

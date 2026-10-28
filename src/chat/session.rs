@@ -480,6 +480,35 @@ struct Inner {
     /// a Codex prompt to that live process is written at once, never held in the adapter's own
     /// queue. Cleared by every start and every teardown.
     provider_session_up: Cell<Option<u64>>,
+    /// The window waits for this thread's usage limit to reset (`continue_after_limit`): sub-agent
+    /// news does not wake it meanwhile; only the continuation starts a turn. Cleared by the window,
+    /// by a turn that completes, and by a switch to another agent.
+    limit_waiting: Cell<bool>,
+    /// The continuation a busy switch owes its task ([`SwitchContinuation`]).
+    switch_continuation: RefCell<Option<SwitchContinuation>>,
+    /// Bumped by every switch: a continuation an older switch armed is never sent.
+    switch_revision: Cell<u64>,
+    /// A delegation root's rebind is about to stop the running turn for a switch
+    /// ([`ChatSession::note_switch_interrupts_turn`]): the switch that follows continues it, though
+    /// no turn runs by then. Taken by the next switch; a turn that ends on its own clears it.
+    switch_interrupted: Cell<bool>,
+    /// The next switch to this agent continues the thread though no turn runs: "Continue in" after
+    /// a usage limit ([`ChatSession::continue_after_switch_to`]). Taken by the next switch.
+    continue_on_switch_to: Cell<Option<Driver>>,
+}
+
+/// The one continuation a busy switch sends its new process, once two things are true, in
+/// either order: the handoff is prepared (the switch read the thread and made the new process its
+/// own) and nothing holds the process any more (no delegation rebind, or `rebind_start` ran).
+/// Whichever comes second sends it, once. A later switch drops it, and a turn that ends on its
+/// own before the handoff is prepared drops it too (nothing is left to continue).
+struct SwitchContinuation {
+    /// The switch it belongs to (`switch_revision`).
+    revision: u64,
+    /// The agent it continues on.
+    driver: Driver,
+    prepared: bool,
+    ready: bool,
 }
 
 /// What the session decided about one Codex permission request, keyed by the id the view knows
@@ -923,6 +952,11 @@ impl ChatSession {
             wakes_held: Cell::new(false),
             held_news: RefCell::new(None),
             provider_session_up: Cell::new(None),
+            limit_waiting: Cell::new(false),
+            switch_continuation: RefCell::new(None),
+            switch_revision: Cell::new(0),
+            switch_interrupted: Cell::new(false),
+            continue_on_switch_to: Cell::new(None),
         });
         *inner.weak_self.borrow_mut() = Some(Rc::downgrade(&inner));
         inner.attach_approval();
@@ -958,6 +992,28 @@ impl ChatSession {
     /// permissive mode, which ends with its agent; the last safe choice instead.
     pub fn wanted_mode(&self) -> Mode {
         self.inner.safe_mode.get()
+    }
+
+    /// A delegation root is about to be stopped for a switch (its rebind): a turn running now
+    /// is interrupted by that switch, not finished, so the switch that follows continues it
+    /// once, as a busy switch does. Called before the stop; nothing when no turn runs.
+    pub(crate) fn note_switch_interrupts_turn(&self) {
+        if self.inner.state.borrow().running_turn {
+            self.inner.switch_interrupted.set(true);
+        }
+    }
+
+    /// "Continue in" another agent: the next switch to `driver` hands the thread over and then
+    /// starts a turn with the handoff, as a busy switch does, though no turn runs now. Another
+    /// switch, or the user writing first, drops it.
+    pub(crate) fn continue_after_switch_to(&self, driver: Driver) {
+        self.inner.continue_on_switch_to.set(Some(driver));
+    }
+
+    /// The window waits (or no longer waits) for this thread's usage limit to reset: while it
+    /// does, sub-agent news does not wake the agent; only the continuation does.
+    pub(crate) fn set_limit_wait(&self, waiting: bool) {
+        self.inner.limit_waiting.set(waiting);
     }
 
     /// Re-arms a handoff found stored and undelivered in the thread's history (see
@@ -1316,6 +1372,9 @@ impl Inner {
                 }
                 // Codex's turn-scoped permission grants ended with the turn.
                 self.codex_turn_grant_paths.borrow_mut().clear();
+                if !self.stopping.get() {
+                    self.turn_ended_on_its_own(*state);
+                }
                 // Only the turn of the prompt that carried the handoff spends it, and only when
                 // it completed with a top-level answer: see `handoff_turn_end`.
                 let end = handoff_turn_end(
@@ -3691,6 +3750,8 @@ impl Inner {
     }
 
     fn send_prompt(self: &Rc<Self>, text: &str) {
+        // The user wrote before a "Continue in" switch was made: that message is what goes on.
+        self.continue_on_switch_to.set(None);
         if self.rebinding.get() || self.switch_reading.get() {
             // Nothing runs until the rebind starts the next generation, or the switch its new
             // process, which then sends the queue.
@@ -4358,8 +4419,16 @@ impl Inner {
     }
 
     fn switch(self: &Rc<Self>, driver: Driver, model: Option<String>, effort: Option<String>) {
-        // The latest choice wins over a switch still reading the thread.
+        // The latest choice wins over a switch still reading the thread, and over the
+        // continuation an earlier switch still owes.
         self.end_pending_switch();
+        let revision = self.switch_revision.get().wrapping_add(1);
+        self.switch_revision.set(revision);
+        self.switch_continuation.borrow_mut().take();
+        // A turn a delegation root's rebind stopped for this switch, or "Continue in": the switch
+        // continues the task as a busy one does, though no turn runs now.
+        let interrupted = self.switch_interrupted.replace(false);
+        let asked = self.continue_on_switch_to.take() == Some(driver);
         let (caps, current_driver, mode, status_model, current_effort, running) = {
             let adapter = self.adapter.borrow();
             let state = self.state.borrow();
@@ -4380,6 +4449,7 @@ impl Inner {
                 state.running_turn,
             )
         };
+        let busy = running || interrupted || asked;
         // No effort asked for on the same agent means "keep it", not "clear it".
         let effort = match (&effort, driver == current_driver) {
             (None, true) => current_effort.clone(),
@@ -4421,22 +4491,24 @@ impl Inner {
         // Persistence follows backend acceptance, never a click or a failed request.
         *self.retired.borrow_mut() = None;
         if same_driver
-            && running
-            && matches!(
+            && busy
+            && (matches!(
                 transition,
                 Transition::SwitchModelInSession | Transition::RestartAndResume
-            )
+            ) || (interrupted && matches!(transition, Transition::Reuse)))
         {
             // The picker already confirmed Switch and Continue. A process replacement actually
             // interrupts this turn and expires its questions/approvals before resuming.
             // Transport writes are asynchronous: even a known native session might never
             // have received the latest task. Carry bounded context as well as native history.
+            self.arm_switch_continuation(revision, driver);
             let asked_model = model.clone();
             self.with_thread_handoff(driver, driver, move |inner, handoff| {
-                // The turn ended while the thread was read: nothing is left to continue, and a
-                // continuation would only redo finished work. The switch is an idle one now,
-                // and what was queued meanwhile goes on the new model once it is made.
-                if !inner.state.borrow().running_turn {
+                // The turn ended on its own while the thread was read: nothing is left to
+                // continue, and a continuation would only redo finished work. The switch is an
+                // idle one now, and what was queued meanwhile goes on the new model once it is
+                // made.
+                if !inner.continuation_owed(revision) {
                     inner.switch_went_ahead();
                     inner.switch(driver, asked_model, effort);
                     return;
@@ -4444,28 +4516,50 @@ impl Inner {
                 let handoff = match handoff {
                     Ok(handoff) => handoff,
                     Err(e) => {
+                        inner.switch_continuation.borrow_mut().take();
                         inner.error(format!(
                             "Could not read the unfinished task to continue: {e}"
                         ));
                         inner.hold_for_switch(Some(driver), "failed");
+                        // A rebind that stopped the agent for this switch starts it again.
+                        inner.ensure_alive();
                         return;
                     }
                 };
                 inner.switch_went_ahead();
                 let native = inner.state.borrow().native_id.clone();
-                {
+                let delta = OpenSessionDelta {
+                    model: Some(target_model),
+                    effort,
+                    mode: None,
+                    resume: native,
+                };
+                let running = inner.state.borrow().alive || inner.proc.borrow().is_some();
+                if running {
                     let _carrying = ScopedFlag::set(&inner.carrying_task);
-                    inner.respawn(&OpenSessionDelta {
-                        model: Some(target_model),
-                        effort,
-                        mode: None,
-                        resume: native,
-                    });
+                    inner.respawn(&delta);
+                } else {
+                    // Stopped already (a delegation root's rebind): the next start takes the
+                    // choice. During the rebind that start is `rebind_start`'s, never one here.
+                    inner.apply_delta(&delta);
+                    inner.ensure_alive();
                 }
                 if handoff.carried > 0 {
                     inner.arm_handoff(handoff);
                 }
-                inner.continue_after_switch(driver);
+                inner.handoff_prepared(revision);
+            });
+            return;
+        }
+        // Stopped for a delegation root's rebind, same agent: no process to tell, and none may
+        // start before the rebind's own start, which launches with the choice.
+        if self.rebinding.get() && same_driver && !self.state.borrow().alive {
+            let native = self.state.borrow().native_id.clone();
+            self.apply_delta(&OpenSessionDelta {
+                model: (!target_model.is_empty()).then_some(target_model),
+                effort,
+                mode: None,
+                resume: native,
             });
             return;
         }
@@ -4540,7 +4634,10 @@ impl Inner {
             }
             Transition::CreateWithHandoff => {
                 // It ends the switch itself, once the thread is read.
-                self.create_with_handoff(driver, model, effort, running);
+                if busy {
+                    self.arm_switch_continuation(revision, driver);
+                }
+                self.create_with_handoff(driver, model, effort, busy, revision);
                 return;
             }
             Transition::Reject(reason) => self.error(reason),
@@ -4562,6 +4659,113 @@ impl Inner {
             self.send_prompt_now(super::SWITCH_CONTINUATION);
         }
         self.settle_carried(sent);
+    }
+
+    /// A busy switch (`revision`, to `driver`) owes its task a continuation. It is ready at once
+    /// unless a delegation rebind holds the process: then `rebind_start` makes it ready.
+    fn arm_switch_continuation(&self, revision: u64, driver: Driver) {
+        *self.switch_continuation.borrow_mut() = Some(SwitchContinuation {
+            revision,
+            driver,
+            prepared: false,
+            ready: !self.rebinding.get(),
+        });
+    }
+
+    /// Whether switch `revision` still owes a continuation: not overtaken by a later switch, nor
+    /// dropped by its turn ending on its own.
+    fn continuation_owed(&self, revision: u64) -> bool {
+        self.switch_continuation
+            .borrow()
+            .as_ref()
+            .is_some_and(|c| c.revision == revision)
+    }
+
+    /// Switch `revision` made its new process its own, with the handoff armed: its continuation
+    /// goes now if nothing holds the process, else when the rebind ends.
+    fn handoff_prepared(self: &Rc<Self>, revision: u64) {
+        let due = match self.switch_continuation.borrow_mut().as_mut() {
+            Some(c) if c.revision == revision => {
+                c.prepared = true;
+                c.ready
+            }
+            _ => return,
+        };
+        if due {
+            self.send_switch_continuation();
+        }
+    }
+
+    /// A delegation rebind ended (`rebind_start`, after it started the next process): a busy
+    /// switch whose handoff is prepared continues now; one still reading the thread, when its
+    /// handoff is.
+    pub(super) fn rebind_ready(self: &Rc<Self>) {
+        let due = match self.switch_continuation.borrow_mut().as_mut() {
+            Some(c) => {
+                c.ready = true;
+                c.prepared
+            }
+            None => return,
+        };
+        if due {
+            self.send_switch_continuation();
+        }
+    }
+
+    /// Sends the owed continuation, once: it is taken before it goes.
+    fn send_switch_continuation(self: &Rc<Self>) {
+        let Some(continuation) = self.switch_continuation.borrow_mut().take() else {
+            return;
+        };
+        self.continue_after_switch(continuation.driver);
+    }
+
+    /// A turn ended on its own (not stopped by the app), `state`: a switch about to continue it
+    /// has nothing left to continue, and a completed turn after a prompt means the agent works
+    /// again, so the thread no longer waits for a usage limit.
+    fn turn_ended_on_its_own(&self, state: TurnState) {
+        self.switch_interrupted.set(false);
+        let unprepared = self
+            .switch_continuation
+            .borrow()
+            .as_ref()
+            .is_some_and(|c| !c.prepared);
+        if unprepared {
+            self.switch_continuation.borrow_mut().take();
+        }
+        if state == TurnState::Completed && self.prompted.get() {
+            self.limit_waiting.set(false);
+        }
+    }
+
+    /// `delta` applied to what the next start launches, as [`Self::respawn`] does, without
+    /// stopping or starting anything: the process is already gone.
+    fn apply_delta(&self, delta: &OpenSessionDelta) {
+        if let Some(model) = &delta.model {
+            let effort = delta
+                .effort
+                .clone()
+                .or_else(|| self.state.borrow().effort.clone());
+            self.prepare_model_change(model.clone(), effort, true);
+        }
+        {
+            let mut open = self.open.borrow_mut();
+            if let Some(m) = &delta.model {
+                open.model = Some(m.clone());
+            }
+            if let Some(e) = &delta.effort {
+                open.effort = Some(e.clone());
+            }
+            if let Some(resume) = &delta.resume {
+                open.resume = Some(resume.clone());
+                open.new_session_id = None;
+            }
+        }
+        if let Some(m) = &delta.model {
+            self.emit(Envelope::new(Event::ModelChangeRequested {
+                model: m.clone(),
+            }));
+        }
     }
 
     /// Ends the switch's hold on `carried_unsent`: dropped when its continuation went (the
@@ -4595,18 +4799,20 @@ impl Inner {
         model: Option<String>,
         effort: Option<String>,
         busy: bool,
+        revision: u64,
     ) {
         let Some(factory) = self.factory.borrow().clone() else {
             self.error("Switching agent is not available in this thread.");
-            self.end_switch(driver, busy);
+            self.end_switch(busy, revision);
             return;
         };
         // Built from the store before anything is stopped, so a failure leaves the thread as it was.
         let from = self.adapter.borrow().driver();
         self.with_thread_handoff(from, driver, move |inner, handoff| {
-            // A turn that ended while the thread was read has nothing left to continue: a
-            // continuation would only redo finished work, so the switch ends as an idle one.
-            let busy = busy && inner.state.borrow().running_turn;
+            // A turn that ended on its own while the thread was read has nothing left to
+            // continue: a continuation would only redo finished work, so the switch ends as an
+            // idle one.
+            let busy = busy && inner.continuation_owed(revision);
             let switched = {
                 // Busy, a message still waiting in an unspawned start is the continuation's.
                 let _carrying = busy.then(|| ScopedFlag::set(&inner.carrying_task));
@@ -4624,15 +4830,19 @@ impl Inner {
                 // (its start waited for it): it is back as it was.
                 inner.ensure_alive();
             }
-            inner.end_switch(driver, busy);
+            inner.end_switch(busy, revision);
         });
     }
 
-    /// The end of a switch: [`Self::create_with_handoff`]'s.
-    fn end_switch(self: &Rc<Self>, driver: Driver, busy: bool) {
+    /// The end of a switch: [`Self::create_with_handoff`]'s. Busy, its continuation goes once
+    /// nothing holds the new process ([`Self::handoff_prepared`]); idle, the queue does.
+    fn end_switch(self: &Rc<Self>, busy: bool, revision: u64) {
         if busy {
-            self.continue_after_switch(driver);
+            self.handoff_prepared(revision);
         } else {
+            if self.continuation_owed(revision) {
+                self.switch_continuation.borrow_mut().take();
+            }
             self.dispatch_queued_prompt();
         }
     }
@@ -4756,6 +4966,10 @@ impl Inner {
         launch: AgentLaunch,
         installed: Installed,
     ) -> (Mode, bool, bool) {
+        // The limit the thread waited out was the old agent's.
+        if self.adapter.borrow().driver() != driver {
+            self.limit_waiting.set(false);
+        }
         *self.provider_thread.borrow_mut() = pt;
         *self.adapter.borrow_mut() = launch.adapter;
         self.adapter_epoch.set(self.adapter_epoch.get() + 1);
@@ -6011,6 +6225,7 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
+    mod continuation_tests;
     mod delegated_tests;
     mod handoff_tests;
     mod switch_tests;
@@ -8728,7 +8943,10 @@ mod tests {
                     .read(|s| s.transcript_messages(&session.inner.thread))
                     .expect("read")
                     .expect("messages")
-                    .len(),
+                    .iter()
+                    // The handoff armed before any message reads back as inherited context.
+                    .filter(|m| m.role != agent_kit::store::INHERITED_ROLE)
+                    .count(),
                 2,
                 "replaying input never stores it twice"
             );
@@ -9159,7 +9377,7 @@ mod tests {
             // Compact by handoff restarts the same agent on a fresh launch.
             session
                 .inner
-                .create_with_handoff(Driver::Agy, None, None, false);
+                .create_with_handoff(Driver::Agy, None, None, false, 0);
             assert_eq!(session.status().mode, Mode::Ask, "compact");
             let argv = session.launch_spec().argv;
             assert!(!argv.iter().any(|a| a == "plan"), "{argv:?}");

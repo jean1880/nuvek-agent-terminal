@@ -89,18 +89,58 @@ pub fn classify(tool: &str) -> ToolClass {
         | "notebook_edit" => ToolClass::Edit,
         "run_command" | "send_command_input" | "call_mcp_tool" | "start_subagent"
         | "invoke_subagent" | "manage_subagents" | "send_message" | "manage_task"
-        | "read_url_content" | "search_web" => ToolClass::Exec,
+        | "define_subagent" | "browser_subagent" | "notebook_execution" | "delete_knowledge"
+        | "generate_image" | "run_workflow" | "manage_inbox" | "read_url_content"
+        | "search_web" => ToolClass::Exec,
         _ => ToolClass::Unknown,
     }
 }
 
-/// Whether a `manage_task` call only asks for the state of a task (`Action` is `status`).
-fn task_status_only(args: &Value) -> bool {
-    ["Action", "action"]
-        .iter()
-        .find_map(|k| args.get(*k))
-        .and_then(Value::as_str)
-        .is_some_and(|a| a.trim().eq_ignore_ascii_case("status"))
+/// An argument name as agy's JSON decoder compares it: without regard to case, where the two
+/// non-ASCII letters that fold onto ASCII ones (long s, Kelvin sign) count too.
+fn folded(key: &str) -> String {
+    key.chars()
+        .map(|c| match c {
+            '\u{17F}' => 's',
+            '\u{212A}' => 'k',
+            c => c.to_ascii_lowercase(),
+        })
+        .collect()
+}
+
+/// Every value in `args` whose name is one of `names` in that sense. agy decodes arguments
+/// without regard to case and lets the last matching name win, so a call may carry several, and
+/// each of them must be judged.
+fn matching_args<'a>(
+    args: &'a Value,
+    names: &'a [&'a str],
+) -> impl Iterator<Item = &'a Value> + 'a {
+    args.as_object().into_iter().flat_map(move |o| {
+        o.iter()
+            .filter(move |(k, _)| {
+                let k = folded(k);
+                names.iter().any(|n| k == folded(n))
+            })
+            .map(|(_, v)| v)
+    })
+}
+
+/// Whether a `manage_task` call only asks for the state of a task: the arguments are an object
+/// with exactly one name that reads as `action`, spelt `Action`, whose value is exactly
+/// `status`, and no name but `TaskId` and `tool_name` besides. Anything else is a command.
+pub(crate) fn task_status_only(args: &Value) -> bool {
+    let Some(object) = args.as_object() else {
+        return false;
+    };
+    let mut actions = object.iter().filter(|(k, _)| folded(k) == "action");
+    let (Some((key, value)), None) = (actions.next(), actions.next()) else {
+        return false;
+    };
+    key == "Action"
+        && value.as_str() == Some("status")
+        && object
+            .keys()
+            .all(|k| matches!(k.as_str(), "Action" | "TaskId" | "tool_name"))
 }
 
 /// The class of one call: [`classify`], except that `manage_task` reading a task's status names
@@ -123,11 +163,18 @@ fn mutates(tool: &str, args: &Value) -> bool {
             | "invoke_subagent"
             | "manage_subagents"
             | "send_message"
+            | "define_subagent"
+            | "browser_subagent"
+            | "notebook_execution"
+            | "delete_knowledge"
+            | "generate_image"
+            | "run_workflow"
+            | "manage_inbox"
     ) || (tool == "manage_task" && !task_status_only(args))
         || classify(tool) == ToolClass::Edit
 }
 
-pub const TARGET_KEYS: [&str; 9] = [
+pub const TARGET_KEYS: [&str; 10] = [
     "TargetFile",
     "target_file",
     "AbsolutePath",
@@ -137,14 +184,14 @@ pub const TARGET_KEYS: [&str; 9] = [
     "Path",
     "path",
     "file",
+    "notebook_path",
 ];
 
-/// Every file an edit tool names, from the argument names agy uses. A payload with several
-/// of them is judged on all of them.
-pub fn edit_targets(args: &Value) -> Vec<&str> {
-    TARGET_KEYS
-        .iter()
-        .filter_map(|k| args.get(*k).and_then(Value::as_str))
+/// Every file an edit tool names, from the argument names agy uses (in any case). A payload with
+/// several of them is judged on all of them; `None` when any is not text (fails closed).
+pub fn edit_targets(args: &Value) -> Option<Vec<&str>> {
+    matching_args(args, &TARGET_KEYS)
+        .map(Value::as_str)
         .collect()
 }
 
@@ -336,16 +383,12 @@ fn searches_recursively(tool: &str) -> bool {
 /// key whose value is not a string (or a list of strings) fails closed.
 pub(crate) fn named_paths(args: &Value) -> Option<Vec<&str>> {
     let mut out = Vec::new();
-    for key in TARGET_KEYS.iter().chain(READ_PATH_KEYS.iter()) {
-        if let Some(v) = args.get(*key) {
-            out.push(v.as_str()?);
-        }
+    for v in matching_args(args, &TARGET_KEYS).chain(matching_args(args, &READ_PATH_KEYS)) {
+        out.push(v.as_str()?);
     }
-    for key in READ_LIST_KEYS {
-        if let Some(v) = args.get(key) {
-            for item in v.as_array()? {
-                out.push(item.as_str()?);
-            }
+    for v in matching_args(args, &READ_LIST_KEYS) {
+        for item in v.as_array()? {
+            out.push(item.as_str()?);
         }
     }
     Some(out)
@@ -449,7 +492,8 @@ pub fn policy_with_home(
             Verdict::Deny("plan mode is read-only")
         }
         (ToolClass::Edit, Mode::AcceptEdits)
-            if auto_allowed(&edit_targets(&query.args), workspaces, home) =>
+            if edit_targets(&query.args)
+                .is_some_and(|targets| auto_allowed(&targets, workspaces, home)) =>
         {
             Verdict::Allow
         }
@@ -1863,6 +1907,251 @@ mod tests {
         );
     }
 
+    /// agy decodes arguments without regard to case and the last matching name wins, so a
+    /// `manage_task` is a status check only when it is exactly one.
+    #[test]
+    fn manage_task_is_a_status_check_only_when_it_is_exactly_one() {
+        use Verdict::{Allow, Ask, Deny};
+        let w = ws();
+        for args in [
+            serde_json::json!({"Action": "status"}),
+            serde_json::json!({"Action": "status", "TaskId": "t1"}),
+            serde_json::json!({"Action": "status", "TaskId": "t1", "tool_name": "manage_task"}),
+        ] {
+            for mode in [Mode::Plan, Mode::Ask, Mode::AcceptEdits] {
+                assert_eq!(policy(mode, &q("manage_task", args.clone()), &w), Allow);
+            }
+        }
+        for args in [
+            serde_json::json!({"Action": "status", "action": "kill"}),
+            serde_json::json!({"action": "kill", "Action": "status"}),
+            serde_json::json!({"Action": "status", "ACTION": "status"}),
+            serde_json::json!({"ACTION": "status"}),
+            serde_json::json!({"action": "status"}),
+            serde_json::json!({"Action": " status "}),
+            serde_json::json!({"Action": "STATUS"}),
+            serde_json::json!({"Action": "Status"}),
+            serde_json::json!({"Action": "status\n"}),
+            serde_json::json!({"Action": ["status"]}),
+            serde_json::json!({"Action": {"Action": "status"}}),
+            serde_json::json!({"Action": 7}),
+            serde_json::json!({"Action": null}),
+            serde_json::json!({"TaskId": "t1"}),
+            serde_json::json!({"Action": "status", "Extra": 1}),
+            serde_json::json!({"Action": "status", "taskid": "t"}),
+            serde_json::json!({"Action": "status", "Nested": {"Action": "kill"}}),
+            serde_json::json!({"Action": "kill"}),
+            serde_json::json!([{"Action": "status"}]),
+            serde_json::json!("status"),
+            Value::Null,
+        ] {
+            assert!(
+                matches!(
+                    policy(Mode::Plan, &q("manage_task", args.clone()), &w),
+                    Deny(_)
+                ),
+                "plan {args}"
+            );
+            assert_eq!(
+                policy(Mode::Ask, &q("manage_task", args.clone()), &w),
+                Ask,
+                "ask {args}"
+            );
+            assert_eq!(
+                classify_call("manage_task", &args),
+                ToolClass::Exec,
+                "{args}"
+            );
+        }
+    }
+
+    /// Tools that run code or reach beyond the workspace are refused in Plan and asked about
+    /// elsewhere.
+    #[test]
+    fn plan_refuses_the_other_agy_tools_that_act() {
+        use Verdict::{Ask, Deny};
+        let w = ws();
+        for tool in [
+            "define_subagent",
+            "browser_subagent",
+            "notebook_execution",
+            "delete_knowledge",
+            "generate_image",
+            "run_workflow",
+            "manage_inbox",
+        ] {
+            let query = q(tool, serde_json::json!({}));
+            assert!(
+                matches!(policy(Mode::Plan, &query, &w), Deny(_)),
+                "plan {tool}"
+            );
+            assert_eq!(policy(Mode::Ask, &query, &w), Ask, "ask {tool}");
+            assert_eq!(policy(Mode::AcceptEdits, &query, &w), Ask, "accept {tool}");
+        }
+    }
+
+    /// Path arguments in any case, text or not, are all judged; a relative path is taken from
+    /// the workspace the query names.
+    #[test]
+    fn file_tools_judge_every_path_name_in_any_case() {
+        use Verdict::{Allow, Ask, Deny};
+        let tmp = tempfile::tempdir().expect("tmp");
+        let repo = std::fs::canonicalize(tmp.path())
+            .expect("canon")
+            .join("repo");
+        std::fs::create_dir_all(repo.join("src")).expect("mk");
+        std::fs::create_dir_all(repo.join(".git")).expect("mk");
+        std::fs::write(repo.join("src/a.rs"), "x").expect("write");
+        std::os::unix::fs::symlink("/etc/hostname", repo.join("link")).expect("link");
+        let home = repo.parent().expect("parent").join("home");
+        std::fs::create_dir_all(home.join(".ssh")).expect("mk");
+        let w = vec![repo.clone()];
+        let at = |rel: &str| repo.join(rel).to_string_lossy().into_owned();
+        let ssh = home
+            .join(".ssh/authorized_keys")
+            .to_string_lossy()
+            .into_owned();
+        let in_repo = |tool: &str, args: Value| ApprovalQuery {
+            cwd: Some(repo.to_string_lossy().into_owned()),
+            ..q(tool, args)
+        };
+        let no_cwd = |tool: &str, args: Value| q(tool, args);
+        let good: Vec<(&str, ApprovalQuery)> = vec![
+            (
+                "inside",
+                in_repo("PLACE", serde_json::json!({"Path": at("src/a.rs")})),
+            ),
+            (
+                "missing",
+                in_repo("PLACE", serde_json::json!({"Path": at("src/new.rs")})),
+            ),
+            (
+                "relative",
+                in_repo("PLACE", serde_json::json!({"Path": "src/a.rs"})),
+            ),
+            (
+                "same twice",
+                in_repo(
+                    "PLACE",
+                    serde_json::json!({"Path": at("src/a.rs"), "PATH": at("src/a.rs")}),
+                ),
+            ),
+        ];
+        let bad: Vec<(&str, ApprovalQuery)> = vec![
+            (
+                "dotdot",
+                in_repo("PLACE", serde_json::json!({"Path": at("src/../src/a.rs")})),
+            ),
+            (
+                "symlink",
+                in_repo("PLACE", serde_json::json!({"Path": at("link")})),
+            ),
+            (
+                "sensitive",
+                in_repo("PLACE", serde_json::json!({"Path": at(".git/config")})),
+            ),
+            (
+                "outside",
+                in_repo("PLACE", serde_json::json!({"Path": ssh.clone()})),
+            ),
+            (
+                "non-string",
+                in_repo("PLACE", serde_json::json!({"Path": 7})),
+            ),
+            (
+                "non-string twin",
+                in_repo(
+                    "PLACE",
+                    serde_json::json!({"Path": at("src/a.rs"), "path": ["x"]}),
+                ),
+            ),
+            (
+                "null twin",
+                in_repo(
+                    "PLACE",
+                    serde_json::json!({"Path": at("src/a.rs"), "PATH": null}),
+                ),
+            ),
+            (
+                "upper twin",
+                in_repo(
+                    "PLACE",
+                    serde_json::json!({"Path": at("src/a.rs"), "PATH": ssh.clone()}),
+                ),
+            ),
+            (
+                "lower twin",
+                in_repo(
+                    "PLACE",
+                    serde_json::json!({"path": ssh.clone(), "Path": at("src/a.rs")}),
+                ),
+            ),
+            (
+                "long s twin",
+                in_repo(
+                    "PLACE",
+                    serde_json::json!({"Path": at("src/a.rs"), "Ab\u{17F}olutePath": ssh.clone()}),
+                ),
+            ),
+            (
+                "relative, no cwd",
+                no_cwd("PLACE", serde_json::json!({"Path": "src/a.rs"})),
+            ),
+            (
+                "relative dotdot",
+                in_repo(
+                    "PLACE",
+                    serde_json::json!({"Path": "../home/.ssh/authorized_keys"}),
+                ),
+            ),
+            ("none", in_repo("PLACE", serde_json::json!({}))),
+        ];
+        for tool in ["edit_file", "read_file"] {
+            let edit = tool == "edit_file";
+            for mode in [Mode::Plan, Mode::Ask, Mode::AcceptEdits] {
+                let check = |query: &ApprovalQuery| {
+                    let query = ApprovalQuery {
+                        tool: tool.into(),
+                        ..query.clone()
+                    };
+                    policy_with_home(mode, &query, &w, Some(&home))
+                };
+                for (name, query) in &good {
+                    let want = match (edit, mode) {
+                        (true, Mode::Plan) => Deny("plan mode is read-only"),
+                        (true, Mode::Ask) => Ask,
+                        // An edit is auto-allowed only on an absolute path; a read resolves one.
+                        (true, _) if *name == "relative" => Ask,
+                        _ => Allow,
+                    };
+                    assert_eq!(check(query), want, "{tool} {mode:?} {name}");
+                }
+                for (name, query) in &bad {
+                    let want = if edit && mode == Mode::Plan {
+                        Deny("plan mode is read-only")
+                    } else {
+                        Ask
+                    };
+                    // A read of nothing in particular is the one call that names no path.
+                    assert_eq!(check(query), want, "{tool} {mode:?} {name}");
+                }
+            }
+        }
+        // A workspace that is the home directory keeps its dotfiles out of reach.
+        let home_ws = vec![home.clone()];
+        let rc = ApprovalQuery {
+            cwd: Some(home.to_string_lossy().into_owned()),
+            ..q(
+                "edit_file",
+                serde_json::json!({"Path": home.join(".bashrc").to_string_lossy()}),
+            )
+        };
+        assert_eq!(
+            policy_with_home(Mode::AcceptEdits, &rc, &home_ws, Some(&home)),
+            Ask
+        );
+    }
+
     #[test]
     fn policy_table_read_containment() {
         use Verdict::{Allow, Ask};
@@ -2060,7 +2349,7 @@ mod tests {
             .expect("view_file step in fixture");
         let info = &step["step_update"]["tool_info"];
         let query = q("view_file", info["parameters"].clone());
-        assert_eq!(edit_targets(&query.args), vec!["/etc/hostname"]);
+        assert_eq!(edit_targets(&query.args), Some(vec!["/etc/hostname"]));
         let tmp = tempfile::tempdir().expect("tmp");
         let w = vec![tmp.path().to_owned()];
         for mode in [Mode::Plan, Mode::Ask, Mode::AcceptEdits] {

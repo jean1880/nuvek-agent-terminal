@@ -196,7 +196,12 @@ fn launch_home(
 /// [`Inner::watch_tool_step`]).
 fn canary_tools(kind: ItemKind) -> Option<&'static [&'static str]> {
     match kind {
-        ItemKind::Command => Some(&["run_command", "send_command_input"]),
+        ItemKind::Command => Some(&[
+            "run_command",
+            "send_command_input",
+            "manage_task",
+            "schedule",
+        ]),
         ItemKind::FileChange => Some(&[
             "replace_file_content",
             "multi_replace_file_content",
@@ -209,6 +214,8 @@ fn canary_tools(kind: ItemKind) -> Option<&'static [&'static str]> {
         ItemKind::Subagent => Some(&[
             "start_subagent",
             "invoke_subagent",
+            "define_subagent",
+            "browser_subagent",
             "manage_subagents",
             "send_message",
         ]),
@@ -2505,9 +2512,10 @@ impl Inner {
     /// tool would run unasked. So each state-changing tool step must be matched by a query the
     /// hook sent us. The query and the step travel on different channels, hence the grace.
     ///
-    /// Scope: command, file edit, MCP, subagent and web steps. Unclassified (`Tool`) steps are not
-    /// watched: agy's internal steps (finish, wait, task bookkeeping) are not known to be hooked,
-    /// and killing a healthy session over one would be worse than missing it.
+    /// Scope: command (task management and scheduling included), file edit, MCP, subagent and web
+    /// steps. Unclassified (`Tool`) steps are not watched: agy's internal steps (finish, wait) are
+    /// not known to be hooked, and killing a healthy session over one would be worse than missing
+    /// it.
     fn watch_tool_step(self: &Rc<Self>, env: &Envelope) {
         match &env.event {
             Event::ItemStarted { kind, .. } => {
@@ -9177,6 +9185,62 @@ mod tests {
             seen,
             |e| matches!(e, Event::Error { message } if message.contains("approval hook is not active")),
         )
+    }
+
+    /// Real agy 1.4 step frames, fed through the adapter: each of these steps runs unasked if
+    /// the hook is not firing, so the canary must trip on every one of them.
+    #[test]
+    fn agy_1_4_steps_with_no_hook_query_trip_the_canary() {
+        for (tool, params) in [
+            ("edit_file", serde_json::json!({"Path": "/w/a.rs"})),
+            (
+                "manage_task",
+                serde_json::json!({"Action": "status", "TaskId": "t1"}),
+            ),
+            (
+                "manage_task",
+                serde_json::json!({"Action": "kill", "TaskId": "t1"}),
+            ),
+            (
+                "schedule",
+                serde_json::json!({"DurationSeconds": 60, "Prompt": "again"}),
+            ),
+            (
+                "send_message",
+                serde_json::json!({"Recipient": "r", "Message": "m"}),
+            ),
+            ("manage_subagents", serde_json::json!({"Action": "list"})),
+            ("define_subagent", serde_json::json!({"Name": "helper"})),
+            ("browser_subagent", serde_json::json!({"Task": "look"})),
+        ] {
+            let step = serde_json::json!({"event": "step_update", "conversation_id": "c1",
+                "step_update": {"conversation_id": "c1", "state": "RUNNING", "step_index": 1,
+                    "step_type": "tool", "tool_name": tool,
+                    "tool_info": {"parameters": params}}})
+            .to_string();
+            in_loop(|ctx| {
+                let tmp = tempfile::tempdir().expect("tmp");
+                let store = Rc::new(Store::open_in_memory().expect("store"));
+                let thread = fresh(&store, "/w");
+                let (sink, seen) = make_sink();
+                let handle = bound_handle(tmp.path());
+                let open = scripted(tmp.path(), &format!("echo '{step}'\nexec sleep 30"));
+                let session = ChatSession::new(
+                    Box::new(AgyAdapter::new("agy")),
+                    open,
+                    store,
+                    thread,
+                    sink,
+                    Some(handle),
+                );
+                session.set_canary_grace(Duration::from_millis(200));
+                assert!(
+                    pump_until(ctx, 15, || hook_missing_error(&seen)),
+                    "the canary let {tool} {params} run unasked"
+                );
+                session.shutdown(false);
+            });
+        }
     }
 
     #[test]

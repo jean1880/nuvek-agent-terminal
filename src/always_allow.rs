@@ -1090,13 +1090,13 @@ impl Action {
     pub fn of(tool: &str, input: &Value) -> Option<Self> {
         let kind = ActionKind::of_tool(tool)?;
         let path = || -> Option<String> {
-            let mut named = crate::approval_server::named_paths(input)?;
-            if let Some(nb) = input.get("notebook_path") {
-                named.push(nb.as_str()?);
-            }
+            let named = crate::approval_server::named_paths(input)?;
             if named.is_empty() {
-                // A Codex patch names its files only in the changes the adapter attaches.
-                return codex_change_path(input);
+                // A Codex patch names its files only in the changes the adapter attaches; no
+                // other tool has such a fallback.
+                return (tool == "file_change")
+                    .then(|| codex_change_path(input))
+                    .flatten();
             }
             let first = *named.first()?;
             (!first.trim().is_empty() && named.iter().all(|p| *p == first))
@@ -5293,6 +5293,23 @@ mod tests {
         ] {
             assert_eq!(Action::of(tool, &edit), None, "{tool}");
         }
+        // Only a Codex patch falls back to its attached changes; an agy edit naming no path (or
+        // a path in an unrecognised shape) describes no action, so it asks.
+        let patch = serde_json::json!({"changes": [{"path": "/w/a.rs"}]});
+        assert_eq!(
+            Action::of("file_change", &patch),
+            Some(Action::Edit {
+                path: "/w/a.rs".into()
+            })
+        );
+        for tool in ["edit_file", "write_to_file", "read_file"] {
+            assert_eq!(Action::of(tool, &patch), None, "{tool}");
+            assert_eq!(Action::of(tool, &serde_json::json!({})), None, "{tool}");
+        }
+        let twin = serde_json::json!({"Path": "/w/a.rs", "PATH": "/home/u/.ssh/authorized_keys"});
+        assert_eq!(Action::of("edit_file", &twin), None);
+        let odd = serde_json::json!({"Path": "/w/a.rs", "path": 7});
+        assert_eq!(Action::of("edit_file", &odd), None);
     }
 
     /// A read that names a second path (a search directory) never rides on a one-path rule.

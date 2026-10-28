@@ -870,7 +870,9 @@ fn thinking_text(id: &str, text: &str) -> Envelope {
 
 fn tool_kind(name: &str) -> ItemKind {
     match name {
-        "run_command" | "send_command_input" => ItemKind::Command,
+        // `manage_task` and `schedule` are watched with the commands: any of them may start or
+        // stop work, and a hooked status call must not hide an unhooked kill.
+        "run_command" | "send_command_input" | "manage_task" | "schedule" => ItemKind::Command,
         "replace_file_content"
         | "multi_replace_file_content"
         | "write_to_file"
@@ -882,9 +884,8 @@ fn tool_kind(name: &str) -> ItemKind {
         }
         "search_web" | "read_url_content" => ItemKind::WebSearch,
         "call_mcp_tool" => ItemKind::McpTool,
-        "start_subagent" | "invoke_subagent" | "manage_subagents" | "send_message" => {
-            ItemKind::Subagent
-        }
+        "start_subagent" | "invoke_subagent" | "define_subagent" | "browser_subagent"
+        | "manage_subagents" | "send_message" => ItemKind::Subagent,
         _ => ItemKind::Tool,
     }
 }

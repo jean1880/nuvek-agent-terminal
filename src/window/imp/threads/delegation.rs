@@ -332,6 +332,7 @@ pub(super) fn switch(
     let serial = slot.switch_serial.clone();
     let chosen = serial.get().wrapping_add(1);
     serial.set(chosen);
+    let armed = session.continue_after_switch_armed();
     glib::MainContext::default().spawn_local(async move {
         let problem = supervisor.agy_root_problem(&profile, driver).await;
         if serial.get() != chosen
@@ -340,6 +341,11 @@ pub(super) fn switch(
                 .await
             || serial.get() != chosen
         {
+            // This switch never reaches the session: a "Continue in" asked for it goes with it,
+            // never one asked for a later pick.
+            if let Some(armed) = armed {
+                session.forget_continue_after_switch(Some(armed));
+            }
             return;
         }
         session.switch(driver, model, effort);

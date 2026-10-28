@@ -494,7 +494,9 @@ struct Inner {
     switch_interrupted: Cell<bool>,
     /// The next switch to this agent continues the thread though no turn runs: "Continue in" after
     /// a usage limit ([`ChatSession::continue_after_switch_to`]). Taken by the next switch.
-    continue_on_switch_to: Cell<Option<Driver>>,
+    continue_on_switch_to: Cell<Option<(Driver, u64)>>,
+    /// Bumped by every "Continue in", which it names.
+    continue_armed: Cell<u64>,
 }
 
 /// The one continuation a busy switch sends its new process, once two things are true, in
@@ -957,6 +959,7 @@ impl ChatSession {
             switch_revision: Cell::new(0),
             switch_interrupted: Cell::new(false),
             continue_on_switch_to: Cell::new(None),
+            continue_armed: Cell::new(0),
         });
         *inner.weak_self.borrow_mut() = Some(Rc::downgrade(&inner));
         inner.attach_approval();
@@ -1014,7 +1017,28 @@ impl ChatSession {
     /// starts a turn with the handoff, as a busy switch does, though no turn runs now. Another
     /// switch, or the user writing first, drops it.
     pub(crate) fn continue_after_switch_to(&self, driver: Driver) {
-        self.inner.continue_on_switch_to.set(Some(driver));
+        let armed = self.inner.continue_armed.get().wrapping_add(1);
+        self.inner.continue_armed.set(armed);
+        self.inner.continue_on_switch_to.set(Some((driver, armed)));
+    }
+
+    /// Which "Continue in" waits for the next switch, if one does: what a switch attempt that
+    /// may never reach the session takes back ([`Self::forget_continue_after_switch`]).
+    pub(crate) fn continue_after_switch_armed(&self) -> Option<u64> {
+        self.inner
+            .continue_on_switch_to
+            .get()
+            .map(|(_, armed)| armed)
+    }
+
+    /// The switch a "Continue in" was asked for will not happen (its question was cancelled,
+    /// its preparation failed): it is dropped. `armed` names the one to drop, so a later one
+    /// asked meanwhile stays; `None` drops whichever waits.
+    pub(crate) fn forget_continue_after_switch(&self, armed: Option<u64>) {
+        let current = self.inner.continue_on_switch_to.get();
+        if armed.is_none() || current.map(|(_, a)| a) == armed {
+            self.inner.continue_on_switch_to.set(None);
+        }
     }
 
     /// The window waits (or no longer waits) for this thread's usage limit to reset: while it
@@ -3647,6 +3671,8 @@ impl Inner {
     }
 
     fn queue_prompt(self: &Rc<Self>, text: &str) {
+        // A message written first is what goes on, not a "Continue in" still waiting.
+        self.continue_on_switch_to.set(None);
         let item = glib::uuid_string_random().to_string();
 
         self.deliver(
@@ -3681,6 +3707,7 @@ impl Inner {
     /// ride on a real prompt. A write the adapter refuses turns the shown message into a queued
     /// one, so it is never lost.
     fn steer_prompt(self: &Rc<Self>, text: &str) {
+        self.continue_on_switch_to.set(None);
         // A switch waiting to read the thread: the message is for its new agent, never a live
         // write into the outgoing one. It queues (and is held if the switch does not happen).
         if self.switch_reading.get() {
@@ -4441,7 +4468,10 @@ impl Inner {
         // A turn a delegation root's rebind stopped for this switch, or "Continue in": the switch
         // continues the task as a busy one does, though no turn runs now.
         let interrupted = self.switch_interrupted.replace(false) || owed;
-        let asked = self.continue_on_switch_to.take() == Some(driver);
+        let asked = self
+            .continue_on_switch_to
+            .take()
+            .is_some_and(|(to, _)| to == driver);
         let (caps, current_driver, mode, status_model, current_effort, running) = {
             let adapter = self.adapter.borrow();
             let state = self.state.borrow();
@@ -4748,6 +4778,8 @@ impl Inner {
         }
         if state == TurnState::Completed && self.prompted.get() {
             self.limit_waiting.set(false);
+            // The agent works again: a "Continue in" asked while it was stopped is moot.
+            self.continue_on_switch_to.set(None);
         }
     }
 

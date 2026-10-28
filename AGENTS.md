@@ -203,7 +203,13 @@ Architectural mandates, standards, and workflows for this codebase.
 - **Closing or losing one worker never leaves its siblings stale**: a `Close` or
   `GenerationExited` bumps the tree's authority epoch to fence what was in flight and revokes
   only that subtree; `commit_revoke` moves every other worker's token from the replaced epoch to
-  the new one. `closing_a_worker_leaves_its_siblings_current` proves it.
+  the new one. Queued instructions and staged launches of siblings survive too: the store fails
+  accepted work and cancels queued sends only inside the event's scope
+  (`RevocationEffect::scope`) and carries the rest to the new epoch, `latch_revoke` drops staged
+  bindings only in that scope, and work resumed after an `await` re-reads its epoch
+  (`settled_epoch_for`), failing only when a revocation covered its own worker. Stop, a mode
+  restriction and shutdown still cancel tree-wide. `closing_a_worker_leaves_its_siblings_current`
+  proves it.
 - **A parent's declared limit on a child is refused, never asked**: `cross_agent_spawn`'s optional
   `capabilities` (`edit`, `exec`, `network`) is all a child may do beyond reading. It only narrows
   the task mode (a plan child can hold `network` only, refused otherwise), a child of a restricted

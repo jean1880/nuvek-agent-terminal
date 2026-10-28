@@ -24,9 +24,41 @@ fn shown_by(
     report.map_or(Shown::Event(seq), Shown::Message)
 }
 
+/// A publication's commit: its event's seq and, for a run's completion, the first part of the
+/// result (the message a wake names; the rest follow it in the mailbox).
 type Receipt = std::sync::mpsc::Receiver<
     agent_kit::store::Result<(i64, Option<agent_core::delegation::MessageId>)>,
 >;
+
+/// The most result bytes one message carries: the send cap, never above the store's bound.
+fn result_cap(sup: &Supervisor) -> usize {
+    (sup.limits.max_message_bytes as usize)
+        .min(agent_kit::store::delegation_typed::MAX_RESULT_BYTES)
+}
+
+/// The most result bytes a publisher keeps while a run goes on: every part's worth.
+fn result_bound(sup: &Supervisor) -> usize {
+    result_cap(sup).saturating_mul(agent_core::delegation::mailbox::MAX_RESULT_PARTS)
+}
+
+/// A run's result split for its parent's mailbox (`mailbox::result_parts`), redacted whole
+/// first, and the text its parent's wake carries: the first part, led by where the others are
+/// when there are several (so cutting the wake to fit never loses that).
+pub(super) fn result_messages(
+    sup: &Supervisor,
+    text: &str,
+    already_cut: usize,
+) -> (Vec<String>, String) {
+    let redacted = agent_core::redact::redact(text);
+    let split =
+        agent_core::delegation::mailbox::result_parts(&redacted, result_cap(sup), already_cut);
+    let first = split.parts.first().cloned().unwrap_or_default();
+    let wake = match split.parts.len() {
+        0 | 1 => first,
+        n => format!("[result in {n} parts; read them with cross_agent_read]\n{first}"),
+    };
+    (split.parts, wake)
+}
 struct PendingPublication {
     scope: Scope,
     envelope: Envelope,
@@ -45,7 +77,10 @@ pub(super) struct Publisher {
     pending: Rc<RefCell<VecDeque<PendingPublication>>>,
     pending_bytes: Rc<Cell<usize>>,
     publishing: Rc<Cell<bool>>,
+    /// The run's result so far, at most [`result_bound`] bytes.
     result: RefCell<String>,
+    /// Result bytes past that bound, cut as they arrived.
+    result_cut: Cell<usize>,
     failed: Rc<Cell<bool>>,
 }
 impl Publisher {
@@ -59,6 +94,7 @@ impl Publisher {
             pending_bytes: Rc::new(Cell::new(0)),
             publishing: Rc::new(Cell::new(false)),
             result: RefCell::new(String::new()),
+            result_cut: Cell::new(0),
             failed: Rc::new(Cell::new(false)),
         }
     }
@@ -82,35 +118,51 @@ impl Publisher {
             .get(&self.worker)
             .is_some_and(|w| w.pending.is_some());
         if !bootstrap {
-            match &env.event {
+            let bound = result_bound(&sup);
+            let mut result = self.result.borrow_mut();
+            let added = match &env.event {
                 Event::ContentDelta {
                     stream: StreamKind::Assistant,
                     text,
-                } => self.result.borrow_mut().push_str(text),
+                } => Some(text.as_str()),
                 Event::ContentSnapshot {
                     stream: StreamKind::Assistant,
                     text,
-                } => *self.result.borrow_mut() = text.clone(),
-                _ => {}
-            }
-            let mut result = self.result.borrow_mut();
-            if result.len() > 16384 {
-                let suffix = "\n[result truncated; inspect the worker transcript]";
-                let end = agent_core::text::truncate_bytes(&result, 16384 - suffix.len()).len();
-                result.truncate(end);
-                result.push_str(suffix);
+                } => {
+                    result.clear();
+                    self.result_cut.set(0);
+                    Some(text.as_str())
+                }
+                _ => None,
+            };
+            if let Some(text) = added {
+                // Kept up to every part's worth; what is past it is counted, for the last
+                // part to say how much was cut.
+                let room = bound.saturating_sub(result.len());
+                let kept = agent_core::text::truncate_bytes(text, room);
+                result.push_str(kept);
+                self.result_cut.set(
+                    self.result_cut
+                        .get()
+                        .saturating_add(text.len() - kept.len()),
+                );
             }
         }
+        let mut wake_text = None;
         let completion = if !bootstrap {
             if let (Event::TurnCompleted { state, usage, .. }, Some(run)) = (&env.event, &scope.run)
             {
+                let text = std::mem::take(&mut *self.result.borrow_mut());
+                let (parts, wake) = result_messages(&sup, &text, self.result_cut.replace(0));
+                wake_text = Some(wake);
                 Some(Completion {
                     run: run.clone(),
                     state: agent_core::delegation::lifecycle::run_state_after(*state),
                     worker_state: agent_core::delegation::lifecycle::worker_state_after(*state),
                     reason: None,
                     usage_json: usage.as_ref().and_then(|u| serde_json::to_string(u).ok()),
-                    result: Some(std::mem::take(&mut *self.result.borrow_mut())),
+                    result: parts,
+                    dispatch_failure: None,
                     event: event.clone(),
                 })
             } else {
@@ -125,8 +177,7 @@ impl Publisher {
             .saturating_add(
                 completion
                     .as_ref()
-                    .and_then(|c| c.result.as_ref())
-                    .map_or(0, String::len),
+                    .map_or(0, |c| c.result.iter().map(String::len).sum()),
             );
         if self.pending.borrow().len() >= HISTORY_EVENTS
             || self.pending_bytes.get().saturating_add(bytes) > HISTORY_BYTES
@@ -142,7 +193,7 @@ impl Publisher {
             return;
         }
         let terminal = completion.is_some();
-        let result = completion.as_ref().and_then(|c| c.result.clone());
+        let result = wake_text;
         let job = move |s: &agent_kit::store::Store| {
             if let Some(mut completion) = completion {
                 let terminal = s
@@ -600,13 +651,19 @@ impl Supervisor {
         }
         self.notify_registry();
     }
-    pub(super) fn complete_run(
+    /// Ends `worker`'s current run as `state` in one transaction: the run's end, the worker's
+    /// state, the terminal event with its links, the dispatch that failed with it (recorded
+    /// after the run's end, so it never ends the run itself) and its parent's report. Only once
+    /// that committed are the parent woken, the worker's memory moved on, its queued work
+    /// drained and, with `end.stop_after`, its session stopped.
+    pub(super) fn complete_run_with(
         self: &std::rc::Rc<Self>,
         worker: &WorkerId,
         state: TurnState,
         usage: Option<String>,
+        end: RunEnd,
     ) {
-        let (run, result) = {
+        let (run, activity) = {
             let mut state = self.state.borrow_mut();
             let Some(w) = state.workers.get_mut(worker) else {
                 return;
@@ -616,6 +673,7 @@ impl Supervisor {
             };
             (run, w.row.last_activity.clone())
         };
+        let result = end.result.or(activity);
         self.state
             .borrow_mut()
             .controls
@@ -633,20 +691,25 @@ impl Supervisor {
                 link.run = Some(run.clone());
             }
         }
+        let (parts, reported) = match &result {
+            Some(text) => result_messages(self, text, 0),
+            None => (Vec::new(), String::new()),
+        };
         let mut completion = Completion {
             run,
             state: agent_core::delegation::lifecycle::run_state_after(state),
             worker_state: agent_core::delegation::lifecycle::worker_state_after(state),
-            reason: None,
+            reason: end.reason,
             usage_json: usage,
-            result,
+            result: parts,
+            dispatch_failure: end.dispatch_failure,
             event,
         };
         let sup = self.clone();
         let worker = worker.clone();
         let stored_worker = worker.clone();
         let completed_run = completion.run.clone();
-        let reported = completion.result.clone();
+        let stop_after = end.stop_after;
         gtk4::glib::spawn_future_local(async move {
             if let Ok(completed) = sup
                 .services
@@ -663,7 +726,7 @@ impl Supervisor {
                 sup.queue_wake(
                     &worker,
                     wake_outcome(state),
-                    reported.as_deref().unwrap_or_default(),
+                    &reported,
                     shown_by(
                         completed.event.seq,
                         completed.notification.map(|(id, _)| id),
@@ -683,6 +746,11 @@ impl Supervisor {
                         );
                     }
                 }
+                if stop_after {
+                    if let Some(session) = sup.child_session(&worker) {
+                        session.shutdown(true);
+                    }
+                }
                 sup.drain_deferred(&worker);
                 sup.notify_registry();
             } else {
@@ -696,4 +764,20 @@ impl Supervisor {
             }
         });
     }
+}
+
+/// How [`Supervisor::complete_run_with`] ends a run beyond its state.
+#[derive(Default)]
+pub(super) struct RunEnd {
+    /// The run's terminal reason.
+    pub reason: Option<String>,
+    /// The parent's report; `None` reports the worker's last activity, if any.
+    pub result: Option<String>,
+    /// The dispatch that failed with the run.
+    pub dispatch_failure: Option<(
+        agent_core::delegation::OperationId,
+        agent_core::delegation::ToolError,
+    )>,
+    /// Stop the worker's session once the end committed: a child that never got its task.
+    pub stop_after: bool,
 }

@@ -469,6 +469,11 @@ impl Supervisor {
                         w.row.state = "waiting".into();
                     } else if w.run.is_some() {
                         w.row.state = "running".into();
+                    } else if let Some(outcome) = w.open_requests.outcome.clone() {
+                        // No run is open: back to how the last run ended.
+                        if w.row.state == "waiting" {
+                            w.row.state = outcome;
+                        }
                     }
                 }
             }
@@ -514,6 +519,8 @@ impl Supervisor {
                         w.row.state = super::supervisor::enum_value(
                             &agent_core::delegation::lifecycle::worker_state_after(*state),
                         );
+                        // What the worker returns to once its last request settles.
+                        w.open_requests.outcome = Some(w.row.state.clone());
                         if w.waiting_on_user() {
                             w.row.state = "waiting".into();
                         }

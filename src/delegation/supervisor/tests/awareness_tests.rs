@@ -183,6 +183,70 @@ fn a_failed_turn_keeps_a_background_request() {
 }
 
 #[test]
+fn a_settled_request_returns_the_worker_to_how_its_run_ended() {
+    in_context(async {
+        let (_dir, sup, root) = harness();
+        for (turn, key, expected) in [
+            (
+                Envelope::turn_completed(TurnState::Failed, Some("boom")),
+                "ended-failed",
+                "failed",
+            ),
+            (
+                Envelope::turn_completed(TurnState::Completed, None),
+                "ended-done",
+                "completed",
+            ),
+        ] {
+            let worker = running_worker(&sup, &root, key).await;
+            feed(&sup, &worker, approval("a"));
+            feed(&sup, &worker, turn);
+            assert_eq!(state_of(&sup, &worker), "waiting");
+            feed(&sup, &worker, resolved("a"));
+            assert_eq!(state_of(&sup, &worker), expected);
+        }
+        stop(&sup).await;
+    });
+}
+
+#[test]
+fn an_earlier_runs_scope_reaches_the_worker_only_while_its_request_is_open() {
+    in_context(async {
+        let (_dir, sup, root) = harness();
+        let worker = running_worker(&sup, &root, "answer-routing").await;
+        let run_a = sup.scope(&worker).expect("scope");
+        sup.on_child_envelope(
+            &worker,
+            run_a.clone(),
+            approval("a"),
+            (1, None),
+            false,
+            None,
+        );
+        {
+            let mut state = sup.state.borrow_mut();
+            let w = state.workers.get_mut(&worker).unwrap();
+            w.last_run = w.run.take();
+            w.run = Some(agent_core::delegation::RunId::parse("r_awareRun2").unwrap());
+        }
+        assert!(sup.scope_is_current(&run_a), "open request: answerable");
+        let mut old_generation = run_a.clone();
+        old_generation.generation = ProcessGeneration(old_generation.generation.0 + 1);
+        assert!(!sup.scope_is_current(&old_generation));
+        sup.on_child_envelope(
+            &worker,
+            run_a.clone(),
+            resolved("a"),
+            (2, None),
+            false,
+            None,
+        );
+        assert!(!sup.scope_is_current(&run_a), "settled request: refused");
+        stop(&sup).await;
+    });
+}
+
+#[test]
 fn a_resolution_from_an_earlier_run_still_settles_its_request() {
     in_context(async {
         let (_dir, sup, root) = harness();

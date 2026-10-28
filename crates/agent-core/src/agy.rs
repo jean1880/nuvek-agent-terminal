@@ -874,12 +874,17 @@ fn tool_kind(name: &str) -> ItemKind {
         "replace_file_content"
         | "multi_replace_file_content"
         | "write_to_file"
+        | "edit_file"
         | "sed_file"
         | "notebook_edit" => ItemKind::FileChange,
-        "view_file" | "list_dir" | "grep_search" | "find_by_name" => ItemKind::FileRead,
+        "view_file" | "read_file" | "list_dir" | "grep_search" | "find_by_name" => {
+            ItemKind::FileRead
+        }
         "search_web" | "read_url_content" => ItemKind::WebSearch,
         "call_mcp_tool" => ItemKind::McpTool,
-        "start_subagent" | "invoke_subagent" => ItemKind::Subagent,
+        "start_subagent" | "invoke_subagent" | "manage_subagents" | "send_message" => {
+            ItemKind::Subagent
+        }
         _ => ItemKind::Tool,
     }
 }
@@ -894,6 +899,7 @@ fn tool_title(name: &str, params: Option<&Value>) -> String {
         "SearchPath",
         "Query",
         "Url",
+        "Path",
     ];
     params
         .and_then(|p| {
@@ -2349,10 +2355,40 @@ mod tests {
             ("call_mcp_tool", ItemKind::McpTool),
             ("start_subagent", ItemKind::Subagent),
             ("invoke_subagent", ItemKind::Subagent),
+            ("manage_subagents", ItemKind::Subagent),
+            ("send_message", ItemKind::Subagent),
             ("something_new", ItemKind::Tool),
         ] {
             assert_eq!(tool_kind(name), kind, "{name}");
         }
+    }
+
+    #[test]
+    fn the_1_4_file_tools_are_file_cards_titled_by_their_path() {
+        for (name, kind) in [
+            ("read_file", ItemKind::FileRead),
+            ("edit_file", ItemKind::FileChange),
+            ("view_file", ItemKind::FileRead),
+            ("write_to_file", ItemKind::FileChange),
+        ] {
+            assert_eq!(tool_kind(name), kind, "{name}");
+        }
+        let params = json!({"Path": "/w/src/lib.rs", "StartLine": 1});
+        assert_eq!(tool_title("read_file", Some(&params)), "/w/src/lib.rs");
+        assert_eq!(tool_title("read_file", None), "read_file");
+        assert_eq!(
+            crate::tool_title::classify(ItemKind::FileRead, "/w/src/lib.rs", Some(&params)).text(),
+            "Read /w/src/lib.rs"
+        );
+        assert_eq!(
+            crate::tool_title::classify(
+                ItemKind::FileChange,
+                "/w/src/lib.rs",
+                Some(&json!({"Path": "/w/src/lib.rs"}))
+            )
+            .text(),
+            "Edit /w/src/lib.rs"
+        );
     }
 
     #[test]

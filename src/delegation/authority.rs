@@ -15,7 +15,8 @@ use serde_json::Value;
 use super::seam::{ApprovalGate, AuthorityParams, Effect, GateVerdict, LiveAuthority};
 use crate::always_allow::Action;
 use crate::approval_server::{
-    canonical_target, classify, edit_targets, path_auto_matchable, read_auto_matchable, ToolClass,
+    canonical_target, classify, classify_call, edit_targets, path_auto_matchable,
+    read_auto_matchable, ToolClass,
 };
 
 /// Argument names agy's `call_mcp_tool` names its server by (as `always_allow::Action::of`).
@@ -64,12 +65,16 @@ pub(crate) fn effect(driver: Driver, tool: &str, input: &Value) -> Effect {
             "run_command" | "send_command_input" => Effect::Exec,
             "read_url_content" | "search_web" => Effect::Network,
             "start_subagent" | "invoke_subagent" | "define_subagent" | "manage_subagents"
-            | "browser_subagent" => Effect::Delegate,
+            | "send_message" | "browser_subagent" => Effect::Delegate,
             "call_mcp_tool" => agy_mcp(input),
+            "manage_task" => match classify_call(tool, input) {
+                ToolClass::Status => Effect::Read,
+                _ => Effect::Exec,
+            },
             t => match classify(t) {
                 ToolClass::ReadOnly => Effect::Read,
                 ToolClass::Edit => Effect::Edit,
-                ToolClass::Exec | ToolClass::Unknown => Effect::Unknown,
+                ToolClass::Status | ToolClass::Exec | ToolClass::Unknown => Effect::Unknown,
             },
         },
     }
@@ -222,8 +227,8 @@ impl ChildAuthority {
     }
 }
 
-impl ApprovalGate for ChildAuthority {
-    fn judge(&self, tool: &str, input: &Value, cwd: Option<&str>) -> GateVerdict {
+impl ChildAuthority {
+    fn decide(&self, tool: &str, input: &Value, cwd: Option<&str>) -> GateVerdict {
         if let Err(reason) = self.holds(&self.live()) {
             return GateVerdict::Deny { reason };
         }
@@ -287,6 +292,25 @@ impl ApprovalGate for ChildAuthority {
             Effect::Edit => self.judge_edit(tool, input, cwd),
             _ => GateVerdict::Defer,
         }
+    }
+}
+
+impl ApprovalGate for ChildAuthority {
+    fn judge(&self, tool: &str, input: &Value, cwd: Option<&str>) -> GateVerdict {
+        let verdict = self.decide(tool, input, cwd);
+        // The tool name and the reason only: the input may carry file contents or commands.
+        match &verdict {
+            GateVerdict::Deny { reason } => tracing::info!(
+                driver = ?self.params.driver, tool, reason = reason.as_str(),
+                "delegated agent's tool call refused"
+            ),
+            GateVerdict::AskOnly { reason } => tracing::info!(
+                driver = ?self.params.driver, tool, reason = reason.as_str(),
+                "delegated agent's tool call put to the user"
+            ),
+            _ => {}
+        }
+        verdict
     }
 
     fn rule_may_apply(&self, action: &Action, cwd: Option<&str>) -> bool {
@@ -555,6 +579,51 @@ mod tests {
                 (Effect::Unknown, "Mystery", json!({})),
             ],
         }
+    }
+
+    #[test]
+    fn agy_1_4_tools_in_the_effect_table_and_the_child_gate() {
+        let f = Fixture::new();
+        let file = f.inside();
+        let read = json!({"Path": file, "StartLine": 1});
+        let edit = json!({"Path": file});
+        let message = json!({"Recipient": "r", "Message": "m"});
+        let subagents = json!({"Action": "list"});
+        let status = json!({"Action": "status", "TaskId": "t"});
+        let kill = json!({"Action": "kill", "TaskId": "t"});
+        let schedule = json!({"DurationSeconds": 60, "Prompt": "p"});
+        for (tool, input, want) in [
+            ("read_file", &read, Effect::Read),
+            ("edit_file", &edit, Effect::Edit),
+            ("send_message", &message, Effect::Delegate),
+            ("manage_subagents", &subagents, Effect::Delegate),
+            ("manage_task", &status, Effect::Read),
+            ("manage_task", &kill, Effect::Exec),
+            ("schedule", &schedule, Effect::Unknown),
+        ] {
+            assert_eq!(effect(Driver::Agy, tool, input), want, "{tool}");
+        }
+        let plan = f.gate(Driver::Agy, TaskMode::Plan);
+        assert_eq!(plan.judge("read_file", &read, None), GateVerdict::Defer);
+        assert_eq!(plan.judge("manage_task", &status, None), GateVerdict::Defer);
+        for (tool, input) in [
+            ("edit_file", &edit),
+            ("send_message", &message),
+            ("manage_subagents", &subagents),
+            ("manage_task", &kill),
+            ("schedule", &schedule),
+        ] {
+            assert!(is_deny(&plan.judge(tool, input, None)), "plan {tool}");
+        }
+        let edits = f.gate(Driver::Agy, TaskMode::AcceptEdits);
+        assert_eq!(edits.judge("read_file", &read, None), GateVerdict::Defer);
+        assert_eq!(edits.judge("edit_file", &edit, None), GateVerdict::Defer);
+        assert_eq!(edits.judge("manage_task", &kill, None), GateVerdict::Defer);
+        assert!(is_ask_only(&edits.judge("schedule", &schedule, None)));
+        assert!(is_deny(&edits.judge("send_message", &message, None)));
+        assert!(is_deny(&edits.judge("manage_subagents", &subagents, None)));
+        let outside = json!({"Path": f.outside()});
+        assert!(is_ask_only(&edits.judge("edit_file", &outside, None)));
     }
 
     fn is_deny(v: &GateVerdict) -> bool {

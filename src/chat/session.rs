@@ -201,11 +201,17 @@ fn canary_tools(kind: ItemKind) -> Option<&'static [&'static str]> {
             "replace_file_content",
             "multi_replace_file_content",
             "write_to_file",
+            "edit_file",
             "sed_file",
             "notebook_edit",
         ]),
         ItemKind::McpTool => Some(&["call_mcp_tool"]),
-        ItemKind::Subagent => Some(&["start_subagent", "invoke_subagent"]),
+        ItemKind::Subagent => Some(&[
+            "start_subagent",
+            "invoke_subagent",
+            "manage_subagents",
+            "send_message",
+        ]),
         ItemKind::WebSearch => Some(&["search_web", "read_url_content"]),
         ItemKind::FileRead
         | ItemKind::Tool
@@ -5999,6 +6005,24 @@ mod tests {
 
     const FIXTURE: &str = include_str!("../../crates/agent-core/tests/fixtures/agy-edit.ndjson");
     const CONVERSATION: &str = "3af90996-e4fe-44be-8d6c-ca20da039f6f";
+
+    #[test]
+    fn the_1_4_tools_are_watched() {
+        let edits = canary_tools(ItemKind::FileChange).expect("edits are watched");
+        for tool in ["write_to_file", "edit_file"] {
+            assert!(edits.contains(&tool), "{tool}");
+        }
+        let subagents = canary_tools(ItemKind::Subagent).expect("subagents are watched");
+        for tool in [
+            "start_subagent",
+            "invoke_subagent",
+            "manage_subagents",
+            "send_message",
+        ] {
+            assert!(subagents.contains(&tool), "{tool}");
+        }
+        assert!(canary_tools(ItemKind::FileRead).is_none());
+    }
 
     pub(super) type Seen = Rc<RefCell<Vec<Envelope>>>;
 

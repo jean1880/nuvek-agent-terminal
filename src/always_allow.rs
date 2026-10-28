@@ -1021,7 +1021,7 @@ impl ActionKind {
             t => match classify(t) {
                 ToolClass::Edit => Some(Self::Edit),
                 ToolClass::ReadOnly => Some(Self::Read),
-                _ => None,
+                ToolClass::Status | ToolClass::Exec | ToolClass::Unknown => None,
             },
         }
     }
@@ -5265,6 +5265,33 @@ mod tests {
             assert!(offerable(&edit(&p), &c), "{p}");
             let rule = Rule::from_action(&edit(&p), &c).expect(&p);
             assert!(!rule.warnings(Scope::Always, Some(&c)).is_empty(), "{p}");
+        }
+    }
+
+    /// agy 1.4 names its file tools `read_file` and `edit_file`, with the path in `Path`.
+    #[test]
+    fn agy_1_4_file_tools_make_path_actions() {
+        let read = serde_json::json!({"Path": "/w/a.rs", "StartLine": 1});
+        assert_eq!(
+            Action::of("read_file", &read),
+            Some(Action::Read {
+                path: "/w/a.rs".into()
+            })
+        );
+        let edit = serde_json::json!({"Path": "/w/a.rs"});
+        assert_eq!(
+            Action::of("edit_file", &edit),
+            Some(Action::Edit {
+                path: "/w/a.rs".into()
+            })
+        );
+        for tool in [
+            "send_message",
+            "manage_subagents",
+            "manage_task",
+            "schedule",
+        ] {
+            assert_eq!(Action::of(tool, &edit), None, "{tool}");
         }
     }
 

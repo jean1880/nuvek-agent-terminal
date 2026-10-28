@@ -67,27 +67,53 @@ pub enum ToolClass {
     Edit,
     /// Commands, network, MCP, subagents: always ask (or deny in plan mode).
     Exec,
+    /// Reads the state of agy's own background work and names no path: allowed in every mode.
+    Status,
     /// Not in the table: always ask.
     Unknown,
 }
 
+/// The class of a tool by name alone. A tool whose class depends on its arguments
+/// (`manage_task`) takes its most restrictive class here; [`classify_call`] reads the arguments.
 pub fn classify(tool: &str) -> ToolClass {
     match tool {
-        "view_file" | "list_dir" | "grep_search" | "find_by_name" | "codebase_search"
-        | "view_code_item" | "read_resource" | "list_resources" => ToolClass::ReadOnly,
+        "view_file" | "read_file" | "list_dir" | "grep_search" | "find_by_name"
+        | "codebase_search" | "view_code_item" | "read_resource" | "list_resources" => {
+            ToolClass::ReadOnly
+        }
         "replace_file_content"
         | "multi_replace_file_content"
         | "write_to_file"
+        | "edit_file"
         | "sed_file"
         | "notebook_edit" => ToolClass::Edit,
         "run_command" | "send_command_input" | "call_mcp_tool" | "start_subagent"
-        | "invoke_subagent" | "read_url_content" | "search_web" => ToolClass::Exec,
+        | "invoke_subagent" | "manage_subagents" | "send_message" | "manage_task"
+        | "read_url_content" | "search_web" => ToolClass::Exec,
         _ => ToolClass::Unknown,
     }
 }
 
+/// Whether a `manage_task` call only asks for the state of a task (`Action` is `status`).
+fn task_status_only(args: &Value) -> bool {
+    ["Action", "action"]
+        .iter()
+        .find_map(|k| args.get(*k))
+        .and_then(Value::as_str)
+        .is_some_and(|a| a.trim().eq_ignore_ascii_case("status"))
+}
+
+/// The class of one call: [`classify`], except that `manage_task` reading a task's status names
+/// no path and changes nothing.
+pub fn classify_call(tool: &str, args: &Value) -> ToolClass {
+    if tool == "manage_task" && task_status_only(args) {
+        return ToolClass::Status;
+    }
+    classify(tool)
+}
+
 /// Plan mode refuses these outright. Network reads are not mutations, so they are asked about.
-fn mutates(tool: &str) -> bool {
+fn mutates(tool: &str, args: &Value) -> bool {
     matches!(
         tool,
         "run_command"
@@ -95,7 +121,10 @@ fn mutates(tool: &str) -> bool {
             | "call_mcp_tool"
             | "start_subagent"
             | "invoke_subagent"
-    ) || classify(tool) == ToolClass::Edit
+            | "manage_subagents"
+            | "send_message"
+    ) || (tool == "manage_task" && !task_status_only(args))
+        || classify(tool) == ToolClass::Edit
 }
 
 pub const TARGET_KEYS: [&str; 9] = [
@@ -406,16 +435,19 @@ pub fn policy_with_home(
     workspaces: &[PathBuf],
     home: Option<&Path>,
 ) -> Verdict {
-    let class = classify(&query.tool);
+    let class = classify_call(&query.tool, &query.args);
     match (class, mode) {
         // Dangerous permissive mode: the user agreed to approve everything, sensitive targets
         // included. Session-only (never a process's starting mode).
         (_, Mode::Bypass) => Verdict::Allow,
+        (ToolClass::Status, _) => Verdict::Allow,
         (ToolClass::ReadOnly, _) if read_allowed(query, workspaces, home) => Verdict::Allow,
         // Reads outside the workspace, of sensitive targets or through a symlink ask in every
         // mode, Plan included: plan mode refuses mutation, not disclosure.
         (ToolClass::ReadOnly, _) => Verdict::Ask,
-        (_, Mode::Plan) if mutates(&query.tool) => Verdict::Deny("plan mode is read-only"),
+        (_, Mode::Plan) if mutates(&query.tool, &query.args) => {
+            Verdict::Deny("plan mode is read-only")
+        }
         (ToolClass::Edit, Mode::AcceptEdits)
             if auto_allowed(&edit_targets(&query.args), workspaces, home) =>
         {
@@ -1756,6 +1788,79 @@ mod tests {
             assert_eq!(policy(mode, &q("brand_new_tool", Value::Null), &w), Ask);
             assert_eq!(policy(mode, &q("", Value::Null), &w), Ask);
         }
+    }
+
+    /// The call shapes agy 1.4 sends: `read_file`, `edit_file`, `send_message`,
+    /// `manage_subagents`, `manage_task` and `schedule`.
+    #[test]
+    fn policy_table_agy_1_4_tools() {
+        use Verdict::{Allow, Ask, Deny};
+        let tmp = tempfile::tempdir().expect("tmp");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).expect("mk");
+        std::fs::write(repo.join("src/a.rs"), "x").expect("write");
+        let w = vec![repo.clone()];
+        let file = repo.join("src/a.rs").to_string_lossy().into_owned();
+        let outside = "/etc/hostname";
+        let call = |tool: &str, args: Value| q(tool, args);
+        let read = |p: &str| call("read_file", serde_json::json!({"Path": p, "StartLine": 1}));
+        let edit_file = |p: &str| call("edit_file", serde_json::json!({"Path": p}));
+        let send = call(
+            "send_message",
+            serde_json::json!({"Recipient": "helper", "Message": "hi"}),
+        );
+        let subagents = call("manage_subagents", serde_json::json!({"Action": "list"}));
+        let status = call(
+            "manage_task",
+            serde_json::json!({"Action": "status", "TaskId": "t1"}),
+        );
+        let kill = call(
+            "manage_task",
+            serde_json::json!({"Action": "kill", "TaskId": "t1"}),
+        );
+        let no_action = call("manage_task", serde_json::json!({"TaskId": "t1"}));
+        let schedule = call(
+            "schedule",
+            serde_json::json!({"DurationSeconds": 60, "Prompt": "again"}),
+        );
+        for mode in [Mode::Plan, Mode::Ask, Mode::AcceptEdits] {
+            assert_eq!(policy(mode, &read(&file), &w), Allow, "{mode:?} read");
+            assert_eq!(policy(mode, &read(outside), &w), Ask, "{mode:?} read out");
+            assert_eq!(policy(mode, &status, &w), Allow, "{mode:?} status");
+            assert_eq!(policy(mode, &schedule, &w), Ask, "{mode:?} schedule");
+        }
+        for query in [&send, &subagents, &kill, &no_action] {
+            assert!(
+                matches!(policy(Mode::Plan, query, &w), Deny(_)),
+                "plan {}",
+                query.tool
+            );
+            assert_eq!(policy(Mode::Ask, query, &w), Ask, "ask {}", query.tool);
+            assert_eq!(
+                policy(Mode::AcceptEdits, query, &w),
+                Ask,
+                "accept {}",
+                query.tool
+            );
+            assert_eq!(policy(Mode::Bypass, query, &w), Allow, "bypass");
+        }
+        assert!(matches!(policy(Mode::Plan, &edit_file(&file), &w), Deny(_)));
+        assert_eq!(policy(Mode::Ask, &edit_file(&file), &w), Ask);
+        assert_eq!(policy(Mode::AcceptEdits, &edit_file(&file), &w), Allow);
+        assert_eq!(policy(Mode::AcceptEdits, &edit_file(outside), &w), Ask);
+        // The status check is for `status` alone.
+        assert_eq!(classify("manage_task"), ToolClass::Exec);
+        assert_eq!(
+            classify_call("manage_task", &serde_json::json!({"Action": "status"})),
+            ToolClass::Status
+        );
+        assert_eq!(
+            classify_call(
+                "manage_task",
+                &serde_json::json!({"Action": "status; kill"})
+            ),
+            ToolClass::Exec
+        );
     }
 
     #[test]

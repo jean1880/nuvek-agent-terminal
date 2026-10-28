@@ -944,6 +944,7 @@ pub(crate) mod tests {
             requested_model: None,
             requested_effort: None,
             reported_model: None,
+            waiting_on_user: false,
         }
     }
 

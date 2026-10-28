@@ -448,31 +448,40 @@ impl Supervisor {
                 return;
             };
             let before = w.row.state.clone();
-            if w.row.state != "closed"
-                && w.generation == scope.generation
-                && w.run.as_ref().or(w.last_run.as_ref()) == scope.run.as_ref()
-            {
+            let current = w.row.state != "closed" && w.generation == scope.generation;
+            // Requests belong to a process generation, not to a run: a resolution captured
+            // under an earlier run still settles its request once a later run is current.
+            if current {
                 w.open_requests.apply(scope.generation, &env);
+                if matches!(
+                    env.event,
+                    Event::ApprovalRequested { .. }
+                        | Event::QuestionRequested { .. }
+                        | Event::FormRequested { .. }
+                        | Event::ApprovalResolved { .. }
+                        | Event::ApprovalExpired
+                        | Event::QuestionResolved { .. }
+                        | Event::FormResolved { .. }
+                ) {
+                    // Waiting while anything is still put to the user; back to running only
+                    // once the last request is settled and a run is open.
+                    if w.waiting_on_user() {
+                        w.row.state = "waiting".into();
+                    } else if w.run.is_some() {
+                        w.row.state = "running".into();
+                    }
+                }
+            }
+            if current && w.run.as_ref().or(w.last_run.as_ref()) == scope.run.as_ref() {
                 match &env.event {
                     Event::TurnStarted { .. }
                         if !bootstrap && !w.readback.failed && w.run == scope.run =>
                     {
                         w.row.state = "running".into();
                         w.opened_run = scope.run.clone();
-                    }
-                    // Waiting while anything is still put to the user; back to running only
-                    // once the last request is settled and a run is open.
-                    Event::ApprovalRequested { .. }
-                    | Event::QuestionRequested { .. }
-                    | Event::FormRequested { .. }
-                    | Event::ApprovalResolved { .. }
-                    | Event::ApprovalExpired
-                    | Event::QuestionResolved { .. }
-                    | Event::FormResolved { .. } => {
+                        // A background request still open keeps the worker waiting.
                         if w.waiting_on_user() {
                             w.row.state = "waiting".into();
-                        } else if w.run.is_some() {
-                            w.row.state = "running".into();
                         }
                     }
                     Event::TurnCompleted { state, usage, .. }
@@ -505,6 +514,9 @@ impl Supervisor {
                         w.row.state = super::supervisor::enum_value(
                             &agent_core::delegation::lifecycle::worker_state_after(*state),
                         );
+                        if w.waiting_on_user() {
+                            w.row.state = "waiting".into();
+                        }
                     }
                     Event::ContentSnapshot {
                         stream: StreamKind::Assistant,

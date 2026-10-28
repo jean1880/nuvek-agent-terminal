@@ -173,6 +173,7 @@ impl Worker {
             requested_model: None,
             requested_effort: None,
             reported_model: None,
+            waiting_on_user: self.summary.waiting_on_user,
         }
     }
 }
@@ -243,11 +244,10 @@ impl Workers {
                     if Some(&history.scope) != live.as_ref()
                         || matches!(
                             summary.state,
-                            WorkerState::Closed
-                                | WorkerState::Stopped
-                                | WorkerState::Unknown
-                                | WorkerState::Failed
+                            WorkerState::Closed | WorkerState::Stopped | WorkerState::Unknown
                         )
+                        // A failed turn leaves a background worker's request answerable.
+                        || (summary.state == WorkerState::Failed && !summary.waiting_on_user)
                     {
                         history.model.settle_stale();
                         history.model.mark_replayed();
@@ -354,13 +354,11 @@ impl Workers {
             });
         worker.histories[at].apply(&scoped.envelope, driver);
         if replayed
-            && matches!(
+            && (matches!(
                 worker.summary.state,
-                WorkerState::Unknown
-                    | WorkerState::Stopped
-                    | WorkerState::Closed
-                    | WorkerState::Failed
-            )
+                WorkerState::Unknown | WorkerState::Stopped | WorkerState::Closed
+            ) || (worker.summary.state == WorkerState::Failed
+                && !worker.summary.waiting_on_user))
         {
             worker.histories[at].model.settle_stale();
             worker.histories[at].model.mark_replayed();
@@ -1764,6 +1762,23 @@ pub(crate) mod tests {
             matches!(backend.actions.borrow().last(), Some(WorkerAction::Approve { request, decision: Decision::Allow, .. }) if request == "later")
         );
         assert_eq!(backend.actions.borrow().len(), 2);
+    }
+
+    #[test]
+    fn a_worker_with_an_open_request_and_no_run_is_active_and_waiting() {
+        let mut asking = summary("w_workerAA", "r_firstRun");
+        asking.state = WorkerState::Waiting;
+        asking.run_id = None;
+        asking.waiting_on_user = true;
+        let mut workers = Workers::default();
+        workers.registry(&[asking]);
+        let agents = workers.summaries();
+        assert!(agents[0].running() && agents[0].active() && !agents[0].idle());
+        assert_eq!(agents[0].state_label(), "waiting");
+        assert_eq!(
+            super::super::subagents::count_text(&agents),
+            "1 active · 0 finished"
+        );
     }
 
     #[test]

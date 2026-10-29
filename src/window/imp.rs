@@ -1063,6 +1063,20 @@ async fn resolve_active_profile(
     chosen
 }
 
+/// A terminal tab whose model provider refused it: nothing is spawned, and the tab (kept, with
+/// the reason written into it) and a dialog say why.
+fn refuse_terminal(
+    parent: &super::AgentTerminalWindow,
+    stack: &Stack,
+    terminal: &Terminal,
+    why: &str,
+) {
+    warn!("a terminal tab's model provider refused its start");
+    stack.set_visible_child_name("terminal");
+    terminal.feed(format!("{why}\r\n").as_bytes());
+    present_message(parent, "Cannot Start", why);
+}
+
 /// Presents a one-button informational dialog anchored to `parent`.
 fn present_message(parent: &super::AgentTerminalWindow, heading: &str, body: &str) {
     present_message_over(parent, heading, body);
@@ -3978,7 +3992,17 @@ impl AgentTerminalWindow {
     ) {
         let obj = self.obj();
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let command = get_startup_command(profile, launch);
+        // A profile on a model server runs on it here too, or not at all: never on the
+        // vendor's models.
+        let provider = profile.and_then(crate::utils::terminal_provider);
+        let on_provider = match profile.map(crate::utils::with_provider_args).transpose() {
+            Ok(p) => p,
+            Err(why) => {
+                refuse_terminal(&obj, stack, terminal, &why);
+                return;
+            }
+        };
+        let command = get_startup_command(on_provider.as_ref(), launch);
         let env_file = profile.and_then(|p| p.env_file.clone());
         info!(
             "Spawning terminal with shell: {}, command: {:?}",
@@ -4076,15 +4100,31 @@ impl AgentTerminalWindow {
                         env_strs.push(format!("{key}={value}"));
                     }
                 }
+                if let Some((provider, driver)) = &provider {
+                    if let Err(why) =
+                        crate::utils::apply_provider_env(provider, *driver, &mut env_strs)
+                    {
+                        refuse_terminal(&obj, &stack, &terminal, &why);
+                        return;
+                    }
+                }
 
                 let env_ptrs: Vec<&str> = env_strs.iter().map(String::as_str).collect();
+                // VTE adds the app's own environment under the one given unless told not to, so a
+                // provider tab, whose vendor variables were removed above, must say the block is
+                // complete: otherwise a removed CLAUDE_CODE_USE_BEDROCK would still be inherited.
+                let spawn_flags = if provider.is_some() {
+                    glib::SpawnFlags::from_bits_retain(vte4::ffi::VTE_SPAWN_NO_PARENT_ENVV as u32)
+                } else {
+                    glib::SpawnFlags::DEFAULT
+                };
 
                 terminal.spawn_async(
                     PtyFlags::DEFAULT,
                     Some(&work_dir),
                     &[&shell, &command[0], &command[1]],
                     &env_ptrs,
-                    glib::SpawnFlags::DEFAULT,
+                    spawn_flags,
                     || {},
                     -1,
                     None::<&gtk4::gio::Cancellable>,

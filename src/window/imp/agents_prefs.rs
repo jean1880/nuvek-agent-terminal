@@ -1,5 +1,5 @@
-//! Preferences → Agents: each chat agent's command, arguments, env file, defaults and on/off,
-//! the default agent for new threads, and agy's approval-hook status.
+//! Preferences → Agents: each chat agent's command, arguments, env file, model provider,
+//! defaults and on/off, the default agent for new threads, and agy's approval-hook status.
 //!
 //! Every row applies on change and persists through the shared config (atomic writes). Rows
 //! that can hold an invalid value say so inline and do not persist it. An agent's settings live
@@ -9,6 +9,7 @@
 use std::rc::Rc;
 
 use agent_core::adapter::{Driver, Mode};
+use agent_core::provider::{ModelProvider, ProviderKind};
 
 use super::*;
 use crate::availability::{AgentAvailability, Availability};
@@ -71,6 +72,51 @@ const ARGS_HELP: &str =
 const ENV_FILE_HELP: &str =
     "A KEY=value file whose variables this agent's threads, probes and usage checks run with \
      (an API key or account, say). Blank: none";
+
+const PROVIDER_HELP: &str =
+    "Run this agent on a local or self-hosted model server instead of its vendor's. \
+     Then pick a Default Model from the server's list";
+const PROVIDER_URL_HELP: &str =
+    "The model server's address, e.g. http://localhost:11434 (Ollama), http://localhost:1234 \
+     (LM Studio) or http://localhost:4000 (LiteLLM). Blank: the server's default on this machine";
+const PROVIDER_KEY_HELP: &str =
+    "The name of the environment variable (from the environment file or your session) holding \
+     the server's API key, e.g. LITELLM_API_KEY. Never the key itself. Blank: no key";
+
+/// The Account row's text for an agent on `provider`: its threads use no vendor account.
+fn provider_account_text(provider: &ModelProvider) -> String {
+    match provider.base() {
+        Ok(base) => format!(
+            "Threads run on {} at {base}; no account is used",
+            provider.kind.label()
+        ),
+        Err(why) => format!("{} cannot be used: {why}", provider.kind.label()),
+    }
+}
+
+/// What the Server URL row does with `text` (blank is the server's default), against `saved`.
+fn provider_url_edit(text: &str, saved: Option<&str>, commit: bool) -> FieldChange<Option<String>> {
+    let text = text.trim();
+    let parsed = if text.is_empty() {
+        Ok(None)
+    } else {
+        agent_core::provider::normalize_base_url(text).map(Some)
+    };
+    crate::config::field_change(parsed, &saved.map(str::to_owned), commit)
+}
+
+/// What the API Key Variable row does with `text` (blank is no key), against `saved`.
+fn provider_key_edit(text: &str, saved: Option<&str>, commit: bool) -> FieldChange<Option<String>> {
+    let text = text.trim();
+    let parsed = if text.is_empty() {
+        Ok(None)
+    } else if agent_core::provider::valid_env_name(text) {
+        Ok(Some(text.to_owned()))
+    } else {
+        Err("Enter a variable name such as LITELLM_API_KEY, not the key itself".to_owned())
+    };
+    crate::config::field_change(parsed, &saved.map(str::to_owned), commit)
+}
 
 /// What the approvals group is about, on Settings → Agents and in setup.
 pub(super) const APPROVAL_GROUP_HELP: &str =
@@ -1758,6 +1804,19 @@ impl AgentTerminalWindow {
                 // Only an agent in use has an account worth showing: one switched off or not
                 // installed never says "signed out".
                 account.set_visible(AgentAvailability::shared().is_ready(driver));
+                // On a model server the vendor's account is not what threads use.
+                if let Some(text) = obj
+                    .imp()
+                    .agent_profile_now(driver)
+                    .provider
+                    .as_ref()
+                    .map(provider_account_text)
+                {
+                    account.set_subtitle(&text);
+                    sign_in.set_visible(false);
+                    account.remove_css_class("error");
+                    return;
+                }
                 let snap = crate::account_status::AccountStatus::shared().snapshot(driver);
                 let (text, signed_out) = account_text(driver, &snap);
                 let started = obj.imp().sign_in_was_started(driver);
@@ -1803,6 +1862,118 @@ impl AgentTerminalWindow {
 
     /// The rest of `driver`'s Settings rows: command, arguments, env file, defaults, and agy's
     /// hook.
+    /// The Model Provider dropdown, and the Server URL and API Key Variable entries it enables.
+    /// Each applies as it is made; a change lists the models again.
+    fn add_provider_rows(
+        &self,
+        group: &adw::PreferencesGroup,
+        dialog: &adw::PreferencesDialog,
+        driver: Driver,
+        provider: Option<&ModelProvider>,
+    ) {
+        let (url, url_error) = validated_entry(
+            "Server URL",
+            PROVIDER_URL_HELP,
+            provider.and_then(|p| p.base_url.as_deref()).unwrap_or(""),
+        );
+        let (key, key_error) = validated_entry(
+            "API Key Variable",
+            PROVIDER_KEY_HELP,
+            provider
+                .and_then(|p| p.api_key_env.as_deref())
+                .unwrap_or(""),
+        );
+        let set_sensitive = {
+            let (url, key) = (url.clone(), key.clone());
+            move |on: bool| {
+                url.set_sensitive(on);
+                key.set_sensitive(on);
+            }
+        };
+        set_sensitive(provider.is_some());
+        let mut choices = vec![(None, format!("{}'s own", driver.info().label))];
+        choices.extend(
+            ProviderKind::ALL
+                .into_iter()
+                .map(|k| (Some(k), k.label().to_owned())),
+        );
+        let kind_row = self.choice_row(
+            "Model Provider",
+            PROVIDER_HELP,
+            choices,
+            provider.map(|p| p.kind),
+            move |imp, choice| {
+                let kind = choice.flatten();
+                imp.edit_agent_profile(driver, |p| {
+                    p.provider = kind.map(|kind| ModelProvider {
+                        kind,
+                        // What was typed stays, so trying another server keeps the address.
+                        ..p.provider
+                            .clone()
+                            .unwrap_or_else(|| ModelProvider::new(kind))
+                    });
+                });
+                set_sensitive(kind.is_some());
+                if !imp.is_closing() {
+                    imp.refresh_agent_data(super::threads::Probes::Force);
+                }
+            },
+        );
+        group.add(&kind_row);
+
+        let url_timer = self.agent_edit_timer(dialog);
+        self.commit_only_entry(
+            &url,
+            &url_error,
+            PROVIDER_URL_HELP,
+            &url_timer,
+            move |imp, text, commit| {
+                let saved = imp.agent_profile_now(driver).provider;
+                provider_url_edit(text, saved.and_then(|p| p.base_url).as_deref(), commit)
+            },
+            move |imp, value| {
+                if let Some(value) = value {
+                    imp.edit_agent_profile(driver, |p| {
+                        if let Some(provider) = p.provider.as_mut() {
+                            provider.base_url = value;
+                        }
+                    });
+                    if !imp.is_closing() {
+                        imp.refresh_agent_data(super::threads::Probes::Force);
+                    }
+                }
+            },
+        );
+        group.add(&url);
+        group.add(&url_error);
+
+        let key_timer = self.agent_edit_timer(dialog);
+        self.commit_only_entry(
+            &key,
+            &key_error,
+            PROVIDER_KEY_HELP,
+            &key_timer,
+            move |imp, text, commit| {
+                let saved = imp.agent_profile_now(driver).provider;
+                provider_key_edit(text, saved.and_then(|p| p.api_key_env).as_deref(), commit)
+            },
+            move |imp, value| {
+                if let Some(value) = value {
+                    imp.edit_agent_profile(driver, |p| {
+                        if let Some(provider) = p.provider.as_mut() {
+                            provider.api_key_env = value;
+                        }
+                    });
+                    if !imp.is_closing() {
+                        imp.refresh_agent_data(super::threads::Probes::Force);
+                    }
+                }
+            },
+        );
+        group.add(&key);
+        group.add(&key_error);
+    }
+
     /// A debounce for one agent field's edits, flushed (and the config written) when `dialog`
     /// closes, and by [`Self::flush_agent_edits`] while it lives.
     fn agent_edit_timer(&self, dialog: &adw::PreferencesDialog) -> Rc<EditDebounce> {
@@ -2105,6 +2276,9 @@ impl AgentTerminalWindow {
         );
         group.add(&env_file);
         group.add(&env_error);
+        if agent_core::provider::supports(driver) {
+            self.add_provider_rows(group, dialog, driver, profile.provider.as_ref());
+        }
 
         // Default model, from the live catalogue; the saved one stays listed even when the
         // catalogue does not have it (yet).
@@ -2645,6 +2819,45 @@ pub(super) mod tests {
                     .cloned()
             })
             .unwrap_or_else(|| panic!("no row titled {title}"))
+    }
+
+    #[test]
+    fn provider_fields_save_only_valid_values() {
+        let saved = |c: FieldChange<Option<String>>| match c {
+            FieldChange::Persist(v) => Ok(v),
+            FieldChange::Keep => Err("keep".to_owned()),
+            FieldChange::Invalid(why) => Err(why),
+        };
+        assert_eq!(
+            saved(provider_url_edit(" http://nas:11434/v1 ", None, true)),
+            Ok(Some("http://nas:11434".to_owned()))
+        );
+        assert_eq!(
+            saved(provider_url_edit("", Some("http://nas:11434"), true)),
+            Ok(None)
+        );
+        assert!(matches!(
+            provider_url_edit("nas:11434", None, true),
+            FieldChange::Invalid(_)
+        ));
+        assert!(matches!(
+            provider_url_edit("http://nas:11434", Some("http://nas:11434"), true),
+            FieldChange::Keep
+        ));
+        assert_eq!(
+            saved(provider_key_edit("LITELLM_API_KEY", None, true)),
+            Ok(Some("LITELLM_API_KEY".to_owned()))
+        );
+        assert_eq!(saved(provider_key_edit(" ", Some("K"), true)), Ok(None));
+        assert_eq!(
+            provider_account_text(&ModelProvider::new(ProviderKind::LmStudio)),
+            "Threads run on LM Studio at http://localhost:1234; no account is used"
+        );
+        // A pasted key is refused, so it is never written to the config.
+        assert!(matches!(
+            provider_key_edit("sk-abc123", None, true),
+            FieldChange::Invalid(_)
+        ));
     }
 
     #[test]

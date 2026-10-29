@@ -66,6 +66,9 @@ struct CacheFile {
     /// old list look new. A file from before this field reads as never fetched: Expired.
     #[serde(default)]
     read_at: ReadAt,
+    /// The model server each list came from; an agent not named here was listed by its vendor.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sources: Vec<(Driver, agent_core::provider::ModelProvider)>,
 }
 
 fn decode_cache(text: &str) -> CacheFile {
@@ -145,6 +148,9 @@ pub struct ModelCatalog {
     targets: RefCell<ProbeTargets>,
     /// A picker requested a refresh before targets were known: true preserves a forced fetch.
     picker_wanted: Cell<Option<bool>>,
+    /// The model server each list came from (persisted with the lists): a list from another
+    /// source than the agent's current one is dropped ([`Self::adopt_sources`]).
+    sources: RefCell<Vec<(Driver, agent_core::provider::ModelProvider)>>,
 }
 
 thread_local! {
@@ -186,6 +192,50 @@ impl ModelCatalog {
             forced: RefCell::new(Vec::new()),
             targets: RefCell::new(ProbeTargets::default()),
             picker_wanted: Cell::new(None),
+            sources: RefCell::new(loaded.sources),
+        }
+    }
+
+    /// The model server `driver`'s list came from; `None`: its vendor.
+    fn source(&self, driver: Driver) -> Option<agent_core::provider::ModelProvider> {
+        self.sources
+            .borrow()
+            .iter()
+            .find(|(d, _)| *d == driver)
+            .map(|(_, p)| p.clone())
+    }
+
+    /// Takes each ready agent's model server from `targets`: a list read from another source
+    /// (the vendor before a provider was set, another server, a cache from before a change) is
+    /// dropped, not fresh, and due, so no model is picked from it or judged retired against it.
+    fn adopt_sources(&self, targets: &ProbeTargets) {
+        let mut changed = false;
+        for driver in Driver::ALL
+            .into_iter()
+            .filter(|d| targets.get(*d).is_some())
+        {
+            let want = targets.provider(driver).map(|(p, _)| p.clone());
+            if self.source(driver) == want {
+                continue;
+            }
+            {
+                let mut sources = self.sources.borrow_mut();
+                sources.retain(|(d, _)| *d != driver);
+                if let Some(provider) = want {
+                    sources.push((driver, provider));
+                }
+            }
+            self.fresh.borrow_mut().retain(|d| *d != driver);
+            let mut read_at = self.read_at.get();
+            read_at.set(driver, None);
+            self.read_at.set(read_at);
+            self.slot(driver).borrow_mut().clear();
+            self.mark_due(driver);
+            changed = true;
+        }
+        if changed {
+            self.save();
+            self.listeners.notify();
         }
     }
 
@@ -370,6 +420,23 @@ impl ModelCatalog {
         }
     }
 
+    /// A model server listed nothing usable for `driver`: its list is emptied (persisted too, so
+    /// a restart does not bring the old one back), marked failed and not fresh, so nothing listed
+    /// before can be picked and no thread's model is called retired on it.
+    fn clear_unlisted(&self, driver: Driver) {
+        self.mark_failed(driver);
+        self.fresh.borrow_mut().retain(|d| *d != driver);
+        let mut read_at = self.read_at.get();
+        read_at.set(driver, None);
+        self.read_at.set(read_at);
+        let had = !self.slot(driver).borrow().is_empty();
+        if had {
+            self.slot(driver).borrow_mut().clear();
+            self.save();
+            self.listeners.notify();
+        }
+    }
+
     fn save(&self) {
         let Some(path) = &self.cache else { return };
         let file = CacheFile {
@@ -377,6 +444,7 @@ impl ModelCatalog {
             agy: self.agy.borrow().clone(),
             codex: self.codex.borrow().clone(),
             read_at: self.read_at.get(),
+            sources: self.sources.borrow().clone(),
         };
         match serde_json::to_vec(&file) {
             Ok(bytes) => {
@@ -393,6 +461,7 @@ impl ModelCatalog {
     /// runs in the environment its threads get.
     pub fn refresh(self: &Rc<Self>, targets: &ProbeTargets) {
         *self.targets.borrow_mut() = targets.clone();
+        self.adopt_sources(targets);
         let all: Vec<Driver> = Driver::ALL
             .into_iter()
             .filter(|d| targets.get(*d).is_some())
@@ -412,6 +481,7 @@ impl ModelCatalog {
     /// are due at `now` against [`MODEL_TTL`] ([`Self::is_due`]). Nothing due: nothing spawns.
     pub fn refresh_if_due(self: &Rc<Self>, targets: &ProbeTargets, now: i64) {
         *self.targets.borrow_mut() = targets.clone();
+        self.adopt_sources(targets);
         if self.picker_wanted.get().is_some() && targets.count() > 0 {
             if self.refreshing.get() {
                 return; // keep the picker request until this fetch ends
@@ -491,6 +561,53 @@ impl ModelCatalog {
                 continue;
             };
             let (me, done) = (self.clone(), finish.clone());
+            // An agent on a model server lists the server's models: its own probe would list its
+            // vendor's, which the thread cannot reach.
+            if let Some((provider, key)) = targets.provider(driver) {
+                let (provider, key) = (provider.clone(), key.value().map(str::to_owned));
+                let asked = provider.clone();
+                glib::spawn_future_local(async move {
+                    let fetched = gtk4::gio::spawn_blocking(move || {
+                        agent_kit::provider_models::fetch(&provider, key.as_deref(), USER_AGENT)
+                            .map(|ids| provider_models(driver, &provider, ids))
+                    })
+                    .await
+                    .unwrap_or_else(|_| Err("the model list fetch panicked".to_owned()));
+                    match fetched {
+                        // The agent moved to another source meanwhile: this answer is not its.
+                        _ if me.source(driver).as_ref() != Some(&asked) => {
+                            debug!(
+                                "{} model list from a superseded server dropped",
+                                driver.info().key
+                            );
+                        }
+                        Ok(models) if !models.is_empty() => {
+                            info!(
+                                count = models.len(),
+                                "{} model list fetched from its model server",
+                                driver.info().key
+                            );
+                            me.set(driver, models);
+                        }
+                        // No list, or an empty one: what was listed before (the vendor's, another
+                        // server's) is not on offer here, so it is dropped, not kept.
+                        fetched => {
+                            match fetched {
+                                Err(why) => {
+                                    warn!(%why, "{} model server list failed", driver.info().key)
+                                }
+                                Ok(_) => {
+                                    warn!("{} model server lists no models", driver.info().key)
+                                }
+                            }
+                            me.clear_unlisted(driver);
+                        }
+                    }
+                    me.mark_attempted(driver);
+                    done();
+                });
+                continue;
+            }
             match driver {
                 // `agy models`: `id<TAB>Display` lines.
                 Driver::Agy => {
@@ -524,6 +641,10 @@ impl ModelCatalog {
                 Driver::Claude | Driver::Codex => {
                     crate::probe::read_shared(driver, target, move |result| {
                         match result {
+                            // The agent moved to a model server meanwhile: not its list now.
+                            Ok(_) if me.source(driver).is_some() => {
+                                debug!("{} vendor model list dropped", driver.info().key);
+                            }
                             Ok(reading) => {
                                 info!(
                                     count = reading.models.len(),
@@ -541,6 +662,29 @@ impl ModelCatalog {
             }
         }
     }
+}
+
+/// The User-Agent of a model server request.
+const USER_AGENT: &str = concat!("agent-terminal/", env!("CARGO_PKG_VERSION"));
+
+/// `driver`'s catalogue entries for the model ids `provider` serves: shown by id, as reached
+/// through the server, with no effort levels (a server reports none).
+fn provider_models(
+    driver: Driver,
+    provider: &agent_core::provider::ModelProvider,
+    ids: Vec<String>,
+) -> Vec<CatalogModel> {
+    ids.into_iter()
+        .map(|id| CatalogModel {
+            driver,
+            display: id.clone(),
+            id,
+            description: None,
+            efforts: Vec::new(),
+            default_effort: None,
+            via: Some(provider.kind.label().to_owned()),
+        })
+        .collect()
 }
 
 /// What an in-thread banner says about a model its agent no longer offers: `None` when nothing is
@@ -730,6 +874,12 @@ mod tests {
                 agy: None,
                 codex: Some(1_700_000_100),
             },
+            sources: vec![(
+                Driver::Codex,
+                agent_core::provider::ModelProvider::new(
+                    agent_core::provider::ProviderKind::LmStudio,
+                ),
+            )],
         };
         let text = serde_json::to_string(&file).unwrap();
         assert_eq!(decode_cache(&text), file);
@@ -786,6 +936,86 @@ mod tests {
         let again = ModelCatalog::with_cache(Some(path));
         let ids: Vec<_> = again.models().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, ["opus", "g", "gpt"]);
+    }
+
+    /// A model server that lists nothing (or cannot be reached) leaves nothing pickable from the
+    /// list before it (the vendor's), on disk too, and no model is judged retired against it.
+    #[test]
+    fn a_model_server_that_lists_nothing_drops_the_list_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        let cat = ModelCatalog::with_cache(Some(path.clone()));
+        cat.set(Driver::Claude, vec![model(Driver::Claude, "opus")]);
+        assert!(cat.is_fresh(Driver::Claude));
+        let hits = Rc::new(Cell::new(0));
+        let h = hits.clone();
+        cat.connect_changed(move || h.set(h.get() + 1));
+        cat.clear_unlisted(Driver::Claude);
+        assert!(cat.models_of(Driver::Claude).is_empty());
+        assert!(!cat.is_fresh(Driver::Claude));
+        assert!(cat.status_of(|d| d == Driver::Claude).failed);
+        assert_eq!(hits.get(), 1);
+        assert!(ModelCatalog::with_cache(Some(path))
+            .models_of(Driver::Claude)
+            .is_empty());
+        // Already empty: nothing to say.
+        cat.clear_unlisted(Driver::Claude);
+        assert_eq!(hits.get(), 1);
+    }
+
+    /// An agent moved to a model server (or another one, or back) drops the list read from its
+    /// old source at once, on disk too, and a fetch answered for the old source is not applied.
+    #[test]
+    fn a_list_from_another_source_is_dropped_when_the_agent_moves() {
+        use agent_core::provider::{ModelProvider, ProviderKind};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        let cat = ModelCatalog::with_cache(Some(path.clone()));
+        let target = crate::probe::ProbeTarget::default();
+        let vendor = ProbeTargets::new(vec![(Driver::Claude, target.clone())]);
+        cat.adopt_sources(&vendor);
+        cat.set(Driver::Claude, vec![model(Driver::Claude, "opus")]);
+        assert!(cat.is_fresh(Driver::Claude));
+        // Unchanged source: the list stays.
+        cat.adopt_sources(&vendor);
+        assert_eq!(cat.models_of(Driver::Claude).len(), 1);
+
+        let ollama = ModelProvider::new(ProviderKind::Ollama);
+        let local = ProbeTargets::new(vec![(Driver::Claude, target)]).with_providers(vec![(
+            Driver::Claude,
+            ollama.clone(),
+            crate::probe::ProviderKey::default(),
+        )]);
+        cat.adopt_sources(&local);
+        assert!(cat.models_of(Driver::Claude).is_empty());
+        assert!(
+            !cat.is_fresh(Driver::Claude),
+            "no model is judged against the old list"
+        );
+        assert_eq!(cat.source(Driver::Claude), Some(ollama.clone()));
+        assert!(cat.is_due(Driver::Claude, NOW, MODEL_TTL));
+        // A restart remembers where the (now server's) list came from.
+        cat.set(Driver::Claude, vec![model(Driver::Claude, "qwen3.5:9b")]);
+        let again = ModelCatalog::with_cache(Some(path));
+        assert_eq!(again.source(Driver::Claude), Some(ollama));
+        assert_eq!(again.models_of(Driver::Claude).len(), 1);
+        // Back on the vendor: the server's list goes.
+        again.adopt_sources(&vendor);
+        assert!(again.models_of(Driver::Claude).is_empty());
+        assert_eq!(again.source(Driver::Claude), None);
+    }
+
+    #[test]
+    fn a_servers_models_are_listed_by_id_through_it() {
+        let provider =
+            agent_core::provider::ModelProvider::new(agent_core::provider::ProviderKind::Ollama);
+        let models = provider_models(Driver::Codex, &provider, vec!["qwen3.5:9b".into()]);
+        assert_eq!(models.len(), 1);
+        assert_eq!(
+            (models[0].id.as_str(), models[0].via.as_deref()),
+            ("qwen3.5:9b", Some("Ollama"))
+        );
+        assert!(models[0].efforts.is_empty());
     }
 
     use crate::freshness::{age_of, freshness, Freshness, DUE_SLACK};

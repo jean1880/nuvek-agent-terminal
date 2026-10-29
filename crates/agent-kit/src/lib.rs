@@ -16,6 +16,7 @@ pub mod handoff;
 mod heal_tail;
 pub mod native;
 pub mod paths;
+pub mod provider_models;
 pub mod restore;
 pub mod sessions;
 pub mod store;

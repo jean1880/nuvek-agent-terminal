@@ -136,6 +136,11 @@ pub struct Profile {
     /// profiles): judged by the command's file name alone. See [`profile_driver`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub driver: Option<agent_core::adapter::Driver>,
+    /// 3.0 chat threads: the local or self-hosted model server (Ollama, LM Studio, LiteLLM) this
+    /// profile's Claude or Codex runs on instead of its vendor's. `None`: the vendor's own. A
+    /// provider that cannot be used refuses the start; it never falls back to the vendor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<agent_core::provider::ModelProvider>,
 }
 
 /// A blank profile with a fresh id, so the invariant holds for `..Profile::default()` too.
@@ -163,6 +168,7 @@ impl Default for Profile {
             disabled: false,
             available_for_delegation: false,
             driver: None,
+            provider: None,
         }
     }
 }
@@ -2856,6 +2862,31 @@ mod tests {
     }
 
     #[test]
+    fn a_profiles_model_provider_round_trips_and_stores_no_key() {
+        use agent_core::provider::{ModelProvider, ProviderKind};
+        let old: Profile =
+            serde_json::from_str(r#"{"id":"p-1","name":"Claude","command":"claude"}"#).unwrap();
+        assert_eq!(old.provider, None);
+        assert!(!serde_json::to_string(&old).unwrap().contains("provider"));
+        let local = Profile {
+            provider: Some(ModelProvider {
+                kind: ProviderKind::LiteLlm,
+                base_url: Some("https://gw.example".into()),
+                api_key_env: Some("GW_KEY".into()),
+            }),
+            ..new_agent_profile(agent_core::adapter::Driver::Codex)
+        };
+        let json = serde_json::to_string(&local).unwrap();
+        assert!(
+            json.contains(
+                r#""provider":{"kind":"litellm","base_url":"https://gw.example","api_key_env":"GW_KEY"}"#
+            ),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<Profile>(&json).unwrap(), local);
+    }
+
+    #[test]
     fn a_profiles_recorded_agent_round_trips_and_older_files_need_no_migration() {
         use agent_core::adapter::Driver;
         // A file from before the field: judged by the command's name, exactly as before.
@@ -3096,6 +3127,10 @@ mod tests {
         assert!(!claude.disabled);
         assert_eq!(claude.default_model, None);
         assert_eq!(claude.default_mode, None);
+        assert_eq!(
+            claude.provider, None,
+            "an older file stays on the vendor's models"
+        );
         let agy = config
             .agent_profile(Driver::Agy)
             .expect("agy by its binary name");

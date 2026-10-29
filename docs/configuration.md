@@ -164,6 +164,31 @@ environment file, default model, mode and effort, and whether it is enabled.
 `available_for_delegation` defaults to `false`; the corresponding Settings switch
 opts a profile in as a parent and child target. Route support remains a separate check.
 
+### Local and self-hosted models
+
+Claude and Codex can run on a model server instead of their vendor's: Ollama (0.14 or
+later), LM Studio (0.4.1 or later) or a LiteLLM gateway. In Settings → Agents, pick the
+server under **Model Provider**, give its **Server URL** (blank: the server's default on
+this machine, `http://localhost:11434`, `:1234` or `:4000`), then pick a **Default Model**
+from the server's list. A profile can also set it in `config.json`, so one agent can have a
+cloud profile and a local one:
+
+```jsonc
+{ "name": "Claude (Ollama)", "command": "claude", "driver": "claude",
+  "default_model": "qwen3-coder",
+  "provider": { "kind": "ollama", "base_url": "http://192.168.1.20:11434" } }
+```
+
+`kind` is `ollama`, `lm_studio` or `litellm`. A server that needs a key gets it from an
+environment variable: set `api_key_env` (Settings: **API Key Variable**) to the variable's
+name, defined in the profile's environment file or your session. The key itself is never
+written to the settings. If the address is invalid, or the key variable is not set, the
+thread refuses to start: it never falls back to the vendor's models.
+
+The model list is the one request the app makes to the server itself (`GET <url>/v1/models`).
+Claude reaches the server's Anthropic-compatible API at the URL's root; Codex reaches its
+OpenAI-compatible Responses API at `<url>/v1`. Antigravity only runs Google's models.
+
 ## agy's approval hook
 
 `--dangerously-skip-permissions` is agy's name for bypassing its built-in terminal

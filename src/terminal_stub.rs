@@ -12,6 +12,11 @@ pub mod prelude {
     // Empty prelude for stub compatibility
 }
 
+/// The VTE constants the app uses, with VTE's values.
+pub mod ffi {
+    pub const VTE_SPAWN_NO_PARENT_ENVV: i32 = 33_554_432;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorBlinkMode {
     System,
@@ -158,6 +163,8 @@ impl Terminal {
     pub fn paste_clipboard(&self) {}
 
     pub fn feed_child(&self, _data: &[u8]) {}
+
+    pub fn feed(&self, _data: &[u8]) {}
 
     pub fn connect_contents_changed<F: Fn(&Self) + 'static>(&self, _f: F) -> glib::SignalHandlerId {
         self.connect_notify_local(None, move |_, _| {})

@@ -802,9 +802,128 @@ pub fn get_startup_command(profile: Option<&Profile>, launch: Launch<'_>) -> Vec
     }
 }
 
+/// The model server a terminal tab of `profile` must run on: its provider and agent, `None` for a
+/// profile with none (or with no chat agent, which a provider means nothing to).
+pub fn terminal_provider(
+    profile: &Profile,
+) -> Option<(
+    agent_core::provider::ModelProvider,
+    agent_core::adapter::Driver,
+)> {
+    Some((
+        profile.provider.clone()?,
+        crate::config::profile_driver(profile)?,
+    ))
+}
+
+/// `profile` with its model provider's arguments after its own, for a terminal tab's command
+/// line. An `Err` refuses the tab: it never starts on the vendor's models.
+pub fn with_provider_args(profile: &Profile) -> Result<Profile, String> {
+    let mut profile = profile.clone();
+    if let Some((provider, driver)) = terminal_provider(&profile) {
+        let args = provider
+            .args(driver)
+            .map_err(|why| format!("Cannot start on {}: {why}.", provider.kind.label()))?;
+        profile.args.extend(args);
+    }
+    Ok(profile)
+}
+
+/// Applies a terminal tab's model provider to its environment block (`NAME=value` entries,
+/// later ones winning): the key comes from the block, the vendor's own variables go, the
+/// provider's are added. An `Err` refuses the tab.
+pub fn apply_provider_env(
+    provider: &agent_core::provider::ModelProvider,
+    driver: agent_core::adapter::Driver,
+    env: &mut Vec<String>,
+) -> Result<(), String> {
+    let value_of = |env: &[String], name: &str| {
+        let prefix = format!("{name}=");
+        env.iter()
+            .rev()
+            .find_map(|e| e.strip_prefix(&prefix).map(str::to_owned))
+    };
+    let key = provider
+        .key_env()
+        .ok()
+        .flatten()
+        .and_then(|name| value_of(env, name));
+    let launch = provider
+        .launch(driver, key.as_deref())
+        .map_err(|why| format!("Cannot start on {}: {why}.", provider.kind.label()))?;
+    env.retain(|e| {
+        !launch
+            .unset
+            .iter()
+            .any(|name| e.split_once('=').is_some_and(|(k, _)| k == name))
+    });
+    env.extend(launch.env.into_iter().map(|(k, v)| format!("{k}={v}")));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_terminal_tab_on_a_model_server_runs_on_it_or_not_at_all() {
+        use agent_core::provider::{ModelProvider, ProviderKind};
+        let on = |kind, key: Option<&str>| Profile {
+            provider: Some(ModelProvider {
+                kind,
+                base_url: Some("http://gw:4000".into()),
+                api_key_env: key.map(Into::into),
+            }),
+            ..crate::config::new_agent_profile(agent_core::adapter::Driver::Codex)
+        };
+        let codex = with_provider_args(&on(ProviderKind::LiteLlm, Some("GW_KEY"))).unwrap();
+        assert!(codex
+            .args
+            .contains(&"model_provider=\"agent_terminal\"".to_owned()));
+        let command = get_startup_command(Some(&codex), Launch::Fresh);
+        assert!(
+            command[1].contains("model_providers.agent_terminal.base_url"),
+            "{command:?}"
+        );
+
+        let (provider, driver) = terminal_provider(&Profile {
+            command: "claude".into(),
+            driver: None,
+            ..on(ProviderKind::LiteLlm, Some("ANTHROPIC_API_KEY"))
+        })
+        .unwrap();
+        assert_eq!(driver, agent_core::adapter::Driver::Claude);
+        let mut env = vec![
+            "HOME=/h".to_owned(),
+            "ANTHROPIC_API_KEY=gateway-key".to_owned(),
+            "CLAUDE_CODE_OAUTH_TOKEN=vendor".to_owned(),
+        ];
+        apply_provider_env(&provider, driver, &mut env).unwrap();
+        assert!(env.contains(&"ANTHROPIC_BASE_URL=http://gw:4000".to_owned()));
+        assert!(env.contains(&"ANTHROPIC_AUTH_TOKEN=gateway-key".to_owned()));
+        assert!(!env
+            .iter()
+            .any(|e| e.starts_with("ANTHROPIC_API_KEY=")
+                || e.starts_with("CLAUDE_CODE_OAUTH_TOKEN=")));
+        // The key variable is not in the block: refused.
+        let mut bare = vec!["HOME=/h".to_owned()];
+        assert!(apply_provider_env(&provider, driver, &mut bare).is_err());
+        assert!(with_provider_args(&Profile {
+            provider: Some(ModelProvider {
+                base_url: Some("gw".into()),
+                ..ModelProvider::new(ProviderKind::Ollama)
+            }),
+            ..crate::config::new_agent_profile(agent_core::adapter::Driver::Claude)
+        })
+        .is_err());
+        // A profile without a chat agent has nothing to run on a server.
+        let shell = Profile {
+            command: "bash".into(),
+            driver: None,
+            ..on(ProviderKind::Ollama, None)
+        };
+        assert_eq!(with_provider_args(&shell).unwrap(), shell);
+    }
 
     /// The new-thread folder table: the most specific folder that exists wins, and only an
     /// explicit one is refused when it is gone.

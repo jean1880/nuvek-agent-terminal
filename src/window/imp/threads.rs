@@ -1729,19 +1729,34 @@ fn decide_live_model(
     }
 }
 
-/// [`decide_live_model`] against the app's catalogue.
+/// [`decide_live_model`] against the app's catalogue. `served`: the catalogue lists what this
+/// thread's profile can run ([`catalogue_serves`]); a thread it does not is never judged by it.
 fn live_model(
     driver: Driver,
+    served: bool,
     model: Option<String>,
     effort: Option<String>,
 ) -> (Option<String>, Option<String>, Option<RetiredModel>) {
     let catalog = ModelCatalog::shared();
     decide_live_model(
         &catalog.models_of(driver),
-        catalog.is_fresh(driver),
+        served && catalog.is_fresh(driver),
         model,
         effort,
     )
+}
+
+/// Whether `driver`'s catalogue lists the models a thread opened with `profile_id` can run. The
+/// list is read for `driver`'s own profile, so a thread on another profile with another model
+/// server (or with one where the agent's has none, or the reverse) is not judged by it: its model
+/// is never called retired against a list it cannot use.
+fn catalogue_serves(
+    config: &crate::config::TerminalConfig,
+    profile_id: Option<&str>,
+    driver: Driver,
+) -> bool {
+    let provider = |p: Option<&Profile>| p.and_then(|p| p.provider.clone());
+    provider(config.thread_profile(profile_id, driver)) == provider(config.agent_profile(driver))
 }
 
 /// What starting a built thread's session needs.
@@ -2221,6 +2236,40 @@ pub(super) fn agent_env(env: Vec<(String, String)>, clear: &[String]) -> AgentEn
     }
 }
 
+/// The arguments and environment an agent on `profile` starts with: the profile's own (`env` is
+/// its sourced env file, `clear` the configured `clear_env`), then its model provider's, which
+/// win over the env file. An `Err` refuses the start with the reason: a profile on a provider
+/// never falls back to its vendor's own models.
+pub(super) fn profile_launch(
+    profile: &Profile,
+    driver: Driver,
+    env: Vec<(String, String)>,
+    clear: &[String],
+) -> Result<(Vec<String>, AgentEnv), String> {
+    let mut args = profile.args.clone();
+    let mut agent = agent_env(env, clear);
+    let Some(provider) = &profile.provider else {
+        return Ok((args, agent));
+    };
+    let key = provider
+        .key_env()
+        .ok()
+        .flatten()
+        .and_then(|name| agent.lookup(name));
+    let launch = provider
+        .launch(driver, key.as_deref())
+        .map_err(|why| format!("Cannot start on {}: {why}.", provider.kind.label()))?;
+    args.extend(launch.args);
+    agent.env.retain(|(name, _)| !launch.unset.contains(name));
+    for name in launch.unset {
+        if !agent.unset.contains(&name) {
+            agent.unset.push(name);
+        }
+    }
+    agent.env.extend(launch.env);
+    Ok((args, agent))
+}
+
 /// What the app removes from an agent's environment: the configured `clear_env` (a launching
 /// agent session's markers) and any inherited approval socket, which only the app may set.
 pub(super) fn unset_list(patterns: &[String]) -> Vec<String> {
@@ -2297,8 +2346,8 @@ fn agent_launch_with(
     let Some(program) = resolved.program.clone() else {
         return Err(not_ready_reason(driver, &Availability::Missing));
     };
+    let (extra_args, env) = profile_launch(&profile, driver, resolved.env, &clear)?;
     let adapter = make_adapter(driver, &program);
-    let env = agent_env(resolved.env, &clear);
     let approval = match driver {
         // Claude and Codex raise approvals over their own protocol, not the hook socket.
         Driver::Claude | Driver::Codex => Err(None),
@@ -2324,7 +2373,7 @@ fn agent_launch_with(
     Ok(AgentLaunch {
         adapter,
         program,
-        extra_args: profile.args.clone(),
+        extra_args,
         default_model: profile.effective_default_model(None),
         default_effort: profile.default_effort.clone(),
         env,
@@ -2940,9 +2989,11 @@ impl AgentTerminalWindow {
         }
         if !probe.is_empty() {
             let known = ModelCatalog::shared().last_targets();
+            // An agent on a model server has no vendor quota to read: never probed for one.
             let targets = crate::probe::ProbeTargets::new(
                 probe
                     .into_iter()
+                    .filter(|d| known.provider(*d).is_none())
                     .filter_map(|d| known.get(d).map(|t| (d, t.clone())))
                     .collect(),
             );
@@ -5352,6 +5403,17 @@ impl AgentTerminalWindow {
         if slot.get().is_some() {
             return; // already running
         }
+        let clear = self.config.borrow().clear_env.clone();
+        let (extra_args, launch_env) =
+            match profile_launch(profile, driver, resolved.env.clone(), &clear) {
+                Ok(launch) => launch,
+                Err(why) => {
+                    // Shown, not stored: fixing the profile and reopening the thread starts it.
+                    warn!(thread, "a thread's model provider refused its start");
+                    view.apply(&Envelope::new(Event::Error { message: why }));
+                    return;
+                }
+            };
         // The provider was read off the main thread, behind the writer's barrier: the session
         // does not read it again here.
         let store = crate::chat::session::SessionStore {
@@ -5379,8 +5441,10 @@ impl AgentTerminalWindow {
             .or_else(|| profile.default_effort.clone());
         // A model its agent no longer offers (judged on a list fetched in this run) is never
         // started: the thread resumes on the replacement, and says so.
+        let served = catalogue_serves(&self.config.borrow(), Some(&profile.id), driver);
         let (model, effort, ported) = live_model(
             driver,
+            served,
             provider
                 .as_ref()
                 .and_then(|p| stored_model(Some(&p.model)))
@@ -5401,7 +5465,7 @@ impl AgentTerminalWindow {
             .unwrap_or_else(|| profile.command.clone());
         let open = OpenSession {
             program: program.clone(),
-            extra_args: profile.args.clone(),
+            extra_args,
             cwd: dir.to_owned(),
             model,
             effort,
@@ -5413,8 +5477,6 @@ impl AgentTerminalWindow {
             delegation: None,
         };
         let adapter = make_adapter(driver, &program);
-        let clear = self.config.borrow().clear_env.clone();
-        let launch_env = agent_env(resolved.env, &clear);
         let approval = match driver {
             Driver::Claude | Driver::Codex => Err(None),
             Driver::Agy => {
@@ -6933,7 +6995,8 @@ impl AgentTerminalWindow {
                 .and_then(|p| p.effective_default_model(None))
         });
         // A profile default the agent has retired is never started: the suggestion is used.
-        let (model, effort, _) = live_model(driver, model, effort);
+        let served = catalogue_serves(&self.config.borrow(), profile_id.as_deref(), driver);
+        let (model, effort, _) = live_model(driver, served, model, effort);
         let ids = match store.new_id().and_then(|thread| {
             Ok(NewThreadIds {
                 thread,
@@ -7380,16 +7443,34 @@ impl AgentTerminalWindow {
             }
             let availability = AgentAvailability::shared();
             let mut envs: Vec<(Driver, AgentEnv)> = Vec::new();
+            let mut providers = Vec::new();
             for (driver, profile) in profiles {
                 if profile.disabled {
                     continue;
                 }
-                let resolved = resolve_agent(profile).await;
+                let resolved = resolve_agent(profile.clone()).await;
                 if !scan_is_current(generation) {
                     return;
                 }
                 // Probes run where the threads run: the profile's env file and `clear_env`.
-                envs.push((driver, agent_env(resolved.env.clone(), &clear)));
+                let env = agent_env(resolved.env.clone(), &clear);
+                // An agent on a model server is never probed through its vendor: its models come
+                // from the server, with the key its threads would use (read here, before a
+                // launch removes the vendor's variables, which may be the one holding it).
+                // (agy cannot run on one: its launch refuses, so it keeps its own list.)
+                if let Some(provider) = profile
+                    .provider
+                    .clone()
+                    .filter(|_| agent_core::provider::supports(driver))
+                {
+                    let key = provider
+                        .key_env()
+                        .ok()
+                        .flatten()
+                        .and_then(|n| env.lookup(n));
+                    providers.push((driver, provider, crate::probe::ProviderKey::new(key)));
+                }
+                envs.push((driver, env));
                 let state = classify(false, Some(resolved.program.as_deref()));
                 // Back from missing (installed, or switched on again): its list may be new.
                 if state.is_ready()
@@ -7419,7 +7500,8 @@ impl AgentTerminalWindow {
                     .find(|(driver, _)| *driver == d)
                     .map(|(_, env)| env.clone())
                     .unwrap_or_default()
-            });
+            })
+            .with_providers(providers);
             match probes {
                 Probes::IfDue => {
                     let now = crate::freshness::now_epoch();
@@ -7498,17 +7580,18 @@ impl AgentTerminalWindow {
     pub(super) fn evaluate_models(&self) {
         let catalog = ModelCatalog::shared();
         let availability = AgentAvailability::shared();
-        let built: Vec<(adw::Banner, Rc<ChatSession>)> = self
+        let built: Vec<(adw::Banner, Rc<ChatSession>, Option<String>)> = self
             .tabs
             .borrow()
             .iter()
             .filter_map(|t| t.chat.as_ref())
-            .filter_map(|c| Some((c.model_banner.clone(), c.slot.get()?)))
+            .filter_map(|c| Some((c.model_banner.clone(), c.slot.get()?, c.profile_id.clone())))
             .collect();
-        for (banner, session) in built {
+        for (banner, session, profile_id) in built {
             let status = session.status();
             let driver = status.driver;
-            let notice = if availability.is_ready(driver) {
+            let served = catalogue_serves(&self.config.borrow(), profile_id.as_deref(), driver);
+            let notice = if availability.is_ready(driver) && served {
                 model_notice(
                     &catalog.models_of(driver),
                     catalog.is_fresh(driver),
@@ -7826,6 +7909,136 @@ fn is_interruption(event: &Event) -> bool {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    /// A profile on a model server starts with the server's arguments after its own and the
+    /// server's environment over its env file; one that cannot use it is refused, never started
+    /// on the vendor's models.
+    #[test]
+    fn a_profile_on_a_model_server_starts_on_it_or_not_at_all() {
+        use agent_core::provider::{ModelProvider, ProviderKind};
+        let env_file = vec![
+            ("ANTHROPIC_API_KEY".to_owned(), "vendor-key".to_owned()),
+            (
+                "ANTHROPIC_BASE_URL".to_owned(),
+                "https://vendor.example".to_owned(),
+            ),
+            ("GW_KEY".to_owned(), "gateway-key".to_owned()),
+        ];
+        let plain = Profile {
+            args: vec!["--verbose".into()],
+            ..crate::config::new_agent_profile(Driver::Claude)
+        };
+        let (args, env) = profile_launch(&plain, Driver::Claude, env_file.clone(), &[]).unwrap();
+        assert_eq!(args, ["--verbose"]);
+        assert_eq!(env.env, env_file);
+
+        let on_gateway = Profile {
+            provider: Some(ModelProvider {
+                kind: ProviderKind::LiteLlm,
+                base_url: Some("http://gw:4000".into()),
+                api_key_env: Some("GW_KEY".into()),
+            }),
+            ..plain.clone()
+        };
+        let (args, env) =
+            profile_launch(&on_gateway, Driver::Claude, env_file.clone(), &[]).unwrap();
+        assert_eq!(args, ["--verbose"]);
+        assert_eq!(
+            env.lookup("ANTHROPIC_BASE_URL").as_deref(),
+            Some("http://gw:4000")
+        );
+        assert_eq!(
+            env.lookup("ANTHROPIC_AUTH_TOKEN").as_deref(),
+            Some("gateway-key")
+        );
+        // The vendor's key is gone, from the env file and from what is inherited.
+        assert!(!env.env.iter().any(|(k, _)| k == "ANTHROPIC_API_KEY"));
+        assert!(env.unset.iter().any(|u| u == "ANTHROPIC_API_KEY"));
+
+        let (args, env) = profile_launch(&on_gateway, Driver::Codex, env_file, &[]).unwrap();
+        assert_eq!(&args[..2], ["--verbose", "-c"]);
+        assert!(args.contains(&"model_providers.agent_terminal.env_key=\"GW_KEY\"".to_owned()));
+        assert!(!args.iter().any(|a| a.contains("gateway-key")));
+        assert_eq!(env.lookup("GW_KEY").as_deref(), Some("gateway-key"));
+
+        // The key variable is set nowhere: refused (the name is unlikely to be in the test's
+        // own environment, and `clear` removes it if it were).
+        let missing = Profile {
+            provider: Some(ModelProvider {
+                api_key_env: Some("AGENT_TERMINAL_TEST_UNSET_KEY".into()),
+                ..on_gateway.provider.clone().unwrap()
+            }),
+            ..plain.clone()
+        };
+        let clear = ["AGENT_TERMINAL_TEST_UNSET_KEY".to_owned()];
+        assert!(profile_launch(&missing, Driver::Claude, Vec::new(), &clear).is_err());
+        let bad_url = Profile {
+            provider: Some(ModelProvider {
+                base_url: Some("gw:4000".into()),
+                ..ModelProvider::new(ProviderKind::Ollama)
+            }),
+            ..plain
+        };
+        let why = profile_launch(&bad_url, Driver::Claude, Vec::new(), &[]).unwrap_err();
+        assert!(why.starts_with("Cannot start on Ollama"), "{why}");
+    }
+
+    /// A cloud profile and a local one of the same agent: the catalogue (read for the agent's
+    /// own profile) judges only the threads of profiles on the same model server.
+    #[test]
+    fn a_thread_is_judged_only_by_a_catalogue_of_its_own_model_server() {
+        use agent_core::provider::{ModelProvider, ProviderKind};
+        let mut config = crate::config::TerminalConfig::default();
+        config.profiles = vec![
+            Profile {
+                id: "claude-cloud".into(),
+                ..crate::config::new_agent_profile(Driver::Claude)
+            },
+            Profile {
+                id: "claude-local".into(),
+                name: "Claude (Ollama)".into(),
+                provider: Some(ModelProvider::new(ProviderKind::Ollama)),
+                ..crate::config::new_agent_profile(Driver::Claude)
+            },
+        ];
+        assert!(catalogue_serves(&config, None, Driver::Claude));
+        assert!(catalogue_serves(
+            &config,
+            Some("claude-cloud"),
+            Driver::Claude
+        ));
+        assert!(!catalogue_serves(
+            &config,
+            Some("claude-local"),
+            Driver::Claude
+        ));
+        // With the agent's own profile on the server, it is the cloud thread that is not judged.
+        config.profiles[0].provider = Some(ModelProvider::new(ProviderKind::Ollama));
+        assert!(catalogue_serves(
+            &config,
+            Some("claude-local"),
+            Driver::Claude
+        ));
+        config.profiles[1].provider = None;
+        assert!(!catalogue_serves(
+            &config,
+            Some("claude-local"),
+            Driver::Claude
+        ));
+        // Not judged: a model missing from a fresh list is kept, not retired.
+        let list = vec![agent_core::catalog::CatalogModel {
+            driver: Driver::Claude,
+            id: "opus".into(),
+            display: "Opus".into(),
+            description: None,
+            efforts: Vec::new(),
+            default_effort: None,
+            via: None,
+        }];
+        let kept = decide_live_model(&list, false, Some("qwen3-coder".into()), None);
+        assert_eq!(kept.0.as_deref(), Some("qwen3-coder"));
+        assert!(kept.2.is_none());
+    }
 
     /// Only a turn that failed for quota starts a usage-limit wait. A rate limit (a tool's own
     /// 429 on agy, a usage reading), a quota error or a quota reading at 100 % never does; a rate

@@ -566,10 +566,24 @@ impl AgentTerminalWindow {
                 if resolved.env_failed {
                     return None;
                 }
+                // A worker whose model provider refuses it is unavailable, never started on its
+                // vendor's models instead.
+                let (extra_args, env) = match profile_launch(
+                    profile,
+                    driver,
+                    resolved.env,
+                    &config.borrow().clear_env,
+                ) {
+                    Ok(launch) => launch,
+                    Err(why) => {
+                        warn!(profile = %profile.name, %why, "a worker's model provider refused it");
+                        return None;
+                    }
+                };
                 Some(ResolvedChild {
                     program: resolved.program?,
-                    extra_args: profile.args.clone(),
-                    env: agent_env(resolved.env, &config.borrow().clear_env),
+                    extra_args,
+                    env,
                     default_model: profile.default_model.clone(),
                     default_effort: profile.default_effort.clone(),
                 })

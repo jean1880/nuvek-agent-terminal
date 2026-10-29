@@ -986,6 +986,33 @@ fn a_late_refusal_requeues_an_overdue_steer_once_under_a_new_correlation() {
     });
 }
 
+/// An overdue steer that never hears back is no longer waited for once its late window ends:
+/// its outcome stays unknown, nothing is sent again, and its worker can be paused again.
+#[test]
+fn an_overdue_steer_with_no_answer_at_all_stops_holding_its_worker() {
+    in_context(async {
+        let (dir, sup, root) = harness();
+        let (worker, _run, op, _id) = overdue_steer(&sup, &root, Delivery::Auto).await;
+        assert!(sup
+            .state
+            .borrow()
+            .late_steers
+            .iter()
+            .any(|(_, e)| e.worker == worker));
+        pump_until(|| {
+            !sup.state
+                .borrow()
+                .late_steers
+                .iter()
+                .any(|(_, e)| e.worker == worker)
+        })
+        .await;
+        assert_eq!(dispatch(&sup, &op), "unknown");
+        assert_eq!(steered(dir.path()), 0, "never sent again on a guess");
+        stop(&sup).await;
+    });
+}
+
 /// A strict steer whose answer is overdue stays unknown, whatever comes late.
 #[test]
 fn an_overdue_strict_steer_stays_unknown() {

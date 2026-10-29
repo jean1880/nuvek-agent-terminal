@@ -25,6 +25,11 @@ pub(super) const STEER_SETTLE: std::time::Duration = std::time::Duration::from_s
 /// The most overdue steers whose late answer is still awaited.
 pub(super) const LATE_STEERS: usize = 64;
 
+/// How many times the settle wait an overdue steer's late answer is still awaited (10 minutes
+/// by default). Past it the correlation is dropped and the outcome stays unknown, so a worker
+/// that never hears back can be paused again.
+const LATE_STEER_WINDOW: u32 = 20;
+
 /// How long a task handed to a child may wait for its turn to open (see `arm_task_start`).
 pub(super) const TASK_START_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -612,14 +617,15 @@ impl Supervisor {
     /// A steer's answer may come after its turn ended (the correlation outlives the turn). One
     /// with no answer within [`STEER_SETTLE`] may yet have been taken: its outcome is recorded
     /// `unknown` (a replay says so), it is never delivered again on a guess, and its correlation
-    /// is kept for a late answer, which settles it (`delivery_control`).
+    /// is kept for a late answer, which settles it (`delivery_control`), for
+    /// [`LATE_STEER_WINDOW`] times the wait.
     pub(super) fn arm_steer_settle(self: &Rc<Self>, worker: &WorkerId, tag: String) {
         let wait = self.state.borrow().steer_settle.unwrap_or(STEER_SETTLE);
-        let sup = self.weak.clone();
+        let weak = self.weak.clone();
         let worker = worker.clone();
         gtk4::glib::spawn_future_local(async move {
             gtk4::glib::timeout_future(wait).await;
-            let Some(sup) = sup.upgrade() else {
+            let Some(sup) = weak.upgrade() else {
                 return;
             };
             let entry = take_scoped_control(&mut sup.state.borrow_mut().controls, &worker, &tag);
@@ -629,11 +635,23 @@ impl Supervisor {
             warn!(%worker, operation = %entry.input.operation, ?wait,
                 "a steer got no answer in time; its outcome is unknown");
             sup.record_fact(entry.input.operation.clone(), DispatchFact::Unknown);
-            let mut state = sup.state.borrow_mut();
-            if state.late_steers.len() >= LATE_STEERS {
-                state.late_steers.pop_front();
+            {
+                let mut state = sup.state.borrow_mut();
+                if state.late_steers.len() >= LATE_STEERS {
+                    state.late_steers.pop_front();
+                }
+                state.late_steers.push_back((tag.clone(), entry));
             }
-            state.late_steers.push_back((tag, entry));
+            drop(sup);
+            // No answer at all: stop waiting, so the worker is not held up for ever.
+            gtk4::glib::timeout_future(wait * LATE_STEER_WINDOW).await;
+            let Some(sup) = weak.upgrade() else {
+                return;
+            };
+            sup.state
+                .borrow_mut()
+                .late_steers
+                .retain(|(t, _)| t != &tag);
         });
     }
     /// A late answer accepted an overdue steer: it was delivered, into the run it was pinned to.

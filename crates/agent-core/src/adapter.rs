@@ -20,6 +20,10 @@ pub enum Driver {
     Claude,
     Agy,
     Codex,
+    /// A model on a local or self-hosted server (Ollama, LM Studio, vLLM, llama.cpp, LocalAI,
+    /// LiteLLM, any OpenAI-compatible one), driven by the app's own agent loop
+    /// (`agent-terminal --local-agent`, [`crate::local_agent`]) rather than a vendor's CLI.
+    Local,
 }
 
 /// Everything the app knows about a driver that is not behaviour: its names, colour and the
@@ -57,7 +61,7 @@ pub struct DriverInfo {
     pub sign_in_hint: &'static str,
 }
 
-const REGISTRY: [DriverInfo; 3] = [
+const REGISTRY: [DriverInfo; 4] = [
     DriverInfo {
         driver: Driver::Claude,
         key: "claude",
@@ -103,11 +107,28 @@ const REGISTRY: [DriverInfo; 3] = [
         sign_in_args: &["login"],
         sign_in_hint: "Run codex login and sign in with ChatGPT (or an API key).",
     },
+    DriverInfo {
+        driver: Driver::Local,
+        key: "local",
+        label: "Local",
+        long_label: "Local Model Server",
+        accent_class: "accent-local",
+        accent_hex: "#c9a0f0",
+        brand_icon: "agent-local-symbolic",
+        // Names the profile, never a binary on PATH: the app runs this agent itself
+        // ([`Driver::is_built_in`]), and it is ready when its server lists models.
+        default_command: "agent-terminal-local",
+        profile_name: "Local",
+        install_hint: "Start a model server (Ollama, LM Studio, vLLM, llama.cpp…) and set its address in Settings → Agents → Local Model Server.",
+        install_url: "https://ollama.com/download",
+        sign_in_args: &[],
+        sign_in_hint: "A local server needs no sign-in; name an API key variable if yours asks for one.",
+    },
 ];
 
 impl Driver {
     /// Every driver, in the order menus and handoffs offer them.
-    pub const ALL: [Driver; 3] = [Driver::Claude, Driver::Agy, Driver::Codex];
+    pub const ALL: [Driver; 4] = [Driver::Claude, Driver::Agy, Driver::Codex, Driver::Local];
 
     /// The driver's description. Exhaustive: a new variant fails to compile here until it has one.
     pub fn info(self) -> &'static DriverInfo {
@@ -115,7 +136,15 @@ impl Driver {
             Driver::Claude => &REGISTRY[0],
             Driver::Agy => &REGISTRY[1],
             Driver::Codex => &REGISTRY[2],
+            Driver::Local => &REGISTRY[3],
         }
+    }
+
+    /// Whether the app runs this agent itself (`agent-terminal --local-agent`) instead of
+    /// launching a CLI found on PATH: its program is the app's own binary, and it is ready when
+    /// its server lists models, not when a command is installed.
+    pub fn is_built_in(self) -> bool {
+        matches!(self, Driver::Local)
     }
 
     /// The driver with this [`DriverInfo::key`].
@@ -587,7 +616,7 @@ mod tests {
         // Exhaustive: adding a variant fails to compile here until ALL and the registry have it.
         for d in Driver::ALL {
             match d {
-                Driver::Claude | Driver::Agy | Driver::Codex => {}
+                Driver::Claude | Driver::Agy | Driver::Codex | Driver::Local => {}
             }
             let info = d.info();
             assert_eq!(info.driver, d, "{} points at another driver", info.key);

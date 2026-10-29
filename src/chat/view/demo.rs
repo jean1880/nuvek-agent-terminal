@@ -453,6 +453,9 @@ impl DemoBackend {
                 Driver::Codex => json!([
                     {"id": "gpt-5-codex", "display": "GPT-5 Codex"}
                 ]),
+                Driver::Local => json!([
+                    {"id": "qwen3.5:9b", "display": "qwen3.5:9b"}
+                ]),
             },
             Control::McpStatus => {
                 let servers: Vec<Value> = self
@@ -612,6 +615,7 @@ impl ChatBackend for DemoBackend {
                     Driver::Claude => "claude-opus-5-5".into(),
                     Driver::Agy => "gemini-3.1-pro-high".into(),
                     Driver::Codex => "gpt-5-codex".into(),
+                    Driver::Local => "qwen3.5:9b".into(),
                 })
             });
             self.status.borrow_mut().effort = effort;

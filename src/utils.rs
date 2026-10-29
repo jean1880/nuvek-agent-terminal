@@ -36,6 +36,14 @@ pub fn cache_command_available(command: &str, available: bool) {
     });
 }
 
+/// This running binary, as the program of an agent the app runs itself (the Local agent's
+/// `--local-agent` runner). `None` when the system cannot say, which refuses the start.
+pub fn own_program() -> Option<String> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.to_str().map(str::to_owned))
+}
+
 /// Forgets cached resolution results.
 #[cfg(test)]
 pub fn clear_command_cache() {
@@ -211,7 +219,15 @@ where
         }
     }
 
-    profiles.iter().find(|p| available(&p.command))
+    profiles.iter().find(|p| available(&p.command)).or_else(|| {
+        // An agent the app runs itself (a Local server) has no command to find, but is still a
+        // way to work: last, since the active profile also opens terminal tabs, which it cannot.
+        profiles.iter().find(|p| {
+            !p.disabled
+                && crate::config::profile_driver(p)
+                    .is_some_and(agent_core::adapter::Driver::is_built_in)
+        })
+    })
 }
 
 /// Reads the exported environment produced by sourcing `path`.
@@ -815,6 +831,10 @@ pub fn terminal_provider(
 /// line. An `Err` refuses the tab: it never starts on the vendor's models.
 pub fn with_provider_args(profile: &Profile, model: Option<&str>) -> Result<Profile, String> {
     let mut profile = profile.clone();
+    if crate::config::profile_driver(&profile).is_some_and(agent_core::adapter::Driver::is_built_in)
+    {
+        return Err("The Local agent runs in a chat thread, not a terminal tab.".to_owned());
+    }
     if let Some((provider, driver)) = terminal_provider(&profile) {
         let label = provider.kind.label();
         let args = provider
@@ -1257,6 +1277,22 @@ mod tests {
     fn resolve_yields_nothing_when_no_command_is_installed() {
         let profiles = vec![profile("Claude", "claude")];
         assert!(resolve_profile(&profiles, None, only(&[])).is_none());
+    }
+
+    #[test]
+    fn a_local_server_counts_as_a_way_to_work_but_only_after_every_command() {
+        let local = |name: &str, disabled: bool| Profile {
+            driver: Some(agent_core::adapter::Driver::Local),
+            disabled,
+            ..profile(name, "agent-terminal-local")
+        };
+        let profiles = vec![local("NAS", false), profile("Claude", "claude")];
+        let chosen = resolve_profile(&profiles, None, only(&["claude"]));
+        assert_eq!(chosen.map(|p| p.name.as_str()), Some("Claude"));
+        let chosen = resolve_profile(&profiles, None, only(&[]));
+        assert_eq!(chosen.map(|p| p.name.as_str()), Some("NAS"));
+        let off = vec![local("NAS", true)];
+        assert!(resolve_profile(&off, None, only(&[])).is_none());
     }
 
     #[test]

@@ -164,7 +164,39 @@ environment file, default model, mode and effort, and whether it is enabled.
 `available_for_delegation` defaults to `false`; the corresponding Settings switch
 opts a profile in as a parent and child target. Route support remains a separate check.
 
-### Local and self-hosted models
+### Local model servers (the Local agent)
+
+The **Local** agent runs a model on your own server, with no vendor CLI involved: Agent
+Terminal runs the agent itself. In Settings → Agents → **Local Model Servers**, press **+**
+to add a server; add as many as you like. Each server has:
+
+- a **Name**, shown under New Thread With (one entry per server that answers);
+- a **Server Type**: Ollama, LM Studio, vLLM, llama.cpp server, SGLang, LocalAI, Jan,
+  text-generation-webui, LiteLLM, or Other (OpenAI-compatible). The type only sets the
+  default address; every server is reached through its OpenAI-compatible API;
+- a **Server URL** (blank: the type's default on this machine, such as
+  `http://localhost:11434` for Ollama or `http://localhost:8000` for vLLM; Other needs one);
+- an optional **API Key Variable** and **Environment File**, as for the other agents;
+- **Models on the Server**, what the server listed at its last scan, with **Scan Now**.
+  Embedding models are left out: they cannot hold a conversation;
+- a **Default Model** from that list, and a **Default Mode**.
+
+A server is ready when it lists at least one chat model. Its threads pick from its own
+models, and keep the server they were opened on. The agent works in the thread's folder with
+six tools (read a file, list a folder, search, write a file, edit a file, run a command).
+Writes and commands follow the mode: Plan only reads, Ask asks before each, Accept edits
+asks before commands and before writing outside the folder. Its conversation is kept under
+`~/.local/state/agent-terminal/local`, so a thread resumes where it was.
+
+Use a model that supports tool calling (Qwen 3 and later, Llama 3.1 and later, Mistral, and
+others). Some servers only call tools when started for it: vLLM needs
+`--enable-auto-tool-choice --tool-call-parser <parser>`, SGLang `--tool-call-parser <parser>`,
+and llama.cpp its Jinja templates (`--jinja`). A model that cannot use tools still answers,
+without reading or changing anything, and the thread says so.
+
+The Local agent cannot take part in cross-agent delegation.
+
+### Claude and Codex on a model server
 
 Claude and Codex can run on a model server instead of their vendor's: Ollama (0.14 or
 later), LM Studio (0.4.1 or later) or a LiteLLM gateway. In Settings → Agents, pick the

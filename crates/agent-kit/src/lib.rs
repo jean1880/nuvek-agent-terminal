@@ -14,6 +14,8 @@ pub mod git;
 pub mod github;
 pub mod handoff;
 mod heal_tail;
+pub mod local_agent;
+pub mod local_tools;
 pub mod native;
 pub mod paths;
 pub mod provider_models;

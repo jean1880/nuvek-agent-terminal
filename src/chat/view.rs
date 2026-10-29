@@ -2468,8 +2468,11 @@ pub(crate) mod tests {
             inner.thinking.shown().as_deref(),
             Some("Claude is working…")
         );
-        // The agent at work leads the wave; the other two keep it company, dimmed.
-        assert_eq!(inner.thinking.dot_states(), ["lead", "dimmed", "dimmed"]);
+        // The agent at work leads the wave; the others keep it company, dimmed.
+        assert_eq!(
+            inner.thinking.dot_states(),
+            ["lead", "dimmed", "dimmed", "dimmed"]
+        );
         view.apply(&Envelope::turn_completed(TurnState::Completed, None));
         assert_eq!(inner.thinking.shown(), None, "gone once the turn ends");
     }

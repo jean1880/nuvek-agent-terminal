@@ -37,6 +37,8 @@ pub struct ReadAt {
     pub agy: Option<i64>,
     #[serde(default)]
     pub codex: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<i64>,
 }
 
 impl ReadAt {
@@ -45,6 +47,7 @@ impl ReadAt {
             Driver::Claude => self.claude,
             Driver::Agy => self.agy,
             Driver::Codex => self.codex,
+            Driver::Local => self.local,
         }
     }
 
@@ -53,6 +56,7 @@ impl ReadAt {
             Driver::Claude => self.claude = at,
             Driver::Agy => self.agy = at,
             Driver::Codex => self.codex = at,
+            Driver::Local => self.local = at,
         }
     }
 }

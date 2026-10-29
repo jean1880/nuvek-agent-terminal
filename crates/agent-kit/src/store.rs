@@ -46,7 +46,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Schema version this build writes. Bump it and add a step to [`migrate`]. An existing store is
 /// only ever upgraded by the preflight (`preflight::run`), after a verified backup.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 /// `PRAGMA synchronous = FULL`: a durable control write's level.
 const SYNC_FULL: i64 = 2;
 /// [`Store::meta`] key of the native sessions whose threads the user deleted (JSON list of
@@ -3938,6 +3938,30 @@ fn migrate_locked_to(conn: &Connection, current: i64, target: i64) -> Result<()>
              INSERT INTO schema_version (version) VALUES (5);",
         )?;
     }
+    if current < 6 && target >= 6 {
+        // The 'local' driver (the app's own agent on a model server), by the same rebuild as
+        // v3. Ids are kept, so `events.provider_thread_id`, `threads.active_provider_thread` and
+        // the delegation tables' references stay valid; the check below proves it.
+        conn.execute_batch(
+            "CREATE TABLE provider_threads_v6 (
+                 id TEXT PRIMARY KEY,
+                 thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+                 driver TEXT NOT NULL CHECK (driver IN ('claude', 'agy', 'codex', 'local')),
+                 model TEXT NOT NULL,
+                 native_id TEXT,
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
+             INSERT INTO provider_threads_v6
+                 (id, thread_id, driver, model, native_id, created_at, updated_at)
+                 SELECT id, thread_id, driver, model, native_id, created_at, updated_at
+                 FROM provider_threads;
+             DROP TABLE provider_threads;
+             ALTER TABLE provider_threads_v6 RENAME TO provider_threads;
+             CREATE INDEX provider_threads_thread ON provider_threads(thread_id);
+             INSERT INTO schema_version (version) VALUES (6);",
+        )?;
+    }
     let broken: Option<String> = conn
         .query_row(
             "SELECT \"table\" FROM pragma_foreign_key_check LIMIT 1",
@@ -5103,6 +5127,54 @@ mod tests {
     }
 
     #[test]
+    fn a_v5_database_migrates_to_v6_keeping_rows_and_allowing_local() {
+        let conn = Connection::open_in_memory().expect("open");
+        conn.pragma_update(None, "foreign_keys", "ON").expect("fk");
+        conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+            .expect("version table");
+        migrate_locked_to(&conn, 0, 5).expect("a v5 database");
+        conn.execute_batch(
+            "INSERT INTO threads (id, title, cwd, created_at, updated_at, active_provider_thread)
+                 VALUES ('t1', 'old', '/w', 1, 2, 'p1');
+             INSERT INTO provider_threads (id, thread_id, driver, model, native_id, created_at, updated_at)
+                 VALUES ('p1', 't1', 'codex', 'gpt', 'n1', 1, 2);
+             INSERT INTO events (thread_id, provider_thread_id, at, envelope_json)
+                 VALUES ('t1', 'p1', 5, '{}');",
+        )
+        .expect("v5 rows");
+        let insert = |id: &str, driver: &str| {
+            conn.execute(
+                "INSERT INTO provider_threads (id, thread_id, driver, model, created_at, updated_at)
+                 VALUES (?1, 't1', ?2, 'm', 0, 0)",
+                params![id, driver],
+            )
+        };
+        assert!(insert("p2", "local").is_err(), "v5 refuses it");
+
+        migrate(&conn).expect("migrate");
+
+        let version: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .expect("version");
+        assert_eq!(version, 6);
+        let kept: (String, String) = conn
+            .query_row(
+                "SELECT driver, native_id FROM provider_threads WHERE id = 'p1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("kept");
+        assert_eq!(kept, ("codex".into(), "n1".into()));
+        let link: Option<String> = conn
+            .query_row("SELECT provider_thread_id FROM events", [], |r| r.get(0))
+            .expect("link");
+        assert_eq!(link.as_deref(), Some("p1"));
+        insert("p2", "local").expect("local allowed");
+        assert!(insert("p3", "other").is_err());
+        migrate(&conn).expect("a second run is a no-op");
+    }
+
+    #[test]
     fn a_v1_database_migrates_to_v3_keeping_rows_and_allowing_codex() {
         let conn = Connection::open_in_memory().expect("open");
         conn.pragma_update(None, "foreign_keys", "ON").expect("fk");
@@ -5177,6 +5249,7 @@ mod tests {
             )
         };
         insert("p3", "codex").expect("codex allowed");
+        insert("p5", "local").expect("local allowed (v6)");
         assert!(insert("p4", "gpt").is_err());
         let index: i64 = conn
             .query_row(

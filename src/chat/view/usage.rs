@@ -243,9 +243,10 @@ impl UsageIndicator {
 
     fn shown(&self) -> Vec<(Driver, Snapshot)> {
         let availability = AgentAvailability::shared();
+        // A model server the app runs has no plan or quota to show.
         Driver::ALL
             .into_iter()
-            .filter(|d| availability.is_ready(*d))
+            .filter(|d| availability.is_ready(*d) && !d.is_built_in())
             .map(|d| (d, self.status.snapshot(d)))
             .collect()
     }

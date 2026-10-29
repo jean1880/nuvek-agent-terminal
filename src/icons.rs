@@ -51,6 +51,7 @@ const SVG_INK: &str = "#2e3436";
 pub const CLAUDE_ICON: &str = "agent-claude-symbolic";
 pub const AGY_ICON: &str = "agent-agy-symbolic";
 pub const CODEX_ICON: &str = "agent-codex-symbolic";
+pub const LOCAL_ICON: &str = "agent-local-symbolic";
 pub const THINKING_ICON: &str = "agent-thinking-symbolic";
 pub const MCP_ICON: &str = "agent-mcp-symbolic";
 pub const SUBAGENT_ICON: &str = "agent-subagent-symbolic";
@@ -83,6 +84,7 @@ pub const ICONS: &[&str] = &[
     CLAUDE_ICON,
     AGY_ICON,
     CODEX_ICON,
+    LOCAL_ICON,
     THINKING_ICON,
     MCP_ICON,
     SUBAGENT_ICON,

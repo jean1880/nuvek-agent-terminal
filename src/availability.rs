@@ -45,7 +45,13 @@ impl Availability {
     pub fn describe(&self, driver: Driver) -> String {
         match self {
             Self::Detecting => "Detecting…".to_owned(),
+            // Its program is this app: what matters is that its server answered.
+            Self::Ready(_) if driver.is_built_in() => "Ready: its server lists models".to_owned(),
             Self::Ready(path) => format!("Ready: {path}"),
+            Self::Missing if driver.is_built_in() => format!(
+                "Its server did not answer or lists no chat model. {}",
+                driver.info().install_hint
+            ),
             Self::Missing => format!("Not found. {}", driver.info().install_hint),
             Self::Disabled => "Off: not offered for new threads or switching".to_owned(),
         }
@@ -118,6 +124,9 @@ pub struct AgentAvailability {
     scans: RefCell<Vec<(Driver, u64)>>,
     listeners: ListenerSet,
     last_scan: Cell<Option<Instant>>,
+    /// The Local agent's servers by profile id: whether each listed a chat model at the last
+    /// scan. One not here has not been scanned (or is switched off): not ready.
+    servers: RefCell<Vec<(String, bool)>>,
 }
 
 thread_local! {
@@ -143,7 +152,36 @@ impl AgentAvailability {
             scans: RefCell::new(Driver::ALL.into_iter().map(|d| (d, 0)).collect()),
             listeners: ListenerSet::default(),
             last_scan: Cell::new(None),
+            servers: RefCell::default(),
         }
+    }
+
+    /// Records whether the Local server `id` lists a chat model, and tells the listeners.
+    pub fn set_server(&self, id: &str, ready: bool) {
+        {
+            let mut servers = self.servers.borrow_mut();
+            match servers.iter_mut().find(|(s, _)| s == id) {
+                Some((_, known)) => *known = ready,
+                None => servers.push((id.to_owned(), ready)),
+            }
+        }
+        self.listeners.notify();
+    }
+
+    /// Forgets every server not in `ids` (removed, or switched off).
+    pub fn keep_servers(&self, ids: &[String]) {
+        self.servers.borrow_mut().retain(|(s, _)| ids.contains(s));
+    }
+
+    /// Whether the Local server `id` listed a chat model at the last scan, while the Local agent
+    /// itself is usable.
+    pub fn server_ready(&self, id: &str) -> bool {
+        self.is_ready(Driver::Local)
+            && self
+                .servers
+                .borrow()
+                .iter()
+                .any(|(s, ready)| s == id && *ready)
     }
 
     /// The app-wide instance (one per main thread).
@@ -278,10 +316,30 @@ mod tests {
         assert!(a.is_ready(Driver::Codex));
         a.set(Driver::Claude, Availability::Missing);
         a.set(Driver::Agy, Availability::Disabled);
+        a.set(Driver::Local, Availability::Missing);
         assert!(!a.any_detecting());
         a.disconnect(id);
         a.set(Driver::Claude, Availability::Detecting);
-        assert_eq!(hits.get(), 4);
+        assert_eq!(hits.get(), 5);
+    }
+
+    #[test]
+    fn a_local_server_is_ready_only_while_its_scan_said_so_and_the_agent_is_usable() {
+        let a = AgentAvailability::new();
+        a.set_server("p-1", true);
+        a.set_server("p-2", false);
+        assert!(!a.server_ready("p-1"), "the agent is not ready yet");
+        a.set(
+            Driver::Local,
+            Availability::Ready("/usr/bin/agent-terminal".into()),
+        );
+        assert!(a.server_ready("p-1"));
+        assert!(!a.server_ready("p-2"));
+        assert!(!a.server_ready("p-3"), "never scanned");
+        a.keep_servers(&["p-2".to_owned()]);
+        assert!(!a.server_ready("p-1"), "removed or switched off");
+        a.set_server("p-2", true);
+        assert!(a.server_ready("p-2"));
     }
 
     #[test]
@@ -361,6 +419,7 @@ mod tests {
         assert!(a.any_detecting());
         a.set(Driver::Claude, Availability::Missing);
         a.set(Driver::Agy, Availability::Disabled);
+        a.set(Driver::Local, Availability::Disabled);
         assert_eq!(choose_default_agent(None, None, |d| a.is_ready(d)), None);
         a.set(Driver::Codex, Availability::Ready("/usr/bin/codex".into()));
         assert!(!a.any_detecting());

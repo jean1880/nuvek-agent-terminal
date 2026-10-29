@@ -266,6 +266,8 @@ pub fn read_shared(
             });
         }
         Driver::Agy => done(Err("agy has no shared probe")),
+        // Its models come from its server's list, and it has no account to read.
+        Driver::Local => done(Err("the Local agent has no shared probe")),
     }
 }
 

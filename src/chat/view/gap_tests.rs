@@ -97,12 +97,12 @@ fn native_the_context_gauge_is_polled_after_a_turn_for_agents_that_do_not_push_i
                 .asked(|c| matches!(c, Control::ContextUsage))
                 .is_some()
         };
-        if driver == Driver::Codex {
-            // Codex pushes `thread/tokenUsage/updated` itself.
+        if matches!(driver, Driver::Codex | Driver::Local) {
+            // Codex pushes `thread/tokenUsage/updated` itself; Local has no gauge to fill.
             for _ in 0..50 {
                 ctx.iteration(false);
             }
-            assert!(!asked(), "Codex is not polled");
+            assert!(!asked(), "{driver:?} is not polled");
         } else {
             assert!(
                 pump_until(&ctx, asked),

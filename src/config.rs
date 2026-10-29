@@ -235,8 +235,53 @@ pub fn new_agent_profile(driver: agent_core::adapter::Driver) -> Profile {
         driver: Some(driver),
         ..Profile::default()
     };
+    if agent_core::provider::required(driver) {
+        // A model server the user has not set up yet: off until switched on in Settings, so
+        // no menu offers it to someone without a server, and an Ollama on this machine first.
+        profile.disabled = true;
+        profile.provider = Some(agent_core::provider::ModelProvider::new(
+            agent_core::provider::ProviderKind::Ollama,
+        ));
+    }
     apply_known_settings(&mut profile);
     profile
+}
+
+/// `base`, or `base 2`, `base 3`… : the first that no profile in `profiles` is named.
+pub fn unique_profile_name(profiles: &[Profile], base: &str) -> String {
+    let taken = |name: &str| profiles.iter().any(|p| p.name == name);
+    if !taken(base) {
+        return base.to_owned();
+    }
+    (2..)
+        .map(|n| format!("{base} {n}"))
+        .find(|name| !taken(name))
+        .unwrap_or_else(|| base.to_owned())
+}
+
+/// Why `name` cannot name the profile `id`: empty, or another profile's.
+pub fn profile_name_problem(profiles: &[Profile], id: &str, name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Some("A name is required".to_owned());
+    }
+    profiles
+        .iter()
+        .any(|p| p.id != id && p.name == name)
+        .then(|| format!("Another profile is already named “{name}”"))
+}
+
+/// The model server `profile` runs on: its own, or for an agent that must have one
+/// ([`agent_core::provider::required`]) the default server on this machine.
+pub fn profile_provider(
+    profile: &Profile,
+    driver: agent_core::adapter::Driver,
+) -> Option<agent_core::provider::ModelProvider> {
+    profile.provider.clone().or_else(|| {
+        agent_core::provider::required(driver).then(|| {
+            agent_core::provider::ModelProvider::new(agent_core::provider::ProviderKind::Ollama)
+        })
+    })
 }
 
 /// Picks the agent for a new chat thread.
@@ -273,6 +318,8 @@ pub fn agent_settings_model(
         agent_core::adapter::Driver::Claude => claude_settings_model(home),
         agent_core::adapter::Driver::Agy => agy_settings_model(home),
         agent_core::adapter::Driver::Codex => codex_settings_model(home),
+        // It has no settings file of its own: its model is the profile's or the server's.
+        agent_core::adapter::Driver::Local => None,
     }
 }
 
@@ -1481,9 +1528,17 @@ impl TerminalConfig {
     /// command runs it. Preferences → Agents edits this profile.
     pub fn agent_profile_index(&self, driver: agent_core::adapter::Driver) -> Option<usize> {
         let runs = |p: &Profile| profile_driver(p) == Some(driver);
+        // The Local agent has a profile per server: its own is the first switched on, so one
+        // server switched off never hides the others.
+        let on = |p: &Profile| runs(p) && !p.disabled && driver.is_built_in();
         self.profiles
             .iter()
-            .position(|p| p.driver == Some(driver) && runs(p))
+            .position(on)
+            .or_else(|| {
+                self.profiles
+                    .iter()
+                    .position(|p| p.driver == Some(driver) && runs(p))
+            })
             .or_else(|| self.profiles.iter().position(runs))
     }
 
@@ -1501,6 +1556,40 @@ impl TerminalConfig {
         };
         self.profiles[index].driver = Some(driver);
         index
+    }
+
+    /// The Local agent's servers: every profile that runs it, in list order. The first is the
+    /// agent's own ([`Self::agent_profile`]); a thread keeps the one it was opened on.
+    pub fn local_servers(&self) -> Vec<&Profile> {
+        self.profiles
+            .iter()
+            .filter(|p| profile_driver(p) == Some(agent_core::adapter::Driver::Local))
+            .collect()
+    }
+
+    /// Adds a Local server, switched on, on `kind`'s default address on this machine, with a name
+    /// no other profile has. Returns its id.
+    pub fn add_local_server(&mut self, kind: agent_core::provider::ProviderKind) -> String {
+        let mut profile = new_agent_profile(agent_core::adapter::Driver::Local);
+        profile.disabled = false;
+        profile.provider = Some(agent_core::provider::ModelProvider::new(kind));
+        profile.name = unique_profile_name(&self.profiles, kind.label());
+        let id = profile.id.clone();
+        self.profiles.push(profile);
+        id
+    }
+
+    /// Removes the profile with this id; whether there was one. A default naming it is cleared,
+    /// so new tabs fall back rather than name a profile that is gone.
+    pub fn remove_profile(&mut self, id: &str) -> bool {
+        let Some(at) = self.profiles.iter().position(|p| p.id == id) else {
+            return false;
+        };
+        let removed = self.profiles.remove(at);
+        if self.default_profile.as_deref() == Some(removed.name.as_str()) {
+            self.default_profile = None;
+        }
+        true
     }
 
     /// The profile that defines `driver`'s chat agent, if one does.

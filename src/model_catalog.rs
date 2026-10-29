@@ -62,6 +62,8 @@ struct CacheFile {
     agy: Vec<CatalogModel>,
     #[serde(default)]
     codex: Vec<CatalogModel>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    local: Vec<CatalogModel>,
     /// When each list was last fetched successfully (epoch seconds), so a restart cannot make an
     /// old list look new. A file from before this field reads as never fetched: Expired.
     #[serde(default)]
@@ -145,6 +147,7 @@ pub struct ModelCatalog {
     claude: RefCell<Vec<CatalogModel>>,
     agy: RefCell<Vec<CatalogModel>>,
     codex: RefCell<Vec<CatalogModel>>,
+    local: RefCell<Vec<CatalogModel>>,
     /// The agents whose list was fetched in this run (not just read from the cache).
     fresh: RefCell<Vec<Driver>>,
     /// The agents whose fetch in this run has finished, whether or not it succeeded.
@@ -210,6 +213,7 @@ impl ModelCatalog {
             claude: RefCell::new(loaded.claude),
             agy: RefCell::new(loaded.agy),
             codex: RefCell::new(loaded.codex),
+            local: RefCell::new(loaded.local),
             fresh: RefCell::new(Vec::new()),
             attempted: RefCell::new(Vec::new()),
             listeners: ListenerSet::default(),
@@ -431,6 +435,7 @@ impl ModelCatalog {
         let mut all = self.claude.borrow().clone();
         all.extend(self.agy.borrow().iter().cloned());
         all.extend(self.codex.borrow().iter().cloned());
+        all.extend(self.local.borrow().iter().cloned());
         all
     }
 
@@ -599,6 +604,7 @@ impl ModelCatalog {
             Driver::Claude => &self.claude,
             Driver::Agy => &self.agy,
             Driver::Codex => &self.codex,
+            Driver::Local => &self.local,
         }
     }
 
@@ -665,6 +671,7 @@ impl ModelCatalog {
             claude: self.claude.borrow().clone(),
             agy: self.agy.borrow().clone(),
             codex: self.codex.borrow().clone(),
+            local: self.local.borrow().clone(),
             read_at: self.read_at.get(),
             sources: self.sources.borrow().clone(),
             others: self.others.borrow().clone(),
@@ -825,8 +832,7 @@ impl ModelCatalog {
                     glib::spawn_future_local(async move {
                         let asked = provider.clone();
                         let fetched = gtk4::gio::spawn_blocking(move || {
-                            agent_kit::provider_models::fetch(&provider, key.as_deref(), USER_AGENT)
-                                .map(|ids| provider_models(driver, &provider, ids))
+                            fetch_listed(driver, &provider, key.as_deref())
                         })
                         .await
                         .unwrap_or_else(|_| Err("the model list fetch panicked".to_owned()));
@@ -860,8 +866,7 @@ impl ModelCatalog {
                 let asked = provider.clone();
                 glib::spawn_future_local(async move {
                     let fetched = gtk4::gio::spawn_blocking(move || {
-                        agent_kit::provider_models::fetch(&provider, key.as_deref(), USER_AGENT)
-                            .map(|ids| provider_models(driver, &provider, ids))
+                        fetch_listed(driver, &provider, key.as_deref())
                     })
                     .await
                     .unwrap_or_else(|_| Err("the model list fetch panicked".to_owned()));
@@ -951,27 +956,60 @@ impl ModelCatalog {
                         done();
                     });
                 }
+                // Its list always comes from its server (above); with no server known there is
+                // no vendor to ask.
+                Driver::Local => {
+                    me.mark_failed(driver);
+                    me.mark_attempted(driver);
+                    done();
+                }
             }
         }
     }
 }
 
 /// The User-Agent of a model server request.
-const USER_AGENT: &str = concat!("agent-terminal/", env!("CARGO_PKG_VERSION"));
+pub(crate) const USER_AGENT: &str = concat!("agent-terminal/", env!("CARGO_PKG_VERSION"));
 
-/// `driver`'s catalogue entries for the model ids `provider` serves: shown by id, as reached
+/// What a model that the server says cannot call tools is described as in the picker.
+const NO_TOOLS: &str = "Cannot call tools: answers without reading or changing files";
+
+/// Reads `provider`'s models for `driver`, off the main thread (blocking). The Local agent asks
+/// the server what each model can do ([`agent_kit::provider_models::fetch_info`]); Claude and
+/// Codex on a server take its list as it is.
+fn fetch_listed(
+    driver: Driver,
+    provider: &agent_core::provider::ModelProvider,
+    key: Option<&str>,
+) -> Result<Vec<CatalogModel>, String> {
+    let infos = if driver.is_built_in() {
+        agent_kit::provider_models::fetch_info(provider, key, USER_AGENT)?
+    } else {
+        agent_kit::provider_models::fetch(provider, key, USER_AGENT)?
+            .iter()
+            .map(|id| agent_core::provider::ModelInfo::by_name(id))
+            .collect()
+    };
+    Ok(provider_models(driver, provider, infos))
+}
+
+/// `driver`'s catalogue entries for the models `provider` serves: shown by id, as reached
 /// through the server, with no effort levels (a server reports none).
 fn provider_models(
     driver: Driver,
     provider: &agent_core::provider::ModelProvider,
-    ids: Vec<String>,
+    infos: Vec<agent_core::provider::ModelInfo>,
 ) -> Vec<CatalogModel> {
-    ids.into_iter()
-        .map(|id| CatalogModel {
+    infos
+        .into_iter()
+        // The Local agent only chats: an embedding model the server also lists is not offered.
+        // (Claude and Codex on a server keep the server's whole list, as before.)
+        .filter(|m| !driver.is_built_in() || m.chat)
+        .map(|m| CatalogModel {
             driver,
-            display: id.clone(),
-            id,
-            description: None,
+            display: m.id.clone(),
+            description: (m.tools == Some(false)).then(|| NO_TOOLS.to_owned()),
+            id: m.id,
             efforts: Vec::new(),
             default_effort: None,
             via: Some(provider.kind.label().to_owned()),
@@ -1218,10 +1256,12 @@ mod tests {
             claude: vec![model(Driver::Claude, "opus")],
             agy: vec![model(Driver::Agy, "gemini-3.1-pro-high")],
             codex: vec![model(Driver::Codex, "gpt-5-codex")],
+            local: vec![model(Driver::Local, "qwen3.5:9b")],
             read_at: ReadAt {
                 claude: Some(1_700_000_000),
                 agy: None,
                 codex: Some(1_700_000_100),
+                local: Some(1_700_000_200),
             },
             sources: vec![(
                 Driver::Codex,
@@ -1521,13 +1561,46 @@ mod tests {
     fn a_servers_models_are_listed_by_id_through_it() {
         let provider =
             agent_core::provider::ModelProvider::new(agent_core::provider::ProviderKind::Ollama);
-        let models = provider_models(Driver::Codex, &provider, vec!["qwen3.5:9b".into()]);
+        use agent_core::provider::ModelInfo;
+        let models = provider_models(
+            Driver::Codex,
+            &provider,
+            vec![ModelInfo::by_name("qwen3.5:9b")],
+        );
         assert_eq!(models.len(), 1);
         assert_eq!(
             (models[0].id.as_str(), models[0].via.as_deref()),
             ("qwen3.5:9b", Some("Ollama"))
         );
         assert!(models[0].efforts.is_empty());
+        // The Local agent is offered only what it can chat with, and told which cannot use tools.
+        let infos = || {
+            vec![
+                ModelInfo {
+                    id: "qwen3.5:9b".into(),
+                    chat: true,
+                    tools: Some(true),
+                },
+                ModelInfo {
+                    id: "nomic-embed-text:latest".into(),
+                    chat: false,
+                    tools: Some(false),
+                },
+                ModelInfo {
+                    id: "qwen2.5:0.5b".into(),
+                    chat: true,
+                    tools: Some(false),
+                },
+            ]
+        };
+        assert_eq!(provider_models(Driver::Codex, &provider, infos()).len(), 3);
+        let local = provider_models(Driver::Local, &provider, infos());
+        assert_eq!(
+            local.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["qwen3.5:9b", "qwen2.5:0.5b"]
+        );
+        assert_eq!(local[0].description, None);
+        assert_eq!(local[1].description.as_deref(), Some(NO_TOOLS));
     }
 
     use crate::freshness::{age_of, freshness, Freshness, DUE_SLACK};
@@ -1629,7 +1702,9 @@ mod tests {
         // The oldest shown list sets the footer's age.
         again.set_at(Driver::Codex, vec![model(Driver::Codex, "gpt")], NOW + 7200);
         assert_eq!(
-            again.status_of(|d| d != Driver::Agy).read_at,
+            again
+                .status_of(|d| matches!(d, Driver::Claude | Driver::Codex))
+                .read_at,
             Some(NOW + 3600)
         );
         // A shown agent with no list at all was not read: the footer cannot say "Updated".

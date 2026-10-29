@@ -19,7 +19,8 @@ Architectural mandates, standards, and workflows for this codebase.
   `gtk4` re-exports (`gtk4::glib`, …). Do not add them as direct dependencies —
   that only creates a second place for versions to drift.
 - **Chat-first**: the primary surface is a chat thread (`src/chat/`) that
-  drives Claude, agy or Codex through a structured adapter (`agent-core`) over a gio
+  drives Claude, agy, Codex or the Local agent (a model on the user's own server, run by
+  the app itself) through a structured adapter (`agent-core`) over a gio
   process transport (`src/agent_proc.rs`). Every new-session action opens a
   thread. Terminal pages remain for any profile and for CLIs with no
   adapter.
@@ -58,7 +59,8 @@ Architectural mandates, standards, and workflows for this codebase.
     as a sub-agent; a reading aid too, though a delegated child's authority refuses what it
     recognises), `provider` (a profile's local or self-hosted model server, Ollama, LM Studio or
     LiteLLM: what Claude and Codex are started with to use it, and its model list read) and the
-    per-agent adapters and pure policies built on it.
+    per-agent adapters and pure policies built on it, `local_agent` among them (the Local
+    agent's runner arguments, tools, mode gate, request body and streamed-reply reader).
   - `crates/agent-kit` (GTK-free; blocking process and file I/O): `git`
     (git plumbing for turn checkpoints and diffs: shells out, but its parsers
     and filters are pure), `diff` (diff bases, numstat, line classification,
@@ -68,7 +70,8 @@ Architectural mandates, standards, and workflows for this codebase.
     a thread's subtitle its branch, shown only for a repository on GitHub),
     `handoff` (hand-off briefs, session readers, quota detection),
     `sessions` (`SessionFormat`, session IDs, transcript lookup and listing),
-    `paths` (`~` expansion), `provider_models` (a model server's model list) and `exec` (child
+    `paths` (`~` expansion), `provider_models` (a model server's model list), `local_agent` and
+    `local_tools` (the Local agent's runner: its chat client, loop, transcript and tools) and `exec` (child
     processes with a timeout).
   - `agent-kit`'s `store` is the SQLite thread store (threads, provider
     threads, scrubbed events, app meta such as the open-thread list).
@@ -306,16 +309,42 @@ Architectural mandates, standards, and workflows for this codebase.
   (`profile_source`). An API key is never stored: the profile names the variable holding it,
   Codex is handed only that name, and the key the model list needs is read before a launch
   removes the vendor's variables (`probe::ProviderKey`, never printed).
+- **The Local agent is the app's own runner, gated like the CLIs**: `Driver::Local` threads run
+  `agent-terminal --local-agent` (`agent_kit::local_agent`), whose pipes carry canonical
+  `Command`/`Envelope` JSON lines (`agent_core::local_agent::LocalAdapter` is a codec). Each
+  server is its own profile (`TerminalConfig::local_servers`), ready only when it lists a chat
+  model (`AgentAvailability::server_ready`). Its tools (`agent_kit::local_tools`) pass
+  `local_agent::gate` first: Plan offers and runs no writing tool, Ask asks before every write
+  and command, Accept edits asks before commands and before any write outside the thread's
+  folder (`local_tools::inside`, links followed, a dangling one counted outside). The runner keeps
+  no approval: the app's own scoped rules answer the cards they cover. A write is bound to what
+  was judged: its folders are opened one at a time without following a link
+  (`local_tools::write_target`), so a folder swapped for a link meanwhile fails it, and one judged
+  inside never lands outside. Files are opened without blocking and read only when regular, at
+  most a fixed size. Commands run in their own process group, killed on Stop or timeout, their
+  output capped and never waited on past a short grace. Stop ends a request's connection
+  (`ChatClient::cancel`). A call from a reply that was cut off or broke off never runs, and every
+  call of an interrupted reply gets an answer. History is sent and kept in whole exchanges.
+  It is never a delegation parent or child (`RouteBlocker::LocalAgentNoBridge`). Its
+  conversation is a `0600` file under `$XDG_STATE_HOME/agent-terminal/local`, which uninstall
+  removes with the state folder.
 - **Localhost bound**: interacts only with the local shell; exposes no ports. The outbound
-  connections are two. The update check (`agent_kit::update`): a single HTTPS GET of the
+  connections are three. The update check (`agent_kit::update`): a single HTTPS GET of the
   repository's latest GitHub release, off the main thread, with a timeout. It runs once per
   process a few seconds after startup unless Settings → "Check for Updates at Startup" is off
   (`check_updates_on_startup`), and when the user picks "Check for Updates…". Tests never reach
   it. And a model server's model list (`agent_kit::provider_models`): one GET of
   `<base>/v1/models` at the address the user configured for a profile's model provider, off the
   main thread, with a timeout, redirects not followed, made only while a profile has a provider
-  (when the models are listed, as the vendor's list is otherwise). Its tests use a loopback
-  listener of their own. Never add any other request. Two user actions reach GitHub without the app making a
+  (when the models are listed, as the vendor's list is otherwise; for each enabled Local server
+  at every agent scan and on Scan Now). For a Local server of a kind that says what each model
+  can do, the catalogue and Scan Now also ask it (`provider_models::fetch_info`): Ollama's
+  `POST /api/show` per model (at most 50, five seconds each), LM Studio's `GET /api/v1/models`;
+  a failure leaves a model to its name. Its tests use a loopback listener of their own. And the
+  Local agent's chat requests (`agent_kit::local_agent::HttpChat`): streamed POSTs of
+  `<base>/v1/chat/completions` to the address the user configured for that server, only while
+  one of its threads runs a turn, redirects not followed, the key sent only as a bearer token
+  read from the variable the profile names. Never add any other request. Two user actions reach GitHub without the app making a
   request: the diff panel's "Open a PR" hands GitHub's compare URL (built from the remote,
   credentials dropped: `agent_kit::github`) to the browser, and "Push & Open PR" runs one
   `git push` (never forced, after a confirmation that shows the command) through the user's own

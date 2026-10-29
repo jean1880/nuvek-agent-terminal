@@ -205,6 +205,8 @@ pub fn read_native_history(home: &Path, s: &NativeSession) -> Result<Vec<Envelop
         Driver::Claude => read_claude(home, id),
         Driver::Agy => read_agy(home, id),
         Driver::Codex => Err("Codex history cannot be imported yet".to_owned()),
+        // Its sessions are the app's own threads, already in the store.
+        Driver::Local => Err("Local sessions are threads already".to_owned()),
     }
 }
 

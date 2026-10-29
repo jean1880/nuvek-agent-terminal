@@ -66,6 +66,15 @@ fn main() -> glib::ExitCode {
             }
         };
     }
+    // The Local agent's runner: a pipe-driven agent loop, before logging or any GTK setup.
+    if std::env::args().nth(1).as_deref() == Some(agent_core::local_agent::RUNNER_FLAG) {
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        let code = agent_kit::local_agent::main(
+            &rest,
+            concat!("agent-terminal/", env!("CARGO_PKG_VERSION")),
+        );
+        return glib::ExitCode::from(code.clamp(0, 255) as u8);
+    }
     // agy's PreToolUse gate: a short-lived blocking client, before logging or any GTK setup.
     if std::env::args().nth(1).as_deref() == Some("--approval-hook") {
         approval_hook::main();
@@ -616,6 +625,7 @@ fn load_css() {
         .thread-dot.dot-claude { color: @brand_claude; }
         .thread-dot.dot-agy { color: @brand_agy; }
         .thread-dot.dot-codex { color: @brand_codex; }
+        .thread-dot.dot-local { color: @brand_local; }
         .thread-term { color: @at_fg_soft; }
         .thread-badge.badge-approval { color: @at_warning; }
         /* A thread waiting for approval while you are elsewhere glows until you look at it. */

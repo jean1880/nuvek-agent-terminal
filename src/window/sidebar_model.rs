@@ -1598,7 +1598,7 @@ mod tests {
             model(Driver::Agy, "gemini", &[]),
             model(Driver::Codex, "gpt", &[]),
         ];
-        let agents = menu_agents(&catalog, |d| d != Driver::Agy);
+        let agents = menu_agents(&catalog, |d| matches!(d, Driver::Claude | Driver::Codex));
         assert_eq!(
             agents.iter().map(|a| a.driver).collect::<Vec<_>>(),
             [Driver::Claude, Driver::Codex]
@@ -1869,7 +1869,7 @@ mod tests {
             assert_eq!(parse_driver(d.info().key), Some(d));
             // Exhaustive: a new driver fails to compile until it is in Driver::ALL.
             match d {
-                Driver::Claude | Driver::Agy | Driver::Codex => {}
+                Driver::Claude | Driver::Agy | Driver::Codex | Driver::Local => {}
             }
             assert_ne!(handoff_target(d, |_| true), Some(d));
         }
@@ -1931,11 +1931,14 @@ mod tests {
 
     #[test]
     fn the_default_handoff_target_cycles_to_the_next_usable_agent() {
-        use Driver::{Agy, Claude, Codex};
+        use Driver::{Agy, Claude, Codex, Local};
         let all = |_| true;
         assert_eq!(handoff_target(Claude, all), Some(Agy));
         assert_eq!(handoff_target(Agy, all), Some(Codex));
-        assert_eq!(handoff_target(Codex, all), Some(Claude));
+        // A vendor out of quota can carry on on the user's own server.
+        assert_eq!(handoff_target(Codex, all), Some(Local));
+        assert_eq!(handoff_target(Local, all), Some(Claude));
+        assert_eq!(handoff_target(Codex, |d| d != Local), Some(Claude));
         // Skips an agent that is off or not installed, and wraps.
         assert_eq!(handoff_target(Claude, |d| d == Codex), Some(Codex));
         assert_eq!(handoff_target(Codex, |d| d == Agy), Some(Agy));
@@ -1956,7 +1959,7 @@ mod tests {
         assert_eq!(safe_handoff_target(Claude, all, true), Some((Codex, false)));
         // agy is the only other agent: offered, flagged.
         assert_eq!(
-            safe_handoff_target(Claude, |d| d != Codex, true),
+            safe_handoff_target(Claude, |d| matches!(d, Claude | Agy), true),
             Some((Agy, true))
         );
         // Nothing usable at all.

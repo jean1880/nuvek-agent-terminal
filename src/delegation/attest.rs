@@ -360,7 +360,8 @@ impl DelegationHooks for Hooks {
                 let model = match w.driver {
                     Driver::Claude => v.pointer("/message/model").and_then(Value::as_str),
                     Driver::Agy => v.get("model").and_then(Value::as_str),
-                    Driver::Codex => None,
+                    // Never a delegated worker (`LocalAgentNoBridge`).
+                    Driver::Codex | Driver::Local => None,
                 };
                 if let Some(model) = model.filter(|m| !m.is_empty() && *m != "unrecognized_model") {
                     observe(identity, IdentityObservation::ReportedModel(model.into()));
@@ -672,6 +673,8 @@ fn observe_calls(
                 );
             }
         }
+        // It has no delegation bridge, so it calls no delegation tool to attest.
+        Driver::Local => {}
     }
 }
 

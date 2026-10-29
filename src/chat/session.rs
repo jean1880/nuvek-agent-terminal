@@ -3683,6 +3683,16 @@ impl Inner {
         self.start_process();
     }
 
+    /// Whether this agent's launch binds the thread's model into its environment (Claude on a
+    /// model server: `agent_core::provider::bind_thread_model`): its model changes are restarts.
+    fn binds_thread_model(&self) -> bool {
+        self.launch_env
+            .borrow()
+            .env
+            .iter()
+            .any(|(_, v)| v == agent_core::provider::THREAD_MODEL)
+    }
+
     /// agy with no approval handle: Plan and Accept edits go to its `--mode` flag, but it cannot
     /// ask before acting.
     fn ask_unavailable(&self) -> bool {
@@ -4689,6 +4699,23 @@ impl Inner {
         }
         match transition {
             Transition::Reuse => {}
+            // On a model server Claude Code refuses a live `set_model` to a model id it does not
+            // know ("Couldn't confirm model"), and its own model names were bound to the old
+            // model at the spawn: the switch is a restart resuming the same session, which
+            // passes `--model` and binds them again.
+            Transition::SwitchModelInSession if self.binds_thread_model() => {
+                self.ensure_alive();
+                if !self.state.borrow().alive {
+                    return;
+                }
+                let native = self.state.borrow().native_id.clone();
+                self.respawn(&OpenSessionDelta {
+                    model: Some(target_model),
+                    effort,
+                    mode: None,
+                    resume: native,
+                });
+            }
             Transition::SwitchModelInSession => {
                 self.ensure_alive();
                 if !self.state.borrow().alive {
@@ -7310,6 +7337,73 @@ mod tests {
             model: Some(model.into()),
             ..open_session("/bin/true", Vec::new(), "/")
         }
+    }
+
+    /// Claude on a model server refuses a live `set_model` to an id it does not know, and its own
+    /// model names were bound to the old model: a model change restarts it on the new model
+    /// (resuming the session), bound again. Elsewhere the change stays a live `set_model`.
+    #[test]
+    fn a_model_change_on_a_model_server_restarts_on_the_new_model() {
+        in_loop(|_| {
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let log: Log = Rc::default();
+            let (sink, seen) = make_sink();
+            let session = ChatSession::with_env(
+                FakeAdapter::boxed(Driver::Claude, &log),
+                open_on("qwen3.5:4b"),
+                store.clone(),
+                thread.clone(),
+                sink,
+                Err(None),
+                LaunchEnv {
+                    env: vec![(
+                        "ANTHROPIC_DEFAULT_HAIKU_MODEL".into(),
+                        agent_core::provider::THREAD_MODEL.into(),
+                    )],
+                    unset: Vec::new(),
+                },
+            );
+            session.inner.state.borrow_mut().native_id = Some("native-1".into());
+            session.switch(Driver::Claude, Some("qwen3.5:9b".into()), None);
+            assert!(
+                !log.borrow()
+                    .iter()
+                    .any(|c| matches!(c, Command::SetModel { .. })),
+                "no live set_model"
+            );
+            assert_eq!(
+                session.inner.open.borrow().model.as_deref(),
+                Some("qwen3.5:9b")
+            );
+            assert_eq!(
+                session.inner.open.borrow().resume.as_deref(),
+                Some("native-1")
+            );
+            assert!(session
+                .launch_spec()
+                .env
+                .contains(&("ANTHROPIC_DEFAULT_HAIKU_MODEL".into(), "qwen3.5:9b".into())));
+            assert!(has(
+                &seen,
+                |e| matches!(e, Event::ModelChangeRequested { model }
+                if model == "qwen3.5:9b")
+            ));
+
+            // The vendor's Claude keeps its live switch.
+            let thread = fresh(&store, "/w");
+            let log: Log = Rc::default();
+            let (session, _) = harness(
+                FakeAdapter::boxed(Driver::Claude, &log),
+                open_on("claude-sonnet-5-5"),
+                &store,
+                &thread,
+            );
+            session.switch(Driver::Claude, Some("claude-opus-5-5".into()), None);
+            assert!(log.borrow().iter().any(
+                |c| matches!(c, Command::SetModel { model, .. } if model == "claude-opus-5-5")
+            ));
+        });
     }
 
     #[test]

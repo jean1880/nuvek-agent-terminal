@@ -199,7 +199,11 @@ Claude Code also picks models on its own: its `opus`, `sonnet`, `haiku` and `fab
 aliases (background tasks use `haiku`), its subagents and auto mode. On a model server all
 of these name the thread's model (`ANTHROPIC_DEFAULT_*_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL`
 and the rest are set for it, and follow a model change), so nothing is sent for a model the
-server does not have. Values for them in your own environment are replaced.
+server does not have. Values for them in your own environment are replaced. Changing the
+model of a thread on a server restarts Claude on the new model, resuming the same
+conversation (Claude Code cannot switch to a model id it does not know in place). Ollama
+answers Claude's token-count requests with 404 (it has no `/v1/messages/count_tokens`);
+Claude carries on without them.
 
 Claude Code assumes a 200K-token context window for a model id it does not know, and
 compacts only near that. Give the server a context window a coding agent can work in (64K

@@ -127,6 +127,7 @@ pub struct AccountStatus {
     claude: RefCell<Snapshot>,
     agy: RefCell<Snapshot>,
     codex: RefCell<Snapshot>,
+    local: RefCell<Snapshot>,
     listeners: ListenerSet,
     /// Told of every successful reading, changed or not (`read_at` moved): the usage file.
     read_listeners: ListenerSet,
@@ -152,6 +153,7 @@ impl AccountStatus {
             claude: RefCell::default(),
             agy: RefCell::default(),
             codex: RefCell::default(),
+            local: RefCell::default(),
             listeners: ListenerSet::default(),
             read_listeners: ListenerSet::default(),
             refreshing: Cell::new(false),
@@ -171,6 +173,7 @@ impl AccountStatus {
             Driver::Claude => &self.claude,
             Driver::Agy => &self.agy,
             Driver::Codex => &self.codex,
+            Driver::Local => &self.local,
         }
     }
 
@@ -507,6 +510,11 @@ impl AccountStatus {
                         me.probe_finished(driver, now_epoch());
                         done();
                     });
+                }
+                // A model server has no account or plan quota to read.
+                Driver::Local => {
+                    me.probe_finished(driver, now_epoch());
+                    done();
                 }
                 Driver::Agy => {
                     let target = target.clone();

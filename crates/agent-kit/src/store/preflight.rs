@@ -954,6 +954,15 @@ mod tests {
                 .collect::<rusqlite::Result<_>>()
                 .expect("rows")
         };
+        // v6 rebuilds `provider_threads` (and its index) to widen its driver check: that table
+        // is v6's change, not v4's, and is checked by its own migration test.
+        let rebuilt_in_v6 = |name: &str| name.starts_with("provider_threads");
+        let objects = |c: &Connection| -> Vec<(String, String, Option<String>)> {
+            objects(c)
+                .into_iter()
+                .filter(|(_, name, _)| !rebuilt_in_v6(name))
+                .collect()
+        };
         let before = objects(&read_only(&db));
         drop(Store::open(&db).expect("open"));
         let after = objects(&read_only(&db));

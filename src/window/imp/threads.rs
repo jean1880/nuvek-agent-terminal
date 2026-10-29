@@ -1774,14 +1774,12 @@ pub(super) fn no_model_reason(source: &agent_core::provider::ModelProvider) -> S
 /// profile's default, else the first chat model the server lists; never the CLI's own setting,
 /// which names a vendor model (`opus`) the server does not have.
 pub(super) fn start_model(profile: &Profile, driver: Driver) -> Option<String> {
-    match profile
-        .provider
-        .as_ref()
+    match crate::config::profile_provider(profile, driver)
         .filter(|_| agent_core::provider::supports(driver))
     {
         None => profile.effective_default_model(None),
         Some(source) => profile.default_model.clone().or_else(|| {
-            let listed = ModelCatalog::shared().models_for(driver, Some(source));
+            let listed = ModelCatalog::shared().models_for(driver, Some(&source));
             agent_core::provider::first_chat_model(listed.iter().map(|m| m.id.as_str()))
                 .map(str::to_owned)
         }),
@@ -1796,8 +1794,7 @@ fn other_profile_sources(
     all: &[Profile],
 ) -> Vec<(Driver, Option<agent_core::provider::ModelProvider>, Profile)> {
     let source = |driver: Driver, p: &Profile| {
-        p.provider
-            .clone()
+        crate::config::profile_provider(p, driver)
             .filter(|_| agent_core::provider::supports(driver))
     };
     let mut out: Vec<(Driver, Option<agent_core::provider::ModelProvider>, Profile)> = Vec::new();
@@ -1824,7 +1821,11 @@ pub(super) fn profile_source(
 ) -> Option<agent_core::provider::ModelProvider> {
     config
         .thread_profile(profile_id, driver)
-        .and_then(|p| p.provider.clone())
+        .cloned()
+        .or_else(|| {
+            agent_core::provider::required(driver).then(|| crate::config::new_agent_profile(driver))
+        })
+        .and_then(|p| crate::config::profile_provider(&p, driver))
         .filter(|_| agent_core::provider::supports(driver))
 }
 
@@ -2256,6 +2257,8 @@ pub(super) async fn resolve_agent(profile: Profile) -> ResolvedAgent {
         return ResolvedAgent::default();
     }
     let (path, home, shell) = env_triplet();
+    // The app runs the Local agent itself: its program is this binary, never one on PATH.
+    let built_in = crate::config::profile_driver(&profile).is_some_and(Driver::is_built_in);
     let command = profile.command.clone();
     let env_file = profile.env_file.clone();
     // The patterns the launch will clear: an export of one of those variables equal to its
@@ -2264,8 +2267,11 @@ pub(super) async fn resolve_agent(profile: Profile) -> ResolvedAgent {
     let clear = SharedConfig::default().borrow().clear_env.clone();
     let read_with = clear.clone();
     let resolved = gtk4::gio::spawn_blocking(move || {
-        let probe = crate::utils::SystemProbe::new(path, home, shell);
-        let program = probe.locate(&command);
+        let program = if built_in {
+            crate::utils::own_program()
+        } else {
+            crate::utils::SystemProbe::new(path, home, shell).locate(&command)
+        };
         let sourced = env_file
             .as_deref()
             .filter(|f| !f.trim().is_empty())
@@ -2297,24 +2303,93 @@ pub(super) async fn resolve_agent(profile: Profile) -> ResolvedAgent {
     resolved
 }
 
-/// `driver`'s own profile in `config`, or a bare one for an agent with none.
+/// Whether the Local server `server` lists a chat model, with the key its threads would use (its
+/// env file, less `clear`). A key variable named but unset is not ready.
+pub(super) async fn scan_local_server(server: &Profile, driver: Driver, clear: &[String]) -> bool {
+    let Some(provider) = crate::config::profile_provider(server, driver) else {
+        return false;
+    };
+    let key = match provider.key_env() {
+        Ok(Some(name)) => {
+            let resolved = resolve_agent(server.clone()).await;
+            match agent_env(resolved.env, clear).lookup(name) {
+                Some(value) => Some(value),
+                None => return false,
+            }
+        }
+        Ok(None) => None,
+        Err(_) => return false,
+    };
+    server_has_chat_model(&provider, key).await
+}
+
+/// Whether `provider` lists a model a conversation can run on (not only embedding models), read
+/// off the main thread. An unreachable server, or one listing none, is not ready: never assumed.
+async fn server_has_chat_model(
+    provider: &agent_core::provider::ModelProvider,
+    key: Option<String>,
+) -> bool {
+    let provider = provider.clone();
+    let listed = gtk4::gio::spawn_blocking(move || {
+        agent_kit::provider_models::fetch(
+            &provider,
+            key.as_deref(),
+            crate::model_catalog::USER_AGENT,
+        )
+    })
+    .await
+    .unwrap_or_else(|_| Err("the model list fetch panicked".to_owned()));
+    match listed {
+        Ok(ids) => agent_core::provider::first_chat_model(ids.iter().map(String::as_str)).is_some(),
+        Err(why) => {
+            warn!(%why, "the Local agent's model server is not ready");
+            false
+        }
+    }
+}
+
+/// The Local server an action that names none runs on: the first switched on whose last scan
+/// found a chat model. `None` while none has.
+pub(super) fn ready_local_server(config: &crate::config::TerminalConfig) -> Option<Profile> {
+    let availability = AgentAvailability::shared();
+    config
+        .local_servers()
+        .into_iter()
+        .find(|p| !p.disabled && availability.server_ready(&p.id))
+        .cloned()
+}
+
+/// `driver`'s own profile in `config`, or a bare one for an agent with none. For the Local
+/// agent, a server that is ready comes first: the first one switched on may be offline.
 pub(super) fn agent_profile_or_new(
     config: &crate::config::TerminalConfig,
     driver: Driver,
 ) -> Profile {
-    config
-        .agent_profile(driver)
-        .cloned()
+    driver
+        .is_built_in()
+        .then(|| ready_local_server(config))
+        .flatten()
+        .or_else(|| config.agent_profile(driver).cloned())
         .unwrap_or_else(|| crate::config::new_agent_profile(driver))
 }
 
 /// The profile a thread opened with `profile_id` runs on `driver` with
-/// ([`crate::config::TerminalConfig::thread_profile`]), or a bare one for an agent with none.
+/// ([`crate::config::TerminalConfig::thread_profile`]), or a bare one for an agent with none. A
+/// thread keeps the Local server it was opened on, even offline; one with none of its own (a
+/// switch to Local) gets a ready one.
 pub(super) fn thread_profile_or_new(
     config: &crate::config::TerminalConfig,
     profile_id: Option<&str>,
     driver: Driver,
 ) -> Profile {
+    let own = profile_id
+        .and_then(|id| config.profile_by_id(id))
+        .filter(|p| crate::config::profile_driver(p) == Some(driver));
+    if own.is_none() && driver.is_built_in() {
+        if let Some(ready) = ready_local_server(config) {
+            return ready;
+        }
+    }
     config
         .thread_profile(profile_id, driver)
         .cloned()
@@ -2342,7 +2417,7 @@ pub(super) fn profile_launch(
 ) -> Result<(Vec<String>, AgentEnv), String> {
     let mut args = profile.args.clone();
     let mut agent = agent_env(env, clear);
-    let Some(provider) = &profile.provider else {
+    let Some(provider) = &crate::config::profile_provider(profile, driver) else {
         return Ok((args, agent));
     };
     let key = provider
@@ -2443,8 +2518,9 @@ fn agent_launch_with(
     let (extra_args, env) = profile_launch(&profile, driver, resolved.env, &clear)?;
     let adapter = make_adapter(driver, &program);
     let approval = match driver {
-        // Claude and Codex raise approvals over their own protocol, not the hook socket.
-        Driver::Claude | Driver::Codex => Err(None),
+        // Claude, Codex and the Local runner raise approvals over their own protocol, not the
+        // hook socket.
+        Driver::Claude | Driver::Codex | Driver::Local => Err(None),
         Driver::Agy => {
             let target = crate::hook_config::HookTarget::new(&env, Some(cwd.into()));
             let verdict = cached_hook_verdict(&target);
@@ -2500,6 +2576,7 @@ fn make_adapter(driver: Driver, program: &str) -> std::boxed::Box<dyn Adapter> {
         Driver::Codex => std::boxed::Box::new(
             agent_core::codex::CodexAdapter::new().client_version(env!("CARGO_PKG_VERSION")),
         ),
+        Driver::Local => std::boxed::Box::new(agent_core::local_agent::LocalAdapter::new()),
     }
 }
 
@@ -2553,7 +2630,7 @@ async fn launch_hook_verdict(
             ))
             .await
         }
-        Driver::Claude | Driver::Codex => Ok(()),
+        Driver::Claude | Driver::Codex | Driver::Local => Ok(()),
     }
 }
 
@@ -5591,7 +5668,7 @@ impl AgentTerminalWindow {
             model,
             effort,
             mode,
-            new_session_id: (resume.is_none() && driver == Driver::Claude)
+            new_session_id: (resume.is_none() && matches!(driver, Driver::Claude | Driver::Local))
                 .then(|| glib::uuid_string_random().to_string()),
             resume,
             approval_hook: false,
@@ -5599,7 +5676,8 @@ impl AgentTerminalWindow {
         };
         let adapter = make_adapter(driver, &program);
         let approval = match driver {
-            Driver::Claude | Driver::Codex => Err(None),
+            // These raise approvals over their own protocol, not the hook socket.
+            Driver::Claude | Driver::Codex | Driver::Local => Err(None),
             Driver::Agy => {
                 // Settings may have changed clear_env while the hook check or catalogue waited.
                 bind_approval(hook_for_launch(hook, &launch_env, dir), thread, dir, mode)
@@ -7107,6 +7185,14 @@ impl AgentTerminalWindow {
             ..
         } = new;
         let store = app_handle();
+        // A Local thread opened without a server of its own is pinned to a ready one now, so it
+        // keeps that server rather than the first one switched on.
+        let profile_id = profile_id.or_else(|| {
+            driver
+                .is_built_in()
+                .then(|| ready_local_server(&self.config.borrow()).map(|p| p.id))
+                .flatten()
+        });
         // The agent is recorded now, so the sidebar and a later reopen know it before the
         // session starts. The session adopts this provider thread.
         let model = model.or_else(|| {
@@ -7513,7 +7599,7 @@ impl AgentTerminalWindow {
         refresh_hook_verdict(directories, active);
         let availability = AgentAvailability::shared();
         availability.mark_scan_started();
-        let (profiles, clear, others) = {
+        let (profiles, clear, others, local_servers) = {
             let config = self.config.borrow();
             let profiles: Vec<(Driver, Profile)> = Driver::ALL
                 .into_iter()
@@ -7523,7 +7609,8 @@ impl AgentTerminalWindow {
                 })
                 .collect();
             let others = other_profile_sources(&profiles, &config.profiles);
-            (profiles, config.clear_env.clone(), others)
+            let servers: Vec<Profile> = config.local_servers().into_iter().cloned().collect();
+            (profiles, config.clear_env.clone(), others, servers)
         };
         for (driver, profile) in &profiles {
             if !scan_is_current(generation) {
@@ -7578,9 +7665,8 @@ impl AgentTerminalWindow {
                 // from the server, with the key its threads would use (read here, before a
                 // launch removes the vendor's variables, which may be the one holding it).
                 // (agy cannot run on one: its launch refuses, so it keeps its own list.)
-                if let Some(provider) = profile
-                    .provider
-                    .clone()
+                let mut server_lists = true;
+                if let Some(provider) = crate::config::profile_provider(&profile, driver)
                     .filter(|_| agent_core::provider::supports(driver))
                 {
                     let key = provider
@@ -7588,10 +7674,29 @@ impl AgentTerminalWindow {
                         .ok()
                         .flatten()
                         .and_then(|n| env.lookup(n));
+                    // The app runs this agent itself, so nothing is installed to find: each of
+                    // its servers is ready when it lists a model it can chat with, and the agent
+                    // when any one is.
+                    if driver.is_built_in() {
+                        let mut any = false;
+                        let mut scanned = Vec::new();
+                        for server in local_servers.iter().filter(|s| !s.disabled) {
+                            let ready = scan_local_server(server, driver, &clear).await;
+                            if !scan_is_current(generation) {
+                                return;
+                            }
+                            availability.set_server(&server.id, ready);
+                            scanned.push(server.id.clone());
+                            any |= ready;
+                        }
+                        availability.keep_servers(&scanned);
+                        server_lists = any;
+                    }
                     providers.push((driver, provider, crate::probe::ProviderKey::new(key)));
                 }
                 envs.push((driver, env));
-                let state = classify(false, Some(resolved.program.as_deref()));
+                let program = resolved.program.as_deref().filter(|_| server_lists);
+                let state = classify(false, Some(program));
                 // Back from missing (installed, or switched on again): its list may be new.
                 if state.is_ready()
                     && matches!(

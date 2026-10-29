@@ -62,6 +62,8 @@ struct CacheFile {
     agy: Vec<CatalogModel>,
     #[serde(default)]
     codex: Vec<CatalogModel>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    local: Vec<CatalogModel>,
     /// When each list was last fetched successfully (epoch seconds), so a restart cannot make an
     /// old list look new. A file from before this field reads as never fetched: Expired.
     #[serde(default)]
@@ -145,6 +147,7 @@ pub struct ModelCatalog {
     claude: RefCell<Vec<CatalogModel>>,
     agy: RefCell<Vec<CatalogModel>>,
     codex: RefCell<Vec<CatalogModel>>,
+    local: RefCell<Vec<CatalogModel>>,
     /// The agents whose list was fetched in this run (not just read from the cache).
     fresh: RefCell<Vec<Driver>>,
     /// The agents whose fetch in this run has finished, whether or not it succeeded.
@@ -210,6 +213,7 @@ impl ModelCatalog {
             claude: RefCell::new(loaded.claude),
             agy: RefCell::new(loaded.agy),
             codex: RefCell::new(loaded.codex),
+            local: RefCell::new(loaded.local),
             fresh: RefCell::new(Vec::new()),
             attempted: RefCell::new(Vec::new()),
             listeners: ListenerSet::default(),
@@ -431,6 +435,7 @@ impl ModelCatalog {
         let mut all = self.claude.borrow().clone();
         all.extend(self.agy.borrow().iter().cloned());
         all.extend(self.codex.borrow().iter().cloned());
+        all.extend(self.local.borrow().iter().cloned());
         all
     }
 
@@ -599,6 +604,7 @@ impl ModelCatalog {
             Driver::Claude => &self.claude,
             Driver::Agy => &self.agy,
             Driver::Codex => &self.codex,
+            Driver::Local => &self.local,
         }
     }
 
@@ -665,6 +671,7 @@ impl ModelCatalog {
             claude: self.claude.borrow().clone(),
             agy: self.agy.borrow().clone(),
             codex: self.codex.borrow().clone(),
+            local: self.local.borrow().clone(),
             read_at: self.read_at.get(),
             sources: self.sources.borrow().clone(),
             others: self.others.borrow().clone(),
@@ -951,13 +958,20 @@ impl ModelCatalog {
                         done();
                     });
                 }
+                // Its list always comes from its server (above); with no server known there is
+                // no vendor to ask.
+                Driver::Local => {
+                    me.mark_failed(driver);
+                    me.mark_attempted(driver);
+                    done();
+                }
             }
         }
     }
 }
 
 /// The User-Agent of a model server request.
-const USER_AGENT: &str = concat!("agent-terminal/", env!("CARGO_PKG_VERSION"));
+pub(crate) const USER_AGENT: &str = concat!("agent-terminal/", env!("CARGO_PKG_VERSION"));
 
 /// `driver`'s catalogue entries for the model ids `provider` serves: shown by id, as reached
 /// through the server, with no effort levels (a server reports none).
@@ -967,6 +981,11 @@ fn provider_models(
     ids: Vec<String>,
 ) -> Vec<CatalogModel> {
     ids.into_iter()
+        // The Local agent only chats: an embedding model the server also lists is not offered.
+        // (Claude and Codex on a server keep the server's whole list, as before.)
+        .filter(|id| {
+            !driver.is_built_in() || agent_core::provider::first_chat_model([id.as_str()]).is_some()
+        })
         .map(|id| CatalogModel {
             driver,
             display: id.clone(),
@@ -1218,10 +1237,12 @@ mod tests {
             claude: vec![model(Driver::Claude, "opus")],
             agy: vec![model(Driver::Agy, "gemini-3.1-pro-high")],
             codex: vec![model(Driver::Codex, "gpt-5-codex")],
+            local: vec![model(Driver::Local, "qwen3.5:9b")],
             read_at: ReadAt {
                 claude: Some(1_700_000_000),
                 agy: None,
                 codex: Some(1_700_000_100),
+                local: Some(1_700_000_200),
             },
             sources: vec![(
                 Driver::Codex,
@@ -1528,6 +1549,14 @@ mod tests {
             ("qwen3.5:9b", Some("Ollama"))
         );
         assert!(models[0].efforts.is_empty());
+        // The Local agent is offered only what it can chat with.
+        let ids = || vec!["qwen3.5:9b".into(), "nomic-embed-text:latest".into()];
+        assert_eq!(provider_models(Driver::Codex, &provider, ids()).len(), 2);
+        let local = provider_models(Driver::Local, &provider, ids());
+        assert_eq!(
+            local.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["qwen3.5:9b"]
+        );
     }
 
     use crate::freshness::{age_of, freshness, Freshness, DUE_SLACK};
@@ -1629,7 +1658,9 @@ mod tests {
         // The oldest shown list sets the footer's age.
         again.set_at(Driver::Codex, vec![model(Driver::Codex, "gpt")], NOW + 7200);
         assert_eq!(
-            again.status_of(|d| d != Driver::Agy).read_at,
+            again
+                .status_of(|d| matches!(d, Driver::Claude | Driver::Codex))
+                .read_at,
             Some(NOW + 3600)
         );
         // A shown agent with no list at all was not read: the footer cannot say "Updated".

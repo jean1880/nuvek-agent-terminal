@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Original monogram for agent-terminal's Local agent (a local model server): a rounded frame holding a prompt
+     chevron over a model-server rack line. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <path fill="#2e3436" fill-rule="evenodd" d="M4 1h8a3 3 0 0 1 3 3v8a3 3 0 0 1-3 3H4a3 3 0 0 1-3-3V4a3 3 0 0 1 3-3zM4 2.6A1.4 1.4 0 0 0 2.6 4v8A1.4 1.4 0 0 0 4 13.4h8a1.4 1.4 0 0 0 1.4-1.4V4A1.4 1.4 0 0 0 12 2.6zM4.6 4.4L8 6.6 4.6 8.8 3.9 7.7 5.6 6.6 3.9 5.5zM8.6 7.9h3.4v1.3H8.6zM3.9 10.4h8.1v1.3H3.9z"/>
+</svg>

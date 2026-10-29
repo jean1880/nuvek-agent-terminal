@@ -2815,6 +2815,28 @@ impl AgentTerminalWindow {
             with.append_item(&gtk4::gio::MenuItem::new(Some(label), Some("win.no-agent")));
         }
         for driver in ready {
+            // The Local agent: one entry per server ready to answer, each a thread on that
+            // server's profile.
+            if driver.is_built_in() {
+                let availability = crate::availability::AgentAvailability::shared();
+                let servers: Vec<Profile> = self
+                    .config
+                    .borrow()
+                    .local_servers()
+                    .into_iter()
+                    .filter(|p| !p.disabled && availability.server_ready(&p.id))
+                    .cloned()
+                    .collect();
+                for server in servers {
+                    let item = gtk4::gio::MenuItem::new(Some(&server.name), None);
+                    item.set_action_and_target_value(
+                        Some("win.new-tab-profile"),
+                        Some(&server.name.to_variant()),
+                    );
+                    with.append_item(&item);
+                }
+                continue;
+            }
             let item = gtk4::gio::MenuItem::new(Some(driver.info().label), None);
             item.set_action_and_target_value(
                 Some("win.new-thread-agent"),

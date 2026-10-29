@@ -294,6 +294,8 @@ fn choice(
         }
         // The effort rides on every turn, so sending it never restarts anything.
         Driver::Codex => (m.id.clone(), effort.map(str::to_owned)),
+        // A model server's models carry no effort.
+        Driver::Local => (m.id.clone(), None),
     }
 }
 

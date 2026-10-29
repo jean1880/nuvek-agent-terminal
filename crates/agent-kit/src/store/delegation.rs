@@ -1607,7 +1607,7 @@ mod tests {
         s.conn
             .execute_batch(
                 "ALTER TABLE delegation_event_links DROP COLUMN process_generation;
-            DELETE FROM schema_version WHERE version = 5;",
+            DELETE FROM schema_version WHERE version >= 5;",
             )
             .expect("old v4 schema");
         s.conn.execute("INSERT INTO delegation_event_links (event_seq,worker_id,root_id,run_id,category,invocation_id)

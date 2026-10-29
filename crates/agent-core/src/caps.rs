@@ -56,6 +56,7 @@ impl Capabilities {
             Driver::Claude => Self::claude(),
             Driver::Agy => Self::agy(),
             Driver::Codex => Self::codex(),
+            Driver::Local => Self::local(),
         }
     }
 
@@ -150,6 +151,31 @@ impl Capabilities {
             // `turn/steer` (codex-cli 0.161.0's own schema).
             live_input: true,
             // Its workers are sub-agents, shown in the sub-agent panel; no shell task to read.
+            task_output: false,
+        }
+    }
+
+    /// The app's own runner (`crate::local_agent`): it takes the model, mode, approvals and interrupts
+    /// over its pipes; the model list comes from the server, read by the app.
+    pub fn local() -> Self {
+        Self {
+            model_switch_in_session: true,
+            mode_change_restarts: false,
+            live_approvals: true,
+            interrupt_keeps_process: true,
+            file_suggestions: false,
+            mcp_panel: false,
+            settings_panel: false,
+            model_list: true,
+            context_usage: false,
+            usage: false,
+            compact_command: None,
+            streams_text: true,
+            streams_reasoning: true,
+            questions: false,
+            plan_mode: true,
+            forms: false,
+            live_input: false,
             task_output: false,
         }
     }

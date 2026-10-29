@@ -1473,7 +1473,10 @@ pub(crate) mod tests {
             inner.interruption.revealer.reveals_child(),
             "a child's approval must reach the parent's pinned shelf"
         );
-        assert_eq!(inner.thinking.dot_states(), ["lead", "dimmed", "working"]);
+        assert_eq!(
+            inner.thinking.dot_states(),
+            ["lead", "dimmed", "working", "dimmed"]
+        );
         assert!(inner.open_worker("w_workerAA"));
         let inspector = inner.worker_inspector.borrow().clone().expect("inspector");
         assert_eq!(
@@ -1549,7 +1552,10 @@ pub(crate) mod tests {
             inner.thinking.shown().as_deref(),
             Some("Waiting on 1 background task…")
         );
-        assert_eq!(inner.thinking.dot_states(), ["lead", "dimmed", "working"]);
+        assert_eq!(
+            inner.thinking.dot_states(),
+            ["lead", "dimmed", "working", "dimmed"]
+        );
         // Between runs a worker is idle: its agent dims, and nothing holds the parent.
         let mut idle = summary("w_workerAA", "r_secondRun");
         idle.run_id = None;

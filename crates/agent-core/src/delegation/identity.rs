@@ -105,7 +105,7 @@ pub enum ProvenanceRule {
 pub fn model_rule(d: Driver) -> ProvenanceRule {
     match d {
         Driver::Claude => ProvenanceRule::ReportedPerTurn,
-        Driver::Codex | Driver::Agy => ProvenanceRule::AcceptedOnSuccess,
+        Driver::Codex | Driver::Agy | Driver::Local => ProvenanceRule::AcceptedOnSuccess,
     }
 }
 
@@ -113,7 +113,7 @@ pub fn model_rule(d: Driver) -> ProvenanceRule {
 pub fn effort_rule(d: Driver) -> ProvenanceRule {
     match d {
         Driver::Codex => ProvenanceRule::AcceptedOnSuccess,
-        Driver::Claude | Driver::Agy => ProvenanceRule::ConfiguredOnly,
+        Driver::Claude | Driver::Agy | Driver::Local => ProvenanceRule::ConfiguredOnly,
     }
 }
 

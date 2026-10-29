@@ -35,14 +35,45 @@ pub enum ProviderKind {
     LmStudio,
     #[serde(rename = "litellm")]
     LiteLlm,
+    Vllm,
+    #[serde(rename = "llama_cpp")]
+    LlamaCpp,
+    #[serde(rename = "sglang")]
+    SgLang,
+    #[serde(rename = "localai")]
+    LocalAi,
+    Jan,
+    #[serde(rename = "text_generation_webui")]
+    TextGenWebUi,
+    /// Any other server with an OpenAI-compatible API: it has no default address.
+    #[serde(rename = "openai_compatible")]
+    OpenAiCompatible,
 }
 
 impl ProviderKind {
-    /// Every kind, in the order Settings lists them. Guarded by `all_lists_every_kind`.
+    /// The kinds Claude and Codex can run on, in the order Settings lists them: each verified
+    /// with them (Anthropic-compatible `/v1/messages` for Claude, `/v1/responses` for Codex).
     pub const ALL: [ProviderKind; 3] = [
         ProviderKind::Ollama,
         ProviderKind::LmStudio,
         ProviderKind::LiteLlm,
+    ];
+
+    /// The kinds the Local agent can run on, in the order Settings lists them: every server
+    /// that serves OpenAI-compatible `/v1/models` and streamed `/v1/chat/completions` with tool
+    /// calls (the Local agent's whole need), then any other such server. Guarded by
+    /// `local_lists_every_kind`.
+    pub const LOCAL: [ProviderKind; 10] = [
+        ProviderKind::Ollama,
+        ProviderKind::LmStudio,
+        ProviderKind::Vllm,
+        ProviderKind::LlamaCpp,
+        ProviderKind::SgLang,
+        ProviderKind::LocalAi,
+        ProviderKind::Jan,
+        ProviderKind::TextGenWebUi,
+        ProviderKind::LiteLlm,
+        ProviderKind::OpenAiCompatible,
     ];
 
     pub fn label(self) -> &'static str {
@@ -50,15 +81,48 @@ impl ProviderKind {
             ProviderKind::Ollama => "Ollama",
             ProviderKind::LmStudio => "LM Studio",
             ProviderKind::LiteLlm => "LiteLLM",
+            ProviderKind::Vllm => "vLLM",
+            ProviderKind::LlamaCpp => "llama.cpp server",
+            ProviderKind::SgLang => "SGLang",
+            ProviderKind::LocalAi => "LocalAI",
+            ProviderKind::Jan => "Jan",
+            ProviderKind::TextGenWebUi => "text-generation-webui",
+            ProviderKind::OpenAiCompatible => "Other (OpenAI-compatible)",
         }
     }
 
-    /// Where the server listens when it runs on this machine with its own defaults.
+    /// Where the server listens when it runs on this machine with its own defaults (from each
+    /// server's documentation, 2026-10). Empty for [`ProviderKind::OpenAiCompatible`]: its
+    /// address must be given.
     pub fn default_base_url(self) -> &'static str {
         match self {
             ProviderKind::Ollama => "http://localhost:11434",
             ProviderKind::LmStudio => "http://localhost:1234",
             ProviderKind::LiteLlm => "http://localhost:4000",
+            ProviderKind::Vllm => "http://localhost:8000",
+            // The port its documentation's examples use; a build may be started on another.
+            ProviderKind::LlamaCpp => "http://localhost:8080",
+            ProviderKind::SgLang => "http://localhost:30000",
+            ProviderKind::LocalAi => "http://localhost:8080",
+            ProviderKind::Jan => "http://127.0.0.1:1337",
+            ProviderKind::TextGenWebUi => "http://localhost:5000",
+            ProviderKind::OpenAiCompatible => "",
+        }
+    }
+
+    /// What a server of this kind needs set up to call tools, for Settings to say when a model
+    /// answers without them. `None`: nothing beyond a model that supports them.
+    pub fn tool_setup_hint(self) -> Option<&'static str> {
+        match self {
+            ProviderKind::Vllm => {
+                Some("vLLM calls tools only when started with --enable-auto-tool-choice --tool-call-parser <parser>")
+            }
+            ProviderKind::SgLang => Some("SGLang calls tools only when started with --tool-call-parser <parser>"),
+            ProviderKind::LlamaCpp => Some("llama.cpp calls tools only with its Jinja chat templates (--jinja)"),
+            ProviderKind::TextGenWebUi => {
+                Some("text-generation-webui runs only the model it has loaded, whichever is picked here")
+            }
+            _ => None,
         }
     }
 
@@ -69,6 +133,8 @@ impl ProviderKind {
             ProviderKind::Ollama => "ollama",
             ProviderKind::LmStudio => "lmstudio",
             ProviderKind::LiteLlm => "litellm",
+            // Never offered for Claude; a value any of them ignores without a key set.
+            _ => "local",
         }
     }
 }
@@ -159,12 +225,19 @@ pub fn launch_on_server(args: &[String], env: &[(String, String)]) -> bool {
     env.iter().any(|(_, v)| v == THREAD_MODEL) || args.contains(&codex)
 }
 
-/// Whether `driver` can run on a provider. agy only speaks to Google's own models.
+/// Whether `driver` can run on a provider. agy only speaks to Google's own models; the Local agent
+/// runs on nothing else.
 pub fn supports(driver: Driver) -> bool {
     match driver {
-        Driver::Claude | Driver::Codex => true,
+        Driver::Claude | Driver::Codex | Driver::Local => true,
         Driver::Agy => false,
     }
+}
+
+/// Whether `driver` must have a provider: the Local agent has no vendor to fall back to, so a
+/// profile without one runs on the default server kind's address on this machine.
+pub fn required(driver: Driver) -> bool {
+    matches!(driver, Driver::Local)
 }
 
 /// `text` as a server base URL: `http://` or `https://`, a host, no credentials, query or
@@ -243,10 +316,14 @@ impl ModelProvider {
         }
     }
 
-    /// The server's base URL, normalized: the configured one, else the kind's default.
+    /// The server's base URL, normalized: the configured one, else the kind's default (a kind
+    /// with none needs one configured).
     pub fn base(&self) -> Result<String, String> {
         match self.base_url.as_deref().filter(|u| !u.trim().is_empty()) {
             Some(url) => normalize_base_url(url),
+            None if self.kind.default_base_url().is_empty() => {
+                Err("Enter the server's address".to_owned())
+            }
             None => Ok(self.kind.default_base_url().to_owned()),
         }
     }
@@ -308,8 +385,9 @@ impl ModelProvider {
                     .map(|n| (*n).to_owned())
                     .collect(),
             },
-            // agy never gets here: `args` refused it.
-            Driver::Codex | Driver::Agy => ProviderLaunch {
+            // agy never gets here: `args` refused it. The Local runner reads the key from the
+            // variable itself: only its name is on the command line.
+            Driver::Codex | Driver::Agy | Driver::Local => ProviderLaunch {
                 args,
                 env: Vec::new(),
                 unset: Vec::new(),
@@ -332,6 +410,7 @@ impl ModelProvider {
                 ))
             }
             Driver::Claude => Vec::new(),
+            Driver::Local => crate::local_agent::RunnerArgs::server_args(&base, key_env),
             Driver::Codex => {
                 let id = CODEX_PROVIDER_ID;
                 let mut settings = vec![
@@ -386,7 +465,8 @@ pub fn model_args(driver: Driver, model: &str) -> Vec<String> {
     match driver {
         Driver::Claude => vec!["--model".to_owned(), model.to_owned()],
         Driver::Codex => vec!["-m".to_owned(), model.to_owned()],
-        Driver::Agy => Vec::new(),
+        // agy has no provider; the Local agent never runs in a terminal tab.
+        Driver::Agy | Driver::Local => Vec::new(),
     }
 }
 
@@ -432,12 +512,56 @@ mod tests {
 
     #[test]
     fn all_lists_every_kind() {
-        for kind in ProviderKind::ALL {
-            match kind {
-                ProviderKind::Ollama | ProviderKind::LmStudio | ProviderKind::LiteLlm => {}
+        assert_eq!(
+            ProviderKind::ALL,
+            [
+                ProviderKind::Ollama,
+                ProviderKind::LmStudio,
+                ProviderKind::LiteLlm
+            ]
+        );
+    }
+
+    #[test]
+    fn local_lists_every_kind() {
+        use ProviderKind::*;
+        // Exhaustive: a new kind fails to compile here until it is placed in LOCAL.
+        let place = |kind: ProviderKind| match kind {
+            Ollama => 0,
+            LmStudio => 1,
+            Vllm => 2,
+            LlamaCpp => 3,
+            SgLang => 4,
+            LocalAi => 5,
+            Jan => 6,
+            TextGenWebUi => 7,
+            LiteLlm => 8,
+            OpenAiCompatible => 9,
+        };
+        for (at, kind) in ProviderKind::LOCAL.into_iter().enumerate() {
+            assert_eq!(place(kind), at);
+            let stored = serde_json::to_string(&kind).unwrap();
+            assert_eq!(serde_json::from_str::<ProviderKind>(&stored).unwrap(), kind);
+            assert!(!kind.label().is_empty());
+            match kind.default_base_url() {
+                "" => assert_eq!(kind, OpenAiCompatible),
+                url => assert_eq!(normalize_base_url(url).as_deref(), Ok(url)),
             }
         }
-        assert_eq!(ProviderKind::ALL.len(), 3);
+        // Every kind Claude and Codex take is one the Local agent takes too.
+        assert!(ProviderKind::ALL
+            .iter()
+            .all(|k| ProviderKind::LOCAL.contains(k)));
+        let other = ModelProvider::new(OpenAiCompatible);
+        assert!(other.base().is_err(), "it has no default address");
+        let given = ModelProvider {
+            base_url: Some("http://192.0.2.9:9000".into()),
+            ..other
+        };
+        assert_eq!(
+            given.models_url().unwrap(),
+            "http://192.0.2.9:9000/v1/models"
+        );
     }
 
     #[test]

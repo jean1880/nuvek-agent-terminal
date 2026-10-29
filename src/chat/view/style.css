@@ -2,7 +2,7 @@
  *
  * Colours are the theme's named colours (the at_ names, defined per theme in src/palette.rs), so the
  * selected theme restyles the chat too. The agent colours are not themed, because they
- * identify the agent in every theme: @brand_claude, @brand_agy and @brand_codex, defined by
+ * identify the agent in every theme: @brand_claude, @brand_agy, @brand_codex and @brand_local, defined by
  * src/brand.rs from DriverInfo::accent_hex in agent-core (the app icon's dots). Text tints
  * are the accent mixed 40% toward white: mix(@brand_claude, white, 0.4).
  */
@@ -66,7 +66,9 @@
 .agent-chip.accent-claude { border-color: alpha(@brand_claude, 0.45); }
 .agent-chip.accent-agy { border-color: alpha(@brand_agy, 0.45); }
 .accent-codex .accent-dot { color: @brand_codex; }
+.accent-local .accent-dot { color: @brand_local; }
 .agent-chip.accent-codex { border-color: alpha(@brand_codex, 0.45); }
+.agent-chip.accent-local { border-color: alpha(@brand_local, 0.45); }
 
 .mode-dropdown > button {
     border-radius: 999px;
@@ -187,11 +189,13 @@ levelbar.context-level block.empty { background-color: transparent; }
 .assistant-row.accent-claude { border-left-color: alpha(@brand_claude, 0.75); }
 .assistant-row.accent-agy { border-left-color: alpha(@brand_agy, 0.75); }
 .assistant-row.accent-codex { border-left-color: alpha(@brand_codex, 0.75); }
+.assistant-row.accent-local { border-left-color: alpha(@brand_local, 0.75); }
 .assistant-head .agent-name { color: @at_fg_dim; font-weight: 700; font-size: 0.85em; letter-spacing: 0.02em; }
 .stream-caret { color: @at_accent; }
 .accent-claude .stream-caret { color: @brand_claude; }
 .accent-agy .stream-caret { color: @brand_agy; }
 .accent-codex .stream-caret { color: @brand_codex; }
+.accent-local .stream-caret { color: @brand_local; }
 
 .md-text { color: mix(@at_fg_strong, @at_fg, 0.4); line-height: 1.45; }
 .md-heading { color: @at_fg_strong; margin-top: 4px; }
@@ -487,7 +491,9 @@ button.flat.quick-reply-action:hover { color: @at_fg_soft; text-decoration: unde
 .switch-divider.accent-claude separator { background-color: alpha(@brand_claude, 0.35); }
 .switch-divider.accent-agy separator { background-color: alpha(@brand_agy, 0.35); }
 .switch-divider.accent-codex .divider-pill { border-color: alpha(@brand_codex, 0.6); background-color: alpha(@brand_codex, 0.08); }
+.switch-divider.accent-local .divider-pill { border-color: alpha(@brand_local, 0.6); background-color: alpha(@brand_local, 0.08); }
 .switch-divider.accent-codex separator { background-color: alpha(@brand_codex, 0.35); }
+.switch-divider.accent-local separator { background-color: alpha(@brand_local, 0.35); }
 .switch-divider .divider-text { color: @at_fg_strong; font-weight: 600; }
 .compaction-divider .divider-text { font-style: italic; }
 
@@ -519,6 +525,7 @@ button.flat.quick-reply-action:hover { color: @at_fg_soft; text-decoration: unde
 .brand-dot.dot-claude { background-color: @brand_claude; }
 .brand-dot.dot-agy { background-color: @brand_agy; }
 .brand-dot.dot-codex { background-color: @brand_codex; }
+.brand-dot.dot-local { background-color: @brand_local; }
 .brand-dot.dimmed { opacity: 0.3; }
 .thinking-dot {
     min-width: 7px;
@@ -527,6 +534,7 @@ button.flat.quick-reply-action:hover { color: @at_fg_soft; text-decoration: unde
 }
 .thinking-dot.dot-agy { animation-delay: 150ms; }
 .thinking-dot.dot-codex { animation-delay: 300ms; }
+.thinking-dot.dot-local { animation-delay: 450ms; }
 /* Every agent at work is lit (brand.rs `set_working`): the thread's own, and each agent its
    running sub-agents are on; the rest are dimmed. The thread's own agent hops a little higher. */
 @keyframes thinking-bounce-lead {
@@ -603,6 +611,7 @@ button.flat.quick-reply-action:hover { color: @at_fg_soft; text-decoration: unde
 .drip-ripple.dot-claude { border-color: @brand_claude; }
 .drip-ripple.dot-agy { border-color: @brand_agy; }
 .drip-ripple.dot-codex { border-color: @brand_codex; }
+.drip-ripple.dot-local { border-color: @brand_local; }
 /* A new thread's empty transcript: the dots at rest, the thread's agent lit. */
 .transcript-empty .brand-dots { margin-bottom: 6px; }
 .transcript-empty .brand-dot { min-width: 10px; min-height: 10px; }

@@ -79,13 +79,20 @@ pub(crate) fn effect(driver: Driver, tool: &str, input: &Value) -> Effect {
                 ToolClass::Status | ToolClass::Exec | ToolClass::Unknown => Effect::Unknown,
             },
         },
+        Driver::Local => match agent_core::local_agent::Tool::from_name(tool) {
+            Some(agent_core::local_agent::Tool::RunCommand) => Effect::Exec,
+            Some(t) if t.writes() => Effect::Edit,
+            Some(_) => Effect::Read,
+            None => Effect::Unknown,
+        },
     }
 }
 
 /// Every file an edit names, per provider. Empty: nothing checkable.
 fn edit_paths<'a>(driver: Driver, tool: &str, input: &'a Value) -> Vec<&'a str> {
     match driver {
-        Driver::Claude => ["file_path", "notebook_path"]
+        // The Local runner's edit tools take Claude's field name.
+        Driver::Claude | Driver::Local => ["file_path", "notebook_path"]
             .iter()
             .filter_map(|k| input.get(*k).and_then(Value::as_str))
             .collect(),
@@ -580,6 +587,12 @@ mod tests {
                 (Effect::Network, "search_web", json!({"query": "x"})),
                 (Effect::Unknown, "Mystery", json!({})),
             ],
+            Driver::Local => vec![
+                (Effect::Read, "read_file", json!({"file_path": file})),
+                (Effect::Edit, "edit_file", json!({"file_path": file})),
+                (Effect::Exec, "run_command", json!({"command": "ls"})),
+                (Effect::Unknown, "Mystery", json!({})),
+            ],
         }
     }
 
@@ -897,6 +910,7 @@ mod tests {
                 Driver::Claude => ("Bash", "command"),
                 Driver::Codex => ("command_execution", "command"),
                 Driver::Agy => ("run_command", "CommandLine"),
+                Driver::Local => unreachable!("never a delegated child"),
             };
             [
                 "cross-agent claude \"review\"",
@@ -937,6 +951,7 @@ mod tests {
                 Driver::Claude => ("Bash", "command"),
                 Driver::Codex => ("command_execution", "command"),
                 Driver::Agy => ("run_command", "CommandLine"),
+                Driver::Local => unreachable!("never a delegated child"),
             };
             for command in [
                 "ls",
@@ -1145,11 +1160,13 @@ mod tests {
                     Driver::Claude => "Write",
                     Driver::Codex => "file_change",
                     Driver::Agy => "write_to_file",
+                    Driver::Local => unreachable!("never a delegated child"),
                 };
                 let input = match driver {
                     Driver::Claude => json!({"file_path":path}),
                     Driver::Codex => json!({"changes":[{"path":path}]}),
                     Driver::Agy => json!({"TargetFile":path}),
+                    Driver::Local => unreachable!("never a delegated child"),
                 };
                 assert!(
                     is_ask_only(&gate.judge(tool, &input, None)),

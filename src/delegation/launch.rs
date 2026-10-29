@@ -91,6 +91,10 @@ fn prepare_with(
         Driver::Codex => {
             launch.open = Some(binding);
         }
+        // It has no bridge to bind (`LocalAgentNoBridge`): refused before any token travels.
+        Driver::Local => {
+            return Err("the Local agent cannot take part in delegation".to_owned());
+        }
     }
     Ok(PreparedBinding {
         worker: req.worker.clone(),

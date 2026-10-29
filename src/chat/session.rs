@@ -8372,7 +8372,9 @@ mod tests {
                 Ok(AgentLaunch {
                     adapter: match d {
                         Driver::Claude => Box::new(agent_core::claude::ClaudeAdapter::new()),
-                        Driver::Agy | Driver::Codex => FakeAdapter::boxed(d, &agy_log),
+                        Driver::Agy | Driver::Codex | Driver::Local => {
+                            FakeAdapter::boxed(d, &agy_log)
+                        }
                     },
                     program: "/bin/true".into(),
                     extra_args: vec!["--profile-arg".into()],

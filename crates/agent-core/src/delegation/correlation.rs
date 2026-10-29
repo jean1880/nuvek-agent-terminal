@@ -130,7 +130,7 @@ pub fn attestation_arguments(
 pub fn attestation_required(driver: Driver, tool: ToolName, gate_passed: bool) -> bool {
     let _every_tool = tool;
     match driver {
-        Driver::Agy => true,
+        Driver::Agy | Driver::Local => true,
         Driver::Claude | Driver::Codex => gate_passed,
     }
 }

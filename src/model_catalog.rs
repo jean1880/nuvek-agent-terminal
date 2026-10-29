@@ -83,9 +83,15 @@ struct OtherList {
     source: Option<agent_core::provider::ModelProvider>,
     #[serde(default)]
     models: Vec<CatalogModel>,
+    /// When the list was last fetched successfully (epoch seconds), for the picker's footer.
+    #[serde(default)]
+    read_at: Option<i64>,
     /// Fetched in this run (a cached one is not): what retirement may be judged on.
     #[serde(skip)]
     fresh: bool,
+    /// The last fetch in this run failed (or listed nothing).
+    #[serde(skip)]
+    failed: bool,
 }
 
 fn decode_cache(text: &str) -> CacheFile {
@@ -172,6 +178,8 @@ pub struct ModelCatalog {
     others: RefCell<Vec<OtherList>>,
     /// The other sources whose fetch was started in this run, successful or not.
     others_tried: RefCell<Vec<(Driver, Option<agent_core::provider::ModelProvider>)>>,
+    /// The other sources whose fetch in this run has finished, successful or not.
+    others_settled: RefCell<Vec<(Driver, Option<agent_core::provider::ModelProvider>)>>,
 }
 
 thread_local! {
@@ -216,7 +224,24 @@ impl ModelCatalog {
             sources: RefCell::new(loaded.sources),
             others: RefCell::new(loaded.others),
             others_tried: RefCell::new(Vec::new()),
+            others_settled: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Whether the fetch in this run of the list a profile on `source` sees ([`Self::models_for`])
+    /// has finished, successfully or not: past this point waiting longer gains nothing.
+    pub fn is_settled_for(
+        &self,
+        driver: Driver,
+        source: Option<&agent_core::provider::ModelProvider>,
+    ) -> bool {
+        if self.source(driver).as_ref() == source {
+            return self.is_settled(driver);
+        }
+        self.others_settled
+            .borrow()
+            .iter()
+            .any(|(d, s)| *d == driver && s.as_ref() == source)
     }
 
     /// `driver`'s models as a profile on `source` (`None`: the vendor) sees them: the agent's own
@@ -272,11 +297,7 @@ impl ModelCatalog {
         driver: Driver,
         source: Option<&agent_core::provider::ModelProvider>,
     ) -> bool {
-        self.targets
-            .borrow()
-            .other_sources()
-            .iter()
-            .any(|(d, s, _)| *d == driver && s.as_ref() == source)
+        self.targets.borrow().uses_other(driver, source)
     }
 
     /// A fetch of another profile's source answered: `models`, or nothing usable (`None`, or
@@ -287,39 +308,47 @@ impl ModelCatalog {
         source: Option<agent_core::provider::ModelProvider>,
         models: Option<Vec<CatalogModel>>,
     ) {
+        {
+            let mut settled = self.others_settled.borrow_mut();
+            if !settled.iter().any(|(d, s)| *d == driver && *s == source) {
+                settled.push((driver, source.clone()));
+            }
+        }
         if !self.wants_other(driver, source.as_ref()) {
             return;
         }
         let models = models.unwrap_or_default();
+        let listed = !models.is_empty();
         let changed = {
             let mut others = self.others.borrow_mut();
             let position = others
                 .iter()
                 .position(|o| o.driver == driver && o.source == source);
-            match position {
-                Some(i) => {
-                    let o = &mut others[i];
-                    let changed = o.models != models || o.fresh != !models.is_empty();
-                    o.fresh = !models.is_empty();
-                    o.models = models;
-                    changed
-                }
-                None => {
-                    let fresh = !models.is_empty();
-                    others.push(OtherList {
-                        driver,
-                        source,
-                        models,
-                        fresh,
-                    });
-                    fresh
-                }
-            }
+            let i = position.unwrap_or_else(|| {
+                others.push(OtherList {
+                    driver,
+                    source,
+                    models: Vec::new(),
+                    read_at: None,
+                    fresh: false,
+                    failed: false,
+                });
+                others.len() - 1
+            });
+            let o = &mut others[i];
+            let changed = o.models != models || o.fresh != listed || position.is_none();
+            o.fresh = listed;
+            o.failed = !listed;
+            o.read_at = if listed { Some(now_epoch()) } else { None };
+            o.models = models;
+            changed
         };
         if changed {
             self.save();
             self.listeners.notify();
         }
+        // The footer of a picker showing this list says how it went.
+        self.status_listeners.notify();
     }
 
     /// The model server `driver`'s list came from; `None`: its vendor.
@@ -364,12 +393,7 @@ impl ModelCatalog {
         {
             let mut others = self.others.borrow_mut();
             let before = others.len();
-            others.retain(|o| {
-                targets
-                    .other_sources()
-                    .iter()
-                    .any(|(d, s, _)| *d == o.driver && *s == o.source)
-            });
+            others.retain(|o| targets.uses_other(o.driver, o.source.as_ref()));
             changed |= others.len() != before;
         }
         if changed {
@@ -494,17 +518,36 @@ impl ModelCatalog {
 
     /// The footer's view of the lists of the `shown` agents.
     pub fn status_of(&self, shown: impl Fn(Driver) -> bool) -> CatalogStatus {
+        self.status_with(shown, |d| self.source(d))
+    }
+
+    /// [`Self::status_of`] for the lists one profile sees ([`Self::models_with`]): `source_of`
+    /// names the source it runs each agent on, so the footer speaks of the rows it sits under.
+    pub fn status_with(
+        &self,
+        shown: impl Fn(Driver) -> bool,
+        source_of: impl Fn(Driver) -> Option<agent_core::provider::ModelProvider>,
+    ) -> CatalogStatus {
         let read_at = self.read_at.get();
-        let shown: Vec<Driver> = Driver::ALL.into_iter().filter(|d| shown(*d)).collect();
-        let failed = shown.iter().any(|d| self.failed.borrow().contains(d));
-        // The oldest read among the shown agents; one with no list, or a list without a time,
+        let mut failed = false;
+        // The oldest read among the shown lists; one with no list, or a list without a time,
         // was not read, which makes the whole footer "not read".
         let mut oldest: Option<Option<i64>> = None;
-        for d in shown {
-            let at = if self.slot(d).borrow().is_empty() {
-                None
+        for d in Driver::ALL.into_iter().filter(|d| shown(*d)) {
+            let source = source_of(d);
+            let at = if self.source(d) == source {
+                failed |= self.failed.borrow().contains(&d);
+                if self.slot(d).borrow().is_empty() {
+                    None
+                } else {
+                    read_at.get(d)
+                }
             } else {
-                read_at.get(d)
+                let others = self.others.borrow();
+                let list = others.iter().find(|o| o.driver == d && o.source == source);
+                failed |= list.is_some_and(|o| o.failed);
+                list.filter(|o| !o.models.is_empty())
+                    .and_then(|o| o.read_at)
             };
             oldest = Some(match (oldest, at) {
                 (None, at) => at,
@@ -693,10 +736,12 @@ impl ModelCatalog {
     /// check, whatever the agent's own clock says. Once tried, it follows the agent's clock.
     fn has_untried_other(&self, targets: &ProbeTargets, driver: Driver) -> bool {
         let tried = self.others_tried.borrow();
-        targets
-            .other_sources()
-            .iter()
-            .any(|(d, s, _)| *d == driver && !tried.iter().any(|(td, ts)| td == d && ts == s))
+        targets.other_sources().iter().any(|o| {
+            o.driver == driver
+                && !tried
+                    .iter()
+                    .any(|(td, ts)| *td == o.driver && *ts == o.source)
+        })
     }
 
     /// Fetches `drivers`' lists (each must have a target).
@@ -714,13 +759,13 @@ impl ModelCatalog {
         let other_jobs: Vec<_> = targets
             .other_sources()
             .iter()
-            .filter(|(d, _, _)| drivers.contains(d))
+            .filter(|o| drivers.contains(&o.driver))
             .cloned()
             .collect();
         let finish = {
             let me = self.clone();
             let jobs = drivers.len() + other_jobs.len();
-            join_n(u8::try_from(jobs).unwrap_or(u8::MAX), move || {
+            join_n(jobs, move || {
                 me.refreshing.set(false);
                 me.status_listeners.notify();
                 // A forced refresh asked for meanwhile: its drivers were marked due, with the
@@ -734,7 +779,13 @@ impl ModelCatalog {
                 }
             })
         };
-        for (driver, source, key) in other_jobs {
+        for crate::probe::OtherSource {
+            driver,
+            source,
+            key,
+            target,
+        } in other_jobs
+        {
             {
                 let mut tried = self.others_tried.borrow_mut();
                 if !tried.iter().any(|(d, s)| *d == driver && *s == source) {
@@ -760,16 +811,14 @@ impl ModelCatalog {
                         done();
                     });
                 }
-                // The vendor's list, for a profile on it while the agent's own is on a server.
-                None => match targets.get(driver) {
-                    Some(target) => {
-                        crate::probe::read_shared(driver, target, move |result| {
-                            me.land_other(driver, None, result.ok().map(|r| r.models.clone()));
-                            done();
-                        });
-                    }
-                    None => done(),
-                },
+                // The vendor's list, for a profile on it while the agent's own is on a server:
+                // probed with that profile's own binary and environment (its account).
+                None => {
+                    crate::probe::read_shared(driver, &target, move |result| {
+                        me.land_other(driver, None, result.ok().map(|r| r.models.clone()));
+                        done();
+                    });
+                }
             }
         }
         for &driver in drivers {
@@ -966,8 +1015,14 @@ impl ModelSource for ProfileModels {
         self.catalog.disconnect(id);
     }
 
+    /// The footer covers the lists this picker shows: the ready agents', each from the source
+    /// the thread's profile runs it on.
     fn status(&self) -> Option<CatalogStatus> {
-        ModelSource::status(&*self.catalog)
+        let availability = crate::availability::AgentAvailability::shared();
+        Some(
+            self.catalog
+                .status_with(|d| availability.is_ready(d), |d| (self.source_of)(d)),
+        )
     }
 
     fn refresh_lists(self: Rc<Self>, force: bool) {
@@ -1154,7 +1209,9 @@ mod tests {
                     agent_core::provider::ProviderKind::Ollama,
                 )),
                 models: vec![model(Driver::Claude, "qwen3-coder")],
+                read_at: Some(1_700_000_200),
                 fresh: false,
+                failed: false,
             }],
         };
         let text = serde_json::to_string(&file).unwrap();
@@ -1281,6 +1338,19 @@ mod tests {
         assert_eq!(again.source(Driver::Claude), None);
     }
 
+    /// Another profile's use of `source` for `driver` (no key, a blank target).
+    fn other(
+        driver: Driver,
+        source: Option<agent_core::provider::ModelProvider>,
+    ) -> crate::probe::OtherSource {
+        crate::probe::OtherSource {
+            driver,
+            source,
+            key: crate::probe::ProviderKey::default(),
+            target: crate::probe::ProbeTarget::default(),
+        }
+    }
+
     /// A second profile of an agent on another source (a server, or the vendor while the agent's
     /// own is on a server) gets that source's list: kept apart, persisted, fresh only once fetched
     /// in this run, dropped when no profile uses it, and never set by a superseded answer.
@@ -1293,9 +1363,8 @@ mod tests {
         let ollama = ModelProvider::new(ProviderKind::Ollama);
         let lm = ModelProvider::new(ProviderKind::LmStudio);
         let target = crate::probe::ProbeTarget::default();
-        let key = crate::probe::ProviderKey::default;
         let targets = ProbeTargets::new(vec![(Driver::Claude, target.clone())])
-            .with_other_sources(vec![(Driver::Claude, Some(ollama.clone()), key())]);
+            .with_other_sources(vec![other(Driver::Claude, Some(ollama.clone()))]);
         *cat.targets.borrow_mut() = targets.clone();
         cat.adopt_sources(&targets);
         cat.set(Driver::Claude, vec![model(Driver::Claude, "opus")]);
@@ -1363,11 +1432,7 @@ mod tests {
         let cat = Rc::new(ModelCatalog::with_cache(None));
         let targets =
             ProbeTargets::new(vec![(Driver::Claude, crate::probe::ProbeTarget::default())])
-                .with_other_sources(vec![(
-                    Driver::Claude,
-                    Some(ollama.clone()),
-                    crate::probe::ProviderKey::default(),
-                )]);
+                .with_other_sources(vec![other(Driver::Claude, Some(ollama.clone()))]);
         *cat.targets.borrow_mut() = targets.clone();
         cat.adopt_sources(&targets);
         cat.set(Driver::Claude, vec![model(Driver::Claude, "opus")]);
@@ -1380,11 +1445,20 @@ mod tests {
             Driver::Claude,
             crate::availability::Availability::Ready("/x".into()),
         );
-        let local = ProfileModels::new(cat.clone(), Rc::new(move |_| Some(ollama.clone())));
-        let cloud = ProfileModels::new(cat, Rc::new(|_| None));
+        let local_source = ollama.clone();
+        let local = ProfileModels::new(cat.clone(), Rc::new(move |_| Some(local_source.clone())));
+        let cloud = ProfileModels::new(cat.clone(), Rc::new(|_| None));
         let ids = |m: Vec<CatalogModel>| m.into_iter().map(|m| m.id).collect::<Vec<_>>();
         assert_eq!(ids(ModelSource::models(&*local)), ["qwen3-coder"]);
         assert_eq!(ids(ModelSource::models(&*cloud)), ["opus"]);
+        // Each footer speaks of the list under it: the server's failing leaves the cloud fine.
+        let status = |s: &Rc<ProfileModels>| ModelSource::status(&**s).unwrap();
+        assert!(!status(&local).failed && status(&local).read_at.is_some());
+        cat.land_other(Driver::Claude, Some(ollama), None);
+        assert!(status(&local).failed);
+        assert_eq!(status(&local).read_at, None, "nothing listed: not read");
+        assert!(!status(&cloud).failed);
+        assert!(status(&cloud).read_at.is_some());
     }
 
     #[test]
@@ -1593,6 +1667,45 @@ mod tests {
             assert!(mark.exists());
             assert_eq!(cat.models_of(Driver::Claude).len(), 1);
             assert!(cat.status_of(|_| true).failed);
+        });
+    }
+
+    /// The vendor's list for another profile (the agent's own is on a server) is probed with
+    /// that profile's own binary and environment, never the agent's own profile's.
+    #[test]
+    fn another_profiles_vendor_list_is_probed_as_that_profile() {
+        use crate::testutil::{in_loop, pump_until};
+        let own_dir = tempfile::tempdir().unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        let (own_target, own_mark) = crate::probe::fixtures::marking_target(own_dir.path());
+        let (other_target, other_mark) = crate::probe::fixtures::marking_target(other_dir.path());
+        let unreachable = agent_core::provider::ModelProvider {
+            base_url: Some("http://127.0.0.1:9".into()),
+            ..agent_core::provider::ModelProvider::new(agent_core::provider::ProviderKind::Ollama)
+        };
+        let targets = ProbeTargets::new(vec![(Driver::Claude, own_target)])
+            .with_providers(vec![(
+                Driver::Claude,
+                unreachable,
+                crate::probe::ProviderKey::default(),
+            )])
+            .with_other_sources(vec![crate::probe::OtherSource {
+                target: other_target,
+                ..other(Driver::Claude, None)
+            }]);
+        in_loop(|ctx| {
+            let cat = Rc::new(ModelCatalog::with_cache(None));
+            cat.refresh(&targets);
+            assert!(pump_until(ctx, 15, || !cat.refreshing.get()));
+            assert!(
+                other_mark.exists(),
+                "the other profile's own binary listed it"
+            );
+            assert!(
+                !own_mark.exists(),
+                "the agent's own profile is on a server: not probed"
+            );
+            assert!(cat.is_settled_for(Driver::Claude, None));
         });
     }
 

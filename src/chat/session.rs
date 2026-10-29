@@ -5007,6 +5007,18 @@ impl Inner {
             }
         };
         let model = model.or_else(|| launch.default_model.clone());
+        // An agent on a model server with no model known is not switched to: it would start on
+        // its own setting, a vendor model the server does not have.
+        if model.is_none()
+            && agent_core::provider::launch_on_server(&launch.extra_args, &launch.env.env)
+        {
+            self.error(format!(
+                "{} has no model on its model server yet. Pick one from the model list, or give \
+                 its profile a Default Model.",
+                driver.info().label
+            ));
+            return false;
+        }
         let effort = effort.or_else(|| launch.default_effort.clone());
         // The new provider thread comes first: if the store refuses, the old agent keeps running.
         // Queued to the store writer: a refusal there is reported by the writer, not here.
@@ -8294,6 +8306,46 @@ mod tests {
             env: LaunchEnv::default(),
             approval: Err(None),
         })
+    }
+
+    /// A switch to an agent on a model server with no model named and none known is refused: it
+    /// would start on its CLI's own setting, a vendor model. Named, it goes ahead.
+    #[test]
+    fn a_switch_to_a_model_server_with_no_model_is_refused() {
+        in_loop(|_| {
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let log: Log = Rc::default();
+            let (session, seen) = harness(
+                FakeAdapter::boxed(Driver::Agy, &log),
+                open_session("/usr/bin/agy", Vec::new(), "/"),
+                &store,
+                &thread,
+            );
+            let codex_log = log.clone();
+            session.set_adapter_factory(Rc::new(move |d| {
+                let launch = agent_core::provider::ModelProvider::new(
+                    agent_core::provider::ProviderKind::Ollama,
+                )
+                .launch(Driver::Codex, None)
+                .unwrap();
+                Ok(AgentLaunch {
+                    adapter: FakeAdapter::boxed(d, &codex_log),
+                    program: "/bin/true".into(),
+                    extra_args: launch.args,
+                    default_model: None,
+                    default_effort: None,
+                    env: LaunchEnv::default(),
+                    approval: Err(None),
+                })
+            }));
+            session.switch(Driver::Codex, None, None);
+            assert_eq!(session.status().driver, Driver::Agy, "not switched");
+            assert!(has(&seen, |e| matches!(e, Event::Error { message }
+                if message.contains("has no model on its model server"))));
+            session.switch(Driver::Codex, Some("qwen3.5:9b".into()), None);
+            assert_eq!(session.status().driver, Driver::Codex);
+        });
     }
 
     #[test]

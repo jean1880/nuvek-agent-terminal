@@ -270,6 +270,14 @@ impl Supervisor {
         )
         .map_err(|code| error(code, "requested capabilities exceed the caller's own"))?;
         let model = r.model.clone().or(resolved.default_model.clone());
+        // A worker on a model server with no model known would start on its CLI's own setting,
+        // a vendor model the server does not have: refused, the caller can name one.
+        if model.is_none() && resolved.source.is_some() {
+            return Err(error(
+                ErrorCode::ProviderUnavailable,
+                "the profile's model server has listed no model yet; name a model",
+            ));
+        }
         let effort = r.effort.clone().or(resolved.default_effort.clone());
         if model
             .iter()

@@ -1649,8 +1649,10 @@ impl AgentTerminalWindow {
         };
         *self.config.borrow_mut() = *new;
         if clear_changed {
-            // An agent's env file is read against these patterns: read them again.
+            // An agent's env file is read against these patterns: read them again, at once, so a
+            // launch (which only uses a resolution already made) finds every agent resolved.
             threads::forget_resolutions();
+            self.refresh_agent_data(threads::Probes::IfDue);
         }
         crate::config::mirror_quick_replies(self.config.borrow().suggest_quick_replies);
         crate::config::mirror_approval_policy(&self.config.borrow());
@@ -4031,7 +4033,10 @@ impl AgentTerminalWindow {
             Some(driver) => threads::start_model(p, driver),
             None => p.effective_default_model(None),
         });
-        let on_provider = match profile.map(crate::utils::with_provider_args).transpose() {
+        let on_provider = match profile
+            .map(|p| crate::utils::with_provider_args(p, terminal_model.as_deref()))
+            .transpose()
+        {
             Ok(p) => p,
             Err(why) => {
                 refuse_terminal(&obj, stack, terminal, &why);

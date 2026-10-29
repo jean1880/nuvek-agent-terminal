@@ -152,6 +152,13 @@ pub fn bind_thread_model(env: &mut Vec<(String, String)>, model: Option<&str>) {
     }
 }
 
+/// Whether a launch's arguments and environment run its agent on a model server: what
+/// [`ModelProvider::launch`] gave it (Claude's thread-model placeholder, Codex's provider).
+pub fn launch_on_server(args: &[String], env: &[(String, String)]) -> bool {
+    let codex = format!("model_provider={}", toml_string(CODEX_PROVIDER_ID));
+    env.iter().any(|(_, v)| v == THREAD_MODEL) || args.contains(&codex)
+}
+
 /// Whether `driver` can run on a provider. agy only speaks to Google's own models.
 pub fn supports(driver: Driver) -> bool {
     match driver {
@@ -369,6 +376,18 @@ fn toml_string(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// The arguments that start `driver`'s own CLI on `model`, for a command line the app builds
+/// itself (a terminal tab's), where no adapter passes it: `--model` for Claude, `-m` for Codex.
+/// Neither takes it from the environment, and left out each starts on its own setting, which on
+/// a model server names a vendor model.
+pub fn model_args(driver: Driver, model: &str) -> Vec<String> {
+    match driver {
+        Driver::Claude => vec!["--model".to_owned(), model.to_owned()],
+        Driver::Codex => vec!["-m".to_owned(), model.to_owned()],
+        Driver::Agy => Vec::new(),
+    }
 }
 
 /// The model a profile on a server starts on when nothing names one: the first of `ids` (the
@@ -623,6 +642,16 @@ mod tests {
             .launch(Driver::Codex, None)
             .unwrap();
         assert!(codex.env.is_empty());
+        // Either launch is recognised as one on a model server; a vendor one is not.
+        let claude = ModelProvider::new(ProviderKind::Ollama)
+            .launch(Driver::Claude, None)
+            .unwrap();
+        assert!(launch_on_server(&claude.args, &claude.env));
+        assert!(launch_on_server(&codex.args, &codex.env));
+        assert!(!launch_on_server(
+            &["--verbose".to_owned()],
+            &[("ANTHROPIC_MODEL".into(), "opus".into())]
+        ));
     }
 
     #[test]

@@ -1747,6 +1747,28 @@ fn live_model(
     )
 }
 
+/// The model server `profile` runs `driver` on (`None`: the vendor's own; agy never runs on one).
+pub(super) fn own_source(
+    profile: &Profile,
+    driver: Driver,
+) -> Option<agent_core::provider::ModelProvider> {
+    profile
+        .provider
+        .clone()
+        .filter(|_| agent_core::provider::supports(driver))
+}
+
+/// Why a thread or worker on a model server cannot start: it has no model (the profile names
+/// none and the server listed none yet). Claude or Codex left without one start on their own
+/// setting, which names a vendor model; so nothing starts.
+pub(super) fn no_model_reason(source: &agent_core::provider::ModelProvider) -> String {
+    format!(
+        "Cannot start on {}: it has listed no model yet. Pick a Default Model for this profile, \
+         or try again once its models are listed.",
+        source.kind.label()
+    )
+}
+
 /// The model a thread or worker on `profile` starts `driver` on when nothing else names one. On
 /// its vendor: the profile's default, else the CLI's own setting. On a model server: the
 /// profile's default, else the first chat model the server lists; never the CLI's own setting,
@@ -2039,10 +2061,15 @@ pub(super) async fn wait_until(
 /// have failed: a failed probe (offline, signed out) must not cost every thread open 3 s. Only a
 /// fetch in this run settles it, never the cache's age: argv decisions use the same predicate.
 /// The one start-up fetch per ready agent makes the wait rare after the first seconds.
-async fn wait_for_fresh_catalog(driver: Driver) {
+/// `source` is the model server the thread's profile runs it on (`None`: the vendor): the list
+/// waited for is that one, which a profile on a server with no model of its own starts from.
+async fn wait_for_fresh_catalog(
+    driver: Driver,
+    source: Option<agent_core::provider::ModelProvider>,
+) {
     let catalog = ModelCatalog::shared();
-    wait_for_catalog(&catalog, driver, CATALOG_WAIT).await;
-    if !catalog.is_fresh(driver) {
+    wait_for_catalog_source(&catalog, driver, source.as_ref(), CATALOG_WAIT).await;
+    if !catalog.is_fresh_for(driver, source.as_ref()) {
         info!(
             "{} model list not fresh after {:?}; starting on the stored model",
             driver.info().label,
@@ -2052,13 +2079,24 @@ async fn wait_for_fresh_catalog(driver: Driver) {
 }
 
 /// Waits at most `limit` for `catalog`'s fetch of `driver` in this run to settle; whether it did.
+#[cfg(test)]
 async fn wait_for_catalog(
     catalog: &ModelCatalog,
     driver: Driver,
     limit: std::time::Duration,
 ) -> bool {
+    wait_for_catalog_source(catalog, driver, None, limit).await
+}
+
+/// Waits at most `limit` for the fetch in this run of the list a profile on `source` sees.
+async fn wait_for_catalog_source(
+    catalog: &ModelCatalog,
+    driver: Driver,
+    source: Option<&agent_core::provider::ModelProvider>,
+    limit: std::time::Duration,
+) -> bool {
     wait_until(limit, std::time::Duration::from_millis(100), || {
-        catalog.is_settled(driver)
+        catalog.is_settled_for(driver, source)
     })
     .await
 }
@@ -2224,6 +2262,7 @@ pub(super) async fn resolve_agent(profile: Profile) -> ResolvedAgent {
     // inherited value must be kept, since the launch unsets the inherited one first. A change to
     // them empties this cache ([`forget_resolutions`]).
     let clear = SharedConfig::default().borrow().clear_env.clone();
+    let read_with = clear.clone();
     let resolved = gtk4::gio::spawn_blocking(move || {
         let probe = crate::utils::SystemProbe::new(path, home, shell);
         let program = probe.locate(&command);
@@ -2245,12 +2284,16 @@ pub(super) async fn resolve_agent(profile: Profile) -> ResolvedAgent {
         ResolvedAgent::default()
     });
     crate::utils::cache_command_available(&profile.command, resolved.program.is_some());
-    RESOLVED.with(|r| {
-        r.borrow_mut().insert(
-            (profile.command.clone(), profile.env_file.clone()),
-            resolved.clone(),
-        )
-    });
+    // Read against patterns a reload has since replaced: used by this caller, never cached, so
+    // the rescan that reload started reads it again.
+    if SharedConfig::default().borrow().clear_env == read_with {
+        RESOLVED.with(|r| {
+            r.borrow_mut().insert(
+                (profile.command.clone(), profile.env_file.clone()),
+                resolved.clone(),
+            )
+        });
+    }
     resolved
 }
 
@@ -5166,7 +5209,7 @@ impl AgentTerminalWindow {
                 // A session that will start now waits (briefly) for a fresh model list, so a
                 // retired model is ported before it reaches argv.
                 if AgentAvailability::shared().is_ready(driver) {
-                    wait_for_fresh_catalog(driver).await;
+                    wait_for_fresh_catalog(driver, own_source(&profile, driver)).await;
                     if !obj.imp().session_start_allowed() {
                         return;
                     }
@@ -5237,13 +5280,19 @@ impl AgentTerminalWindow {
         let view = ChatView::new(backend);
         view.set_text_scale(self.config.borrow().font_scale);
         view.set_vexpand(true);
-        // The thread's own profile decides each agent's list (its model server or the vendor).
-        let profile_id = self
-            .with_page_chat(page, |c| c.profile_id.clone())
-            .flatten();
+        // The thread's own profile decides each agent's list (its model server or the vendor),
+        // read at every look: a reopened thread gets its stored profile after this, and a switch
+        // to another agent changes it.
+        let picker_thread = thread.clone();
         view.set_model_source(crate::model_catalog::ProfileModels::new(
             ModelCatalog::shared(),
             Rc::new(move |d| {
+                let profile_id = thread_owner(&picker_thread).and_then(|window| {
+                    window
+                        .imp()
+                        .with_chat(&picker_thread, |c| c.profile_id.clone())
+                        .flatten()
+                });
                 profile_source(&SharedConfig::default().borrow(), profile_id.as_deref(), d)
             }),
         ));
@@ -5511,6 +5560,18 @@ impl AgentTerminalWindow {
                 .or_else(|| start_model(profile, driver)),
             effort,
         );
+        // On a model server with no model known, nothing starts: the CLI would take its own
+        // setting, a vendor model. Shown, not stored; reopening once a model is listed starts it.
+        if let (Some(source), None) = (&source, &model) {
+            warn!(
+                thread,
+                "a thread on a model server has no model to start on"
+            );
+            view.apply(&Envelope::new(Event::Error {
+                message: no_model_reason(source),
+            }));
+            return;
+        }
         // The mode the user chose in this thread first (the session then runs what this agent
         // can honour of it), else the thread's own last running mode (what its picker shows),
         // else the profile's: starting in the profile's left the picker showing one mode while
@@ -7554,22 +7615,29 @@ impl AgentTerminalWindow {
             if !scan_is_current(generation) {
                 return;
             }
-            // The sources other profiles use, each with the key its profile's threads would use
-            // (read from that profile's own environment, before any launch removes variables).
+            // The sources other profiles use, each from that profile's own resolution: the key
+            // its threads would use (read before any launch removes variables), and for the
+            // vendor's list its own binary and environment (its account may not be the agent's).
             let mut other_sources = Vec::new();
             for (driver, source, profile) in others {
-                let key = match source.as_ref().and_then(|s| s.key_env().ok().flatten()) {
-                    Some(name) => {
-                        let name = name.to_owned();
-                        let resolved = resolve_agent(profile).await;
-                        if !scan_is_current(generation) {
-                            return;
-                        }
-                        agent_env(resolved.env, &clear).lookup(&name)
-                    }
-                    None => None,
+                let resolved = resolve_agent(profile).await;
+                if !scan_is_current(generation) {
+                    return;
+                }
+                let env = agent_env(resolved.env, &clear);
+                let key = source
+                    .as_ref()
+                    .and_then(|s| s.key_env().ok().flatten())
+                    .and_then(|name| env.lookup(name));
+                let Some(program) = resolved.program else {
+                    continue; // that profile's binary is not there: nothing to list it with
                 };
-                other_sources.push((driver, source, crate::probe::ProviderKey::new(key)));
+                other_sources.push(crate::probe::OtherSource {
+                    driver,
+                    source,
+                    key: crate::probe::ProviderKey::new(key),
+                    target: crate::probe::ProbeTarget { program, env },
+                });
             }
             let targets = probe_targets(&availability.all(), |d| {
                 envs.iter()
@@ -7908,7 +7976,7 @@ impl AgentTerminalWindow {
                     return;
                 }
                 if AgentAvailability::shared().is_ready(driver) {
-                    wait_for_fresh_catalog(driver).await;
+                    wait_for_fresh_catalog(driver, own_source(&profile, driver)).await;
                 }
                 let Some(obj) = obj.upgrade() else { return };
                 if !obj.imp().session_start_allowed() {

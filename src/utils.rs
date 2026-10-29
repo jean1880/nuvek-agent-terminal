@@ -813,13 +813,25 @@ pub fn terminal_provider(
 
 /// `profile` with its model provider's arguments after its own, for a terminal tab's command
 /// line. An `Err` refuses the tab: it never starts on the vendor's models.
-pub fn with_provider_args(profile: &Profile) -> Result<Profile, String> {
+pub fn with_provider_args(profile: &Profile, model: Option<&str>) -> Result<Profile, String> {
     let mut profile = profile.clone();
     if let Some((provider, driver)) = terminal_provider(&profile) {
+        let label = provider.kind.label();
         let args = provider
             .args(driver)
-            .map_err(|why| format!("Cannot start on {}: {why}.", provider.kind.label()))?;
+            .map_err(|why| format!("Cannot start on {label}: {why}."))?;
+        // The CLI is told its model: left to itself it starts on its own setting, which names
+        // a vendor model the server does not have.
+        let model = model.filter(|m| !m.trim().is_empty()).ok_or_else(|| {
+            format!(
+                "Cannot start on {label}: it has listed no model yet. Pick a Default Model for \
+                 this profile, or try again once its models are listed."
+            )
+        })?;
         profile.args.extend(args);
+        profile
+            .args
+            .extend(agent_core::provider::model_args(driver, model));
     }
     Ok(profile)
 }
@@ -874,7 +886,11 @@ mod tests {
             }),
             ..crate::config::new_agent_profile(agent_core::adapter::Driver::Codex)
         };
-        let codex = with_provider_args(&on(ProviderKind::LiteLlm, Some("GW_KEY"))).unwrap();
+        let codex = with_provider_args(
+            &on(ProviderKind::LiteLlm, Some("GW_KEY")),
+            Some("qwen3-coder"),
+        )
+        .unwrap();
         assert!(codex
             .args
             .contains(&"model_provider=\"agent_terminal\"".to_owned()));
@@ -883,6 +899,12 @@ mod tests {
             command[1].contains("model_providers.agent_terminal.base_url"),
             "{command:?}"
         );
+        // The CLI is told its model, also when resuming (Codex's `-m` precedes `resume`).
+        assert!(command[1].contains("'-m' 'qwen3-coder'"), "{command:?}");
+        let resumed = get_startup_command(Some(&codex), Launch::Resume("abc"));
+        assert!(resumed[1].contains("'-m' 'qwen3-coder'"), "{resumed:?}");
+        // No model known: refused, never left to the CLI's own (vendor) setting.
+        assert!(with_provider_args(&on(ProviderKind::Ollama, None), None).is_err());
 
         let (provider, driver) = terminal_provider(&Profile {
             command: "claude".into(),
@@ -918,13 +940,16 @@ mod tests {
         // The key variable is not in the block: refused.
         let mut bare = vec!["HOME=/h".to_owned()];
         assert!(apply_provider_env(&provider, driver, None, &mut bare).is_err());
-        assert!(with_provider_args(&Profile {
-            provider: Some(ModelProvider {
-                base_url: Some("gw".into()),
-                ..ModelProvider::new(ProviderKind::Ollama)
-            }),
-            ..crate::config::new_agent_profile(agent_core::adapter::Driver::Claude)
-        })
+        assert!(with_provider_args(
+            &Profile {
+                provider: Some(ModelProvider {
+                    base_url: Some("gw".into()),
+                    ..ModelProvider::new(ProviderKind::Ollama)
+                }),
+                ..crate::config::new_agent_profile(agent_core::adapter::Driver::Claude)
+            },
+            Some("m")
+        )
         .is_err());
         // A profile without a chat agent has nothing to run on a server.
         let shell = Profile {
@@ -932,7 +957,7 @@ mod tests {
             driver: None,
             ..on(ProviderKind::Ollama, None)
         };
-        assert_eq!(with_provider_args(&shell).unwrap(), shell);
+        assert_eq!(with_provider_args(&shell, None).unwrap(), shell);
     }
 
     /// The new-thread folder table: the most specific folder that exists wins, and only an

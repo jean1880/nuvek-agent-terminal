@@ -296,7 +296,10 @@ Architectural mandates, standards, and workflows for this codebase.
   auto-mode models: `provider::CLAUDE_MODEL_VARS`) are unset, then bound to the process's model
   at every spawn (`bind_thread_model`), so background tasks and subagents stay on the server; an
   unbound one is never exported. A model is chosen by `start_model`: the profile's own, else the
-  server's first chat model (never the CLI's own setting, which names a vendor model). The
+  server's first chat model (never the CLI's own setting, which names a vendor model); with none
+  known, nothing starts (thread, switch, worker or terminal tab), and a terminal tab is given its
+  model on the command line (`provider::model_args`). A model change on a server is a resumed
+  restart (`binds_thread_model`): Claude Code refuses a live `set_model` to an unknown id. The
   catalogue keeps a list per source any enabled profile uses (`ModelCatalog::models_for`,
   `other_profile_sources`): each thread's picker (`ProfileModels`), its retirement judgement and
   a delegated worker's effort check use the list of the source its own profile runs

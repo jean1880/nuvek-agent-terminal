@@ -27,7 +27,10 @@ Architectural mandates, standards, and workflows for this codebase.
   configured CLI or the user's `$SHELL`.
 - **PTY Isolation**: sessions inherit the user's interactive environment (`-ic`)
   and full environment variables so tooling (nvm, aliases) stays available.
-  `TERM`/`COLORTERM` are forced so the CLI renders its full TUI.
+  `TERM`/`COLORTERM` are forced so the CLI renders its full TUI. The block built from them
+  (minus `clear_env`, plus the env file) is the child's whole environment
+  (`spawn_with_exact_env`, `VTE_SPAWN_NO_PARENT_ENVV`): with VTE's default flags every variable
+  removed from it was added back from the app's own.
 - **`exec`, and nothing before it**: the startup command is `exec <cli>` so the
   CLI owns the controlling terminal. Never emit banner or `clear` output into the
   TTY beforehand — it disrupts the CLI's initial terminal handshake. Anything

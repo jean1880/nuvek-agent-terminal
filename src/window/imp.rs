@@ -1063,6 +1063,30 @@ async fn resolve_active_profile(
     chosen
 }
 
+/// Starts `argv` in `terminal` with exactly the environment `env`. VTE adds the app's own
+/// environment under the one given unless told not to, which would bring back every variable
+/// removed from `env` (`clear_env`'s session markers, a model provider's vendor variables), so
+/// the block is passed as complete: `env` must hold everything the shell needs.
+fn spawn_with_exact_env(
+    terminal: &Terminal,
+    work_dir: &str,
+    argv: &[&str],
+    env: &[&str],
+    done: impl FnOnce(Result<glib::Pid, glib::Error>) + 'static,
+) {
+    terminal.spawn_async(
+        PtyFlags::DEFAULT,
+        Some(work_dir),
+        argv,
+        env,
+        glib::SpawnFlags::from_bits_retain(vte4::ffi::VTE_SPAWN_NO_PARENT_ENVV as u32),
+        || {},
+        -1,
+        None::<&gtk4::gio::Cancellable>,
+        done,
+    );
+}
+
 /// A terminal tab whose model provider refused it: nothing is spawned, and the tab (kept, with
 /// the reason written into it) and a dialog say why.
 fn refuse_terminal(
@@ -4059,7 +4083,8 @@ impl AgentTerminalWindow {
         // markers come with it and the CLI we spawn concludes it is a nested
         // child. Stripping happens before the env_file merge below, so a profile
         // can deliberately put any of these back.
-        let cleared = crate::utils::strip_env(&mut env_strs, &self.config.borrow().clear_env);
+        let clear = self.config.borrow().clear_env.clone();
+        let cleared = crate::utils::strip_env(&mut env_strs, &clear);
         if !cleared.is_empty() {
             info!(
                 "Cleared {} inherited session variable(s) from the child environment: {}",
@@ -4088,10 +4113,13 @@ impl AgentTerminalWindow {
             terminal,
             async move {
                 if let Some(path) = env_file {
-                    let extra =
-                        gtk4::gio::spawn_blocking(move || crate::utils::load_env_file(&path))
-                            .await
-                            .unwrap_or_default();
+                    // With the patterns: an export of a cleared variable equal to its inherited
+                    // value is kept, since the block below no longer has it to fall back on.
+                    let extra = gtk4::gio::spawn_blocking(move || {
+                        crate::utils::load_env_file_for_profile(&path, &clear).unwrap_or_default()
+                    })
+                    .await
+                    .unwrap_or_default();
 
                     // Later entries win in the environment block, so appending
                     // lets the profile override an inherited value.
@@ -4110,24 +4138,11 @@ impl AgentTerminalWindow {
                 }
 
                 let env_ptrs: Vec<&str> = env_strs.iter().map(String::as_str).collect();
-                // VTE adds the app's own environment under the one given unless told not to, so a
-                // provider tab, whose vendor variables were removed above, must say the block is
-                // complete: otherwise a removed CLAUDE_CODE_USE_BEDROCK would still be inherited.
-                let spawn_flags = if provider.is_some() {
-                    glib::SpawnFlags::from_bits_retain(vte4::ffi::VTE_SPAWN_NO_PARENT_ENVV as u32)
-                } else {
-                    glib::SpawnFlags::DEFAULT
-                };
-
-                terminal.spawn_async(
-                    PtyFlags::DEFAULT,
-                    Some(&work_dir),
+                spawn_with_exact_env(
+                    &terminal,
+                    &work_dir,
                     &[&shell, &command[0], &command[1]],
                     &env_ptrs,
-                    spawn_flags,
-                    || {},
-                    -1,
-                    None::<&gtk4::gio::Cancellable>,
                     glib::clone!(
                         #[weak]
                         obj,
@@ -7338,6 +7353,39 @@ mod tests {
         );
         // No tab yet: fall through to the starting directory.
         assert_eq!(profile_tab_dir(None, None), None);
+    }
+
+    /// A terminal's child sees the environment block it was given and nothing else: a variable
+    /// the app has but the block leaves out (one `clear_env` removed) does not come back.
+    #[test]
+    #[cfg(feature = "terminal")] // the stub never spawns
+    fn a_terminal_gets_exactly_the_environment_it_is_given() {
+        init_gtk();
+        let ctx = glib::MainContext::default();
+        // In the app's own environment, left out of the block the terminal is given.
+        std::env::set_var("AGENT_TERMINAL_TEST_CLEARED", "inherited");
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("seen");
+        let script = format!(
+            "printf %s \"${{AGENT_TERMINAL_TEST_CLEARED-unset}}:${{AGENT_TERMINAL_TEST_GIVEN-unset}}\" > '{}'",
+            out.display()
+        );
+        let terminal = Terminal::new();
+        let spawned = std::rc::Rc::new(std::cell::Cell::new(None::<bool>));
+        let s = spawned.clone();
+        spawn_with_exact_env(
+            &terminal,
+            &dir.path().to_string_lossy(),
+            &["/bin/sh", "-c", &script],
+            &["PATH=/usr/bin:/bin", "AGENT_TERMINAL_TEST_GIVEN=given"],
+            move |result| s.set(Some(result.is_ok())),
+        );
+        assert!(crate::testutil::pump_until(&ctx, 10, || {
+            spawned.get().is_some() && std::fs::read_to_string(&out).is_ok_and(|t| !t.is_empty())
+        }));
+        assert_eq!(spawned.get(), Some(true));
+        // With VTE's default flags this read "inherited:given".
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "unset:given");
     }
 
     #[test]

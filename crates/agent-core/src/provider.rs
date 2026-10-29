@@ -478,6 +478,71 @@ pub fn first_chat_model<'a>(ids: impl IntoIterator<Item = &'a str>) -> Option<&'
         .find(|id| !id.to_ascii_lowercase().contains("embed"))
 }
 
+/// What is known of one model a server lists: whether it can hold a conversation (not an
+/// embedding model) and, when the server says, whether it can call tools.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelInfo {
+    pub id: String,
+    pub chat: bool,
+    /// `None`: the server does not say.
+    pub tools: Option<bool>,
+}
+
+impl ModelInfo {
+    /// What the name alone tells, for a server that reports nothing more.
+    pub fn by_name(id: &str) -> Self {
+        Self {
+            id: id.to_owned(),
+            chat: first_chat_model([id]).is_some(),
+            tools: None,
+        }
+    }
+}
+
+/// What an Ollama `POST /api/show` answer says of a model: `(chat, tools)` from its
+/// `capabilities` (`completion`, `embedding`, `tools`, …). `None` when it lists none (an older
+/// server), so the name decides.
+pub fn parse_ollama_show(json: &str) -> Option<(bool, bool)> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let caps: Vec<&str> = value
+        .get("capabilities")?
+        .as_array()?
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    if caps.is_empty() {
+        return None;
+    }
+    let chat = caps.contains(&"completion") && !caps.contains(&"embedding");
+    Some((chat, caps.contains(&"tools")))
+}
+
+/// What an LM Studio `GET /api/v1/models` answer (0.4 and later) says of each model, by key:
+/// `type` `llm` is a chat model (`embedding` is not), and `capabilities.trained_for_tool_use`
+/// says whether it calls tools. Models it does not describe are left to their names.
+pub fn parse_lmstudio_models(json: &str) -> Vec<ModelInfo> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    value
+        .get("models")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|m| {
+            let id = m.get("key").and_then(serde_json::Value::as_str)?;
+            let kind = m.get("type").and_then(serde_json::Value::as_str)?;
+            Some(ModelInfo {
+                id: id.to_owned(),
+                chat: kind == "llm",
+                tools: m
+                    .pointer("/capabilities/trained_for_tool_use")
+                    .and_then(serde_json::Value::as_bool),
+            })
+        })
+        .collect()
+}
+
 /// The model ids of a `/v1/models` answer (`{"data": [{"id": …}, …]}`), in the server's order,
 /// without duplicates, empty or oversized ids, or control characters; at most [`MAX_MODELS`].
 pub fn parse_models(json: &str) -> Result<Vec<String>, String> {
@@ -619,6 +684,52 @@ mod tests {
         ] {
             assert!(normalize_base_url(bad).is_err(), "{bad:?} accepted");
         }
+    }
+
+    #[test]
+    fn native_model_details_say_what_chats_and_what_calls_tools() {
+        // Recorded from Ollama 0.40.13 (qwen3.5:9b), trimmed; and an embedding model.
+        let qwen = r#"{"capabilities":["completion","vision","tools","thinking"],"details":{}}"#;
+        assert_eq!(parse_ollama_show(qwen), Some((true, true)));
+        let embed = r#"{"capabilities":["embedding"]}"#;
+        assert_eq!(parse_ollama_show(embed), Some((false, false)));
+        let plain = r#"{"capabilities":["completion"]}"#;
+        assert_eq!(parse_ollama_show(plain), Some((true, false)));
+        assert_eq!(
+            parse_ollama_show(r#"{"details":{}}"#),
+            None,
+            "an older server"
+        );
+        assert_eq!(parse_ollama_show("nope"), None);
+
+        let lm = r#"{"models":[
+            {"type":"llm","key":"qwen/qwen3-8b","capabilities":{"vision":false,"trained_for_tool_use":true}},
+            {"type":"embedding","key":"text-embedding-nomic"},
+            {"type":"llm","key":"old-model"}
+        ]}"#;
+        assert_eq!(
+            parse_lmstudio_models(lm),
+            vec![
+                ModelInfo {
+                    id: "qwen/qwen3-8b".into(),
+                    chat: true,
+                    tools: Some(true)
+                },
+                ModelInfo {
+                    id: "text-embedding-nomic".into(),
+                    chat: false,
+                    tools: None
+                },
+                ModelInfo {
+                    id: "old-model".into(),
+                    chat: true,
+                    tools: None
+                },
+            ]
+        );
+        assert!(parse_lmstudio_models("{}").is_empty());
+        assert!(!ModelInfo::by_name("nomic-embed-text").chat);
+        assert!(ModelInfo::by_name("qwen3.5:9b").chat);
     }
 
     #[test]

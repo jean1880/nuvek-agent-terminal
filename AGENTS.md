@@ -330,7 +330,10 @@ Architectural mandates, standards, and workflows for this codebase.
   `<base>/v1/models` at the address the user configured for a profile's model provider, off the
   main thread, with a timeout, redirects not followed, made only while a profile has a provider
   (when the models are listed, as the vendor's list is otherwise; for each enabled Local server
-  at every agent scan and on Scan Now). Its tests use a loopback listener of their own. And the
+  at every agent scan and on Scan Now). For a Local server of a kind that says what each model
+  can do, the catalogue and Scan Now also ask it (`provider_models::fetch_info`): Ollama's
+  `POST /api/show` per model (at most 50, five seconds each), LM Studio's `GET /api/v1/models`;
+  a failure leaves a model to its name. Its tests use a loopback listener of their own. And the
   Local agent's chat requests (`agent_kit::local_agent::HttpChat`): streamed POSTs of
   `<base>/v1/chat/completions` to the address the user configured for that server, only while
   one of its threads runs a turn, redirects not followed, the key sent only as a bearer token

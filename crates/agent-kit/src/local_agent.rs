@@ -388,6 +388,8 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                         ..c.clone()
                     })
                     .collect(),
+                // Reasoning is never kept: it only matters inside its own turn.
+                reasoning_content: None,
                 ..m.clone()
             })
             .collect();
@@ -445,6 +447,8 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         self.emit(Envelope::new(Event::TurnStarted {
             model: Some(model.clone()),
         }));
+        // Earlier turns' reasoning is not sent again.
+        agent_core::local_agent::forget_reasoning(&mut self.messages);
         self.messages.push(ChatMessage::new("user", text));
         let mut usage = Usage::default();
         let mut result = Ok(());
@@ -517,12 +521,16 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         // What arrived before an interrupt is kept, so the next turn knows it was said; calls
         // only when they will each get an answer below.
         if !reply.text.is_empty() || !reply.tool_calls.is_empty() {
+            let calls = runnable && !reply.tool_calls.is_empty();
             self.messages.push(ChatMessage {
-                tool_calls: if runnable {
+                tool_calls: if calls {
                     reply.tool_calls.clone()
                 } else {
                     Vec::new()
                 },
+                // Sent back with its calls while this turn runs (`forget_reasoning`).
+                reasoning_content: (calls && !reply.reasoning.is_empty())
+                    .then(|| reply.reasoning.clone()),
                 ..ChatMessage::new("assistant", reply.text.clone())
             });
         }
@@ -1511,6 +1519,45 @@ mod tests {
         run.wait_for(completed);
         run.finish();
         assert_ne!(first, second, "a resumed session never reuses a card's id");
+    }
+
+    #[test]
+    fn reasoning_goes_back_with_its_calls_in_the_turn_and_never_after() {
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("a.txt"), "x").unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut call =
+            vec![r#"data: {"choices":[{"delta":{"reasoning":"I should read it"}}]}"#.to_owned()];
+        call.extend(tool_call("c1", "read_file", json!({"file_path": "a.txt"})));
+        let script = Script::new(vec![Ok(call), Ok(text(&["Read"])), Ok(text(&["Later"]))]);
+        let run = start(
+            args(work.path(), Mode::Ask),
+            script.clone(),
+            state.path().into(),
+        );
+        run.send(prompt("read a.txt"));
+        run.wait_for(completed);
+        run.send(prompt("and now?"));
+        run.wait_for(completed);
+        run.finish();
+        let bodies = script.bodies();
+        let with_calls = |body: &Value| {
+            body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["tool_calls"].is_array())
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(
+            with_calls(&bodies[1])["reasoning_content"],
+            "I should read it",
+            "sent back while its turn runs"
+        );
+        assert!(with_calls(&bodies[2]).get("reasoning_content").is_none());
+        let saved = std::fs::read_to_string(state.path().join("s-1.json")).unwrap();
+        assert!(!saved.contains("I should read it"), "never kept on disk");
     }
 
     #[test]

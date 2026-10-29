@@ -20,21 +20,30 @@ const SERVER_URL_HELP: &str = "The server's address, e.g. http://192.0.2.10:1143
 /// Fills the server list again (after an add or a removal).
 type Refill = Rc<dyn Fn()>;
 
-/// What "Models on the Server" says about a scan of `base` that listed `ids`: how many models a
-/// thread can run on, which, and how many embedding models were left out. `Err` when there is
-/// none to chat with.
-pub(super) fn scan_summary(base: &str, ids: &[String]) -> Result<String, String> {
-    let (chat, embed): (Vec<&String>, Vec<&String>) = ids
-        .iter()
-        .partition(|id| agent_core::provider::first_chat_model([id.as_str()]).is_some());
+/// What "Models on the Server" says about a scan of `base` that found `models`: how many a
+/// thread can run on, which (marked when the server says one cannot call tools), and how many
+/// embedding models were left out. `Err` when there is none to chat with.
+pub(super) fn scan_summary(
+    base: &str,
+    models: &[agent_core::provider::ModelInfo],
+) -> Result<String, String> {
+    let (chat, embed): (Vec<_>, Vec<_>) = models.iter().partition(|m| m.chat);
     if chat.is_empty() {
-        return Err(if ids.is_empty() {
+        return Err(if models.is_empty() {
             format!("{base} lists no models. Pull or load one on the server, then Scan Now.")
         } else {
             format!("{base} lists only embedding models, which cannot hold a conversation.")
         });
     }
-    let shown: Vec<&str> = chat.iter().take(8).map(|s| s.as_str()).collect();
+    let named: Vec<String> = chat
+        .iter()
+        .take(8)
+        .map(|m| match m.tools {
+            Some(false) => format!("{} (no tools)", m.id),
+            _ => m.id.clone(),
+        })
+        .collect();
+    let shown: Vec<&str> = named.iter().map(String::as_str).collect();
     let mut text = format!(
         "{} model{} at {base}: {}",
         chat.len(),
@@ -76,21 +85,22 @@ async fn scan_server(server: Profile) -> Result<(String, Vec<String>), String> {
         }
         None => None,
     };
-    let ids = off_main("the scan", move || {
-        agent_kit::provider_models::fetch(
+    let models = off_main("the scan", move || {
+        agent_kit::provider_models::fetch_info(
             &provider,
             key.as_deref(),
             crate::model_catalog::USER_AGENT,
         )
     })
     .await?;
-    let mut summary = scan_summary(&base, &ids)?;
+    let mut summary = scan_summary(&base, &models)?;
     if let Some(hint) = hint {
         summary.push_str(&format!(". Note: {hint}."));
     }
-    let chat = ids
+    let chat = models
         .into_iter()
-        .filter(|id| agent_core::provider::first_chat_model([id.as_str()]).is_some())
+        .filter(|m| m.chat)
+        .map(|m| m.id)
         .collect();
     Ok((summary, chat))
 }
@@ -635,19 +645,37 @@ mod tests {
 
     #[test]
     fn a_scan_names_the_chat_models_and_leaves_embedding_ones_out() {
-        let ids: Vec<String> = ["qwen3.5:9b", "nomic-embed-text:latest", "qwen3.5:4b"]
-            .map(String::from)
-            .to_vec();
+        use agent_core::provider::ModelInfo;
+        let models = vec![
+            ModelInfo {
+                id: "qwen3.5:9b".into(),
+                chat: true,
+                tools: Some(true),
+            },
+            ModelInfo {
+                id: "nomic-embed-text:latest".into(),
+                chat: false,
+                tools: Some(false),
+            },
+            ModelInfo {
+                id: "qwen2.5:0.5b".into(),
+                chat: true,
+                tools: Some(false),
+            },
+        ];
         assert_eq!(
-            scan_summary("http://192.0.2.1:11434", &ids).unwrap(),
-            "2 models at http://192.0.2.1:11434: qwen3.5:9b, qwen3.5:4b (1 embedding model not offered)"
+            scan_summary("http://192.0.2.1:11434", &models).unwrap(),
+            "2 models at http://192.0.2.1:11434: qwen3.5:9b, qwen2.5:0.5b (no tools) \
+             (1 embedding model not offered)"
         );
-        let many: Vec<String> = (0..10).map(|i| format!("m{i}")).collect();
+        let many: Vec<ModelInfo> = (0..10)
+            .map(|i| ModelInfo::by_name(&format!("m{i}")))
+            .collect();
         assert!(scan_summary("b", &many).unwrap().ends_with(" and 2 more"));
         assert!(scan_summary("b", &[])
             .unwrap_err()
             .contains("lists no models"));
-        assert!(scan_summary("b", &["bge-embed".into()])
+        assert!(scan_summary("b", &[ModelInfo::by_name("bge-embed")])
             .unwrap_err()
             .contains("only embedding"));
     }

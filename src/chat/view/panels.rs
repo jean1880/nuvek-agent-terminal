@@ -599,6 +599,16 @@ pub fn confirm_bypass(parent: &impl IsA<gtk4::Widget>, driver: Driver, then: imp
     dialog.present(Some(parent));
 }
 
+/// The picker's hint for a thread on `driver`.
+fn picker_hint(driver: Driver) -> &'static str {
+    if driver.is_built_in() {
+        "Click a model to switch to it."
+    } else {
+        "Click a model to switch to it. Set its effort first, or press Apply to change only the \
+         effort."
+    }
+}
+
 /// The model picker: ONE searchable list of every model of both agents, so a thread can jump
 /// from an agy Gemini to a Claude model (or back) in a single click. Picking a row of the other
 /// agent is a handoff, which the backend's `switch` performs.
@@ -613,10 +623,10 @@ pub fn model_picker(ctx: &PanelCtx) {
     search.set_margin_end(18);
     let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
     outer.append(&search);
-    // How a choice is made: nothing in a list of rows says a click commits.
+    // How a choice is made: nothing in a list of rows says a click commits. Efforts are only
+    // spoken of where the thread's agent has them (a model server's models have none).
     let hint = wrapped_text(
-        "Click a model to switch to it. Set its effort first, or press Apply to change only \
-         the effort.",
+        picker_hint(status.driver),
         &["dim-label", "model-picker-hint"],
     );
     hint.set_margin_start(18);

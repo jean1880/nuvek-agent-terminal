@@ -5,7 +5,9 @@
 
 use std::time::Duration;
 
-use agent_core::provider::{parse_models, ModelProvider};
+use agent_core::provider::{
+    parse_lmstudio_models, parse_models, parse_ollama_show, ModelInfo, ModelProvider, ProviderKind,
+};
 
 /// How long the whole request may take.
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -51,6 +53,86 @@ pub fn fetch(
         .read_to_string()
         .map_err(|_| format!("Could not read {server}'s model list."))?;
     parse_models(&body)
+}
+
+/// The most models whose details are asked of an Ollama server, one request each: the rest are
+/// judged by name.
+const MAX_DETAILED: usize = 50;
+/// How long one detail request may take.
+const DETAIL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// [`fetch`], then what the server says of each model where it says it: Ollama's
+/// `POST /api/show` (its `capabilities`), LM Studio's `GET /api/v1/models` (`type`,
+/// `trained_for_tool_use`). Any other server, or a detail request that fails, leaves a model to
+/// its name ([`ModelInfo::by_name`]): the list itself never fails for want of details.
+pub fn fetch_info(
+    provider: &ModelProvider,
+    key: Option<&str>,
+    user_agent: &str,
+) -> Result<Vec<ModelInfo>, String> {
+    let ids = fetch(provider, key, user_agent)?;
+    let base = provider.base()?;
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(DETAIL_TIMEOUT))
+        .max_redirects(0)
+        .user_agent(user_agent)
+        .build()
+        .into();
+    let bearer = key.filter(|k| !k.is_empty()).map(|k| format!("Bearer {k}"));
+    let read = |reply: Result<ureq::http::Response<ureq::Body>, ureq::Error>| -> Option<String> {
+        let mut reply = reply.ok()?;
+        if !reply.status().is_success() {
+            return None;
+        }
+        reply
+            .body_mut()
+            .with_config()
+            .limit(MAX_BODY)
+            .read_to_string()
+            .ok()
+    };
+    Ok(match provider.kind {
+        ProviderKind::Ollama => ids
+            .iter()
+            .enumerate()
+            .map(|(at, id)| {
+                let shown = (at < MAX_DETAILED).then(|| {
+                    let mut request = agent.post(&format!("{base}/api/show"));
+                    if let Some(bearer) = &bearer {
+                        request = request.header("Authorization", bearer);
+                    }
+                    read(request.send_json(serde_json::json!({ "model": id })))
+                });
+                match shown.flatten().as_deref().and_then(parse_ollama_show) {
+                    Some((chat, tools)) => ModelInfo {
+                        id: id.clone(),
+                        chat,
+                        tools: Some(tools),
+                    },
+                    None => ModelInfo::by_name(id),
+                }
+            })
+            .collect(),
+        ProviderKind::LmStudio => {
+            let mut request = agent.get(&format!("{base}/api/v1/models"));
+            if let Some(bearer) = &bearer {
+                request = request.header("Authorization", bearer);
+            }
+            let described = read(request.call())
+                .map(|body| parse_lmstudio_models(&body))
+                .unwrap_or_default();
+            ids.iter()
+                .map(|id| {
+                    described
+                        .iter()
+                        .find(|m| &m.id == id)
+                        .cloned()
+                        .unwrap_or_else(|| ModelInfo::by_name(id))
+                })
+                .collect()
+        }
+        _ => ids.iter().map(|id| ModelInfo::by_name(id)).collect(),
+    })
 }
 
 #[cfg(test)]
@@ -135,6 +217,83 @@ mod tests {
             "{err}"
         );
         assert!(!err.contains("k-secret"));
+    }
+
+    /// Serves `n` requests on a loopback port, each answered by `reply(head, body)` with a status
+    /// line and a JSON body.
+    fn serve_many(
+        n: usize,
+        reply: fn(&str, &str) -> (&'static str, String),
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::Read;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            for _ in 0..n {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut head = String::new();
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = line.to_lowercase().strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap_or(0);
+                    }
+                    head.push_str(&line);
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let (status, json) = reply(&head, &String::from_utf8_lossy(&body));
+                let answer = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                    json.len()
+                );
+                stream.write_all(answer.as_bytes()).unwrap();
+            }
+        });
+        (base, handle)
+    }
+
+    #[test]
+    fn ollama_details_say_what_chats_and_calls_tools_and_a_failure_falls_back_to_the_name() {
+        let (base, server) = serve_many(4, |head, body| {
+            if head.starts_with("GET /v1/models") {
+                let list = r#"{"data":[{"id":"qwen3.5:9b"},{"id":"nomic-embed-text"},{"id":"mystery-embed"}]}"#;
+                return ("200 OK", list.to_owned());
+            }
+            assert!(head.starts_with("POST /api/show"), "{head}");
+            if body.contains("qwen3.5:9b") {
+                (
+                    "200 OK",
+                    r#"{"capabilities":["completion","tools"]}"#.to_owned(),
+                )
+            } else if body.contains("nomic-embed-text") {
+                ("200 OK", r#"{"capabilities":["embedding"]}"#.to_owned())
+            } else {
+                ("500 Internal Server Error", "{}".to_owned())
+            }
+        });
+        let info = fetch_info(&at(&base), None, "t").unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            info,
+            vec![
+                ModelInfo {
+                    id: "qwen3.5:9b".into(),
+                    chat: true,
+                    tools: Some(true)
+                },
+                ModelInfo {
+                    id: "nomic-embed-text".into(),
+                    chat: false,
+                    tools: Some(false)
+                },
+                ModelInfo::by_name("mystery-embed"),
+            ]
+        );
     }
 
     #[test]

@@ -348,6 +348,18 @@ pub struct ChatMessage {
     /// The call a `tool` message answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// The reasoning that led to an assistant message's tool calls, sent back with it while its
+    /// turn runs: some reasoning models' templates refuse, or go astray on, a tool-call turn
+    /// without it. Dropped once the turn ends ([`forget_reasoning`]), and never kept on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+}
+
+/// Drops the reasoning of earlier turns: it is sent back only within the turn that made it.
+pub fn forget_reasoning(messages: &mut [ChatMessage]) {
+    for message in messages {
+        message.reasoning_content = None;
+    }
 }
 
 impl ChatMessage {
@@ -434,6 +446,8 @@ pub enum StreamEvent {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Reply {
     pub text: String,
+    /// Its reasoning, from whichever field or `<think>` tags the server used.
+    pub reasoning: String,
     pub tool_calls: Vec<ToolCall>,
     /// The server's `finish_reason`, if it sent one.
     pub finish_reason: Option<String>,
@@ -477,7 +491,9 @@ impl StreamReader {
         let data = data.trim();
         if data == "[DONE]" {
             self.done = true;
-            return self.think.flush();
+            let rest = self.think.flush();
+            self.keep(&rest);
+            return rest;
         }
         let Ok(chunk) = serde_json::from_str::<Value>(data) else {
             return vec![StreamEvent::Error(
@@ -496,12 +512,7 @@ impl StreamReader {
                 }
             }
             if let Some(text) = delta["content"].as_str().filter(|t| !t.is_empty()) {
-                for event in self.think.feed(text) {
-                    if let StreamEvent::Text(text) = &event {
-                        self.reply.text.push_str(text);
-                    }
-                    out.push(event);
-                }
+                out.extend(self.think.feed(text));
             }
             for call in delta["tool_calls"].as_array().into_iter().flatten() {
                 self.add_call_fragment(call);
@@ -517,7 +528,19 @@ impl StreamReader {
                 count("completion_tokens"),
             ));
         }
+        self.keep(&out);
         out
+    }
+
+    /// Adds what `events` say to the reply's text and reasoning.
+    fn keep(&mut self, events: &[StreamEvent]) {
+        for event in events {
+            match event {
+                StreamEvent::Text(text) => self.reply.text.push_str(text),
+                StreamEvent::Reasoning(text) => self.reply.reasoning.push_str(text),
+                _ => {}
+            }
+        }
     }
 
     fn add_call_fragment(&mut self, call: &Value) {
@@ -552,11 +575,7 @@ impl StreamReader {
     /// get one, since the answer must name it.
     pub fn finish(mut self) -> (Reply, Vec<StreamEvent>) {
         let rest = self.think.flush();
-        for event in &rest {
-            if let StreamEvent::Text(text) = event {
-                self.reply.text.push_str(text);
-            }
-        }
+        self.keep(&rest);
         self.reply.tool_calls = self
             .calls
             .into_iter()

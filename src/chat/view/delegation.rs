@@ -364,10 +364,28 @@ impl Workers {
         else {
             return;
         };
-        let at = worker
-            .histories
-            .iter()
-            .position(|history| history.scope == scoped.scope)
+        // A request is settled in the history that holds it, even when a later run of the same
+        // process is the one reporting that it was answered or expired.
+        let holder = match (&scoped.envelope.event, scoped.envelope.request.as_deref()) {
+            (
+                Event::ApprovalResolved { .. }
+                | Event::ApprovalExpired
+                | Event::QuestionResolved { .. }
+                | Event::FormResolved { .. },
+                Some(native),
+            ) => worker.histories.iter().position(|history| {
+                history.scope.generation == scoped.scope.generation
+                    && history.requests.contains_key(native)
+            }),
+            _ => None,
+        };
+        let at = holder
+            .or_else(|| {
+                worker
+                    .histories
+                    .iter()
+                    .position(|history| history.scope == scoped.scope)
+            })
             .unwrap_or_else(|| {
                 let mut history = History::new(scoped.scope.clone());
                 history.identity = worker.summary.identity.clone();
@@ -674,7 +692,13 @@ impl Inner {
             .delegation
             .borrow()
             .worker(scope.worker.as_str())
-            .is_some_and(|worker| worker.live_scope().as_ref() == Some(&scope))
+            .is_some_and(|worker| {
+                let live = worker.live_scope();
+                worker
+                    .histories
+                    .iter()
+                    .any(|history| history.scope == scope && worker.keeps(history, live.as_ref()))
+            })
         {
             return;
         }
@@ -923,16 +947,14 @@ impl Inner {
     fn worker_request(self: &Rc<Self>, scope: &Scope, event: RowEvent) {
         let worker_id = scope.worker.as_str();
         let native = |request: &str| {
-            self.delegation
-                .borrow()
-                .worker(worker_id)
-                .filter(|worker| worker.live_scope().as_ref() == Some(scope))
-                .and_then(|worker| {
-                    worker
-                        .histories
-                        .iter()
-                        .find(|history| &history.scope == scope)
-                })
+            let workers = self.delegation.borrow();
+            let worker = workers.worker(worker_id)?;
+            let live = worker.live_scope();
+            // The live run's history, or an earlier run's that still holds an open request.
+            worker
+                .histories
+                .iter()
+                .find(|history| &history.scope == scope && worker.keeps(history, live.as_ref()))
                 .and_then(|history| history.native_requests.get(request).cloned())
         };
         let (request, action) = match event {
@@ -1404,6 +1426,7 @@ pub(crate) mod tests {
     pub(crate) fn ui_checks() {
         worker_shelf_ui_checks();
         bypass_allows_worker_requests_ui_checks();
+        requests_across_runs_ui_checks();
         let backend = Rc::new(Backend {
             actions: RefCell::new(Vec::new()),
             diff_scopes: RefCell::new(Vec::new()),
@@ -1784,6 +1807,99 @@ pub(crate) mod tests {
             matches!(backend.actions.borrow().last(), Some(WorkerAction::Approve { request, decision: Decision::Allow, .. }) if request == "later")
         );
         assert_eq!(backend.actions.borrow().len(), 2);
+    }
+
+    /// Requests left open by run A of a process stay answerable once run B has started, by the
+    /// user and by dangerous permissive mode, and a resolution reported in run B settles the
+    /// card in run A's history.
+    fn requests_across_runs_ui_checks() {
+        requests_across_runs(true);
+        requests_across_runs(false);
+    }
+
+    /// One view per answerer: the user's answer or dangerous permissive mode's.
+    fn requests_across_runs(by_user: bool) {
+        let backend = Rc::new(Backend {
+            actions: RefCell::new(Vec::new()),
+            diff_scopes: RefCell::new(Vec::new()),
+            root_answers: Cell::new(0),
+            mode: Cell::new(Mode::Ask),
+        });
+        let view = ChatView::new(backend.clone());
+        let subscriber = view.delegation_subscriber("root-thread");
+        let inner = view.inner().expect("inner");
+        subscriber.registry("root-thread", &[summary("w_workerAA", "r_firstRun")]);
+        let run_a = scope("w_workerAA", 1, "r_firstRun");
+        let approval = |request: &str| {
+            Envelope::new(Event::ApprovalRequested {
+                tool: "Bash".into(),
+                title: None,
+                input: json!({"command":"true"}),
+                reason: None,
+                options: vec![Decision::Allow, Decision::Deny],
+                response: ResponseCapability::Live,
+                remembers: None,
+            })
+            .request(request)
+        };
+        for request in ["a", "b"] {
+            subscriber.scoped(&ScopedEnvelope {
+                scope: run_a.clone(),
+                envelope: approval(request),
+            });
+        }
+        // Run B starts in the same process; both requests are still open.
+        let mut next = summary("w_workerAA", "r_secondRun");
+        next.waiting_on_user = true;
+        next.state = WorkerState::Waiting;
+        subscriber.registry("root-thread", &[next]);
+        let run_b = scope("w_workerAA", 1, "r_secondRun");
+        subscriber.scoped(&ScopedEnvelope {
+            scope: run_b.clone(),
+            envelope: Envelope::new(Event::TurnStarted { model: None }),
+        });
+        // The provider reports a answered in run B: only b stays pending, in run A's history.
+        subscriber.scoped(&ScopedEnvelope {
+            scope: run_b,
+            envelope: Envelope::new(Event::ApprovalExpired).request("a"),
+        });
+        let (local_a, local_b) = {
+            let workers = inner.delegation.borrow();
+            let worker = workers.worker("w_workerAA").expect("worker");
+            let history = worker
+                .histories
+                .iter()
+                .find(|h| h.scope == run_a)
+                .expect("run A history");
+            assert_eq!(
+                history.model.pending_approvals_offering(Decision::Allow),
+                [history.requests["b"].clone()],
+                "only the unsettled request stays pending"
+            );
+            (history.requests["a"].clone(), history.requests["b"].clone())
+        };
+        assert!(local_a != local_b);
+        // The user answers b from run A's card, opened in the worker's inspector.
+        if by_user {
+            assert!(inner.open_worker("w_workerAA"));
+            let inspector = inner.worker_inspector.borrow().clone().expect("inspector");
+            *inspector.selected.borrow_mut() = Some(run_a.clone());
+            inner.worker_row(
+                "w_workerAA",
+                RowEvent::Approve {
+                    request: local_b,
+                    decision: Decision::Allow,
+                    custom_rule: None,
+                },
+            );
+        } else {
+            // Dangerous permissive mode answers it too, once.
+            backend.mode.set(Mode::Bypass);
+            inner.allow_worker_requests();
+        }
+        assert!(
+            matches!(backend.actions.borrow().as_slice(), [WorkerAction::Approve { scope, request, .. }] if scope == &run_a && request == "b")
+        );
     }
 
     #[test]

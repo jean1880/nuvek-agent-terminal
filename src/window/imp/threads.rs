@@ -2221,6 +2221,40 @@ pub(super) fn agent_env(env: Vec<(String, String)>, clear: &[String]) -> AgentEn
     }
 }
 
+/// The arguments and environment an agent on `profile` starts with: the profile's own (`env` is
+/// its sourced env file, `clear` the configured `clear_env`), then its model provider's, which
+/// win over the env file. An `Err` refuses the start with the reason: a profile on a provider
+/// never falls back to its vendor's own models.
+pub(super) fn profile_launch(
+    profile: &Profile,
+    driver: Driver,
+    env: Vec<(String, String)>,
+    clear: &[String],
+) -> Result<(Vec<String>, AgentEnv), String> {
+    let mut args = profile.args.clone();
+    let mut agent = agent_env(env, clear);
+    let Some(provider) = &profile.provider else {
+        return Ok((args, agent));
+    };
+    let key = provider
+        .key_env()
+        .ok()
+        .flatten()
+        .and_then(|name| agent.lookup(name));
+    let launch = provider
+        .launch(driver, key.as_deref())
+        .map_err(|why| format!("Cannot start on {}: {why}.", provider.kind.label()))?;
+    args.extend(launch.args);
+    agent.env.retain(|(name, _)| !launch.unset.contains(name));
+    for name in launch.unset {
+        if !agent.unset.contains(&name) {
+            agent.unset.push(name);
+        }
+    }
+    agent.env.extend(launch.env);
+    Ok((args, agent))
+}
+
 /// What the app removes from an agent's environment: the configured `clear_env` (a launching
 /// agent session's markers) and any inherited approval socket, which only the app may set.
 pub(super) fn unset_list(patterns: &[String]) -> Vec<String> {
@@ -2297,8 +2331,8 @@ fn agent_launch_with(
     let Some(program) = resolved.program.clone() else {
         return Err(not_ready_reason(driver, &Availability::Missing));
     };
+    let (extra_args, env) = profile_launch(&profile, driver, resolved.env, &clear)?;
     let adapter = make_adapter(driver, &program);
-    let env = agent_env(resolved.env, &clear);
     let approval = match driver {
         // Claude and Codex raise approvals over their own protocol, not the hook socket.
         Driver::Claude | Driver::Codex => Err(None),
@@ -2324,7 +2358,7 @@ fn agent_launch_with(
     Ok(AgentLaunch {
         adapter,
         program,
-        extra_args: profile.args.clone(),
+        extra_args,
         default_model: profile.effective_default_model(None),
         default_effort: profile.default_effort.clone(),
         env,
@@ -5352,6 +5386,17 @@ impl AgentTerminalWindow {
         if slot.get().is_some() {
             return; // already running
         }
+        let clear = self.config.borrow().clear_env.clone();
+        let (extra_args, launch_env) =
+            match profile_launch(profile, driver, resolved.env.clone(), &clear) {
+                Ok(launch) => launch,
+                Err(why) => {
+                    // Shown, not stored: fixing the profile and reopening the thread starts it.
+                    warn!(thread, "a thread's model provider refused its start");
+                    view.apply(&Envelope::new(Event::Error { message: why }));
+                    return;
+                }
+            };
         // The provider was read off the main thread, behind the writer's barrier: the session
         // does not read it again here.
         let store = crate::chat::session::SessionStore {
@@ -5401,7 +5446,7 @@ impl AgentTerminalWindow {
             .unwrap_or_else(|| profile.command.clone());
         let open = OpenSession {
             program: program.clone(),
-            extra_args: profile.args.clone(),
+            extra_args,
             cwd: dir.to_owned(),
             model,
             effort,
@@ -5413,8 +5458,6 @@ impl AgentTerminalWindow {
             delegation: None,
         };
         let adapter = make_adapter(driver, &program);
-        let clear = self.config.borrow().clear_env.clone();
-        let launch_env = agent_env(resolved.env, &clear);
         let approval = match driver {
             Driver::Claude | Driver::Codex => Err(None),
             Driver::Agy => {
@@ -7380,16 +7423,25 @@ impl AgentTerminalWindow {
             }
             let availability = AgentAvailability::shared();
             let mut envs: Vec<(Driver, AgentEnv)> = Vec::new();
+            let mut providers = Vec::new();
             for (driver, profile) in profiles {
                 if profile.disabled {
                     continue;
                 }
-                let resolved = resolve_agent(profile).await;
+                let resolved = resolve_agent(profile.clone()).await;
                 if !scan_is_current(generation) {
                     return;
                 }
-                // Probes run where the threads run: the profile's env file and `clear_env`.
-                envs.push((driver, agent_env(resolved.env.clone(), &clear)));
+                // Probes run where the threads run: the profile's env file and `clear_env`, and
+                // its model provider's environment. A provider that refuses the start lists no
+                // models (it is never probed through the vendor instead).
+                match profile_launch(&profile, driver, resolved.env.clone(), &clear) {
+                    Ok((_, env)) => envs.push((driver, env)),
+                    Err(_) => envs.push((driver, agent_env(resolved.env.clone(), &clear))),
+                }
+                if let Some(provider) = profile.provider.clone() {
+                    providers.push((driver, provider));
+                }
                 let state = classify(false, Some(resolved.program.as_deref()));
                 // Back from missing (installed, or switched on again): its list may be new.
                 if state.is_ready()
@@ -7419,7 +7471,8 @@ impl AgentTerminalWindow {
                     .find(|(driver, _)| *driver == d)
                     .map(|(_, env)| env.clone())
                     .unwrap_or_default()
-            });
+            })
+            .with_providers(providers);
             match probes {
                 Probes::IfDue => {
                     let now = crate::freshness::now_epoch();
@@ -7826,6 +7879,79 @@ fn is_interruption(event: &Event) -> bool {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    /// A profile on a model server starts with the server's arguments after its own and the
+    /// server's environment over its env file; one that cannot use it is refused, never started
+    /// on the vendor's models.
+    #[test]
+    fn a_profile_on_a_model_server_starts_on_it_or_not_at_all() {
+        use agent_core::provider::{ModelProvider, ProviderKind};
+        let env_file = vec![
+            ("ANTHROPIC_API_KEY".to_owned(), "vendor-key".to_owned()),
+            (
+                "ANTHROPIC_BASE_URL".to_owned(),
+                "https://vendor.example".to_owned(),
+            ),
+            ("GW_KEY".to_owned(), "gateway-key".to_owned()),
+        ];
+        let plain = Profile {
+            args: vec!["--verbose".into()],
+            ..crate::config::new_agent_profile(Driver::Claude)
+        };
+        let (args, env) = profile_launch(&plain, Driver::Claude, env_file.clone(), &[]).unwrap();
+        assert_eq!(args, ["--verbose"]);
+        assert_eq!(env.env, env_file);
+
+        let on_gateway = Profile {
+            provider: Some(ModelProvider {
+                kind: ProviderKind::LiteLlm,
+                base_url: Some("http://gw:4000".into()),
+                api_key_env: Some("GW_KEY".into()),
+            }),
+            ..plain.clone()
+        };
+        let (args, env) =
+            profile_launch(&on_gateway, Driver::Claude, env_file.clone(), &[]).unwrap();
+        assert_eq!(args, ["--verbose"]);
+        assert_eq!(
+            env.lookup("ANTHROPIC_BASE_URL").as_deref(),
+            Some("http://gw:4000")
+        );
+        assert_eq!(
+            env.lookup("ANTHROPIC_AUTH_TOKEN").as_deref(),
+            Some("gateway-key")
+        );
+        // The vendor's key is gone, from the env file and from what is inherited.
+        assert!(!env.env.iter().any(|(k, _)| k == "ANTHROPIC_API_KEY"));
+        assert!(env.unset.iter().any(|u| u == "ANTHROPIC_API_KEY"));
+
+        let (args, env) = profile_launch(&on_gateway, Driver::Codex, env_file, &[]).unwrap();
+        assert_eq!(&args[..2], ["--verbose", "-c"]);
+        assert!(args.contains(&"model_providers.agent_terminal.env_key=\"GW_KEY\"".to_owned()));
+        assert!(!args.iter().any(|a| a.contains("gateway-key")));
+        assert_eq!(env.lookup("GW_KEY").as_deref(), Some("gateway-key"));
+
+        // The key variable is set nowhere: refused (the name is unlikely to be in the test's
+        // own environment, and `clear` removes it if it were).
+        let missing = Profile {
+            provider: Some(ModelProvider {
+                api_key_env: Some("AGENT_TERMINAL_TEST_UNSET_KEY".into()),
+                ..on_gateway.provider.clone().unwrap()
+            }),
+            ..plain.clone()
+        };
+        let clear = ["AGENT_TERMINAL_TEST_UNSET_KEY".to_owned()];
+        assert!(profile_launch(&missing, Driver::Claude, Vec::new(), &clear).is_err());
+        let bad_url = Profile {
+            provider: Some(ModelProvider {
+                base_url: Some("gw:4000".into()),
+                ..ModelProvider::new(ProviderKind::Ollama)
+            }),
+            ..plain
+        };
+        let why = profile_launch(&bad_url, Driver::Claude, Vec::new(), &[]).unwrap_err();
+        assert!(why.starts_with("Cannot start on Ollama"), "{why}");
+    }
 
     /// Only a turn that failed for quota starts a usage-limit wait. A rate limit (a tool's own
     /// 429 on agy, a usage reading), a quota error or a quota reading at 100 % never does; a rate

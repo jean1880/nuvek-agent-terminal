@@ -53,7 +53,9 @@ Architectural mandates, standards, and workflows for this codebase.
     `agent_command` (a shell command that launches an agent CLI, `cross-agent`, `claude -p`,
     `codex exec` or `agy -p`, read from a command line or a shell tool's input, so it can be shown
     as a sub-agent; a reading aid too, though a delegated child's authority refuses what it
-    recognises) and the per-agent adapters and pure policies built on it.
+    recognises), `provider` (a profile's local or self-hosted model server, Ollama, LM Studio or
+    LiteLLM: what Claude and Codex are started with to use it, and its model list read) and the
+    per-agent adapters and pure policies built on it.
   - `crates/agent-kit` (GTK-free; blocking process and file I/O): `git`
     (git plumbing for turn checkpoints and diffs: shells out, but its parsers
     and filters are pure), `diff` (diff bases, numstat, line classification,
@@ -63,7 +65,8 @@ Architectural mandates, standards, and workflows for this codebase.
     a thread's subtitle its branch, shown only for a repository on GitHub),
     `handoff` (hand-off briefs, session readers, quota detection),
     `sessions` (`SessionFormat`, session IDs, transcript lookup and listing),
-    `paths` (`~` expansion) and `exec` (child processes with a timeout).
+    `paths` (`~` expansion), `provider_models` (a model server's model list) and `exec` (child
+    processes with a timeout).
   - `agent-kit`'s `store` is the SQLite thread store (threads, provider
     threads, scrubbed events, app meta such as the open-thread list).
     `store_writer` is the one thread that writes it: the app's main thread
@@ -277,13 +280,25 @@ Architectural mandates, standards, and workflows for this codebase.
   `a_thread_continues_after_its_limit_*` and `continuation_tests` prove these.
 - **Agent processes get a cleaned environment**: `clear_env` and any inherited
   approval-socket variables are removed (`SpawnSpec::unset`), then the profile's
-  env file, then the approval socket.
-- **Localhost bound**: interacts only with the local shell; exposes no ports. The one outbound
-  connection is the update check (`agent_kit::update`): a single HTTPS GET of the repository's
-  latest GitHub release, off the main thread, with a timeout. It runs once per process a few
-  seconds after startup unless Settings → "Check for Updates at Startup" is off
+  env file, then its model provider's variables, then the approval socket.
+- **A profile on a model server never falls back to its vendor**: a profile's `provider` (Settings
+  → Agents → Model Provider, Claude and Codex only) starts the agent on that server
+  (`agent_core::provider`: Claude through `ANTHROPIC_BASE_URL`, with the vendor's own credential
+  variables removed; Codex through a `-c` provider of the app's own id). Every launch path goes
+  through `profile_launch` (threads, switches, forks, delegated workers, probes): a provider that
+  cannot be used (a bad address, a key variable that is unset) refuses the start, and its agent
+  lists no models rather than its vendor's. An API key is never stored: the profile names the
+  variable holding it, and Codex is handed only that name.
+- **Localhost bound**: interacts only with the local shell; exposes no ports. The outbound
+  connections are two. The update check (`agent_kit::update`): a single HTTPS GET of the
+  repository's latest GitHub release, off the main thread, with a timeout. It runs once per
+  process a few seconds after startup unless Settings → "Check for Updates at Startup" is off
   (`check_updates_on_startup`), and when the user picks "Check for Updates…". Tests never reach
-  it. Never add any other request. Two user actions reach GitHub without the app making a
+  it. And a model server's model list (`agent_kit::provider_models`): one GET of
+  `<base>/v1/models` at the address the user configured for a profile's model provider, off the
+  main thread, with a timeout, redirects not followed, made only while a profile has a provider
+  (when the models are listed, as the vendor's list is otherwise). Its tests use a loopback
+  listener of their own. Never add any other request. Two user actions reach GitHub without the app making a
   request: the diff panel's "Open a PR" hands GitHub's compare URL (built from the remote,
   credentials dropped: `agent_kit::github`) to the browser, and "Push & Open PR" runs one
   `git push` (never forced, after a confirmation that shows the command) through the user's own

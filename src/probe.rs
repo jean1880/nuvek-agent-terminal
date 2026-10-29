@@ -11,6 +11,7 @@ use std::thread::LocalKey;
 use agent_core::adapter::Driver;
 use agent_core::catalog::CatalogModel;
 use agent_core::event::{Account, QuotaWindow};
+use agent_core::provider::ModelProvider;
 use gtk4::glib;
 
 use crate::agent_proc::AgentEnv;
@@ -28,11 +29,34 @@ pub struct ProbeTarget {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProbeTargets {
     targets: Vec<(agent_core::adapter::Driver, ProbeTarget)>,
+    /// The model servers agents run on ([`agent_core::provider`]): their model list comes from
+    /// the server rather than the agent's own probe.
+    providers: Vec<(agent_core::adapter::Driver, ModelProvider)>,
 }
 
 impl ProbeTargets {
     pub fn new(targets: Vec<(agent_core::adapter::Driver, ProbeTarget)>) -> Self {
-        Self { targets }
+        Self {
+            targets,
+            providers: Vec::new(),
+        }
+    }
+
+    /// These targets, with `providers` naming the agents that run on a model server.
+    pub fn with_providers(
+        mut self,
+        providers: Vec<(agent_core::adapter::Driver, ModelProvider)>,
+    ) -> Self {
+        self.providers = providers;
+        self
+    }
+
+    /// The model server `driver` runs on, if it runs on one.
+    pub fn provider(&self, driver: agent_core::adapter::Driver) -> Option<&ModelProvider> {
+        self.providers
+            .iter()
+            .find(|(d, _)| *d == driver)
+            .map(|(_, p)| p)
     }
 
     pub fn get(&self, driver: agent_core::adapter::Driver) -> Option<&ProbeTarget> {

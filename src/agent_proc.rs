@@ -546,6 +546,18 @@ fn use_shell_path(launcher: &gio::SubprocessLauncher) {
 }
 
 impl AgentEnv {
+    /// The value of `name` a process launched with this environment sees: the profile's (the
+    /// last wins), else the app's own unless this environment removes it.
+    pub fn lookup(&self, name: &str) -> Option<String> {
+        if let Some((_, value)) = self.env.iter().rev().find(|(k, _)| k == name) {
+            return Some(value.clone());
+        }
+        if self.unset.iter().any(|u| u == name) {
+            return None;
+        }
+        std::env::var(name).ok()
+    }
+
     fn apply(&self, launcher: &gio::SubprocessLauncher) {
         for key in &self.unset {
             launcher.unsetenv(key);

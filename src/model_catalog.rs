@@ -491,6 +491,40 @@ impl ModelCatalog {
                 continue;
             };
             let (me, done) = (self.clone(), finish.clone());
+            // An agent on a model server lists the server's models: its own probe would list its
+            // vendor's, which the thread cannot reach.
+            if let Some(provider) = targets.provider(driver).cloned() {
+                let key = provider
+                    .key_env()
+                    .ok()
+                    .flatten()
+                    .and_then(|name| target.env.lookup(name));
+                glib::spawn_future_local(async move {
+                    let fetched = gtk4::gio::spawn_blocking(move || {
+                        agent_kit::provider_models::fetch(&provider, key.as_deref(), USER_AGENT)
+                            .map(|ids| provider_models(driver, &provider, ids))
+                    })
+                    .await
+                    .unwrap_or_else(|_| Err("the model list fetch panicked".to_owned()));
+                    match fetched {
+                        Ok(models) => {
+                            info!(
+                                count = models.len(),
+                                "{} model list fetched from its model server",
+                                driver.info().key
+                            );
+                            me.set(driver, models);
+                        }
+                        Err(why) => {
+                            warn!(%why, "{} model server list failed", driver.info().key);
+                            me.mark_failed(driver);
+                        }
+                    }
+                    me.mark_attempted(driver);
+                    done();
+                });
+                continue;
+            }
             match driver {
                 // `agy models`: `id<TAB>Display` lines.
                 Driver::Agy => {
@@ -541,6 +575,29 @@ impl ModelCatalog {
             }
         }
     }
+}
+
+/// The User-Agent of a model server request.
+const USER_AGENT: &str = concat!("agent-terminal/", env!("CARGO_PKG_VERSION"));
+
+/// `driver`'s catalogue entries for the model ids `provider` serves: shown by id, as reached
+/// through the server, with no effort levels (a server reports none).
+fn provider_models(
+    driver: Driver,
+    provider: &agent_core::provider::ModelProvider,
+    ids: Vec<String>,
+) -> Vec<CatalogModel> {
+    ids.into_iter()
+        .map(|id| CatalogModel {
+            driver,
+            display: id.clone(),
+            id,
+            description: None,
+            efforts: Vec::new(),
+            default_effort: None,
+            via: Some(provider.kind.label().to_owned()),
+        })
+        .collect()
 }
 
 /// What an in-thread banner says about a model its agent no longer offers: `None` when nothing is

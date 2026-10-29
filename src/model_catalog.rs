@@ -92,6 +92,9 @@ struct OtherList {
     /// The last fetch in this run failed (or listed nothing).
     #[serde(skip)]
     failed: bool,
+    /// The `read_at` last written to (or read from) the cache.
+    #[serde(skip)]
+    saved_at: Option<i64>,
 }
 
 fn decode_cache(text: &str) -> CacheFile {
@@ -222,7 +225,16 @@ impl ModelCatalog {
             targets: RefCell::new(ProbeTargets::default()),
             picker_wanted: Cell::new(None),
             sources: RefCell::new(loaded.sources),
-            others: RefCell::new(loaded.others),
+            others: RefCell::new(
+                loaded
+                    .others
+                    .into_iter()
+                    .map(|o| OtherList {
+                        saved_at: o.read_at,
+                        ..o
+                    })
+                    .collect(),
+            ),
             others_tried: RefCell::new(Vec::new()),
             others_settled: RefCell::new(Vec::new()),
         }
@@ -332,19 +344,30 @@ impl ModelCatalog {
                     read_at: None,
                     fresh: false,
                     failed: false,
+                    saved_at: None,
                 });
                 others.len() - 1
             });
             let o = &mut others[i];
+            let now = now_epoch();
             let changed = o.models != models || o.fresh != listed || position.is_none();
+            // The time is what keeps an old list from looking fresh after a restart: an unchanged
+            // list is still saved, once its stored time is MODEL_PICKER_AGE behind (as the
+            // agent's own lists are).
+            let time_due = listed
+                && o.saved_at
+                    .is_none_or(|s| now.saturating_sub(s) >= MODEL_PICKER_AGE);
             o.fresh = listed;
             o.failed = !listed;
-            o.read_at = if listed { Some(now_epoch()) } else { None };
+            o.read_at = if listed { Some(now) } else { None };
             o.models = models;
-            changed
+            (changed, time_due)
         };
-        if changed {
+        let (changed, time_due) = changed;
+        if changed || time_due {
             self.save();
+        }
+        if changed {
             self.listeners.notify();
         }
         // The footer of a picker showing this list says how it went.
@@ -649,6 +672,9 @@ impl ModelCatalog {
         match serde_json::to_vec(&file) {
             Ok(bytes) => {
                 self.saved_at.set(self.read_at.get());
+                for o in self.others.borrow_mut().iter_mut() {
+                    o.saved_at = o.read_at;
+                }
                 write_cache(path.clone(), bytes);
             }
             Err(e) => warn!(error = %e, "could not encode the model cache"),
@@ -1212,6 +1238,7 @@ mod tests {
                 read_at: Some(1_700_000_200),
                 fresh: false,
                 failed: false,
+                saved_at: None,
             }],
         };
         let text = serde_json::to_string(&file).unwrap();
@@ -1423,6 +1450,35 @@ mod tests {
         cat.adopt_sources(&without);
         assert!(cat.models_for(Driver::Claude, Some(&ollama)).is_empty());
         assert!(!cat.has_untried_other(&without, Driver::Claude));
+    }
+
+    /// An unchanged refresh of another profile's list still moves its stored time, once it is
+    /// MODEL_PICKER_AGE behind, so a restart does not show an older read than the last.
+    #[test]
+    fn an_unchanged_other_list_keeps_its_read_time_on_disk() {
+        let ollama =
+            agent_core::provider::ModelProvider::new(agent_core::provider::ProviderKind::Ollama);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        let cat = ModelCatalog::with_cache(Some(path.clone()));
+        let targets =
+            ProbeTargets::new(vec![(Driver::Claude, crate::probe::ProbeTarget::default())])
+                .with_other_sources(vec![other(Driver::Claude, Some(ollama.clone()))]);
+        *cat.targets.borrow_mut() = targets.clone();
+        cat.adopt_sources(&targets);
+        let list = || Some(vec![model(Driver::Claude, "qwen3-coder")]);
+        cat.land_other(Driver::Claude, Some(ollama.clone()), list());
+        // As if that write were long ago, and the list unchanged since.
+        let old = now_epoch() - MODEL_PICKER_AGE - 10;
+        for o in cat.others.borrow_mut().iter_mut() {
+            o.read_at = Some(old);
+            o.saved_at = Some(old);
+        }
+        cat.save();
+        cat.land_other(Driver::Claude, Some(ollama), list());
+        let stored = ModelCatalog::with_cache(Some(path));
+        let read_at = stored.others.borrow()[0].read_at.unwrap();
+        assert!(read_at > old, "the newer read time was written");
     }
 
     #[test]

@@ -221,6 +221,7 @@ impl ModelProvider {
     /// configured key variable that is unset is refused: the server would only answer 401.
     /// Never falls back to the agent's own vendor: every error means "do not start".
     pub fn launch(&self, driver: Driver, key: Option<&str>) -> Result<ProviderLaunch, String> {
+        let args = self.args(driver)?;
         let base = self.base()?;
         let key_env = self.key_env()?;
         let key = key.filter(|k| !k.is_empty());
@@ -231,15 +232,8 @@ impl ModelProvider {
             ));
         }
         Ok(match driver {
-            Driver::Agy => {
-                return Err(format!(
-                    "{} cannot run on {}",
-                    driver.info().label,
-                    self.kind.label()
-                ))
-            }
             Driver::Claude => ProviderLaunch {
-                args: Vec::new(),
+                args,
                 env: vec![
                     ("ANTHROPIC_BASE_URL".to_owned(), base),
                     (
@@ -251,6 +245,30 @@ impl ModelProvider {
                 ],
                 unset: CLAUDE_UNSET.map(str::to_owned).to_vec(),
             },
+            // agy never gets here: `args` refused it.
+            Driver::Codex | Driver::Agy => ProviderLaunch {
+                args,
+                env: Vec::new(),
+                unset: Vec::new(),
+            },
+        })
+    }
+
+    /// The arguments [`Self::launch`] gives `driver`, which never hold the key: what a command
+    /// line built before the agent's environment is known (a terminal tab's) can use. Refuses
+    /// what `launch` refuses for any reason but an unset key.
+    pub fn args(&self, driver: Driver) -> Result<Vec<String>, String> {
+        let base = self.base()?;
+        let key_env = self.key_env()?;
+        Ok(match driver {
+            Driver::Agy => {
+                return Err(format!(
+                    "{} cannot run on {}",
+                    driver.info().label,
+                    self.kind.label()
+                ))
+            }
+            Driver::Claude => Vec::new(),
             Driver::Codex => {
                 let id = CODEX_PROVIDER_ID;
                 let mut settings = vec![
@@ -272,14 +290,10 @@ impl ModelProvider {
                         toml_string(name)
                     ));
                 }
-                ProviderLaunch {
-                    args: settings
-                        .into_iter()
-                        .flat_map(|s| ["-c".to_owned(), s])
-                        .collect(),
-                    env: Vec::new(),
-                    unset: Vec::new(),
-                }
+                settings
+                    .into_iter()
+                    .flat_map(|s| ["-c".to_owned(), s])
+                    .collect()
             }
         })
     }
@@ -488,6 +502,10 @@ mod tests {
             ]
         );
         assert!(!launch.args.iter().any(|a| a.contains("secret-value")));
+        // The same arguments before the key is known; only `launch` checks that it is set.
+        assert_eq!(p.args(Driver::Codex).unwrap(), launch.args);
+        assert!(p.args(Driver::Claude).unwrap().is_empty());
+        assert!(p.args(Driver::Agy).is_err());
         assert!(!["openai", "ollama", "lmstudio"].contains(&CODEX_PROVIDER_ID));
     }
 

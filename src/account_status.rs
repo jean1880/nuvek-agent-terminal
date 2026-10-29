@@ -451,6 +451,8 @@ impl AccountStatus {
         Driver::ALL
             .into_iter()
             .filter(|d| self.probeable(*d) && wanted(*d) && !self.slot(*d).borrow().probing)
+            // An agent on a model server uses no vendor account: its vendor is never probed.
+            .filter(|d| targets.provider(*d).is_none())
             .filter_map(|d| targets.get(d).map(|t| (d, t.clone())))
             .collect()
     }
@@ -1088,6 +1090,31 @@ mod tests {
         assert_eq!(changed.get(), 1, "no repaint for the same data while fresh");
         assert_eq!(read.get(), 2);
         assert_eq!(st.snapshot(Driver::Claude).read_at, Some(NOW + 120));
+    }
+
+    /// An agent on a model server uses no vendor account, so its vendor is never probed.
+    #[test]
+    fn an_agent_on_a_model_server_is_never_probed_for_its_vendor_account() {
+        use agent_core::provider::{ModelProvider, ProviderKind};
+        let target = crate::probe::ProbeTarget {
+            program: "/bin/true".into(),
+            env: Default::default(),
+        };
+        let targets = ProbeTargets::new(vec![
+            (Driver::Claude, target.clone()),
+            (Driver::Codex, target),
+        ])
+        .with_providers(vec![(
+            Driver::Codex,
+            ModelProvider::new(ProviderKind::Ollama),
+            crate::probe::ProviderKey::default(),
+        )]);
+        let jobs: Vec<Driver> = AccountStatus::new()
+            .jobs(&targets, |_| true)
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect();
+        assert_eq!(jobs, vec![Driver::Claude]);
     }
 
     #[test]

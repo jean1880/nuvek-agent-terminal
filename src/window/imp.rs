@@ -1063,6 +1063,20 @@ async fn resolve_active_profile(
     chosen
 }
 
+/// A terminal tab whose model provider refused it: nothing is spawned, and the tab (kept, with
+/// the reason written into it) and a dialog say why.
+fn refuse_terminal(
+    parent: &super::AgentTerminalWindow,
+    stack: &Stack,
+    terminal: &Terminal,
+    why: &str,
+) {
+    warn!("a terminal tab's model provider refused its start");
+    stack.set_visible_child_name("terminal");
+    terminal.feed(format!("{why}\r\n").as_bytes());
+    present_message(parent, "Cannot Start", why);
+}
+
 /// Presents a one-button informational dialog anchored to `parent`.
 fn present_message(parent: &super::AgentTerminalWindow, heading: &str, body: &str) {
     present_message_over(parent, heading, body);
@@ -3978,7 +3992,17 @@ impl AgentTerminalWindow {
     ) {
         let obj = self.obj();
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let command = get_startup_command(profile, launch);
+        // A profile on a model server runs on it here too, or not at all: never on the
+        // vendor's models.
+        let provider = profile.and_then(crate::utils::terminal_provider);
+        let on_provider = match profile.map(crate::utils::with_provider_args).transpose() {
+            Ok(p) => p,
+            Err(why) => {
+                refuse_terminal(&obj, stack, terminal, &why);
+                return;
+            }
+        };
+        let command = get_startup_command(on_provider.as_ref(), launch);
         let env_file = profile.and_then(|p| p.env_file.clone());
         info!(
             "Spawning terminal with shell: {}, command: {:?}",
@@ -4074,6 +4098,14 @@ impl AgentTerminalWindow {
                     for (key, value) in extra {
                         debug!("Env file sets {key}");
                         env_strs.push(format!("{key}={value}"));
+                    }
+                }
+                if let Some((provider, driver)) = &provider {
+                    if let Err(why) =
+                        crate::utils::apply_provider_env(provider, *driver, &mut env_strs)
+                    {
+                        refuse_terminal(&obj, &stack, &terminal, &why);
+                        return;
                     }
                 }
 

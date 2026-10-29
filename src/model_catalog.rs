@@ -370,6 +370,23 @@ impl ModelCatalog {
         }
     }
 
+    /// A model server listed nothing usable for `driver`: its list is emptied (persisted too, so
+    /// a restart does not bring the old one back), marked failed and not fresh, so nothing listed
+    /// before can be picked and no thread's model is called retired on it.
+    fn clear_unlisted(&self, driver: Driver) {
+        self.mark_failed(driver);
+        self.fresh.borrow_mut().retain(|d| *d != driver);
+        let mut read_at = self.read_at.get();
+        read_at.set(driver, None);
+        self.read_at.set(read_at);
+        let had = !self.slot(driver).borrow().is_empty();
+        if had {
+            self.slot(driver).borrow_mut().clear();
+            self.save();
+            self.listeners.notify();
+        }
+    }
+
     fn save(&self) {
         let Some(path) = &self.cache else { return };
         let file = CacheFile {
@@ -493,12 +510,8 @@ impl ModelCatalog {
             let (me, done) = (self.clone(), finish.clone());
             // An agent on a model server lists the server's models: its own probe would list its
             // vendor's, which the thread cannot reach.
-            if let Some(provider) = targets.provider(driver).cloned() {
-                let key = provider
-                    .key_env()
-                    .ok()
-                    .flatten()
-                    .and_then(|name| target.env.lookup(name));
+            if let Some((provider, key)) = targets.provider(driver) {
+                let (provider, key) = (provider.clone(), key.value().map(str::to_owned));
                 glib::spawn_future_local(async move {
                     let fetched = gtk4::gio::spawn_blocking(move || {
                         agent_kit::provider_models::fetch(&provider, key.as_deref(), USER_AGENT)
@@ -507,7 +520,7 @@ impl ModelCatalog {
                     .await
                     .unwrap_or_else(|_| Err("the model list fetch panicked".to_owned()));
                     match fetched {
-                        Ok(models) => {
+                        Ok(models) if !models.is_empty() => {
                             info!(
                                 count = models.len(),
                                 "{} model list fetched from its model server",
@@ -515,9 +528,18 @@ impl ModelCatalog {
                             );
                             me.set(driver, models);
                         }
-                        Err(why) => {
-                            warn!(%why, "{} model server list failed", driver.info().key);
-                            me.mark_failed(driver);
+                        // No list, or an empty one: what was listed before (the vendor's, another
+                        // server's) is not on offer here, so it is dropped, not kept.
+                        fetched => {
+                            match fetched {
+                                Err(why) => {
+                                    warn!(%why, "{} model server list failed", driver.info().key)
+                                }
+                                Ok(_) => {
+                                    warn!("{} model server lists no models", driver.info().key)
+                                }
+                            }
+                            me.clear_unlisted(driver);
                         }
                     }
                     me.mark_attempted(driver);
@@ -843,6 +865,44 @@ mod tests {
         let again = ModelCatalog::with_cache(Some(path));
         let ids: Vec<_> = again.models().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, ["opus", "g", "gpt"]);
+    }
+
+    /// A model server that lists nothing (or cannot be reached) leaves nothing pickable from the
+    /// list before it (the vendor's), on disk too, and no model is judged retired against it.
+    #[test]
+    fn a_model_server_that_lists_nothing_drops_the_list_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        let cat = ModelCatalog::with_cache(Some(path.clone()));
+        cat.set(Driver::Claude, vec![model(Driver::Claude, "opus")]);
+        assert!(cat.is_fresh(Driver::Claude));
+        let hits = Rc::new(Cell::new(0));
+        let h = hits.clone();
+        cat.connect_changed(move || h.set(h.get() + 1));
+        cat.clear_unlisted(Driver::Claude);
+        assert!(cat.models_of(Driver::Claude).is_empty());
+        assert!(!cat.is_fresh(Driver::Claude));
+        assert!(cat.status_of(|d| d == Driver::Claude).failed);
+        assert_eq!(hits.get(), 1);
+        assert!(ModelCatalog::with_cache(Some(path))
+            .models_of(Driver::Claude)
+            .is_empty());
+        // Already empty: nothing to say.
+        cat.clear_unlisted(Driver::Claude);
+        assert_eq!(hits.get(), 1);
+    }
+
+    #[test]
+    fn a_servers_models_are_listed_by_id_through_it() {
+        let provider =
+            agent_core::provider::ModelProvider::new(agent_core::provider::ProviderKind::Ollama);
+        let models = provider_models(Driver::Codex, &provider, vec!["qwen3.5:9b".into()]);
+        assert_eq!(models.len(), 1);
+        assert_eq!(
+            (models[0].id.as_str(), models[0].via.as_deref()),
+            ("qwen3.5:9b", Some("Ollama"))
+        );
+        assert!(models[0].efforts.is_empty());
     }
 
     use crate::freshness::{age_of, freshness, Freshness, DUE_SLACK};

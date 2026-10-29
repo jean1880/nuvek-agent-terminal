@@ -1729,19 +1729,34 @@ fn decide_live_model(
     }
 }
 
-/// [`decide_live_model`] against the app's catalogue.
+/// [`decide_live_model`] against the app's catalogue. `served`: the catalogue lists what this
+/// thread's profile can run ([`catalogue_serves`]); a thread it does not is never judged by it.
 fn live_model(
     driver: Driver,
+    served: bool,
     model: Option<String>,
     effort: Option<String>,
 ) -> (Option<String>, Option<String>, Option<RetiredModel>) {
     let catalog = ModelCatalog::shared();
     decide_live_model(
         &catalog.models_of(driver),
-        catalog.is_fresh(driver),
+        served && catalog.is_fresh(driver),
         model,
         effort,
     )
+}
+
+/// Whether `driver`'s catalogue lists the models a thread opened with `profile_id` can run. The
+/// list is read for `driver`'s own profile, so a thread on another profile with another model
+/// server (or with one where the agent's has none, or the reverse) is not judged by it: its model
+/// is never called retired against a list it cannot use.
+fn catalogue_serves(
+    config: &crate::config::TerminalConfig,
+    profile_id: Option<&str>,
+    driver: Driver,
+) -> bool {
+    let provider = |p: Option<&Profile>| p.and_then(|p| p.provider.clone());
+    provider(config.thread_profile(profile_id, driver)) == provider(config.agent_profile(driver))
 }
 
 /// What starting a built thread's session needs.
@@ -5424,8 +5439,10 @@ impl AgentTerminalWindow {
             .or_else(|| profile.default_effort.clone());
         // A model its agent no longer offers (judged on a list fetched in this run) is never
         // started: the thread resumes on the replacement, and says so.
+        let served = catalogue_serves(&self.config.borrow(), Some(&profile.id), driver);
         let (model, effort, ported) = live_model(
             driver,
+            served,
             provider
                 .as_ref()
                 .and_then(|p| stored_model(Some(&p.model)))
@@ -6976,7 +6993,8 @@ impl AgentTerminalWindow {
                 .and_then(|p| p.effective_default_model(None))
         });
         // A profile default the agent has retired is never started: the suggestion is used.
-        let (model, effort, _) = live_model(driver, model, effort);
+        let served = catalogue_serves(&self.config.borrow(), profile_id.as_deref(), driver);
+        let (model, effort, _) = live_model(driver, served, model, effort);
         let ids = match store.new_id().and_then(|thread| {
             Ok(NewThreadIds {
                 thread,
@@ -7432,16 +7450,20 @@ impl AgentTerminalWindow {
                 if !scan_is_current(generation) {
                     return;
                 }
-                // Probes run where the threads run: the profile's env file and `clear_env`, and
-                // its model provider's environment. A provider that refuses the start lists no
-                // models (it is never probed through the vendor instead).
-                match profile_launch(&profile, driver, resolved.env.clone(), &clear) {
-                    Ok((_, env)) => envs.push((driver, env)),
-                    Err(_) => envs.push((driver, agent_env(resolved.env.clone(), &clear))),
-                }
+                // Probes run where the threads run: the profile's env file and `clear_env`.
+                let env = agent_env(resolved.env.clone(), &clear);
+                // An agent on a model server is never probed through its vendor: its models come
+                // from the server, with the key its threads would use (read here, before a
+                // launch removes the vendor's variables, which may be the one holding it).
                 if let Some(provider) = profile.provider.clone() {
-                    providers.push((driver, provider));
+                    let key = provider
+                        .key_env()
+                        .ok()
+                        .flatten()
+                        .and_then(|n| env.lookup(n));
+                    providers.push((driver, provider, crate::probe::ProviderKey::new(key)));
                 }
+                envs.push((driver, env));
                 let state = classify(false, Some(resolved.program.as_deref()));
                 // Back from missing (installed, or switched on again): its list may be new.
                 if state.is_ready()
@@ -7551,17 +7573,18 @@ impl AgentTerminalWindow {
     pub(super) fn evaluate_models(&self) {
         let catalog = ModelCatalog::shared();
         let availability = AgentAvailability::shared();
-        let built: Vec<(adw::Banner, Rc<ChatSession>)> = self
+        let built: Vec<(adw::Banner, Rc<ChatSession>, Option<String>)> = self
             .tabs
             .borrow()
             .iter()
             .filter_map(|t| t.chat.as_ref())
-            .filter_map(|c| Some((c.model_banner.clone(), c.slot.get()?)))
+            .filter_map(|c| Some((c.model_banner.clone(), c.slot.get()?, c.profile_id.clone())))
             .collect();
-        for (banner, session) in built {
+        for (banner, session, profile_id) in built {
             let status = session.status();
             let driver = status.driver;
-            let notice = if availability.is_ready(driver) {
+            let served = catalogue_serves(&self.config.borrow(), profile_id.as_deref(), driver);
+            let notice = if availability.is_ready(driver) && served {
                 model_notice(
                     &catalog.models_of(driver),
                     catalog.is_fresh(driver),
@@ -7951,6 +7974,63 @@ pub(super) mod tests {
         };
         let why = profile_launch(&bad_url, Driver::Claude, Vec::new(), &[]).unwrap_err();
         assert!(why.starts_with("Cannot start on Ollama"), "{why}");
+    }
+
+    /// A cloud profile and a local one of the same agent: the catalogue (read for the agent's
+    /// own profile) judges only the threads of profiles on the same model server.
+    #[test]
+    fn a_thread_is_judged_only_by_a_catalogue_of_its_own_model_server() {
+        use agent_core::provider::{ModelProvider, ProviderKind};
+        let mut config = crate::config::TerminalConfig::default();
+        config.profiles = vec![
+            Profile {
+                id: "claude-cloud".into(),
+                ..crate::config::new_agent_profile(Driver::Claude)
+            },
+            Profile {
+                id: "claude-local".into(),
+                name: "Claude (Ollama)".into(),
+                provider: Some(ModelProvider::new(ProviderKind::Ollama)),
+                ..crate::config::new_agent_profile(Driver::Claude)
+            },
+        ];
+        assert!(catalogue_serves(&config, None, Driver::Claude));
+        assert!(catalogue_serves(
+            &config,
+            Some("claude-cloud"),
+            Driver::Claude
+        ));
+        assert!(!catalogue_serves(
+            &config,
+            Some("claude-local"),
+            Driver::Claude
+        ));
+        // With the agent's own profile on the server, it is the cloud thread that is not judged.
+        config.profiles[0].provider = Some(ModelProvider::new(ProviderKind::Ollama));
+        assert!(catalogue_serves(
+            &config,
+            Some("claude-local"),
+            Driver::Claude
+        ));
+        config.profiles[1].provider = None;
+        assert!(!catalogue_serves(
+            &config,
+            Some("claude-local"),
+            Driver::Claude
+        ));
+        // Not judged: a model missing from a fresh list is kept, not retired.
+        let list = vec![agent_core::catalog::CatalogModel {
+            driver: Driver::Claude,
+            id: "opus".into(),
+            display: "Opus".into(),
+            description: None,
+            efforts: Vec::new(),
+            default_effort: None,
+            via: None,
+        }];
+        let kept = decide_live_model(&list, false, Some("qwen3-coder".into()), None);
+        assert_eq!(kept.0.as_deref(), Some("qwen3-coder"));
+        assert!(kept.2.is_none());
     }
 
     /// Only a turn that failed for quota starts a usage-limit wait. A rate limit (a tool's own

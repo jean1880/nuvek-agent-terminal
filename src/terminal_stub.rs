@@ -159,6 +159,8 @@ impl Terminal {
 
     pub fn feed_child(&self, _data: &[u8]) {}
 
+    pub fn feed(&self, _data: &[u8]) {}
+
     pub fn connect_contents_changed<F: Fn(&Self) + 'static>(&self, _f: F) -> glib::SignalHandlerId {
         self.connect_notify_local(None, move |_, _| {})
     }

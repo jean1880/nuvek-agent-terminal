@@ -29,9 +29,34 @@ pub struct ProbeTarget {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProbeTargets {
     targets: Vec<(agent_core::adapter::Driver, ProbeTarget)>,
-    /// The model servers agents run on ([`agent_core::provider`]): their model list comes from
-    /// the server rather than the agent's own probe.
-    providers: Vec<(agent_core::adapter::Driver, ModelProvider)>,
+    /// The model servers agents run on ([`agent_core::provider`]), with their keys: their model
+    /// list comes from the server, and their vendor's account is never probed.
+    providers: Vec<(agent_core::adapter::Driver, ModelProvider, ProviderKey)>,
+}
+
+/// A model server's API key, held in memory for its model-list request. Its `Debug` never shows
+/// the value.
+#[derive(Clone, Default, PartialEq)]
+pub struct ProviderKey(Option<String>);
+
+impl ProviderKey {
+    pub fn new(key: Option<String>) -> Self {
+        Self(key)
+    }
+
+    pub fn value(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+}
+
+impl std::fmt::Debug for ProviderKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "ProviderKey(****)"
+        } else {
+            "ProviderKey(None)"
+        })
+    }
 }
 
 impl ProbeTargets {
@@ -45,18 +70,21 @@ impl ProbeTargets {
     /// These targets, with `providers` naming the agents that run on a model server.
     pub fn with_providers(
         mut self,
-        providers: Vec<(agent_core::adapter::Driver, ModelProvider)>,
+        providers: Vec<(agent_core::adapter::Driver, ModelProvider, ProviderKey)>,
     ) -> Self {
         self.providers = providers;
         self
     }
 
-    /// The model server `driver` runs on, if it runs on one.
-    pub fn provider(&self, driver: agent_core::adapter::Driver) -> Option<&ModelProvider> {
+    /// The model server `driver` runs on and its key, if it runs on one.
+    pub fn provider(
+        &self,
+        driver: agent_core::adapter::Driver,
+    ) -> Option<(&ModelProvider, &ProviderKey)> {
         self.providers
             .iter()
-            .find(|(d, _)| *d == driver)
-            .map(|(_, p)| p)
+            .find(|(d, _, _)| *d == driver)
+            .map(|(_, p, k)| (p, k))
     }
 
     pub fn get(&self, driver: agent_core::adapter::Driver) -> Option<&ProbeTarget> {
@@ -337,6 +365,24 @@ pub(crate) mod fixtures {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_provider_key_is_carried_but_never_printed() {
+        let key = ProviderKey::new(Some("sk-live-secret".into()));
+        assert_eq!(key.value(), Some("sk-live-secret"));
+        let targets = ProbeTargets::default().with_providers(vec![(
+            Driver::Claude,
+            ModelProvider::new(agent_core::provider::ProviderKind::LiteLlm),
+            key,
+        )]);
+        assert!(!format!("{targets:?}").contains("sk-live-secret"));
+        assert_eq!(
+            targets.provider(Driver::Claude).map(|(_, k)| k.value()),
+            Some(Some("sk-live-secret"))
+        );
+        assert!(targets.provider(Driver::Codex).is_none());
+        assert_eq!(format!("{:?}", ProviderKey::default()), "ProviderKey(None)");
+    }
 
     #[test]
     fn only_the_first_caller_starts_and_all_get_the_result() {

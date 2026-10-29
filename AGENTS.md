@@ -284,11 +284,15 @@ Architectural mandates, standards, and workflows for this codebase.
 - **A profile on a model server never falls back to its vendor**: a profile's `provider` (Settings
   → Agents → Model Provider, Claude and Codex only) starts the agent on that server
   (`agent_core::provider`: Claude through `ANTHROPIC_BASE_URL`, with the vendor's own credential
-  variables removed; Codex through a `-c` provider of the app's own id). Every launch path goes
-  through `profile_launch` (threads, switches, forks, delegated workers, probes): a provider that
-  cannot be used (a bad address, a key variable that is unset) refuses the start, and its agent
-  lists no models rather than its vendor's. An API key is never stored: the profile names the
-  variable holding it, and Codex is handed only that name.
+  variables removed; Codex through a `-c` provider of the app's own id). Every chat launch path
+  goes through `profile_launch` (threads, switches, forks, delegated workers), and a terminal tab
+  through `utils::with_provider_args` and `apply_provider_env`: a provider that cannot be used (a
+  bad address, a key variable that is unset) refuses the start. Such an agent lists the server's
+  models or none (never its vendor's), its vendor's account is never probed, and a thread on
+  another profile than the agent's own is never judged by the agent's list unless both use the
+  same server (`catalogue_serves`). An API key is never stored: the profile names the variable
+  holding it, Codex is handed only that name, and the key the model list needs is read before a
+  launch removes the vendor's variables (`probe::ProviderKey`, never printed).
 - **Localhost bound**: interacts only with the local shell; exposes no ports. The outbound
   connections are two. The update check (`agent_kit::update`): a single HTTPS GET of the
   repository's latest GitHub release, off the main thread, with a timeout. It runs once per

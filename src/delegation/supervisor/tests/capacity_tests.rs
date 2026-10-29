@@ -690,3 +690,116 @@ fn a_resume_during_an_unfinished_stop_keeps_the_slot() {
         stop(&sup).await;
     });
 }
+
+/// A worker whose overdue steer still waits for a late answer is never paused: only its
+/// process can give that answer. Once the steer is settled it can be.
+#[test]
+fn a_worker_awaiting_a_late_steer_answer_is_never_paused() {
+    in_context(async {
+        let (_dir, sup, root) = harness();
+        let workers = full_table(&sup, &root, "late-steer").await;
+        let awaiting = workers[0].clone();
+        // An overdue steer kept for its late answer (`arm_steer_settle`), its run since ended.
+        let entry = crate::delegation::deferred::Delivery {
+            worker: awaiting.clone(),
+            input: crate::delegation::seam::DelegatedInput {
+                operation: OperationId::from_suffix("latesteerop").unwrap(),
+                epoch: sup.epoch(&root).unwrap(),
+                source: crate::delegation::seam::InputSource::Task,
+                from: root.clone(),
+                from_label: "root".into(),
+                text: "steer".into(),
+                plan: agent_core::delegation::mailbox::DeliveryPlan::StartTurn,
+                tag: "late-tag".into(),
+            },
+            policy: agent_core::delegation::wire::Delivery::Auto,
+            reserved: true,
+        };
+        sup.state
+            .borrow_mut()
+            .late_steers
+            .push_back(("late-tag".into(), entry));
+        assert!(sup.state.borrow().workers[&awaiting].run.is_none());
+        assert!(!sup.child_suspendable(&awaiting));
+
+        let extra = idle_worker(&sup, &root, "late-steer-room").await;
+        assert!(live(&sup, &extra));
+        assert!(live(&sup, &awaiting), "its steer's answer can still come");
+        assert!(
+            !live(&sup, &workers[1]),
+            "the next least recently active one was paused"
+        );
+
+        sup.state.borrow_mut().late_steers.clear();
+        assert!(
+            sup.child_suspendable(&awaiting),
+            "settled: it may be paused now"
+        );
+        stop(&sup).await;
+    });
+}
+
+/// A paused worker's instruction needs room; making it pauses another worker, and a sibling's
+/// revocation is still being committed when the launch is prepared. Neither end was covered:
+/// the launch waits the revocation out and the instruction is delivered.
+#[test]
+fn a_resume_waits_out_a_siblings_revocation_instead_of_failing() {
+    in_context(async {
+        let (dir, sup, root) = harness();
+        let cap = sup.limits.live_processes_app as usize;
+        let workers = full_table(&sup, &root, "sibling-close").await;
+        let target = workers[cap - 1].clone();
+        idle_for(&sup, &target, 1000);
+        assert_eq!(sup.stop_idle_children(500), 1);
+        pump_until(|| !live(&sup, &target)).await;
+        // The table full again, so the resume must pause another worker.
+        let filler = idle_worker(&sup, &root, "sibling-close-fill").await;
+        assert!(live(&sup, &filler));
+        let hold = Rc::new(std::cell::Cell::new(true));
+        sup.state.borrow_mut().hold_launch = Some(hold.clone());
+        sup.send_worker(
+            &root,
+            instruction(&target, "AFTER_SIBLING", "after-sibling"),
+        )
+        .await
+        .expect("send");
+        // Room made: the least recently active worker paused, the launch about to be prepared.
+        pump_until(|| {
+            !live(&sup, &workers[0])
+                && sup
+                    .state
+                    .borrow()
+                    .launch_slots
+                    .values()
+                    .any(|w| w.as_ref() == Some(&target))
+        })
+        .await;
+        // Past its slot and settled epoch, it now waits at the launch barrier.
+        glib::timeout_future(Duration::from_millis(30)).await;
+        // A sibling's close is latched and not yet committed as the launch is prepared.
+        sup.state
+            .borrow_mut()
+            .roots
+            .get_mut(&root)
+            .unwrap()
+            .revoking = true;
+        hold.set(false);
+        glib::timeout_future(Duration::from_millis(100)).await;
+        assert!(
+            !live(&sup, &target),
+            "it waits while the revocation is committed"
+        );
+        // Committed, covering neither the root nor the target.
+        sup.state
+            .borrow_mut()
+            .roots
+            .get_mut(&root)
+            .unwrap()
+            .revoking = false;
+        within_cap(&sup, || {
+            live(&sup, &target) && frames(&dir).contains("AFTER_SIBLING")
+        })
+        .await;
+        stop(&sup).await;
+    });
+}

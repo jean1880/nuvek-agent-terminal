@@ -2878,8 +2878,24 @@ impl Supervisor {
         profile: &Profile,
     ) -> Result<(), ToolError> {
         // Captured once; after each await it is re-read (`settled_epoch_for`): a sibling's close
-        // or exit moves it on, and only a revocation covering this worker fails the binding.
-        let mut epoch = self.epoch(worker)?;
+        // or exit moves it on, and only a revocation covering this worker fails the binding. One
+        // being committed as this starts is waited out the same way, never refused for itself.
+        let mut epoch = {
+            let before = {
+                let state = self.state.borrow();
+                let w = state
+                    .workers
+                    .get(worker)
+                    .ok_or_else(|| error(ErrorCode::NotFound, "unknown worker"))?;
+                state
+                    .roots
+                    .get(&w.root)
+                    .ok_or_else(|| error(ErrorCode::RuntimeUnavailable, "root unavailable"))?
+                    .row
+                    .epoch()
+            };
+            self.settled_epoch_for(worker, before).await?
+        };
         let (driver, role, task_mode) = {
             let state = self.state.borrow();
             let w = state

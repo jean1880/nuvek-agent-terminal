@@ -90,6 +90,11 @@ impl Supervisor {
         };
         if let Some(slot) = &_slot {
             slot.bind(worker);
+            // Making room may have waited out a sibling's close: its epoch is known before the
+            // launch is prepared, and only a revocation covering either end fails this.
+            input.epoch = self
+                .settled_delivery_epoch(&input.from, worker, input.epoch)
+                .await?;
         }
         let mut spec = self
             .state

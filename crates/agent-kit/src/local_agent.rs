@@ -288,6 +288,9 @@ pub struct Runner<C: ChatClient, W: Write> {
     next_id: u64,
     /// The current model cannot take tools: it goes without them until the model changes.
     no_tools: bool,
+    /// The thread's folder, opened when the session starts: every write and command is
+    /// anchored to it.
+    workspace: Option<std::sync::Arc<crate::local_tools::Workspace>>,
 }
 
 impl<C: ChatClient, W: Write> Runner<C, W> {
@@ -310,6 +313,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             generation: new_session_id()[..8].to_owned(),
             next_id: 0,
             no_tools: false,
+            workspace: None,
         }
     }
 
@@ -335,6 +339,13 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         if let Err(why) = self.load() {
             self.emit(Envelope::new(Event::Error { message: why }));
             return 1;
+        }
+        match crate::local_tools::Workspace::open(Path::new(&self.args.cwd)) {
+            Ok(ws) => self.workspace = Some(std::sync::Arc::new(ws)),
+            Err(why) => {
+                self.emit(Envelope::new(Event::Error { message: why }));
+                return 1;
+            }
         }
         self.emit(Envelope::new(Event::SessionStarted {
             native_id: self.session.clone(),
@@ -824,13 +835,15 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             Ok(input) => input,
             Err(why) => return fail(self, why),
         };
-        let cwd = PathBuf::from(&self.args.cwd);
+        let Some(ws) = self.workspace.clone() else {
+            return fail(self, "The thread's folder is not open.".to_owned());
+        };
         let outside = tool != Tool::RunCommand
             && tool.writes()
             && input
                 .get("file_path")
                 .and_then(Value::as_str)
-                .is_none_or(|p| !crate::local_tools::inside(&cwd, p));
+                .is_none_or(|p| !crate::local_tools::inside(&ws, p));
         match gate(tool, self.mode, outside) {
             Gate::Refuse(why) => {
                 self.emit(Envelope::item_completed(
@@ -864,10 +877,8 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         // while it works.
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker = {
-            let (cancel, input, cwd) = (cancel.clone(), input.clone(), cwd.clone());
-            std::thread::spawn(move || {
-                crate::local_tools::run(tool, &input, &cwd, outside, &cancel)
-            })
+            let (cancel, input) = (cancel.clone(), input.clone());
+            std::thread::spawn(move || crate::local_tools::run(tool, &input, &ws, outside, &cancel))
         };
         let mut stop = None;
         while !worker.is_finished() {

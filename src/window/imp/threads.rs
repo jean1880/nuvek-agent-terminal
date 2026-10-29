@@ -782,6 +782,10 @@ pub(super) struct ChatTab {
     /// read; honoured while that profile runs the thread's agent
     /// ([`crate::config::TerminalConfig::thread_profile`]).
     pub(super) profile_id: Option<String>,
+    /// The Local server a switch to the Local agent launched on, kept here until that session
+    /// reports it started: only then does it replace `profile_id` (and the store's), so a switch
+    /// that fails or is rolled back leaves the thread's own profile as it was.
+    pub(super) staged_local_profile: Option<String>,
     /// A handoff found stored and undelivered when the thread was built: re-armed (not seeded
     /// again) in whichever session starts first.
     stored_handoff: Option<crate::chat::session::Handoff>,
@@ -2487,26 +2491,21 @@ fn agent_launch(driver: Driver, thread: &str, cwd: &str) -> Result<AgentLaunch, 
             .with_chat(thread, |c| c.profile_id.clone())
             .flatten()
     });
-    // A thread switched to the Local agent without a server of its own is bound to the ready one
-    // it launches on, kept with the thread: its picker, its retirement checks and its resumes
-    // then read the same server, whichever answers later.
+    // A thread switched to the Local agent without a server of its own launches on a ready one,
+    // staged with the thread: once that session reports it started, the thread is bound to it
+    // (`commit_staged_local_profile`), so its picker, its retirement checks and its resumes read
+    // the same server. A switch that fails or is rolled back never touches the thread's profile.
     if driver.is_built_in() {
         let config = SharedConfig::default();
         let chosen = thread_profile_or_new(&config.borrow(), profile_id.as_deref(), driver).id;
         let bound = profile_id.as_deref() == Some(chosen.as_str());
         let known = config.borrow().profile_by_id(&chosen).is_some();
+        if let Some(window) = &owner {
+            window.imp().with_chat_mut(thread, |c| {
+                c.staged_local_profile = (!bound && known).then(|| chosen.clone());
+            });
+        }
         if !bound && known {
-            if let Some(window) = &owner {
-                window.imp().with_chat_mut(thread, |c| {
-                    c.profile_id = Some(chosen.clone());
-                });
-                let (id, pin) = (thread.to_owned(), chosen.clone());
-                window
-                    .imp()
-                    .write_store("bind a thread to its Local server", move |s| {
-                        s.set_thread_profile(&id, Some(&pin))
-                    });
-            }
             profile_id = Some(chosen);
         }
     }
@@ -5199,6 +5198,7 @@ impl AgentTerminalWindow {
                 pending_prompt: None,
                 pending_handoff: false,
                 profile_id: None,
+                staged_local_profile: None,
                 stored_handoff: None,
                 chosen_mode: None,
                 pending_effort: None,
@@ -5854,6 +5854,7 @@ impl AgentTerminalWindow {
         // for a reopen). Not before: a switch whose agent never starts rolls back, and the old
         // agent must restart on its own profile.
         let mut clear_profile = false;
+        let mut commit_profile: Option<String> = None;
         // The agent refused the turn over its usage limit ([`limit_refused`]): may start a wait,
         // with the reset time a rate limit in that turn gave.
         let refused: Option<Option<i64>>;
@@ -5879,6 +5880,16 @@ impl AgentTerminalWindow {
             };
             let switched = chat.driver != driver;
             chat.driver = driver;
+            // The Local server a switch launched on becomes the thread's once that session
+            // started; any other agent's events drop a staged one (that switch did not happen).
+            if !driver.is_built_in() {
+                chat.staged_local_profile = None;
+            } else if matches!(env.event, Event::SessionStarted { .. }) {
+                if let Some(pin) = chat.staged_local_profile.take() {
+                    chat.profile_id = Some(pin.clone());
+                    commit_profile = Some(pin);
+                }
+            }
             let profile_runs = chat.profile_id.as_deref().map(|id| {
                 self.config
                     .borrow()
@@ -6101,6 +6112,12 @@ impl AgentTerminalWindow {
             let id = thread.to_owned();
             self.write_store("clear a switched thread's profile", move |s| {
                 s.set_thread_profile(&id, None)
+            });
+        }
+        if let Some(pin) = commit_profile {
+            let id = thread.to_owned();
+            self.write_store("bind a thread to its Local server", move |s| {
+                s.set_thread_profile(&id, Some(&pin))
             });
         }
         if let Some((page, question)) = ask {

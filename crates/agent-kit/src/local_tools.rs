@@ -91,13 +91,47 @@ fn resolved(path: &Path) -> Option<PathBuf> {
     Some(out)
 }
 
-/// Whether `path` (relative to `cwd` or absolute) is inside `cwd`, links followed. Anything that
-/// cannot be resolved is outside: it asks.
-pub fn inside(cwd: &Path, path: &str) -> bool {
-    let Ok(root) = cwd.canonicalize() else {
-        return false;
-    };
-    resolved(&absolute(cwd, path)).is_some_and(|p| p.starts_with(root))
+/// The thread's folder, pinned when the agent starts: the path it was given, where that led
+/// then, and the folder itself, open. Writes and commands are anchored to the open folder, so
+/// the folder renamed or replaced by a link later never moves them, and a path that no longer
+/// leads into it is outside.
+#[derive(Debug)]
+pub struct Workspace {
+    /// As given: relative tool paths are joined to it.
+    cwd: PathBuf,
+    /// Where it led when opened.
+    root: PathBuf,
+    folder: OwnedFd,
+}
+
+impl Workspace {
+    pub fn open(cwd: &Path) -> Result<Self, String> {
+        let root = cwd
+            .canonicalize()
+            .map_err(|e| format!("Cannot open the thread's folder {}: {e}", cwd.display()))?;
+        let folder = open_at(
+            None,
+            &cstring(root.as_os_str())?,
+            libc::O_DIRECTORY | libc::O_RDONLY | libc::O_NOFOLLOW,
+            0,
+        )
+        .map_err(|e| format!("Cannot open the thread's folder {}: {e}", cwd.display()))?;
+        Ok(Self {
+            cwd: cwd.to_path_buf(),
+            root,
+            folder,
+        })
+    }
+
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+}
+
+/// Whether `path` (relative to the thread's folder or absolute) is inside the folder as it was
+/// pinned, links followed. Anything that cannot be resolved is outside: it asks.
+pub fn inside(ws: &Workspace, path: &str) -> bool {
+    resolved(&absolute(&ws.cwd, path)).is_some_and(|p| p.starts_with(&ws.root))
 }
 
 fn text<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -107,24 +141,24 @@ fn text<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("{key} is required"))
 }
 
-/// Runs `tool` with `input` in `cwd`: what the model is told, or why it failed. `may_leave` says
-/// a write outside the folder was approved (or every request is: Bypass); without it a write
-/// that now leads outside is refused. `cancel` stops a running command (its whole process
-/// group) or a search, when it is set.
+/// Runs `tool` with `input` in the thread's folder: what the model is told, or why it failed.
+/// `may_leave` says a write outside the folder was approved (or every request is: Bypass);
+/// without it a write that now leads outside is refused. `cancel` stops a running command (its
+/// whole process group) or a search, when it is set.
 pub fn run(
     tool: Tool,
     input: &Value,
-    cwd: &Path,
+    ws: &Workspace,
     may_leave: bool,
     cancel: &AtomicBool,
 ) -> Result<String, String> {
     match tool {
-        Tool::ReadFile => read_file(input, cwd),
-        Tool::ListDir => list_dir(input, cwd),
-        Tool::Search => search(input, cwd, cancel),
-        Tool::WriteFile => write_file(input, cwd, may_leave),
-        Tool::EditFile => edit_file(input, cwd, may_leave),
-        Tool::RunCommand => run_command(input, cwd, cancel),
+        Tool::ReadFile => read_file(input, &ws.cwd),
+        Tool::ListDir => list_dir(input, &ws.cwd),
+        Tool::Search => search(input, &ws.cwd, cancel),
+        Tool::WriteFile => write_file(input, ws, may_leave),
+        Tool::EditFile => edit_file(input, ws, may_leave),
+        Tool::RunCommand => run_command(input, ws, cancel),
     }
 }
 
@@ -193,29 +227,41 @@ fn read_text(path: &Path, max: u64) -> Result<String, String> {
 }
 
 /// The folder a write of `path` lands in, and the file's name in it. The path is resolved as
-/// [`inside`] judges it; then each folder from the thread's folder (or from `/`, only when
+/// [`inside`] judges it; then each folder from the pinned thread folder (or from `/`, only when
 /// `may_leave`) is opened in turn without following a link, made when `create` and missing. A
-/// folder that became a link, or a path that now leads outside when it may not, fails it.
+/// folder that became a link, or a path that now leads outside when it may not (the thread's
+/// folder itself replaced included), fails it.
 fn write_target(
-    cwd: &Path,
+    ws: &Workspace,
     path: &str,
     may_leave: bool,
     create: bool,
 ) -> Result<(OwnedFd, CString, PathBuf), String> {
-    let shown = absolute(cwd, path);
-    let root = cwd
-        .canonicalize()
-        .map_err(|e| format!("Cannot open the thread's folder: {e}"))?;
+    let shown = absolute(&ws.cwd, path);
     let target = resolved(&shown).ok_or_else(|| {
         format!(
             "{} leads through a link that names nothing; nothing was written",
             shown.display()
         )
     })?;
-    let (base, rel) = match target.strip_prefix(&root) {
-        Ok(rel) => (root.clone(), rel.to_path_buf()),
+    let changed = |e: std::io::Error| {
+        format!(
+            "A folder on the way to {} changed (it is a link now, or gone), so nothing was \
+             written: {e}",
+            shown.display()
+        )
+    };
+    // Inside: from the folder opened when the agent started, never from its path again.
+    let (base, rel) = match target.strip_prefix(&ws.root) {
+        Ok(rel) => (ws.folder.try_clone().map_err(changed)?, rel.to_path_buf()),
         Err(_) if may_leave => (
-            PathBuf::from("/"),
+            open_at(
+                None,
+                &cstring(OsStr::new("/"))?,
+                libc::O_DIRECTORY | libc::O_RDONLY,
+                0,
+            )
+            .map_err(changed)?,
             target.strip_prefix("/").unwrap_or(&target).to_path_buf(),
         ),
         Err(_) => {
@@ -229,21 +275,8 @@ fn write_target(
     let Some((last, folders)) = names.split_last() else {
         return Err(format!("{} is a folder", shown.display()));
     };
-    let changed = |e: std::io::Error| {
-        format!(
-            "A folder on the way to {} changed (it is a link now, or gone), so nothing was \
-             written: {e}",
-            shown.display()
-        )
-    };
     let folder_flags = libc::O_DIRECTORY | libc::O_RDONLY | libc::O_NOFOLLOW;
-    let mut dir = open_at(
-        None,
-        &cstring(base.as_os_str())?,
-        libc::O_DIRECTORY | libc::O_RDONLY,
-        0,
-    )
-    .map_err(changed)?;
+    let mut dir = base;
     for name in folders {
         let name = cstring(name)?;
         let next = match open_at(Some(&dir), &name, folder_flags, 0) {
@@ -268,17 +301,31 @@ fn write_target(
     Ok((dir, cstring(last)?, shown))
 }
 
-/// Writes `content` as the file `name` in the open folder `dir`, never through a link.
+/// Writes `content` as the file `name` in the open folder `dir`, never through a link and only
+/// to a regular file: it is opened without blocking (a pipe with no reader is refused at once,
+/// never waited on) and without truncating, checked, and only then emptied and written.
 fn write_at(dir: &OwnedFd, name: &CString, shown: &Path, content: &str) -> Result<(), String> {
     use std::io::Write;
     let fd = open_at(
         Some(dir),
         name,
-        libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_NONBLOCK,
         0o666,
     )
     .map_err(|e| format!("Cannot write {}: {e}", shown.display()))?;
-    std::fs::File::from(fd)
+    let file = std::fs::File::from(fd);
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("Cannot write {}: {e}", shown.display()))?;
+    if !meta.is_file() {
+        return Err(format!(
+            "{} is not a regular file; nothing was written",
+            shown.display()
+        ));
+    }
+    file.set_len(0)
+        .map_err(|e| format!("Cannot write {}: {e}", shown.display()))?;
+    (&file)
         .write_all(content.as_bytes())
         .map_err(|e| format!("Cannot write {}: {e}", shown.display()))
 }
@@ -430,9 +477,9 @@ fn search(input: &Value, cwd: &Path, cancel: &AtomicBool) -> Result<String, Stri
     Ok(out)
 }
 
-fn write_file(input: &Value, cwd: &Path, may_leave: bool) -> Result<String, String> {
+fn write_file(input: &Value, ws: &Workspace, may_leave: bool) -> Result<String, String> {
     let content = text(input, "content")?;
-    let (dir, name, path) = write_target(cwd, text(input, "file_path")?, may_leave, true)?;
+    let (dir, name, path) = write_target(ws, text(input, "file_path")?, may_leave, true)?;
     write_at(&dir, &name, &path, content)?;
     Ok(format!(
         "Wrote {} bytes to {}",
@@ -441,7 +488,7 @@ fn write_file(input: &Value, cwd: &Path, may_leave: bool) -> Result<String, Stri
     ))
 }
 
-fn edit_file(input: &Value, cwd: &Path, may_leave: bool) -> Result<String, String> {
+fn edit_file(input: &Value, ws: &Workspace, may_leave: bool) -> Result<String, String> {
     let old = text(input, "old_string")?;
     let new = text(input, "new_string")?;
     if old.is_empty() {
@@ -451,7 +498,7 @@ fn edit_file(input: &Value, cwd: &Path, may_leave: bool) -> Result<String, Strin
         return Err("old_string and new_string are the same".to_owned());
     }
     // Read and written through the same folder, opened without following links.
-    let (dir, name, path) = write_target(cwd, text(input, "file_path")?, may_leave, false)?;
+    let (dir, name, path) = write_target(ws, text(input, "file_path")?, may_leave, false)?;
     let fd = open_at(
         Some(&dir),
         &name,
@@ -493,7 +540,7 @@ fn edit_file(input: &Value, cwd: &Path, may_leave: bool) -> Result<String, Strin
 /// Stop (`cancel`) ends it and everything it started. Each output is kept up to
 /// [`MAX_COMMAND_OUTPUT`]; past that it is read and dropped, so the command never blocks on a
 /// full pipe and never fills memory.
-fn run_command(input: &Value, cwd: &Path, cancel: &AtomicBool) -> Result<String, String> {
+fn run_command(input: &Value, ws: &Workspace, cancel: &AtomicBool) -> Result<String, String> {
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     use std::time::Instant;
@@ -505,40 +552,82 @@ fn run_command(input: &Value, cwd: &Path, cancel: &AtomicBool) -> Result<String,
         .get("timeout_secs")
         .and_then(Value::as_u64)
         .map_or(DEFAULT_COMMAND_SECS, |s| s.clamp(1, MAX_COMMAND_SECS));
-    let mut child = std::process::Command::new("sh")
-        .arg("-c")
+    let folder = ws.folder.as_raw_fd();
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c")
         .arg(command)
-        .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0)
+        .process_group(0);
+    // SAFETY: only `fchdir`, async-signal-safe, between fork and exec; `folder` stays open in
+    // the child until exec (it closes there: the descriptor is close-on-exec). It runs in the
+    // folder opened when the agent started, never wherever its path leads now.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::fchdir(folder) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("Could not run the command: {e}"))?;
     let group = child.id() as libc::pid_t;
     // Each pipe drains on its own thread into a shared, capped buffer and says when it ended.
-    // The command's result never waits on them past a short grace: a descendant that left the
-    // group (`setsid`) and kept a pipe open would otherwise hold the call open forever. Such a
-    // drain thread lives on, holding at most the cap, until that process closes the pipe.
+    // The result never waits on them past a short grace: a descendant that left the group
+    // (`setsid`) and kept a pipe open would otherwise hold the call open forever. The drains poll
+    // in short slices and stop once the call returns (`stop`), closing their end of the pipe, so
+    // nothing is left behind either.
     type Drained = (
         std::sync::Arc<std::sync::Mutex<(Vec<u8>, usize)>>,
         std::sync::mpsc::Receiver<()>,
     );
-    let drain = |pipe: Option<Box<dyn Read + Send>>| -> Drained {
+    struct StopOnDrop(std::sync::Arc<AtomicBool>);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let _stop_on_return = StopOnDrop(stop.clone());
+    let drain = |pipe: Option<(Box<dyn Read + Send>, libc::c_int)>| -> Drained {
         let buffer = std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), 0usize)));
         let (done, finished) = std::sync::mpsc::channel();
-        let sink = buffer.clone();
+        let (sink, stop) = (buffer.clone(), stop.clone());
         std::thread::spawn(move || {
-            if let Some(mut pipe) = pipe {
+            if let Some((mut pipe, fd)) = pipe {
                 let mut chunk = [0u8; 8192];
-                while let Ok(n) = pipe.read(&mut chunk) {
-                    if n == 0 {
-                        break;
+                while !stop.load(Ordering::Relaxed) {
+                    let mut ready = libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    // SAFETY: a valid pollfd; `fd` stays open while `pipe` (owned here) lives.
+                    match unsafe { libc::poll(&mut ready, 1, 100) } {
+                        0 => continue,
+                        n if n < 0 => {
+                            if std::io::Error::last_os_error().kind()
+                                == std::io::ErrorKind::Interrupted
+                            {
+                                continue;
+                            }
+                            break;
+                        }
+                        _ => {}
                     }
-                    if let Ok(mut held) = sink.lock() {
-                        let room = MAX_COMMAND_OUTPUT.saturating_sub(held.0.len());
-                        held.0.extend_from_slice(&chunk[..n.min(room)]);
-                        held.1 += n.saturating_sub(room);
+                    match pipe.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if let Ok(mut held) = sink.lock() {
+                                let room = MAX_COMMAND_OUTPUT.saturating_sub(held.0.len());
+                                held.0.extend_from_slice(&chunk[..n.min(room)]);
+                                held.1 += n.saturating_sub(room);
+                            }
+                        }
                     }
                 }
             }
@@ -553,18 +642,14 @@ fn run_command(input: &Value, cwd: &Path, cancel: &AtomicBool) -> Result<String,
             .map(|held| (held.0.clone(), held.1))
             .unwrap_or_default()
     };
-    let stdout = drain(
-        child
-            .stdout
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-    let stderr = drain(
-        child
-            .stderr
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
+    let stdout = drain(child.stdout.take().map(|p| {
+        let fd = p.as_raw_fd();
+        (Box::new(p) as Box<dyn Read + Send>, fd)
+    }));
+    let stderr = drain(child.stderr.take().map(|p| {
+        let fd = p.as_raw_fd();
+        (Box::new(p) as Box<dyn Read + Send>, fd)
+    }));
     let kill_group = || {
         // SAFETY: killpg with the group this child leads; at worst it names no process.
         unsafe { libc::killpg(group, libc::SIGKILL) };
@@ -633,9 +718,72 @@ mod tests {
         tempfile::tempdir().expect("tempdir")
     }
 
+    fn ws(cwd: &Path) -> Workspace {
+        Workspace::open(cwd).expect("workspace")
+    }
+
     /// [`run`] with no Stop, and no write outside approved.
     fn go(tool: Tool, input: &Value, cwd: &Path) -> Result<String, String> {
-        run(tool, input, cwd, false, &AtomicBool::new(false))
+        run(tool, input, &ws(cwd), false, &AtomicBool::new(false))
+    }
+
+    #[test]
+    fn the_thread_folder_replaced_by_a_link_never_moves_a_write_or_a_command() {
+        let parent = dir();
+        let cwd = parent.path().join("work");
+        std::fs::create_dir(&cwd).unwrap();
+        let pinned = ws(&cwd);
+        let outside = dir();
+        // Judged inside, then the whole folder renamed and its path made a link out.
+        assert!(inside(&pinned, "x.txt"));
+        std::fs::rename(&cwd, parent.path().join("moved")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &cwd).unwrap();
+        let err = run(
+            Tool::WriteFile,
+            &json!({"file_path": "x.txt", "content": "x"}),
+            &pinned,
+            false,
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(err.contains("nothing was written"), "{err}");
+        assert!(!outside.path().join("x.txt").exists());
+        assert!(!inside(&pinned, "x.txt"), "it now leads outside: it asks");
+        // A command still runs in the folder that was pinned.
+        run(
+            Tool::RunCommand,
+            &json!({"command": "touch made"}),
+            &pinned,
+            false,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(parent.path().join("moved/made").exists());
+        assert!(!outside.path().join("made").exists());
+    }
+
+    #[test]
+    fn a_write_to_a_pipe_is_refused_at_once_and_truncates_nothing_first() {
+        let d = dir();
+        let fifo = d.path().join("pipe");
+        let name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid path string; makes a FIFO in the test's own folder.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+        let err = go(
+            Tool::WriteFile,
+            &json!({"file_path": "pipe", "content": "x"}),
+            d.path(),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("Cannot write") || err.contains("not a regular file"),
+            "{err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "never waits for a reader"
+        );
     }
 
     #[test]
@@ -645,7 +793,7 @@ mod tests {
         let outside = dir();
         std::fs::create_dir(cwd.join("sub")).unwrap();
         // Judged inside (no approval needed), then swapped while the card was open.
-        assert!(inside(cwd, "sub/x.txt"));
+        assert!(inside(&ws(cwd), "sub/x.txt"));
         std::fs::remove_dir(cwd.join("sub")).unwrap();
         std::os::unix::fs::symlink(outside.path(), cwd.join("sub")).unwrap();
         let err = go(
@@ -674,7 +822,7 @@ mod tests {
         run(
             Tool::WriteFile,
             &json!({"file_path": target.to_str().unwrap(), "content": "ok"}),
-            cwd,
+            &ws(cwd),
             true,
             &AtomicBool::new(false),
         )
@@ -697,7 +845,7 @@ mod tests {
         let stopped = run(
             Tool::Search,
             &json!({"pattern": "needle"}),
-            d.path(),
+            &ws(d.path()),
             false,
             &AtomicBool::new(true),
         );
@@ -725,8 +873,8 @@ mod tests {
         let other = dir();
         // A dangling link to a file not made yet, in a folder outside: outside, so it asks.
         std::os::unix::fs::symlink(other.path().join("absent"), cwd.join("dangling")).unwrap();
-        assert!(!inside(cwd, "dangling"));
-        assert!(!inside(cwd, "dangling/below"));
+        assert!(!inside(&ws(cwd), "dangling"));
+        assert!(!inside(&ws(cwd), "dangling/below"));
         // Even approved, a write never follows a link at its last component.
         let err = go(
             Tool::WriteFile,
@@ -740,7 +888,7 @@ mod tests {
         let err = go(Tool::ReadFile, &json!({"file_path": "/dev/zero"}), cwd).unwrap_err();
         assert!(err.contains("not a regular file"), "{err}");
         assert!(
-            !inside(Path::new("/no/such/folder"), "x"),
+            Workspace::open(Path::new("/no/such/folder")).is_err(),
             "an unresolvable folder"
         );
     }
@@ -765,7 +913,7 @@ mod tests {
             run(
                 Tool::RunCommand,
                 &json!({"command": "sleep 30 & sleep 30; touch late"}),
-                &cwd,
+                &ws(&cwd),
                 false,
                 &stop,
             )
@@ -783,13 +931,13 @@ mod tests {
         let d = dir();
         let cwd = d.path();
         std::fs::create_dir(cwd.join("src")).unwrap();
-        assert!(inside(cwd, "src/new.rs"), "a file not made yet");
-        assert!(inside(cwd, "./a/../b.rs"));
-        assert!(!inside(cwd, "../escape.rs"));
-        assert!(!inside(cwd, "/etc/passwd"));
+        assert!(inside(&ws(cwd), "src/new.rs"), "a file not made yet");
+        assert!(inside(&ws(cwd), "./a/../b.rs"));
+        assert!(!inside(&ws(cwd), "../escape.rs"));
+        assert!(!inside(&ws(cwd), "/etc/passwd"));
         let other = dir();
         std::os::unix::fs::symlink(other.path(), cwd.join("link")).unwrap();
-        assert!(!inside(cwd, "link/x.rs"), "a link out of the folder");
+        assert!(!inside(&ws(cwd), "link/x.rs"), "a link out of the folder");
         assert_eq!(
             absolute(Path::new("/w"), "a/./b/../c"),
             PathBuf::from("/w/a/c")

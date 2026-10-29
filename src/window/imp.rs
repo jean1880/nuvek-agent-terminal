@@ -4083,7 +4083,8 @@ impl AgentTerminalWindow {
         // markers come with it and the CLI we spawn concludes it is a nested
         // child. Stripping happens before the env_file merge below, so a profile
         // can deliberately put any of these back.
-        let cleared = crate::utils::strip_env(&mut env_strs, &self.config.borrow().clear_env);
+        let clear = self.config.borrow().clear_env.clone();
+        let cleared = crate::utils::strip_env(&mut env_strs, &clear);
         if !cleared.is_empty() {
             info!(
                 "Cleared {} inherited session variable(s) from the child environment: {}",
@@ -4112,10 +4113,13 @@ impl AgentTerminalWindow {
             terminal,
             async move {
                 if let Some(path) = env_file {
-                    let extra =
-                        gtk4::gio::spawn_blocking(move || crate::utils::load_env_file(&path))
-                            .await
-                            .unwrap_or_default();
+                    // With the patterns: an export of a cleared variable equal to its inherited
+                    // value is kept, since the block below no longer has it to fall back on.
+                    let extra = gtk4::gio::spawn_blocking(move || {
+                        crate::utils::load_env_file_for_profile(&path, &clear).unwrap_or_default()
+                    })
+                    .await
+                    .unwrap_or_default();
 
                     // Later entries win in the environment block, so appending
                     // lets the profile override an inherited value.
@@ -7354,6 +7358,7 @@ mod tests {
     /// A terminal's child sees the environment block it was given and nothing else: a variable
     /// the app has but the block leaves out (one `clear_env` removed) does not come back.
     #[test]
+    #[cfg(feature = "terminal")] // the stub never spawns
     fn a_terminal_gets_exactly_the_environment_it_is_given() {
         init_gtk();
         let ctx = glib::MainContext::default();

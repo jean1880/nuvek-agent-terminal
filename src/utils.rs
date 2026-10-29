@@ -221,13 +221,9 @@ where
 /// handshake. Sourcing in a detached subshell and harvesting only the resulting
 /// environment gets the useful half of that idea without the harmful half.
 ///
-/// Failures are logged and yield nothing rather than blocking the session.
-pub fn load_env_file(path: &str) -> Vec<(String, String)> {
-    load_env_file_checked(path).unwrap_or_default()
-}
-
-/// Like `load_env_file`, but callers that must bind an exact profile can refuse a failed
-/// source instead of silently using the application's environment. Errors contain no values.
+/// Failures are logged and returned, so a caller that must bind an exact profile can refuse a
+/// failed source instead of silently using the application's environment. Errors contain no
+/// values.
 pub fn load_env_file_checked(path: &str) -> Result<Vec<(String, String)>, String> {
     load_env_file_inner(path, &[])
 }
@@ -235,7 +231,6 @@ pub fn load_env_file_checked(path: &str) -> Result<Vec<(String, String)>, String
 /// Like [`load_env_file_checked`] for a profile with `clear_env` patterns. The session strips
 /// those variables from the inherited environment before applying the file, so an export equal
 /// to the inherited value is still needed there and is kept when its name matches a pattern.
-#[allow(dead_code)] // the session spawn paths call it once they pass the profile's patterns
 pub fn load_env_file_for_profile(
     path: &str,
     clear_env: &[String],
@@ -1284,7 +1279,7 @@ mod tests {
         // No `export` on the second one: `set -a` must still pick it up.
         std::fs::write(&path, "export FOO=bar\nBAZ=qux\n").unwrap();
 
-        let env = load_env_file(path.to_str().unwrap());
+        let env = load_env_file_checked(path.to_str().unwrap()).unwrap_or_default();
         let get = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
         assert_eq!(get("FOO"), Some("bar"));
         assert_eq!(get("BAZ"), Some("qux"));
@@ -1292,7 +1287,7 @@ mod tests {
 
     #[test]
     fn a_missing_env_file_is_ignored_rather_than_fatal() {
-        assert!(load_env_file("/nonexistent/env.sh").is_empty());
+        assert!(load_env_file_checked("/nonexistent/env.sh").is_err());
         assert!(load_env_file_checked("/nonexistent/env.sh").is_err());
     }
 
@@ -1305,7 +1300,7 @@ mod tests {
         let path = dir.path().join("env.sh");
         std::fs::write(&path, "export AGENT_TERMINAL_TEST_ONLY=yes\n").unwrap();
 
-        let env = load_env_file(path.to_str().unwrap());
+        let env = load_env_file_checked(path.to_str().unwrap()).unwrap_or_default();
         let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
 
         assert!(keys.contains(&"AGENT_TERMINAL_TEST_ONLY"));
@@ -1329,7 +1324,7 @@ mod tests {
         let path = dir.path().join("env.sh");
         std::fs::write(&path, "export TERM=dumb-for-test\n").unwrap();
 
-        let env = load_env_file(path.to_str().unwrap());
+        let env = load_env_file_checked(path.to_str().unwrap()).unwrap_or_default();
         assert_eq!(
             env.iter()
                 .find(|(k, _)| k == "TERM")

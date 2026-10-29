@@ -226,7 +226,7 @@ impl Supervisor {
     }
     /// Whether the supervisor may pause `worker`'s process: a delegated worker, not closed or
     /// failed, with its process up and started, nothing of its at work, no input queued or on
-    /// its way to it, and no live descendant (whose link through it a stop would cut). The
+    /// its way to it, no steer still awaiting its answer, and no live descendant (whose link through it a stop would cut). The
     /// session has its own checks too
     /// ([`crate::chat::session::ChatSession::suspend_child_if_idle`]).
     pub(super) fn child_suspendable(&self, worker: &WorkerId) -> bool {
@@ -237,7 +237,10 @@ impl Supervisor {
             };
             let queued = state.deferred.get(worker).is_some_and(|q| !q.is_empty())
                 || state.controls.values().any(|c| &c.worker == worker)
-                || state.delivery_holds.contains_key(worker);
+                || state.delivery_holds.contains_key(worker)
+                // An overdue steer's late answer comes only from this process: a stop would
+                // end its correlation unanswered, and its delivery would stay unknown.
+                || state.late_steers.iter().any(|(_, e)| &e.worker == worker);
             if w.row.parent_id.is_none()
                 || matches!(w.row.state.as_str(), "closed" | "failed")
                 || w.at_work()

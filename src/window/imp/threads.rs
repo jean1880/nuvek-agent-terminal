@@ -2355,6 +2355,22 @@ async fn server_has_chat_model(
     }
 }
 
+/// What one event of a thread's session does to the Local server a switch staged
+/// (`staged_local_profile`): the Local session's `SessionStarted` commits it (returned, to bind
+/// the thread to). Nothing else clears it: the outgoing agent's own closing events (its exit
+/// included) come first in every switch. Only the next launch replaces it (`agent_launch`).
+fn settle_staged_local(
+    staged: &mut Option<String>,
+    driver: Driver,
+    event: &Event,
+) -> Option<String> {
+    if driver.is_built_in() && matches!(event, Event::SessionStarted { .. }) {
+        staged.take()
+    } else {
+        None
+    }
+}
+
 /// The Local server an action that names none runs on: the first switched on whose last scan
 /// found a chat model. `None` while none has.
 pub(super) fn ready_local_server(config: &crate::config::TerminalConfig) -> Option<Profile> {
@@ -2495,19 +2511,23 @@ fn agent_launch(driver: Driver, thread: &str, cwd: &str) -> Result<AgentLaunch, 
     // staged with the thread: once that session reports it started, the thread is bound to it
     // (`commit_staged_local_profile`), so its picker, its retirement checks and its resumes read
     // the same server. A switch that fails or is rolled back never touches the thread's profile.
+    // Every launch replaces what an earlier one staged: a launch of another agent (a rollback,
+    // another switch) leaves nothing staged, so no later Local start commits a stale server.
+    let mut staged = None;
     if driver.is_built_in() {
         let config = SharedConfig::default();
         let chosen = thread_profile_or_new(&config.borrow(), profile_id.as_deref(), driver).id;
         let bound = profile_id.as_deref() == Some(chosen.as_str());
         let known = config.borrow().profile_by_id(&chosen).is_some();
-        if let Some(window) = &owner {
-            window.imp().with_chat_mut(thread, |c| {
-                c.staged_local_profile = (!bound && known).then(|| chosen.clone());
-            });
-        }
         if !bound && known {
+            staged = Some(chosen.clone());
             profile_id = Some(chosen);
         }
+    }
+    if let Some(window) = &owner {
+        window.imp().with_chat_mut(thread, |c| {
+            c.staged_local_profile = staged;
+        });
     }
     agent_launch_with(
         &AgentAvailability::shared().get(driver),
@@ -5880,15 +5900,11 @@ impl AgentTerminalWindow {
             };
             let switched = chat.driver != driver;
             chat.driver = driver;
-            // The Local server a switch launched on becomes the thread's once that session
-            // started; any other agent's events drop a staged one (that switch did not happen).
-            if !driver.is_built_in() {
-                chat.staged_local_profile = None;
-            } else if matches!(env.event, Event::SessionStarted { .. }) {
-                if let Some(pin) = chat.staged_local_profile.take() {
-                    chat.profile_id = Some(pin.clone());
-                    commit_profile = Some(pin);
-                }
+            if let Some(pin) =
+                settle_staged_local(&mut chat.staged_local_profile, driver, &env.event)
+            {
+                chat.profile_id = Some(pin.clone());
+                commit_profile = Some(pin);
             }
             let profile_runs = chat.profile_id.as_deref().map(|id| {
                 self.config
@@ -8210,6 +8226,62 @@ fn is_interruption(event: &Event) -> bool {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    /// A successful Claude → Local switch: the outgoing Claude session's closing events come
+    /// first and keep the staged server; Local's own start commits it, once.
+    #[test]
+    fn a_switch_to_local_commits_its_server_through_the_outgoing_agents_shutdown() {
+        let mut staged = Some("p-nas".to_owned());
+        for (driver, event) in [
+            (
+                Driver::Claude,
+                Event::TurnCompleted {
+                    state: agent_core::event::TurnState::Interrupted,
+                    usage: None,
+                    cost_usd: None,
+                    error: None,
+                },
+            ),
+            (
+                Driver::Claude,
+                Event::SessionExited {
+                    code: Some(0),
+                    expected: true,
+                },
+            ),
+            (
+                Driver::Local,
+                Event::Notice {
+                    text: "starting".into(),
+                },
+            ),
+        ] {
+            assert_eq!(settle_staged_local(&mut staged, driver, &event), None);
+            assert_eq!(staged.as_deref(), Some("p-nas"), "{event:?} keeps it");
+        }
+        let started = Event::SessionStarted {
+            native_id: "s".into(),
+            model: None,
+            cwd: None,
+        };
+        assert_eq!(
+            settle_staged_local(&mut staged, Driver::Local, &started).as_deref(),
+            Some("p-nas")
+        );
+        assert_eq!(staged, None);
+        // Committed once: a later start (a resume) binds nothing again.
+        assert_eq!(
+            settle_staged_local(&mut staged, Driver::Local, &started),
+            None
+        );
+        // Another agent's start never commits a Local server.
+        let mut other = Some("p-nas".to_owned());
+        assert_eq!(
+            settle_staged_local(&mut other, Driver::Codex, &started),
+            None
+        );
+        assert_eq!(other.as_deref(), Some("p-nas"));
+    }
 
     /// A profile on a model server starts with the server's arguments after its own and the
     /// server's environment over its env file; one that cannot use it is refused, never started

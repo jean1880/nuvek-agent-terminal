@@ -100,6 +100,9 @@ pub struct ClaudeAdapter {
     tasks: Vec<BackgroundTask>,
     /// Background task id → the tool call that started it (`task_started`).
     task_tools: HashMap<String, String>,
+    /// Shell calls that launch an agent (`cross-agent codex …`, `claude -p …`), by tool-use id:
+    /// backgrounded, their task is listed as the sub-agent it is, not as a shell command.
+    shell_agents: HashMap<String, crate::agent_command::AgentCommand>,
     /// Sub-agent task id (its `agentId`) → the `Agent` call that first ran it. A continuation
     /// (`SendMessage` to that id) restarts the same task under the `SendMessage` call's id, but
     /// its steps nest under the original call, so the original card is the one that runs again.
@@ -169,6 +172,7 @@ impl ClaudeAdapter {
             background_children: HashMap::new(),
             tasks: Vec::new(),
             task_tools: HashMap::new(),
+            shell_agents: HashMap::new(),
             agent_items: HashMap::new(),
             agent_calls: HashSet::new(),
             subagent_models: HashMap::new(),
@@ -332,7 +336,7 @@ impl ClaudeAdapter {
             if t.tool_use_id.is_none() {
                 t.tool_use_id = Some(item);
                 out.push(Envelope::new(Event::BackgroundTasks {
-                    tasks: self.tasks.clone(),
+                    tasks: self.shown_tasks(),
                 }));
             }
         }
@@ -361,6 +365,44 @@ impl ClaudeAdapter {
         self.agent_calls.insert(item.to_owned());
     }
 
+    /// Remembers shell call `id` when its input launches an agent.
+    fn note_shell_agent(&mut self, id: &str, name: &str, input: &Value) {
+        let Some(launch) = crate::agent_command::from_tool_input(name, input) else {
+            return;
+        };
+        if self.shell_agents.len() >= SEEN_CAP {
+            self.shell_agents.clear();
+        }
+        self.shell_agents.insert(id.to_owned(), launch);
+    }
+
+    /// The task list as shown: a shell task whose call launched an agent is that sub-agent,
+    /// named as its card is (Claude's description of it is whatever the call said, even a log
+    /// line).
+    fn shown_tasks(&self) -> Vec<BackgroundTask> {
+        self.tasks
+            .iter()
+            .map(|task| {
+                let launch = (task.kind != BackgroundTaskKind::Agent)
+                    .then_some(task.tool_use_id.as_deref())
+                    .flatten()
+                    .and_then(|tool| self.shell_agents.get(tool));
+                let Some(launch) = launch else {
+                    return task.clone();
+                };
+                let label = launch.driver.info().label;
+                BackgroundTask {
+                    kind: BackgroundTaskKind::Agent,
+                    description: Some(match &launch.model {
+                        Some(model) => format!("{label} · {model} (shell)"),
+                        None => format!("{label} (shell)"),
+                    }),
+                    ..task.clone()
+                }
+            })
+            .collect()
+    }
+
     /// `background_tasks_changed`: the full list of running background tasks.
     fn background_tasks(&mut self, v: &Value) -> Vec<Envelope> {
         let tasks: Vec<BackgroundTask> = array_of(v, "tasks")
@@ -382,8 +424,10 @@ impl ClaudeAdapter {
         if tasks == self.tasks {
             return Vec::new();
         }
-        self.tasks = tasks.clone();
-        vec![Envelope::new(Event::BackgroundTasks { tasks })]
+        self.tasks = tasks;
+        vec![Envelope::new(Event::BackgroundTasks {
+            tasks: self.shown_tasks(),
+        })]
     }
 
     /// `task_notification`: a backgrounded sub-agent finished. Its item completes with the
@@ -844,6 +888,7 @@ impl ClaudeAdapter {
                         continue;
                     };
                     let input = block.get("input").cloned().unwrap_or(Value::Null);
+                    self.note_shell_agent(id, name, &input);
                     if self.started_items.contains(id) {
                         out.push(
                             Envelope::new(Event::ContentSnapshot {
@@ -3693,6 +3738,64 @@ mod tests {
         assert!(a
             .feed(&task_notification("sh1", "toolu_sh", "completed", "done"))
             .is_empty());
+    }
+
+    #[test]
+    fn a_backgrounded_shell_launch_of_an_agent_is_listed_as_that_sub_agent() {
+        let mut a = ClaudeAdapter::new();
+        a.feed(&init_frame());
+        let call = json!({"type": "assistant", "uuid": "u-xa", "parent_tool_use_id": null,
+            "message": {"id": "m-xa", "role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_xa", "name": "Bash",
+                 "input": {"command": "cross-agent codex -m gpt-6.1-sol \"Review the diff\"",
+                           "run_in_background": true}}]}});
+        a.feed(&call.to_string());
+        let list = |task: &str, tool: Option<&str>| -> Vec<BackgroundTask> {
+            vec![BackgroundTask {
+                id: task.to_owned(),
+                kind: BackgroundTaskKind::Shell,
+                description: Some("2026-10-29T15:27:20 INFO cross-agent | delegate".to_owned()),
+                tool_use_id: tool.map(str::to_owned),
+            }]
+        };
+        let changed = json!({"type": "system", "subtype": "background_tasks_changed",
+            "tasks": [{"task_id": "xa1", "task_type": "local_bash",
+                       "description": "2026-10-29T15:27:20 INFO cross-agent | delegate"}]});
+        // Listed before its call is known: a shell command still.
+        assert_eq!(
+            task_lists(&a.feed(&changed.to_string())),
+            [list("xa1", None)]
+        );
+        // Its start names the call: from then on it is the sub-agent it launched.
+        let shown = task_lists(&a.feed(&task_started_of("xa1", "toolu_xa", "local_bash")));
+        let agent = BackgroundTask {
+            kind: BackgroundTaskKind::Agent,
+            description: Some("Codex · gpt-6.1-sol (shell)".to_owned()),
+            ..list("xa1", Some("toolu_xa")).remove(0)
+        };
+        assert_eq!(shown, [vec![agent]]);
+        // Its call still completes on its own result, like any backgrounded shell command.
+        let result = json!({"type": "user", "uuid": "r-xa", "parent_tool_use_id": null,
+            "message": {"role": "user", "content": [{"type": "tool_result",
+                "tool_use_id": "toolu_xa", "content": "Command running in background"}]}});
+        assert_eq!(
+            completions(&a.feed(&result.to_string()), "toolu_xa").len(),
+            1
+        );
+
+        // A plain backgrounded command keeps its kind and description.
+        let mut a = ClaudeAdapter::new();
+        a.feed(&init_frame());
+        let call = json!({"type": "assistant", "uuid": "u-sh", "parent_tool_use_id": null,
+            "message": {"id": "m-sh", "role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_sh", "name": "Bash",
+                 "input": {"command": "sleep 9", "run_in_background": true}}]}});
+        a.feed(&call.to_string());
+        a.feed(&changed.to_string());
+        assert_eq!(
+            task_lists(&a.feed(&task_started_of("xa1", "toolu_sh", "local_bash"))),
+            [list("xa1", Some("toolu_sh"))]
+        );
     }
 
     #[test]

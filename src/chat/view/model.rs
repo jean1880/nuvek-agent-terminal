@@ -1095,6 +1095,21 @@ impl Transcript {
         }
         drop(memo);
         for worker in &mut out {
+            // A backgrounded shell launch answers its call at once ("running in background"):
+            // it is at work for as long as its task is listed.
+            let shell = matches!(
+                self.items.get(&worker.id).map(|i| &i.body),
+                Some(Body::Tool(t)) if t.kind == ItemKind::Command
+            );
+            if shell
+                && worker.status == ToolStatus::Completed
+                && self
+                    .background
+                    .iter()
+                    .any(|t| t.tool_use_id.as_deref() == Some(worker.id.as_str()))
+            {
+                worker.status = ToolStatus::Running;
+            }
             worker.driver = worker
                 .delegation
                 .as_ref()
@@ -4044,6 +4059,28 @@ mod tests {
         t.apply(&done, Driver::Claude);
         assert!(t.running_drivers(Vec::new()).is_empty());
         assert_eq!(t.subagents()[0].status, ToolStatus::Completed);
+
+        // Backgrounded, its call answers at once: it runs for as long as its task is listed.
+        t.apply(
+            &command("bg", "cross-agent codex \"Map the crate\""),
+            Driver::Claude,
+        );
+        let launched = Envelope::item_completed("bg", ItemStatus::Completed, Some("running"), None);
+        t.apply(&launched, Driver::Claude);
+        let listed = |tasks: Vec<BackgroundTask>| ev(Event::BackgroundTasks { tasks });
+        t.apply(
+            &listed(vec![BackgroundTask {
+                id: "task-bg".into(),
+                kind: BackgroundTaskKind::Agent,
+                description: Some("Codex (shell)".into()),
+                tool_use_id: Some("bg".into()),
+            }]),
+            Driver::Claude,
+        );
+        assert_eq!(t.subagents()[1].status, ToolStatus::Running);
+        assert_eq!(t.running_drivers(Vec::new()), [Driver::Codex]);
+        t.apply(&listed(Vec::new()), Driver::Claude);
+        assert_eq!(t.subagents()[1].status, ToolStatus::Completed);
     }
 
     #[test]

@@ -1780,8 +1780,13 @@ pub(super) fn start_model(profile: &Profile, driver: Driver) -> Option<String> {
         None => profile.effective_default_model(None),
         Some(source) => profile.default_model.clone().or_else(|| {
             let listed = ModelCatalog::shared().models_for(driver, Some(&source));
-            agent_core::provider::first_chat_model(listed.iter().map(|m| m.id.as_str()))
-                .map(str::to_owned)
+            if driver.is_built_in() {
+                // Its list is already only what the server says can chat: trust that over names.
+                listed.first().map(|m| m.id.clone())
+            } else {
+                agent_core::provider::first_chat_model(listed.iter().map(|m| m.id.as_str()))
+                    .map(str::to_owned)
+            }
         }),
     }
 }
@@ -1819,13 +1824,9 @@ pub(super) fn profile_source(
     profile_id: Option<&str>,
     driver: Driver,
 ) -> Option<agent_core::provider::ModelProvider> {
-    config
-        .thread_profile(profile_id, driver)
-        .cloned()
-        .or_else(|| {
-            agent_core::provider::required(driver).then(|| crate::config::new_agent_profile(driver))
-        })
-        .and_then(|p| crate::config::profile_provider(&p, driver))
+    // The same resolution as the launch's (`agent_launch`), so the picker lists the server the
+    // thread runs on.
+    crate::config::profile_provider(&thread_profile_or_new(config, profile_id, driver), driver)
         .filter(|_| agent_core::provider::supports(driver))
 }
 
@@ -2329,9 +2330,11 @@ async fn server_has_chat_model(
     provider: &agent_core::provider::ModelProvider,
     key: Option<String>,
 ) -> bool {
+    // What the server says each model can do, as the catalogue reads it: a server is ready by the
+    // same judgement that lists its models.
     let provider = provider.clone();
     let listed = gtk4::gio::spawn_blocking(move || {
-        agent_kit::provider_models::fetch(
+        agent_kit::provider_models::fetch_info(
             &provider,
             key.as_deref(),
             crate::model_catalog::USER_AGENT,
@@ -2340,7 +2343,7 @@ async fn server_has_chat_model(
     .await
     .unwrap_or_else(|_| Err("the model list fetch panicked".to_owned()));
     match listed {
-        Ok(ids) => agent_core::provider::first_chat_model(ids.iter().map(String::as_str)).is_some(),
+        Ok(models) => models.iter().any(|m| m.chat),
         Err(why) => {
             warn!(%why, "the Local agent's model server is not ready");
             false
@@ -2477,12 +2480,36 @@ fn now_ms() -> i64 {
 fn agent_launch(driver: Driver, thread: &str, cwd: &str) -> Result<AgentLaunch, String> {
     // The thread's own profile while it runs `driver` (a restart or a roll back); a switch to
     // another agent gets that agent's own.
-    let profile_id = thread_owner(thread).and_then(|window| {
+    let owner = thread_owner(thread);
+    let mut profile_id = owner.as_ref().and_then(|window| {
         window
             .imp()
             .with_chat(thread, |c| c.profile_id.clone())
             .flatten()
     });
+    // A thread switched to the Local agent without a server of its own is bound to the ready one
+    // it launches on, kept with the thread: its picker, its retirement checks and its resumes
+    // then read the same server, whichever answers later.
+    if driver.is_built_in() {
+        let config = SharedConfig::default();
+        let chosen = thread_profile_or_new(&config.borrow(), profile_id.as_deref(), driver).id;
+        let bound = profile_id.as_deref() == Some(chosen.as_str());
+        let known = config.borrow().profile_by_id(&chosen).is_some();
+        if !bound && known {
+            if let Some(window) = &owner {
+                window.imp().with_chat_mut(thread, |c| {
+                    c.profile_id = Some(chosen.clone());
+                });
+                let (id, pin) = (thread.to_owned(), chosen.clone());
+                window
+                    .imp()
+                    .write_store("bind a thread to its Local server", move |s| {
+                        s.set_thread_profile(&id, Some(&pin))
+                    });
+            }
+            profile_id = Some(chosen);
+        }
+    }
     agent_launch_with(
         &AgentAvailability::shared().get(driver),
         driver,

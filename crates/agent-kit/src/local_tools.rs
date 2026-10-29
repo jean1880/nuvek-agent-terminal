@@ -4,14 +4,22 @@
 //! What may run without asking is decided before a tool runs (`agent_core::local_agent::gate`),
 //! and [`inside`] tells it whether a write stays in the folder: the path is resolved through any
 //! symbolic link, so a link pointing out of the folder counts as outside, and a link that cannot
-//! be resolved (a dangling one) does too. A write never follows a link at its last component.
+//! be resolved (a dangling one) does too.
 //!
-//! Residual risk (not closed): a folder in the path swapped for a link between that check and
-//! the write is not seen. The check and the write are a few calls apart in one process.
+//! A write is then bound to what was judged, however long its approval took: its folders are
+//! opened one at a time from the thread's folder (or `/` for an approved write outside it)
+//! without following any link (`O_NOFOLLOW`), and the file is opened in the last of them the
+//! same way. A folder swapped for a link meanwhile fails the write instead of redirecting it, and
+//! a write judged inside never lands outside. Files are opened without blocking and read only
+//! when they are regular files, at most a fixed size: a pipe or a device is refused.
 
+use std::ffi::{CString, OsStr};
 use std::io::Read;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use agent_core::local_agent::Tool;
 use serde_json::Value;
@@ -99,67 +107,185 @@ fn text<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("{key} is required"))
 }
 
-/// Runs `tool` with `input` in `cwd`: what the model is told, or why it failed. `cancel` stops a
-/// running command (its whole process group) when it is set.
-pub fn run(tool: Tool, input: &Value, cwd: &Path, cancel: &AtomicBool) -> Result<String, String> {
+/// Runs `tool` with `input` in `cwd`: what the model is told, or why it failed. `may_leave` says
+/// a write outside the folder was approved (or every request is: Bypass); without it a write
+/// that now leads outside is refused. `cancel` stops a running command (its whole process
+/// group) or a search, when it is set.
+pub fn run(
+    tool: Tool,
+    input: &Value,
+    cwd: &Path,
+    may_leave: bool,
+    cancel: &AtomicBool,
+) -> Result<String, String> {
     match tool {
         Tool::ReadFile => read_file(input, cwd),
         Tool::ListDir => list_dir(input, cwd),
-        Tool::Search => search(input, cwd),
-        Tool::WriteFile => write_file(input, cwd),
-        Tool::EditFile => edit_file(input, cwd),
+        Tool::Search => search(input, cwd, cancel),
+        Tool::WriteFile => write_file(input, cwd, may_leave),
+        Tool::EditFile => edit_file(input, cwd, may_leave),
         Tool::RunCommand => run_command(input, cwd, cancel),
     }
 }
 
-/// A regular file's text, at most [`MAX_READ_BYTES`]: a device, a pipe or a folder is refused, and
-/// the read itself is bounded, whatever the file's size said.
-fn read_text(path: &Path) -> Result<String, String> {
-    let meta =
-        std::fs::metadata(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+fn cstring(part: &OsStr) -> Result<CString, String> {
+    CString::new(part.as_bytes()).map_err(|_| "The path holds a NUL byte".to_owned())
+}
+
+/// `openat(2)` relative to `dir` (the process's folder when `None`), close-on-exec.
+fn open_at(
+    dir: Option<&OwnedFd>,
+    name: &CString,
+    flags: libc::c_int,
+    mode: libc::c_uint,
+) -> std::io::Result<OwnedFd> {
+    let base = dir.map_or(libc::AT_FDCWD, AsRawFd::as_raw_fd);
+    // SAFETY: `name` is a valid NUL-terminated string and `base` an open folder (or AT_FDCWD).
+    let fd = unsafe { libc::openat(base, name.as_ptr(), flags | libc::O_CLOEXEC, mode) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just opened here and is owned by nothing else.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// The open text of a regular file, at most `max` bytes: a folder, a pipe or a device is
+/// refused (it was opened without blocking, so a pipe never hangs the open), and the read itself
+/// is bounded, whatever the file's size said.
+fn read_open(fd: OwnedFd, shown: &Path, max: u64) -> Result<String, String> {
+    let file = std::fs::File::from(fd);
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("Cannot read {}: {e}", shown.display()))?;
     if meta.is_dir() {
-        return Err(format!("{} is a folder; use list_dir", path.display()));
+        return Err(format!("{} is a folder; use list_dir", shown.display()));
     }
     if !meta.is_file() {
-        return Err(format!("{} is not a regular file", path.display()));
+        return Err(format!("{} is not a regular file", shown.display()));
     }
-    if meta.len() > MAX_READ_BYTES {
+    if meta.len() > max {
         return Err(format!(
             "{} is {} MB, too large to read whole",
-            path.display(),
+            shown.display(),
             meta.len() / (1024 * 1024)
         ));
     }
-    let file =
-        std::fs::File::open(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
     let mut bytes = Vec::new();
-    file.take(MAX_READ_BYTES + 1)
+    file.take(max + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
-    if bytes.len() as u64 > MAX_READ_BYTES {
-        return Err(format!("{} grew too large to read whole", path.display()));
+        .map_err(|e| format!("Cannot read {}: {e}", shown.display()))?;
+    if bytes.len() as u64 > max {
+        return Err(format!("{} grew too large to read whole", shown.display()));
     }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// Writes `content` to `path`, never through a link at its last component (`O_NOFOLLOW`).
-fn write_no_follow(path: &Path, content: &str) -> Result<(), String> {
+/// A regular file's text at `path` (links followed: a read goes where the path leads).
+fn read_text(path: &Path, max: u64) -> Result<String, String> {
+    let fd = open_at(
+        None,
+        &cstring(path.as_os_str())?,
+        libc::O_RDONLY | libc::O_NONBLOCK,
+        0,
+    )
+    .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+    read_open(fd, path, max)
+}
+
+/// The folder a write of `path` lands in, and the file's name in it. The path is resolved as
+/// [`inside`] judges it; then each folder from the thread's folder (or from `/`, only when
+/// `may_leave`) is opened in turn without following a link, made when `create` and missing. A
+/// folder that became a link, or a path that now leads outside when it may not, fails it.
+fn write_target(
+    cwd: &Path,
+    path: &str,
+    may_leave: bool,
+    create: bool,
+) -> Result<(OwnedFd, CString, PathBuf), String> {
+    let shown = absolute(cwd, path);
+    let root = cwd
+        .canonicalize()
+        .map_err(|e| format!("Cannot open the thread's folder: {e}"))?;
+    let target = resolved(&shown).ok_or_else(|| {
+        format!(
+            "{} leads through a link that names nothing; nothing was written",
+            shown.display()
+        )
+    })?;
+    let (base, rel) = match target.strip_prefix(&root) {
+        Ok(rel) => (root.clone(), rel.to_path_buf()),
+        Err(_) if may_leave => (
+            PathBuf::from("/"),
+            target.strip_prefix("/").unwrap_or(&target).to_path_buf(),
+        ),
+        Err(_) => {
+            return Err(format!(
+                "{} now leads outside the folder; nothing was written",
+                shown.display()
+            ))
+        }
+    };
+    let names: Vec<_> = rel.components().map(|c| c.as_os_str().to_owned()).collect();
+    let Some((last, folders)) = names.split_last() else {
+        return Err(format!("{} is a folder", shown.display()));
+    };
+    let changed = |e: std::io::Error| {
+        format!(
+            "A folder on the way to {} changed (it is a link now, or gone), so nothing was \
+             written: {e}",
+            shown.display()
+        )
+    };
+    let folder_flags = libc::O_DIRECTORY | libc::O_RDONLY | libc::O_NOFOLLOW;
+    let mut dir = open_at(
+        None,
+        &cstring(base.as_os_str())?,
+        libc::O_DIRECTORY | libc::O_RDONLY,
+        0,
+    )
+    .map_err(changed)?;
+    for name in folders {
+        let name = cstring(name)?;
+        let next = match open_at(Some(&dir), &name, folder_flags, 0) {
+            Ok(fd) => fd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && create => {
+                // SAFETY: `dir` is an open folder and `name` a valid NUL-terminated string.
+                if unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o777) } != 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(format!(
+                            "Cannot create a folder for {}: {e}",
+                            shown.display()
+                        ));
+                    }
+                }
+                open_at(Some(&dir), &name, folder_flags, 0).map_err(changed)?
+            }
+            Err(e) => return Err(changed(e)),
+        };
+        dir = next;
+    }
+    Ok((dir, cstring(last)?, shown))
+}
+
+/// Writes `content` as the file `name` in the open folder `dir`, never through a link.
+fn write_at(dir: &OwnedFd, name: &CString, shown: &Path, content: &str) -> Result<(), String> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|e| format!("Cannot write {}: {e}", path.display()))?;
-    file.write_all(content.as_bytes())
-        .map_err(|e| format!("Cannot write {}: {e}", path.display()))
+    let fd = open_at(
+        Some(dir),
+        name,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW,
+        0o666,
+    )
+    .map_err(|e| format!("Cannot write {}: {e}", shown.display()))?;
+    std::fs::File::from(fd)
+        .write_all(content.as_bytes())
+        .map_err(|e| format!("Cannot write {}: {e}", shown.display()))
 }
 
 fn read_file(input: &Value, cwd: &Path) -> Result<String, String> {
     let path = absolute(cwd, text(input, "file_path")?);
-    let content = read_text(&path)?;
+    let content = read_text(&path, MAX_READ_BYTES)?;
     let offset = input
         .get("offset")
         .and_then(Value::as_u64)
@@ -220,7 +346,7 @@ fn list_dir(input: &Value, cwd: &Path) -> Result<String, String> {
     })
 }
 
-fn search(input: &Value, cwd: &Path) -> Result<String, String> {
+fn search(input: &Value, cwd: &Path, cancel: &AtomicBool) -> Result<String, String> {
     let pattern = text(input, "pattern")?;
     if pattern.is_empty() {
         return Err("pattern is empty".to_owned());
@@ -239,13 +365,14 @@ fn search(input: &Value, cwd: &Path) -> Result<String, String> {
         let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
         entries.sort_by_key(|e| e.file_name());
         for entry in entries {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("Stopped by the user.".to_owned());
+            }
+            // Not followed: a link, a pipe or a device is never read.
             let Ok(kind) = entry.file_type() else {
                 continue;
             };
             let path = entry.path();
-            if kind.is_symlink() {
-                continue;
-            }
             if kind.is_dir() {
                 let name = entry.file_name();
                 if !SKIPPED_DIRS.iter().any(|s| name == *s) {
@@ -253,16 +380,27 @@ fn search(input: &Value, cwd: &Path) -> Result<String, String> {
                 }
                 continue;
             }
-            if entry.metadata().map_or(true, |m| m.len() > MAX_SEARCH_FILE) {
+            if !kind.is_file() {
                 continue;
             }
-            let Ok(bytes) = std::fs::read(&path) else {
+            // Opened without following a link or blocking, read only if still a regular file.
+            let Ok(fd) = cstring(path.as_os_str()).and_then(|p| {
+                open_at(
+                    None,
+                    &p,
+                    libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW,
+                    0,
+                )
+                .map_err(|e| e.to_string())
+            }) else {
                 continue;
             };
-            if bytes.iter().take(8192).any(|b| *b == 0) {
+            let Ok(content) = read_open(fd, &path, MAX_SEARCH_FILE) else {
+                continue;
+            };
+            if content.bytes().take(8192).any(|b| b == 0) {
                 continue; // binary
             }
-            let content = String::from_utf8_lossy(&bytes);
             let shown = path
                 .strip_prefix(&root)
                 .unwrap_or(&path)
@@ -292,14 +430,10 @@ fn search(input: &Value, cwd: &Path) -> Result<String, String> {
     Ok(out)
 }
 
-fn write_file(input: &Value, cwd: &Path) -> Result<String, String> {
-    let path = absolute(cwd, text(input, "file_path")?);
+fn write_file(input: &Value, cwd: &Path, may_leave: bool) -> Result<String, String> {
     let content = text(input, "content")?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Cannot create {}: {e}", parent.display()))?;
-    }
-    write_no_follow(&path, content)?;
+    let (dir, name, path) = write_target(cwd, text(input, "file_path")?, may_leave, true)?;
+    write_at(&dir, &name, &path, content)?;
     Ok(format!(
         "Wrote {} bytes to {}",
         content.len(),
@@ -307,8 +441,7 @@ fn write_file(input: &Value, cwd: &Path) -> Result<String, String> {
     ))
 }
 
-fn edit_file(input: &Value, cwd: &Path) -> Result<String, String> {
-    let path = absolute(cwd, text(input, "file_path")?);
+fn edit_file(input: &Value, cwd: &Path, may_leave: bool) -> Result<String, String> {
     let old = text(input, "old_string")?;
     let new = text(input, "new_string")?;
     if old.is_empty() {
@@ -317,7 +450,16 @@ fn edit_file(input: &Value, cwd: &Path) -> Result<String, String> {
     if old == new {
         return Err("old_string and new_string are the same".to_owned());
     }
-    let content = read_text(&path)?;
+    // Read and written through the same folder, opened without following links.
+    let (dir, name, path) = write_target(cwd, text(input, "file_path")?, may_leave, false)?;
+    let fd = open_at(
+        Some(&dir),
+        &name,
+        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW,
+        0,
+    )
+    .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+    let content = read_open(fd, &path, MAX_READ_BYTES)?;
     let count = content.matches(old).count();
     let all = input
         .get("replace_all")
@@ -338,7 +480,7 @@ fn edit_file(input: &Value, cwd: &Path) -> Result<String, String> {
     } else {
         content.replacen(old, new, 1)
     };
-    write_no_follow(&path, &edited)?;
+    write_at(&dir, &name, &path, &edited)?;
     let replaced = if all { count } else { 1 };
     Ok(format!(
         "Edited {} ({replaced} replacement{})",
@@ -354,7 +496,7 @@ fn edit_file(input: &Value, cwd: &Path) -> Result<String, String> {
 fn run_command(input: &Value, cwd: &Path, cancel: &AtomicBool) -> Result<String, String> {
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
     let command = text(input, "command")?;
     if command.trim().is_empty() {
         return Err("command is empty".to_owned());
@@ -374,23 +516,42 @@ fn run_command(input: &Value, cwd: &Path, cancel: &AtomicBool) -> Result<String,
         .spawn()
         .map_err(|e| format!("Could not run the command: {e}"))?;
     let group = child.id() as libc::pid_t;
-    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+    // Each pipe drains on its own thread into a shared, capped buffer and says when it ended.
+    // The command's result never waits on them past a short grace: a descendant that left the
+    // group (`setsid`) and kept a pipe open would otherwise hold the call open forever. Such a
+    // drain thread lives on, holding at most the cap, until that process closes the pipe.
+    type Drained = (
+        std::sync::Arc<std::sync::Mutex<(Vec<u8>, usize)>>,
+        std::sync::mpsc::Receiver<()>,
+    );
+    let drain = |pipe: Option<Box<dyn Read + Send>>| -> Drained {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), 0usize)));
+        let (done, finished) = std::sync::mpsc::channel();
+        let sink = buffer.clone();
         std::thread::spawn(move || {
-            let mut kept = Vec::new();
-            let mut dropped = 0usize;
             if let Some(mut pipe) = pipe {
                 let mut chunk = [0u8; 8192];
                 while let Ok(n) = pipe.read(&mut chunk) {
                     if n == 0 {
                         break;
                     }
-                    let room = MAX_COMMAND_OUTPUT.saturating_sub(kept.len());
-                    kept.extend_from_slice(&chunk[..n.min(room)]);
-                    dropped += n.saturating_sub(room);
+                    if let Ok(mut held) = sink.lock() {
+                        let room = MAX_COMMAND_OUTPUT.saturating_sub(held.0.len());
+                        held.0.extend_from_slice(&chunk[..n.min(room)]);
+                        held.1 += n.saturating_sub(room);
+                    }
                 }
             }
-            (kept, dropped)
-        })
+            let _ = done.send(());
+        });
+        (buffer, finished)
+    };
+    let collect = |(buffer, finished): Drained, until: std::time::Instant| -> (Vec<u8>, usize) {
+        let _ = finished.recv_timeout(until.saturating_duration_since(std::time::Instant::now()));
+        buffer
+            .lock()
+            .map(|held| (held.0.clone(), held.1))
+            .unwrap_or_default()
     };
     let stdout = drain(
         child
@@ -431,10 +592,12 @@ fn run_command(input: &Value, cwd: &Path, cancel: &AtomicBool) -> Result<String,
             }
         }
     };
-    // A background job it left holding the pipes would keep the drains reading: end the group.
+    // A background job it left in its group would keep the drains reading: end the group, then
+    // take what the pipes gave within a short grace.
     kill_group();
-    let (out, out_dropped) = stdout.join().unwrap_or_default();
-    let (err, err_dropped) = stderr.join().unwrap_or_default();
+    let grace = Instant::now() + Duration::from_millis(500);
+    let (out, out_dropped) = collect(stdout, grace);
+    let (err, err_dropped) = collect(stderr, grace);
     let mut text = String::from_utf8_lossy(&out).into_owned();
     if out_dropped > 0 {
         text.push_str(&format!("\n… {out_dropped} more bytes of output not kept"));
@@ -470,9 +633,89 @@ mod tests {
         tempfile::tempdir().expect("tempdir")
     }
 
-    /// [`run`] with no Stop.
+    /// [`run`] with no Stop, and no write outside approved.
     fn go(tool: Tool, input: &Value, cwd: &Path) -> Result<String, String> {
-        run(tool, input, cwd, &AtomicBool::new(false))
+        run(tool, input, cwd, false, &AtomicBool::new(false))
+    }
+
+    #[test]
+    fn a_folder_swapped_for_a_link_after_the_check_never_redirects_a_write() {
+        let d = dir();
+        let cwd = d.path();
+        let outside = dir();
+        std::fs::create_dir(cwd.join("sub")).unwrap();
+        // Judged inside (no approval needed), then swapped while the card was open.
+        assert!(inside(cwd, "sub/x.txt"));
+        std::fs::remove_dir(cwd.join("sub")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), cwd.join("sub")).unwrap();
+        let err = go(
+            Tool::WriteFile,
+            &json!({"file_path": "sub/x.txt", "content": "x"}),
+            cwd,
+        )
+        .unwrap_err();
+        assert!(err.contains("nothing was written"), "{err}");
+        assert!(!outside.path().join("x.txt").exists());
+        // The same for an edit.
+        std::fs::write(outside.path().join("y.txt"), "old").unwrap();
+        let err = go(
+            Tool::EditFile,
+            &json!({"file_path": "sub/y.txt", "old_string": "old", "new_string": "new"}),
+            cwd,
+        )
+        .unwrap_err();
+        assert!(err.contains("nothing was written"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("y.txt")).unwrap(),
+            "old"
+        );
+        // An approved write outside goes where it was shown to go.
+        let target = outside.path().join("approved.txt");
+        run(
+            Tool::WriteFile,
+            &json!({"file_path": target.to_str().unwrap(), "content": "ok"}),
+            cwd,
+            true,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "ok");
+    }
+
+    #[test]
+    fn a_pipe_never_blocks_a_read_or_a_search_and_a_stop_ends_a_search() {
+        let d = dir();
+        let fifo = d.path().join("pipe");
+        let name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid path string; makes a FIFO in the test's own folder.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        std::fs::write(d.path().join("a.rs"), "needle\n").unwrap();
+        let err = go(Tool::ReadFile, &json!({"file_path": "pipe"}), d.path()).unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
+        let found = go(Tool::Search, &json!({"pattern": "needle"}), d.path()).unwrap();
+        assert_eq!(found, "a.rs:1: needle");
+        let stopped = run(
+            Tool::Search,
+            &json!({"pattern": "needle"}),
+            d.path(),
+            false,
+            &AtomicBool::new(true),
+        );
+        assert_eq!(stopped.unwrap_err(), "Stopped by the user.");
+    }
+
+    #[test]
+    fn a_descendant_that_leaves_the_group_never_holds_the_result() {
+        let d = dir();
+        let started = std::time::Instant::now();
+        let out = go(
+            Tool::RunCommand,
+            &json!({"command": "setsid sleep 20 & echo done"}),
+            d.path(),
+        )
+        .unwrap();
+        assert!(out.contains("done"), "{out}");
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
@@ -491,7 +734,7 @@ mod tests {
             cwd,
         )
         .unwrap_err();
-        assert!(err.starts_with("Cannot write"), "{err}");
+        assert!(err.contains("nothing was written"), "{err}");
         assert!(!other.path().join("absent").exists());
         // A device is not read, whatever its size says.
         let err = go(Tool::ReadFile, &json!({"file_path": "/dev/zero"}), cwd).unwrap_err();
@@ -523,6 +766,7 @@ mod tests {
                 Tool::RunCommand,
                 &json!({"command": "sleep 30 & sleep 30; touch late"}),
                 &cwd,
+                false,
                 &stop,
             )
         });

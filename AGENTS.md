@@ -316,8 +316,15 @@ Architectural mandates, standards, and workflows for this codebase.
   model (`AgentAvailability::server_ready`). Its tools (`agent_kit::local_tools`) pass
   `local_agent::gate` first: Plan offers and runs no writing tool, Ask asks before every write
   and command, Accept edits asks before commands and before any write outside the thread's
-  folder (`local_tools::inside`, links followed), "Allow for session" covers edits inside the
-  folder or one exact command line. A tool call in a reply the output limit cut off never runs.
+  folder (`local_tools::inside`, links followed, a dangling one counted outside). The runner keeps
+  no approval: the app's own scoped rules answer the cards they cover. A write is bound to what
+  was judged: its folders are opened one at a time without following a link
+  (`local_tools::write_target`), so a folder swapped for a link meanwhile fails it, and one judged
+  inside never lands outside. Files are opened without blocking and read only when regular, at
+  most a fixed size. Commands run in their own process group, killed on Stop or timeout, their
+  output capped and never waited on past a short grace. Stop ends a request's connection
+  (`ChatClient::cancel`). A call from a reply that was cut off or broke off never runs, and every
+  call of an interrupted reply gets an answer. History is sent and kept in whole exchanges.
   It is never a delegation parent or child (`RouteBlocker::LocalAgentNoBridge`). Its
   conversation is a `0600` file under `$XDG_STATE_HOME/agent-terminal/local`, which uninstall
   removes with the state folder.

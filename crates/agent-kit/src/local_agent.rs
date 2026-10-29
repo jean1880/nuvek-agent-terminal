@@ -45,42 +45,54 @@ const STALL: Duration = Duration::from_secs(600);
 /// read back.
 const CONTEXT_BUDGET: usize = 400_000;
 const MAX_TRANSCRIPT_BYTES: u64 = 64 * 1024 * 1024;
+/// The most of the conversation kept at all (memory and file), in bytes of text: a few requests'
+/// worth, so the oldest exchanges go once they could never be sent again.
+const RETAIN_BUDGET: usize = 4 * CONTEXT_BUDGET;
 
 /// One line of a streamed reply, or why the reply failed. The channel closing is its end.
 pub type ReplyLine = Result<String, String>;
 
 /// What the runner needs from a server: one streamed chat request. The reply arrives on the
-/// channel line by line, read elsewhere, so the runner can see a Stop while the server is silent;
-/// dropping the receiver abandons the request.
+/// channel line by line, read elsewhere, so the runner can see a Stop while the server is silent.
+/// [`ChatClient::cancel`] ends the request in flight, whatever it is waiting on.
 pub trait ChatClient {
     fn start(&mut self, body: &Value) -> Receiver<ReplyLine>;
+    /// Ends the request [`ChatClient::start`] began, if it is still going.
+    fn cancel(&mut self) {}
 }
 
 /// The real client: `POST <server>/v1/chat/completions` with `ureq`, no redirects, read on a
-/// thread of its own.
+/// thread of its own. Each request has an agent of its own, so cancelling one closes its
+/// connection (`Agent::shutdown`), which wakes a read the server left waiting and tells the
+/// server to stop generating.
 pub struct HttpChat {
     url: String,
     key: Option<String>,
-    agent: ureq::Agent,
+    user_agent: String,
+    current: Option<ureq::Agent>,
 }
 
 impl HttpChat {
     pub fn new(server: &str, key: Option<String>, user_agent: &str) -> Self {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
+        Self {
+            url: format!("{server}/v1/chat/completions"),
+            key: key.filter(|k| !k.is_empty()),
+            user_agent: user_agent.to_owned(),
+            current: None,
+        }
+    }
+
+    fn agent(&self) -> ureq::Agent {
+        ureq::Agent::config_builder()
             .timeout_connect(Some(CONNECT_TIMEOUT))
             .timeout_recv_response(Some(RESPONSE_TIMEOUT))
             // A ceiling on a whole reply; a silent server is noticed sooner (`STALL`).
             .timeout_recv_body(Some(Duration::from_secs(3600)))
             .max_redirects(0)
             .http_status_as_error(false)
-            .user_agent(user_agent)
+            .user_agent(&self.user_agent)
             .build()
-            .into();
-        Self {
-            url: format!("{server}/v1/chat/completions"),
-            key: key.filter(|k| !k.is_empty()),
-            agent,
-        }
+            .into()
     }
 
     fn request(
@@ -143,19 +155,23 @@ impl HttpChat {
 
 impl ChatClient for HttpChat {
     fn start(&mut self, body: &Value) -> Receiver<ReplyLine> {
+        self.cancel();
         let (tx, rx) = std::sync::mpsc::channel();
-        let (agent, url, key, body) = (
-            self.agent.clone(),
-            self.url.clone(),
-            self.key.clone(),
-            body.clone(),
-        );
+        let agent = self.agent();
+        self.current = Some(agent.clone());
+        let (url, key, body) = (self.url.clone(), self.key.clone(), body.clone());
         std::thread::spawn(move || {
             if let Err(why) = Self::request(&agent, &url, key.as_deref(), &body, &tx) {
                 let _ = tx.send(Err(why));
             }
         });
         rx
+    }
+
+    fn cancel(&mut self) {
+        if let Some(agent) = self.current.take() {
+            agent.shutdown();
+        }
     }
 }
 
@@ -372,7 +388,11 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
     /// conversation is left as it is, so this turn's next request still has it.
     fn save(&mut self) {
         use agent_core::redact::redact;
-        let messages = self
+        // What is kept is bounded, in whole exchanges, so it never grows past what can be sent.
+        drop_oldest_until(&mut self.messages, |kept| {
+            kept.iter().map(message_size).sum::<usize>() <= RETAIN_BUDGET
+        });
+        let mut messages: Vec<ChatMessage> = self
             .messages
             .iter()
             .map(|m| ChatMessage {
@@ -393,11 +413,21 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 ..m.clone()
             })
             .collect();
-        let transcript = Transcript {
-            model: self.model.clone(),
-            messages,
+        // Never a file the loader would refuse: the oldest exchanges go until it fits, and with
+        // only the latest left and still too large, nothing is kept.
+        let encode = |messages: &[ChatMessage]| {
+            serde_json::to_vec(&Transcript {
+                model: self.model.clone(),
+                messages: messages.to_vec(),
+            })
         };
-        let result = serde_json::to_vec(&transcript)
+        drop_oldest_until(&mut messages, |kept| {
+            encode(kept).is_ok_and(|bytes| bytes.len() as u64 <= MAX_TRANSCRIPT_BYTES)
+        });
+        if encode(&messages).is_ok_and(|bytes| bytes.len() as u64 > MAX_TRANSCRIPT_BYTES) {
+            messages.clear();
+        }
+        let result = encode(&messages)
             .map_err(std::io::Error::other)
             .and_then(|bytes| {
                 create_private_dir(&self.dir)?;
@@ -593,7 +623,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         loop {
             if let Some(stop) = poll(commands, &mut self.deferred) {
                 stopped = Some(stop);
-                break; // dropping `lines` abandons the request
+                break; // the request is ended below
             }
             match lines.recv_timeout(Duration::from_millis(100)) {
                 Ok(Ok(line)) => {
@@ -620,7 +650,12 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 Err(RecvTimeoutError::Timeout) => {}
             }
         }
+        // Whatever ended the reading (a Stop, a stall, an error, the end), the request ends too:
+        // its connection is closed, so no thread waits on a silent server and the server stops.
         drop(lines);
+        if let Some(client) = self.client.as_mut() {
+            client.cancel();
+        }
         let done = reader.is_done();
         let (reply, rest) = reader.finish();
         let ended = done || reply.finish_reason.is_some();
@@ -830,7 +865,9 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker = {
             let (cancel, input, cwd) = (cancel.clone(), input.clone(), cwd.clone());
-            std::thread::spawn(move || crate::local_tools::run(tool, &input, &cwd, &cancel))
+            std::thread::spawn(move || {
+                crate::local_tools::run(tool, &input, &cwd, outside, &cancel)
+            })
         };
         let mut stop = None;
         while !worker.is_finished() {
@@ -948,31 +985,62 @@ fn poll(commands: &Receiver<Option<Command>>, deferred: &mut Vec<Command>) -> Op
     }
 }
 
-/// The newest part of `messages` whose text fits `budget` characters, starting at a user message
-/// so no tool answer or reply is sent without what it answers. The latest exchange is kept whole
-/// even past the budget: the server then says if it is too long.
+/// The text a message carries, in bytes: its content, its calls and its reasoning.
+fn message_size(m: &ChatMessage) -> usize {
+    m.content.len()
+        + m.reasoning_content.as_ref().map_or(0, String::len)
+        + m.tool_calls
+            .iter()
+            .map(|c| c.function.arguments.len() + c.function.name.len() + c.id.len())
+            .sum::<usize>()
+}
+
+/// Where each exchange of `messages` starts: at every user message (and at 0, for anything
+/// before the first). An exchange is a question and everything that answers it, so cutting only
+/// at these never parts a tool call from its answer.
+fn exchange_starts(messages: &[ChatMessage]) -> Vec<usize> {
+    let mut starts: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == "user")
+        .map(|(at, _)| at)
+        .collect();
+    if starts.first() != Some(&0) && !messages.is_empty() {
+        starts.insert(0, 0);
+    }
+    starts
+}
+
+/// The newest whole exchanges of `messages` whose text fits `budget` bytes. The latest exchange
+/// is kept whole even past the budget: the server then says if it is too long, and nothing is
+/// ever sent without what it answers.
 fn within_budget(messages: &[ChatMessage], budget: usize) -> &[ChatMessage] {
-    let size = |m: &ChatMessage| {
-        m.content.len()
-            + m.tool_calls
-                .iter()
-                .map(|c| c.function.arguments.len() + c.function.name.len())
-                .sum::<usize>()
-    };
+    let starts = exchange_starts(messages);
+    let mut keep_from = messages.len();
     let mut total = 0;
-    let mut start = messages.len();
-    for (at, message) in messages.iter().enumerate().rev() {
-        total += size(message);
-        if total > budget && start < messages.len() {
+    let mut end = messages.len();
+    for &start in starts.iter().rev() {
+        total += messages[start..end].iter().map(message_size).sum::<usize>();
+        if total > budget && keep_from < messages.len() {
             break;
         }
-        start = at;
+        keep_from = start;
+        end = start;
     }
-    // Forward to the first user message at or after the cut.
-    let kept = &messages[start..];
-    match kept.iter().position(|m| m.role == "user") {
-        Some(user) if start > 0 => &kept[user..],
-        _ => kept,
+    &messages[keep_from..]
+}
+
+/// Drops the oldest whole exchanges of `messages` until `fits` accepts them, keeping at least the
+/// latest one.
+fn drop_oldest_until(messages: &mut Vec<ChatMessage>, fits: impl Fn(&[ChatMessage]) -> bool) {
+    while !fits(messages) {
+        let starts = exchange_starts(messages);
+        match starts.get(1) {
+            Some(&next) => {
+                messages.drain(..next);
+            }
+            None => return,
+        }
     }
 }
 
@@ -1589,8 +1657,19 @@ mod tests {
     }
 
     #[test]
-    fn the_history_sent_fits_the_budget_and_starts_at_a_question() {
+    fn the_history_sent_is_whole_exchanges_and_never_parts_a_call_from_its_answer() {
         let msg = |role: &str, n: usize| ChatMessage::new(role, "x".repeat(n));
+        let call = |n: usize| ChatMessage {
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                kind: "function".into(),
+                function: agent_core::local_agent::ToolFunction {
+                    name: "write_file".into(),
+                    arguments: "a".repeat(n),
+                },
+            }],
+            ..ChatMessage::new("assistant", "")
+        };
         let all = vec![
             msg("user", 50),
             msg("assistant", 50),
@@ -1602,8 +1681,96 @@ mod tests {
         let kept = within_budget(&all, 100);
         assert_eq!(kept.len(), 2);
         assert_eq!(kept[0].role, "user");
-        // The latest message is kept even alone past the budget.
-        assert_eq!(within_budget(&all, 1).len(), 1);
+        // The latest exchange is kept whole, even alone past the budget.
+        assert_eq!(within_budget(&all, 1).len(), 2);
+        // A huge call then a short answer: the call, its answer and their question go together.
+        let big = vec![
+            msg("user", 10),
+            msg("user", 5),
+            call(450_000),
+            msg("tool", 5),
+        ];
+        let kept = within_budget(&big, 400_000);
+        assert_eq!(
+            kept.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+            ["user", "assistant", "tool"]
+        );
+        // Reasoning counts.
+        let thought = ChatMessage {
+            reasoning_content: Some("r".repeat(500)),
+            ..msg("assistant", 1)
+        };
+        let reasoned = vec![msg("user", 1), msg("user", 1), thought];
+        assert_eq!(within_budget(&reasoned, 100).len(), 2);
+        // Kept history drops whole exchanges from the oldest.
+        let mut kept = all.clone();
+        drop_oldest_until(&mut kept, |m| m.len() <= 2);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].role, "user");
+    }
+
+    #[test]
+    fn a_stop_closes_the_connection_of_a_silent_server() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (closed_tx, closed) = channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut seen = Vec::new();
+            let mut byte = [0u8; 1];
+            while !seen.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                seen.push(byte[0]);
+            }
+            let head = String::from_utf8_lossy(&seen).to_lowercase();
+            let length: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            let mut body = vec![0; length];
+            let _ = stream.read_exact(&mut body);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n\
+                  data: {\"choices\":[{\"delta\":{\"content\":\"thinking\"}}]}\n\n",
+            );
+            // Silent from here on; a read ends only when the client closes the connection.
+            let mut rest = [0u8; 64];
+            while matches!(stream.read(&mut rest), Ok(n) if n > 0) {}
+            let _ = closed_tx.send(());
+        });
+        let work = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let (commands, rx) = channel();
+        let (tx, events) = channel();
+        let run_args = RunnerArgs {
+            server: base.clone(),
+            ..args(work.path(), Mode::Ask)
+        };
+        let dir = state.path().to_path_buf();
+        let done = std::thread::spawn(move || {
+            Runner::new(
+                run_args,
+                HttpChat::new(&base, None, "t"),
+                dir,
+                Lines(tx, Vec::new()),
+            )
+            .run(&rx)
+        });
+        let run = Run {
+            commands,
+            events,
+            done,
+        };
+        run.send(prompt("go"));
+        run.wait_for(|e| matches!(e.event, Event::ContentDelta { .. }).then_some(()));
+        run.send(Command::Interrupt);
+        let (state_, _, _) = run.wait_for(completed);
+        assert_eq!(state_, TurnState::Interrupted);
+        closed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the connection is closed, not left waiting on the server");
+        run.finish();
     }
 
     #[test]

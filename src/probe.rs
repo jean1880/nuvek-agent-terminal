@@ -370,12 +370,23 @@ mod tests {
     fn a_provider_key_is_carried_but_never_printed() {
         let key = ProviderKey::new(Some("sk-live-secret".into()));
         assert_eq!(key.value(), Some("sk-live-secret"));
-        let targets = ProbeTargets::default().with_providers(vec![(
+        let env_file = ProbeTarget {
+            program: "claude".into(),
+            env: AgentEnv {
+                env: vec![("GW_KEY".into(), "sk-live-secret".into())],
+                unset: Vec::new(),
+            },
+        };
+        let targets = ProbeTargets::new(vec![(Driver::Claude, env_file)]).with_providers(vec![(
             Driver::Claude,
             ModelProvider::new(agent_core::provider::ProviderKind::LiteLlm),
             key,
         )]);
-        assert!(!format!("{targets:?}").contains("sk-live-secret"));
+        let shown = format!("{targets:?}");
+        assert!(
+            shown.contains("GW_KEY") && !shown.contains("sk-live-secret"),
+            "{shown}"
+        );
         assert_eq!(
             targets.provider(Driver::Claude).map(|(_, k)| k.value()),
             Some(Some("sk-live-secret"))

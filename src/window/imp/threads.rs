@@ -2989,9 +2989,11 @@ impl AgentTerminalWindow {
         }
         if !probe.is_empty() {
             let known = ModelCatalog::shared().last_targets();
+            // An agent on a model server has no vendor quota to read: never probed for one.
             let targets = crate::probe::ProbeTargets::new(
                 probe
                     .into_iter()
+                    .filter(|d| known.provider(*d).is_none())
                     .filter_map(|d| known.get(d).map(|t| (d, t.clone())))
                     .collect(),
             );
@@ -7455,7 +7457,12 @@ impl AgentTerminalWindow {
                 // An agent on a model server is never probed through its vendor: its models come
                 // from the server, with the key its threads would use (read here, before a
                 // launch removes the vendor's variables, which may be the one holding it).
-                if let Some(provider) = profile.provider.clone() {
+                // (agy cannot run on one: its launch refuses, so it keeps its own list.)
+                if let Some(provider) = profile
+                    .provider
+                    .clone()
+                    .filter(|_| agent_core::provider::supports(driver))
+                {
                     let key = provider
                         .key_env()
                         .ok()

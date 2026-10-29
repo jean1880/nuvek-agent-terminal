@@ -86,11 +86,25 @@ pub struct ModelProvider {
 
 /// What an agent process gets for its provider: arguments to add after the profile's own,
 /// environment to set (after the profile's, so it wins), and variables to remove first.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct ProviderLaunch {
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub unset: Vec<String>,
+}
+
+/// Names the variables but never shows their values: one is the API key.
+impl std::fmt::Debug for ProviderLaunch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderLaunch")
+            .field("args", &self.args)
+            .field(
+                "env",
+                &self.env.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            )
+            .field("unset", &self.unset)
+            .finish()
+    }
 }
 
 /// Claude Code variables that would send its requests somewhere other than the provider, or
@@ -479,6 +493,8 @@ mod tests {
         assert!(launch
             .env
             .contains(&("ANTHROPIC_AUTH_TOKEN".into(), "secret-value".into())));
+        let shown = format!("{launch:?}");
+        assert!(shown.contains("ANTHROPIC_AUTH_TOKEN") && !shown.contains("secret-value"));
     }
 
     #[test]

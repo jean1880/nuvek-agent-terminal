@@ -4110,13 +4110,21 @@ impl AgentTerminalWindow {
                 }
 
                 let env_ptrs: Vec<&str> = env_strs.iter().map(String::as_str).collect();
+                // VTE adds the app's own environment under the one given unless told not to, so a
+                // provider tab, whose vendor variables were removed above, must say the block is
+                // complete: otherwise a removed CLAUDE_CODE_USE_BEDROCK would still be inherited.
+                let spawn_flags = if provider.is_some() {
+                    glib::SpawnFlags::from_bits_retain(vte4::ffi::VTE_SPAWN_NO_PARENT_ENVV as u32)
+                } else {
+                    glib::SpawnFlags::DEFAULT
+                };
 
                 terminal.spawn_async(
                     PtyFlags::DEFAULT,
                     Some(&work_dir),
                     &[&shell, &command[0], &command[1]],
                     &env_ptrs,
-                    glib::SpawnFlags::DEFAULT,
+                    spawn_flags,
                     || {},
                     -1,
                     None::<&gtk4::gio::Cancellable>,

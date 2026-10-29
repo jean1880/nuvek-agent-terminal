@@ -531,10 +531,24 @@ pub const AGY_TIMEOUT: Duration = Duration::from_secs(20);
 /// file) and what the app removes (`clear_env`, an approval socket inherited from a launching
 /// session). Threads, side processes and the background probes all use the same value, so the
 /// model list and usage indicator come from the account a thread would use.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 pub struct AgentEnv {
     pub env: Vec<(String, String)>,
     pub unset: Vec<String>,
+}
+
+/// Names the variables but never shows their values: an env file or a model provider puts keys
+/// here.
+impl std::fmt::Debug for AgentEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentEnv")
+            .field(
+                "env",
+                &self.env.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            )
+            .field("unset", &self.unset)
+            .finish()
+    }
 }
 
 /// Gives a launch the user's shell `PATH` (when it has been read), so an agent's tools find what

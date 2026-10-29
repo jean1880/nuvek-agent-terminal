@@ -12,6 +12,11 @@ pub mod prelude {
     // Empty prelude for stub compatibility
 }
 
+/// The VTE constants the app uses, with VTE's values.
+pub mod ffi {
+    pub const VTE_SPAWN_NO_PARENT_ENVV: i32 = 33_554_432;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorBlinkMode {
     System,

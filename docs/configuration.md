@@ -189,6 +189,28 @@ The model list is the one request the app makes to the server itself (`GET <url>
 Claude reaches the server's Anthropic-compatible API at the URL's root; Codex reaches its
 OpenAI-compatible Responses API at `<url>/v1`. Antigravity only runs Google's models.
 
+Each profile's threads pick from its own server's list: a cloud profile and a local one of
+the same agent each show their own models, and a model is only ever called retired against
+the list of the server it runs on. A profile with no **Default Model** starts on the first
+model its server lists that is not an embedding model; it never takes the CLI's own default
+(such as `opus` in `~/.claude/settings.json`), which the server would not have.
+
+Claude Code also picks models on its own: its `opus`, `sonnet`, `haiku` and `fable`
+aliases (background tasks use `haiku`), its subagents and auto mode. On a model server all
+of these name the thread's model (`ANTHROPIC_DEFAULT_*_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL`
+and the rest are set for it, and follow a model change), so nothing is sent for a model the
+server does not have. Values for them in your own environment are replaced. Changing the
+model of a thread on a server restarts Claude on the new model, resuming the same
+conversation (Claude Code cannot switch to a model id it does not know in place). Ollama
+answers Claude's token-count requests with 404 (it has no `/v1/messages/count_tokens`);
+Claude carries on without them.
+
+Claude Code assumes a 200K-token context window for a model id it does not know, and
+compacts only near that. Give the server a context window a coding agent can work in (64K
+or more: `OLLAMA_CONTEXT_LENGTH` for Ollama, the model's context length in LM Studio), and,
+if it is under 200K, set `CLAUDE_CODE_AUTO_COMPACT_WINDOW` to it in the profile's
+environment file (100K at least) so Claude compacts before the server cuts it off.
+
 ## agy's approval hook
 
 `--dangerously-skip-permissions` is agy's name for bypassing its built-in terminal

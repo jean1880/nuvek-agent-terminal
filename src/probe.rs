@@ -32,6 +32,22 @@ pub struct ProbeTargets {
     /// The model servers agents run on ([`agent_core::provider`]), with their keys: their model
     /// list comes from the server, and their vendor's account is never probed.
     providers: Vec<(agent_core::adapter::Driver, ModelProvider, ProviderKey)>,
+    /// The sources other profiles of an agent use, when not the agent's own: another model
+    /// server, or (`None`) the vendor while the agent's own profile is on a server. Their lists
+    /// are fetched with the agent's, so each thread's picker shows what its profile can run.
+    other_sources: Vec<OtherSource>,
+}
+
+/// A source another profile of an agent uses ([`ProbeTargets::other_sources`]), with what
+/// fetching its list takes from that profile: the server's key, or the profile's own binary and
+/// environment for the vendor's list (its account may not be the agent's own profile's).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OtherSource {
+    pub driver: agent_core::adapter::Driver,
+    /// The model server; `None`: the vendor.
+    pub source: Option<ModelProvider>,
+    pub key: ProviderKey,
+    pub target: ProbeTarget,
 }
 
 /// A model server's API key, held in memory for its model-list request. Its `Debug` never shows
@@ -64,7 +80,30 @@ impl ProbeTargets {
         Self {
             targets,
             providers: Vec::new(),
+            other_sources: Vec::new(),
         }
+    }
+
+    /// These targets, with the sources other profiles use ([`Self::other_sources`]).
+    pub fn with_other_sources(mut self, sources: Vec<OtherSource>) -> Self {
+        self.other_sources = sources;
+        self
+    }
+
+    /// The sources other profiles of an agent use.
+    pub fn other_sources(&self) -> &[OtherSource] {
+        &self.other_sources
+    }
+
+    /// Whether another profile uses `source` for `driver`.
+    pub fn uses_other(
+        &self,
+        driver: agent_core::adapter::Driver,
+        source: Option<&ModelProvider>,
+    ) -> bool {
+        self.other_sources
+            .iter()
+            .any(|o| o.driver == driver && o.source.as_ref() == source)
     }
 
     /// These targets, with `providers` naming the agents that run on a model server.
@@ -268,12 +307,16 @@ impl ListenerSet {
     }
 }
 
-/// Returns a callback to call once per task; the `n`th call runs `all_done`.
-pub fn join_n(n: u8, all_done: impl Fn() + 'static) -> Rc<dyn Fn()> {
+/// Returns a callback to call once per task; the `n`th call runs `all_done`, exactly once (a
+/// call past the `n`th does nothing).
+pub fn join_n(n: usize, all_done: impl Fn() + 'static) -> Rc<dyn Fn()> {
     let pending = Cell::new(n);
     Rc::new(move || {
-        pending.set(pending.get().saturating_sub(1));
-        if pending.get() == 0 {
+        let Some(left) = pending.get().checked_sub(1) else {
+            return;
+        };
+        pending.set(left);
+        if left == 0 {
             all_done();
         }
     })
@@ -556,6 +599,19 @@ mod tests {
         let done = join_n(3, move || f.set(f.get() + 1));
         done();
         done();
+        assert_eq!(fired.get(), 0);
+        done();
+        assert_eq!(fired.get(), 1);
+        // Exactly once: a stray call past the last does not finish it again.
+        done();
+        assert_eq!(fired.get(), 1);
+        // More tasks than a byte holds: none finishes it early.
+        let fired = Rc::new(Cell::new(0));
+        let f = fired.clone();
+        let done = join_n(300, move || f.set(f.get() + 1));
+        for _ in 0..299 {
+            done();
+        }
         assert_eq!(fired.get(), 0);
         done();
         assert_eq!(fired.get(), 1);

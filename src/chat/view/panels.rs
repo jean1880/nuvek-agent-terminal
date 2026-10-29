@@ -356,11 +356,7 @@ fn model_list(
             let row = adw::ActionRow::new();
             row.set_use_markup(false);
             row.set_title(&m.display);
-            let sub = match &m.description {
-                Some(desc) => format!("{} · {desc}", m.id),
-                None => m.id.clone(),
-            };
-            row.set_subtitle(&sub);
+            row.set_subtitle(&picker_subtitle(m));
             row.set_activatable(true);
             if let Some(via) = &m.via {
                 let tag = label(&format!("via {via}"), &["model-via"]);
@@ -444,6 +440,18 @@ fn model_list(
 /// The picker's footer: how old the lists are (`Updated 3 h ago`, `Refreshing…`, `Could not
 /// refresh; …`) and a Refresh button. `None` for a source with no clock. Muted unless every shown
 /// list is Fresh. Follows the source until the picker closes.
+/// A picker row's subtitle: the model's id, then its description. The id is left out when it is
+/// the row's title already (a model server's models are named by their id).
+fn picker_subtitle(m: &CatalogModel) -> String {
+    let id = (m.id != m.display).then_some(m.id.as_str());
+    match (id, m.description.as_deref()) {
+        (Some(id), Some(desc)) => format!("{id} · {desc}"),
+        (Some(id), None) => id.to_owned(),
+        (None, Some(desc)) => desc.to_owned(),
+        (None, None) => String::new(),
+    }
+}
+
 fn picker_footer(source: &Rc<dyn ModelSource>, picker: &adw::Dialog) -> Option<gtk4::Box> {
     use crate::freshness::{age_of, freshness, Freshness, MODEL_TTL};
     source.status()?;
@@ -1133,6 +1141,29 @@ pub fn context_panel(ctx: &PanelCtx, fallback: Option<Gauge>) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn a_picker_row_never_repeats_its_title() {
+        let row = |id: &str, display: &str, description: Option<&str>| CatalogModel {
+            driver: Driver::Claude,
+            id: id.into(),
+            display: display.into(),
+            description: description.map(Into::into),
+            efforts: Vec::new(),
+            default_effort: None,
+            via: None,
+        };
+        assert_eq!(picker_subtitle(&row("qwen3.5:9b", "qwen3.5:9b", None)), "");
+        assert_eq!(
+            picker_subtitle(&row("claude-opus-5-5", "Opus 5.5", Some("Most capable"))),
+            "claude-opus-5-5 · Most capable"
+        );
+        assert_eq!(
+            picker_subtitle(&row("claude-opus-5-5", "Opus 5.5", None)),
+            "claude-opus-5-5"
+        );
+        assert_eq!(picker_subtitle(&row("m", "m", Some("Local"))), "Local");
+    }
 
     #[test]
     fn a_resolved_request_cancels_its_expiry_timer() {

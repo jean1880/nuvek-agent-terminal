@@ -1907,6 +1907,9 @@ impl Inner {
         // The profile's environment first, so it can never override the approval socket or the
         // delegation binding.
         let mut env = launch.env.clone();
+        // A model server's Claude names this process's model for its own aliases and subagents:
+        // bound at every spawn, so a respawn on another model moves them with it.
+        agent_core::provider::bind_thread_model(&mut env, open.model.as_deref());
         env.extend(approval.as_ref().map(|a| a.env()).unwrap_or_default());
         if let Some(binding) = binding {
             env.extend(binding.env);
@@ -3680,6 +3683,16 @@ impl Inner {
         self.start_process();
     }
 
+    /// Whether this agent's launch binds the thread's model into its environment (Claude on a
+    /// model server: `agent_core::provider::bind_thread_model`): its model changes are restarts.
+    fn binds_thread_model(&self) -> bool {
+        self.launch_env
+            .borrow()
+            .env
+            .iter()
+            .any(|(_, v)| v == agent_core::provider::THREAD_MODEL)
+    }
+
     /// agy with no approval handle: Plan and Accept edits go to its `--mode` flag, but it cannot
     /// ask before acting.
     fn ask_unavailable(&self) -> bool {
@@ -4686,6 +4699,23 @@ impl Inner {
         }
         match transition {
             Transition::Reuse => {}
+            // On a model server Claude Code refuses a live `set_model` to a model id it does not
+            // know ("Couldn't confirm model"), and its own model names were bound to the old
+            // model at the spawn: the switch is a restart resuming the same session, which
+            // passes `--model` and binds them again.
+            Transition::SwitchModelInSession if self.binds_thread_model() => {
+                self.ensure_alive();
+                if !self.state.borrow().alive {
+                    return;
+                }
+                let native = self.state.borrow().native_id.clone();
+                self.respawn(&OpenSessionDelta {
+                    model: Some(target_model),
+                    effort,
+                    mode: None,
+                    resume: native,
+                });
+            }
             Transition::SwitchModelInSession => {
                 self.ensure_alive();
                 if !self.state.borrow().alive {
@@ -4977,6 +5007,18 @@ impl Inner {
             }
         };
         let model = model.or_else(|| launch.default_model.clone());
+        // An agent on a model server with no model known is not switched to: it would start on
+        // its own setting, a vendor model the server does not have.
+        if model.is_none()
+            && agent_core::provider::launch_on_server(&launch.extra_args, &launch.env.env)
+        {
+            self.error(format!(
+                "{} has no model on its model server yet. Pick one from the model list, or give \
+                 its profile a Default Model.",
+                driver.info().label
+            ));
+            return false;
+        }
         let effort = effort.or_else(|| launch.default_effort.clone());
         // The new provider thread comes first: if the store refuses, the old agent keeps running.
         // Queued to the store writer: a refusal there is reported by the writer, not here.
@@ -7309,6 +7351,73 @@ mod tests {
         }
     }
 
+    /// Claude on a model server refuses a live `set_model` to an id it does not know, and its own
+    /// model names were bound to the old model: a model change restarts it on the new model
+    /// (resuming the session), bound again. Elsewhere the change stays a live `set_model`.
+    #[test]
+    fn a_model_change_on_a_model_server_restarts_on_the_new_model() {
+        in_loop(|_| {
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let log: Log = Rc::default();
+            let (sink, seen) = make_sink();
+            let session = ChatSession::with_env(
+                FakeAdapter::boxed(Driver::Claude, &log),
+                open_on("qwen3.5:4b"),
+                store.clone(),
+                thread.clone(),
+                sink,
+                Err(None),
+                LaunchEnv {
+                    env: vec![(
+                        "ANTHROPIC_DEFAULT_HAIKU_MODEL".into(),
+                        agent_core::provider::THREAD_MODEL.into(),
+                    )],
+                    unset: Vec::new(),
+                },
+            );
+            session.inner.state.borrow_mut().native_id = Some("native-1".into());
+            session.switch(Driver::Claude, Some("qwen3.5:9b".into()), None);
+            assert!(
+                !log.borrow()
+                    .iter()
+                    .any(|c| matches!(c, Command::SetModel { .. })),
+                "no live set_model"
+            );
+            assert_eq!(
+                session.inner.open.borrow().model.as_deref(),
+                Some("qwen3.5:9b")
+            );
+            assert_eq!(
+                session.inner.open.borrow().resume.as_deref(),
+                Some("native-1")
+            );
+            assert!(session
+                .launch_spec()
+                .env
+                .contains(&("ANTHROPIC_DEFAULT_HAIKU_MODEL".into(), "qwen3.5:9b".into())));
+            assert!(has(
+                &seen,
+                |e| matches!(e, Event::ModelChangeRequested { model }
+                if model == "qwen3.5:9b")
+            ));
+
+            // The vendor's Claude keeps its live switch.
+            let thread = fresh(&store, "/w");
+            let log: Log = Rc::default();
+            let (session, _) = harness(
+                FakeAdapter::boxed(Driver::Claude, &log),
+                open_on("claude-sonnet-5-5"),
+                &store,
+                &thread,
+            );
+            session.switch(Driver::Claude, Some("claude-opus-5-5".into()), None);
+            assert!(log.borrow().iter().any(
+                |c| matches!(c, Command::SetModel { model, .. } if model == "claude-opus-5-5")
+            ));
+        });
+    }
+
     #[test]
     fn a_prompt_on_a_retired_model_first_moves_to_its_replacement_and_says_so() {
         in_loop(|_| {
@@ -8199,6 +8308,46 @@ mod tests {
         })
     }
 
+    /// A switch to an agent on a model server with no model named and none known is refused: it
+    /// would start on its CLI's own setting, a vendor model. Named, it goes ahead.
+    #[test]
+    fn a_switch_to_a_model_server_with_no_model_is_refused() {
+        in_loop(|_| {
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let log: Log = Rc::default();
+            let (session, seen) = harness(
+                FakeAdapter::boxed(Driver::Agy, &log),
+                open_session("/usr/bin/agy", Vec::new(), "/"),
+                &store,
+                &thread,
+            );
+            let codex_log = log.clone();
+            session.set_adapter_factory(Rc::new(move |d| {
+                let launch = agent_core::provider::ModelProvider::new(
+                    agent_core::provider::ProviderKind::Ollama,
+                )
+                .launch(Driver::Codex, None)
+                .unwrap();
+                Ok(AgentLaunch {
+                    adapter: FakeAdapter::boxed(d, &codex_log),
+                    program: "/bin/true".into(),
+                    extra_args: launch.args,
+                    default_model: None,
+                    default_effort: None,
+                    env: LaunchEnv::default(),
+                    approval: Err(None),
+                })
+            }));
+            session.switch(Driver::Codex, None, None);
+            assert_eq!(session.status().driver, Driver::Agy, "not switched");
+            assert!(has(&seen, |e| matches!(e, Event::Error { message }
+                if message.contains("has no model on its model server"))));
+            session.switch(Driver::Codex, Some("qwen3.5:9b".into()), None);
+            assert_eq!(session.status().driver, Driver::Codex);
+        });
+    }
+
     #[test]
     fn a_cross_agent_switch_starts_the_profiles_binary_on_the_chosen_or_default_model() {
         in_loop(|_| {
@@ -8230,7 +8379,14 @@ mod tests {
                     default_model: (d == Driver::Claude).then(|| "claude-sonnet-5-5".into()),
                     default_effort: None,
                     env: LaunchEnv {
-                        env: vec![("FROM_ENV_FILE".into(), "1".into())],
+                        env: vec![
+                            ("FROM_ENV_FILE".into(), "1".into()),
+                            // A model server's: Claude's own model names follow the thread's.
+                            (
+                                "ANTHROPIC_DEFAULT_HAIKU_MODEL".into(),
+                                agent_core::provider::THREAD_MODEL.into(),
+                            ),
+                        ],
                         unset: vec!["CLAUDECODE".into()],
                     },
                     approval: Err(None),
@@ -8249,6 +8405,10 @@ mod tests {
                 .windows(2)
                 .any(|w| w == ["--model", "claude-sonnet-5-5"]));
             assert!(spec.env.contains(&("FROM_ENV_FILE".into(), "1".into())));
+            assert!(spec.env.contains(&(
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL".into(),
+                "claude-sonnet-5-5".into()
+            )));
             assert!(spec.unset.contains(&"CLAUDECODE".to_owned()));
             assert_eq!(session.status().model, None);
             assert_eq!(
@@ -8270,6 +8430,11 @@ mod tests {
                 .argv
                 .windows(2)
                 .any(|w| w == ["--model", "claude-opus-5-5"]));
+            // Bound again at this spawn: the helper models moved with the thread's.
+            assert!(spec.env.contains(&(
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL".into(),
+                "claude-opus-5-5".into()
+            )));
             assert!(has(
                 &seen,
                 |e| matches!(e, Event::ModelChangeRequested { model } if model == "claude-opus-5-5")

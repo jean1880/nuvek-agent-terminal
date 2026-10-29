@@ -470,7 +470,7 @@ impl AccountStatus {
         }
         let finish = {
             let me = self.clone();
-            join_n(jobs.len() as u8, move || {
+            join_n(jobs.len(), move || {
                 me.refreshing.set(false);
                 let again = me.queued.borrow_mut().take();
                 if let Some(targets) = again {

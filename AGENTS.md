@@ -291,11 +291,21 @@ Architectural mandates, standards, and workflows for this codebase.
   goes through `profile_launch` (threads, switches, forks, delegated workers), and a terminal tab
   through `utils::with_provider_args` and `apply_provider_env`: a provider that cannot be used (a
   bad address, a key variable that is unset) refuses the start. Such an agent lists the server's
-  models or none (never its vendor's), its vendor's account is never probed, and a thread on
-  another profile than the agent's own is never judged by the agent's list unless both use the
-  same server (`catalogue_serves`). An API key is never stored: the profile names the variable
-  holding it, Codex is handed only that name, and the key the model list needs is read before a
-  launch removes the vendor's variables (`probe::ProviderKey`, never printed).
+  models or none (never its vendor's), and its vendor's account is never probed. Claude's own
+  model names (`ANTHROPIC_MODEL`, the `ANTHROPIC_DEFAULT_*_MODEL` aliases, the subagent and
+  auto-mode models: `provider::CLAUDE_MODEL_VARS`) are unset, then bound to the process's model
+  at every spawn (`bind_thread_model`), so background tasks and subagents stay on the server; an
+  unbound one is never exported. A model is chosen by `start_model`: the profile's own, else the
+  server's first chat model (never the CLI's own setting, which names a vendor model); with none
+  known, nothing starts (thread, switch, worker or terminal tab), and a terminal tab is given its
+  model on the command line (`provider::model_args`). A model change on a server is a resumed
+  restart (`binds_thread_model`): Claude Code refuses a live `set_model` to an unknown id. The
+  catalogue keeps a list per source any enabled profile uses (`ModelCatalog::models_for`,
+  `other_profile_sources`): each thread's picker (`ProfileModels`), its retirement judgement and
+  a delegated worker's effort check use the list of the source its own profile runs
+  (`profile_source`). An API key is never stored: the profile names the variable holding it,
+  Codex is handed only that name, and the key the model list needs is read before a launch
+  removes the vendor's variables (`probe::ProviderKey`, never printed).
 - **Localhost bound**: interacts only with the local shell; exposes no ports. The outbound
   connections are two. The update check (`agent_kit::update`): a single HTTPS GET of the
   repository's latest GitHub release, off the main thread, with a timeout. It runs once per

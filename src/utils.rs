@@ -813,23 +813,37 @@ pub fn terminal_provider(
 
 /// `profile` with its model provider's arguments after its own, for a terminal tab's command
 /// line. An `Err` refuses the tab: it never starts on the vendor's models.
-pub fn with_provider_args(profile: &Profile) -> Result<Profile, String> {
+pub fn with_provider_args(profile: &Profile, model: Option<&str>) -> Result<Profile, String> {
     let mut profile = profile.clone();
     if let Some((provider, driver)) = terminal_provider(&profile) {
+        let label = provider.kind.label();
         let args = provider
             .args(driver)
-            .map_err(|why| format!("Cannot start on {}: {why}.", provider.kind.label()))?;
+            .map_err(|why| format!("Cannot start on {label}: {why}."))?;
+        // The CLI is told its model: left to itself it starts on its own setting, which names
+        // a vendor model the server does not have.
+        let model = model.filter(|m| !m.trim().is_empty()).ok_or_else(|| {
+            format!(
+                "Cannot start on {label}: it has listed no model yet. Pick a Default Model for \
+                 this profile, or try again once its models are listed."
+            )
+        })?;
         profile.args.extend(args);
+        profile
+            .args
+            .extend(agent_core::provider::model_args(driver, model));
     }
     Ok(profile)
 }
 
 /// Applies a terminal tab's model provider to its environment block (`NAME=value` entries,
 /// later ones winning): the key comes from the block, the vendor's own variables go, the
-/// provider's are added. An `Err` refuses the tab.
+/// provider's are added, with Claude's own model names bound to `model` (the profile's default:
+/// the one the tab's CLI starts on). An `Err` refuses the tab.
 pub fn apply_provider_env(
     provider: &agent_core::provider::ModelProvider,
     driver: agent_core::adapter::Driver,
+    model: Option<&str>,
     env: &mut Vec<String>,
 ) -> Result<(), String> {
     let value_of = |env: &[String], name: &str| {
@@ -843,9 +857,10 @@ pub fn apply_provider_env(
         .ok()
         .flatten()
         .and_then(|name| value_of(env, name));
-    let launch = provider
+    let mut launch = provider
         .launch(driver, key.as_deref())
         .map_err(|why| format!("Cannot start on {}: {why}.", provider.kind.label()))?;
+    agent_core::provider::bind_thread_model(&mut launch.env, model);
     env.retain(|e| {
         !launch
             .unset
@@ -871,7 +886,11 @@ mod tests {
             }),
             ..crate::config::new_agent_profile(agent_core::adapter::Driver::Codex)
         };
-        let codex = with_provider_args(&on(ProviderKind::LiteLlm, Some("GW_KEY"))).unwrap();
+        let codex = with_provider_args(
+            &on(ProviderKind::LiteLlm, Some("GW_KEY")),
+            Some("qwen3-coder"),
+        )
+        .unwrap();
         assert!(codex
             .args
             .contains(&"model_provider=\"agent_terminal\"".to_owned()));
@@ -880,6 +899,12 @@ mod tests {
             command[1].contains("model_providers.agent_terminal.base_url"),
             "{command:?}"
         );
+        // The CLI is told its model, also when resuming (Codex's `-m` precedes `resume`).
+        assert!(command[1].contains("'-m' 'qwen3-coder'"), "{command:?}");
+        let resumed = get_startup_command(Some(&codex), Launch::Resume("abc"));
+        assert!(resumed[1].contains("'-m' 'qwen3-coder'"), "{resumed:?}");
+        // No model known: refused, never left to the CLI's own (vendor) setting.
+        assert!(with_provider_args(&on(ProviderKind::Ollama, None), None).is_err());
 
         let (provider, driver) = terminal_provider(&Profile {
             command: "claude".into(),
@@ -892,9 +917,21 @@ mod tests {
             "HOME=/h".to_owned(),
             "ANTHROPIC_API_KEY=gateway-key".to_owned(),
             "CLAUDE_CODE_OAUTH_TOKEN=vendor".to_owned(),
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-from-the-shell".to_owned(),
         ];
-        apply_provider_env(&provider, driver, &mut env).unwrap();
+        apply_provider_env(&provider, driver, Some("qwen3-coder"), &mut env).unwrap();
         assert!(env.contains(&"ANTHROPIC_BASE_URL=http://gw:4000".to_owned()));
+        // Claude's own model names are the tab's model, the shell's value gone.
+        assert!(env.contains(&"ANTHROPIC_DEFAULT_HAIKU_MODEL=qwen3-coder".to_owned()));
+        assert!(env.contains(&"ANTHROPIC_MODEL=qwen3-coder".to_owned()));
+        assert!(!env
+            .iter()
+            .any(|e| e.contains("claude-haiku-from-the-shell")));
+        let mut unknown = vec!["ANTHROPIC_API_KEY=k".to_owned()];
+        apply_provider_env(&provider, driver, None, &mut unknown).unwrap();
+        assert!(!unknown
+            .iter()
+            .any(|e| e.contains(agent_core::provider::THREAD_MODEL)));
         assert!(env.contains(&"ANTHROPIC_AUTH_TOKEN=gateway-key".to_owned()));
         assert!(!env
             .iter()
@@ -902,14 +939,17 @@ mod tests {
                 || e.starts_with("CLAUDE_CODE_OAUTH_TOKEN=")));
         // The key variable is not in the block: refused.
         let mut bare = vec!["HOME=/h".to_owned()];
-        assert!(apply_provider_env(&provider, driver, &mut bare).is_err());
-        assert!(with_provider_args(&Profile {
-            provider: Some(ModelProvider {
-                base_url: Some("gw".into()),
-                ..ModelProvider::new(ProviderKind::Ollama)
-            }),
-            ..crate::config::new_agent_profile(agent_core::adapter::Driver::Claude)
-        })
+        assert!(apply_provider_env(&provider, driver, None, &mut bare).is_err());
+        assert!(with_provider_args(
+            &Profile {
+                provider: Some(ModelProvider {
+                    base_url: Some("gw".into()),
+                    ..ModelProvider::new(ProviderKind::Ollama)
+                }),
+                ..crate::config::new_agent_profile(agent_core::adapter::Driver::Claude)
+            },
+            Some("m")
+        )
         .is_err());
         // A profile without a chat agent has nothing to run on a server.
         let shell = Profile {
@@ -917,7 +957,7 @@ mod tests {
             driver: None,
             ..on(ProviderKind::Ollama, None)
         };
-        assert_eq!(with_provider_args(&shell).unwrap(), shell);
+        assert_eq!(with_provider_args(&shell, None).unwrap(), shell);
     }
 
     /// The new-thread folder table: the most specific folder that exists wins, and only an
@@ -1286,9 +1326,9 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_env_file_is_ignored_rather_than_fatal() {
+    fn a_missing_env_file_is_reported_rather_than_fatal() {
         assert!(load_env_file_checked("/nonexistent/env.sh").is_err());
-        assert!(load_env_file_checked("/nonexistent/env.sh").is_err());
+        assert!(load_env_file_for_profile("/nonexistent/env.sh", &["X".into()]).is_err());
     }
 
     #[test]

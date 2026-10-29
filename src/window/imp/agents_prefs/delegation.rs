@@ -642,9 +642,11 @@ async fn registration_context(
     clear: Vec<String>,
 ) -> Result<RegistrationCtx, String> {
     let file = profile.env_file.clone();
+    let patterns = clear.clone();
+    // With the patterns, as the agent's own launch reads it (`resolve_agent`).
     let env =
         gtk4::gio::spawn_blocking(move || match file.filter(|path| !path.trim().is_empty()) {
-            Some(path) => crate::utils::load_env_file_checked(&path),
+            Some(path) => crate::utils::load_env_file_for_profile(&path, &patterns),
             None => Ok(Vec::new()),
         })
         .await

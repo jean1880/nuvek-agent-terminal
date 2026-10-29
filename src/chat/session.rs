@@ -1907,6 +1907,9 @@ impl Inner {
         // The profile's environment first, so it can never override the approval socket or the
         // delegation binding.
         let mut env = launch.env.clone();
+        // A model server's Claude names this process's model for its own aliases and subagents:
+        // bound at every spawn, so a respawn on another model moves them with it.
+        agent_core::provider::bind_thread_model(&mut env, open.model.as_deref());
         env.extend(approval.as_ref().map(|a| a.env()).unwrap_or_default());
         if let Some(binding) = binding {
             env.extend(binding.env);
@@ -8230,7 +8233,14 @@ mod tests {
                     default_model: (d == Driver::Claude).then(|| "claude-sonnet-5-5".into()),
                     default_effort: None,
                     env: LaunchEnv {
-                        env: vec![("FROM_ENV_FILE".into(), "1".into())],
+                        env: vec![
+                            ("FROM_ENV_FILE".into(), "1".into()),
+                            // A model server's: Claude's own model names follow the thread's.
+                            (
+                                "ANTHROPIC_DEFAULT_HAIKU_MODEL".into(),
+                                agent_core::provider::THREAD_MODEL.into(),
+                            ),
+                        ],
                         unset: vec!["CLAUDECODE".into()],
                     },
                     approval: Err(None),
@@ -8249,6 +8259,10 @@ mod tests {
                 .windows(2)
                 .any(|w| w == ["--model", "claude-sonnet-5-5"]));
             assert!(spec.env.contains(&("FROM_ENV_FILE".into(), "1".into())));
+            assert!(spec.env.contains(&(
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL".into(),
+                "claude-sonnet-5-5".into()
+            )));
             assert!(spec.unset.contains(&"CLAUDECODE".to_owned()));
             assert_eq!(session.status().model, None);
             assert_eq!(
@@ -8270,6 +8284,11 @@ mod tests {
                 .argv
                 .windows(2)
                 .any(|w| w == ["--model", "claude-opus-5-5"]));
+            // Bound again at this spawn: the helper models moved with the thread's.
+            assert!(spec.env.contains(&(
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL".into(),
+                "claude-opus-5-5".into()
+            )));
             assert!(has(
                 &seen,
                 |e| matches!(e, Event::ModelChangeRequested { model } if model == "claude-opus-5-5")

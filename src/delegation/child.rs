@@ -281,7 +281,9 @@ impl Supervisor {
                 "model or effort contains protected text",
             ));
         }
-        let models = crate::model_catalog::ModelCatalog::shared().models_of(driver);
+        // The list of the source the child's own profile runs it on.
+        let models = crate::model_catalog::ModelCatalog::shared()
+            .models_for(driver, resolved.source.as_ref());
         if driver == Driver::Claude
             && effort.as_ref().is_some_and(|e| {
                 !models

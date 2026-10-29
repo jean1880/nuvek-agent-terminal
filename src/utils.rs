@@ -826,10 +826,12 @@ pub fn with_provider_args(profile: &Profile) -> Result<Profile, String> {
 
 /// Applies a terminal tab's model provider to its environment block (`NAME=value` entries,
 /// later ones winning): the key comes from the block, the vendor's own variables go, the
-/// provider's are added. An `Err` refuses the tab.
+/// provider's are added, with Claude's own model names bound to `model` (the profile's default:
+/// the one the tab's CLI starts on). An `Err` refuses the tab.
 pub fn apply_provider_env(
     provider: &agent_core::provider::ModelProvider,
     driver: agent_core::adapter::Driver,
+    model: Option<&str>,
     env: &mut Vec<String>,
 ) -> Result<(), String> {
     let value_of = |env: &[String], name: &str| {
@@ -843,9 +845,10 @@ pub fn apply_provider_env(
         .ok()
         .flatten()
         .and_then(|name| value_of(env, name));
-    let launch = provider
+    let mut launch = provider
         .launch(driver, key.as_deref())
         .map_err(|why| format!("Cannot start on {}: {why}.", provider.kind.label()))?;
+    agent_core::provider::bind_thread_model(&mut launch.env, model);
     env.retain(|e| {
         !launch
             .unset
@@ -892,9 +895,21 @@ mod tests {
             "HOME=/h".to_owned(),
             "ANTHROPIC_API_KEY=gateway-key".to_owned(),
             "CLAUDE_CODE_OAUTH_TOKEN=vendor".to_owned(),
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-from-the-shell".to_owned(),
         ];
-        apply_provider_env(&provider, driver, &mut env).unwrap();
+        apply_provider_env(&provider, driver, Some("qwen3-coder"), &mut env).unwrap();
         assert!(env.contains(&"ANTHROPIC_BASE_URL=http://gw:4000".to_owned()));
+        // Claude's own model names are the tab's model, the shell's value gone.
+        assert!(env.contains(&"ANTHROPIC_DEFAULT_HAIKU_MODEL=qwen3-coder".to_owned()));
+        assert!(env.contains(&"ANTHROPIC_MODEL=qwen3-coder".to_owned()));
+        assert!(!env
+            .iter()
+            .any(|e| e.contains("claude-haiku-from-the-shell")));
+        let mut unknown = vec!["ANTHROPIC_API_KEY=k".to_owned()];
+        apply_provider_env(&provider, driver, None, &mut unknown).unwrap();
+        assert!(!unknown
+            .iter()
+            .any(|e| e.contains(agent_core::provider::THREAD_MODEL)));
         assert!(env.contains(&"ANTHROPIC_AUTH_TOKEN=gateway-key".to_owned()));
         assert!(!env
             .iter()
@@ -902,7 +917,7 @@ mod tests {
                 || e.starts_with("CLAUDE_CODE_OAUTH_TOKEN=")));
         // The key variable is not in the block: refused.
         let mut bare = vec!["HOME=/h".to_owned()];
-        assert!(apply_provider_env(&provider, driver, &mut bare).is_err());
+        assert!(apply_provider_env(&provider, driver, None, &mut bare).is_err());
         assert!(with_provider_args(&Profile {
             provider: Some(ModelProvider {
                 base_url: Some("gw".into()),
@@ -1286,9 +1301,9 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_env_file_is_ignored_rather_than_fatal() {
+    fn a_missing_env_file_is_reported_rather_than_fatal() {
         assert!(load_env_file_checked("/nonexistent/env.sh").is_err());
-        assert!(load_env_file_checked("/nonexistent/env.sh").is_err());
+        assert!(load_env_file_for_profile("/nonexistent/env.sh", &["X".into()]).is_err());
     }
 
     #[test]

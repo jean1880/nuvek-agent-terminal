@@ -2299,11 +2299,17 @@ impl AgentTerminalWindow {
             #[strong]
             filling,
             move || {
-                let saved = obj.imp().agent_profile_now(driver).default_model;
-                let from_settings = crate::config::agent_settings_model(driver, None);
-                let default_label = match &from_settings {
-                    Some(m) => format!("The CLI's default ({m})"),
-                    None => "The CLI's default".to_owned(),
+                let profile = obj.imp().agent_profile_now(driver);
+                let saved = profile.default_model;
+                // On a model server nothing named starts the server's first chat model
+                // (`threads::start_model`), never the CLI's own setting.
+                let default_label = if profile.provider.is_some() {
+                    "The server's first chat model".to_owned()
+                } else {
+                    match crate::config::agent_settings_model(driver, None) {
+                        Some(m) => format!("The CLI's default ({m})"),
+                        None => "The CLI's default".to_owned(),
+                    }
                 };
                 let mut ids: Vec<Option<String>> = vec![None];
                 let mut labels: Vec<String> = vec![default_label];

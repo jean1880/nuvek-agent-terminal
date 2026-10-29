@@ -237,7 +237,7 @@ impl AgentProcess {
             launcher.unsetenv(key);
         }
         use_shell_path(&launcher);
-        for (key, value) in &spec.env {
+        for (key, value) in exported(&spec.env) {
             launcher.setenv(key, value, true);
         }
         let argv: Vec<&OsStr> = spec.argv.iter().map(|a| OsStr::new(a.as_str())).collect();
@@ -577,10 +577,18 @@ impl AgentEnv {
             launcher.unsetenv(key);
         }
         use_shell_path(launcher);
-        for (key, value) in &self.env {
+        for (key, value) in exported(&self.env) {
             launcher.setenv(key, value, true);
         }
     }
+}
+
+/// The entries of `env` a child is given: a model server's thread-model placeholder that no
+/// spawn bound ([`agent_core::provider::bind_thread_model`]) is never exported as a model name.
+fn exported(env: &[(String, String)]) -> impl Iterator<Item = (&String, &String)> {
+    env.iter()
+        .filter(|(_, v)| v != agent_core::provider::THREAD_MODEL)
+        .map(|(k, v)| (k, v))
 }
 
 /// Runs a one-shot side process (agy `-p /model --output-format json`, `agy models`) and returns
@@ -1001,6 +1009,50 @@ mod tests {
         );
         assert!(ok, "{out}");
         assert_eq!(out.trim(), "eof:set:unset");
+    }
+
+    /// A variable `clear_env` names is unset for an agent; its env file exporting the same value
+    /// it had puts it back, read with the patterns as an agent's resolution reads it.
+    #[test]
+    fn an_env_file_puts_back_a_cleared_variable_even_at_its_inherited_value() {
+        std::env::set_var("AT_CLEARED_REEXPORT", "same");
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("agent.env");
+        std::fs::write(&file, "export AT_CLEARED_REEXPORT=same\n").unwrap();
+        let clear = vec!["AT_CLEARED_*".to_owned()];
+        let env = AgentEnv {
+            env: crate::utils::load_env_file_for_profile(file.to_str().unwrap(), &clear).unwrap(),
+            unset: vec!["AT_CLEARED_REEXPORT".into()],
+        };
+        let (out, ok) = side(
+            "read x; echo \"${AT_CLEARED_REEXPORT-unset}\"",
+            env,
+            Duration::from_secs(10),
+        );
+        assert!(ok, "{out}");
+        assert_eq!(out.trim(), "same");
+    }
+
+    /// An unbound thread-model placeholder never reaches a child as a model name.
+    #[test]
+    fn an_unbound_thread_model_is_never_exported() {
+        let env = AgentEnv {
+            env: vec![
+                (
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL".into(),
+                    agent_core::provider::THREAD_MODEL.into(),
+                ),
+                ("AT_KEPT".into(), "kept".into()),
+            ],
+            unset: vec!["ANTHROPIC_DEFAULT_HAIKU_MODEL".into()],
+        };
+        let (out, ok) = side(
+            "read x; echo \"${ANTHROPIC_DEFAULT_HAIKU_MODEL-unset}:$AT_KEPT\"",
+            env,
+            Duration::from_secs(10),
+        );
+        assert!(ok, "{out}");
+        assert_eq!(out.trim(), "unset:kept");
     }
 
     /// agy, signed out, prints its login prompt on stderr and waits: killed at the timeout, the

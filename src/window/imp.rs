@@ -1640,11 +1640,18 @@ impl AgentTerminalWindow {
         };
 
         info!("Settings file changed on disk; applying it");
-        let profiles_changed = {
+        let (profiles_changed, clear_changed) = {
             let old = self.config.borrow();
-            old.default_profile != new.default_profile || old.profiles != new.profiles
+            (
+                old.default_profile != new.default_profile || old.profiles != new.profiles,
+                old.clear_env != new.clear_env,
+            )
         };
         *self.config.borrow_mut() = *new;
+        if clear_changed {
+            // An agent's env file is read against these patterns: read them again.
+            threads::forget_resolutions();
+        }
         crate::config::mirror_quick_replies(self.config.borrow().suggest_quick_replies);
         crate::config::mirror_approval_policy(&self.config.borrow());
         crate::diff_tool::DiffTools::shared().set(self.config.borrow().diff_tool.clone());
@@ -4019,6 +4026,11 @@ impl AgentTerminalWindow {
         // A profile on a model server runs on it here too, or not at all: never on the
         // vendor's models.
         let provider = profile.and_then(crate::utils::terminal_provider);
+        // The model the tab's CLI starts on, which Claude's own model names follow.
+        let terminal_model = profile.and_then(|p| match crate::config::profile_driver(p) {
+            Some(driver) => threads::start_model(p, driver),
+            None => p.effective_default_model(None),
+        });
         let on_provider = match profile.map(crate::utils::with_provider_args).transpose() {
             Ok(p) => p,
             Err(why) => {
@@ -4129,9 +4141,12 @@ impl AgentTerminalWindow {
                     }
                 }
                 if let Some((provider, driver)) = &provider {
-                    if let Err(why) =
-                        crate::utils::apply_provider_env(provider, *driver, &mut env_strs)
-                    {
+                    if let Err(why) = crate::utils::apply_provider_env(
+                        provider,
+                        *driver,
+                        terminal_model.as_deref(),
+                        &mut env_strs,
+                    ) {
                         refuse_terminal(&obj, &stack, &terminal, &why);
                         return;
                     }

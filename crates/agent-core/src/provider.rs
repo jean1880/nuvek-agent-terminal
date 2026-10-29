@@ -117,6 +117,41 @@ const CLAUDE_UNSET: [&str; 5] = [
     "CLAUDE_CODE_USE_FOUNDRY",
 ];
 
+/// Stands for the thread's model in a provider launch's environment until the spawn binds it
+/// ([`bind_thread_model`]); never exported itself (the control character keeps it from passing
+/// for a model id).
+pub const THREAD_MODEL: &str = "\u{1}agent-terminal:thread-model";
+
+/// What Claude Code picks a model through on its own: the session's model when no `--model` is
+/// given, the `opus`, `sonnet`, `haiku` and `fable` aliases (its background tasks among them,
+/// and the older small-fast-model name for them), its subagents and the auto-mode classifier.
+/// On a model server these would name Anthropic models the server does not have, so all of them
+/// name the thread's model; an inherited value is removed first, so none leaks through.
+pub const CLAUDE_MODEL_VARS: [&str; 9] = [
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+    "CLAUDE_CODE_AUTO_MODE_MODEL",
+];
+
+/// Binds a launch environment's [`THREAD_MODEL`] values to `model`, the model the process starts
+/// on; with none known, those variables are dropped rather than exported unbound.
+pub fn bind_thread_model(env: &mut Vec<(String, String)>, model: Option<&str>) {
+    match model.filter(|m| !m.trim().is_empty()) {
+        Some(model) => {
+            for (_, value) in env.iter_mut().filter(|(_, v)| v == THREAD_MODEL) {
+                *value = model.to_owned();
+            }
+        }
+        None => env.retain(|(_, v)| v != THREAD_MODEL),
+    }
+}
+
 /// Whether `driver` can run on a provider. agy only speaks to Google's own models.
 pub fn supports(driver: Driver) -> bool {
     match driver {
@@ -256,8 +291,15 @@ impl ModelProvider {
                     ),
                     // A per-request header that defeats a local server's prompt cache.
                     ("CLAUDE_CODE_ATTRIBUTION_HEADER".to_owned(), "0".to_owned()),
-                ],
-                unset: CLAUDE_UNSET.map(str::to_owned).to_vec(),
+                ]
+                .into_iter()
+                .chain(CLAUDE_MODEL_VARS.map(|name| (name.to_owned(), THREAD_MODEL.to_owned())))
+                .collect(),
+                unset: CLAUDE_UNSET
+                    .iter()
+                    .chain(CLAUDE_MODEL_VARS.iter())
+                    .map(|n| (*n).to_owned())
+                    .collect(),
             },
             // agy never gets here: `args` refused it.
             Driver::Codex | Driver::Agy => ProviderLaunch {
@@ -327,6 +369,14 @@ fn toml_string(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// The model a profile on a server starts on when nothing names one: the first of `ids` (the
+/// server's order) that is not an embedding model. Ollama and LM Studio list those beside chat
+/// models with nothing but the name to tell them apart, and one cannot hold a conversation.
+pub fn first_chat_model<'a>(ids: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    ids.into_iter()
+        .find(|id| !id.to_ascii_lowercase().contains("embed"))
 }
 
 /// The model ids of a `/v1/models` answer (`{"data": [{"id": …}, …]}`), in the server's order,
@@ -474,13 +524,22 @@ mod tests {
         let launch = p.launch(Driver::Claude, None).unwrap();
         assert!(launch.args.is_empty());
         assert_eq!(
-            launch.env,
-            vec![
+            launch.env[..3],
+            [
                 ("ANTHROPIC_BASE_URL".into(), "http://nas:11434".into()),
                 ("ANTHROPIC_AUTH_TOKEN".into(), "ollama".into()),
                 ("CLAUDE_CODE_ATTRIBUTION_HEADER".into(), "0".into()),
             ]
         );
+        // Every model Claude Code would pick on its own is the thread's, bound at the spawn.
+        for name in CLAUDE_MODEL_VARS {
+            assert!(
+                launch.env.contains(&(name.into(), THREAD_MODEL.into())),
+                "{name}"
+            );
+            // An inherited value is removed first, so with no model known none leaks through.
+            assert!(launch.unset.iter().any(|u| u == name), "{name}");
+        }
         for name in [
             "ANTHROPIC_API_KEY",
             "CLAUDE_CODE_OAUTH_TOKEN",
@@ -538,6 +597,42 @@ mod tests {
             .launch(Driver::Agy, None)
             .is_err());
         assert!(!supports(Driver::Agy));
+    }
+
+    #[test]
+    fn the_thread_model_is_bound_at_the_spawn_or_not_exported() {
+        let launch = ModelProvider::new(ProviderKind::Ollama)
+            .launch(Driver::Claude, None)
+            .unwrap();
+        let mut env = launch.env.clone();
+        bind_thread_model(&mut env, Some("qwen3-coder"));
+        for name in CLAUDE_MODEL_VARS {
+            assert!(env.contains(&(name.into(), "qwen3-coder".into())), "{name}");
+        }
+        assert!(!env.iter().any(|(_, v)| v == THREAD_MODEL));
+        let mut env = launch.env;
+        bind_thread_model(&mut env, None);
+        assert!(!env
+            .iter()
+            .any(|(k, _)| CLAUDE_MODEL_VARS.contains(&k.as_str())));
+        assert!(env.iter().any(|(k, _)| k == "ANTHROPIC_BASE_URL"));
+        bind_thread_model(&mut env, Some("  "));
+        assert!(!env.iter().any(|(_, v)| v == THREAD_MODEL));
+        // Codex names its model on its own command line: nothing to bind.
+        let codex = ModelProvider::new(ProviderKind::Ollama)
+            .launch(Driver::Codex, None)
+            .unwrap();
+        assert!(codex.env.is_empty());
+    }
+
+    #[test]
+    fn a_profile_with_no_model_starts_on_the_first_chat_model() {
+        assert_eq!(
+            first_chat_model(["nomic-embed-text:latest", "qwen3.5:9b", "qwen2.5-coder:3b"]),
+            Some("qwen3.5:9b")
+        );
+        assert_eq!(first_chat_model(["text-EMBEDDING-3"]), None);
+        assert_eq!(first_chat_model([]), None);
     }
 
     #[test]

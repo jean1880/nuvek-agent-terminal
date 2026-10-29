@@ -580,12 +580,22 @@ impl AgentTerminalWindow {
                         return None;
                     }
                 };
+                let source = profile
+                    .provider
+                    .clone()
+                    .filter(|_| agent_core::provider::supports(driver));
                 Some(ResolvedChild {
                     program: resolved.program?,
                     extra_args,
                     env,
-                    default_model: profile.default_model.clone(),
+                    // On a model server a worker naming no model gets the server's first chat
+                    // model, as a thread does; on the vendor, the profile's own as before.
+                    default_model: match source {
+                        Some(_) => start_model(profile, driver),
+                        None => profile.default_model.clone(),
+                    },
                     default_effort: profile.default_effort.clone(),
+                    source,
                 })
             }),
             make_adapter: Rc::new(make_adapter),

@@ -116,6 +116,9 @@ pub(crate) struct ResolvedChild {
     pub env: AgentEnv,
     pub default_model: Option<String>,
     pub default_effort: Option<String>,
+    /// The model server the profile runs the agent on (`None`: the vendor): the model list a
+    /// requested effort is checked against.
+    pub source: Option<agent_core::provider::ModelProvider>,
 }
 
 // ---- IPC (C serves, A dispatches) --------------------------------------------------------------

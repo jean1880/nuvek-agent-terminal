@@ -32,6 +32,14 @@ pub struct ProbeTargets {
     /// The model servers agents run on ([`agent_core::provider`]), with their keys: their model
     /// list comes from the server, and their vendor's account is never probed.
     providers: Vec<(agent_core::adapter::Driver, ModelProvider, ProviderKey)>,
+    /// The sources other profiles of an agent use, when not the agent's own: another model
+    /// server, or (`None`) the vendor while the agent's own profile is on a server. Their lists
+    /// are fetched with the agent's, so each thread's picker shows what its profile can run.
+    other_sources: Vec<(
+        agent_core::adapter::Driver,
+        Option<ModelProvider>,
+        ProviderKey,
+    )>,
 }
 
 /// A model server's API key, held in memory for its model-list request. Its `Debug` never shows
@@ -64,7 +72,32 @@ impl ProbeTargets {
         Self {
             targets,
             providers: Vec::new(),
+            other_sources: Vec::new(),
         }
+    }
+
+    /// These targets, with the sources other profiles use ([`Self::other_sources`]).
+    pub fn with_other_sources(
+        mut self,
+        sources: Vec<(
+            agent_core::adapter::Driver,
+            Option<ModelProvider>,
+            ProviderKey,
+        )>,
+    ) -> Self {
+        self.other_sources = sources;
+        self
+    }
+
+    /// The sources other profiles of an agent use, with each server's key.
+    pub fn other_sources(
+        &self,
+    ) -> &[(
+        agent_core::adapter::Driver,
+        Option<ModelProvider>,
+        ProviderKey,
+    )] {
+        &self.other_sources
     }
 
     /// These targets, with `providers` naming the agents that run on a model server.

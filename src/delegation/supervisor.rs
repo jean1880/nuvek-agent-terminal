@@ -301,6 +301,7 @@ mod tests {
                     },
                     default_model: Some("synthetic-model".into()),
                     default_effort: None,
+                    source: None,
                 })
             }),
             make_adapter: Rc::new(|driver, program| -> Box<dyn agent_core::adapter::Adapter> {

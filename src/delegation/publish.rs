@@ -8,7 +8,7 @@ use agent_core::event::{Envelope, Event, StreamKind, TurnState};
 use agent_core::redact::stream::{StreamKey, StreamSanitiser};
 use agent_kit::store::delegation_typed::{Completion, LinkSpec, PublishEvent};
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::rc::{Rc, Weak};
 
 /// The event's sequence number and, for a run's completion, the parent's report message: the
@@ -24,9 +24,41 @@ fn shown_by(
     report.map_or(Shown::Event(seq), Shown::Message)
 }
 
+/// A publication's commit: its event's seq and, for a run's completion, the first part of the
+/// result (the message a wake names; the rest follow it in the mailbox).
 type Receipt = std::sync::mpsc::Receiver<
     agent_kit::store::Result<(i64, Option<agent_core::delegation::MessageId>)>,
 >;
+
+/// The most result bytes one message carries: the send cap, never above the store's bound.
+fn result_cap(sup: &Supervisor) -> usize {
+    (sup.limits.max_message_bytes as usize)
+        .min(agent_kit::store::delegation_typed::MAX_RESULT_BYTES)
+}
+
+/// The most result bytes a publisher keeps while a run goes on: every part's worth.
+pub(super) fn result_bound(sup: &Supervisor) -> usize {
+    result_cap(sup).saturating_mul(agent_core::delegation::mailbox::MAX_RESULT_PARTS)
+}
+
+/// A run's result split for its parent's mailbox (`mailbox::result_parts`), redacted whole
+/// first, and the text its parent's wake carries: the first part, led by where the others are
+/// when there are several (so cutting the wake to fit never loses that).
+pub(super) fn result_messages(
+    sup: &Supervisor,
+    text: &str,
+    already_cut: usize,
+) -> (Vec<String>, String) {
+    let redacted = agent_core::redact::redact(text);
+    let split =
+        agent_core::delegation::mailbox::result_parts(&redacted, result_cap(sup), already_cut);
+    let first = split.parts.first().cloned().unwrap_or_default();
+    let wake = match split.parts.len() {
+        0 | 1 => first,
+        n => format!("[result in {n} parts; read them with cross_agent_read]\n{first}"),
+    };
+    (split.parts, wake)
+}
 struct PendingPublication {
     scope: Scope,
     envelope: Envelope,
@@ -41,12 +73,84 @@ pub(super) struct Publisher {
     pub supervisor: Weak<Supervisor>,
     pub worker: WorkerId,
     sanitiser: RefCell<StreamSanitiser>,
-    keys: RefCell<HashMap<(u64, String, String), StreamKey>>,
+    /// Streams the sanitiser may hold text for, in the order each was first seen: a flush
+    /// releases them in that order.
+    keys: RefCell<Vec<(StreamId, StreamKey)>>,
     pending: Rc<RefCell<VecDeque<PendingPublication>>>,
     pending_bytes: Rc<Cell<usize>>,
     publishing: Rc<Cell<bool>>,
-    result: RefCell<String>,
+    /// The run's result so far: each assistant item's text, in the order the items began, at
+    /// most [`result_bound`] + [`RESULT_LOOKAHEAD`] bytes in all.
+    result: RefCell<Vec<ResultItem>>,
     failed: Rc<Cell<bool>>,
+}
+
+/// Bytes kept past [`result_bound`] so the whole text is redacted before it is cut: a secret
+/// that straddles the bound is masked whole, never left half visible.
+pub(super) const RESULT_LOOKAHEAD: usize = 256;
+
+/// One assistant item's share of a run's result.
+pub(super) struct ResultItem {
+    item: Option<String>,
+    text: String,
+    /// Bytes of it past the bound, cut as they arrived.
+    cut: usize,
+}
+
+/// Adds `text` to `item`'s share of `items` (replacing it for a snapshot), within `limit`
+/// bytes in all.
+/// One sanitiser stream: its generation, item and stream kind.
+type StreamId = (u64, String, String);
+
+/// The item name a stream with none goes under (the sanitiser's key and the flush use it).
+const UNIDENTIFIED: &str = "unidentified";
+
+/// Gives `item` its place in `items` if it has none yet.
+pub(super) fn note_item(items: &mut Vec<ResultItem>, item: Option<&str>) {
+    let item = item.unwrap_or(UNIDENTIFIED);
+    if !items.iter().any(|i| i.item.as_deref() == Some(item)) {
+        items.push(ResultItem {
+            item: Some(item.to_owned()),
+            text: String::new(),
+            cut: 0,
+        });
+    }
+}
+
+pub(super) fn accumulate(
+    items: &mut Vec<ResultItem>,
+    item: Option<&str>,
+    text: &str,
+    replace: bool,
+    limit: usize,
+) {
+    let item = item.unwrap_or(UNIDENTIFIED);
+    note_item(items, Some(item));
+    let Some(at) = items.iter().position(|i| i.item.as_deref() == Some(item)) else {
+        return;
+    };
+    if replace {
+        items[at].text.clear();
+        items[at].cut = 0;
+    }
+    let used: usize = items.iter().map(|i| i.text.len()).sum();
+    let kept = agent_core::text::truncate_bytes(text, limit.saturating_sub(used));
+    let entry = &mut items[at];
+    entry.text.push_str(kept);
+    entry.cut = entry.cut.saturating_add(text.len() - kept.len());
+}
+
+/// The run's whole result, its items in order, and the bytes cut from it as it arrived.
+pub(super) fn take_result(items: &mut Vec<ResultItem>) -> (String, usize) {
+    let items = std::mem::take(items);
+    let cut = items.iter().map(|i| i.cut).sum();
+    let text = items
+        .iter()
+        .map(|i| i.text.as_str())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (text, cut)
 }
 impl Publisher {
     pub(super) fn new(supervisor: Weak<Supervisor>, worker: WorkerId) -> Self {
@@ -54,13 +158,28 @@ impl Publisher {
             supervisor,
             worker,
             sanitiser: RefCell::new(StreamSanitiser::new(Default::default())),
-            keys: RefCell::new(HashMap::new()),
+            keys: RefCell::new(Vec::new()),
             pending: Rc::new(RefCell::new(VecDeque::new())),
             pending_bytes: Rc::new(Cell::new(0)),
             publishing: Rc::new(Cell::new(false)),
-            result: RefCell::new(String::new()),
+            result: RefCell::new(Vec::new()),
             failed: Rc::new(Cell::new(false)),
         }
+    }
+    /// The run's result as it stands, for tests.
+    #[cfg(test)]
+    pub(super) fn result_so_far(&self) -> String {
+        let items = self
+            .result
+            .borrow()
+            .iter()
+            .map(|i| ResultItem {
+                item: i.item.clone(),
+                text: i.text.clone(),
+                cut: i.cut,
+            })
+            .collect::<Vec<_>>();
+        take_result(&mut { items }).0
     }
     fn enqueue(&self, env: Envelope) {
         if self.failed.get() {
@@ -81,36 +200,43 @@ impl Publisher {
             .workers
             .get(&self.worker)
             .is_some_and(|w| w.pending.is_some());
+        // Each run's result starts with its turn: nothing of a run that ended another way (a
+        // cancel) is carried into the next.
+        if matches!(env.event, Event::TurnStarted { .. }) {
+            self.result.borrow_mut().clear();
+        }
         if !bootstrap {
+            let limit = result_bound(&sup).saturating_add(RESULT_LOOKAHEAD);
+            let mut result = self.result.borrow_mut();
             match &env.event {
                 Event::ContentDelta {
                     stream: StreamKind::Assistant,
                     text,
-                } => self.result.borrow_mut().push_str(text),
+                } => accumulate(&mut result, env.item.as_deref(), text, false, limit),
+                // A snapshot replaces its own item's text only (a heal of a split secret
+                // included), never another item's of the same turn.
                 Event::ContentSnapshot {
                     stream: StreamKind::Assistant,
                     text,
-                } => *self.result.borrow_mut() = text.clone(),
+                } => accumulate(&mut result, env.item.as_deref(), text, true, limit),
                 _ => {}
             }
-            let mut result = self.result.borrow_mut();
-            if result.len() > 16384 {
-                let suffix = "\n[result truncated; inspect the worker transcript]";
-                let end = agent_core::text::truncate_bytes(&result, 16384 - suffix.len()).len();
-                result.truncate(end);
-                result.push_str(suffix);
-            }
         }
+        let mut wake_text = None;
         let completion = if !bootstrap {
             if let (Event::TurnCompleted { state, usage, .. }, Some(run)) = (&env.event, &scope.run)
             {
+                let (text, cut) = take_result(&mut self.result.borrow_mut());
+                let (parts, wake) = result_messages(&sup, &text, cut);
+                wake_text = Some(wake);
                 Some(Completion {
                     run: run.clone(),
                     state: agent_core::delegation::lifecycle::run_state_after(*state),
                     worker_state: agent_core::delegation::lifecycle::worker_state_after(*state),
                     reason: None,
                     usage_json: usage.as_ref().and_then(|u| serde_json::to_string(u).ok()),
-                    result: Some(std::mem::take(&mut *self.result.borrow_mut())),
+                    result: parts,
+                    dispatch_failure: None,
                     event: event.clone(),
                 })
             } else {
@@ -125,8 +251,7 @@ impl Publisher {
             .saturating_add(
                 completion
                     .as_ref()
-                    .and_then(|c| c.result.as_ref())
-                    .map_or(0, String::len),
+                    .map_or(0, |c| c.result.iter().map(String::len).sum()),
             );
         if self.pending.borrow().len() >= HISTORY_EVENTS
             || self.pending_bytes.get().saturating_add(bytes) > HISTORY_BYTES
@@ -142,7 +267,7 @@ impl Publisher {
             return;
         }
         let terminal = completion.is_some();
-        let result = completion.as_ref().and_then(|c| c.result.clone());
+        let result = wake_text;
         let job = move |s: &agent_kit::store::Store| {
             if let Some(mut completion) = completion {
                 let terminal = s
@@ -251,15 +376,11 @@ impl Publisher {
     fn flush(&self, generation: ProcessGeneration, item: Option<&str>, cancel: bool) {
         let keys = {
             let mut all = self.keys.borrow_mut();
-            let selected = all
-                .keys()
-                .filter(|(g, i, _)| *g == generation.0 && item.is_none_or(|x| x == i))
-                .cloned()
-                .collect::<Vec<_>>();
-            selected
+            let (selected, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut *all)
                 .into_iter()
-                .filter_map(|k| all.remove(&k))
-                .collect::<Vec<_>>()
+                .partition(|((g, i, _), _)| *g == generation.0 && item.is_none_or(|x| x == i));
+            *all = kept;
+            selected.into_iter().map(|(_, key)| key).collect::<Vec<_>>()
         };
         for key in keys {
             let out = if cancel {
@@ -307,11 +428,19 @@ impl ChildPublish for Publisher {
             &env.event
         {
             let stream = *stream;
-            let key = scope.stream_key(env.item.as_deref().unwrap_or("unidentified"), stream);
-            self.keys.borrow_mut().insert(
-                (generation.0, key.item.clone(), key.stream.clone()),
-                key.clone(),
-            );
+            let key = scope.stream_key(env.item.as_deref().unwrap_or(UNIDENTIFIED), stream);
+            {
+                let id = (generation.0, key.item.clone(), key.stream.clone());
+                let mut keys = self.keys.borrow_mut();
+                if !keys.iter().any(|(k, _)| *k == id) {
+                    keys.push((id, key.clone()));
+                }
+            }
+            // The item's place in the result is where it first appeared, before the sanitiser
+            // holds any of its text back.
+            if stream == StreamKind::Assistant {
+                note_item(&mut self.result.borrow_mut(), env.item.as_deref());
+            }
             let out = if matches!(env.event, Event::ContentSnapshot { .. }) {
                 self.sanitiser.borrow_mut().replace_snapshot(&key, text)
             } else {
@@ -346,6 +475,10 @@ impl ChildPublish for Publisher {
             };
         } else if matches!(env.event, Event::ItemCompleted { .. }) {
             self.flush(generation, env.item.as_deref(), false);
+        } else if matches!(env.event, Event::TurnCompleted { .. }) {
+            // What a stream still holds is released before the turn's end, even when no item
+            // completed it, so the result carries all of it.
+            self.flush(generation, None, false);
         }
         agent_kit::store::scrub_envelope(env).ok()
     }
@@ -356,6 +489,15 @@ impl ChildPublish for Publisher {
         self.flush(generation, None, true);
     }
 }
+/// Whether a control entry is a steer awaiting its run's answer, rather than a write awaiting
+/// its echo.
+fn is_steer(entry: &super::deferred::Delivery) -> bool {
+    matches!(
+        entry.input.plan,
+        agent_core::delegation::mailbox::DeliveryPlan::SteerNow(_)
+    )
+}
+
 /// A run's end, as its parent's wake says it.
 fn wake_outcome(state: TurnState) -> agent_core::delegation::wake::Outcome {
     use agent_core::delegation::wake::Outcome;
@@ -373,7 +515,13 @@ pub(super) fn category(event: &Event) -> Option<EventCategory> {
         | Event::TurnCompleted { .. }
         | Event::ModeChanged { .. } => EventCategory::Lifecycle,
         Event::ItemStarted { .. } | Event::ItemCompleted { .. } => EventCategory::Activity,
-        Event::ApprovalRequested { .. } | Event::ApprovalResolved { .. } => EventCategory::Approval,
+        Event::ApprovalRequested { .. }
+        | Event::ApprovalResolved { .. }
+        | Event::ApprovalExpired
+        | Event::QuestionRequested { .. }
+        | Event::QuestionResolved { .. }
+        | Event::FormRequested { .. }
+        | Event::FormResolved { .. } => EventCategory::Approval,
         Event::DelegatedMessage { .. } => EventCategory::Message,
         Event::Error { .. } => EventCategory::Error,
         _ => return None,
@@ -442,19 +590,50 @@ impl Supervisor {
                 return;
             };
             let before = w.row.state.clone();
-            if w.row.state != "closed"
-                && w.generation == scope.generation
-                && w.run.as_ref().or(w.last_run.as_ref()) == scope.run.as_ref()
-            {
+            let current = w.row.state != "closed" && w.generation == scope.generation;
+            // Requests belong to a process generation, not to a run: a resolution captured
+            // under an earlier run still settles its request once a later run is current.
+            if current {
+                // Anything its process says is activity: a run's end and a settled request
+                // included, which leave nothing at work to stamp it later.
+                w.last_active = std::time::Instant::now();
+                w.open_requests.apply(scope.generation, &env);
+                if matches!(
+                    env.event,
+                    Event::ApprovalRequested { .. }
+                        | Event::QuestionRequested { .. }
+                        | Event::FormRequested { .. }
+                        | Event::ApprovalResolved { .. }
+                        | Event::ApprovalExpired
+                        | Event::QuestionResolved { .. }
+                        | Event::FormResolved { .. }
+                ) {
+                    // Waiting while anything is still put to the user; back to running only
+                    // once the last request is settled and a run is open.
+                    if w.waiting_on_user() {
+                        w.row.state = "waiting".into();
+                    } else if w.run.is_some() {
+                        w.row.state = "running".into();
+                    } else if let Some(outcome) = w.open_requests.outcome.clone() {
+                        // No run is open: back to how the last run ended.
+                        if w.row.state == "waiting" {
+                            w.row.state = outcome;
+                        }
+                    }
+                }
+            }
+            if current && w.run.as_ref().or(w.last_run.as_ref()) == scope.run.as_ref() {
                 match &env.event {
                     Event::TurnStarted { .. }
                         if !bootstrap && !w.readback.failed && w.run == scope.run =>
                     {
                         w.row.state = "running".into();
                         w.opened_run = scope.run.clone();
+                        // A background request still open keeps the worker waiting.
+                        if w.waiting_on_user() {
+                            w.row.state = "waiting".into();
+                        }
                     }
-                    Event::ApprovalRequested { .. } => w.row.state = "waiting".into(),
-                    Event::ApprovalResolved { .. } => w.row.state = "running".into(),
                     Event::TurnCompleted { state, usage, .. }
                         if !bootstrap
                             && !w.readback.failed
@@ -485,6 +664,11 @@ impl Supervisor {
                         w.row.state = super::supervisor::enum_value(
                             &agent_core::delegation::lifecycle::worker_state_after(*state),
                         );
+                        // What the worker returns to once its last request settles.
+                        w.open_requests.outcome = Some(w.row.state.clone());
+                        if w.waiting_on_user() {
+                            w.row.state = "waiting".into();
+                        }
                     }
                     Event::ContentSnapshot {
                         stream: StreamKind::Assistant,
@@ -526,10 +710,12 @@ impl Supervisor {
         }
         if let Some((state, usage)) = ended {
             let _ = usage;
+            // A steer's answer may still come after its turn ended: its correlation stays
+            // until that answer or its settle deadline (`arm_steer_settle`).
             self.state
                 .borrow_mut()
                 .controls
-                .retain(|_, entry| &entry.worker != worker);
+                .retain(|_, entry| &entry.worker != worker || is_steer(entry));
             self.drain_deferred(worker);
             self.queue_wake(
                 worker,
@@ -561,13 +747,19 @@ impl Supervisor {
         }
         self.notify_registry();
     }
-    pub(super) fn complete_run(
+    /// Ends `worker`'s current run as `state` in one transaction: the run's end, the worker's
+    /// state, the terminal event with its links, the dispatch that failed with it (recorded
+    /// after the run's end, so it never ends the run itself) and its parent's report. Only once
+    /// that committed are the parent woken, the worker's memory moved on, its queued work
+    /// drained and, with `end.stop_after`, its session stopped.
+    pub(super) fn complete_run_with(
         self: &std::rc::Rc<Self>,
         worker: &WorkerId,
         state: TurnState,
         usage: Option<String>,
+        end: RunEnd,
     ) {
-        let (run, result) = {
+        let (run, activity) = {
             let mut state = self.state.borrow_mut();
             let Some(w) = state.workers.get_mut(worker) else {
                 return;
@@ -577,10 +769,11 @@ impl Supervisor {
             };
             (run, w.row.last_activity.clone())
         };
+        let result = end.result.or(activity);
         self.state
             .borrow_mut()
             .controls
-            .retain(|_, entry| &entry.worker != worker);
+            .retain(|_, entry| &entry.worker != worker || is_steer(entry));
         let env = Envelope::new(Event::Notice {
             text: result
                 .clone()
@@ -594,37 +787,59 @@ impl Supervisor {
                 link.run = Some(run.clone());
             }
         }
+        let (parts, reported) = match &result {
+            Some(text) => result_messages(self, text, 0),
+            None => (Vec::new(), String::new()),
+        };
         let mut completion = Completion {
             run,
             state: agent_core::delegation::lifecycle::run_state_after(state),
             worker_state: agent_core::delegation::lifecycle::worker_state_after(state),
-            reason: None,
+            reason: end.reason,
             usage_json: usage,
-            result,
+            result: parts,
+            dispatch_failure: end.dispatch_failure,
             event,
         };
         let sup = self.clone();
         let worker = worker.clone();
         let stored_worker = worker.clone();
         let completed_run = completion.run.clone();
-        let reported = completion.result.clone();
-        gtk4::glib::spawn_future_local(async move {
-            if let Ok(completed) = sup
-                .services
-                .durable("complete delegated run", move |s| {
-                    if s.delegation_worker(stored_worker.as_str())?
-                        .is_some_and(|w| w.state == "closed")
-                    {
-                        completion.worker_state = agent_core::event::WorkerState::Closed;
-                    }
-                    s.complete_delegation_run(&completion)
-                })
-                .await
+        let stop_after = end.stop_after;
+        let job = move |s: &agent_kit::store::Store| {
+            if s.delegation_worker(stored_worker.as_str())?
+                .is_some_and(|w| w.state == "closed")
             {
+                completion.worker_state = agent_core::event::WorkerState::Closed;
+            }
+            s.complete_delegation_run(&completion)
+        };
+        // Queued on the store writer now, not when a future first runs: anything the session
+        // publishes from here on (a turn ending in flight) is written after this end, and finds
+        // the run already settled rather than ending it first.
+        let receipt = if let Some(writer) = self.services.handle.writer() {
+            writer.durable_call("complete delegated run", job)
+        } else {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let _ = tx.send(self.services.handle.reader().atomically(job));
+            rx
+        };
+        gtk4::glib::spawn_future_local(async move {
+            let committed = gtk4::gio::spawn_blocking(move || {
+                receipt
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .map_err(|_| agent_kit::store::StoreError::WriterGone)?
+            })
+            .await
+            .unwrap_or(Err(agent_kit::store::StoreError::WriterGone));
+            if let Err(e) = &committed {
+                (sup.services.report)(&format!("Cannot save delegation control state: {e}"));
+            }
+            if let Ok(completed) = committed {
                 sup.queue_wake(
                     &worker,
                     wake_outcome(state),
-                    reported.as_deref().unwrap_or_default(),
+                    &reported,
                     shown_by(
                         completed.event.seq,
                         completed.notification.map(|(id, _)| id),
@@ -638,11 +853,26 @@ impl Supervisor {
                     .filter(|w| w.run.as_ref() == Some(&completed_run))
                 {
                     w.last_run = w.run.take();
+                    w.last_active = std::time::Instant::now();
                     if w.row.state != "closed" {
                         w.row.state = super::supervisor::enum_value(
                             &agent_core::delegation::lifecycle::worker_state_after(state),
                         );
                     }
+                }
+                // Only the generation the ended run was on is stopped, and only while it has
+                // moved on to nothing else: no newer run, and no queued work, which its next
+                // delivery starts on a fresh generation of its own instead.
+                let stop = stop_after.and_then(|generation| {
+                    let state = sup.state.borrow();
+                    let w = state.workers.get(&worker)?;
+                    let idle = w.generation == generation
+                        && w.run.is_none()
+                        && state.deferred.get(&worker).is_none_or(|q| q.is_empty());
+                    idle.then(|| w.session()).flatten()
+                });
+                if let Some(session) = stop {
+                    session.shutdown(true);
                 }
                 sup.drain_deferred(&worker);
                 sup.notify_registry();
@@ -657,4 +887,21 @@ impl Supervisor {
             }
         });
     }
+}
+
+/// How [`Supervisor::complete_run_with`] ends a run beyond its state.
+#[derive(Default)]
+pub(super) struct RunEnd {
+    /// The run's terminal reason.
+    pub reason: Option<String>,
+    /// The parent's report; `None` reports the worker's last activity, if any.
+    pub result: Option<String>,
+    /// The dispatch that failed with the run.
+    pub dispatch_failure: Option<(
+        agent_core::delegation::OperationId,
+        agent_core::delegation::ToolError,
+    )>,
+    /// Stop the worker's session once the end committed, if it is still on this generation
+    /// with nothing newer to do: a child that never got its task.
+    pub stop_after: Option<agent_core::delegation::ProcessGeneration>,
 }

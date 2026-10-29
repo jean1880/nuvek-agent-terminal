@@ -221,6 +221,121 @@ pub fn on_steer_refused(d: Delivery) -> Result<DeliveryState, ErrorCode> {
     }
 }
 
+/// The one step back a delivery may take: an `auto` message written to a run that refused it
+/// (`submitted`) goes back to wait for the next turn. It is not a [`delivery_step`] (an echo, a
+/// confirmation or an unknown outcome never takes it): only the refused steer's own path does,
+/// and only for `auto`, since a `this_run` message has no next turn to fall back to.
+pub fn requeue_refused_steer(
+    from: DeliveryState,
+    policy: Delivery,
+) -> Result<DeliveryState, LifecycleError> {
+    match (from, on_steer_refused(policy)) {
+        (DeliveryState::Submitted | DeliveryState::Unknown, Ok(to)) if policy == Delivery::Auto => {
+            Ok(to)
+        }
+        _ => Err(LifecycleError::Illegal {
+            from: WorkerState::Unknown,
+            input: "requeue_refused_steer",
+        }),
+    }
+}
+
+/// A steer whose answer was overdue (`unknown`) and then came, accepted: delivered
+/// (`provider_confirmed`). Not a [`delivery_step`]: only that late answer's own path takes it.
+pub fn confirm_late_steer(from: DeliveryState) -> Result<DeliveryState, LifecycleError> {
+    match from {
+        DeliveryState::Unknown => Ok(DeliveryState::ProviderConfirmed),
+        _ => Err(LifecycleError::Illegal {
+            from: WorkerState::Unknown,
+            input: "confirm_late_steer",
+        }),
+    }
+}
+
+/// The most messages one run's result is split into.
+pub const MAX_RESULT_PARTS: usize = 8;
+
+/// A run's result as its parent's mailbox carries it: at most [`MAX_RESULT_PARTS`] messages,
+/// each within the message cap it was split for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResultParts {
+    pub parts: Vec<String>,
+    /// Bytes of the (redacted) result that no part carries.
+    pub omitted: usize,
+}
+
+/// The header of part `i` of `n` (one-based), on its own line.
+fn part_header(i: usize, n: usize) -> String {
+    format!("[part {i}/{n}]\n")
+}
+
+/// The note the last part ends with when the result did not fit.
+fn omission_note(bytes: usize) -> String {
+    format!("\n[… {bytes} more bytes of the result were cut; read the worker's transcript]")
+}
+
+/// Splits a run's result into its parent's mailbox messages. `text` must already be redacted
+/// whole (a cut made first could leave half a secret unmasked); `already_cut` is what was cut
+/// from it before it got here. A result that fits one message is that message, unchanged. A
+/// longer one becomes up to [`MAX_RESULT_PARTS`] parts, each headed "[part i/n]", every one
+/// within `cap` bytes with its header (and the last with its omission note) counted inside the
+/// cap, cut on character boundaries; the last says how much did not fit. There is always one
+/// part: an empty result is one empty message, so the parent still hears the run ended.
+pub fn result_parts(text: &str, cap: usize, already_cut: usize) -> ResultParts {
+    if text.len() <= cap && already_cut == 0 {
+        return ResultParts {
+            parts: vec![text.to_owned()],
+            omitted: 0,
+        };
+    }
+    // The widest header and note, so the number of parts never changes what fits.
+    let header = part_header(MAX_RESULT_PARTS, MAX_RESULT_PARTS).len();
+    let note = omission_note(text.len().saturating_add(already_cut)).len();
+    let mut chunks: Vec<&str> = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() && chunks.len() < MAX_RESULT_PARTS {
+        let take = crate::text::truncate_bytes(rest, cap.saturating_sub(header));
+        if take.is_empty() {
+            break;
+        }
+        chunks.push(take);
+        rest = &rest[take.len()..];
+    }
+    let mut omitted = rest.len().saturating_add(already_cut);
+    // Something is cut: the last part makes room for saying so. The parts stay a prefix of the
+    // text, so whatever the last one gives up is cut too.
+    if omitted > 0 {
+        while let Some(last) = chunks.pop() {
+            let keep = crate::text::truncate_bytes(last, cap.saturating_sub(header + note));
+            omitted += last.len() - keep.len();
+            if !keep.is_empty() {
+                chunks.push(keep);
+                break;
+            }
+        }
+    }
+    let n = chunks.len().max(1);
+    let mut parts: Vec<String> = chunks
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("{}{c}", part_header(i + 1, n)))
+        .collect();
+    if parts.is_empty() {
+        parts.push(part_header(1, 1));
+    }
+    if omitted > 0 {
+        if let Some(last) = parts.last_mut() {
+            last.push_str(&omission_note(omitted));
+        }
+    }
+    // A cap too small for a header and the note still bounds every part.
+    for part in &mut parts {
+        let end = crate::text::truncate_bytes(part, cap).len();
+        part.truncate(end);
+    }
+    ResultParts { parts, omitted }
+}
+
 /// Most lines awaiting their echo; the oldest is dropped past it.
 pub const ECHO_QUEUE_CAP: usize = 256;
 
@@ -350,6 +465,9 @@ impl ContinuationBudget {
         self.reserved = false;
     }
 }
+
+#[cfg(test)]
+mod result_tests;
 
 #[cfg(test)]
 mod tests {

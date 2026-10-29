@@ -203,7 +203,13 @@ Architectural mandates, standards, and workflows for this codebase.
 - **Closing or losing one worker never leaves its siblings stale**: a `Close` or
   `GenerationExited` bumps the tree's authority epoch to fence what was in flight and revokes
   only that subtree; `commit_revoke` moves every other worker's token from the replaced epoch to
-  the new one. `closing_a_worker_leaves_its_siblings_current` proves it.
+  the new one. Queued instructions and staged launches of siblings survive too: the store fails
+  accepted work and cancels queued sends only inside the event's scope
+  (`RevocationEffect::scope`) and carries the rest to the new epoch, `latch_revoke` drops staged
+  bindings only in that scope, and work resumed after an `await` re-reads its epoch
+  (`settled_epoch_for`), failing only when a revocation covered its own worker. Stop, a mode
+  restriction and shutdown still cancel tree-wide. `closing_a_worker_leaves_its_siblings_current`
+  proves it.
 - **A parent's declared limit on a child is refused, never asked**: `cross_agent_spawn`'s optional
   `capabilities` (`edit`, `exec`, `network`) is all a child may do beyond reading. It only narrows
   the task mode (a plan child can hold `network` only, refused otherwise), a child of a restricted
@@ -234,7 +240,20 @@ Architectural mandates, standards, and workflows for this codebase.
   prompt-less init turn names no transcript). The stop is silent: no exit reaches the view or the
   store. A mode or same-agent model picked while suspended is kept for the resume (never Bypass);
   other controls say, unstored, that the agent is paused. The next prompt resumes the same native
-  session (`ensure_alive`).
+  session (`ensure_alive`). A delegated worker is never stopped by that sweep; only its
+  supervisor pauses it (`ChatSession::suspend_child_if_idle`, the same `suspend_blocker` checks
+  with only the delegated-worker exclusion relaxed), when it has been idle for
+  `idle_suspend_minutes` (`Supervisor::stop_idle_children`, 0 never) or when a start would pass
+  `live_processes_app` (the least recently active idle worker goes first, its exit awaited; with
+  none, the start is refused saying how many are idle and that `cross_agent_close` frees a
+  slot, retryable while a run or a stop is in progress; a stop already under way is waited for,
+  bounded). Admission reserves: an admitted start counts as a process until its own exists or it
+  fails (`LaunchSlot`), and a worker an instruction is on its way to is never paused
+  (`DeliveryHold`). The supervisor's own check comes first (no run, pending input, preparation, dispatch,
+  queued delivery or open request, its process up and read back, and never with a live
+  descendant), and its hooks consent with the same planned rotation, so nothing is revoked and
+  the epoch is unchanged. Silent too: its next instruction resumes the same native session
+  through `ensure_child`. `capacity_tests` (supervisor and session) prove these.
 - **A thread stopped by its usage limit continues once it resets, unless told not to**: with
   `continue_after_limit` on (default; Settings → Behaviour), a root thread whose turn failed for
   quota (never a rate limit alone, which may be a tool's own 429, nor a usage reading, which may
@@ -245,11 +264,17 @@ Architectural mandates, standards, and workflows for this codebase.
   name). Readings count from when windows last arrived (`updated_at`), never an account-only
   update. agy's `/usage` side command never raises `RateLimited`: a reading is not a refusal. The window's minute sweep (`continue_after_limits`)
   then calls `ChatSession::continue_after_limit`, which sends the app's continue prompt as a
-  notice in the same native session, starting the process again if it is gone. Never into a
-  running turn or anything a wake waits for, never for a delegated worker, never for a root the
-  user stopped. The wait ends when the agent works again, the thread switches agent (the
-  hand-off included), the user picks "Don't Continue" on its banner, or the setting goes off.
-  `limit_wait::tests` and the session test `a_thread_continues_after_its_limit_*` prove these.
+  notice in the same native session, starting the process again if it is gone. A handoff still
+  waiting for a prompt rides on it and is spent as a user prompt's would be; the prompt is never
+  stored as the user's message. Never into a running turn or anything else a wake waits for
+  (`TurnPurpose::LimitContinue`), never for a delegated worker, never for a root the user
+  stopped. While the thread waits, sub-agent news does not wake it (`TurnPurpose::Wake`); it
+  arrives after the continuation. The wait ends when the agent works again, the thread switches
+  agent (the hand-off included), the user picks "Don't Continue" on its banner, or the setting
+  goes off. "Continue in …" on the limit's banner (and a bare `/handoff` while the thread is
+  stopped by its limit) switches and then continues the work in the new agent with the handoff,
+  as a busy switch does. `limit_wait::tests`, the session tests
+  `a_thread_continues_after_its_limit_*` and `continuation_tests` prove these.
 - **Agent processes get a cleaned environment**: `clear_env` and any inherited
   approval-socket variables are removed (`SpawnSpec::unset`), then the profile's
   env file, then the approval socket.

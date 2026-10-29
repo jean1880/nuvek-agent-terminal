@@ -14,6 +14,22 @@ use serde_json::Value;
 use std::rc::Rc;
 use tracing::{info, warn};
 
+/// The parent's report of a run cancelled before its task or message reached the agent.
+pub(super) const CANCELLED_BEFORE_ITS_TURN: &str =
+    "Cancelled before its turn started: the agent was never given this work.";
+
+/// How long a steer may wait for the run's answer before its outcome is recorded unknown
+/// (see `arm_steer_settle`).
+pub(super) const STEER_SETTLE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The most overdue steers whose late answer is still awaited.
+pub(super) const LATE_STEERS: usize = 64;
+
+/// How many times the settle wait an overdue steer's late answer is still awaited (10 minutes
+/// by default). Past it the correlation is dropped and the outcome stays unknown, so a worker
+/// that never hears back can be paused again.
+const LATE_STEER_WINDOW: u32 = 20;
+
 /// How long a task handed to a child may wait for its turn to open (see `arm_task_start`).
 pub(super) const TASK_START_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -125,17 +141,21 @@ impl Supervisor {
                 "recipient is dispatching another entry",
             ));
         }
-        let needs_rebind = {
-            let state = self.state.borrow();
-            let w = &state.workers[&target];
-            w.row.parent_id.is_some()
-                && (w.session.is_none()
-                    || w.generations.is_empty()
-                    || !w.readback.ready
-                    || w.row.delegation_status == "rebind_required"
-                    || !state.token_current(w))
+        // From here to the delivery, the recipient is never paused to make room: the readiness
+        // read now must still hold once the acceptance is in. Dropped on every return.
+        let _hold = (direction == Direction::ParentToChild).then(|| self.hold_delivery(&target));
+        let needs_rebind = |sup: &Self| {
+            let state = sup.state.borrow();
+            state.workers.get(&target).is_some_and(|w| {
+                w.row.parent_id.is_some()
+                    && (w.session.is_none()
+                        || w.generations.is_empty()
+                        || !w.readback.ready
+                        || w.row.delegation_status == "rebind_required"
+                        || !state.token_current(w))
+            })
         };
-        let needs_queue = matches!(plan, DeliveryPlan::QueueNextTurn) || needs_rebind;
+        let needs_queue = matches!(plan, DeliveryPlan::QueueNextTurn) || needs_rebind(self);
         let live = match &plan {
             DeliveryPlan::SteerNow(r) => Some(r.clone()),
             DeliveryPlan::WriteLive { target } => target.clone(),
@@ -199,7 +219,9 @@ impl Supervisor {
             policy: r.delivery,
             reserved: !needs_queue,
         };
-        if needs_queue {
+        // A recipient whose process went away during the acceptance anyway (it exited, or was
+        // stopped) is started again through the queue, never handed a write it cannot take.
+        if needs_queue || needs_rebind(self) {
             self.state
                 .borrow_mut()
                 .deferred
@@ -300,35 +322,19 @@ impl Supervisor {
             w.dispatching = true;
         }
         if !entry.reserved {
+            // A requeued refused steer is accepted again too: one reservation, with every check.
             let op = entry.input.operation.clone();
-            let message = match &entry.input.source {
-                InputSource::Message { id, .. } => Some(id.clone()),
-                _ => None,
-            };
             match self
                 .services
                 .durable("reserve deferred delivery", move |s| {
-                    if s.delegation_operation(op.as_str())?
-                        .is_some_and(|o| o.dispatch_state == "submitted")
-                    {
-                        if let Some(id) = message {
-                            s.record_delegation_delivery(
-                                &id,
-                                DeliveryState::DispatchReserved,
-                                None,
-                            )?;
-                        }
-                        Ok(Ok(()))
-                    } else {
-                        Ok(s.reserve_delegation_dispatch(&op)?.map(|_| ()))
-                    }
+                    Ok(s.reserve_delegation_dispatch(&op)?.map(|_| ()))
                 })
                 .await
             {
                 Ok(Ok(_)) => entry.reserved = true,
                 Ok(Err(e)) | Err(e) => {
                     if let Some(w) = self.state.borrow_mut().workers.get_mut(&entry.worker) {
-                        w.dispatching = false;
+                        w.end_dispatch();
                     }
                     self.record_fact(entry.input.operation, DispatchFact::Failed(e));
                     return;
@@ -348,8 +354,19 @@ impl Supervisor {
             );
             return;
         };
+        // A sibling's close or exit while this waited moved the epoch on, and this with it.
+        let reserved_run = match self
+            .settled_delivery_epoch(&entry.input.from, &entry.worker, entry.input.epoch)
+            .await
+        {
+            Ok(epoch) => {
+                entry.input.epoch = epoch;
+                self.reserve_run(&entry).await
+            }
+            Err(e) => Err(e),
+        };
         // The run this delivery starts, and whether it reserved that run itself.
-        let used = match self.reserve_run(&entry).await {
+        let used = match reserved_run {
             Ok(run) => Dispatch {
                 fresh: run.is_some() && run != prior,
                 run,
@@ -357,12 +374,25 @@ impl Supervisor {
             },
             Err(e) => {
                 if let Some(w) = self.state.borrow_mut().workers.get_mut(&entry.worker) {
-                    w.dispatching = false;
+                    w.end_dispatch();
                 }
                 self.record_fact(entry.input.operation, DispatchFact::Failed(e));
                 return;
             }
         };
+        match self
+            .settled_delivery_epoch(&entry.input.from, &entry.worker, entry.input.epoch)
+            .await
+        {
+            Ok(epoch) => entry.input.epoch = epoch,
+            Err(e) => {
+                if let Some(w) = self.state.borrow_mut().workers.get_mut(&entry.worker) {
+                    w.end_dispatch();
+                }
+                self.fail_dispatch(&entry, &used, e);
+                return;
+            }
+        }
         let expected = match &entry.input.plan {
             DeliveryPlan::SteerNow(r) => Some(r),
             DeliveryPlan::WriteLive { target } => target.as_ref(),
@@ -370,7 +400,7 @@ impl Supervisor {
         };
         // No await from this check to the actual session write.
         if let Some(w) = self.state.borrow_mut().workers.get_mut(&entry.worker) {
-            w.dispatching = false;
+            w.end_dispatch();
         }
         if let Err(e) = self.dispatch_check(
             &entry.input.from,
@@ -403,7 +433,11 @@ impl Supervisor {
             }
             DelegatedOutcome::SteerSent { tag } => {
                 self.record_fact(entry.input.operation.clone(), DispatchFact::Submitted);
-                self.state.borrow_mut().controls.insert(tag, entry.clone());
+                self.state
+                    .borrow_mut()
+                    .controls
+                    .insert(tag.clone(), entry.clone());
+                self.arm_steer_settle(&entry.worker, tag);
             }
             DelegatedOutcome::Written | DelegatedOutcome::TurnStarted => {
                 self.record_fact(entry.input.operation.clone(), DispatchFact::Submitted);
@@ -484,9 +518,9 @@ impl Supervisor {
             if let Some(w) = sup.state.borrow_mut().workers.get_mut(&worker) {
                 w.dispatching = true;
             }
-            let ready = sup.ensure_child(&worker, &entry.input).await;
+            let ready = sup.ensure_child(&worker, &mut entry.input).await;
             if let Some(w) = sup.state.borrow_mut().workers.get_mut(&worker) {
-                w.dispatching = false;
+                w.end_dispatch();
             }
             if let Err(e) = ready {
                 sup.record_fact(entry.input.operation, DispatchFact::Failed(e));
@@ -501,50 +535,153 @@ impl Supervisor {
             return;
         };
         let entry = take_scoped_control(&mut self.state.borrow_mut().controls, worker, tag);
-        let Some(mut entry) = entry else {
+        if let Some(entry) = entry {
+            match &env.event {
+                Event::ControlResult { ok: Some(_), .. } => self.confirm_delivery(entry),
+                Event::ControlResult { error: Some(_), .. } => self.steer_refused(worker, entry),
+                _ => {}
+            }
+            return;
+        }
+        // An answer for a steer already recorded unknown: it settles it now.
+        let late = {
+            let mut state = self.state.borrow_mut();
+            let at = state
+                .late_steers
+                .iter()
+                .position(|(t, e)| t == tag && &e.worker == worker);
+            at.and_then(|at| state.late_steers.remove(at))
+                .map(|(_, entry)| entry)
+        };
+        let Some(entry) = late else {
             return;
         };
         match &env.event {
-            Event::ControlResult { ok: Some(_), .. } => self.confirm_delivery(entry),
+            Event::ControlResult { ok: Some(_), .. } => self.confirm_late_steer(entry),
+            // Refused: never delivered, proven now. `auto` goes to the next turn; `this_run`
+            // stays unknown, as recorded.
             Event::ControlResult { error: Some(_), .. } if entry.policy == DeliveryPolicy::Auto => {
-                entry.reserved = false;
-                entry.input.plan = DeliveryPlan::StartTurn;
-                let message = match &entry.input.source {
-                    InputSource::Message { id, .. } => Some(id.clone()),
-                    _ => None,
-                };
-                if let Some(message) = message {
-                    self.services
-                        .write("requeue refused steer", None, true, move |s| {
-                            s.record_delegation_delivery(
-                                &message,
-                                DeliveryState::QueuedNextTurn,
-                                None,
-                            )?;
-                            Ok(())
-                        });
-                }
-                self.state
-                    .borrow_mut()
-                    .deferred
-                    .entry(worker.clone())
-                    .or_default()
-                    .push_back(entry);
+                self.steer_refused(worker, entry)
             }
-            Event::ControlResult { error: Some(_), .. } => self.record_fact(
-                entry.input.operation,
-                DispatchFact::Failed(error(ErrorCode::StaleRun, "strict steer was refused")),
-            ),
-            _ => {}
+            _ => {
+                info!(%worker, operation = %entry.input.operation,
+                    "a late answer for a strict steer; its outcome stays unknown");
+            }
         }
     }
+    /// A steer the run refused: `auto` falls back to the next turn (`mailbox::on_steer_refused`):
+    /// the message waits for it again and its operation is accepted again, durably, before it is
+    /// queued, so the next delivery reserves it with every check and confirms it in the run it
+    /// reaches. That delivery is a new attempt with a correlation of its own: a late answer for
+    /// this one can never settle it. `this_run` has no next turn: it fails.
+    fn steer_refused(self: &Rc<Self>, worker: &WorkerId, mut entry: Delivery) {
+        if entry.policy != DeliveryPolicy::Auto {
+            self.record_fact(
+                entry.input.operation,
+                DispatchFact::Failed(error(ErrorCode::StaleRun, "strict steer was refused")),
+            );
+            return;
+        }
+        let InputSource::Message { id: message, .. } = entry.input.source.clone() else {
+            return;
+        };
+        entry.reserved = false;
+        entry.input.plan = DeliveryPlan::StartTurn;
+        entry.input.tag = fresh_tag(&entry.input.operation);
+        let operation = entry.input.operation.clone();
+        let sup = self.clone();
+        let worker = worker.clone();
+        gtk4::glib::spawn_future_local(async move {
+            let requeued = sup
+                .services
+                .durable("requeue refused steer", move |s| {
+                    s.requeue_refused_delegation_steer(&message)
+                })
+                .await;
+            if let Err(e) = requeued {
+                warn!(%worker, %operation, "a refused steer could not be requeued");
+                sup.record_fact(operation, DispatchFact::Failed(e));
+                return;
+            }
+            info!(%worker, %operation, "refused steer requeued for the next turn");
+            sup.state
+                .borrow_mut()
+                .deferred
+                .entry(worker.clone())
+                .or_default()
+                .push_back(entry);
+            // The run that refused it may already be over: nothing else would drain it.
+            sup.drain_deferred(&worker);
+        });
+    }
+    /// A steer's answer may come after its turn ended (the correlation outlives the turn). One
+    /// with no answer within [`STEER_SETTLE`] may yet have been taken: its outcome is recorded
+    /// `unknown` (a replay says so), it is never delivered again on a guess, and its correlation
+    /// is kept for a late answer, which settles it (`delivery_control`), for
+    /// [`LATE_STEER_WINDOW`] times the wait.
+    pub(super) fn arm_steer_settle(self: &Rc<Self>, worker: &WorkerId, tag: String) {
+        let wait = self.state.borrow().steer_settle.unwrap_or(STEER_SETTLE);
+        let weak = self.weak.clone();
+        let worker = worker.clone();
+        gtk4::glib::spawn_future_local(async move {
+            gtk4::glib::timeout_future(wait).await;
+            let Some(sup) = weak.upgrade() else {
+                return;
+            };
+            let entry = take_scoped_control(&mut sup.state.borrow_mut().controls, &worker, &tag);
+            let Some(entry) = entry else {
+                return;
+            };
+            warn!(%worker, operation = %entry.input.operation, ?wait,
+                "a steer got no answer in time; its outcome is unknown");
+            sup.record_fact(entry.input.operation.clone(), DispatchFact::Unknown);
+            {
+                let mut state = sup.state.borrow_mut();
+                if state.late_steers.len() >= LATE_STEERS {
+                    state.late_steers.pop_front();
+                }
+                state.late_steers.push_back((tag.clone(), entry));
+            }
+            drop(sup);
+            // No answer at all: stop waiting, so the worker is not held up for ever.
+            gtk4::glib::timeout_future(wait * LATE_STEER_WINDOW).await;
+            let Some(sup) = weak.upgrade() else {
+                return;
+            };
+            sup.state
+                .borrow_mut()
+                .late_steers
+                .retain(|(t, _)| t != &tag);
+        });
+    }
+    /// A late answer accepted an overdue steer: it was delivered, into the run it was pinned to.
+    fn confirm_late_steer(&self, entry: Delivery) {
+        let InputSource::Message { id, .. } = entry.input.source else {
+            return;
+        };
+        let run = match &entry.input.plan {
+            DeliveryPlan::SteerNow(run) => Some(run.clone()),
+            _ => None,
+        };
+        info!(worker = %entry.worker, operation = %entry.input.operation,
+            "an overdue steer was accepted after all");
+        self.services
+            .write("confirm overdue steer", None, true, move |s| {
+                s.confirm_late_delegation_steer(&id, run.as_ref())
+            });
+    }
     fn confirm_delivery(&self, entry: Delivery) {
-        let run = self
-            .state
-            .borrow()
-            .workers
-            .get(&entry.worker)
-            .and_then(|w| w.run.clone());
+        // A steer the provider took was taken into the run it was pinned to, even when its
+        // answer comes after that run ended; anything else, into the worker's current run.
+        let run = match &entry.input.plan {
+            DeliveryPlan::SteerNow(run) => Some(run.clone()),
+            _ => self
+                .state
+                .borrow()
+                .workers
+                .get(&entry.worker)
+                .and_then(|w| w.run.clone()),
+        };
         self.record_fact(entry.input.operation.clone(), DispatchFact::Confirmed);
         if let InputSource::Message { id, .. } = entry.input.source {
             self.services
@@ -664,54 +801,45 @@ impl Supervisor {
             fact_only(e);
             return;
         }
-        // The run ends: interrupted by the cancel that stopped it, or failed with the
-        // delivery. It ends first, and the failed dispatch is recorded after it in the same
-        // transaction: recording the fact on a spawn's still-open run would otherwise end that
-        // run as `failed` and hide the cancel. A run that already ended is left as it is.
-        let (run_state, worker_state) = if stopping {
-            ("interrupted", Some("waiting"))
-        } else {
-            ("failed", None)
-        };
+        // A cancel that stopped it: the run ends interrupted as any cancelled run does, through
+        // the one completion (its end, the worker's state, the terminal event and links, the
+        // failed dispatch after the run's end, the parent's report), and the parent hears of it
+        // once that committed. A task never delivered leaves its child nothing to do: it is
+        // stopped then, never before, or a turn ending in flight would end the run first.
+        if stopping {
+            self.complete_run_with(
+                &entry.worker,
+                agent_core::event::TurnState::Interrupted,
+                None,
+                super::publish::RunEnd {
+                    reason: Some("cancelled".into()),
+                    result: Some(CANCELLED_BEFORE_ITS_TURN.into()),
+                    dispatch_failure: Some((entry.input.operation.clone(), e)),
+                    stop_after: task.then_some(used.generation),
+                },
+            );
+            self.notify_registry();
+            return;
+        }
+        // Failed with the delivery. The run ends first, and the failed dispatch is recorded
+        // after it in the same transaction: recording the fact on a spawn's still-open run would
+        // otherwise end that run as `failed`. A run that already ended is left as it is.
         if let Some(w) = self.state.borrow_mut().workers.get_mut(&entry.worker) {
             w.last_run = w.run.take();
-            if let Some(state) = worker_state {
-                w.row.state = state.into();
-            }
         }
-        let worker = entry.worker.clone();
-        let reason = if stopping {
-            "cancelled".to_owned()
-        } else {
-            e.code.as_str().to_owned()
-        };
+        let reason = e.code.as_str().to_owned();
         let operation = entry.input.operation.clone();
         let fact = DispatchFact::Failed(e);
         self.services
             .write("end undelivered delegated run", None, true, move |s| {
                 s.atomically(|s| {
                     let at = super::supervisor::now();
-                    s.end_delegation_run_if_open(run.as_str(), run_state, Some(&reason), at)?;
-                    if let Some(state) = worker_state {
-                        if s.delegation_worker(worker.as_str())?
-                            .is_some_and(|w| w.state != "closed")
-                        {
-                            s.set_delegation_worker_state(worker.as_str(), state, None, at)?;
-                        }
-                    }
+                    s.end_delegation_run_if_open(run.as_str(), "failed", Some(&reason), at)?;
                     // As `record_fact` does: a fact already recorded is not recorded again.
                     s.record_delegation_dispatch_once(&operation, &fact)?;
                     Ok(())
                 })
             });
-        if stopping && task {
-            // As `cancel_bound_run` does with a task still pending: a child that never got
-            // its task is stopped. Only after the run's end is queued: stopping ends any turn
-            // in flight, whose publication would otherwise end the run first, with no reason.
-            if let Some(session) = self.child_session(&entry.worker) {
-                session.shutdown(true);
-            }
-        }
         self.notify_registry();
         if !task {
             self.drain_deferred(&entry.worker);
@@ -783,6 +911,11 @@ impl Supervisor {
         });
     }
 }
+/// A correlation tag no earlier attempt of `operation` used.
+fn fresh_tag(operation: &agent_core::delegation::OperationId) -> String {
+    format!("{operation}#{}", gtk4::glib::uuid_string_random())
+}
+
 fn take_scoped_control(
     controls: &mut std::collections::HashMap<String, Delivery>,
     worker: &WorkerId,

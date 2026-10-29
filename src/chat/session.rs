@@ -196,22 +196,54 @@ fn launch_home(
 /// [`Inner::watch_tool_step`]).
 fn canary_tools(kind: ItemKind) -> Option<&'static [&'static str]> {
     match kind {
-        ItemKind::Command => Some(&["run_command", "send_command_input"]),
+        ItemKind::Command => Some(&[
+            "run_command",
+            "send_command_input",
+            "manage_task",
+            "schedule",
+        ]),
         ItemKind::FileChange => Some(&[
             "replace_file_content",
             "multi_replace_file_content",
             "write_to_file",
+            "edit_file",
             "sed_file",
             "notebook_edit",
         ]),
         ItemKind::McpTool => Some(&["call_mcp_tool"]),
-        ItemKind::Subagent => Some(&["start_subagent", "invoke_subagent"]),
+        ItemKind::Subagent => Some(&[
+            "start_subagent",
+            "invoke_subagent",
+            "define_subagent",
+            "browser_subagent",
+            "manage_subagents",
+            "send_message",
+        ]),
         ItemKind::WebSearch => Some(&["search_web", "read_url_content"]),
         ItemKind::FileRead
         | ItemKind::Tool
         | ItemKind::UserMessage
         | ItemKind::AssistantMessage
         | ItemKind::Reasoning => None,
+    }
+}
+
+/// The tool a started step names (the adapter records the step's own tool name in its input),
+/// when it is one of the `tools` its kind is watched for.
+fn step_tool(input: Option<&serde_json::Value>, tools: &[&str]) -> Option<String> {
+    input
+        .and_then(|i| i.get("tool_name"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| tools.contains(name))
+        .map(str::to_owned)
+}
+
+/// Uses up the hook query that covers a step: one for its own tool when it names one, else one
+/// for any tool of its kind.
+fn consume_for_step(approval: &ApprovalHandle, exact: Option<&str>, tools: &[&str]) -> bool {
+    match exact {
+        Some(name) => approval.consume_query(&[name]),
+        None => approval.consume_query(tools),
     }
 }
 
@@ -480,6 +512,39 @@ struct Inner {
     /// a Codex prompt to that live process is written at once, never held in the adapter's own
     /// queue. Cleared by every start and every teardown.
     provider_session_up: Cell<Option<u64>>,
+    /// The window waits for this thread's usage limit to reset (`continue_after_limit`): sub-agent
+    /// news does not wake it meanwhile; only the continuation starts a turn. Cleared by the window,
+    /// by a turn that completes, and by a switch to another agent.
+    limit_waiting: Cell<bool>,
+    /// The continuation a busy switch owes its task ([`SwitchContinuation`]).
+    switch_continuation: RefCell<Option<SwitchContinuation>>,
+    /// Bumped by every switch: a continuation an older switch armed is never sent.
+    switch_revision: Cell<u64>,
+    /// A delegation root's rebind is about to stop the running turn for a switch
+    /// ([`ChatSession::note_switch_interrupts_turn`]): the switch that follows continues it, though
+    /// no turn runs by then. Taken by the next switch; a turn that ends on its own clears it.
+    switch_interrupted: Cell<bool>,
+    /// The next switch to this agent continues the thread though no turn runs: "Continue in" after
+    /// a usage limit ([`ChatSession::continue_after_switch_to`]). Taken by the next switch.
+    continue_on_switch_to: Cell<Option<(Driver, u64)>>,
+    /// Bumped by every "Continue in", which it names.
+    continue_armed: Cell<u64>,
+    /// Bumped whenever the agent works again on its own ([`ChatSession::work_epoch`]).
+    work_epoch: Cell<u64>,
+}
+
+/// The one continuation a busy switch sends its new process, once two things are true, in
+/// either order: the handoff is prepared (the switch read the thread and made the new process its
+/// own) and nothing holds the process any more (no delegation rebind, or `rebind_start` ran).
+/// Whichever comes second sends it, once. A later switch drops it, and a turn that ends on its
+/// own before the handoff is prepared drops it too (nothing is left to continue).
+struct SwitchContinuation {
+    /// The switch it belongs to (`switch_revision`).
+    revision: u64,
+    /// The agent it continues on.
+    driver: Driver,
+    prepared: bool,
+    ready: bool,
 }
 
 /// What the session decided about one Codex permission request, keyed by the id the view knows
@@ -923,6 +988,13 @@ impl ChatSession {
             wakes_held: Cell::new(false),
             held_news: RefCell::new(None),
             provider_session_up: Cell::new(None),
+            limit_waiting: Cell::new(false),
+            switch_continuation: RefCell::new(None),
+            switch_revision: Cell::new(0),
+            switch_interrupted: Cell::new(false),
+            continue_on_switch_to: Cell::new(None),
+            continue_armed: Cell::new(0),
+            work_epoch: Cell::new(0),
         });
         *inner.weak_self.borrow_mut() = Some(Rc::downgrade(&inner));
         inner.attach_approval();
@@ -958,6 +1030,70 @@ impl ChatSession {
     /// permissive mode, which ends with its agent; the last safe choice instead.
     pub fn wanted_mode(&self) -> Mode {
         self.inner.safe_mode.get()
+    }
+
+    /// A delegation root is about to be stopped for a switch (its rebind): a turn running now
+    /// is interrupted by that switch, not finished, so the switch that follows continues it
+    /// once, as a busy switch does. Called before the stop.
+    ///
+    /// A new preparation also overtakes an earlier switch: one still reading the thread goes no
+    /// further, and the continuation it still owed (its turn was stopped, nothing continued it)
+    /// passes to the switch that follows, the newest choice.
+    pub(crate) fn note_switch_interrupts_turn(&self) {
+        let inner = &self.inner;
+        inner.end_pending_switch();
+        let owed = inner.switch_continuation.borrow_mut().take().is_some();
+        if owed || inner.state.borrow().running_turn {
+            inner.switch_interrupted.set(true);
+        }
+    }
+
+    /// "Continue in" another agent: the next switch to `driver` hands the thread over and then
+    /// starts a turn with the handoff, as a busy switch does, though no turn runs now. Another
+    /// switch, or the user writing first, drops it.
+    ///
+    /// `since` is [`Self::work_epoch`] when the user asked (a question may have been open
+    /// since): if the agent has continued or completed a turn meanwhile, the work it was to
+    /// continue is done, and nothing is armed. False then.
+    pub(crate) fn continue_after_switch_to(&self, driver: Driver, since: u64) -> bool {
+        if self.inner.work_epoch.get() != since {
+            return false;
+        }
+        let armed = self.inner.continue_armed.get().wrapping_add(1);
+        self.inner.continue_armed.set(armed);
+        self.inner.continue_on_switch_to.set(Some((driver, armed)));
+        true
+    }
+
+    /// Bumped whenever the agent works again on its own: it continued after its usage limit,
+    /// or completed a turn after a prompt. What a "Continue in" asked at one value is for.
+    pub(crate) fn work_epoch(&self) -> u64 {
+        self.inner.work_epoch.get()
+    }
+
+    /// Which "Continue in" waits for the next switch, if one does: what a switch attempt that
+    /// may never reach the session takes back ([`Self::forget_continue_after_switch`]).
+    pub(crate) fn continue_after_switch_armed(&self) -> Option<u64> {
+        self.inner
+            .continue_on_switch_to
+            .get()
+            .map(|(_, armed)| armed)
+    }
+
+    /// The switch a "Continue in" was asked for will not happen (its question was cancelled,
+    /// its preparation failed): it is dropped. `armed` names the one to drop, so a later one
+    /// asked meanwhile stays; `None` drops whichever waits.
+    pub(crate) fn forget_continue_after_switch(&self, armed: Option<u64>) {
+        let current = self.inner.continue_on_switch_to.get();
+        if armed.is_none() || current.map(|(_, a)| a) == armed {
+            self.inner.continue_on_switch_to.set(None);
+        }
+    }
+
+    /// The window waits (or no longer waits) for this thread's usage limit to reset: while it
+    /// does, sub-agent news does not wake the agent; only the continuation does.
+    pub(crate) fn set_limit_wait(&self, waiting: bool) {
+        self.inner.limit_waiting.set(waiting);
     }
 
     /// Re-arms a handoff found stored and undelivered in the thread's history (see
@@ -1044,7 +1180,7 @@ impl ChatSession {
     /// conversation: the next prompt starts it again, resuming the same native session. Nothing
     /// is said to the view or stored. Whether it stopped.
     pub fn suspend_if_idle(&self) -> bool {
-        self.inner.suspend()
+        self.inner.suspend(false)
     }
 
     /// Where the agent process is in its life, for the header and the sidebar (read-only).
@@ -1316,6 +1452,9 @@ impl Inner {
                 }
                 // Codex's turn-scoped permission grants ended with the turn.
                 self.codex_turn_grant_paths.borrow_mut().clear();
+                if !self.stopping.get() {
+                    self.turn_ended_on_its_own(*state);
+                }
                 // Only the turn of the prompt that carried the handoff spends it, and only when
                 // it completed with a top-level answer: see `handoff_turn_end`.
                 let end = handoff_turn_end(
@@ -2499,19 +2638,25 @@ impl Inner {
     /// tool would run unasked. So each state-changing tool step must be matched by a query the
     /// hook sent us. The query and the step travel on different channels, hence the grace.
     ///
-    /// Scope: command, file edit, MCP, subagent and web steps. Unclassified (`Tool`) steps are not
-    /// watched: agy's internal steps (finish, wait, task bookkeeping) are not known to be hooked,
-    /// and killing a healthy session over one would be worse than missing it.
+    /// Scope: command (task management and scheduling included), file edit, MCP, subagent and web
+    /// steps. Unclassified (`Tool`) steps are not watched: agy's internal steps (finish, wait) are
+    /// not known to be hooked, and killing a healthy session over one would be worse than missing
+    /// it.
     fn watch_tool_step(self: &Rc<Self>, env: &Envelope) {
         match &env.event {
-            Event::ItemStarted { kind, .. } => {
+            Event::ItemStarted { kind, input, .. } => {
                 let Some(tools) = canary_tools(*kind) else {
                     return;
                 };
                 let Some(approval) = self.approval() else {
                     return;
                 };
-                if self.adapter.borrow().driver() != Driver::Agy || approval.consume_query(tools) {
+                // The step names its tool: only a query for that very tool covers it. A step
+                // that does not name one of the kind's tools falls back to the whole group.
+                let exact = step_tool(input.as_ref(), tools);
+                if self.adapter.borrow().driver() != Driver::Agy
+                    || consume_for_step(&approval, exact.as_deref(), tools)
+                {
                     return;
                 }
                 let item_id = env.item.clone();
@@ -2535,7 +2680,10 @@ impl Inner {
                     {
                         return;
                     }
-                    if inner.approval().is_some_and(|a| a.consume_query(tools)) {
+                    if inner
+                        .approval()
+                        .is_some_and(|a| consume_for_step(&a, exact.as_deref(), tools))
+                    {
                         return;
                     }
                     if let Some(id) = &item_id {
@@ -3171,12 +3319,15 @@ impl Inner {
     /// What stops [`Self::suspend`] now, if anything (the first reason found). The process can
     /// be stopped and resumed later with nothing lost only when it is alive, has a conversation
     /// to resume (a native id, and a turn on it or a resumed start), and holds no work,
-    /// question or state that lives only in the process or in flight. Never a delegated worker,
-    /// never dangerous permissive mode (session-only: a resume would not re-enter it), and
-    /// never with session grants Codex's own process holds (they would end unannounced).
-    fn suspend_blocker(&self) -> Option<&'static str> {
+    /// question or state that lives only in the process or in flight. Never dangerous permissive
+    /// mode (session-only: a resume would not re-enter it), and never with session grants
+    /// Codex's own process holds (they would end unannounced). `worker`: the supervisor pausing
+    /// one of its delegated workers, the only way one is ever suspended (a thread's idle sweep
+    /// never stops a worker; the supervisor never stops anything else this way).
+    fn suspend_blocker(&self, worker: bool) -> Option<&'static str> {
         let state = self.state.borrow();
         let checks = [
+            (worker && self.child.is_none(), "not a delegated worker"),
             (!state.alive, "not running"),
             (state.running_turn, "a turn is running"),
             (state.mode == Mode::Bypass, "dangerous permissive mode"),
@@ -3189,7 +3340,7 @@ impl Inner {
                 !self.codex_grants.borrow().is_empty(),
                 "Codex session grants",
             ),
-            (self.child.is_some(), "a delegated worker"),
+            (!worker && self.child.is_some(), "a delegated worker"),
             (self.active_workers.get() > 0, "active provider workers"),
             (
                 !self.proc.borrow().as_ref().is_some_and(|p| p.is_alive()),
@@ -3227,11 +3378,12 @@ impl Inner {
 
     /// Stops an idle agent process to free its memory, keeping its native session so the next
     /// prompt resumes it ([`Self::ensure_alive`]). Silent: no exit reaches the view or the
-    /// store, since nothing ended for the user. A delegation root's stop is a planned rotation
-    /// its hooks agree to (nothing revoked; the next prompt rebinds quietly). False, doing
-    /// nothing, while [`Self::suspend_blocker`] names a reason or the hooks refuse.
-    fn suspend(&self) -> bool {
-        if let Some(why) = self.suspend_blocker() {
+    /// store, since nothing ended for the user. A delegation root's or delegated worker's stop
+    /// is a planned rotation its hooks agree to (nothing revoked; the next prompt or instruction
+    /// rebinds quietly). False, doing nothing, while [`Self::suspend_blocker`] names a reason or
+    /// the hooks refuse. `worker`: as for [`Self::suspend_blocker`].
+    fn suspend(&self, worker: bool) -> bool {
+        if let Some(why) = self.suspend_blocker(worker) {
             tracing::debug!(thread = %self.thread, why, "idle agent not suspended");
             return false;
         }
@@ -3577,6 +3729,8 @@ impl Inner {
     }
 
     fn queue_prompt(self: &Rc<Self>, text: &str) {
+        // A message written first is what goes on, not a "Continue in" still waiting.
+        self.continue_on_switch_to.set(None);
         let item = glib::uuid_string_random().to_string();
 
         self.deliver(
@@ -3611,6 +3765,7 @@ impl Inner {
     /// ride on a real prompt. A write the adapter refuses turns the shown message into a queued
     /// one, so it is never lost.
     fn steer_prompt(self: &Rc<Self>, text: &str) {
+        self.continue_on_switch_to.set(None);
         // A switch waiting to read the thread: the message is for its new agent, never a live
         // write into the outgoing one. It queues (and is held if the switch does not happen).
         if self.switch_reading.get() {
@@ -3691,6 +3846,8 @@ impl Inner {
     }
 
     fn send_prompt(self: &Rc<Self>, text: &str) {
+        // The user wrote before a "Continue in" switch was made: that message is what goes on.
+        self.continue_on_switch_to.set(None);
         if self.rebinding.get() || self.switch_reading.get() {
             // Nothing runs until the rebind starts the next generation, or the switch its new
             // process, which then sends the queue.
@@ -4358,8 +4515,21 @@ impl Inner {
     }
 
     fn switch(self: &Rc<Self>, driver: Driver, model: Option<String>, effort: Option<String>) {
-        // The latest choice wins over a switch still reading the thread.
+        // The latest choice wins over a switch still reading the thread, and over the
+        // continuation an earlier switch still owes.
         self.end_pending_switch();
+        let revision = self.switch_revision.get().wrapping_add(1);
+        self.switch_revision.set(revision);
+        // What an overtaken switch still owed (its turn was stopped and nothing continued it)
+        // passes to this one, the newest choice: the task is continued once, here.
+        let owed = self.switch_continuation.borrow_mut().take().is_some();
+        // A turn a delegation root's rebind stopped for this switch, or "Continue in": the switch
+        // continues the task as a busy one does, though no turn runs now.
+        let interrupted = self.switch_interrupted.replace(false) || owed;
+        let asked = self
+            .continue_on_switch_to
+            .take()
+            .is_some_and(|(to, _)| to == driver);
         let (caps, current_driver, mode, status_model, current_effort, running) = {
             let adapter = self.adapter.borrow();
             let state = self.state.borrow();
@@ -4380,6 +4550,7 @@ impl Inner {
                 state.running_turn,
             )
         };
+        let busy = running || interrupted || asked;
         // No effort asked for on the same agent means "keep it", not "clear it".
         let effort = match (&effort, driver == current_driver) {
             (None, true) => current_effort.clone(),
@@ -4421,22 +4592,24 @@ impl Inner {
         // Persistence follows backend acceptance, never a click or a failed request.
         *self.retired.borrow_mut() = None;
         if same_driver
-            && running
-            && matches!(
+            && busy
+            && (matches!(
                 transition,
                 Transition::SwitchModelInSession | Transition::RestartAndResume
-            )
+            ) || (interrupted && matches!(transition, Transition::Reuse)))
         {
             // The picker already confirmed Switch and Continue. A process replacement actually
             // interrupts this turn and expires its questions/approvals before resuming.
             // Transport writes are asynchronous: even a known native session might never
             // have received the latest task. Carry bounded context as well as native history.
+            self.arm_switch_continuation(revision, driver);
             let asked_model = model.clone();
             self.with_thread_handoff(driver, driver, move |inner, handoff| {
-                // The turn ended while the thread was read: nothing is left to continue, and a
-                // continuation would only redo finished work. The switch is an idle one now,
-                // and what was queued meanwhile goes on the new model once it is made.
-                if !inner.state.borrow().running_turn {
+                // The turn ended on its own while the thread was read: nothing is left to
+                // continue, and a continuation would only redo finished work. The switch is an
+                // idle one now, and what was queued meanwhile goes on the new model once it is
+                // made.
+                if !inner.continuation_owed(revision) {
                     inner.switch_went_ahead();
                     inner.switch(driver, asked_model, effort);
                     return;
@@ -4444,28 +4617,50 @@ impl Inner {
                 let handoff = match handoff {
                     Ok(handoff) => handoff,
                     Err(e) => {
+                        inner.switch_continuation.borrow_mut().take();
                         inner.error(format!(
                             "Could not read the unfinished task to continue: {e}"
                         ));
                         inner.hold_for_switch(Some(driver), "failed");
+                        // A rebind that stopped the agent for this switch starts it again.
+                        inner.ensure_alive();
                         return;
                     }
                 };
                 inner.switch_went_ahead();
                 let native = inner.state.borrow().native_id.clone();
-                {
+                let delta = OpenSessionDelta {
+                    model: Some(target_model),
+                    effort,
+                    mode: None,
+                    resume: native,
+                };
+                let running = inner.state.borrow().alive || inner.proc.borrow().is_some();
+                if running {
                     let _carrying = ScopedFlag::set(&inner.carrying_task);
-                    inner.respawn(&OpenSessionDelta {
-                        model: Some(target_model),
-                        effort,
-                        mode: None,
-                        resume: native,
-                    });
+                    inner.respawn(&delta);
+                } else {
+                    // Stopped already (a delegation root's rebind): the next start takes the
+                    // choice. During the rebind that start is `rebind_start`'s, never one here.
+                    inner.apply_delta(&delta);
+                    inner.ensure_alive();
                 }
                 if handoff.carried > 0 {
                     inner.arm_handoff(handoff);
                 }
-                inner.continue_after_switch(driver);
+                inner.handoff_prepared(revision);
+            });
+            return;
+        }
+        // Stopped for a delegation root's rebind, same agent: no process to tell, and none may
+        // start before the rebind's own start, which launches with the choice.
+        if self.rebinding.get() && same_driver && !self.state.borrow().alive {
+            let native = self.state.borrow().native_id.clone();
+            self.apply_delta(&OpenSessionDelta {
+                model: (!target_model.is_empty()).then_some(target_model),
+                effort,
+                mode: None,
+                resume: native,
             });
             return;
         }
@@ -4540,7 +4735,10 @@ impl Inner {
             }
             Transition::CreateWithHandoff => {
                 // It ends the switch itself, once the thread is read.
-                self.create_with_handoff(driver, model, effort, running);
+                if busy {
+                    self.arm_switch_continuation(revision, driver);
+                }
+                self.create_with_handoff(driver, model, effort, busy, revision);
                 return;
             }
             Transition::Reject(reason) => self.error(reason),
@@ -4562,6 +4760,116 @@ impl Inner {
             self.send_prompt_now(super::SWITCH_CONTINUATION);
         }
         self.settle_carried(sent);
+    }
+
+    /// A busy switch (`revision`, to `driver`) owes its task a continuation. It is ready at once
+    /// unless a delegation rebind holds the process: then `rebind_start` makes it ready.
+    fn arm_switch_continuation(&self, revision: u64, driver: Driver) {
+        *self.switch_continuation.borrow_mut() = Some(SwitchContinuation {
+            revision,
+            driver,
+            prepared: false,
+            ready: !self.rebinding.get(),
+        });
+    }
+
+    /// Whether switch `revision` still owes a continuation: not overtaken by a later switch, nor
+    /// dropped by its turn ending on its own.
+    fn continuation_owed(&self, revision: u64) -> bool {
+        self.switch_continuation
+            .borrow()
+            .as_ref()
+            .is_some_and(|c| c.revision == revision)
+    }
+
+    /// Switch `revision` made its new process its own, with the handoff armed: its continuation
+    /// goes now if nothing holds the process, else when the rebind ends.
+    fn handoff_prepared(self: &Rc<Self>, revision: u64) {
+        let due = match self.switch_continuation.borrow_mut().as_mut() {
+            Some(c) if c.revision == revision => {
+                c.prepared = true;
+                c.ready
+            }
+            _ => return,
+        };
+        if due {
+            self.send_switch_continuation();
+        }
+    }
+
+    /// A delegation rebind ended (`rebind_start`, after it started the next process): a busy
+    /// switch whose handoff is prepared continues now; one still reading the thread, when its
+    /// handoff is.
+    pub(super) fn rebind_ready(self: &Rc<Self>) {
+        let due = match self.switch_continuation.borrow_mut().as_mut() {
+            Some(c) => {
+                c.ready = true;
+                c.prepared
+            }
+            None => return,
+        };
+        if due {
+            self.send_switch_continuation();
+        }
+    }
+
+    /// Sends the owed continuation, once: it is taken before it goes.
+    fn send_switch_continuation(self: &Rc<Self>) {
+        let Some(continuation) = self.switch_continuation.borrow_mut().take() else {
+            return;
+        };
+        self.continue_after_switch(continuation.driver);
+    }
+
+    /// A turn ended on its own (not stopped by the app), `state`: a switch about to continue it
+    /// has nothing left to continue, and a completed turn after a prompt means the agent works
+    /// again, so the thread no longer waits for a usage limit.
+    fn turn_ended_on_its_own(&self, state: TurnState) {
+        self.switch_interrupted.set(false);
+        let unprepared = self
+            .switch_continuation
+            .borrow()
+            .as_ref()
+            .is_some_and(|c| !c.prepared);
+        if unprepared {
+            self.switch_continuation.borrow_mut().take();
+        }
+        if state == TurnState::Completed && self.prompted.get() {
+            self.limit_waiting.set(false);
+            // The agent works again: a "Continue in" asked while it was stopped is moot.
+            self.continue_on_switch_to.set(None);
+            self.work_epoch.set(self.work_epoch.get().wrapping_add(1));
+        }
+    }
+
+    /// `delta` applied to what the next start launches, as [`Self::respawn`] does, without
+    /// stopping or starting anything: the process is already gone.
+    fn apply_delta(&self, delta: &OpenSessionDelta) {
+        if let Some(model) = &delta.model {
+            let effort = delta
+                .effort
+                .clone()
+                .or_else(|| self.state.borrow().effort.clone());
+            self.prepare_model_change(model.clone(), effort, true);
+        }
+        {
+            let mut open = self.open.borrow_mut();
+            if let Some(m) = &delta.model {
+                open.model = Some(m.clone());
+            }
+            if let Some(e) = &delta.effort {
+                open.effort = Some(e.clone());
+            }
+            if let Some(resume) = &delta.resume {
+                open.resume = Some(resume.clone());
+                open.new_session_id = None;
+            }
+        }
+        if let Some(m) = &delta.model {
+            self.emit(Envelope::new(Event::ModelChangeRequested {
+                model: m.clone(),
+            }));
+        }
     }
 
     /// Ends the switch's hold on `carried_unsent`: dropped when its continuation went (the
@@ -4595,18 +4903,20 @@ impl Inner {
         model: Option<String>,
         effort: Option<String>,
         busy: bool,
+        revision: u64,
     ) {
         let Some(factory) = self.factory.borrow().clone() else {
             self.error("Switching agent is not available in this thread.");
-            self.end_switch(driver, busy);
+            self.end_switch(busy, revision);
             return;
         };
         // Built from the store before anything is stopped, so a failure leaves the thread as it was.
         let from = self.adapter.borrow().driver();
         self.with_thread_handoff(from, driver, move |inner, handoff| {
-            // A turn that ended while the thread was read has nothing left to continue: a
-            // continuation would only redo finished work, so the switch ends as an idle one.
-            let busy = busy && inner.state.borrow().running_turn;
+            // A turn that ended on its own while the thread was read has nothing left to
+            // continue: a continuation would only redo finished work, so the switch ends as an
+            // idle one.
+            let busy = busy && inner.continuation_owed(revision);
             let switched = {
                 // Busy, a message still waiting in an unspawned start is the continuation's.
                 let _carrying = busy.then(|| ScopedFlag::set(&inner.carrying_task));
@@ -4624,15 +4934,19 @@ impl Inner {
                 // (its start waited for it): it is back as it was.
                 inner.ensure_alive();
             }
-            inner.end_switch(driver, busy);
+            inner.end_switch(busy, revision);
         });
     }
 
-    /// The end of a switch: [`Self::create_with_handoff`]'s.
-    fn end_switch(self: &Rc<Self>, driver: Driver, busy: bool) {
+    /// The end of a switch: [`Self::create_with_handoff`]'s. Busy, its continuation goes once
+    /// nothing holds the new process ([`Self::handoff_prepared`]); idle, the queue does.
+    fn end_switch(self: &Rc<Self>, busy: bool, revision: u64) {
         if busy {
-            self.continue_after_switch(driver);
+            self.handoff_prepared(revision);
         } else {
+            if self.continuation_owed(revision) {
+                self.switch_continuation.borrow_mut().take();
+            }
             self.dispatch_queued_prompt();
         }
     }
@@ -4756,6 +5070,10 @@ impl Inner {
         launch: AgentLaunch,
         installed: Installed,
     ) -> (Mode, bool, bool) {
+        // The limit the thread waited out was the old agent's.
+        if self.adapter.borrow().driver() != driver {
+            self.limit_waiting.set(false);
+        }
         *self.provider_thread.borrow_mut() = pt;
         *self.adapter.borrow_mut() = launch.adapter;
         self.adapter_epoch.set(self.adapter_epoch.get() + 1);
@@ -5823,21 +6141,39 @@ fn new_fence() -> String {
     glib::uuid_string_random().replace('-', "")
 }
 
+/// What a handoff carries of one item: a tool's opens with what it did ("command: Run cargo
+/// test"), so a command with no output, or an edit whose result says nothing of its target,
+/// still shows; its output (capped later, as tool output) follows.
+fn carried_text(message: &TranscriptMessage) -> String {
+    if message.role != "tool" || message.title.trim().is_empty() {
+        return message.text.clone();
+    }
+    let line = format!("{}: {}", message.kind, message.title);
+    if message.text.trim().is_empty() {
+        line
+    } else {
+        format!("{line}\n{}", message.text)
+    }
+}
+
 /// The budgeted, fenced and redacted handoff of a thread's history. Tool items are carried as
-/// tool output (capped, untrusted); items with no text are skipped, and an item still open (its
-/// process died with it) is described as interrupted.
+/// tool output (capped, untrusted) under their title; items with nothing to say are skipped,
+/// and an item still open (its process died with it) is described as interrupted. The thread's
+/// inherited context (what a fork started from) is carried as one item.
 pub(crate) fn build_handoff(messages: &[TranscriptMessage], source: &str) -> Handoff {
     let history: Vec<HistoricalMessage> = messages
         .iter()
-        .filter(|m| !m.text.trim().is_empty())
-        .map(|m| HistoricalMessage {
+        .map(|m| (m, carried_text(m)))
+        .filter(|(_, text)| !text.trim().is_empty())
+        .map(|(m, text)| HistoricalMessage {
             role: match m.role.as_str() {
                 "user" => Role::User,
                 "tool" => Role::Tool,
+                agent_kit::store::INHERITED_ROLE => Role::Inherited,
                 _ => Role::Assistant,
             },
             kind: m.kind.clone(),
-            text: m.text.clone(),
+            text,
             item_id: m.item_id.clone(),
             status: if m.status == "open" {
                 "interrupted".to_owned()
@@ -5993,12 +6329,33 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
+    mod capacity_tests;
+    mod continuation_tests;
     mod delegated_tests;
+    mod handoff_tests;
     mod switch_tests;
     mod teardown_tests;
 
     const FIXTURE: &str = include_str!("../../crates/agent-core/tests/fixtures/agy-edit.ndjson");
     const CONVERSATION: &str = "3af90996-e4fe-44be-8d6c-ca20da039f6f";
+
+    #[test]
+    fn the_1_4_tools_are_watched() {
+        let edits = canary_tools(ItemKind::FileChange).expect("edits are watched");
+        for tool in ["write_to_file", "edit_file"] {
+            assert!(edits.contains(&tool), "{tool}");
+        }
+        let subagents = canary_tools(ItemKind::Subagent).expect("subagents are watched");
+        for tool in [
+            "start_subagent",
+            "invoke_subagent",
+            "manage_subagents",
+            "send_message",
+        ] {
+            assert!(subagents.contains(&tool), "{tool}");
+        }
+        assert!(canary_tools(ItemKind::FileRead).is_none());
+    }
 
     pub(super) type Seen = Rc<RefCell<Vec<Envelope>>>;
 
@@ -6289,7 +6646,7 @@ mod tests {
                 "up once it reported"
             );
             assert_eq!(
-                session.inner.suspend_blocker(),
+                session.inner.suspend_blocker(false),
                 Some("no conversation yet to resume"),
                 "Claude's prompt-less init turn leaves no transcript to resume"
             );
@@ -6310,7 +6667,7 @@ mod tests {
             };
             let stored_before = stored();
 
-            assert_eq!(session.inner.suspend_blocker(), None);
+            assert_eq!(session.inner.suspend_blocker(false), None);
             assert!(session.suspend_if_idle(), "an idle session suspends");
             assert!(!session.status().alive);
             assert_eq!(session.lifecycle(), life(false, false, true), "paused");
@@ -6865,13 +7222,13 @@ mod tests {
             ))));
             // A session id with no prompted turn on it may name no transcript to resume.
             assert_eq!(
-                session.inner.suspend_blocker(),
+                session.inner.suspend_blocker(false),
                 Some("no conversation yet to resume")
             );
             session.send_prompt("first");
             assert!(pump_until(ctx, 10, || session.inner.has_conversation.get()
                 && !session.status().running_turn));
-            assert_eq!(session.inner.suspend_blocker(), None, "idle now");
+            assert_eq!(session.inner.suspend_blocker(false), None, "idle now");
             // Codex's own session grants would end unannounced.
             session
                 .inner
@@ -6879,7 +7236,7 @@ mod tests {
                 .borrow_mut()
                 .push("Network access".into());
             assert_eq!(
-                session.inner.suspend_blocker(),
+                session.inner.suspend_blocker(false),
                 Some("Codex session grants")
             );
             session.inner.codex_grants.borrow_mut().clear();
@@ -6902,7 +7259,7 @@ mod tests {
                 .inner
                 .emit(workers(agent_core::event::WorkerState::Running));
             assert_eq!(
-                session.inner.suspend_blocker(),
+                session.inner.suspend_blocker(false),
                 Some("active provider workers")
             );
             assert!(!session.suspend_if_idle(), "a running worker keeps it up");
@@ -6910,7 +7267,7 @@ mod tests {
                 .inner
                 .emit(workers(agent_core::event::WorkerState::Stopping));
             assert_eq!(
-                session.inner.suspend_blocker(),
+                session.inner.suspend_blocker(false),
                 Some("active provider workers"),
                 "a stop in progress is still active"
             );
@@ -6918,7 +7275,7 @@ mod tests {
                 .inner
                 .emit(workers(agent_core::event::WorkerState::Completed));
             assert_eq!(
-                session.inner.suspend_blocker(),
+                session.inner.suspend_blocker(false),
                 None,
                 "settled workers let go"
             );
@@ -8709,7 +9066,10 @@ mod tests {
                     .read(|s| s.transcript_messages(&session.inner.thread))
                     .expect("read")
                     .expect("messages")
-                    .len(),
+                    .iter()
+                    // The handoff armed before any message reads back as inherited context.
+                    .filter(|m| m.role != agent_kit::store::INHERITED_ROLE)
+                    .count(),
                 2,
                 "replaying input never stores it twice"
             );
@@ -9140,7 +9500,7 @@ mod tests {
             // Compact by handoff restarts the same agent on a fresh launch.
             session
                 .inner
-                .create_with_handoff(Driver::Agy, None, None, false);
+                .create_with_handoff(Driver::Agy, None, None, false, 0);
             assert_eq!(session.status().mode, Mode::Ask, "compact");
             let argv = session.launch_spec().argv;
             assert!(!argv.iter().any(|a| a == "plan"), "{argv:?}");
@@ -9153,6 +9513,62 @@ mod tests {
             seen,
             |e| matches!(e, Event::Error { message } if message.contains("approval hook is not active")),
         )
+    }
+
+    /// Real agy 1.4 step frames, fed through the adapter: each of these steps runs unasked if
+    /// the hook is not firing, so the canary must trip on every one of them.
+    #[test]
+    fn agy_1_4_steps_with_no_hook_query_trip_the_canary() {
+        for (tool, params) in [
+            ("edit_file", serde_json::json!({"Path": "/w/a.rs"})),
+            (
+                "manage_task",
+                serde_json::json!({"Action": "status", "TaskId": "t1"}),
+            ),
+            (
+                "manage_task",
+                serde_json::json!({"Action": "kill", "TaskId": "t1"}),
+            ),
+            (
+                "schedule",
+                serde_json::json!({"DurationSeconds": 60, "Prompt": "again"}),
+            ),
+            (
+                "send_message",
+                serde_json::json!({"Recipient": "r", "Message": "m"}),
+            ),
+            ("manage_subagents", serde_json::json!({"Action": "list"})),
+            ("define_subagent", serde_json::json!({"Name": "helper"})),
+            ("browser_subagent", serde_json::json!({"Task": "look"})),
+        ] {
+            let step = serde_json::json!({"event": "step_update", "conversation_id": "c1",
+                "step_update": {"conversation_id": "c1", "state": "RUNNING", "step_index": 1,
+                    "step_type": "tool", "tool_name": tool,
+                    "tool_info": {"parameters": params}}})
+            .to_string();
+            in_loop(|ctx| {
+                let tmp = tempfile::tempdir().expect("tmp");
+                let store = Rc::new(Store::open_in_memory().expect("store"));
+                let thread = fresh(&store, "/w");
+                let (sink, seen) = make_sink();
+                let handle = bound_handle(tmp.path());
+                let open = scripted(tmp.path(), &format!("echo '{step}'\nexec sleep 30"));
+                let session = ChatSession::new(
+                    Box::new(AgyAdapter::new("agy")),
+                    open,
+                    store,
+                    thread,
+                    sink,
+                    Some(handle),
+                );
+                session.set_canary_grace(Duration::from_millis(200));
+                assert!(
+                    pump_until(ctx, 15, || hook_missing_error(&seen)),
+                    "the canary let {tool} {params} run unasked"
+                );
+                session.shutdown(false);
+            });
+        }
     }
 
     #[test]
@@ -9561,6 +9977,100 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(resolutions, [Decision::Deny]);
         });
+    }
+
+    /// Runs a hooked agy that sends `queries` (as the hook would) and then prints `steps`;
+    /// whether the canary tripped.
+    fn canary_trips(
+        queries: &[(&str, serde_json::Value)],
+        steps: &[(&str, serde_json::Value)],
+    ) -> bool {
+        let tripped = Cell::new(false);
+        in_loop(|ctx| {
+            use std::io::Write as _;
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let handle = bound_handle(tmp.path());
+            let socket = handle.socket_path().to_owned();
+            let printed: Vec<String> = steps
+                .iter()
+                .enumerate()
+                .map(|(i, (tool, params))| {
+                    let line = serde_json::json!({"event": "step_update", "conversation_id": "c1",
+                        "step_update": {"conversation_id": "c1", "state": "RUNNING",
+                            "step_index": i + 1, "step_type": "tool", "tool_name": tool,
+                            "tool_info": {"parameters": params}}});
+                    format!("echo '{line}'")
+                })
+                .collect();
+            let body = format!(
+                "while [ ! -e \"$D/go\" ]; do sleep 0.05; done\n{}\nexec sleep 30",
+                printed.join("\n")
+            );
+            let session = ChatSession::new(
+                Box::new(AgyAdapter::new("agy")),
+                scripted(tmp.path(), &body),
+                store,
+                thread,
+                sink,
+                Some(handle),
+            );
+            session.set_canary_grace(Duration::from_millis(300));
+            let mut hooks = Vec::new();
+            for (i, (tool, args)) in queries.iter().enumerate() {
+                let mut hook = std::os::unix::net::UnixStream::connect(&socket).expect("connect");
+                let query = agent_core::approval::ApprovalQuery {
+                    id: format!("h{i}"),
+                    conversation_id: "c1".into(),
+                    tool: (*tool).into(),
+                    args: args.clone(),
+                    cwd: None,
+                };
+                writeln!(
+                    hook,
+                    "{}",
+                    agent_core::approval::encode_query(&query).expect("enc")
+                )
+                .expect("send");
+                hooks.push(hook);
+            }
+            // Let the server record the queries before the steps arrive.
+            let _ = pump_until(ctx, 1, || false);
+            std::fs::write(tmp.path().join("go"), "").expect("go");
+            tripped.set(pump_until(ctx, 3, || hook_missing_error(&seen)));
+            drop(hooks);
+            session.shutdown(false);
+        });
+        tripped.get()
+    }
+
+    /// A query for one tool never covers an unhooked step of another, even one watched in the
+    /// same group; each step uses up the query for its own tool.
+    #[test]
+    fn a_hook_query_covers_only_the_step_of_its_own_tool() {
+        let run = ("run_command", serde_json::json!({"CommandLine": "ls"}));
+        let kill = serde_json::json!({"Action": "kill", "TaskId": "t1"});
+        let status = serde_json::json!({"Action": "status", "TaskId": "t1"});
+        assert!(
+            canary_trips(&[run], &[("manage_task", kill.clone())]),
+            "a run_command query covered an unhooked manage_task"
+        );
+        assert!(
+            !canary_trips(
+                &[("manage_task", kill.clone())],
+                &[("manage_task", kill.clone())]
+            ),
+            "a manage_task query did not cover its own step"
+        );
+        assert!(
+            canary_trips(
+                &[("manage_task", status.clone())],
+                &[("manage_task", status.clone()), ("manage_task", kill)]
+            ),
+            "a consumed status query covered a later unhooked kill"
+        );
     }
 
     #[test]
@@ -10047,6 +10557,7 @@ mod tests {
             text: text.into(),
             item_id: id.into(),
             status: status.into(),
+            title: String::new(),
         };
         let history = [
             msg("user", "user_message", "run it", "open", "u1"),

@@ -812,10 +812,14 @@ pub(super) struct ChatTab {
 }
 
 impl ChatTab {
-    /// The thread no longer waits for its usage limit.
+    /// The thread no longer waits for its usage limit: its session may be woken by sub-agent
+    /// news again.
     fn end_limit_wait(&mut self) {
         self.limit_wait = None;
         self.wait_banner.set_revealed(false);
+        if let Some(session) = self.slot.get() {
+            session.set_limit_wait(false);
+        }
     }
 
     /// Says on the wait banner when the thread continues.
@@ -2786,6 +2790,10 @@ impl AgentTerminalWindow {
         if minutes == 0 || self.is_closing() {
             return;
         }
+        // Delegated workers idle as long give their process slots back the same way.
+        if let Some(sup) = crate::delegation::supervisor() {
+            sup.stop_idle_children(minutes);
+        }
         let shown = self.shown_thread.borrow().clone();
         let now = std::time::Instant::now();
         // Collected first: a session stopping must not find the registry borrowed.
@@ -2862,6 +2870,10 @@ impl AgentTerminalWindow {
             }
         }
         chat.show_limit_wait(now);
+        // Sub-agent news waits too: the limit would refuse the turn it started.
+        if let Some(session) = chat.slot.get() {
+            session.set_limit_wait(true);
+        }
     }
 
     /// "Don't Continue": `thread` stops waiting for its usage limit (until it hits it again).
@@ -4086,6 +4098,10 @@ impl AgentTerminalWindow {
         self.ask(dialog, "stop", move |imp, stop| {
             imp.with_chat_mut(&thread, |c| c.confirming_switch = false);
             if !stop {
+                // Not switching: a "Continue in" asked for this switch goes with it.
+                if let Some(session) = imp.slot_of(&thread).and_then(|s| s.get()) {
+                    session.forget_continue_after_switch(None);
+                }
                 return;
             }
             // The slot again: the page may have closed while the question was open.
@@ -6183,7 +6199,9 @@ impl AgentTerminalWindow {
 
     /// The banners' "Continue in" button and a bare `/handoff`: hand the thread to the next
     /// usable agent, never silently to an agy that would edit unasked (see
-    /// [`safe_handoff_target`]): that one is confirmed first.
+    /// [`safe_handoff_target`]): that one is confirmed first. While the thread is stopped by its
+    /// usage limit (its banner, or a limit wait), the new agent then continues the work with the
+    /// handoff, as a busy switch does; otherwise the handoff waits for the user's next message.
     fn continue_rate_limited(&self, thread: &str) {
         let Some(slot) = self.slot_of(thread) else {
             return;
@@ -6193,11 +6211,37 @@ impl AgentTerminalWindow {
             |d| self.agent_usable(d),
             self.agy_cannot_ask_for(thread),
         );
+        // Stopped by its limit: the new agent is to continue the work as it stands now.
+        let continue_since = self
+            .stopped_by_limit(thread)
+            .then(|| slot.get().map(|s| s.work_epoch()))
+            .flatten();
         match target {
-            Some((target, false)) => self.switch_in_place(thread, target),
-            Some((target, true)) => self.confirm_unasked_switch(thread, target),
+            Some((target, false)) => self.hand_over(thread, target, continue_since),
+            Some((target, true)) => self.confirm_unasked_switch(thread, target, continue_since),
             None => self.show_toast("No other agent is installed and enabled"),
         }
+    }
+
+    /// Whether `thread` is stopped by its usage limit: its banner is up, or it waits.
+    fn stopped_by_limit(&self, thread: &str) -> bool {
+        self.with_chat(thread, |c| c.limit_wait.is_some() || c.rate_limited)
+            .unwrap_or(false)
+    }
+
+    /// Switches `thread` to `target` in place; with `continue_since` (the session's work epoch
+    /// when the user asked), its new agent then continues the work
+    /// ([`ChatSession::continue_after_switch_to`]), only if the thread is still stopped by its
+    /// limit and its agent has not worked since (a question may have been open meanwhile).
+    /// Asked for this one switch only: a switch that does not reach the session (a question
+    /// cancelled, a preparation that failed) takes it back.
+    fn hand_over(&self, thread: &str, target: Driver, continue_since: Option<u64>) {
+        if let Some(since) = continue_since.filter(|_| self.stopped_by_limit(thread)) {
+            if let Some(session) = self.slot_of(thread).and_then(|s| s.get()) {
+                session.continue_after_switch_to(target, since);
+            }
+        }
+        self.switch_in_place(thread, target);
     }
 
     /// Switches `thread` (open in this window) to `target` in place, on the agent's default model.
@@ -6419,7 +6463,7 @@ impl AgentTerminalWindow {
 
     /// Asks before handing `thread` to `target` (agy without its hook) while the thread forbids
     /// unasked edits: it would apply edits on its own. One question at a time.
-    fn confirm_unasked_switch(&self, thread: &str, target: Driver) {
+    fn confirm_unasked_switch(&self, thread: &str, target: Driver, continue_since: Option<u64>) {
         if self.unasked_prompt_open.replace(true) {
             return;
         }
@@ -6440,7 +6484,7 @@ impl AgentTerminalWindow {
         self.ask(dialog, "continue", move |imp, go| {
             imp.unasked_prompt_open.set(false);
             if go {
-                imp.switch_in_place(&thread, target);
+                imp.hand_over(&thread, target, continue_since);
             }
         });
     }

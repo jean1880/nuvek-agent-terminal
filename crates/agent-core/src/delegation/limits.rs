@@ -14,7 +14,8 @@ pub struct Limits {
     // Runs, processes, depth, pending starts.
     pub active_runs_per_root: u32,
     pub active_runs_app: u32,
-    /// An idle process still counts; only an observed exit frees a slot.
+    /// An idle process still counts; only an observed exit frees a slot. A spawn or restart
+    /// past it first pauses the least recently active idle worker that can resume losslessly.
     pub live_processes_app: u32,
     pub max_depth: u8,
     pub pending_starts_per_root: u32,
@@ -151,7 +152,12 @@ impl Default for Limits {
 pub struct Usage {
     pub active_runs_root: u32,
     pub active_runs_app: u32,
+    /// Processes up, plus slots admitted for a launch not yet holding one.
     pub live_processes: u32,
+    /// Workers whose process is up with no run open.
+    pub idle_workers: u32,
+    /// Processes already stopping: each frees its slot once its exit is seen.
+    pub stopping_processes: u32,
     pub pending_root: u32,
     pub pending_app: u32,
     pub waits_app: u32,
@@ -168,7 +174,8 @@ fn capacity(limit: &str) -> ToolError {
     .with_detail("limit", limit)
 }
 
-/// One more spawn: a pending start and an active run, plus a live process when it needs one.
+/// One more spawn: a pending start and an active run, plus a live process when it needs one
+/// (refused with [`processes_full`]).
 pub fn admit_spawn(l: &Limits, u: &Usage, needs_process: bool) -> Result<(), ToolError> {
     let checks = [
         (
@@ -190,9 +197,34 @@ pub fn admit_spawn(l: &Limits, u: &Usage, needs_process: bool) -> Result<(), Too
         }
     }
     if needs_process && u.live_processes >= l.live_processes_app {
-        return Err(capacity("live_processes_app"));
+        return Err(processes_full(l, u));
     }
     Ok(())
+}
+
+/// Every process slot is taken and no idle worker could be paused to free one. Names the limit,
+/// how many of those workers are idle, and what frees a slot. Retryable only while a run is in
+/// progress (once it ends, its worker may be paused for the next start) or a process is already
+/// stopping (its exit frees a slot).
+pub fn processes_full(l: &Limits, u: &Usage) -> ToolError {
+    let runs = u.active_runs_app > 0 || u.stopping_processes > 0;
+    let mut message = format!(
+        "delegation limit reached: live_processes_app ({} of {} agent processes in use; {} of \
+         their workers are idle but cannot be paused now without losing work). Closing a worker you \
+         no longer need with cross_agent_close frees its slot.",
+        u.live_processes, l.live_processes_app, u.idle_workers
+    );
+    if u.stopping_processes > 0 {
+        message.push_str(" A process already stopping frees one when it exits.");
+    } else if runs {
+        message.push_str(" A run in progress may free one when it ends.");
+    }
+    let mut e = ToolError::new(ErrorCode::CapacityReached, message)
+        .with_detail("limit", "live_processes_app")
+        .with_detail("live_processes", u.live_processes)
+        .with_detail("idle_workers", u.idle_workers);
+    e.retryable = runs;
+    e
 }
 
 /// One more open wait.
@@ -270,6 +302,43 @@ mod tests {
         let mut no_process = full;
         no_process.live_processes = 8;
         assert_eq!(admit_spawn(&l, &no_process, false), Ok(()));
+    }
+
+    /// A full process table says how many workers sit idle and what frees a slot, and is worth
+    /// retrying only while a run is in progress.
+    #[test]
+    fn a_full_process_table_is_explained_and_retryable_only_while_a_run_will_end() {
+        let l = Limits::default();
+        let idle = Usage {
+            live_processes: 8,
+            idle_workers: 8,
+            ..Usage::default()
+        };
+        let e = admit_spawn(&l, &idle, true).expect_err("full");
+        assert_eq!(e.code, ErrorCode::CapacityReached);
+        assert!(!e.retryable, "nothing running will end");
+        assert!(e.message.contains("live_processes_app"), "{}", e.message);
+        assert!(e.message.contains("8 of 8"), "{}", e.message);
+        assert!(e.message.contains("cross_agent_close"), "{}", e.message);
+        let details = e.details.expect("details");
+        assert_eq!(details["limit"], "live_processes_app");
+        assert_eq!(details["idle_workers"], 8);
+        assert_eq!(details["live_processes"], 8);
+        let running = Usage {
+            active_runs_app: 1,
+            idle_workers: 7,
+            ..idle
+        };
+        let e = admit_spawn(&l, &running, true).expect_err("full");
+        assert!(e.retryable, "a run in progress may free a slot");
+        assert!(e.message.contains("7 of"), "{}", e.message);
+        let stopping = Usage {
+            stopping_processes: 1,
+            ..idle
+        };
+        let e = admit_spawn(&l, &stopping, true).expect_err("full");
+        assert!(e.retryable, "a process already stopping frees a slot");
+        assert!(e.message.contains("already stopping"), "{}", e.message);
     }
 
     #[test]

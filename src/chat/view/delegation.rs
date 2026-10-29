@@ -127,6 +127,18 @@ impl Worker {
         })
     }
 
+    /// Whether `history` is still live next to `live`: its scope is the live one, or an earlier
+    /// run of the same process still has a request open that the user can answer.
+    fn keeps(&self, history: &History, live: Option<&Scope>) -> bool {
+        live.is_some_and(|live| {
+            history.scope == *live
+                || (self.summary.waiting_on_user
+                    && history.scope.generation == live.generation
+                    && history.scope.worker == live.worker
+                    && history.model.pending_interruption().is_some())
+        })
+    }
+
     fn summary(&self) -> SubagentSummary {
         let identity = self.summary.identity.as_ref();
         let delegation = identity.map(|identity| WorkerDelegation {
@@ -173,6 +185,7 @@ impl Worker {
             requested_model: None,
             requested_effort: None,
             reported_model: None,
+            waiting_on_user: self.summary.waiting_on_user,
         }
     }
 }
@@ -187,13 +200,13 @@ impl Workers {
     }
 
     fn live_histories(&self) -> impl Iterator<Item = (&Worker, &History)> {
-        self.records.iter().filter_map(|worker| {
-            let scope = worker.live_scope()?;
+        self.records.iter().flat_map(|worker| {
+            let live = worker.live_scope();
             worker
                 .histories
                 .iter()
-                .find(|history| history.scope == scope)
-                .map(|history| (worker, history))
+                .filter(move |history| worker.keeps(history, live.as_ref()))
+                .map(move |history| (worker, history))
         })
     }
 
@@ -239,15 +252,19 @@ impl Workers {
             {
                 worker.summary = summary.clone();
                 let live = worker.live_scope();
-                for history in &mut worker.histories {
-                    if Some(&history.scope) != live.as_ref()
+                let keep: Vec<bool> = worker
+                    .histories
+                    .iter()
+                    .map(|history| worker.keeps(history, live.as_ref()))
+                    .collect();
+                for (history, keep) in worker.histories.iter_mut().zip(keep) {
+                    if !keep
                         || matches!(
                             summary.state,
-                            WorkerState::Closed
-                                | WorkerState::Stopped
-                                | WorkerState::Unknown
-                                | WorkerState::Failed
+                            WorkerState::Closed | WorkerState::Stopped | WorkerState::Unknown
                         )
+                        // A failed turn leaves a background worker's request answerable.
+                        || (summary.state == WorkerState::Failed && !summary.waiting_on_user)
                     {
                         history.model.settle_stale();
                         history.model.mark_replayed();
@@ -294,8 +311,13 @@ impl Workers {
         {
             record.canonical_scope = scope;
             let live = record.live_scope();
-            for history in &mut record.histories {
-                if Some(&history.scope) != live.as_ref() {
+            let keep: Vec<bool> = record
+                .histories
+                .iter()
+                .map(|history| record.keeps(history, live.as_ref()))
+                .collect();
+            for (history, keep) in record.histories.iter_mut().zip(keep) {
+                if !keep {
                     history.model.settle_stale();
                     history.model.mark_replayed();
                 } else {
@@ -342,10 +364,28 @@ impl Workers {
         else {
             return;
         };
-        let at = worker
-            .histories
-            .iter()
-            .position(|history| history.scope == scoped.scope)
+        // A request is settled in the history that holds it, even when a later run of the same
+        // process is the one reporting that it was answered or expired.
+        let holder = match (&scoped.envelope.event, scoped.envelope.request.as_deref()) {
+            (
+                Event::ApprovalResolved { .. }
+                | Event::ApprovalExpired
+                | Event::QuestionResolved { .. }
+                | Event::FormResolved { .. },
+                Some(native),
+            ) => worker.histories.iter().position(|history| {
+                history.scope.generation == scoped.scope.generation
+                    && history.requests.contains_key(native)
+            }),
+            _ => None,
+        };
+        let at = holder
+            .or_else(|| {
+                worker
+                    .histories
+                    .iter()
+                    .position(|history| history.scope == scoped.scope)
+            })
             .unwrap_or_else(|| {
                 let mut history = History::new(scoped.scope.clone());
                 history.identity = worker.summary.identity.clone();
@@ -354,13 +394,11 @@ impl Workers {
             });
         worker.histories[at].apply(&scoped.envelope, driver);
         if replayed
-            && matches!(
+            && (matches!(
                 worker.summary.state,
-                WorkerState::Unknown
-                    | WorkerState::Stopped
-                    | WorkerState::Closed
-                    | WorkerState::Failed
-            )
+                WorkerState::Unknown | WorkerState::Stopped | WorkerState::Closed
+            ) || (worker.summary.state == WorkerState::Failed
+                && !worker.summary.waiting_on_user))
         {
             worker.histories[at].model.settle_stale();
             worker.histories[at].model.mark_replayed();
@@ -654,7 +692,13 @@ impl Inner {
             .delegation
             .borrow()
             .worker(scope.worker.as_str())
-            .is_some_and(|worker| worker.live_scope().as_ref() == Some(&scope))
+            .is_some_and(|worker| {
+                let live = worker.live_scope();
+                worker
+                    .histories
+                    .iter()
+                    .any(|history| history.scope == scope && worker.keeps(history, live.as_ref()))
+            })
         {
             return;
         }
@@ -903,16 +947,14 @@ impl Inner {
     fn worker_request(self: &Rc<Self>, scope: &Scope, event: RowEvent) {
         let worker_id = scope.worker.as_str();
         let native = |request: &str| {
-            self.delegation
-                .borrow()
-                .worker(worker_id)
-                .filter(|worker| worker.live_scope().as_ref() == Some(scope))
-                .and_then(|worker| {
-                    worker
-                        .histories
-                        .iter()
-                        .find(|history| &history.scope == scope)
-                })
+            let workers = self.delegation.borrow();
+            let worker = workers.worker(worker_id)?;
+            let live = worker.live_scope();
+            // The live run's history, or an earlier run's that still holds an open request.
+            worker
+                .histories
+                .iter()
+                .find(|history| &history.scope == scope && worker.keeps(history, live.as_ref()))
                 .and_then(|history| history.native_requests.get(request).cloned())
         };
         let (request, action) = match event {
@@ -1112,6 +1154,7 @@ pub(crate) mod tests {
             },
             delegation: DelegationStatus::new(DelegationStatusCode::Available),
             last_activity: None,
+            waiting_on_user: false,
             updated_at: "2026-10-15T00:00:00Z".into(),
         }
     }
@@ -1383,6 +1426,7 @@ pub(crate) mod tests {
     pub(crate) fn ui_checks() {
         worker_shelf_ui_checks();
         bypass_allows_worker_requests_ui_checks();
+        requests_across_runs_ui_checks();
         let backend = Rc::new(Backend {
             actions: RefCell::new(Vec::new()),
             diff_scopes: RefCell::new(Vec::new()),
@@ -1763,5 +1807,166 @@ pub(crate) mod tests {
             matches!(backend.actions.borrow().last(), Some(WorkerAction::Approve { request, decision: Decision::Allow, .. }) if request == "later")
         );
         assert_eq!(backend.actions.borrow().len(), 2);
+    }
+
+    /// Requests left open by run A of a process stay answerable once run B has started, by the
+    /// user and by dangerous permissive mode, and a resolution reported in run B settles the
+    /// card in run A's history.
+    fn requests_across_runs_ui_checks() {
+        requests_across_runs(true);
+        requests_across_runs(false);
+    }
+
+    /// One view per answerer: the user's answer or dangerous permissive mode's.
+    fn requests_across_runs(by_user: bool) {
+        let backend = Rc::new(Backend {
+            actions: RefCell::new(Vec::new()),
+            diff_scopes: RefCell::new(Vec::new()),
+            root_answers: Cell::new(0),
+            mode: Cell::new(Mode::Ask),
+        });
+        let view = ChatView::new(backend.clone());
+        let subscriber = view.delegation_subscriber("root-thread");
+        let inner = view.inner().expect("inner");
+        subscriber.registry("root-thread", &[summary("w_workerAA", "r_firstRun")]);
+        let run_a = scope("w_workerAA", 1, "r_firstRun");
+        let approval = |request: &str| {
+            Envelope::new(Event::ApprovalRequested {
+                tool: "Bash".into(),
+                title: None,
+                input: json!({"command":"true"}),
+                reason: None,
+                options: vec![Decision::Allow, Decision::Deny],
+                response: ResponseCapability::Live,
+                remembers: None,
+            })
+            .request(request)
+        };
+        for request in ["a", "b"] {
+            subscriber.scoped(&ScopedEnvelope {
+                scope: run_a.clone(),
+                envelope: approval(request),
+            });
+        }
+        // Run B starts in the same process; both requests are still open.
+        let mut next = summary("w_workerAA", "r_secondRun");
+        next.waiting_on_user = true;
+        next.state = WorkerState::Waiting;
+        subscriber.registry("root-thread", &[next]);
+        let run_b = scope("w_workerAA", 1, "r_secondRun");
+        subscriber.scoped(&ScopedEnvelope {
+            scope: run_b.clone(),
+            envelope: Envelope::new(Event::TurnStarted { model: None }),
+        });
+        // The provider reports a answered in run B: only b stays pending, in run A's history.
+        subscriber.scoped(&ScopedEnvelope {
+            scope: run_b,
+            envelope: Envelope::new(Event::ApprovalExpired).request("a"),
+        });
+        let (local_a, local_b) = {
+            let workers = inner.delegation.borrow();
+            let worker = workers.worker("w_workerAA").expect("worker");
+            let history = worker
+                .histories
+                .iter()
+                .find(|h| h.scope == run_a)
+                .expect("run A history");
+            assert_eq!(
+                history.model.pending_approvals_offering(Decision::Allow),
+                [history.requests["b"].clone()],
+                "only the unsettled request stays pending"
+            );
+            (history.requests["a"].clone(), history.requests["b"].clone())
+        };
+        assert!(local_a != local_b);
+        // The user answers b from run A's card, opened in the worker's inspector.
+        if by_user {
+            assert!(inner.open_worker("w_workerAA"));
+            let inspector = inner.worker_inspector.borrow().clone().expect("inspector");
+            *inspector.selected.borrow_mut() = Some(run_a.clone());
+            inner.worker_row(
+                "w_workerAA",
+                RowEvent::Approve {
+                    request: local_b,
+                    decision: Decision::Allow,
+                    custom_rule: None,
+                },
+            );
+        } else {
+            // Dangerous permissive mode answers it too, once.
+            backend.mode.set(Mode::Bypass);
+            inner.allow_worker_requests();
+        }
+        assert!(
+            matches!(backend.actions.borrow().as_slice(), [WorkerAction::Approve { scope, request, .. }] if scope == &run_a && request == "b")
+        );
+    }
+
+    #[test]
+    fn a_request_stays_answerable_in_a_later_run_of_the_same_process() {
+        let mut workers = Workers::default();
+        workers.registry(&[summary("w_workerAA", "r_firstRun")]);
+        feed(
+            &mut workers,
+            &scope("w_workerAA", 1, "r_firstRun"),
+            Envelope::new(Event::ApprovalRequested {
+                tool: "shell".into(),
+                title: None,
+                input: json!({"command":"true"}),
+                reason: None,
+                options: vec![Decision::Allow, Decision::Deny],
+                response: ResponseCapability::Live,
+                remembers: None,
+            })
+            .request("native-1"),
+        );
+        // The next run starts in the same process while the request is still open.
+        let mut next = summary("w_workerAA", "r_secondRun");
+        next.waiting_on_user = true;
+        workers.registry(&[next]);
+        assert_eq!(workers.needs_user(), Some(Activity::NeedsApproval));
+        // Once the worker no longer waits on the user, the old run's card is stale.
+        workers.registry(&[summary("w_workerAA", "r_secondRun")]);
+        assert_eq!(workers.needs_user(), None);
+    }
+
+    #[test]
+    fn a_worker_with_an_open_request_and_no_run_is_active_and_waiting() {
+        let mut asking = summary("w_workerAA", "r_firstRun");
+        asking.state = WorkerState::Waiting;
+        asking.run_id = None;
+        asking.waiting_on_user = true;
+        let mut workers = Workers::default();
+        workers.registry(&[asking]);
+        let agents = workers.summaries();
+        assert!(agents[0].running() && agents[0].active() && !agents[0].idle());
+        assert_eq!(agents[0].state_label(), "waiting");
+        assert_eq!(
+            super::super::subagents::count_text(&agents),
+            "1 active · 0 finished"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_worker_is_idle_and_not_counted_as_active() {
+        let mut idle = summary("w_workerAA", "r_firstRun");
+        idle.state = WorkerState::Waiting;
+        idle.run_id = None;
+        let mut asking = summary("w_workerBB", "r_secondRun");
+        asking.state = WorkerState::Waiting;
+        asking.waiting_on_user = true;
+        let mut working = summary("w_workerCC", "r_thirdRun");
+        working.state = WorkerState::Running;
+        let mut workers = Workers::default();
+        workers.registry(&[idle, asking, working]);
+        let agents = workers.summaries();
+        let labels: Vec<_> = agents.iter().map(|a| a.state_label()).collect();
+        assert_eq!(labels, ["idle", "waiting", "running"]);
+        assert!(agents[0].idle() && !agents[0].running());
+        assert!(agents[1].running() && agents[2].running());
+        assert_eq!(
+            super::super::subagents::count_text(&agents),
+            "2 active · 1 finished"
+        );
     }
 }

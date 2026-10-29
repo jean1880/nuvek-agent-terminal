@@ -57,16 +57,24 @@ impl HookInput {
     }
 
     /// The question for the app. `id` must be unique per call (the hook picks it). The working
-    /// directory is the command's own `Cwd` when it has one, else the first workspace path.
+    /// directory is a command's own `Cwd` when it has one, else the first workspace path. Only
+    /// the command tools honour `Cwd`: a file tool resolves a relative path against the
+    /// workspace whatever `Cwd` says, so it is not taken from there.
     pub fn to_query(&self, id: impl Into<String>) -> ApprovalQuery {
-        let cwd = self
-            .tool_call
-            .args
-            .get("Cwd")
-            .and_then(Value::as_str)
-            .filter(|c| !c.is_empty())
-            .map(str::to_owned)
-            .or_else(|| self.workspace_paths.first().cloned());
+        let own = matches!(
+            self.tool_call.name.as_str(),
+            "run_command" | "send_command_input"
+        )
+        .then(|| {
+            self.tool_call
+                .args
+                .get("Cwd")
+                .and_then(Value::as_str)
+                .filter(|c| !c.is_empty())
+                .map(str::to_owned)
+        })
+        .flatten();
+        let cwd = own.or_else(|| self.workspace_paths.first().cloned());
         ApprovalQuery {
             id: id.into(),
             conversation_id: self.conversation_id.clone(),
@@ -161,6 +169,28 @@ mod tests {
 
     fn out(reply: Option<&ApprovalReply>) -> Value {
         serde_json::from_str(&hook_output(reply)).expect("hook output is JSON")
+    }
+
+    #[test]
+    fn only_command_tools_take_their_cwd_from_the_arguments() {
+        let query = |tool: &str| {
+            let payload = format!(
+                r#"{{"toolCall":{{"name":"{tool}","args":{{"Path":"Makefile","Cwd":"/ws/tests"}}}},"workspacePaths":["/ws"]}}"#
+            );
+            HookInput::parse(&payload).expect("parse").to_query("q").cwd
+        };
+        for tool in ["run_command", "send_command_input"] {
+            assert_eq!(query(tool).as_deref(), Some("/ws/tests"), "{tool}");
+        }
+        for tool in [
+            "read_file",
+            "edit_file",
+            "view_file",
+            "write_to_file",
+            "grep_search",
+        ] {
+            assert_eq!(query(tool).as_deref(), Some("/ws"), "{tool}");
+        }
     }
 
     #[test]

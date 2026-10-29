@@ -81,6 +81,7 @@ const PATH_KEYS: &[&str] = &[
     "filePath",
     "filepath",
     "DirectoryPath",
+    "Path",
 ];
 const COMMAND_KEYS: &[&str] = &["command", "CommandLine", "cmd"];
 const PATTERN_KEYS: &[&str] = &["pattern", "Pattern", "query", "Query", "SearchPattern"];
@@ -92,8 +93,8 @@ fn kind_of_name(name: &str) -> Option<ToolKind> {
     Some(match name {
         "Bash" | "bash" | "run_command" | "send_command_input" | "command_execution"
         | "commandExecution" | "shell" | "local_shell" => ToolKind::Run,
-        "Read" | "NotebookRead" | "LS" | "view_file" | "list_dir" | "view_code_item"
-        | "view_file_outline" => ToolKind::Read,
+        "Read" | "NotebookRead" | "LS" | "view_file" | "read_file" | "list_dir"
+        | "view_code_item" | "view_file_outline" => ToolKind::Read,
         "Grep" | "Glob" | "grep_search" | "find_by_name" | "codebase_search" | "WebSearch"
         | "search_web" | "web_search" | "webSearch" => ToolKind::Search,
         "Edit"
@@ -101,6 +102,7 @@ fn kind_of_name(name: &str) -> Option<ToolKind> {
         | "NotebookEdit"
         | "replace_file_content"
         | "multi_replace_file_content"
+        | "edit_file"
         | "sed_file"
         | "notebook_edit"
         | "apply_patch"

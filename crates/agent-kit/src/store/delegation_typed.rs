@@ -21,7 +21,9 @@
 use std::collections::{BTreeSet, HashSet};
 
 use agent_core::adapter::Driver;
-use agent_core::delegation::authority::{revocation, RevocationEffect, RevocationEvent, TaskMode};
+use agent_core::delegation::authority::{
+    revocation, RevocationEffect, RevocationEvent, RevocationScope, TaskMode,
+};
 use agent_core::delegation::error::{truncate_bytes, ErrorCode, ToolError};
 use agent_core::delegation::identity::Identity;
 use agent_core::delegation::ids::{
@@ -30,8 +32,8 @@ use agent_core::delegation::ids::{
 use agent_core::delegation::lifecycle::RunState;
 use agent_core::delegation::limits::{admit_spawn, Limits, Usage};
 use agent_core::delegation::mailbox::{
-    ack_eligible, delivery_step, kind_allowed, ContinuationBudget, DeliveryState, Direction,
-    MessageKind,
+    ack_eligible, delivery_step, kind_allowed, requeue_refused_steer, ContinuationBudget,
+    DeliveryState, Direction, MessageKind, MAX_RESULT_PARTS,
 };
 use agent_core::delegation::operation::{
     canonical_request, idempotency, on_restart, operation_step, replay, CanonicalRequest,
@@ -151,6 +153,13 @@ fn operation_id(s: &str) -> Result<OperationId> {
 
 fn illegal(what: &str) -> StoreError {
     StoreError::Failed(format!("illegal delegation transition: {what}"))
+}
+
+/// [`Store::meta`] key of the epoch an accepted operation was carried to by a revocation that
+/// did not cover it: its own row's epoch is frozen at acceptance. Removed once it leaves
+/// `accepted`.
+fn carried_epoch_key(op: &str) -> String {
+    format!("delegation_operation_epoch:{op}")
 }
 
 fn rfc3339_ms(ms: i64) -> String {
@@ -373,9 +382,13 @@ pub struct Completion {
     pub worker_state: WorkerState,
     pub reason: Option<String>,
     pub usage_json: Option<String>,
-    /// The result for the parent's mailbox (scrubbed and cut to [`MAX_RESULT_BYTES`]); `None`
-    /// sends no notification.
-    pub result: Option<String>,
+    /// The result for the parent's mailbox, as `mailbox::result_parts` split it: one `report`
+    /// per part, in order (each scrubbed again and cut to [`MAX_RESULT_BYTES`]; at most
+    /// `MAX_RESULT_PARTS`). Empty sends no notification.
+    pub result: Vec<String>,
+    /// A dispatch that failed with the run (a task cancelled before its turn opened): recorded
+    /// in the same transaction, after the run's end, so it never ends the run itself.
+    pub dispatch_failure: Option<(OperationId, ToolError)>,
     /// The terminal event and its links.
     pub event: PublishEvent,
 }
@@ -384,7 +397,10 @@ pub struct Completion {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completed {
     pub event: Published,
+    /// The first part of the result (the one a wake names), if any.
     pub notification: Option<(MessageId, i64)>,
+    /// Every part of the result, in order: its message and that message's seq.
+    pub parts: Vec<(MessageId, i64)>,
 }
 
 /// A committed revocation.
@@ -680,13 +696,6 @@ impl Store {
             Err(code) => done(
                 ToolError::new(code, "the authority epoch changed; read capabilities again")
                     .with_detail("authority_epoch", current.0),
-            ),
-            Ok(IdempotencyDecision::StaleEpoch(op)) => done(
-                ToolError::new(
-                    ErrorCode::StaleEpoch,
-                    "this key was used under an earlier authority epoch",
-                )
-                .with_detail("operation_id", op.as_str()),
             ),
             Ok(IdempotencyDecision::Conflict(op)) => done(
                 ToolError::new(
@@ -1066,7 +1075,9 @@ impl Store {
                 kind: req.kind,
             }),
             seq: 0,
-            complete_now: false,
+            // A child's send to its parent is mailbox data, delivered once stored: nothing
+            // dispatches it, so its operation is done at acceptance (as an ACK is).
+            complete_now: direction == Direction::ChildToParent,
         }))
     }
 
@@ -1307,6 +1318,11 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(op.to_string()))?;
         let from: OperationState = parse_name("dispatch state", &row.dispatch_state)?;
         operation_step(from, to).map_err(|_| illegal("operation"))?;
+        // An epoch carried by a revocation applies only while it is accepted: every way out
+        // of `accepted` (reservation, failure, revocation, restart) drops it, in this unit.
+        if from == OperationState::Accepted {
+            self.delete_meta(&carried_epoch_key(&row.id))?;
+        }
         // Every stored error is scrubbed whole (message and every string of its nested details):
         // it is replayed to callers verbatim.
         let error_json = error
@@ -1353,6 +1369,17 @@ impl Store {
         )?)
     }
 
+    /// The epoch an accepted operation holds now: the one a revocation that did not cover it
+    /// carried it to, else the one it was accepted under.
+    fn operation_epoch(&self, row: &OperationRow) -> Result<i64> {
+        match self.meta(&carried_epoch_key(&row.id))? {
+            Some(v) => v.parse().map_err(|_| {
+                StoreError::Failed(format!("the stored epoch of {} is unreadable", row.id))
+            }),
+            None => Ok(row.authority_epoch),
+        }
+    }
+
     fn messages_of_operation(&self, op: &str) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
@@ -1369,6 +1396,18 @@ impl Store {
         error: &ToolError,
         now: i64,
     ) -> Result<Vec<MessageId>> {
+        self.end_undispatched(row, error, DeliveryState::Cancelled, now)
+    }
+
+    /// [`Self::invalidate_operation`], its queued parent→child message moving to `message`
+    /// (`cancelled` by a revocation, `failed` when it was abandoned).
+    fn end_undispatched(
+        &self,
+        row: &OperationRow,
+        error: &ToolError,
+        message: DeliveryState,
+        now: i64,
+    ) -> Result<Vec<MessageId>> {
         let op = operation_id(&row.id)?;
         let stored = error.clone().with_detail("operation_id", row.id.as_str());
         self.step_operation(&op, OperationState::Failed, Some(&stored), now)?;
@@ -1379,7 +1418,7 @@ impl Store {
             if !self.is_parent_to_child(&m)? {
                 continue;
             }
-            if self.try_step_message(&m, DeliveryState::Cancelled, None, now)? {
+            if self.try_step_message(&m, message, None, now)? {
                 cancelled.push(message_id(&m)?);
             }
         }
@@ -1434,7 +1473,7 @@ impl Store {
         }
         let now = self.now();
         let root = self.root_row(&row.root_id)?;
-        if root.authority_epoch != row.authority_epoch {
+        if root.authority_epoch != self.operation_epoch(&row)? {
             let e = ToolError::new(ErrorCode::StaleEpoch, "the authority epoch changed");
             self.invalidate_operation(&row, &e, now)?;
             return Ok(Err(e.with_detail("operation_id", op.as_str())));
@@ -1592,10 +1631,18 @@ impl Store {
                     }
                 }
                 DeliveryState::ProviderConfirmed => {
-                    if let (Some(t), Some(o)) = (row.target_run_id.as_deref(), observed) {
-                        if t != o {
+                    // An `auto` message promised no run: one its refused steer aimed at and
+                    // that it then reached on the next turn is delivered, not misdelivered.
+                    let auto = row.delivery_policy == name_of(&Delivery::Auto);
+                    match (row.target_run_id.as_deref(), observed) {
+                        (Some(t), Some(o)) if t != o && !auto => {
                             return Err(illegal("confirmed in another run is misdelivered"));
                         }
+                        // A message pinned to a run is confirmed only in a run it names.
+                        (Some(_), None) if !auto => {
+                            return Err(illegal("a targeted message is confirmed in a run"));
+                        }
+                        _ => {}
                     }
                 }
                 _ => {}
@@ -1603,6 +1650,86 @@ impl Store {
             let now = s.now();
             s.set_delegation_message_delivery(m.as_str(), &name_of(&to), observed, now)?;
             Ok(to)
+        })
+    }
+
+    /// An `auto` parent→child message whose steer the recipient's run refused after it was
+    /// written (`submitted`) waits for the recipient's next turn again (`queued_next_turn`), and
+    /// its operation is `accepted` again, in the same transaction: from here it is any accepted
+    /// send, so its next dispatch is reserved with every check (the epoch, a closed target), and a
+    /// revocation or a restart fails it like any other. Its epoch is the root's current one (it was
+    /// current, being in flight). The only way back from `submitted`, for either
+    /// (`mailbox::requeue_refused_steer`, `operation::requeue_refused_steer`); any other message,
+    /// or one in any other state, is refused and nothing changes. The run it was aimed at stays
+    /// recorded as accepted (a frozen fact), and a confirmation in a later run is its delivery
+    /// ([`Store::record_delegation_delivery`]).
+    pub fn requeue_refused_delegation_steer(&self, m: &MessageId) -> Result<DeliveryState> {
+        self.atomically(|s| {
+            let row = s
+                .delegation_message(m.as_str())?
+                .ok_or_else(|| StoreError::NotFound(m.to_string()))?;
+            if !s.is_parent_to_child(m.as_str())? {
+                return Err(illegal("only a delivery to a child is requeued"));
+            }
+            let from: DeliveryState = parse_name("delivery state", &row.delivery_state)?;
+            let policy: Delivery = parse_name("delivery policy", &row.delivery_policy)?;
+            let to = requeue_refused_steer(from, policy).map_err(|_| illegal("requeue"))?;
+            let op = row
+                .operation_id
+                .as_deref()
+                .and_then(|id| s.delegation_operation(id).transpose())
+                .transpose()?
+                .ok_or_else(|| illegal("a requeued steer needs its operation"))?;
+            let op_from: OperationState = parse_name("dispatch state", &op.dispatch_state)?;
+            let op_to = agent_core::delegation::operation::requeue_refused_steer(op_from)
+                .map_err(|_| illegal("requeue"))?;
+            let now = s.now();
+            s.set_delegation_message_delivery(m.as_str(), &name_of(&to), None, now)?;
+            s.set_delegation_dispatch_state(&op.id, &name_of(&op_to), None, None, now)?;
+            let root = s.root_row(&op.root_id)?;
+            if root.authority_epoch != op.authority_epoch {
+                s.set_meta(
+                    &carried_epoch_key(&op.id),
+                    &root.authority_epoch.to_string(),
+                )?;
+            }
+            Ok(to)
+        })
+    }
+
+    /// A steer whose answer was overdue (its operation and message `unknown`) was accepted
+    /// after all: the message is delivered, in `run` (a run of its recipient) when named, and
+    /// the operation confirmed, together. Anything not in that state is refused unchanged.
+    pub fn confirm_late_delegation_steer(&self, m: &MessageId, run: Option<&RunId>) -> Result<()> {
+        self.atomically(|s| {
+            let row = s
+                .delegation_message(m.as_str())?
+                .ok_or_else(|| StoreError::NotFound(m.to_string()))?;
+            let from: DeliveryState = parse_name("delivery state", &row.delivery_state)?;
+            let to = agent_core::delegation::mailbox::confirm_late_steer(from)
+                .map_err(|_| illegal("late confirmation"))?;
+            let op = row
+                .operation_id
+                .as_deref()
+                .and_then(|id| s.delegation_operation(id).transpose())
+                .transpose()?
+                .ok_or_else(|| illegal("a late confirmation needs its operation"))?;
+            let op_from: OperationState = parse_name("dispatch state", &op.dispatch_state)?;
+            let op_to = agent_core::delegation::operation::confirm_late_steer(op_from)
+                .map_err(|_| illegal("late confirmation"))?;
+            if let Some(r) = run {
+                let root = s.root_row(&row.root_id)?;
+                s.check_run_of(r, Some(&worker_id(&row.recipient_worker_id)?), &root)?;
+            }
+            let now = s.now();
+            s.set_delegation_message_delivery(
+                m.as_str(),
+                &name_of(&to),
+                run.map(RunId::as_str),
+                now,
+            )?;
+            s.set_delegation_dispatch_state(&op.id, &name_of(&op_to), None, None, now)?;
+            Ok(())
         })
     }
 
@@ -1668,51 +1795,72 @@ impl Store {
                 now,
             )?;
             s.set_delegation_worker_state(&worker.id, &name_of(&c.worker_state), None, now)?;
-            let mut notification = None;
-            if let (Some(result), Some(parent)) = (&c.result, &worker.parent_id) {
-                let message = s.new_message_id()?;
-                let row = MessageRow {
-                    id: message.to_string(),
-                    root_id: worker.root_id.clone(),
-                    operation_id: None,
-                    sender_worker_id: worker.id.clone(),
-                    recipient_worker_id: parent.clone(),
-                    kind: name_of(&MessageKind::Report),
-                    reply_to: None,
-                    body: truncate_bytes(&redact(result), MAX_RESULT_BYTES).to_owned(),
-                    delivery_policy: name_of(&Delivery::Auto),
-                    target_run_id: None,
-                    delivery_state: name_of(&DeliveryState::Queued),
-                    recipient_run_id: None,
-                    queued_at: now,
-                    submitted_at: None,
-                    confirmed_at: None,
-                    presented_at: None,
-                    acknowledged_at: None,
-                    updated_at: now,
-                    event_seq: None,
+            // After the run's end: a failed dispatch recorded first would end the run itself.
+            // A dispatch that already settled another way (confirmed, say) is left as it is.
+            if let Some((op, e)) = &c.dispatch_failure {
+                let settled = match s.delegation_operation(op.as_str())? {
+                    Some(row) => {
+                        let from: OperationState =
+                            parse_name("dispatch state", &row.dispatch_state)?;
+                        operation_step(from, OperationState::Failed).is_err()
+                    }
+                    None => true,
                 };
-                let seq = s.insert_message_and_event(
-                    &row,
-                    Direction::ChildToParent,
-                    MessageKind::Report,
-                )?;
-                notification = Some((message, seq));
+                if !settled {
+                    s.record_delegation_dispatch(op, &DispatchFact::Failed(e.clone()))?;
+                }
+            }
+            let mut parts = Vec::new();
+            if let Some(parent) = &worker.parent_id {
+                for part in c.result.iter().take(MAX_RESULT_PARTS) {
+                    let message = s.new_message_id()?;
+                    let row = MessageRow {
+                        id: message.to_string(),
+                        root_id: worker.root_id.clone(),
+                        operation_id: None,
+                        sender_worker_id: worker.id.clone(),
+                        recipient_worker_id: parent.clone(),
+                        kind: name_of(&MessageKind::Report),
+                        reply_to: None,
+                        body: truncate_bytes(&redact(part), MAX_RESULT_BYTES).to_owned(),
+                        delivery_policy: name_of(&Delivery::Auto),
+                        target_run_id: None,
+                        delivery_state: name_of(&DeliveryState::Queued),
+                        recipient_run_id: None,
+                        queued_at: now,
+                        submitted_at: None,
+                        confirmed_at: None,
+                        presented_at: None,
+                        acknowledged_at: None,
+                        updated_at: now,
+                        event_seq: None,
+                    };
+                    let seq = s.insert_message_and_event(
+                        &row,
+                        Direction::ChildToParent,
+                        MessageKind::Report,
+                    )?;
+                    parts.push((message, seq));
+                }
             }
             Ok(Completed {
                 event,
-                notification,
+                notification: parts.first().cloned(),
+                parts,
             })
         })
     }
 
     // ---- revoke ----
 
-    /// Bumps the root's authority epoch
-    /// when the event revokes, fails every not-yet-reserved operation of the tree with
-    /// `stale_epoch`, cancels queued parent→child sends, releases the continuation reservation,
-    /// marks out-of-ceiling workers `restricted` and closes a closed subtree. The returned effect
-    /// names the tokens to kill and the processes to stop (the caller does that, in memory).
+    /// Bumps the root's authority epoch when the event revokes, releases the continuation
+    /// reservation, marks out-of-ceiling workers `restricted` and closes a closed subtree. Within
+    /// the event's scope (`RevocationEffect::scope`: the whole tree for a stop, a restriction or
+    /// a shutdown; the named worker's subtree for a close or an exit) every not-yet-reserved
+    /// operation fails with a reason and every queued parent→child send is cancelled. Outside
+    /// it, accepted operations are carried to the new epoch and queued sends stay queued: closing
+    /// or losing one worker never cancels its siblings' work. The returned effect names the tokens
+    /// to kill and the processes to stop (the caller does that, in memory).
     pub fn revoke_delegation(
         &self,
         root_worker: &WorkerId,
@@ -1769,6 +1917,23 @@ impl Store {
             )?;
             out.authority_epoch += 1;
             out.continuation_released = root.continuation_reserved;
+            // What the event covers: the whole tree, or one worker's subtree. Work aimed
+            // outside a subtree is carried to the new epoch; work inside it fails with a reason.
+            let covered: Option<Vec<String>> = match &effect.scope {
+                RevocationScope::Root => None,
+                RevocationScope::Subtree(w) => Some(
+                    self.delegation_subtree(w)?
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                ),
+                RevocationScope::None => Some(Vec::new()),
+            };
+            let in_scope = |w: Option<&str>| match (&covered, w) {
+                (None, _) => true,
+                (Some(c), Some(w)) => c.iter().any(|x| x == w),
+                (Some(_), None) => false,
+            };
             let accepted: Vec<OperationRow> = {
                 let mut stmt = self.conn.prepare(
                     "SELECT id FROM delegation_operations WHERE root_id = ?1
@@ -1785,27 +1950,56 @@ impl Store {
                 }
                 rows
             };
-            let e = ToolError::new(ErrorCode::StaleEpoch, "the authority epoch changed");
+            let e = match event {
+                RevocationEvent::Close(_) => {
+                    ToolError::new(ErrorCode::WorkerClosed, "its worker was closed")
+                }
+                RevocationEvent::GenerationExited(_) => {
+                    ToolError::new(ErrorCode::StaleEpoch, "its worker stopped")
+                }
+                _ => ToolError::new(ErrorCode::StaleEpoch, "the authority epoch changed"),
+            };
             for row in &accepted {
-                out.cancelled
-                    .extend(self.invalidate_operation(row, &e, now)?);
-                out.invalidated.push(operation_id(&row.id)?);
+                let covered = in_scope(row.target_worker_id.as_deref())
+                    || in_scope(Some(row.principal_worker_id.as_str()));
+                if covered {
+                    out.cancelled
+                        .extend(self.invalidate_operation(row, &e, now)?);
+                    out.invalidated.push(operation_id(&row.id)?);
+                } else if (row.kind == name_of(&OperationKind::Spawn)
+                    || row.kind == name_of(&OperationKind::Send))
+                    && self.operation_epoch(row)? == root.authority_epoch
+                {
+                    // Current work for a child the event did not cover moves to the new epoch.
+                    // Its row's epoch is frozen at acceptance (a schema trigger): the epoch it now
+                    // holds is kept beside it, and reserving its dispatch checks that one. Work
+                    // already stale stays stale; cancels and closes are reserved at acceptance
+                    // and never wait here.
+                    self.set_meta(
+                        &carried_epoch_key(&row.id),
+                        &i64_of(out.authority_epoch).to_string(),
+                    )?;
+                }
             }
-            // Queued parent→child deliveries of no operation (continuations) go too; child→parent
-            // mailbox entries are data and stay as they are.
-            let queued: Vec<String> = {
+            // Queued parent→child deliveries of no operation (continuations) go too, when the
+            // event covers their recipient; child→parent mailbox entries are data and stay as
+            // they are.
+            let queued: Vec<(String, String)> = {
                 let mut stmt = self.conn.prepare(
-                    "SELECT m.id FROM delegation_messages m
+                    "SELECT m.id, m.recipient_worker_id FROM delegation_messages m
                      JOIN delegation_workers r ON r.id = m.recipient_worker_id
                      WHERE m.root_id = ?1 AND m.delivery_state IN ('queued', 'queued_next_turn')
                        AND r.parent_id = m.sender_worker_id ORDER BY m.rowid",
                 )?;
                 let ids = stmt
-                    .query_map(params![root.id], |r| r.get(0))?
+                    .query_map(params![root.id], |r| Ok((r.get(0)?, r.get(1)?)))?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 ids
             };
-            for m in queued {
+            for (m, recipient) in queued {
+                if !in_scope(Some(recipient.as_str())) {
+                    continue;
+                }
                 if self.try_step_message(&m, DeliveryState::Cancelled, None, now)? {
                     out.cancelled.push(message_id(&m)?);
                 }
@@ -2519,6 +2713,34 @@ impl Store {
                 abnormal,
                 ..Reconciled::default()
             };
+            // Work for a child that was accepted but never reserved died with the app that
+            // would have dispatched it: it fails, saying so, with its queued message and its
+            // reserved run. Nothing replays it. A child's send to its parent is complete once
+            // accepted (it is mailbox data) and stays as it is.
+            let abandoned = ToolError::new(
+                ErrorCode::RuntimeUnavailable,
+                "the app restarted before this was delivered; it was not sent",
+            );
+            for id in s.ids(
+                "SELECT id FROM delegation_operations
+                 WHERE dispatch_state = 'accepted' AND kind IN ('spawn', 'send') ORDER BY rowid",
+            )? {
+                let row = s
+                    .delegation_operation(&id)?
+                    .ok_or_else(|| StoreError::NotFound(id.clone()))?;
+                if row.kind == name_of(&OperationKind::Send) {
+                    let mut to_child = false;
+                    for m in s.messages_of_operation(&row.id)? {
+                        to_child |= s.is_parent_to_child(&m)?;
+                    }
+                    if !to_child {
+                        continue;
+                    }
+                }
+                let failed = s.end_undispatched(&row, &abandoned, DeliveryState::Failed, now)?;
+                out.messages.extend(failed);
+                out.operations.push(operation_id(&id)?);
+            }
             for id in s.ids(
                 "SELECT id FROM delegation_runs
                  WHERE state IN ('reserved', 'starting', 'running', 'stopping') ORDER BY rowid",
@@ -2799,6 +3021,9 @@ impl Store {
             "DELETE FROM delegation_messages WHERE id IN (SELECT value FROM json_each(?1))",
             params![m_json],
         )?;
+        for op in &ops {
+            self.delete_meta(&carried_epoch_key(op))?;
+        }
         self.conn.execute(
             "DELETE FROM delegation_operations WHERE id IN (SELECT value FROM json_each(?1))",
             params![o_json],
@@ -2879,6 +3104,15 @@ fn scrub_tool_error(e: &ToolError) -> Result<ToolError> {
 /// A page event's summary and state: scrubbed, at most [`MAX_EVENT_SUMMARY_BYTES`], never a
 /// token stream.
 fn event_summary(env: &Envelope) -> (String, Option<StateRef>) {
+    // Activity, questions and forms are one line a reader skims; their detail (a command's
+    // whole output, say) is in the worker's own transcript, not on the page.
+    let one_line = matches!(
+        env.event,
+        Event::ItemStarted { .. }
+            | Event::ItemCompleted { .. }
+            | Event::QuestionRequested { .. }
+            | Event::FormRequested { .. }
+    );
     let (text, state) = match &env.event {
         Event::Notice { text } => (text.clone(), None),
         Event::SessionStarted { .. } => (
@@ -2934,15 +3168,82 @@ fn event_summary(env: &Envelope) -> (String, Option<StateRef>) {
             format!("approval requested: {}", title.as_deref().unwrap_or(tool)),
             None,
         ),
+        Event::QuestionRequested { questions, .. } => (
+            match questions.first() {
+                Some(q) => format!("question: {}", q.question),
+                None => "question".to_owned(),
+            },
+            None,
+        ),
+        Event::FormRequested {
+            server, message, ..
+        } => (
+            format!(
+                "form: {}",
+                if message.trim().is_empty() {
+                    server
+                } else {
+                    message
+                }
+            ),
+            None,
+        ),
         Event::DelegatedMessage { text, .. } => (text.clone(), None),
         // Never a token stream: content is summarised by its item, not its deltas.
         Event::ContentDelta { .. } | Event::ContentSnapshot { .. } => ("activity".to_owned(), None),
         other => (super::event_kind(other), None),
     };
-    (
-        truncate_bytes(&redact(&text), MAX_EVENT_SUMMARY_BYTES).to_owned(),
-        state,
-    )
+    let text = redact(&text);
+    let summary = if one_line {
+        first_line(&text, MAX_ACTIVITY_SUMMARY_BYTES)
+    } else {
+        truncate_bytes(&text, MAX_EVENT_SUMMARY_BYTES).to_owned()
+    };
+    (summary, state)
+}
+
+/// The longest an activity, question or form summary on a page may be.
+const MAX_ACTIVITY_SUMMARY_BYTES: usize = 240;
+
+/// `text`'s first non-empty line, cut on a character boundary to `max` bytes with the cut (or
+/// any dropped lines) marked by `…`.
+fn first_line(text: &str, max: usize) -> String {
+    const MARK: &str = "…";
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let first = lines.next().unwrap_or_default();
+    let more = lines.next().is_some();
+    if first.len() <= max && !more {
+        return first.to_owned();
+    }
+    let room = truncate_whole_marker(first, max.saturating_sub(MARK.len()));
+    format!("{room}{MARK}")
+}
+
+/// `text` cut to at most `max` bytes on a character boundary, and never inside a redaction
+/// marker (`****` and up to four characters after it): a cut that would split one drops the
+/// whole marker, so no half of a mask is left to read as something else.
+fn truncate_whole_marker(text: &str, max: usize) -> &str {
+    const OPEN: &str = "****";
+    let cut = truncate_bytes(text, max);
+    let end = cut.len();
+    let mut from = 0;
+    while let Some(at) = text[from..].find(OPEN) {
+        let start = from + at;
+        if start >= end {
+            break;
+        }
+        let tail_len: usize = text[start + OPEN.len()..]
+            .chars()
+            .take(4)
+            .take_while(|c| !c.is_whitespace())
+            .map(char::len_utf8)
+            .sum();
+        if end < start + OPEN.len() + tail_len {
+            return &text[..start];
+        }
+        from = start + OPEN.len();
+    }
+    cut
 }
 
 #[cfg(test)]
@@ -2965,6 +3266,8 @@ mod tests {
     };
     use std::path::{Path, PathBuf};
     use std::time::Duration;
+
+    mod delivery_tests;
 
     struct Fx {
         _dir: tempfile::TempDir,
@@ -3365,7 +3668,8 @@ mod tests {
         assert_eq!(revoked.authority_epoch, 1);
         assert_eq!(revoked.invalidated, vec![first.operation.clone()]);
         assert_eq!(op_state(&f.s, &first.operation), "failed");
-        // The same identical request under the new epoch is stale, never a new run.
+        // The same identical request under the new epoch replays the failure the bump gave
+        // it, never a new run.
         let again = accept(
             &f.s,
             &f.root.worker,
@@ -3373,7 +3677,9 @@ mod tests {
             Resolution::default(),
             AcceptPlan::Spawn(spawn_plan()),
         );
-        let Err(e) = again else { panic!("{again:?}") };
+        let Ok(Accepted::Replay(ReplayOutcome::Error(e))) = again else {
+            panic!("{again:?}")
+        };
         assert_eq!(e.code, ErrorCode::StaleEpoch);
         assert_eq!(
             e.details.as_ref().expect("d")["operation_id"],
@@ -3706,7 +4012,8 @@ mod tests {
             worker_state: WorkerState::Waiting,
             reason: None,
             usage_json: None,
-            result: Some("all good".into()),
+            result: vec!["all good".into()],
+            dispatch_failure: None,
             event: PublishEvent {
                 thread,
                 provider_thread: None,
@@ -3830,7 +4137,8 @@ mod tests {
                 worker_state: WorkerState::Waiting,
                 reason: None,
                 usage_json: None,
-                result: Some(format!("found it; token {secret} {}", "x".repeat(40_000))),
+                result: vec![format!("found it; token {secret} {}", "x".repeat(40_000))],
+                dispatch_failure: None,
                 event: PublishEvent {
                     thread,
                     provider_thread: None,
@@ -3871,7 +4179,8 @@ mod tests {
             worker_state: WorkerState::Failed,
             reason: None,
             usage_json: None,
-            result: None,
+            result: Vec::new(),
+            dispatch_failure: None,
             event: PublishEvent {
                 thread: f.root_thread.clone(),
                 provider_thread: None,
@@ -4168,17 +4477,18 @@ mod tests {
         f.s.revoke_delegation(&f.root.worker, &RevocationEvent::RootStop)
             .expect("revoke");
         assert_eq!(op_state(&f.s, &ack_op), "confirmed");
-        // Its key is not re-run under the new epoch.
+        // Its key is not re-run under the new epoch: the retry gets the stored outcome.
         let replay =
             f.s.acknowledge_delegation_messages(&AckRequest {
                 principal: f.root.worker.clone(),
                 request: ack_req(&[&shown], "a2"),
             })
             .expect("s");
-        assert!(
-            matches!(replay, Err(ref e) if e.code == ErrorCode::StaleEpoch),
-            "{replay:?}"
-        );
+        let Ok(AckResult::Replay(ReplayOutcome::Receipt(r))) = &replay else {
+            panic!("{replay:?}")
+        };
+        assert_eq!(r["operation_id"], json!(ack_op.as_str()));
+        assert_eq!(r["replayed"], json!(true));
     }
 
     #[test]
@@ -5036,7 +5346,8 @@ mod tests {
             worker_state: WorkerState::Waiting,
             reason: None,
             usage_json: None,
-            result: Some("done".into()),
+            result: vec!["done".into()],
+            dispatch_failure: None,
             event: PublishEvent {
                 thread: f.root_thread.clone(),
                 provider_thread: None,
@@ -5258,4 +5569,7 @@ mod tests {
         });
         assert!(r.is_err());
     }
+
+    /// What a parent reads of a worker's activity, questions and forms.
+    mod awareness_tests;
 }

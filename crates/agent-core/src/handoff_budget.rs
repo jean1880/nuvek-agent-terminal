@@ -58,6 +58,9 @@ pub enum Role {
     Assistant,
     /// A tool's output (a command, a file read, a web page): untrusted data, capped when carried.
     Tool,
+    /// The context a thread was created with (a fork's or a compaction's handoff): an earlier
+    /// handoff's rendered history, carried as one item inside this handoff's own fence.
+    Inherited,
 }
 
 impl Role {
@@ -66,6 +69,7 @@ impl Role {
             Self::User => "user",
             Self::Assistant => "assistant",
             Self::Tool => "tool",
+            Self::Inherited => "inherited",
         }
     }
 }
@@ -240,7 +244,7 @@ fn render_message(message: &HistoricalMessage, fence: &str) -> String {
     let text = redact(&message.text);
     let body = match message.role {
         Role::Tool => carried_tool_text(&message.kind, &text),
-        Role::User | Role::Assistant => text,
+        Role::User | Role::Assistant | Role::Inherited => text,
     };
     format!(
         "<<<HANDOFF-{fence} BEGIN role={} kind={} item={} status={}>>>\n{}\n<<<HANDOFF-{fence} END>>>",
@@ -283,13 +287,80 @@ pub fn handoff_coverage(source: &str, first_item: Option<&str>, last_item: Optio
     )
 }
 
-/// Picks which messages fit `budget`, whole or not at all (T3 `selectHistory`), as rendered with
-/// `fence`.
+/// Budget units one message costs in the rendered history: its escaped, fenced form and the
+/// separator before it.
+fn message_cost(message: &HistoricalMessage, fence: &str) -> usize {
+    json_len(&render_message(message, fence)).saturating_add(MESSAGE_OVERHEAD)
+}
+
+/// `text` cut to about `keep` bytes, the head and the tail halves (on character boundaries)
+/// around a line saying how many bytes were left out. Unchanged when it is no longer than that.
+fn cut_middle(text: &str, keep: usize) -> String {
+    if text.len() <= keep {
+        return text.to_owned();
+    }
+    let mut head_end = keep / 2;
+    while !text.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = text.len() - (keep - keep / 2);
+    while !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!(
+        "{}\n[… {} bytes omitted …]\n{}",
+        &text[..head_end],
+        tail_start - head_end,
+        &text[tail_start..]
+    )
+}
+
+/// `message` cut ([`cut_middle`]) to the longest text whose rendered cost fits `budget`, with
+/// that cost; `None` when not even its framing fits. The text is redacted whole first, so the cut
+/// can never leave a credential half-visible (rendering redacts it again, which changes nothing).
+fn cut_to_fit(
+    message: &HistoricalMessage,
+    budget: usize,
+    fence: &str,
+) -> Option<(HistoricalMessage, usize)> {
+    let text = redact(&message.text);
+    let with = |keep: usize| HistoricalMessage {
+        text: cut_middle(&text, keep),
+        ..message.clone()
+    };
+    let mut best = {
+        let empty = with(0);
+        let cost = message_cost(&empty, fence);
+        (cost <= budget).then_some((empty, cost))?
+    };
+    // The cost grows with what is kept, but not strictly (escapes, the omitted count's digits):
+    // every candidate is measured, and only one that fits is taken.
+    let (mut low, mut high) = (0, text.len());
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        let candidate = with(mid);
+        let cost = message_cost(&candidate, fence);
+        if cost <= budget {
+            best = (candidate, cost);
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    Some(best)
+}
+
+/// Picks which messages fit `budget` (T3 `selectHistory`), as rendered with `fence`.
 ///
-/// Priority: the latest user message, the latest assistant message (the agent's own words, not a
-/// tool's output), the first user message (the original constraints), then every other message
-/// newest first. A message that does not fit the remaining budget is omitted whole and later,
-/// smaller ones may still fit.
+/// Priority: the latest user message (the request being continued), the inherited context (the
+/// first [`Role::Inherited`] item: what a forked thread started from), the latest assistant
+/// message (the agent's own words, not a tool's output), the first user message (the original
+/// constraints), then every other message newest first. The latest user message and the
+/// inherited context are never left out for being too long: each is cut to what remains, its
+/// head and tail kept around a "[… n bytes omitted …]" line (after redaction, so a cut never
+/// shows half a credential). Either is left out only when not even its framing fits. Any other
+/// message that does not fit the remaining budget is omitted whole, and later, smaller ones may
+/// still fit.
 pub fn select_history(
     messages: &[HistoricalMessage],
     coverage: &str,
@@ -319,8 +390,10 @@ pub fn select_history_after(
         .unwrap_or(i64::MAX)
         .saturating_sub(i64::try_from(wrapper).unwrap_or(i64::MAX));
     let mut selected = vec![false; total];
+    // A message kept cut to fit, in place of its whole text.
+    let mut cut: Vec<Option<HistoricalMessage>> = vec![None; total];
 
-    let mut try_add = |index: Option<usize>| {
+    let mut add = |index: Option<usize>, may_cut: bool| {
         let Some(index) = index else { return };
         let Some(message) = messages.get(index) else {
             return;
@@ -328,26 +401,42 @@ pub fn select_history_after(
         if selected[index] {
             return;
         }
-        let cost = i64::try_from(json_len(&render_message(message, fence)) + MESSAGE_OVERHEAD)
-            .unwrap_or(i64::MAX);
-        if cost > remaining {
+        let budget_left = usize::try_from(remaining).unwrap_or(0);
+        let cost = message_cost(message, fence);
+        if cost <= budget_left {
+            selected[index] = true;
+            remaining -= i64::try_from(cost).unwrap_or(i64::MAX);
             return;
         }
-        selected[index] = true;
-        remaining -= cost;
+        if !may_cut {
+            return;
+        }
+        if let Some((shortened, cost)) = cut_to_fit(message, budget_left, fence) {
+            selected[index] = true;
+            cut[index] = Some(shortened);
+            remaining -= i64::try_from(cost).unwrap_or(i64::MAX);
+        }
     };
-    try_add(messages.iter().rposition(|m| m.role == Role::User));
-    try_add(messages.iter().rposition(|m| m.role == Role::Assistant));
-    try_add(messages.iter().position(|m| m.role == Role::User));
+    add(messages.iter().rposition(|m| m.role == Role::User), true);
+    add(
+        messages.iter().position(|m| m.role == Role::Inherited),
+        true,
+    );
+    add(
+        messages.iter().rposition(|m| m.role == Role::Assistant),
+        false,
+    );
+    add(messages.iter().position(|m| m.role == Role::User), false);
     for index in (0..total).rev() {
-        try_add(Some(index));
+        add(Some(index), false);
     }
 
     let kept: Vec<HistoricalMessage> = messages
         .iter()
         .zip(&selected)
-        .filter(|(_, keep)| **keep)
-        .map(|(m, _)| m.clone())
+        .zip(cut)
+        .filter(|((_, keep), _)| **keep)
+        .map(|((m, _), shortened)| shortened.unwrap_or_else(|| m.clone()))
         .collect();
     let omitted_ids: Vec<String> = messages
         .iter()
@@ -388,6 +477,7 @@ mod tests {
                 Role::User => "user_message",
                 Role::Assistant => "assistant_message",
                 Role::Tool => "command",
+                Role::Inherited => "inherited_context",
             }
             .to_owned(),
             text: text.to_owned(),
@@ -824,5 +914,150 @@ mod tests {
         assert!(!is_valid_fence("short"));
         assert!(!is_valid_fence("0f3c9a7e-5b2d-4c18-a6e9-f1b3d5c7e9a1"));
         assert!(!is_valid_fence("0f3c9a7e5b2d4c18>>>f1b3d5c7e9a1"));
+    }
+}
+
+/// The latest request and a fork's inherited context are kept, cut if they must be, before any
+/// other history.
+#[cfg(test)]
+mod request_and_inherited_tests {
+    use super::*;
+
+    const FENCE: &str = "6b1d0e9c3a5f4e27b8c1d2e3f4a5b6c7";
+
+    fn item(id: &str, role: Role, text: &str) -> HistoricalMessage {
+        HistoricalMessage {
+            role,
+            kind: match role {
+                Role::User => "user_message",
+                Role::Assistant => "assistant_message",
+                Role::Tool => "command",
+                Role::Inherited => "inherited_context",
+            }
+            .to_owned(),
+            text: text.to_owned(),
+            item_id: id.to_owned(),
+            status: "completed".to_owned(),
+        }
+    }
+
+    /// What a fork is seeded with: an earlier handoff's rendered history, with its own fence.
+    fn earlier_handoff() -> String {
+        let old = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
+        render_history(
+            &[item("old:u", Role::User, "the inherited request")],
+            "Provider context handoff. Source: Claude thread old.",
+            old,
+        )
+    }
+
+    #[test]
+    fn an_oversized_latest_request_is_kept_cut_never_dropped() {
+        let request = format!("BEGIN-{}-END", "r".repeat(30_000));
+        let msgs = vec![
+            item("u1", Role::User, "first"),
+            item("a1", Role::Assistant, "answer"),
+            item("u2", Role::User, &request),
+        ];
+        let sel = select_history(&msgs, "History", 4_000, FENCE);
+        let kept = sel
+            .messages
+            .iter()
+            .find(|m| m.item_id == "u2")
+            .expect("the latest request is kept");
+        assert!(kept.text.starts_with("BEGIN-"), "its head is kept");
+        assert!(kept.text.ends_with("-END"), "its tail is kept");
+        assert!(kept.text.contains(" bytes omitted …]"), "{}", kept.text);
+        assert!(kept.text.len() < request.len());
+        assert!(history_cost(&sel.messages, &sel.context, FENCE) <= 4_000);
+    }
+
+    #[test]
+    fn a_cut_request_never_shows_half_a_credential() {
+        let secret = format!("ghp_{}", "Q".repeat(36));
+        let request = format!("{}{secret}{}", "x".repeat(1_500), "y".repeat(30_000));
+        let msgs = vec![item("u1", Role::User, &request)];
+        let sel = select_history(&msgs, "History", 3_000, FENCE);
+        let rendered = render_history(&sel.messages, &sel.context, FENCE);
+        assert!(!rendered.contains("ghp_QQ"), "{rendered}");
+        assert!(!rendered.contains("QQQQQQQQ"), "{rendered}");
+    }
+
+    #[test]
+    fn the_inherited_context_comes_after_the_latest_request_and_before_other_history() {
+        let body = "h".repeat(1_500);
+        let msgs = vec![
+            item("seed", Role::Inherited, &earlier_handoff()),
+            item("u1", Role::User, "my own first request"),
+            item("a1", Role::Assistant, &body),
+            item("t1", Role::Tool, &body),
+            item("u2", Role::User, "the newest request"),
+        ];
+        let need = |ids: &[&str]| {
+            let kept: Vec<HistoricalMessage> = msgs
+                .iter()
+                .filter(|m| ids.contains(&m.item_id.as_str()))
+                .cloned()
+                .collect();
+            let context = coverage_context("History", msgs.len(), msgs.len(), FENCE);
+            history_cost(&kept, &context, FENCE)
+        };
+        let budget = need(&["seed", "u2"]) + 50;
+        assert!(budget < need(&["seed", "u2", "a1"]));
+        let sel = select_history(&msgs, "History", budget, FENCE);
+        let ids: Vec<&str> = sel.messages.iter().map(|m| m.item_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["seed", "u2"],
+            "the seed outranks the rest of the history"
+        );
+        let rendered = render_history(&sel.messages, &sel.context, FENCE);
+        assert_eq!(rendered.matches("the inherited request").count(), 1);
+        assert!(history_cost(&sel.messages, &sel.context, FENCE) <= budget);
+    }
+
+    #[test]
+    fn the_inherited_fence_is_quoted_inside_the_new_one() {
+        let msgs = vec![
+            item("seed", Role::Inherited, &earlier_handoff()),
+            item("u1", Role::User, "go on"),
+        ];
+        let sel = select_history(&msgs, "History", 16_000, FENCE);
+        let rendered = render_history(&sel.messages, &sel.context, FENCE);
+        // Only this handoff's own fence starts a line; the inherited one is quoted.
+        for line in rendered.lines().filter(|l| l.starts_with("<<<")) {
+            assert!(line.starts_with(&format!("<<<HANDOFF-{FENCE}")), "{line}");
+        }
+        assert!(rendered.contains("> <<<HANDOFF-a1b2c3d4e5f60718293a4b5c6d7e8f90 BEGIN"));
+        assert!(rendered.contains("role=inherited kind=inherited_context"));
+    }
+
+    #[test]
+    fn a_long_inherited_context_is_cut_once_the_request_is_in() {
+        let seed = format!("SEED-HEAD {} SEED-TAIL", "s".repeat(20_000));
+        let msgs = vec![
+            item("seed", Role::Inherited, &seed),
+            item("u1", Role::User, "keep going"),
+            item("a1", Role::Assistant, &"a".repeat(2_000)),
+        ];
+        let sel = select_history(&msgs, "History", 5_000, FENCE);
+        let ids: Vec<&str> = sel.messages.iter().map(|m| m.item_id.as_str()).collect();
+        assert_eq!(ids, ["seed", "u1"]);
+        let inherited = &sel.messages[0];
+        assert!(inherited.text.starts_with("SEED-HEAD"));
+        assert!(inherited.text.ends_with("SEED-TAIL"));
+        assert!(history_cost(&sel.messages, &sel.context, FENCE) <= 5_000);
+    }
+
+    #[test]
+    fn with_no_room_past_the_request_the_inherited_context_is_dropped() {
+        let msgs = vec![
+            item("seed", Role::Inherited, &earlier_handoff()),
+            item("u1", Role::User, &"r".repeat(30_000)),
+        ];
+        let sel = select_history(&msgs, "History", 3_000, FENCE);
+        let ids: Vec<&str> = sel.messages.iter().map(|m| m.item_id.as_str()).collect();
+        assert_eq!(ids, ["u1"], "the request took all the room");
+        assert!(history_cost(&sel.messages, &sel.context, FENCE) <= 3_000);
     }
 }

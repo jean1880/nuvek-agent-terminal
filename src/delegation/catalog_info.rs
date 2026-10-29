@@ -4,8 +4,10 @@
 use agent_core::catalog::CatalogModel;
 use agent_core::delegation::error::truncate_bytes;
 use agent_core::delegation::wire::{
-    ModelInfo, UsageInfo, UsageWindow, MAX_EFFORT_BYTES, MAX_MODEL_BYTES, MAX_USAGE_WINDOWS,
+    CapabilityLimits, ModelInfo, UsageInfo, UsageWindow, MAX_EFFORT_BYTES, MAX_MODEL_BYTES,
+    MAX_USAGE_WINDOWS,
 };
+use agent_core::delegation::Limits;
 use agent_core::model_tags::{effort_for, ModelTags};
 
 use crate::account_status::Snapshot;
@@ -63,6 +65,15 @@ pub(super) fn agy_launch_model(
             .find(|m| m.id == id && !m.efforts.is_empty())
             .map_or(id.clone(), |m| m.model_id_for(effort)),
     )
+}
+
+/// `capabilities.limits`: the limits, with the agent processes delegated workers hold now
+/// (`live`) beside the app's cap on them.
+pub(super) fn capability_limits(limits: &Limits, live: u32) -> CapabilityLimits {
+    CapabilityLimits {
+        live_processes: live,
+        ..CapabilityLimits::from_limits(limits)
+    }
 }
 
 /// An agent's usage as listed at `now`: windows, headroom, load and age. Never the account.
@@ -199,6 +210,19 @@ mod tests {
             Some("mystery")
         );
         assert_eq!(launch(None, Some("high")), None);
+    }
+
+    /// The process cap is listed with how much of it is in use.
+    #[test]
+    fn the_limits_list_the_process_cap_and_its_use() {
+        let limits = Limits::default();
+        let listed = capability_limits(&limits, 3);
+        assert_eq!(listed.live_processes_app, limits.live_processes_app);
+        assert_eq!(listed.live_processes, 3);
+        assert_eq!(listed.active_runs_per_root, limits.active_runs_per_root);
+        let v = serde_json::to_value(listed).expect("ser");
+        assert_eq!(v["live_processes_app"], 8);
+        assert_eq!(v["live_processes"], 3);
     }
 
     #[test]

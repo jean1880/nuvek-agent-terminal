@@ -39,11 +39,18 @@ pub(super) struct ChildSpec {
     pub resume: Option<String>,
 }
 impl Supervisor {
+    /// Makes `worker` ready to take `input`, starting a new generation when it has no live
+    /// process. Every await re-reads `input.epoch` (`settled_delivery_epoch`): a sibling's close or
+    /// exit moves it on to the new epoch, and only a revocation covering the sender or this worker
+    /// fails the delivery.
     pub(super) async fn ensure_child(
         self: &Rc<Self>,
         worker: &WorkerId,
-        input: &DelegatedInput,
+        input: &mut DelegatedInput,
     ) -> Result<(), ToolError> {
+        input.epoch = self
+            .settled_delivery_epoch(&input.from, worker, input.epoch)
+            .await?;
         self.dispatch_check(&input.from, worker, input.epoch, None)?;
         self.epoch(worker)?;
         let (session, ready, generation) = {
@@ -64,6 +71,30 @@ impl Supervisor {
         };
         if ready {
             return Ok(());
+        }
+        // The start's slot, its own until this start ends (`_slot` drops on every return), by
+        // when its process holds it. A worker with no process (paused, or gone) takes one again;
+        // one whose process is still up or stopping (a pause whose exit is not seen yet) carries
+        // that process's slot over, so its exit never frees capacity this start still needs.
+        let restart = {
+            let state = self.state.borrow();
+            state
+                .workers
+                .get(worker)
+                .map(|w| (w.root.clone(), w.generations.is_empty()))
+        };
+        let _slot = match restart {
+            Some((root, true)) => Some(self.make_room(&root, Some(worker)).await?),
+            Some((_, false)) => Some(self.reserve_launch()),
+            None => None,
+        };
+        if let Some(slot) = &_slot {
+            slot.bind(worker);
+            // Making room may have waited out a sibling's close: its epoch is known before the
+            // launch is prepared, and only a revocation covering either end fails this.
+            input.epoch = self
+                .settled_delivery_epoch(&input.from, worker, input.epoch)
+                .await?;
         }
         let mut spec = self
             .state
@@ -92,24 +123,36 @@ impl Supervisor {
                 .insert(worker.clone(), spec.clone());
         }
         let approval = self.prepare_launch(&spec, generation).await?;
+        input.epoch = self
+            .settled_delivery_epoch(&input.from, worker, input.epoch)
+            .await?;
         self.dispatch_check(&input.from, worker, input.epoch, None)?;
-        {
+        // The new generation's startup check, set only once the old generation is gone: what
+        // the old one still says as it stops (an unfinished startup check of its own, say) is
+        // never taken for the new one's.
+        let fresh_readback = || -> Result<(), ToolError> {
             let mut state = self.state.borrow_mut();
             let w = state
                 .workers
                 .get_mut(worker)
                 .ok_or_else(|| error(ErrorCode::NotFound, "worker closed"))?;
             w.readback = super::readback::Readback::child(spec.driver, spec.mode);
-        }
+            Ok(())
+        };
         let session = if let Some(session) = session {
             self.rotate_before_stop(worker, session.process_generation());
             if let Some(watch) = session.rebind_stop() {
                 super::capacity::wait_exit(&watch).await;
             }
+            input.epoch = self
+                .settled_delivery_epoch(&input.from, worker, input.epoch)
+                .await?;
             self.dispatch_check(&input.from, worker, input.epoch, None)?;
+            fresh_readback()?;
             session.rebind_start();
             session
         } else {
+            fresh_readback()?;
             self.build_child(&spec, approval)?
         };
         if spec.driver == Driver::Claude {
@@ -124,7 +167,9 @@ impl Supervisor {
         self.arm_startup(worker, generation);
         let start = std::time::Instant::now();
         loop {
-            self.epoch(worker)?;
+            input.epoch = self
+                .settled_delivery_epoch(&input.from, worker, input.epoch)
+                .await?;
             let (ready, failed) = {
                 let state = self.state.borrow();
                 let w = &state.workers[worker];
@@ -206,7 +251,11 @@ impl Supervisor {
                 "maximum delegation depth reached",
             ));
         }
-        agent_core::delegation::limits::admit_spawn(&self.limits, &self.usage(&root), true)?;
+        agent_core::delegation::limits::admit_spawn(&self.limits, &self.usage(&root), false)?;
+        // Every process slot taken: an idle worker is paused for this one, or the spawn is
+        // refused, saying why. The slot is this spawn's from now until its process exists or
+        // the spawn ends (`slot` drops on every return).
+        let slot = self.make_room(&root, None).await?;
         // A restricted worker's limits reach the children it starts (a root has none).
         let parent_capabilities = self
             .state
@@ -313,7 +362,7 @@ impl Supervisor {
         );
         super::attest::sanitise_identity(&mut identity);
         let plan=SpawnPlan{driver,identity,workspace,launch_json:serde_json::json!({"model":model,"effort":effort,"capabilities":capabilities,"cwd":child_cwd,"source_repo":lease_plan.as_ref().map(|l|&l.source_repo),"branch":lease_plan.as_ref().map(|l|&l.branch),"base_commit":lease_plan.as_ref().map(|l|&l.base_commit)}).to_string(),cwd:child_cwd.to_string_lossy().into_owned(),state:SpawnState::Starting,process_generation:1};
-        let accept = self.accept_request(
+        let mut accept = self.accept_request(
             caller,
             &root,
             ToolRequest::Spawn(r.clone()),
@@ -325,6 +374,9 @@ impl Supervisor {
             AcceptPlan::Spawn(Box::new(plan)),
             warnings,
         );
+        // The store admits one more process against the others: this spawn's own reserved
+        // slot is that one.
+        accept.live_processes = accept.live_processes.saturating_sub(1);
         let (accepted, _) = self.accept(accept, true).await?;
         let accepted = match accepted {
             Accepted::Replay(r) => return super::ops::replay_value(r),
@@ -342,6 +394,14 @@ impl Supervisor {
             run = ?accepted.run.as_ref().map(|r| r.to_string()),
             "delegated worker spawned"
         );
+        slot.bind(&worker);
+        #[cfg(test)]
+        {
+            let hold = self.state.borrow().hold_before_insert.clone();
+            while hold.as_ref().is_some_and(|h| h.get()) {
+                gtk4::glib::timeout_future(std::time::Duration::from_millis(5)).await;
+            }
+        }
         let lease = if let Some(plan) = lease_plan {
             match gtk4::gio::spawn_blocking(move || super::workspace::create_lease(&plan)).await {
                 Ok(Ok(l)) => Some(l),
@@ -453,6 +513,8 @@ impl Supervisor {
             }
             Err(e) => self.fail_worker(&worker, e),
         }
+        // Started (its session counts its launch until the process exists) or failed.
+        drop(slot);
         self.notify_registry();
         Ok(accepted.receipt)
     }
@@ -461,6 +523,13 @@ impl Supervisor {
         spec: &ChildSpec,
         generation: ProcessGeneration,
     ) -> Result<Approval, ToolError> {
+        #[cfg(test)]
+        {
+            let hold = self.state.borrow().hold_launch.clone();
+            while hold.as_ref().is_some_and(|h| h.get()) {
+                gtk4::glib::timeout_future(std::time::Duration::from_millis(5)).await;
+            }
+        }
         if let Some(lease) = spec.lease.clone() {
             gtk4::gio::spawn_blocking(move || super::workspace::verify_lease(&lease))
                 .await

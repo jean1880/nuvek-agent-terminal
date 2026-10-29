@@ -9,7 +9,7 @@ use crate::agent_proc::ExitWatch;
 use crate::chat::session::ChatSession;
 use crate::config::Profile;
 use agent_core::adapter::{Driver, Mode};
-use agent_core::delegation::authority::{revocation, RevocationEvent, TaskMode};
+use agent_core::delegation::authority::{revocation, RevocationEvent, RevocationScope, TaskMode};
 use agent_core::delegation::correlation::ObservedCalls;
 use agent_core::delegation::route::{RouteQuery, RouteSpec};
 use agent_core::delegation::wire::WorkerSummary;
@@ -2103,8 +2103,16 @@ mod tests {
             stop(&sup).await;
         });
     }
+    /// A parent can tell a worker waiting on the user from one at work.
+    mod awareness_tests;
+    /// Idle workers give their process slots back, losslessly.
+    mod capacity_tests;
+    /// Delivery and completion across refusals, revocations, retries and long answers.
+    mod delivery_tests;
     /// Worker status, run agreement, startup deadlines and paging errors (PR-E).
     mod status_tests;
+    /// A root's busy switch continues its task once, however the switch and its rebind interleave.
+    mod switch_continuation_tests;
     /// A root is told its sub-agents' results without polling for them.
     mod wake_tests;
 }
@@ -2170,6 +2178,62 @@ impl TokenSlot {
         }
     }
 }
+/// The requests a worker has put to the user that nobody has answered yet (approvals,
+/// questions and forms), keyed by the process generation that asked and the request id. A
+/// request leaves when it is answered, withdrawn or expires; a stopped turn and a process exit
+/// take every request of that generation with them. A failed or completed turn does not:
+/// background work can outlive such a turn and still be waiting on the user, as the view
+/// keeps it.
+#[derive(Debug, Default)]
+pub(super) struct OpenRequests {
+    open: std::collections::BTreeSet<(ProcessGeneration, String)>,
+    /// The state the last run left the worker in, restored when the last request settles with
+    /// no run open (a request held it at `waiting` meanwhile).
+    pub outcome: Option<String>,
+}
+impl OpenRequests {
+    /// Follows one event of `generation`'s process.
+    pub fn apply(&mut self, generation: ProcessGeneration, env: &agent_core::event::Envelope) {
+        use agent_core::event::{Event, QuestionSource, TurnState};
+        let key = || (generation, env.request.clone().unwrap_or_default());
+        match &env.event {
+            Event::ApprovalRequested { .. }
+            | Event::FormRequested { .. }
+            | Event::QuestionRequested {
+                source: QuestionSource::Agent,
+                ..
+            } => {
+                // A newer process asking means older ones are gone.
+                self.open.retain(|(g, _)| *g >= generation);
+                self.open.insert(key());
+            }
+            Event::ApprovalResolved { .. }
+            | Event::ApprovalExpired
+            | Event::QuestionResolved { .. }
+            | Event::FormResolved { .. } => {
+                self.open.remove(&key());
+            }
+            Event::TurnCompleted {
+                state: TurnState::Interrupted,
+                ..
+            }
+            | Event::SessionExited { .. } => self.clear_generation(generation),
+            _ => {}
+        }
+    }
+    /// Forgets every request `generation`'s process made (it exited, or its turn was stopped).
+    pub fn clear_generation(&mut self, generation: ProcessGeneration) {
+        self.open.retain(|(g, _)| *g != generation);
+    }
+    /// Whether `generation`'s process has a request open.
+    pub fn any_in(&self, generation: ProcessGeneration) -> bool {
+        self.open.iter().any(|(g, _)| *g == generation)
+    }
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.open.is_empty()
+    }
+}
 pub(super) struct WorkerRt {
     pub row: WorkerRow,
     pub root: WorkerId,
@@ -2202,8 +2266,17 @@ pub(super) struct WorkerRt {
     /// per run (a worker's state is inherited from its previous run until the new turn opens).
     pub opened_run: Option<RunId>,
     pub cwd: PathBuf,
+    /// Requests put to the user and not yet settled; see [`OpenRequests`].
+    pub open_requests: OpenRequests,
+    /// When the worker was last seen at work (or was created): an idle worker's process is
+    /// paused least recently active first, and only once idle long enough.
+    pub last_active: Instant,
 }
 impl WorkerRt {
+    /// Whether the worker's current process has a request open that only the user can answer.
+    pub fn waiting_on_user(&self) -> bool {
+        self.open_requests.any_in(self.generation)
+    }
     pub fn session(&self) -> Option<Rc<ChatSession>> {
         self.session.clone().or_else(|| self.root_session.upgrade())
     }
@@ -2233,6 +2306,31 @@ pub(super) struct Runtime {
     pub wakes: HashMap<WorkerId, agent_core::delegation::wake::Queue>,
     /// Roots with a wake attempt already scheduled.
     pub wake_armed: HashSet<WorkerId>,
+    /// Per worker, the newest epoch a revocation covering it was latched under: work that
+    /// captured that epoch or an older one is void (`Supervisor::epoch_for`), while a sibling's
+    /// revocation only moves its work on to the new epoch.
+    pub fences: HashMap<WorkerId, AuthorityEpoch>,
+    /// How long a steer waits for its run's answer before it is taken as refused; `None` is
+    /// [`super::deferred::STEER_SETTLE`] (tests shorten it).
+    pub steer_settle: Option<std::time::Duration>,
+    /// Steers whose answer was overdue, recorded `unknown`, by correlation tag: an answer that
+    /// still comes settles them (accepted: delivered; refused: requeued). The oldest gives way
+    /// past [`super::deferred::LATE_STEERS`].
+    pub late_steers: std::collections::VecDeque<(String, super::deferred::Delivery)>,
+    /// Process slots admitted but not yet holding a process, by reservation, with the worker
+    /// each launches once known (see `capacity.rs`).
+    pub launch_slots: HashMap<u64, Option<WorkerId>>,
+    pub next_launch_slot: u64,
+    /// Workers a delivery is on its way to: never paused under it (see `capacity.rs`).
+    pub delivery_holds: HashMap<WorkerId, u32>,
+    /// Test barriers: a held send's acceptance, a held launch's preparation.
+    #[cfg(test)]
+    pub hold_send_accept: Option<Rc<std::cell::Cell<bool>>>,
+    #[cfg(test)]
+    pub hold_launch: Option<Rc<std::cell::Cell<bool>>>,
+    /// Test barrier: a spawn between its slot naming the worker and the worker's registration.
+    #[cfg(test)]
+    pub hold_before_insert: Option<Rc<std::cell::Cell<bool>>>,
 }
 impl Runtime {
     /// Whether `w` holds a capability issued under its root's current authority epoch. No
@@ -2356,6 +2454,8 @@ impl Supervisor {
         if same_policy {
             self.rotate_before_stop(&worker, session.process_generation());
         }
+        // The stop ends a running turn as an exit would: said first, so the switch continues it.
+        session.note_switch_interrupts_turn();
         if let Some(watch) = session.rebind_stop() {
             super::capacity::wait_exit(&watch).await;
         }
@@ -2767,6 +2867,8 @@ impl Supervisor {
             readback: super::readback::Readback::default(),
             opened_run: None,
             cwd,
+            open_requests: OpenRequests::default(),
+            last_active: Instant::now(),
         }
     }
     pub(super) async fn stage(
@@ -2775,7 +2877,25 @@ impl Supervisor {
         generation: ProcessGeneration,
         profile: &Profile,
     ) -> Result<(), ToolError> {
-        let epoch = self.epoch(worker)?;
+        // Captured once; after each await it is re-read (`settled_epoch_for`): a sibling's close
+        // or exit moves it on, and only a revocation covering this worker fails the binding. One
+        // being committed as this starts is waited out the same way, never refused for itself.
+        let mut epoch = {
+            let before = {
+                let state = self.state.borrow();
+                let w = state
+                    .workers
+                    .get(worker)
+                    .ok_or_else(|| error(ErrorCode::NotFound, "unknown worker"))?;
+                state
+                    .roots
+                    .get(&w.root)
+                    .ok_or_else(|| error(ErrorCode::RuntimeUnavailable, "root unavailable"))?
+                    .row
+                    .epoch()
+            };
+            self.settled_epoch_for(worker, before).await?
+        };
         let (driver, role, task_mode) = {
             let state = self.state.borrow();
             let w = state
@@ -2830,7 +2950,7 @@ impl Supervisor {
                 break old;
             }
             glib::timeout_future(std::time::Duration::from_millis(10)).await;
-            self.epoch(worker)?;
+            epoch = self.settled_epoch_for(worker, epoch).await?;
         };
         if let Some(path) = old.and_then(|b| b.overlay) {
             let _ = gio::spawn_blocking(move || super::launch::unlink_overlay(&path)).await;
@@ -2847,7 +2967,8 @@ impl Supervisor {
                     "cannot prepare delegation binding",
                 )
             })?;
-        let valid = self.epoch(worker) == Ok(epoch) && self.profile_available(worker) && {
+        let current = self.settled_epoch_for(worker, epoch).await;
+        let valid = current.is_ok() && self.profile_available(worker) && {
             let state = self.state.borrow();
             state.workers.get(worker).is_some_and(|w| {
                 w.row.state != "closed"
@@ -3265,6 +3386,39 @@ impl Supervisor {
                 .map(|(id, w)| (id.clone(), w.row.parent(), w.row.task_mode_kind()))
                 .collect::<Vec<_>>();
             let effect = revocation(event, &tree);
+            // The workers the event covers: queued work and staged launches go only for them,
+            // and work they had in flight is fenced; the rest of the tree carries on.
+            let covered: HashSet<WorkerId> = match &effect.scope {
+                RevocationScope::Root => tree.iter().map(|(id, _, _)| id.clone()).collect(),
+                RevocationScope::Subtree(w) => {
+                    let mut out = HashSet::from([w.clone()]);
+                    loop {
+                        let more: Vec<WorkerId> = tree
+                            .iter()
+                            .filter(|(id, parent, _)| {
+                                !out.contains(id)
+                                    && parent.as_ref().is_some_and(|p| out.contains(p))
+                            })
+                            .map(|(id, _, _)| id.clone())
+                            .collect();
+                        if more.is_empty() {
+                            break out;
+                        }
+                        out.extend(more);
+                    }
+                }
+                RevocationScope::None => HashSet::new(),
+            };
+            if effect.bump {
+                if let Some(epoch) = state.roots.get(root).map(|r| r.row.epoch()) {
+                    let live: HashSet<WorkerId> = state.workers.keys().cloned().collect();
+                    state.fences.retain(|id, _| live.contains(id));
+                    for id in &covered {
+                        let fence = state.fences.entry(id.clone()).or_insert(epoch);
+                        *fence = (*fence).max(epoch);
+                    }
+                }
+            }
             if event.is_root_wide() {
                 if let Some(thread) = state.roots.get(root).map(|r| r.row.root_thread_id.clone()) {
                     let revision = state.preparations.entry(thread).or_default();
@@ -3290,7 +3444,11 @@ impl Supervisor {
             let mut conns = Vec::new();
             let mut overlays = Vec::new();
             if effect.bump {
-                for w in state.workers.values_mut().filter(|w| &w.root == root) {
+                for (_, w) in state
+                    .workers
+                    .iter_mut()
+                    .filter(|(id, w)| &w.root == root && covered.contains(*id))
+                {
                     if let Some(path) = w.staged.take().and_then(|b| b.overlay) {
                         overlays.push(path);
                     }
@@ -3318,12 +3476,16 @@ impl Supervisor {
                 }
             }
             state.waits.retain(|_, w| !effect.kill_tokens.contains(w));
-            state
-                .deferred
-                .retain(|worker, _| !effect.kill_tokens.contains(worker));
+            // The store cancels the covered workers' queued messages: their entries go too.
+            state.deferred.retain(|worker, _| {
+                !effect.kill_tokens.contains(worker) && !(effect.bump && covered.contains(worker))
+            });
             state
                 .controls
                 .retain(|_, entry| !effect.kill_tokens.contains(&entry.worker));
+            state
+                .late_steers
+                .retain(|(_, entry)| !effect.kill_tokens.contains(&entry.worker));
             (sessions, conns, overlays)
         };
         for path in overlays {
@@ -3392,13 +3554,33 @@ impl Supervisor {
         // the event names (their tokens are already gone). Every other worker of the tree keeps
         // its credential, now under the new epoch: closing one sibling must not leave the
         // others stale, every call denied. A token from an older epoch stays stale.
+        // Their queued instructions and pending tasks move with them: the store carried their
+        // accepted operations to the new epoch, and what waits in memory is stamped to match.
         if let Some((before, after)) = moved {
-            for (id, w) in state.workers.iter_mut() {
+            let Runtime {
+                workers,
+                deferred,
+                fences,
+                ..
+            } = &mut *state;
+            for (id, w) in workers.iter_mut() {
                 if &w.root != root || revoked.effect.kill_tokens.contains(id) {
                     continue;
                 }
                 if let Some(token) = w.token.as_mut().filter(|t| t.epoch == before) {
                     token.epoch = after;
+                }
+                // A worker the revocation covered keeps its fence: what it had waiting is void.
+                if fences.get(id).is_some_and(|f| *f >= before) {
+                    continue;
+                }
+                if let Some(input) = w.pending.as_mut().filter(|i| i.epoch == before) {
+                    input.epoch = after;
+                }
+                for entry in deferred.get_mut(id).into_iter().flatten() {
+                    if entry.input.epoch == before {
+                        entry.input.epoch = after;
+                    }
                 }
             }
         }
@@ -3455,6 +3637,12 @@ impl Supervisor {
     pub(super) fn notify_registry(&self) {
         let work = {
             let mut state = self.state.borrow_mut();
+            // Every change a worker's work makes reaches the registry: one still at work now is
+            // active now.
+            let now = Instant::now();
+            for w in state.workers.values_mut().filter(|w| w.at_work()) {
+                w.last_active = now;
+            }
             state.subscribers.retain(|(_, s)| s.strong_count() > 0);
             state
                 .subscribers
@@ -3517,6 +3705,7 @@ impl Supervisor {
                 paths: Vec::new(),
             },
             last_activity: w.row.last_activity.clone(),
+            waiting_on_user: w.waiting_on_user(),
             updated_at: agent_core::quota::epoch_to_rfc3339(w.row.updated_at / 1000),
         };
         fit_summary(&mut summary);

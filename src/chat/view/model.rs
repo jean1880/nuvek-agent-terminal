@@ -237,6 +237,9 @@ pub struct SubagentSummary {
     pub requested_effort: Option<String>,
     /// The model the provider says the sub-agent runs on, once it has said so.
     pub reported_model: Option<String>,
+    /// A request only the user can answer is open, even if the worker's turn has ended (a
+    /// background worker may ask after it): the worker counts as active and waiting.
+    pub waiting_on_user: bool,
 }
 
 impl SubagentSummary {
@@ -250,6 +253,9 @@ impl SubagentSummary {
     }
 
     pub fn active(&self) -> bool {
+        if self.waiting_on_user {
+            return true;
+        }
         match self.lifecycle {
             Some(state) => matches!(
                 state,
@@ -267,12 +273,22 @@ impl SubagentSummary {
     /// interrupted, waiting for its parent's next message) is active but not running: only a
     /// worker with a current run is.
     pub fn running(&self) -> bool {
+        if self.waiting_on_user {
+            return true;
+        }
         match &self.delegation {
             Some(delegation) if self.lifecycle.is_some() => {
                 delegation.run.is_some() && self.active()
             }
             _ => self.active(),
         }
+    }
+
+    /// A delegated worker between runs: alive and open to its parent's next message, but with
+    /// nothing running (a cancelled run leaves it here). The lists file it with the finished
+    /// ones rather than the active.
+    pub fn idle(&self) -> bool {
+        self.active() && !self.running()
     }
 
     pub fn finished(&self) -> bool {
@@ -287,7 +303,12 @@ impl SubagentSummary {
         match self.lifecycle {
             Some(WorkerState::Starting) => "starting",
             Some(WorkerState::Running) => "running",
-            Some(WorkerState::Waiting) => "waiting",
+            // A delegated worker with a run open is waiting on the user; without one it is
+            // idle, between runs.
+            Some(WorkerState::Waiting) => match &self.delegation {
+                Some(d) if d.run.is_none() && !self.waiting_on_user => "idle",
+                _ => "waiting",
+            },
             Some(WorkerState::Completed) => "completed",
             Some(WorkerState::Failed) => "failed",
             Some(WorkerState::Stopped) => "stopped",
@@ -330,6 +351,7 @@ impl SubagentSummary {
             requested_model: launch.model,
             requested_effort: None,
             reported_model: tool.reported_model.clone(),
+            waiting_on_user: false,
         })
     }
 
@@ -380,6 +402,7 @@ impl SubagentSummary {
             requested_model: field("model"),
             requested_effort: field("effort"),
             reported_model: tool.reported_model.clone(),
+            waiting_on_user: false,
         }
     }
 }

@@ -1140,9 +1140,16 @@ pub struct CapabilityLimits {
     pub max_wait_ms: u32,
     pub max_depth: u8,
     pub active_runs_per_root: u32,
+    /// Agent processes the app runs for delegated workers at once, idle ones included.
+    #[serde(default)]
+    pub live_processes_app: u32,
+    /// How many of them run now.
+    #[serde(default)]
+    pub live_processes: u32,
 }
 
 impl CapabilityLimits {
+    /// The limits, with no processes counted ([`Self::live_processes`] is the caller's).
     pub fn from_limits(l: &Limits) -> Self {
         Self {
             max_task_bytes: l.max_task_bytes,
@@ -1152,6 +1159,8 @@ impl CapabilityLimits {
             max_wait_ms: l.wait_timeout_max_ms,
             max_depth: l.max_depth,
             active_runs_per_root: l.active_runs_per_root,
+            live_processes_app: l.live_processes_app,
+            live_processes: 0,
         }
     }
 }
@@ -1358,6 +1367,11 @@ pub struct WorkerSummary {
     pub delegation: DelegationStatus,
     /// Scrubbed, at most 512 bytes.
     pub last_activity: Option<String>,
+    /// Whether the worker has a request open that only the user can answer (an approval, a
+    /// question or a form): its state is then `waiting` while it still has a current run. A
+    /// stored summary from before this field reads as `false`.
+    #[serde(default)]
+    pub waiting_on_user: bool,
     /// RFC 3339.
     pub updated_at: String,
 }
@@ -1666,6 +1680,7 @@ pub(crate) mod fixtures {
                 paths: vec![text(c, MAX_STATUS_PATH_BYTES); MAX_STATUS_PATHS],
             },
             last_activity: Some(text(c, MAX_LAST_ACTIVITY_BYTES)),
+            waiting_on_user: true,
             updated_at: "2026-10-15T00:00:00.000000000+00:00".into(),
         }
     }

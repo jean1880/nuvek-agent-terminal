@@ -6,10 +6,13 @@
 //! wait starts are the ones that stopped the thread (a plan has others, for models the thread
 //! may not use); it continues once a reading taken after the limit shows every one of them
 //! free (or, if none was exhausted then, every window free). A window still shown exhausted a
-//! grace past its own reset time counts as free: that copy is stale. When all of them name a reset time,
-//! the next reading is taken just after the latest, which the thread shows as when it continues;
-//! only the reading decides. The caller supplies the clock and the readings; nothing here sends
-//! or probes anything.
+//! grace past its own reset time counts as free: readings are merged, so that copy is stale. A
+//! reading taken after the limit can show it so at any later tick, with no new probe. Unless the
+//! agent refused work while that same copy was already past its reset: then it frees only when
+//! its usage drops or it names another reset, so a wrong guess costs one failed turn, never a
+//! loop. When every window still holding the thread names a reset time, the next reading is
+//! taken just after the latest, which the thread shows as when it continues; only a reading
+//! decides. The caller supplies the clock and the readings; nothing here sends or probes anything.
 
 /// Seconds past a reset time before continuing: the provider's clock and ours may differ.
 pub const GRACE: i64 = 60;
@@ -33,13 +36,11 @@ impl Window {
         self.used >= 1.0
     }
 
-    /// Free at `now`: not exhausted, or exhausted only as of a reading that predates its own
-    /// reset. A window the agent stops reporting is kept as last seen (`AccountStatus` merges
-    /// readings), so a copy still at 100 % a grace past its reset time is stale, not a limit.
-    /// If it was not, the next turn fails on the limit again and a new wait starts.
-    fn free(&self, now: i64) -> bool {
-        !self.exhausted()
-            || self
+    /// Shown exhausted a grace past its own reset time. A window the agent stops reporting is
+    /// kept as last seen (`AccountStatus` merges readings), so such a copy is usually stale.
+    fn past_reset(&self, now: i64) -> bool {
+        self.exhausted()
+            && self
                 .resets_at
                 .is_some_and(|r| now >= r.saturating_add(GRACE))
     }
@@ -68,6 +69,10 @@ pub struct LimitWait {
     checks: usize,
     /// The windows exhausted when the wait started: what stopped the thread.
     blocking: Vec<String>,
+    /// Windows already past their reset (key and reset time) when the agent refused work: the
+    /// refusal disproves that copy, so it is never taken as stale in this wait. Each frees only
+    /// when its usage drops or it names another reset, so a stale guess is made at most once.
+    refuted: Vec<(String, Option<i64>)>,
 }
 
 impl LimitWait {
@@ -86,7 +91,24 @@ impl LimitWait {
                 .filter(|w| w.exhausted())
                 .map(|w| w.key.clone())
                 .collect(),
+            refuted: held
+                .iter()
+                .filter(|w| w.past_reset(now))
+                .map(|w| (w.key.clone(), w.resets_at))
+                .collect(),
         }
+    }
+
+    /// Free at `now`: not exhausted, or past its own reset (a stale copy) unless this wait's
+    /// refusal already disproved that same copy. If a stale guess is wrong, the next turn fails
+    /// on the limit and the new wait refutes it.
+    fn free(&self, w: &Window, now: i64) -> bool {
+        !w.exhausted()
+            || (w.past_reset(now)
+                && !self
+                    .refuted
+                    .iter()
+                    .any(|(key, reset)| *key == w.key && *reset == w.resets_at))
     }
 
     /// The agent refused work again at `now`, with `reset` if known: a later reset time than
@@ -114,21 +136,21 @@ impl LimitWait {
         // Only a reading taken after the limit was hit says whether it is over.
         if let Some((_, windows)) = reading.filter(|(at, w)| *at > self.since && !w.is_empty()) {
             let freed = if self.blocking.is_empty() {
-                windows.iter().all(|w| w.free(now))
+                windows.iter().all(|w| self.free(w, now))
             } else {
                 // Each blocking window must be in the reading, and free.
                 self.blocking
                     .iter()
-                    .all(|key| windows.iter().any(|w| w.key == *key && w.free(now)))
+                    .all(|key| windows.iter().any(|w| w.key == *key && self.free(w, now)))
             };
             if freed {
                 return Step::Continue;
             }
-            // When every window still exhausted says when it resets, the next reading waits for
-            // the latest of them; one that does not keeps the backoff.
+            // When every window still holding the thread says when it resets, the next reading
+            // waits for the latest of them; one that does not keeps the backoff.
             let latest = windows
                 .iter()
-                .filter(|w| w.exhausted())
+                .filter(|w| !self.free(w, now))
                 .filter(|w| self.blocking.is_empty() || self.blocking.contains(&w.key))
                 .map(|w| w.resets_at.filter(|r| *r > now))
                 .collect::<Option<Vec<i64>>>()
@@ -307,6 +329,63 @@ mod tests {
         let mut wait = LimitWait::new(None, 100, &[]);
         assert_eq!(
             wait.step(4_000 + GRACE, Some((4_000 + GRACE, &at_limit))),
+            Step::Continue
+        );
+    }
+
+    #[test]
+    fn an_earlier_reading_after_the_limit_frees_a_window_once_its_reset_passes() {
+        // The reading taken at 200 is the latest one: no new probe is needed to judge it later.
+        let at_limit = [window("Weekly", 1.0, Some(4_000))];
+        let mut wait = LimitWait::new(None, 100, &at_limit);
+        assert_eq!(wait.step(300, Some((200, &at_limit))), Step::Wait);
+        assert_eq!(
+            wait.step(4_000 + GRACE, Some((200, &at_limit))),
+            Step::Continue
+        );
+    }
+
+    #[test]
+    fn a_refusal_past_a_windows_reset_refutes_that_copy_so_the_guess_is_made_once() {
+        // The guess was wrong: the continued turn failed on the limit at 5 000 while "Weekly"
+        // still showed the reset it had passed. The new wait never takes that copy as stale.
+        let refused = [window("Weekly", 1.0, Some(4_000))];
+        let mut wait = LimitWait::new(None, 5_000, &refused);
+        assert_eq!(wait.step(5_110, Some((5_100, &refused))), Step::Wait);
+        assert_eq!(wait.step(10_000, Some((9_000, &refused))), Step::Probe);
+        assert_eq!(
+            wait.reset(),
+            None,
+            "a refuted copy names no reset to wait for"
+        );
+        // A new reset time still in the future is waited for, and read again after it.
+        let renewed = [window("Weekly", 1.0, Some(20_000))];
+        assert_eq!(wait.step(10_100, Some((10_050, &renewed))), Step::Wait);
+        assert_eq!(wait.reset(), Some(20_000));
+        // A copy that names another reset, now passed, is a new copy: stale again, so it frees.
+        assert_eq!(
+            wait.step(20_000 + GRACE, Some((10_050, &renewed))),
+            Step::Continue
+        );
+        // So does a drop in usage under the same refuted reset.
+        let mut wait = LimitWait::new(None, 5_000, &refused);
+        let dropped = [window("Weekly", 0.3, Some(4_000))];
+        assert_eq!(wait.step(5_200, Some((5_100, &dropped))), Step::Continue);
+    }
+
+    #[test]
+    fn a_stale_blocking_window_beside_a_full_one_waits_for_the_full_one() {
+        let at_limit = [
+            window("5-hour", 1.0, Some(4_000)),
+            window("Weekly", 1.0, Some(9_000)),
+        ];
+        let mut wait = LimitWait::new(None, 100, &at_limit);
+        assert_eq!(wait.step(300, Some((200, &at_limit))), Step::Wait);
+        // "5-hour" is past its reset, "Weekly" is not: the thread still waits, for "Weekly".
+        assert_eq!(wait.step(4_000 + GRACE, Some((200, &at_limit))), Step::Wait);
+        assert_eq!(wait.reset(), Some(9_000));
+        assert_eq!(
+            wait.step(9_000 + GRACE, Some((200, &at_limit))),
             Step::Continue
         );
     }

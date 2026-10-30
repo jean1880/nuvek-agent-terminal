@@ -46,7 +46,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Schema version this build writes. Bump it and add a step to [`migrate`]. An existing store is
 /// only ever upgraded by the preflight (`preflight::run`), after a verified backup.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 /// `PRAGMA synchronous = FULL`: a durable control write's level.
 const SYNC_FULL: i64 = 2;
 /// [`Store::meta`] key of the native sessions whose threads the user deleted (JSON list of
@@ -3962,6 +3962,10 @@ fn migrate_locked_to(conn: &Connection, current: i64, target: i64) -> Result<()>
              INSERT INTO schema_version (version) VALUES (6);",
         )?;
     }
+    if current < 7 && target >= 7 {
+        // The 'local' driver for delegation workers too, so a root thread can move to it.
+        conn.execute_batch(delegation::SCHEMA_V7)?;
+    }
     let broken: Option<String> = conn
         .query_row(
             "SELECT \"table\" FROM pragma_foreign_key_check LIMIT 1",
@@ -5156,7 +5160,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .expect("version");
-        assert_eq!(version, 6);
+        assert_eq!(version, SCHEMA_VERSION);
         let kept: (String, String) = conn
             .query_row(
                 "SELECT driver, native_id FROM provider_threads WHERE id = 'p1'",
@@ -5171,6 +5175,96 @@ mod tests {
         assert_eq!(link.as_deref(), Some("p1"));
         insert("p2", "local").expect("local allowed");
         assert!(insert("p3", "other").is_err());
+        migrate(&conn).expect("a second run is a no-op");
+    }
+
+    #[test]
+    fn a_v6_database_migrates_to_v7_keeping_workers_and_allowing_a_local_root() {
+        let conn = Connection::open_in_memory().expect("open");
+        conn.pragma_update(None, "foreign_keys", "ON").expect("fk");
+        conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+            .expect("version table");
+        migrate_locked_to(&conn, 0, 6).expect("a v6 database");
+        conn.execute_batch(
+            "BEGIN;
+             INSERT INTO threads (id, title, cwd, created_at, updated_at) VALUES ('t1', 'r', '/w', 1, 2);
+             INSERT INTO delegation_roots (id, root_thread_id, root_worker_id, task_state,
+                 policy_json, continuation_budget, created_at, updated_at)
+                 VALUES ('r1', 't1', 'w_root', 'active', '{}', 3, 1, 2);
+             INSERT INTO delegation_workers (id, root_id, parent_id, origin, depth, name, driver,
+                 profile_id, launch_json, state, workspace_json, delegation_status, created_at,
+                 updated_at)
+                 VALUES ('w_root', 'r1', NULL, 'root', 0, 'root', 'claude', 'p', '{}',
+                         'running', '{}', 'available', 1, 2),
+                        ('w_kid', 'r1', 'w_root', 'native', 1, 'kid', 'codex', 'p', '{}',
+                         'running', '{}', 'available', 1, 2);
+             INSERT INTO delegation_runs (id, worker_id, process_generation, authority_epoch,
+                 state, created_at, updated_at)
+                 VALUES ('run1', 'w_kid', 0, 0, 'running', 1, 2);
+             COMMIT;",
+        )
+        .expect("v6 rows");
+        let to_local = || {
+            conn.execute(
+                "UPDATE delegation_workers SET driver = 'local' WHERE id = 'w_root'",
+                [],
+            )
+        };
+        assert!(to_local().is_err(), "v6 refuses it");
+
+        migrate(&conn).expect("migrate");
+
+        let version: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .expect("version");
+        assert_eq!(version, SCHEMA_VERSION);
+        let kept: Vec<(String, String, Option<String>)> = conn
+            .prepare("SELECT id, driver, parent_id FROM delegation_workers ORDER BY id")
+            .expect("prepare")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .expect("query")
+            .collect::<std::result::Result<_, _>>()
+            .expect("rows");
+        assert_eq!(
+            kept,
+            vec![
+                ("w_kid".into(), "codex".into(), Some("w_root".into())),
+                ("w_root".into(), "claude".into(), None)
+            ]
+        );
+        let run_worker: String = conn
+            .query_row("SELECT worker_id FROM delegation_runs", [], |r| r.get(0))
+            .expect("run");
+        assert_eq!(run_worker, "w_kid");
+
+        to_local().expect("local allowed");
+        assert!(conn
+            .execute(
+                "UPDATE delegation_workers SET driver = 'other' WHERE id = 'w_root'",
+                []
+            )
+            .is_err());
+        assert!(
+            conn.execute(
+                "UPDATE delegation_workers SET depth = 2 WHERE id = 'w_kid'",
+                []
+            )
+            .is_err(),
+            "the lineage trigger is back"
+        );
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE tbl_name = 'delegation_workers'
+                 AND type IN ('index', 'trigger') AND name LIKE 'delegation_workers_%'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("indexes");
+        assert_eq!(indexes, 5);
+        let fk: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .expect("fk");
+        assert_eq!(fk, 1);
         migrate(&conn).expect("a second run is a no-op");
     }
 

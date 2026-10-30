@@ -218,6 +218,68 @@ CREATE INDEX delegation_native_aliases_worker ON delegation_native_aliases(worke
 INSERT INTO schema_version (version) VALUES (4);
 ";
 
+/// The v7 migration step: `delegation_workers` allows the 'local' driver, so a root thread can
+/// move to the Local agent (it binds no bridge, but its row follows the thread's driver). SQLite
+/// cannot alter a CHECK constraint, so the table is rebuilt with foreign keys off (create new,
+/// copy, drop, rename); ids are kept, so every table referring to a worker stays valid. Dropping
+/// the table drops its indexes and triggers, which are created again verbatim.
+pub(crate) const SCHEMA_V7: &str = "
+CREATE TABLE delegation_workers_v7 (
+    id TEXT PRIMARY KEY,
+    root_id TEXT NOT NULL REFERENCES delegation_roots(id),
+    parent_id TEXT,
+    origin TEXT NOT NULL CHECK (origin IN ('root', 'native', 'supervised')),
+    depth INTEGER NOT NULL CHECK (depth BETWEEN 0 AND 2),
+    name TEXT NOT NULL,
+    driver TEXT NOT NULL CHECK (driver IN ('claude', 'agy', 'codex', 'local')),
+    profile_id TEXT NOT NULL,
+    launch_json TEXT NOT NULL,
+    backing_thread_id TEXT UNIQUE REFERENCES threads(id),
+    state TEXT NOT NULL CHECK (state IN ('starting', 'running', 'waiting', 'completed', 'failed',
+                                         'stopping', 'stopped', 'closed', 'unknown')),
+    task_mode TEXT CHECK (task_mode IN ('ask', 'accept_edits', 'plan')),
+    workspace_json TEXT NOT NULL,
+    identity_json TEXT,
+    delegation_status TEXT NOT NULL CHECK (delegation_status IN ('available', 'workspace_untrusted',
+        'rebind_required', 'restricted', 'bridge_disabled', 'unavailable')),
+    delegation_reason TEXT CHECK (length(CAST(delegation_reason AS BLOB)) <= 256),
+    delegation_paths TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(delegation_paths)
+        AND json_type(delegation_paths) = 'array' AND json_array_length(delegation_paths) <= 16),
+    last_activity TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY (root_id, parent_id) REFERENCES delegation_workers(root_id, id),
+    CHECK ((origin = 'root') = (parent_id IS NULL)),
+    CHECK ((origin = 'root') = (depth = 0)),
+    CHECK (origin = 'supervised' OR backing_thread_id IS NULL)
+);
+INSERT INTO delegation_workers_v7 (id, root_id, parent_id, origin, depth, name, driver,
+    profile_id, launch_json, backing_thread_id, state, task_mode, workspace_json, identity_json,
+    delegation_status, delegation_reason, delegation_paths, last_activity, created_at, updated_at)
+SELECT id, root_id, parent_id, origin, depth, name, driver,
+    profile_id, launch_json, backing_thread_id, state, task_mode, workspace_json, identity_json,
+    delegation_status, delegation_reason, delegation_paths, last_activity, created_at, updated_at
+FROM delegation_workers;
+DROP TABLE delegation_workers;
+ALTER TABLE delegation_workers_v7 RENAME TO delegation_workers;
+CREATE UNIQUE INDEX delegation_workers_root_id ON delegation_workers(root_id, id);
+CREATE UNIQUE INDEX delegation_workers_one_root ON delegation_workers(root_id)
+    WHERE origin = 'root';
+CREATE INDEX delegation_workers_parent ON delegation_workers(root_id, parent_id);
+CREATE TRIGGER delegation_workers_depth BEFORE INSERT ON delegation_workers
+WHEN NEW.parent_id IS NOT NULL
+ AND NEW.depth IS NOT (SELECT depth + 1 FROM delegation_workers WHERE id = NEW.parent_id)
+BEGIN SELECT RAISE(ABORT, 'a delegation worker is one level below its parent'); END;
+CREATE TRIGGER delegation_workers_lineage BEFORE UPDATE ON delegation_workers
+WHEN NEW.id IS NOT OLD.id OR NEW.root_id IS NOT OLD.root_id
+  OR NEW.parent_id IS NOT OLD.parent_id OR NEW.origin IS NOT OLD.origin
+  OR NEW.depth IS NOT OLD.depth OR NEW.created_at IS NOT OLD.created_at
+  OR (OLD.backing_thread_id IS NOT NULL AND NEW.backing_thread_id IS NOT OLD.backing_thread_id)
+BEGIN SELECT RAISE(ABORT, 'a delegation worker''s lineage is immutable'); END;
+
+INSERT INTO schema_version (version) VALUES (7);
+";
+
 /// The tables v4 adds, in creation order.
 pub const V4_TABLES: [&str; 7] = [
     "delegation_roots",

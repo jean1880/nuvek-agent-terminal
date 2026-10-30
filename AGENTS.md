@@ -483,9 +483,9 @@ epoch field) in `make package` and `packaging/build-deb.sh`; the rpm has `epoch 
 - An indicator-style check has three states, never two. An unreadable indicator source
   must report unknown, never healthy.
 - A dialog closes on a press outside it, as Escape closes it (an alert answers its close
-  response; a dialog that refuses to close is asked, not forced): `dialogs::close_on_outside_click`,
-  hooked by every window that shows dialogs through its `visible-dialog`. A new such window hooks
-  it too.
+  response; a dialog that refuses to close is asked, not forced). Every window that shows dialogs
+  calls `dialogs::close_dialogs_on_outside_click`, which hooks each dialog as it becomes the
+  window's `visible-dialog`; a new such window calls it too.
 - Settings apply as they are made, never on dialog close: a switch or dropdown at
   once, a text entry when committed (Enter, its apply button, or focus leaving it),
   and never with a half-typed value. Rows that can hold an invalid

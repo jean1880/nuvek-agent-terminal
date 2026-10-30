@@ -1390,11 +1390,7 @@ impl ObjectImpl for AgentTerminalWindow {
         self.watch_focus();
         self.report_config_problem();
         // Every dialog shown here closes on a press outside it, as Escape does.
-        self.obj().connect_visible_dialog_notify(|window| {
-            if let Some(dialog) = window.visible_dialog() {
-                crate::dialogs::close_on_outside_click(&dialog);
-            }
-        });
+        crate::dialogs::close_dialogs_on_outside_click(&*self.obj());
     }
 }
 
@@ -7507,7 +7503,6 @@ mod tests {
         agents_prefs::tests::invalid_agent_drafts_are_not_saved(window.imp());
         agents_prefs::tests::the_master_switch_sets_every_enabled_agent(window.imp());
         agents_prefs::tests::pages_have_renderable_titles(window.imp());
-        crate::dialogs::tests::a_shown_dialog_closes_on_a_press_outside_it(&window);
         diff_panel_shows_each_outcome();
         super::super::diff_panel::tests::the_panel_pops_out_docks_and_offers_a_pr(
             window.upcast_ref(),

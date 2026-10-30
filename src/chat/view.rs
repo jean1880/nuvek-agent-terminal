@@ -1096,8 +1096,15 @@ impl Inner {
                 .then(|| self.model.borrow().current_model().map(str::to_owned))
                 .flatten()
         });
+        // Which of the agent's servers: three Ollama servers all read "Local" otherwise.
+        let server = self
+            .models
+            .borrow()
+            .as_ref()
+            .and_then(|source| source.current_server());
         self.header.set_agent(
             status.driver,
+            server.as_deref(),
             model.as_deref(),
             status.pending_model.as_deref(),
             status.effort.as_deref(),
@@ -3567,6 +3574,7 @@ pub(crate) mod tests {
         follow::tests::a_followed_scroller_tracks_its_end_until_the_user_scrolls_up();
         composer::tests::stop_preserves_a_draft_and_completions_stay_in_the_field();
         panels::tests::changing_effort_does_not_switch_until_row_activation();
+        panels::tests::each_server_is_a_group_and_a_pick_moves_the_thread_to_it();
         panels::tests::a_reconnect_in_flight_shows_on_its_row();
         escape_closes_the_model_picker();
         usage::tests::compact_scope_does_not_filter_provider_comparison();

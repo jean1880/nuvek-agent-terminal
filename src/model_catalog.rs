@@ -186,6 +186,9 @@ pub struct ModelCatalog {
     others_tried: RefCell<Vec<(Driver, Option<agent_core::provider::ModelProvider>)>>,
     /// The other sources whose fetch in this run has finished, successful or not.
     others_settled: RefCell<Vec<(Driver, Option<agent_core::provider::ModelProvider>)>>,
+    /// The sources (an agent's own, or another profile's) whose last fetch answered with no model
+    /// the agent can use, as opposed to failing: what the picker says of an empty group.
+    answered_empty: RefCell<Vec<(Driver, Option<agent_core::provider::ModelProvider>)>>,
 }
 
 thread_local! {
@@ -241,6 +244,7 @@ impl ModelCatalog {
             ),
             others_tried: RefCell::new(Vec::new()),
             others_settled: RefCell::new(Vec::new()),
+            answered_empty: RefCell::new(Vec::new()),
         }
     }
 
@@ -333,6 +337,11 @@ impl ModelCatalog {
         if !self.wants_other(driver, source.as_ref()) {
             return;
         }
+        self.note_empty(
+            driver,
+            source.clone(),
+            models.as_ref().is_some_and(Vec::is_empty),
+        );
         let models = models.unwrap_or_default();
         let listed = !models.is_empty();
         let changed = {
@@ -511,9 +520,49 @@ impl ModelCatalog {
 
     /// Records a failed fetch: the list stays, and is shown as not refreshed.
     fn mark_failed(&self, driver: Driver) {
+        self.note_empty(driver, self.source(driver), false);
         let mut failed = self.failed.borrow_mut();
         if !failed.contains(&driver) {
             failed.push(driver);
+        }
+    }
+
+    /// Records whether `source`'s last fetch for `driver` answered with no usable model (`empty`)
+    /// rather than failing or listing some.
+    fn note_empty(
+        &self,
+        driver: Driver,
+        source: Option<agent_core::provider::ModelProvider>,
+        empty: bool,
+    ) {
+        let mut answered = self.answered_empty.borrow_mut();
+        answered.retain(|(d, s)| !(*d == driver && *s == source));
+        if empty {
+            answered.push((driver, source));
+        }
+    }
+
+    /// What the picker can say of `driver`'s list as a profile on `source` sees it: listed (even
+    /// from the cache), not read yet, answered with no usable model, or not reachable.
+    pub fn list_state(
+        &self,
+        driver: Driver,
+        source: Option<&agent_core::provider::ModelProvider>,
+    ) -> agent_core::catalog::SourceState {
+        use agent_core::catalog::SourceState;
+        if !self.models_for(driver, source).is_empty() {
+            SourceState::Listed
+        } else if self
+            .answered_empty
+            .borrow()
+            .iter()
+            .any(|(d, s)| *d == driver && s.as_ref() == source)
+        {
+            SourceState::NoChatModel
+        } else if self.is_settled_for(driver, source) {
+            SourceState::Unreachable
+        } else {
+            SourceState::Pending
         }
     }
 
@@ -618,8 +667,11 @@ impl ModelCatalog {
     fn set_at(&self, driver: Driver, models: Vec<CatalogModel>, now: i64) {
         if models.is_empty() {
             self.mark_failed(driver);
+            // It answered: with nothing usable, which the picker says apart from a failure.
+            self.note_empty(driver, self.source(driver), true);
             return;
         }
+        self.note_empty(driver, self.source(driver), false);
         self.failed.borrow_mut().retain(|d| *d != driver);
         let mut read_at = self.read_at.get();
         read_at.set(driver, Some(now));
@@ -889,6 +941,7 @@ impl ModelCatalog {
                         // No list, or an empty one: what was listed before (the vendor's, another
                         // server's) is not on offer here, so it is dropped, not kept.
                         fetched => {
+                            let answered = fetched.is_ok();
                             match fetched {
                                 Err(why) => {
                                     warn!(%why, "{} model server list failed", driver.info().key)
@@ -898,6 +951,10 @@ impl ModelCatalog {
                                 }
                             }
                             me.clear_unlisted(driver);
+                            // It answered, with nothing to chat with: not "not reachable".
+                            if answered {
+                                me.note_empty(driver, Some(asked), true);
+                            }
                         }
                     }
                     me.mark_attempted(driver);
@@ -1045,21 +1102,83 @@ pub fn only_ready(models: Vec<CatalogModel>, ready: impl Fn(Driver) -> bool) -> 
     models.into_iter().filter(|m| ready(m.driver)).collect()
 }
 
+/// One group a thread's picker offers: an agent as one profile runs it, on its vendor or on a
+/// model server ([`agent_core::catalog::SourceGroup`] without its models, which the catalogue
+/// fills in).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickerSpec {
+    pub driver: Driver,
+    /// The profile's id; `None`: the thread's own for `driver` (no profile is set up for it).
+    pub profile: Option<String>,
+    pub name: String,
+    pub detail: Option<String>,
+    /// Where its models are read: `None`, the vendor.
+    pub source: Option<agent_core::provider::ModelProvider>,
+    /// The thread runs on this profile now.
+    pub current: bool,
+}
+
+/// What lists a thread's picker groups ([`PickerSpec`]), asked at every read.
+pub type PickerSpecs = Rc<dyn Fn() -> Vec<PickerSpec>>;
+
 /// One thread's picker rows: each agent's models as the thread's profile runs it (its own model
 /// server, another profile's, or the vendor), from the app-wide catalogue. `source_of` names the
 /// source the thread runs an agent on; it is asked at every read, so a Settings change shows.
+/// With `specs`, the picker shows one group per profile they list (every model server its own
+/// group), each with that source's models.
 pub struct ProfileModels {
     catalog: Rc<ModelCatalog>,
     source_of: Rc<dyn Fn(Driver) -> Option<agent_core::provider::ModelProvider>>,
+    specs: Option<PickerSpecs>,
 }
 
 impl ProfileModels {
+    #[cfg_attr(not(test), allow(dead_code))] // the app groups by profile (`grouped`)
     pub fn new(
         catalog: Rc<ModelCatalog>,
         source_of: Rc<dyn Fn(Driver) -> Option<agent_core::provider::ModelProvider>>,
     ) -> Rc<Self> {
-        Rc::new(Self { catalog, source_of })
+        Rc::new(Self {
+            catalog,
+            source_of,
+            specs: None,
+        })
     }
+
+    /// [`Self::new`], grouping the picker by the profiles `specs` lists.
+    pub fn grouped(
+        catalog: Rc<ModelCatalog>,
+        source_of: Rc<dyn Fn(Driver) -> Option<agent_core::provider::ModelProvider>>,
+        specs: PickerSpecs,
+    ) -> Rc<Self> {
+        Rc::new(Self {
+            catalog,
+            source_of,
+            specs: Some(specs),
+        })
+    }
+}
+
+/// The picker's groups for `specs` from `catalog`, leaving out agents `ready` refuses: each
+/// profile's source's models, and what is known of a source with none.
+pub fn picker_groups(
+    catalog: &ModelCatalog,
+    specs: Vec<PickerSpec>,
+    ready: impl Fn(Driver) -> bool,
+) -> Vec<agent_core::catalog::SourceGroup> {
+    specs
+        .into_iter()
+        .filter(|s| ready(s.driver))
+        .map(|s| agent_core::catalog::SourceGroup {
+            models: catalog.models_for(s.driver, s.source.as_ref()),
+            state: catalog.list_state(s.driver, s.source.as_ref()),
+            driver: s.driver,
+            profile: s.profile,
+            name: s.name,
+            detail: s.detail,
+            current: s.current,
+        })
+        .collect()
 }
 
 impl ModelSource for ProfileModels {
@@ -1069,6 +1188,22 @@ impl ModelSource for ProfileModels {
         only_ready(self.catalog.models_with(|d| (self.source_of)(d)), |d| {
             availability.is_ready(d)
         })
+    }
+
+    fn current_server(&self) -> Option<String> {
+        let specs = self.specs.as_ref()?;
+        specs()
+            .into_iter()
+            .find(|s| s.current && s.source.is_some())
+            .map(|s| s.name)
+    }
+
+    fn groups(&self) -> Option<Vec<agent_core::catalog::SourceGroup>> {
+        let availability = crate::availability::AgentAvailability::shared();
+        let specs = self.specs.as_ref()?;
+        Some(picker_groups(&self.catalog, specs(), |d| {
+            availability.is_ready(d)
+        }))
     }
 
     fn connect_changed(&self, f: Box<dyn Fn()>) -> u64 {
@@ -1490,6 +1625,84 @@ mod tests {
         cat.adopt_sources(&without);
         assert!(cat.models_for(Driver::Claude, Some(&ollama)).is_empty());
         assert!(!cat.has_untried_other(&without, Driver::Claude));
+    }
+
+    /// A picker group with no models says why: not read yet, answered with no usable model, or
+    /// not reachable; and each server's group lists that server's models.
+    #[test]
+    fn each_sources_group_has_its_own_models_and_says_why_one_is_empty() {
+        use agent_core::catalog::SourceState;
+        use agent_core::provider::{ModelProvider, ProviderKind};
+        let cat = ModelCatalog::with_cache(None);
+        let desk = ModelProvider::new(ProviderKind::Ollama);
+        let nas = ModelProvider {
+            base_url: Some("http://192.0.2.7:11434".into()),
+            ..ModelProvider::new(ProviderKind::Ollama)
+        };
+        let laptop = ModelProvider::new(ProviderKind::LmStudio);
+        let targets =
+            ProbeTargets::new(vec![(Driver::Local, crate::probe::ProbeTarget::default())])
+                .with_providers(vec![(
+                    Driver::Local,
+                    desk.clone(),
+                    crate::probe::ProviderKey::default(),
+                )])
+                .with_other_sources(vec![
+                    other(Driver::Local, Some(nas.clone())),
+                    other(Driver::Local, Some(laptop.clone())),
+                ]);
+        *cat.targets.borrow_mut() = targets.clone();
+        cat.adopt_sources(&targets);
+        let state = |p: &ModelProvider| cat.list_state(Driver::Local, Some(p));
+        assert_eq!(state(&nas), SourceState::Pending, "nothing read yet");
+
+        cat.land_fetch(Driver::Local, vec![model(Driver::Local, "qwen3:8b")]);
+        cat.land_other(
+            Driver::Local,
+            Some(nas.clone()),
+            Some(vec![model(Driver::Local, "gemma3")]),
+        );
+        cat.land_other(Driver::Local, Some(laptop.clone()), None);
+        assert_eq!(state(&desk), SourceState::Listed);
+        assert_eq!(state(&nas), SourceState::Listed);
+        assert_eq!(state(&laptop), SourceState::Unreachable);
+
+        let spec = |source: &ModelProvider, name: &str| PickerSpec {
+            driver: Driver::Local,
+            profile: Some(format!("p-{name}")),
+            name: name.to_owned(),
+            detail: None,
+            source: Some(source.clone()),
+            current: false,
+        };
+        let groups = picker_groups(
+            &cat,
+            vec![
+                spec(&desk, "Desk"),
+                spec(&nas, "NAS"),
+                spec(&laptop, "Laptop"),
+            ],
+            |_| true,
+        );
+        let ids: Vec<Vec<&str>> = groups
+            .iter()
+            .map(|g| g.models.iter().map(|m| m.id.as_str()).collect())
+            .collect();
+        assert_eq!(ids, [vec!["qwen3:8b"], vec!["gemma3"], vec![]]);
+        assert_eq!(groups[2].state, SourceState::Unreachable);
+        assert!(picker_groups(&cat, vec![spec(&desk, "Desk")], |_| false).is_empty());
+
+        // An answer with nothing to chat with is not a failure.
+        cat.land_other(Driver::Local, Some(nas.clone()), Some(Vec::new()));
+        assert_eq!(state(&nas), SourceState::NoChatModel);
+        cat.land_fetch(Driver::Local, Vec::new());
+        assert_eq!(
+            state(&desk),
+            SourceState::Listed,
+            "an empty refresh keeps the last list"
+        );
+        cat.land_other(Driver::Local, Some(nas.clone()), None);
+        assert_eq!(state(&nas), SourceState::Unreachable);
     }
 
     /// An unchanged refresh of another profile's list still moves its stored time, once it is

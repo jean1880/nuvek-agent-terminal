@@ -1118,6 +1118,11 @@ impl Supervisor {
                 let driver = crate::config::profile_driver(&p)?;
                 let id = agent_core::delegation::ProfileId::parse(&p.id).ok()?;
                 let available = opted_in(&p) && (self.services.resolve)(&p).is_some();
+                // Each profile's own source: three servers of one agent list three lists.
+                let models = (self.services.catalog.models)(driver, &p)
+                    .iter()
+                    .filter_map(|m| super::catalog_info::model_info(m, tags.tags.as_deref()))
+                    .collect();
                 Some(ProfileCapabilities {
                     profile_id: id,
                     name: p.name,
@@ -1150,10 +1155,7 @@ impl Supervisor {
                             }
                         })
                         .collect(),
-                    models: (self.services.catalog.models)(driver)
-                        .iter()
-                        .filter_map(|m| super::catalog_info::model_info(m, tags.tags.as_deref()))
-                        .collect(),
+                    models,
                     usage: (self.services.catalog.usage)(driver)
                         .map(|s| super::catalog_info::usage_info(&s, now)),
                     workspaces: vec![

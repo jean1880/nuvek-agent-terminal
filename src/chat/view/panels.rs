@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use agent_core::adapter::{Control, Driver};
-use agent_core::catalog::{group_for_picker, CatalogModel};
+use agent_core::catalog::{filter_groups, groups_by_agent, CatalogModel, SourceGroup};
 use gtk4::glib;
 use serde_json::Value;
 
@@ -255,14 +255,17 @@ fn catalog_from_payload(driver: Driver, entries: Vec<payload::ModelEntry>) -> Ve
         .collect()
 }
 
-/// Whether `m` is the model the thread is on now (agy rows match at any of their efforts).
-fn is_current(m: &CatalogModel, status: &SessionStatus) -> bool {
-    m.driver == status.driver && status.model.as_deref().is_some_and(|id| m.is_model(id))
+/// Whether `m` is the model the thread is on now (agy rows match at any of their efforts). Only a
+/// row of the group the thread runs on can be: the same model on another server is not it.
+fn is_current(m: &CatalogModel, group: &SourceGroup, status: &SessionStatus) -> bool {
+    group.current
+        && m.driver == status.driver
+        && status.model.as_deref().is_some_and(|id| m.is_model(id))
 }
 
 /// The effort a row starts on: the thread's own when this is its model, else the model's default.
-fn initial_effort(m: &CatalogModel, status: &SessionStatus) -> Option<String> {
-    let current = if !is_current(m, status) {
+fn initial_effort(m: &CatalogModel, group: &SourceGroup, status: &SessionStatus) -> Option<String> {
+    let current = if !is_current(m, group, status) {
         None
     } else if m.driver == Driver::Agy {
         status.model.as_deref().and_then(|id| m.effort_in(id))
@@ -299,35 +302,91 @@ fn choice(
     }
 }
 
-/// `pick(driver, model value, effort, unchanged)`: `unchanged` when the choice is what the
-/// thread already runs (the current model at its own effort), so there is nothing to switch.
-type Pick = Rc<dyn Fn(Driver, String, Option<String>, bool)>;
+/// Another profile than the thread's own a pick runs on: its id, and its name for the dialogs.
+#[derive(Clone)]
+struct Target {
+    profile: String,
+    name: String,
+}
+
+/// `pick(driver, target, model value, effort, unchanged)`: `target` when the row's group is
+/// another profile than the one the thread runs `driver` on; `unchanged` when the choice is what
+/// the thread already runs (the current model at its own effort), so there is nothing to switch.
+type Pick = Rc<dyn Fn(Driver, Option<Target>, String, Option<String>, bool)>;
 
 /// What a switch to an agent would cost ([`crate::chat::ChatBackend::switch_caveats`]).
 type Caveats<'a> = &'a dyn Fn(Driver) -> Vec<String>;
 
-/// The grouped, filtered rows for `query`. Every row has the same UX for both agents: the name
-/// and, when the model offers efforts, an effort dropdown. Effort is staged; activating the
-/// row calls `pick` with that choice. The other agent's group says first what a switch to it
-/// costs (`caveats`).
+/// What moving the thread to `group` costs, said under its heading: another agent's caveats
+/// (`caveats`), or for another profile of the thread's own agent, that it is a new session.
+fn group_caveats(group: &SourceGroup, status: &SessionStatus, caveats: Caveats) -> Vec<String> {
+    if group.driver != status.driver {
+        return caveats(group.driver);
+    }
+    if group.current || group.profile.is_none() {
+        return Vec::new();
+    }
+    vec![format!(
+        "Choosing a model here moves this thread to {}: it continues from a summary of the \
+         conversation, in a new session.",
+        group.name
+    )]
+}
+
+/// A group's heading: the agent's mark and the group's name, then what the source is (the agent,
+/// the server's kind and address) and, when it lists nothing, why.
+fn group_heading(group: &SourceGroup) -> gtk4::Box {
+    let heading = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+    heading.set_margin_top(6);
+    heading.set_margin_start(6);
+    heading.set_margin_end(6);
+    let title = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    title.add_css_class(accent_class(group.driver));
+    title.set_halign(gtk4::Align::Start);
+    title.append(&brand_image(group.driver));
+    title.append(&label(&group.name.to_uppercase(), &["model-group"]));
+    if group.current {
+        let here = label("This thread", &["model-group-current"]);
+        here.set_tooltip_text(Some("The thread runs on this one now"));
+        title.append(&here);
+    }
+    heading.append(&title);
+    let detail = match (group.detail.as_deref(), group.state.note()) {
+        (Some(d), Some(n)) => Some(format!("{d} · {n}")),
+        (Some(d), None) => Some(d.to_owned()),
+        (None, Some(n)) => Some(n.to_owned()),
+        (None, None) => None,
+    };
+    if let Some(detail) = detail {
+        heading.append(&wrapped_text(&detail, &["dim-label", "model-group-detail"]));
+    }
+    heading
+}
+
+/// The grouped, filtered rows for `query`: one group per agent and source (a model server is its
+/// own group, its models under it). Every row has the same UX: the name and, when the model
+/// offers efforts, an effort dropdown. Effort is staged; activating the row calls `pick` with
+/// that choice and the group's profile. A group the thread is not on says first what moving to
+/// it costs.
 fn model_list(
-    models: &[CatalogModel],
+    groups: &[SourceGroup],
     query: &str,
     status: &SessionStatus,
     pick: &Pick,
     caveats: Caveats,
 ) -> gtk4::Widget {
-    let groups = group_for_picker(models, query, Some(status.driver));
-    if groups.is_empty() {
+    let shown = filter_groups(groups, query, Some(status.driver));
+    if shown.is_empty() {
+        let none = groups.iter().all(|g| g.models.is_empty());
         let page = adw::StatusPage::new();
         page.add_css_class("compact");
         crate::icons::set_status_icon(&page, "at-system-search-symbolic");
-        page.set_title(if models.is_empty() {
+        page.set_title(if none {
             "No models yet"
         } else {
             "No models match"
         });
-        page.set_description(Some(if models.is_empty() {
+        page.set_description(Some(if none {
             "The model lists are fetched in the background and appear here when they arrive."
         } else {
             "Try a different search."
@@ -336,23 +395,28 @@ fn model_list(
     }
     let status = Rc::new(status.clone()); // shared by every row's handlers
     let column = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-    for (driver, rows) in groups {
-        let heading_text = label(&driver.info().long_label.to_uppercase(), &["model-group"]);
-        let heading = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-        heading.add_css_class(accent_class(driver));
-        heading.set_halign(gtk4::Align::Start);
-        heading.set_margin_top(6);
-        heading.set_margin_start(6);
-        heading.append(&brand_image(driver));
-        heading.append(&heading_text);
-        column.append(&heading);
-        let notes = caveats(driver);
+    for (group, rows) in shown {
+        column.append(&group_heading(group));
+        // Nothing listed: the heading said why, and there is nothing to move to.
+        if rows.is_empty() {
+            continue;
+        }
+        let notes = group_caveats(group, &status, caveats);
         if !notes.is_empty() {
             let note = wrapped_text(&notes.join(" "), &["dim-label", "switch-caveats"]);
             note.set_margin_start(6);
             note.set_margin_end(6);
             column.append(&note);
         }
+        // Another profile than the thread's own: a pick moves the thread to it.
+        let target = group
+            .profile
+            .clone()
+            .filter(|_| !group.current)
+            .map(|profile| Target {
+                profile,
+                name: group.name.clone(),
+            });
         let list = boxed_list();
         for m in rows {
             let row = adw::ActionRow::new();
@@ -360,13 +424,19 @@ fn model_list(
             row.set_title(&m.display);
             row.set_subtitle(&picker_subtitle(m));
             row.set_activatable(true);
-            if let Some(via) = &m.via {
+            // The heading already names a server's kind: `via Ollama` on each row says nothing.
+            if let Some(via) = m.via.as_ref().filter(|via| {
+                !group
+                    .detail
+                    .as_deref()
+                    .is_some_and(|d| d.contains(via.as_str()))
+            }) {
                 let tag = label(&format!("via {via}"), &["model-via"]);
                 tag.set_valign(gtk4::Align::Center);
                 row.add_suffix(&tag);
             }
             // The effort shown on the row; `touched` once the user has picked one here.
-            let initial = initial_effort(m, &status);
+            let initial = initial_effort(m, group, &status);
             let effort: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(initial.clone()));
             let touched = Rc::new(Cell::new(false));
             // A changed effort is staged, and says so: Apply commits it, as choosing the row
@@ -376,7 +446,7 @@ fn model_list(
             apply.add_css_class("effort-apply");
             apply.set_valign(gtk4::Align::Center);
             apply.set_visible(false);
-            let current = is_current(m, &status);
+            let current = is_current(m, group, &status);
             if !m.efforts.is_empty() {
                 let efforts: Vec<&str> = m.efforts.iter().map(String::as_str).collect();
                 let dropdown = gtk4::DropDown::from_strings(&efforts);
@@ -421,10 +491,11 @@ fn model_list(
             }
             let commit: Rc<dyn Fn()> = {
                 let (pick, m, status) = (pick.clone(), m.clone(), status.clone());
+                let target = target.clone();
                 Rc::new(move || {
                     let unchanged = current && *effort.borrow() == initial;
                     let (id, e) = choice(&m, effort.borrow().as_deref(), touched.get(), &status);
-                    pick(m.driver, id, e, unchanged);
+                    pick(m.driver, target.clone(), id, e, unchanged);
                 })
             };
             apply.connect_clicked({
@@ -506,16 +577,18 @@ fn picker_footer(source: &Rc<dyn ModelSource>, picker: &adw::Dialog) -> Option<g
 }
 
 /// The busy-switch dialog's title, body and confirm label. The same agent keeps its own session
-/// (a model or effort change); another agent continues from a summary, and says what else ends.
+/// (a model or effort change); another agent, or another profile of it (`server`: its name),
+/// continues from a summary, and says what else ends.
 fn busy_switch_text(
     from: Driver,
     to: Driver,
+    server: Option<&str>,
     caveats: &[String],
 ) -> (String, String, &'static str) {
     const CANCELLED: &str =
         "Any approval or question waiting for your answer is cancelled; the new turn can ask again.";
     let from_name = from.info().label;
-    if from == to {
+    if from == to && server.is_none() {
         return (
             "Change Model Now?".to_owned(),
             format!(
@@ -525,7 +598,7 @@ fn busy_switch_text(
             "Change and Continue",
         );
     }
-    let to_name = to.info().label;
+    let to_name = server.unwrap_or(to.info().label);
     let mut body = format!(
         "{from_name} is still working. Switching interrupts this turn and continues the \
          unfinished task in {to_name}. {CANCELLED}"
@@ -547,10 +620,11 @@ fn confirm_busy_switch(
     parent: &adw::Dialog,
     from: Driver,
     to: Driver,
+    server: Option<&str>,
     caveats: &[String],
     then: impl Fn() + 'static,
 ) {
-    let (title, body, confirm) = busy_switch_text(from, to, caveats);
+    let (title, body, confirm) = busy_switch_text(from, to, server, caveats);
     let dialog = crate::dialogs::confirm_dialog(
         &title,
         &body,
@@ -648,11 +722,23 @@ pub fn model_picker(ctx: &PanelCtx) {
         }
     ));
 
-    let models: Rc<RefCell<Vec<CatalogModel>>> = Rc::default();
+    let groups: Rc<RefCell<Vec<SourceGroup>>> = Rc::default();
     let pick: Pick = {
         let backend = ctx.backend.clone();
         let d = d.downgrade();
-        Rc::new(move |driver, id, effort, unchanged| {
+        // A pick on another profile moves the thread there; on its own, it switches as before.
+        let go = {
+            let backend = backend.clone();
+            Rc::new(
+                move |driver, target: Option<Target>, id: String, effort: Option<String>| {
+                    match target {
+                        Some(t) => backend.switch_profile(driver, t.profile, Some(id), effort),
+                        None => backend.switch(driver, Some(id), effort),
+                    }
+                },
+            )
+        };
+        Rc::new(move |driver, target, id, effort, unchanged| {
             let status = backend.status();
             // The thread already runs this: nothing to switch, and nothing to interrupt.
             if unchanged {
@@ -662,7 +748,7 @@ pub fn model_picker(ctx: &PanelCtx) {
                 return;
             }
             if !status.running_turn {
-                backend.switch(driver, Some(id), effort);
+                go(driver, target, id, effort);
                 if let Some(d) = d.upgrade() {
                     d.close();
                 }
@@ -671,19 +757,27 @@ pub fn model_picker(ctx: &PanelCtx) {
             // Mid-turn, a switch stops the turn (and any approval or question in it): ask first.
             let Some(picker) = d.upgrade() else { return };
             let caveats = backend.switch_caveats(driver);
-            confirm_busy_switch(&picker, status.driver, driver, &caveats, {
-                let (backend, d) = (backend.clone(), d.clone());
-                move || {
-                    backend.switch(driver, Some(id.clone()), effort.clone());
-                    if let Some(d) = d.upgrade() {
-                        d.close();
+            let server = target.as_ref().map(|t| t.name.clone());
+            confirm_busy_switch(
+                &picker,
+                status.driver,
+                driver,
+                server.as_deref(),
+                &caveats,
+                {
+                    let (go, d) = (go.clone(), d.clone());
+                    move || {
+                        go(driver, target.clone(), id.clone(), effort.clone());
+                        if let Some(d) = d.upgrade() {
+                            d.close();
+                        }
                     }
-                }
-            });
+                },
+            );
         })
     };
     let render: Rc<dyn Fn()> = {
-        let (models, backend) = (models.clone(), ctx.backend.clone());
+        let (groups, backend) = (groups.clone(), ctx.backend.clone());
         let (stack, search) = (stack.downgrade(), search.downgrade());
         Rc::new(move || {
             let (Some(stack), Some(search)) = (stack.upgrade(), search.upgrade()) else {
@@ -691,7 +785,7 @@ pub fn model_picker(ctx: &PanelCtx) {
             };
             let caveats = |to| backend.switch_caveats(to);
             let list = model_list(
-                &models.borrow(),
+                &groups.borrow(),
                 &search.text(),
                 &backend.status(),
                 &pick,
@@ -707,23 +801,40 @@ pub fn model_picker(ctx: &PanelCtx) {
 
     match &ctx.models {
         Some(source) => {
-            *models.borrow_mut() = source.models();
+            let read = {
+                let (source, driver) = (source.clone(), status.driver);
+                move || {
+                    source
+                        .groups()
+                        .unwrap_or_else(|| groups_by_agent(&source.models(), Some(driver)))
+                }
+            };
+            *groups.borrow_mut() = read();
             render();
             // Keep the list live while the picker is open; the view owns the single connection
             // to the source and forwards to whoever is registered here. An unchanged list is
             // not rebuilt, so a background refresh keeps the scroll position.
             let live = {
-                let (source, models, render) = (source.clone(), models.clone(), render.clone());
+                let (groups, render) = (groups.clone(), render.clone());
                 Rc::new(move || {
-                    let now = source.models();
-                    if *models.borrow() != now {
-                        *models.borrow_mut() = now;
+                    let now = read();
+                    if *groups.borrow() != now {
+                        *groups.borrow_mut() = now;
                         render();
                     }
                 }) as Rc<dyn Fn()>
             };
             if let Some(footer) = picker_footer(source, &d) {
                 outer.append(&footer);
+            }
+            // A group's state (checking, not reachable, no chat model) can change with no change
+            // to any list: the fetch's end says so, and the groups are read again then too.
+            if let Some(id) = source.connect_status_changed(Box::new({
+                let live = live.clone();
+                move || live()
+            })) {
+                let source = source.clone();
+                d.connect_closed(move |_| source.disconnect_status(id));
             }
             // Lists older than the picker's age are fetched in the background; the cached ones
             // are already shown.
@@ -744,8 +855,8 @@ pub fn model_picker(ctx: &PanelCtx) {
                     stack,
                     move |result| match result {
                         Ok(v) => {
-                            *models.borrow_mut() =
-                                catalog_from_payload(driver, payload::models(&v));
+                            let models = catalog_from_payload(driver, payload::models(&v));
+                            *groups.borrow_mut() = groups_by_agent(&models, Some(driver));
                             render();
                         }
                         Err(e) => show_error(&stack, &e),
@@ -1262,13 +1373,13 @@ pub(crate) mod tests {
     pub(crate) fn changing_effort_does_not_switch_until_row_activation() {
         let picks = Rc::new(RefCell::new(Vec::new()));
         let picked = picks.clone();
-        let pick: Pick = Rc::new(move |driver, model, effort, unchanged| {
+        let pick: Pick = Rc::new(move |driver, _target, model, effort, unchanged| {
             picked.borrow_mut().push((driver, model, effort, unchanged))
         });
         let models = [model(Driver::Codex, "codex-other", &["low", "high"])];
         let caveats = |to: Driver| vec![format!("costs of {}", to.info().label)];
         let list = model_list(
-            &models,
+            &groups_by_agent(&models, Some(Driver::Claude)),
             "",
             &status(Driver::Claude, Some("opus")),
             &pick,
@@ -1310,14 +1421,15 @@ pub(crate) mod tests {
         // On the current model, Apply shows only while the effort differs from its own.
         let picks = Rc::new(RefCell::new(Vec::new()));
         let picked = picks.clone();
-        let pick: Pick = Rc::new(move |driver, model, effort, unchanged| {
+        let pick: Pick = Rc::new(move |driver, _target, model, effort, unchanged| {
             picked.borrow_mut().push((driver, model, effort, unchanged))
         });
         let models = [model(Driver::Claude, "opus", &["low", "high"])];
         let mut on_opus = status(Driver::Claude, Some("opus"));
         on_opus.effort = Some("low".to_owned());
         let no_caveats = |_| Vec::new();
-        let list = model_list(&models, "", &on_opus, &pick, &no_caveats);
+        let groups = groups_by_agent(&models, Some(Driver::Claude));
+        let list = model_list(&groups, "", &on_opus, &pick, &no_caveats);
         assert!(
             crate::testutil::find_by_class::<gtk4::Widget>(list.upcast_ref(), "switch-caveats")
                 .is_none(),
@@ -1360,7 +1472,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_busy_switch_dialog_names_what_it_changes() {
-        let (title, body, confirm) = busy_switch_text(Driver::Claude, Driver::Claude, &[]);
+        let (title, body, confirm) = busy_switch_text(Driver::Claude, Driver::Claude, None, &[]);
         assert_eq!(title, "Change Model Now?");
         assert_eq!(confirm, "Change and Continue");
         assert!(body.contains("model or effort"), "{body}");
@@ -1370,7 +1482,7 @@ pub(crate) mod tests {
         );
 
         let caveats = ["Continues this thread in Antigravity from a summary.".to_owned()];
-        let (title, body, confirm) = busy_switch_text(Driver::Claude, Driver::Agy, &caveats);
+        let (title, body, confirm) = busy_switch_text(Driver::Claude, Driver::Agy, None, &caveats);
         assert_eq!(title, "Switch to Antigravity Now?");
         assert_eq!(confirm, "Switch and Continue");
         assert!(body.contains("in Antigravity"), "{body}");
@@ -1417,13 +1529,15 @@ pub(crate) mod tests {
         };
         assert!(is_current(
             &m,
+            &own(&m),
             &status(Driver::Agy, Some("gemini-3.1-pro-high"))
         ));
         assert!(!is_current(
             &m,
+            &own(&m),
             &status(Driver::Claude, Some("gemini-3.1-pro-high"))
         ));
-        assert!(!is_current(&m, &status(Driver::Agy, None)));
+        assert!(!is_current(&m, &own(&m), &status(Driver::Agy, None)));
     }
 
     #[test]
@@ -1431,11 +1545,112 @@ pub(crate) mod tests {
         let mut gpt = model(Driver::Codex, "gpt-5-codex", &["low", "high"]);
         gpt.default_effort = Some("high".into());
         let st = status(Driver::Claude, Some("opus"));
-        assert_eq!(initial_effort(&gpt, &st).as_deref(), Some("high"));
+        assert_eq!(
+            initial_effort(&gpt, &own(&gpt), &st).as_deref(),
+            Some("high")
+        );
         assert_eq!(
             choice(&gpt, Some("low"), false, &st),
             ("gpt-5-codex".to_owned(), Some("low".to_owned()))
         );
+    }
+
+    /// The group of `m`'s agent the thread runs on.
+    fn own(m: &CatalogModel) -> SourceGroup {
+        groups_by_agent(std::slice::from_ref(m), Some(m.driver)).remove(0)
+    }
+
+    /// A Local server's group, `current` when the thread runs on it.
+    fn local_server(name: &str, current: bool, ids: &[&str]) -> SourceGroup {
+        SourceGroup {
+            driver: Driver::Local,
+            profile: Some(format!("p-{name}")),
+            name: name.to_owned(),
+            detail: Some("Local Model Server · Ollama · http://192.0.2.1:11434".to_owned()),
+            state: agent_core::catalog::SourceState::Listed,
+            current,
+            models: ids
+                .iter()
+                .map(|id| CatalogModel {
+                    via: Some("Ollama".to_owned()),
+                    ..model(Driver::Local, id, &[])
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn each_server_is_a_group_and_a_pick_moves_the_thread_to_it() {
+        let picks = Rc::new(RefCell::new(Vec::new()));
+        let picked = picks.clone();
+        let pick: Pick = Rc::new(move |driver, target: Option<Target>, model, _, unchanged| {
+            picked
+                .borrow_mut()
+                .push((driver, target.map(|t| t.profile), model, unchanged))
+        });
+        let groups = [
+            local_server("Desk", true, &["qwen3:8b"]),
+            local_server("NAS", false, &["qwen3:8b", "gemma3"]),
+            SourceGroup {
+                state: agent_core::catalog::SourceState::Unreachable,
+                ..local_server("Laptop", false, &[])
+            },
+        ];
+        let mut on_desk = status(Driver::Local, Some("qwen3:8b"));
+        on_desk.capabilities = agent_core::caps::Capabilities::of(Driver::Local);
+        let no_caveats = |_| Vec::new();
+        let list = model_list(&groups, "", &on_desk, &pick, &no_caveats);
+        let texts = |class: &str| -> Vec<String> {
+            crate::testutil::find_all_by_class::<gtk4::Label>(list.upcast_ref(), class)
+                .iter()
+                .map(|l| l.text().to_string())
+                .collect()
+        };
+        assert_eq!(
+            texts("model-group"),
+            ["DESK", "NAS", "LAPTOP"],
+            "one heading per server"
+        );
+        let details = texts("model-group-detail");
+        assert!(
+            details[2].ends_with("Not reachable"),
+            "an offline server says so: {details:?}"
+        );
+        assert!(
+            texts("model-via").is_empty(),
+            "the heading names the server's kind, not every row"
+        );
+        let rows = crate::testutil::find_all::<adw::ActionRow>(list.upcast_ref());
+        assert_eq!(rows.len(), 3, "each server's own models, under it");
+        // The same model on another server is not the thread's current one: choosing it moves
+        // the thread there.
+        rows[0].emit_by_name::<()>("activated", &[]);
+        rows[1].emit_by_name::<()>("activated", &[]);
+        assert_eq!(
+            *picks.borrow(),
+            [
+                (Driver::Local, None, "qwen3:8b".to_owned(), true),
+                (
+                    Driver::Local,
+                    Some("p-NAS".to_owned()),
+                    "qwen3:8b".to_owned(),
+                    false
+                ),
+            ]
+        );
+        let notes = texts("switch-caveats");
+        assert_eq!(
+            notes.len(),
+            1,
+            "only the other servers with rows warn: {notes:?}"
+        );
+        assert!(notes[0].contains("moves this thread to NAS"), "{notes:?}");
+    }
+
+    #[test]
+    fn the_busy_switch_dialog_names_the_server_it_moves_to() {
+        let (title, body, _) = busy_switch_text(Driver::Local, Driver::Local, Some("NAS"), &[]);
+        assert_eq!(title, "Switch to NAS Now?");
+        assert!(body.contains("in NAS"), "{body}");
     }
 
     fn model(driver: Driver, id: &str, efforts: &[&str]) -> CatalogModel {
@@ -1454,14 +1669,20 @@ pub(crate) mod tests {
     fn an_agy_row_matches_the_thread_at_any_effort_and_starts_on_its_effort() {
         let flash = model(Driver::Agy, "gemini-3.8-flash", &["low", "medium", "high"]);
         let on_high = status(Driver::Agy, Some("gemini-3.8-flash-high"));
-        assert!(is_current(&flash, &on_high));
-        assert_eq!(initial_effort(&flash, &on_high).as_deref(), Some("high"));
+        assert!(is_current(&flash, &own(&flash), &on_high));
+        assert_eq!(
+            initial_effort(&flash, &own(&flash), &on_high).as_deref(),
+            Some("high")
+        );
         // Another row starts on the model's default (medium).
         let pro = model(Driver::Agy, "gemini-3.1-pro", &["low", "high"]);
-        assert!(!is_current(&pro, &on_high));
-        assert_eq!(initial_effort(&pro, &on_high).as_deref(), Some("low"));
+        assert!(!is_current(&pro, &own(&pro), &on_high));
+        assert_eq!(
+            initial_effort(&pro, &own(&pro), &on_high).as_deref(),
+            Some("low")
+        );
         let bare = model(Driver::Agy, "plain", &[]);
-        assert_eq!(initial_effort(&bare, &on_high), None);
+        assert_eq!(initial_effort(&bare, &own(&bare), &on_high), None);
     }
 
     #[test]
@@ -1492,8 +1713,9 @@ pub(crate) mod tests {
         );
         // The thread has an effort: rows start on it, and it is sent (unchanged = in session).
         st.effort = Some("high".into());
+        let opus = model(Driver::Claude, "opus", &["low", "high"]);
         assert_eq!(
-            initial_effort(&model(Driver::Claude, "opus", &["low", "high"]), &st).as_deref(),
+            initial_effort(&opus, &own(&opus), &st).as_deref(),
             Some("high")
         );
         assert_eq!(

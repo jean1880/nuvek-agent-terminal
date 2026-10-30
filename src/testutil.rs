@@ -308,6 +308,42 @@ pub fn find_by_class<T: gtk4::prelude::IsA<gtk4::Widget>>(
     find_where(root, &|w: &gtk4::Widget| w.has_css_class(class))
 }
 
+/// Every widget of type `T` at or below `root`, in document order.
+pub fn find_all<T: gtk4::prelude::IsA<gtk4::Widget>>(root: &gtk4::Widget) -> Vec<T> {
+    let mut out = Vec::new();
+    collect_where(root, &|_| true, &mut out);
+    out
+}
+
+/// Every widget of type `T` with CSS class `class` at or below `root`, in document order.
+pub fn find_all_by_class<T: gtk4::prelude::IsA<gtk4::Widget>>(
+    root: &gtk4::Widget,
+    class: &str,
+) -> Vec<T> {
+    use gtk4::prelude::*;
+    let mut out = Vec::new();
+    collect_where(root, &|w: &gtk4::Widget| w.has_css_class(class), &mut out);
+    out
+}
+
+fn collect_where<T: gtk4::prelude::IsA<gtk4::Widget>>(
+    widget: &gtk4::Widget,
+    keep: &dyn Fn(&gtk4::Widget) -> bool,
+    out: &mut Vec<T>,
+) {
+    use gtk4::prelude::*;
+    if keep(widget) {
+        if let Some(found) = widget.downcast_ref::<T>() {
+            out.push(found.clone());
+        }
+    }
+    let mut child = widget.first_child();
+    while let Some(w) = child {
+        collect_where(&w, keep, out);
+        child = w.next_sibling();
+    }
+}
+
 fn find_where<T: gtk4::prelude::IsA<gtk4::Widget>>(
     widget: &gtk4::Widget,
     keep: &dyn Fn(&gtk4::Widget) -> bool,

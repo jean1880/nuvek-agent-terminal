@@ -723,6 +723,19 @@ impl ChatTab {
 }
 
 /// One chat thread page's state, beside its [`TabState`].
+impl ChatTab {
+    /// The profile the thread runs on now: the one its running process was launched on by a move
+    /// that has not started yet, else the one it is bound to. What "this thread's" profile means
+    /// to the picker, a pick, a restart's preparation and a fork, so a pick made while a move is
+    /// still starting is judged against where the thread is going, not where it was.
+    pub(super) fn running_profile_id(&self) -> Option<String> {
+        self.slot
+            .get()
+            .and_then(|s| s.launched_profile())
+            .or_else(|| self.profile_id.clone())
+    }
+}
+
 pub(super) struct ChatTab {
     pub(super) thread: String,
     /// The agent when the page was opened, until the session reports its own.
@@ -782,10 +795,6 @@ pub(super) struct ChatTab {
     /// read; honoured while that profile runs the thread's agent
     /// ([`crate::config::TerminalConfig::thread_profile`]).
     pub(super) profile_id: Option<String>,
-    /// The Local server a switch to the Local agent launched on, kept here until that session
-    /// reports it started: only then does it replace `profile_id` (and the store's), so a switch
-    /// that fails or is rolled back leaves the thread's own profile as it was.
-    pub(super) staged_local_profile: Option<String>,
     /// A handoff found stored and undelivered when the thread was built: re-armed (not seeded
     /// again) in whichever session starts first.
     stored_handoff: Option<crate::chat::session::Handoff>,
@@ -1036,15 +1045,43 @@ impl ChatBackend for SessionSlot {
         match window {
             Some((window, thread)) => window
                 .imp()
-                .switch_agent_confirmed(&thread, driver, model, effort),
-            None => delegation::switch(self, driver, model, effort),
+                .switch_agent_confirmed(&thread, driver, model, effort, None),
+            None => delegation::switch(self, driver, model, effort, None),
         }
+    }
+    fn switch_profile(
+        &self,
+        driver: Driver,
+        profile: String,
+        model: Option<String>,
+        effort: Option<String>,
+    ) {
+        let Some((window, thread)) = self
+            .thread
+            .as_deref()
+            .and_then(|thread| Some((thread_owner(thread)?, thread.to_owned())))
+        else {
+            self.switch(driver, model, effort);
+            return;
+        };
+        // The profile the thread would run `driver` on anyway: an ordinary switch.
+        if window.imp().thread_profile(&thread, driver).id == profile {
+            self.switch(driver, model, effort);
+            return;
+        }
+        let label = switch_label(&SharedConfig::default().borrow(), &profile, driver);
+        let target = crate::chat::session::SwitchTarget { profile, label };
+        // A new process on another profile ends this one's work like an agent switch: its window
+        // asks first when that would cut work short.
+        window
+            .imp()
+            .switch_agent_confirmed(&thread, driver, model, effort, Some(target));
     }
     fn reload_session(&self) {
         if let Some(s) = self.get() {
             let status = s.status();
             s.rebind_stop();
-            delegation::switch(self, status.driver, status.model, status.effort);
+            delegation::switch(self, status.driver, status.model, status.effort, None);
         }
     }
     fn set_mode(&self, mode: Mode) {
@@ -1834,6 +1871,83 @@ pub(super) fn profile_source(
         .filter(|_| agent_core::provider::supports(driver))
 }
 
+/// The model picker's groups for a thread opened with `profile_id` that runs `current` now: for
+/// each agent, its vendor (the thread's own profile on it, else the first enabled one on it) and
+/// each enabled profile on a model server, every server its own group. The profile the thread
+/// runs on is always listed, even switched off since. The Local agent has servers only.
+pub(super) fn picker_specs(
+    config: &crate::config::TerminalConfig,
+    profile_id: Option<&str>,
+    current: Driver,
+) -> Vec<crate::model_catalog::PickerSpec> {
+    use crate::model_catalog::PickerSpec;
+    let mut out = Vec::new();
+    for driver in Driver::ALL {
+        let info = driver.info();
+        let source = |p: &Profile| {
+            crate::config::profile_provider(p, driver)
+                .filter(|_| agent_core::provider::supports(driver))
+        };
+        // The profile a pick in this agent's vendor group would keep, and the one it runs now.
+        let own = thread_profile_or_new(config, profile_id, driver);
+        let runs = |p: &Profile| driver == current && p.id == own.id;
+        let profiles: Vec<&Profile> = config
+            .profiles
+            .iter()
+            .filter(|p| profile_driver(p) == Some(driver) && (!p.disabled || runs(p)))
+            .collect();
+        if !agent_core::provider::required(driver) {
+            let vendor = if source(&own).is_none() {
+                Some(own.clone())
+            } else {
+                profiles
+                    .iter()
+                    .find(|p| source(p).is_none())
+                    .map(|p| (*p).clone())
+            };
+            if let Some(vendor) = vendor {
+                out.push(PickerSpec {
+                    driver,
+                    // A bare profile (none set up) is no profile a switch could name.
+                    profile: config.profile_by_id(&vendor.id).map(|p| p.id.clone()),
+                    name: info.long_label.to_owned(),
+                    // Another profile than the agent's usual one says which.
+                    detail: Some(vendor.name.clone()).filter(|n| n != info.profile_name),
+                    source: None,
+                    current: runs(&vendor),
+                });
+            }
+        }
+        for profile in profiles {
+            let Some(provider) = source(profile) else {
+                continue;
+            };
+            let address = provider
+                .base()
+                .unwrap_or_else(|_| provider.kind.default_base_url().to_owned());
+            // The Local agent's group is its server: the agent goes without saying.
+            let detail = if driver.is_built_in() {
+                format!("{} · {address}", provider.kind.label())
+            } else {
+                format!(
+                    "{} · {} · {address}",
+                    info.long_label,
+                    provider.kind.label()
+                )
+            };
+            out.push(PickerSpec {
+                driver,
+                profile: Some(profile.id.clone()),
+                name: profile.name.clone(),
+                detail: Some(detail),
+                current: runs(profile),
+                source: Some(provider),
+            });
+        }
+    }
+    out
+}
+
 /// What starting a built thread's session needs.
 struct StartJob {
     thread: String,
@@ -2355,20 +2469,17 @@ async fn server_has_chat_model(
     }
 }
 
-/// What one event of a thread's session does to the Local server a switch staged
-/// (`staged_local_profile`): the Local session's `SessionStarted` commits it (returned, to bind
-/// the thread to). Nothing else clears it: the outgoing agent's own closing events (its exit
-/// included) come first in every switch. Only the next launch replaces it (`agent_launch`).
-fn settle_staged_local(
-    staged: &mut Option<String>,
-    driver: Driver,
-    event: &Event,
-) -> Option<String> {
-    if driver.is_built_in() && matches!(event, Event::SessionStarted { .. }) {
-        staged.take()
-    } else {
-        None
-    }
+/// The profile a thread bound to `bound` is bound to by one event of its session, whose running
+/// process a switch launched on `launched` ([`ChatSession::launched_profile`]; `None`: the
+/// thread's own): that process's `SessionStarted` binds it (returned), once. The binding lives
+/// with the process, not beside it: a launch that is refused installs nothing and so changes
+/// nothing, a rollback installs the thread's own, and the outgoing agent's closing events are
+/// not a start. So no process ever binds the thread to a profile it was not started on.
+fn launched_binding(bound: Option<&str>, launched: Option<&str>, event: &Event) -> Option<String> {
+    let starts = matches!(event, Event::SessionStarted { .. });
+    launched
+        .filter(|id| starts && bound != Some(*id))
+        .map(str::to_owned)
 }
 
 /// The Local server an action that names none runs on: the first switched on whose last scan
@@ -2497,9 +2608,14 @@ fn now_ms() -> i64 {
 /// the cached resolution (a switch cannot wait). An agent that is not Ready (missing, switched
 /// off, still being detected) or has no resolved binary is refused with the reason: nothing is
 /// ever spawned from a guessed command name.
-fn agent_launch(driver: Driver, thread: &str, cwd: &str) -> Result<AgentLaunch, String> {
-    // The thread's own profile while it runs `driver` (a restart or a roll back); a switch to
-    // another agent gets that agent's own.
+fn agent_launch(
+    driver: Driver,
+    thread: &str,
+    cwd: &str,
+    requested: Option<&str>,
+) -> Result<AgentLaunch, String> {
+    // The profile a switch named (the picker's group); otherwise the thread's own while it runs
+    // `driver` (a restart or a roll back), and on a switch to another agent that agent's own.
     let owner = thread_owner(thread);
     let mut profile_id = owner.as_ref().and_then(|window| {
         window
@@ -2507,27 +2623,27 @@ fn agent_launch(driver: Driver, thread: &str, cwd: &str) -> Result<AgentLaunch, 
             .with_chat(thread, |c| c.profile_id.clone())
             .flatten()
     });
-    // A thread switched to the Local agent without a server of its own launches on a ready one,
-    // staged with the thread: once that session reports it started, the thread is bound to it
-    // (`commit_staged_local_profile`), so its picker, its retirement checks and its resumes read
-    // the same server. A switch that fails or is rolled back never touches the thread's profile.
-    // Every launch replaces what an earlier one staged: a launch of another agent (a rollback,
-    // another switch) leaves nothing staged, so no later Local start commits a stale server.
-    let mut staged = None;
-    if driver.is_built_in() {
-        let config = SharedConfig::default();
-        let chosen = thread_profile_or_new(&config.borrow(), profile_id.as_deref(), driver).id;
+    // A switch onto a named profile, or a thread switched to the Local agent without a server of
+    // its own (which launches on a ready one), launches on it and says so (`AgentLaunch::profile`):
+    // once that process reports it started, the thread is bound to it (`launched_binding`), so its
+    // picker, its retirement checks and its resumes read the same server. A switch that is
+    // refused, fails or is rolled back never touches the thread's profile.
+    let config = SharedConfig::default();
+    let chosen = match requested {
+        Some(id) => Some(requested_profile(&config.borrow(), id, driver)?),
+        None if driver.is_built_in() => {
+            Some(thread_profile_or_new(&config.borrow(), profile_id.as_deref(), driver).id)
+        }
+        None => None,
+    };
+    let mut moved_to = None;
+    if let Some(chosen) = chosen {
         let bound = profile_id.as_deref() == Some(chosen.as_str());
         let known = config.borrow().profile_by_id(&chosen).is_some();
         if !bound && known {
-            staged = Some(chosen.clone());
+            moved_to = Some(chosen.clone());
             profile_id = Some(chosen);
         }
-    }
-    if let Some(window) = &owner {
-        window.imp().with_chat_mut(thread, |c| {
-            c.staged_local_profile = staged;
-        });
     }
     agent_launch_with(
         &AgentAvailability::shared().get(driver),
@@ -2536,6 +2652,42 @@ fn agent_launch(driver: Driver, thread: &str, cwd: &str) -> Result<AgentLaunch, 
         cwd,
         profile_id.as_deref(),
     )
+    .map(|mut launch| {
+        // Carried by the process: only its own start binds the thread to it.
+        launch.profile = moved_to;
+        launch
+    })
+}
+
+/// What a thread's notice calls profile `id` of `driver` it moved to: the agent and the server
+/// (`Local Model Server on NAS`), or just the agent on its vendor.
+fn switch_label(config: &crate::config::TerminalConfig, id: &str, driver: Driver) -> String {
+    let agent = driver.info().long_label;
+    match config.profile_by_id(id) {
+        Some(p) if crate::config::profile_provider(p, driver).is_some() => {
+            format!("{agent} on {}", p.name)
+        }
+        _ => agent.to_owned(),
+    }
+}
+
+/// The profile `id` a switch named for `driver`, or why it cannot be used: it was removed,
+/// switched off, or runs another agent since the picker listed it.
+fn requested_profile(
+    config: &crate::config::TerminalConfig,
+    id: &str,
+    driver: Driver,
+) -> Result<String, String> {
+    match config.profile_by_id(id) {
+        Some(p) if p.disabled => Err(format!("{} is switched off in Settings.", p.name)),
+        Some(p) if profile_driver(p) == Some(driver) => Ok(p.id.clone()),
+        Some(p) => Err(format!(
+            "{} no longer runs {}.",
+            p.name,
+            driver.info().long_label
+        )),
+        None => Err("That profile no longer exists. Choose a model again.".to_owned()),
+    }
 }
 
 /// [`agent_launch`] against an explicit availability.
@@ -2587,6 +2739,7 @@ fn agent_launch_with(
         }
     };
     Ok(AgentLaunch {
+        profile: None,
         adapter,
         program,
         extra_args,
@@ -4336,12 +4489,13 @@ impl AgentTerminalWindow {
         driver: Driver,
         model: Option<String>,
         effort: Option<String>,
+        target: Option<crate::chat::session::SwitchTarget>,
     ) {
         let Some(slot) = self.slot_of(thread) else {
             return;
         };
         if !self.switch_would_stop_work(thread) {
-            delegation::switch(&slot, driver, model, effort);
+            delegation::switch(&slot, driver, model, effort, target);
             return;
         }
         // At most one question per thread: another pick while it is open does nothing.
@@ -4375,7 +4529,7 @@ impl AgentTerminalWindow {
             // The slot again: the page may have closed while the question was open.
             if let Some(slot) = imp.slot_of(&thread) {
                 slot.interrupt();
-                delegation::switch(&slot, driver, model, effort);
+                delegation::switch(&slot, driver, model, effort, target);
             }
         });
     }
@@ -5218,7 +5372,6 @@ impl AgentTerminalWindow {
                 pending_prompt: None,
                 pending_handoff: false,
                 profile_id: None,
-                staged_local_profile: None,
                 stored_handoff: None,
                 chosen_mode: None,
                 pending_effort: None,
@@ -5408,16 +5561,37 @@ impl AgentTerminalWindow {
         // read at every look: a reopened thread gets its stored profile after this, and a switch
         // to another agent changes it.
         let picker_thread = thread.clone();
-        view.set_model_source(crate::model_catalog::ProfileModels::new(
+        let thread_profile_id = move || {
+            thread_owner(&picker_thread).and_then(|window| {
+                window
+                    .imp()
+                    .with_chat(&picker_thread, ChatTab::running_profile_id)
+                    .flatten()
+            })
+        };
+        let specs_thread = thread.clone();
+        let specs_profile_id = thread_profile_id.clone();
+        view.set_model_source(crate::model_catalog::ProfileModels::grouped(
             ModelCatalog::shared(),
             Rc::new(move |d| {
-                let profile_id = thread_owner(&picker_thread).and_then(|window| {
-                    window
-                        .imp()
-                        .with_chat(&picker_thread, |c| c.profile_id.clone())
-                        .flatten()
-                });
-                profile_source(&SharedConfig::default().borrow(), profile_id.as_deref(), d)
+                profile_source(
+                    &SharedConfig::default().borrow(),
+                    thread_profile_id().as_deref(),
+                    d,
+                )
+            }),
+            // Every agent as each of its profiles runs it: every model server its own group.
+            Rc::new(move || {
+                let Some(driver) = thread_owner(&specs_thread)
+                    .and_then(|w| w.imp().with_chat(&specs_thread, |c| c.driver))
+                else {
+                    return Vec::new();
+                };
+                picker_specs(
+                    &SharedConfig::default().borrow(),
+                    specs_profile_id().as_deref(),
+                    driver,
+                )
             }),
         ));
         view.set_account_status(AccountStatus::shared());
@@ -5755,7 +5929,9 @@ impl AgentTerminalWindow {
             return;
         }
         let (thread_for, dir_for) = (thread.to_owned(), dir.to_owned());
-        session.set_adapter_factory(Rc::new(move |d| agent_launch(d, &thread_for, &dir_for)));
+        session.set_adapter_factory(Rc::new(move |d, profile| {
+            agent_launch(d, &thread_for, &dir_for, profile)
+        }));
         let dir_for = dir.to_owned();
         session.set_agy_can_ask(Rc::new(move || agy_hook_ready(&dir_for)));
         session.set_lifecycle_listener(Self::lifecycle_listener(thread));
@@ -5789,7 +5965,7 @@ impl AgentTerminalWindow {
             session.restore_handoff(stored);
         }
         if let Some((driver, model, effort)) = switch {
-            delegation::switch(&slot, driver, model, effort);
+            delegation::switch(&slot, driver, model, effort, None);
         }
         if let Some(prompt) = prompt.filter(|_| self.session_start_allowed()) {
             session.send_prompt(&prompt);
@@ -5900,8 +6076,10 @@ impl AgentTerminalWindow {
             };
             let switched = chat.driver != driver;
             chat.driver = driver;
+            // The running process's own launch: only its start binds what it was launched on.
+            let launched = chat.slot.get().and_then(|s| s.launched_profile());
             if let Some(pin) =
-                settle_staged_local(&mut chat.staged_local_profile, driver, &env.event)
+                launched_binding(chat.profile_id.as_deref(), launched.as_deref(), &env.event)
             {
                 chat.profile_id = Some(pin.clone());
                 commit_profile = Some(pin);
@@ -6930,7 +7108,7 @@ impl AgentTerminalWindow {
     ) {
         let (title, source_driver, source_profile) = self
             .with_chat(thread, |c| {
-                (c.title.clone(), Some(c.driver), c.profile_id.clone())
+                (c.title.clone(), Some(c.driver), c.running_profile_id())
             })
             .unwrap_or_default();
         // A fork on the same agent keeps the profile; continuing in another agent takes that
@@ -7108,7 +7286,9 @@ impl AgentTerminalWindow {
 
     /// The profile open thread `thread` runs on `driver` with.
     pub(super) fn thread_profile(&self, thread: &str, driver: Driver) -> Profile {
-        let id = self.with_chat(thread, |c| c.profile_id.clone()).flatten();
+        let id = self
+            .with_chat(thread, ChatTab::running_profile_id)
+            .flatten();
         self.thread_profile_for(id.as_deref(), driver)
     }
 
@@ -7895,7 +8075,13 @@ impl AgentTerminalWindow {
             .borrow()
             .iter()
             .filter_map(|t| t.chat.as_ref())
-            .filter_map(|c| Some((c.model_banner.clone(), c.slot.get()?, c.profile_id.clone())))
+            .filter_map(|c| {
+                Some((
+                    c.model_banner.clone(),
+                    c.slot.get()?,
+                    c.running_profile_id(),
+                ))
+            })
             .collect();
         for (banner, session, profile_id) in built {
             let status = session.status();
@@ -8227,60 +8413,171 @@ fn is_interruption(event: &Event) -> bool {
 pub(super) mod tests {
     use super::*;
 
-    /// A successful Claude → Local switch: the outgoing Claude session's closing events come
-    /// first and keep the staged server; Local's own start commits it, once.
+    /// A switch's new process binds the thread to the profile it was launched on when it starts,
+    /// once; the outgoing agent's closing events never do, nor does a process started on the
+    /// thread's own profile (a rollback, the old agent started again after a refused move).
     #[test]
-    fn a_switch_to_local_commits_its_server_through_the_outgoing_agents_shutdown() {
-        let mut staged = Some("p-nas".to_owned());
-        for (driver, event) in [
-            (
-                Driver::Claude,
-                Event::TurnCompleted {
-                    state: agent_core::event::TurnState::Interrupted,
-                    usage: None,
-                    cost_usd: None,
-                    error: None,
-                },
-            ),
-            (
-                Driver::Claude,
-                Event::SessionExited {
-                    code: Some(0),
-                    expected: true,
-                },
-            ),
-            (
-                Driver::Local,
-                Event::Notice {
-                    text: "starting".into(),
-                },
-            ),
-        ] {
-            assert_eq!(settle_staged_local(&mut staged, driver, &event), None);
-            assert_eq!(staged.as_deref(), Some("p-nas"), "{event:?} keeps it");
-        }
+    fn a_process_binds_the_thread_to_the_profile_it_was_launched_on_when_it_starts() {
         let started = Event::SessionStarted {
             native_id: "s".into(),
             model: None,
             cwd: None,
         };
+        // Claude → Local on the NAS: Claude's closing events come first and bind nothing.
+        for event in [
+            Event::TurnCompleted {
+                state: agent_core::event::TurnState::Interrupted,
+                usage: None,
+                cost_usd: None,
+                error: None,
+            },
+            Event::SessionExited {
+                code: Some(0),
+                expected: true,
+            },
+            Event::Notice {
+                text: "starting".into(),
+            },
+        ] {
+            assert_eq!(
+                launched_binding(Some("p-claude"), Some("p-nas"), &event),
+                None,
+                "{event:?}"
+            );
+        }
         assert_eq!(
-            settle_staged_local(&mut staged, Driver::Local, &started).as_deref(),
+            launched_binding(Some("p-claude"), Some("p-nas"), &started).as_deref(),
             Some("p-nas")
         );
-        assert_eq!(staged, None);
-        // Committed once: a later start (a resume) binds nothing again.
+        // Once bound, a later start (a resume) binds nothing again.
         assert_eq!(
-            settle_staged_local(&mut staged, Driver::Local, &started),
+            launched_binding(Some("p-nas"), Some("p-nas"), &started),
             None
         );
-        // Another agent's start never commits a Local server.
-        let mut other = Some("p-nas".to_owned());
+        // A process on the thread's own profile (a rollback, the old agent started again after
+        // a refused move) binds nothing.
+        assert_eq!(launched_binding(Some("p-desk"), None, &started), None);
+        // Overlapping moves, A → B (still starting) → C refused: C installed nothing, so the
+        // running process is still B's, and its start binds B.
         assert_eq!(
-            settle_staged_local(&mut other, Driver::Codex, &started),
-            None
+            launched_binding(Some("p-a"), Some("p-b"), &started).as_deref(),
+            Some("p-b")
         );
-        assert_eq!(other.as_deref(), Some("p-nas"));
+    }
+
+    /// A switch names a profile by id: one removed, switched off or now running another agent
+    /// is refused with the reason, never launched as something else.
+    #[test]
+    fn a_requested_profile_must_still_run_the_agent() {
+        let mut config = crate::config::TerminalConfig::default();
+        let nas = config.add_local_server(agent_core::provider::ProviderKind::Ollama);
+        assert_eq!(
+            requested_profile(&config, &nas, Driver::Local).as_deref(),
+            Ok(nas.as_str())
+        );
+        assert!(requested_profile(&config, &nas, Driver::Claude)
+            .unwrap_err()
+            .contains("no longer runs Claude"));
+        assert!(requested_profile(&config, "p-gone", Driver::Local).is_err());
+        if let Some(p) = config.profiles.iter_mut().find(|p| p.id == nas) {
+            p.disabled = true;
+        }
+        assert!(requested_profile(&config, &nas, Driver::Local)
+            .unwrap_err()
+            .contains("switched off"));
+    }
+
+    /// Every model server is its own picker group, named after its profile and saying where it
+    /// is; the thread's own is marked current, a switched-off server is left out, and an agent
+    /// with a vendor profile and a server profile gets both groups.
+    #[test]
+    fn the_picker_lists_every_server_as_its_own_group() {
+        use agent_core::provider::{ModelProvider, ProviderKind};
+        let mut config = crate::config::TerminalConfig::default();
+        let desk = config.add_local_server(ProviderKind::Ollama);
+        let nas = config.add_local_server(ProviderKind::Ollama);
+        let off = config.add_local_server(ProviderKind::LmStudio);
+        for p in &mut config.profiles {
+            if p.id == nas {
+                p.name = "NAS".into();
+                if let Some(provider) = p.provider.as_mut() {
+                    provider.base_url = Some("http://192.0.2.7:11434".into());
+                }
+            }
+            if p.id == off {
+                p.disabled = true;
+            }
+        }
+        let mut gateway = crate::config::new_agent_profile(Driver::Claude);
+        gateway.name = "Gateway".into();
+        gateway.provider = Some(ModelProvider::new(ProviderKind::LiteLlm));
+        let gateway_id = gateway.id.clone();
+        let mut claude = crate::config::new_agent_profile(Driver::Claude);
+        claude.disabled = false;
+        let claude_id = claude.id.clone();
+        config.profiles.push(claude);
+        config.profiles.push(gateway);
+
+        let specs = picker_specs(&config, Some(&nas), Driver::Local);
+        let of = |driver: Driver| -> Vec<(Option<String>, String, bool)> {
+            specs
+                .iter()
+                .filter(|s| s.driver == driver)
+                .map(|s| (s.profile.clone(), s.name.clone(), s.current))
+                .collect()
+        };
+        assert_eq!(
+            of(Driver::Local),
+            [
+                (Some(desk), "Ollama".to_owned(), false),
+                (Some(nas.clone()), "NAS".to_owned(), true),
+            ],
+            "one group per switched-on server, the thread's own current"
+        );
+        let nas_spec = specs
+            .iter()
+            .find(|s| s.profile.as_deref() == Some(nas.as_str()))
+            .expect("the NAS group");
+        assert_eq!(
+            nas_spec.detail.as_deref(),
+            Some("Ollama · http://192.0.2.7:11434"),
+            "the server's kind and address"
+        );
+        assert_eq!(
+            of(Driver::Claude),
+            [
+                (Some(claude_id.clone()), "Claude".to_owned(), false),
+                (Some(gateway_id.clone()), "Gateway".to_owned(), false),
+            ],
+            "Claude on its vendor and on the gateway, each its own group"
+        );
+        let gateway_spec = specs
+            .iter()
+            .find(|s| s.profile.as_deref() == Some(gateway_id.as_str()))
+            .expect("the gateway group");
+        assert!(
+            gateway_spec
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.starts_with("Claude · LiteLLM · ")),
+            "{:?}",
+            gateway_spec.detail
+        );
+
+        // A Claude thread on the gateway: that group is the current one, not the vendor's.
+        let specs = picker_specs(&config, Some(&gateway_id), Driver::Claude);
+        let current: Vec<&str> = specs
+            .iter()
+            .filter(|s| s.current)
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(current, ["Gateway"]);
+
+        // A thread still on a server switched off since keeps its group.
+        let specs = picker_specs(&config, Some(&off), Driver::Local);
+        assert!(specs
+            .iter()
+            .any(|s| s.profile.as_deref() == Some(off.as_str()) && s.current));
     }
 
     /// A profile on a model server starts with the server's arguments after its own and the
@@ -11366,7 +11663,7 @@ pub(super) mod tests {
         })
         .expect("opened in place");
         let thread = imp.current_thread().expect("its page");
-        let relaunch = || agent_launch(Driver::Claude, &thread, &cwd).expect("launch");
+        let relaunch = || agent_launch(Driver::Claude, &thread, &cwd, None).expect("launch");
 
         // The switch to Codex emits its events before Codex starts; Codex then fails, and the
         // session rolls back to Claude, reporting the failure on Claude.

@@ -131,7 +131,7 @@ mod tests {
         let tags = std::sync::Arc::new(tags);
         TEST_CATALOG.with(|c| {
             *c.borrow_mut() = Some(super::super::services::CatalogServices {
-                models: Rc::new(|driver| {
+                models: Rc::new(|driver, _| {
                     vec![agent_core::catalog::CatalogModel {
                         driver,
                         id: "opus".into(),

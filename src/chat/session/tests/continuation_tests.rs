@@ -98,8 +98,9 @@ impl Thread {
         );
         let launch = super::answering_claude(&new);
         let env = minimal_env(&new);
-        session.set_adapter_factory(Rc::new(move |driver| {
+        session.set_adapter_factory(Rc::new(move |driver, _| {
             Ok(AgentLaunch {
+                profile: None,
                 adapter: Box::new(Relabelled {
                     inner: agent_core::claude::ClaudeAdapter::new(),
                     driver,

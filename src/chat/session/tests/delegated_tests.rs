@@ -1805,7 +1805,9 @@ fn a_rebind_around_a_roots_switch_lets_the_switch_start_the_new_agent() {
             },
         );
         let factory = new.clone();
-        session.set_adapter_factory(Rc::new(move |d| launch_of(FakeAdapter::boxed(d, &factory))));
+        session.set_adapter_factory(Rc::new(move |d, _| {
+            launch_of(FakeAdapter::boxed(d, &factory))
+        }));
         assert!(pump_until(ctx, 5, || session.status().alive));
 
         session.rebind_stop();

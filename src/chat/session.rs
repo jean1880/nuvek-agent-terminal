@@ -79,6 +79,10 @@ pub struct AgentLaunch {
     /// agy: the approval socket for the new process. Without one agy cannot ask (Ask runs as
     /// Plan; see [`effective_mode`]).
     pub approval: Approval,
+    /// The profile this launch moves the thread to (its id), when it is not the thread's own: the
+    /// window binds the thread to it once this process's session starts
+    /// ([`ChatSession::launched_profile`]), and never for another process.
+    pub profile: Option<String>,
 }
 
 /// `Continued on <new model> (<old> was retired)`.
@@ -96,10 +100,21 @@ pub struct RetiredModel {
     pub replacement: Replacement,
 }
 
-/// Builds what another driver starts with (the window knows how; this module does not). An `Err`
-/// is the reason the driver cannot be started (missing or switched off): the switch is refused
-/// with it and nothing changes.
-pub type AdapterFactory = Rc<dyn Fn(Driver) -> Result<AgentLaunch, String>>;
+/// Builds what another driver starts with (the window knows how; this module does not), on the
+/// profile a switch names (its id), or with `None` the thread's own for that driver. An `Err` is
+/// the reason the driver cannot be started (missing or switched off): the switch is refused with
+/// it and nothing changes.
+pub type AdapterFactory = Rc<dyn Fn(Driver, Option<&str>) -> Result<AgentLaunch, String>>;
+
+/// Another profile than the thread's own a switch moves it to (another model server, or the
+/// vendor from a server): always a new process continuing from a handoff, even on the same agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwitchTarget {
+    /// The profile's id, handed to the [`AdapterFactory`].
+    pub profile: String,
+    /// What the thread's notice calls where it went (`Local Model Server on NAS`).
+    pub label: String,
+}
 
 /// How long a state-changing tool step may run before its hook query must have arrived.
 const CANARY_GRACE: Duration = Duration::from_secs(8);
@@ -309,6 +324,12 @@ struct Inner {
     /// The agy start waiting on that proof, if any.
     starting: RefCell<Option<PendingStart>>,
     factory: RefCell<Option<AdapterFactory>>,
+    /// The profile the next [`Inner::switch`] moves the thread to ([`ChatSession::switch_to`]);
+    /// taken by that switch.
+    switch_target: RefCell<Option<SwitchTarget>>,
+    /// The profile the installed agent was launched on by a switch ([`AgentLaunch::profile`]);
+    /// `None` for the thread's own. Replaced at every install, rollbacks included.
+    launched_profile: RefCell<Option<String>>,
     /// Whether a switch to agy now would get its approval hook (the window's cached proof). Only
     /// says so before the switch; the launch itself proves the hook as always.
     agy_can_ask: RefCell<Option<Rc<dyn Fn() -> bool>>>,
@@ -904,6 +925,8 @@ impl ChatSession {
             hook_check: RefCell::new(default_hook_check()),
             starting: RefCell::new(None),
             factory: RefCell::new(None),
+            switch_target: RefCell::new(None),
+            launched_profile: RefCell::new(None),
             agy_can_ask: RefCell::new(None),
             launch_env: RefCell::new(env),
             proc: RefCell::new(None),
@@ -1012,6 +1035,27 @@ impl ChatSession {
     /// Lets `switch` build an adapter for the other driver (needed for `CreateWithHandoff`).
     pub fn set_adapter_factory(&self, factory: AdapterFactory) {
         *self.inner.factory.borrow_mut() = Some(factory);
+    }
+
+    /// Switches to `driver` on `target`'s profile: as [`ChatBackend::switch`], but always onto a
+    /// new process on that profile continuing from a handoff, even on the same agent. Rolled back
+    /// to the thread's own profile if it never starts.
+    pub fn switch_to(
+        &self,
+        driver: Driver,
+        target: SwitchTarget,
+        model: Option<String>,
+        effort: Option<String>,
+    ) {
+        *self.inner.switch_target.borrow_mut() = Some(target);
+        self.inner.switch(driver, model, effort);
+    }
+
+    /// The profile the running agent was launched on by a switch, `None` for the thread's own:
+    /// what a staged profile is committed against, so a process that never started on it (a
+    /// refused move, a restart of the old agent) cannot bind the thread to it.
+    pub fn launched_profile(&self) -> Option<String> {
+        self.inner.launched_profile.borrow().clone()
     }
 
     /// Lets the picker say, before a switch to agy, whether it could ask first
@@ -4528,6 +4572,8 @@ impl Inner {
     }
 
     fn switch(self: &Rc<Self>, driver: Driver, model: Option<String>, effort: Option<String>) {
+        // Another profile (`switch_to`): a new process there, whatever the agent.
+        let target = self.switch_target.borrow_mut().take();
         // The latest choice wins over a switch still reading the thread, and over the
         // continuation an earlier switch still owes.
         self.end_pending_switch();
@@ -4580,7 +4626,8 @@ impl Inner {
             workspace: workspace.clone(),
             capabilities: caps.clone(),
         };
-        let same_driver = driver == current_driver;
+        // Another profile of the same agent is not "the same": nothing of its session carries.
+        let same_driver = driver == current_driver && target.is_none();
         let target_model = match (&model, same_driver) {
             (Some(m), _) => m.clone(),
             (None, true) => status_model.unwrap_or_default(),
@@ -4588,7 +4635,7 @@ impl Inner {
         };
         // The target's own capabilities are not known without its adapter; the policy only
         // reads the live session's.
-        let target = SessionState {
+        let wanted = SessionState {
             selection: ModelSelection {
                 driver,
                 model: target_model.clone(),
@@ -4598,8 +4645,12 @@ impl Inner {
             workspace,
             capabilities: caps.clone(),
         };
-        let plan = plan_selection(&caps, &current.selection, &target.selection);
-        let transition = decide_transition(Some(&current), &target, true, Some(&plan));
+        let plan = plan_selection(&caps, &current.selection, &wanted.selection);
+        let transition = if target.is_some() {
+            Transition::CreateWithHandoff
+        } else {
+            decide_transition(Some(&current), &wanted, true, Some(&plan))
+        };
         debug!(?transition, "model switch");
         // A choice made now settles any pending question about a retired model.
         // Persistence follows backend acceptance, never a click or a failed request.
@@ -4768,7 +4819,7 @@ impl Inner {
                 if busy {
                     self.arm_switch_continuation(revision, driver);
                 }
-                self.create_with_handoff(driver, model, effort, busy, revision);
+                self.create_with_handoff(driver, model, effort, busy, revision, target);
                 return;
             }
             Transition::Reject(reason) => self.error(reason),
@@ -4934,6 +4985,7 @@ impl Inner {
         effort: Option<String>,
         busy: bool,
         revision: u64,
+        target: Option<SwitchTarget>,
     ) {
         let Some(factory) = self.factory.borrow().clone() else {
             self.error("Switching agent is not available in this thread.");
@@ -4950,7 +5002,7 @@ impl Inner {
             let switched = {
                 // Busy, a message still waiting in an unspawned start is the continuation's.
                 let _carrying = busy.then(|| ScopedFlag::set(&inner.carrying_task));
-                inner.hand_off_to(driver, model, effort, from, &factory, handoff)
+                inner.hand_off_to(driver, model, effort, from, target, &factory, handoff)
             };
             if switched {
                 // Not yet "went ahead": its start may still fail (a hook proof still out, then
@@ -4981,12 +5033,14 @@ impl Inner {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn hand_off_to(
         self: &Rc<Self>,
         driver: Driver,
         model: Option<String>,
         effort: Option<String>,
         from: Driver,
+        target: Option<SwitchTarget>,
         factory: &AdapterFactory,
         handoff: agent_kit::store::Result<Handoff>,
     ) -> bool {
@@ -4999,7 +5053,7 @@ impl Inner {
         };
         let carried = handoff.carried;
 
-        let launch = match factory(driver) {
+        let launch = match factory(driver, target.as_ref().map(|t| t.profile.as_str())) {
             Ok(launch) => launch,
             Err(reason) => {
                 self.error(reason);
@@ -5038,6 +5092,7 @@ impl Inner {
             let state = self.state.borrow();
             Previous {
                 driver: from,
+                launched: self.launched_profile.borrow().clone(),
                 provider_thread: self.provider_thread.borrow().clone(),
                 native_id: state.native_id.clone(),
                 model: state.model.clone(),
@@ -5060,13 +5115,17 @@ impl Inner {
             },
         );
         *self.rollback.borrow_mut() = Some(previous);
+        // Where it went: the agent, or the profile a switch named (another server of it).
+        let place = target
+            .as_ref()
+            .map_or(driver.info().long_label, |t| t.label.as_str());
         let mut text = if carried == 0 {
-            format!("Switched to {}", driver.info().long_label)
+            format!("Switched to {place}")
         } else {
-            handoff_notice(&format!("in {}", driver.info().long_label), &handoff)
+            handoff_notice(&format!("in {place}"), &handoff)
         };
-        // Session approvals belong to the agent they were given to; Always rules carry.
-        if from != driver {
+        // Session approvals belong to the agent session they were given to; Always rules carry.
+        if from != driver || target.is_some() {
             let ended = self.end_session_rules();
             if ended > 0 {
                 if !text.ends_with('.') {
@@ -5117,6 +5176,7 @@ impl Inner {
             self.limit_waiting.set(false);
         }
         *self.provider_thread.borrow_mut() = pt;
+        *self.launched_profile.borrow_mut() = launch.profile.clone();
         *self.adapter.borrow_mut() = launch.adapter;
         self.adapter_epoch.set(self.adapter_epoch.get() + 1);
         *self.launch_env.borrow_mut() = launch.env;
@@ -5182,7 +5242,9 @@ impl Inner {
         let failed = self.adapter.borrow().driver().info().long_label;
         let back = previous.driver.info().long_label;
         let factory = self.factory.borrow().clone();
-        let launch = match factory.map(|f| f(previous.driver)) {
+        // The profile the agent it goes back to ran on (the thread's own unless a move launched
+        // it elsewhere): the one the switch tried is the one that failed.
+        let launch = match factory.map(|f| f(previous.driver, previous.launched.as_deref())) {
             Some(Ok(launch)) => launch,
             Some(Err(why)) => {
                 self.error(format!(
@@ -5271,6 +5333,9 @@ impl Inner {
 /// the thread back to this one rather than stranding it with no agent.
 struct Previous {
     driver: Driver,
+    /// The profile its process was launched on by a move ([`AgentLaunch::profile`]), so a
+    /// rollback returns to that process's profile, not to the one the thread was bound to before.
+    launched: Option<String>,
     provider_thread: String,
     native_id: Option<String>,
     model: Option<String>,
@@ -8298,6 +8363,7 @@ mod tests {
 
     fn launch_of(adapter: Box<dyn Adapter>) -> Result<AgentLaunch, String> {
         Ok(AgentLaunch {
+            profile: None,
             adapter,
             program: "unused".into(),
             extra_args: Vec::new(),
@@ -8323,13 +8389,14 @@ mod tests {
                 &thread,
             );
             let codex_log = log.clone();
-            session.set_adapter_factory(Rc::new(move |d| {
+            session.set_adapter_factory(Rc::new(move |d, _| {
                 let launch = agent_core::provider::ModelProvider::new(
                     agent_core::provider::ProviderKind::Ollama,
                 )
                 .launch(Driver::Codex, None)
                 .unwrap();
                 Ok(AgentLaunch {
+                    profile: None,
                     adapter: FakeAdapter::boxed(d, &codex_log),
                     program: "/bin/true".into(),
                     extra_args: launch.args,
@@ -8367,9 +8434,10 @@ mod tests {
             let made: Rc<Cell<usize>> = Rc::default();
             let count = made.clone();
             let agy_log = log.clone();
-            session.set_adapter_factory(Rc::new(move |d| {
+            session.set_adapter_factory(Rc::new(move |d, _| {
                 count.set(count.get() + 1);
                 Ok(AgentLaunch {
+                    profile: None,
                     adapter: match d {
                         Driver::Claude => Box::new(agent_core::claude::ClaudeAdapter::new()),
                         Driver::Agy | Driver::Codex | Driver::Local => {
@@ -8457,7 +8525,7 @@ mod tests {
             &thread,
         );
         let log2 = log.clone();
-        session.set_adapter_factory(Rc::new(move |d| launch_of(FakeAdapter::boxed(d, &log2))));
+        session.set_adapter_factory(Rc::new(move |d, _| launch_of(FakeAdapter::boxed(d, &log2))));
         (session, seen)
     }
 
@@ -8472,7 +8540,7 @@ mod tests {
                 unset: vec![],
             };
             let expected = agy_env.clone();
-            session.set_adapter_factory(Rc::new(move |driver| {
+            session.set_adapter_factory(Rc::new(move |driver, _| {
                 let mut launch = launch_of(FakeAdapter::boxed(driver, &log))?;
                 launch.env = agy_env.clone();
                 Ok(launch)
@@ -8574,7 +8642,8 @@ mod tests {
             assert_eq!(store.provider_threads(&thread).expect("pts").len(), 1);
 
             let log = log_claude.clone();
-            session.set_adapter_factory(Rc::new(move |d| launch_of(FakeAdapter::boxed(d, &log))));
+            session
+                .set_adapter_factory(Rc::new(move |d, _| launch_of(FakeAdapter::boxed(d, &log))));
             session.switch(Driver::Claude, Some("opus".into()), None);
 
             let status = session.status();
@@ -8989,7 +9058,7 @@ mod tests {
             cwd: None,
         }));
         let (ag, cl) = (log_agy.clone(), log_claude);
-        session.set_adapter_factory(Rc::new(move |d| match d {
+        session.set_adapter_factory(Rc::new(move |d, _| match d {
             Driver::Claude => launch_of(claude(d, &cl)),
             _ => launch_of(agy(d, &ag)),
         }));
@@ -9625,7 +9694,7 @@ mod tests {
                 Some(handle),
             );
             let dir = tmp.path().to_owned();
-            session.set_adapter_factory(Rc::new(move |_| {
+            session.set_adapter_factory(Rc::new(move |_, _| {
                 // The profile's default mode (Plan) is what a fresh launch binds the hook to.
                 let profile_default = ApprovalHandle::bind(
                     &dir.join("rt2"),
@@ -9636,6 +9705,7 @@ mod tests {
                 )
                 .expect("bind");
                 Ok(AgentLaunch {
+                    profile: None,
                     adapter: Box::new(AgyAdapter::new("agy")),
                     program: "/bin/sh".into(),
                     extra_args: vec![dir.join("agent.sh").to_string_lossy().into_owned()],
@@ -9667,7 +9737,7 @@ mod tests {
             // Compact by handoff restarts the same agent on a fresh launch.
             session
                 .inner
-                .create_with_handoff(Driver::Agy, None, None, false, 0);
+                .create_with_handoff(Driver::Agy, None, None, false, 0, None);
             assert_eq!(session.status().mode, Mode::Ask, "compact");
             let argv = session.launch_spec().argv;
             assert!(!argv.iter().any(|a| a == "plan"), "{argv:?}");
@@ -10375,7 +10445,7 @@ mod tests {
                 sink,
                 None,
             );
-            session.set_adapter_factory(Rc::new(move |d| {
+            session.set_adapter_factory(Rc::new(move |d, _| {
                 launch_of(FakeAdapter::boxed(d, &Log::default()))
             }));
             assert!(session.status().alive);
@@ -10406,7 +10476,7 @@ mod tests {
                 &store,
                 &thread,
             );
-            session.set_adapter_factory(Rc::new(|d| {
+            session.set_adapter_factory(Rc::new(|d, _| {
                 Err(format!("{} is not available", d.info().long_label))
             }));
             session.switch(Driver::Claude, Some("opus".into()), None);
@@ -10586,7 +10656,7 @@ mod tests {
                     )
                 };
                 let factory_log = new_log.clone();
-                session.set_adapter_factory(Rc::new(move |d| {
+                session.set_adapter_factory(Rc::new(move |d, _| {
                     launch_of(FakeAdapter::boxed(d, &factory_log))
                 }));
                 if same_agent {
@@ -11593,7 +11663,8 @@ mod tests {
             );
             let log: Log = Rc::default();
             let log2 = log.clone();
-            session.set_adapter_factory(Rc::new(move |d| launch_of(FakeAdapter::boxed(d, &log2))));
+            session
+                .set_adapter_factory(Rc::new(move |d, _| launch_of(FakeAdapter::boxed(d, &log2))));
             feed(&session, &can_use_tool("r1", "touch b.tmp"));
             session.respond_approval("r1", Decision::AllowForSession);
             feed(&session, &can_use_tool("r2", "ls -la"));

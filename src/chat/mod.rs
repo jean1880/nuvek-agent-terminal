@@ -87,6 +87,20 @@ pub trait ChatBackend {
     /// For agy the effort is already part of `model` (the composed id); Claude takes it
     /// separately, and a changed effort restarts its process.
     fn switch(&self, driver: Driver, model: Option<String>, effort: Option<String>);
+    /// [`Self::switch`] onto the profile `profile` (its id) of `driver`: a model of another model
+    /// server (or of the vendor, from a server) than the thread's. A profile other than the one
+    /// the thread runs `driver` on is always a new agent process continuing from a handoff, even
+    /// on the same agent. A backend that knows no profiles switches as [`Self::switch`] does.
+    fn switch_profile(
+        &self,
+        driver: Driver,
+        profile: String,
+        model: Option<String>,
+        effort: Option<String>,
+    ) {
+        let _ = profile;
+        self.switch(driver, model, effort);
+    }
     /// What switching to `to` would cost, one sentence each, for the picker to say before the
     /// user chooses (a summary handoff, approvals that end, an agy that cannot ask). Empty for
     /// the current agent, and for a backend that cannot tell.
@@ -168,6 +182,17 @@ pub enum WorkerAction {
 pub trait ModelSource {
     /// The current snapshot, possibly empty (nothing fetched or cached yet).
     fn models(&self) -> Vec<agent_core::catalog::CatalogModel>;
+    /// The picker's groups: one per agent and source (the vendor, each model server), each with
+    /// its models and the profile a pick runs on. `None`: one group per agent, from
+    /// [`Self::models`].
+    fn groups(&self) -> Option<Vec<agent_core::catalog::SourceGroup>> {
+        None
+    }
+    /// The name of the model server the thread runs on now (its profile's), for the header;
+    /// `None` on the vendor, or for a source that knows no profiles.
+    fn current_server(&self) -> Option<String> {
+        None
+    }
     /// Calls `f` on the main thread each time the snapshot changes; the id disconnects it.
     fn connect_changed(&self, f: Box<dyn Fn()>) -> u64;
     /// Removes a listener added by [`Self::connect_changed`].

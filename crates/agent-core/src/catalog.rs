@@ -377,18 +377,8 @@ pub fn group_for_picker<'a>(
     query: &str,
     current: Option<Driver>,
 ) -> Vec<(Driver, Vec<&'a CatalogModel>)> {
-    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
-    let matches = |m: &CatalogModel| {
-        let hay = format!(
-            "{} {} {} {}",
-            m.id,
-            m.display,
-            m.description.as_deref().unwrap_or(""),
-            m.via.as_deref().unwrap_or("")
-        )
-        .to_lowercase();
-        words.iter().all(|w| hay.contains(w))
-    };
+    let words = query_words(query);
+    let matches = |m: &CatalogModel| row_matches(m, "", &words);
     let mut drivers = Vec::with_capacity(Driver::ALL.len());
     if let Some(cur) = current {
         drivers.push(cur);
@@ -408,6 +398,119 @@ pub fn group_for_picker<'a>(
             // Aliases (they follow the agent's newest model) before pinned versions.
             rows.sort_by_key(|m| !m.is_alias());
             (!rows.is_empty()).then_some((d, rows))
+        })
+        .collect()
+}
+
+/// A search's words, lower-cased.
+fn query_words(query: &str) -> Vec<String> {
+    query.split_whitespace().map(str::to_lowercase).collect()
+}
+
+/// Whether every word is found in `m`'s id, display name, description or route, or in `extra`
+/// (the name of the group the row is in).
+fn row_matches(m: &CatalogModel, extra: &str, words: &[String]) -> bool {
+    let hay = format!(
+        "{} {} {} {} {}",
+        m.id,
+        m.display,
+        m.description.as_deref().unwrap_or(""),
+        m.via.as_deref().unwrap_or(""),
+        extra
+    )
+    .to_lowercase();
+    words.iter().all(|w| hay.contains(w))
+}
+
+/// What is known of a picker group's model list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceState {
+    /// Listed: its models are the group's rows.
+    Listed,
+    /// Not read yet (the first fetch has not answered).
+    Pending,
+    /// The last read failed: the server did not answer, or refused.
+    Unreachable,
+    /// It answered with no model the agent can chat with.
+    NoChatModel,
+}
+
+impl SourceState {
+    /// What the group's heading says instead of rows; `None` while it has rows.
+    pub fn note(self) -> Option<&'static str> {
+        match self {
+            Self::Listed => None,
+            Self::Pending => Some("Checking…"),
+            Self::Unreachable => Some("Not reachable"),
+            Self::NoChatModel => Some("No chat model"),
+        }
+    }
+}
+
+/// One group of the model picker: an agent as one of its profiles runs it (on its vendor or on a
+/// model server), with that source's models. Choosing a row runs the thread on `profile`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceGroup {
+    pub driver: Driver,
+    /// The profile (its id) the thread runs on when a row is chosen; `None`: the thread's own for
+    /// `driver`, whatever that is.
+    pub profile: Option<String>,
+    /// The heading: the agent's name, or the server profile's.
+    pub name: String,
+    /// Under the heading: which agent, of what kind of server, at what address.
+    pub detail: Option<String>,
+    pub state: SourceState,
+    /// The thread runs on this group's profile now: its current model is one of these rows.
+    pub current: bool,
+    pub models: Vec<CatalogModel>,
+}
+
+/// `models` as one group per agent (the picker of a source that knows no profiles): each agent's
+/// own name, its rows in catalog order, `current`'s marked.
+pub fn groups_by_agent(models: &[CatalogModel], current: Option<Driver>) -> Vec<SourceGroup> {
+    Driver::ALL
+        .into_iter()
+        .filter_map(|d| {
+            let rows: Vec<CatalogModel> =
+                models.iter().filter(|m| m.driver == d).cloned().collect();
+            (!rows.is_empty()).then(|| SourceGroup {
+                driver: d,
+                profile: None,
+                name: d.info().long_label.to_owned(),
+                detail: None,
+                state: SourceState::Listed,
+                current: Some(d) == current,
+                models: rows,
+            })
+        })
+        .collect()
+}
+
+/// The picker's groups for `query`, each with its matching rows: the group the thread runs on
+/// first, then the other groups of its agent, then the rest in the order given. A row matches as
+/// [`group_for_picker`]'s do, or by its group's name, so a server's name finds all its models.
+/// With no query, a group with no rows (a server not listed yet, offline, or with no chat model)
+/// is kept, to say so; with one, only groups with matching rows are.
+pub fn filter_groups<'a>(
+    groups: &'a [SourceGroup],
+    query: &str,
+    current: Option<Driver>,
+) -> Vec<(&'a SourceGroup, Vec<&'a CatalogModel>)> {
+    let words = query_words(query);
+    let mut order: Vec<&SourceGroup> = groups.iter().collect();
+    // Stable: the given order holds within each rank.
+    order.sort_by_key(|g| (!g.current, Some(g.driver) != current));
+    order
+        .into_iter()
+        .filter_map(|g| {
+            let mut rows: Vec<&CatalogModel> = g
+                .models
+                .iter()
+                .filter(|m| row_matches(m, &g.name, &words))
+                .collect();
+            rows.sort_by_key(|m| !m.is_alias());
+            let shown = !rows.is_empty() || (words.is_empty() && g.models.is_empty());
+            shown.then_some((g, rows))
         })
         .collect()
 }
@@ -779,5 +882,65 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
         let g = group_for_picker(&all, "", None);
         assert_eq!(g[0].0, Driver::Claude);
         assert_eq!(g[1].0, Driver::Agy);
+    }
+
+    fn server(name: &str, current: bool, state: SourceState, ids: &[&str]) -> SourceGroup {
+        SourceGroup {
+            driver: Driver::Local,
+            profile: Some(format!("p-{name}")),
+            name: name.to_owned(),
+            detail: Some("Ollama · http://192.0.2.1:11434".to_owned()),
+            state,
+            current,
+            models: ids.iter().map(|id| m(Driver::Local, id, &[])).collect(),
+        }
+    }
+
+    #[test]
+    fn each_server_is_its_own_group_with_its_own_models() {
+        let mut groups = groups_by_agent(&parse_claude_initialize(&init_frame()), None);
+        groups.push(server("Desk", false, SourceState::Listed, &["qwen3:8b"]));
+        groups.push(server(
+            "NAS",
+            true,
+            SourceState::Listed,
+            &["qwen3:8b", "gemma3"],
+        ));
+        groups.push(server("Laptop", false, SourceState::Unreachable, &[]));
+        let g = filter_groups(&groups, "", Some(Driver::Local));
+        let names: Vec<&str> = g.iter().map(|(g, _)| g.name.as_str()).collect();
+        // The thread's own server first, then its agent's other servers, then the rest.
+        assert_eq!(names, ["NAS", "Desk", "Laptop", "Claude"]);
+        assert_eq!(g[0].1.len(), 2);
+        assert_eq!(
+            g[1].1.len(),
+            1,
+            "the same model on two servers is listed under each"
+        );
+        // A server with nothing listed is still shown, to say why.
+        assert!(g[2].1.is_empty());
+        assert_eq!(g[2].0.state.note(), Some("Not reachable"));
+
+        // A server's name finds all its models; a search hides the empty groups.
+        let g = filter_groups(&groups, "nas", Some(Driver::Local));
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].0.name, "NAS");
+        assert_eq!(g[0].1.len(), 2);
+        let g = filter_groups(&groups, "gemma", Some(Driver::Local));
+        assert_eq!(g.len(), 1);
+        assert!(filter_groups(&groups, "zzz", None).is_empty());
+    }
+
+    #[test]
+    fn groups_by_agent_marks_the_current_agent() {
+        let mut all = parse_agy_models(TSV);
+        all.extend(parse_claude_initialize(&init_frame()));
+        let groups = groups_by_agent(&all, Some(Driver::Agy));
+        let g = filter_groups(&groups, "", Some(Driver::Agy));
+        assert_eq!(g[0].0.driver, Driver::Agy);
+        assert!(g[0].0.current);
+        assert_eq!(g[0].0.profile, None);
+        assert_eq!(g[1].0.driver, Driver::Claude);
+        assert!(!g[1].0.current);
     }
 }

@@ -14,7 +14,7 @@ fn queued_session(driver: Driver, log: &Log) -> (Rc<Store>, ThreadId, Rc<ChatSes
         &thread,
     );
     let log = log.clone();
-    session.set_adapter_factory(Rc::new(move |d| {
+    session.set_adapter_factory(Rc::new(move |d, _| {
         launch_of(FakeAdapter::writing_with_open_turn(d, &log))
     }));
     (store, thread, session, seen)
@@ -249,7 +249,7 @@ fn a_switch_that_rolls_back_keeps_the_unspawned_message() {
         let log: Log = Rc::default();
         let (store, thread, session, _) = queued_session(Driver::Agy, &log);
         let factory_log = log.clone();
-        session.set_adapter_factory(Rc::new(move |d| {
+        session.set_adapter_factory(Rc::new(move |d, _| {
             launch_of(if d == Driver::Claude {
                 FakeAdapter::unspawnable(d, &factory_log)
             } else {

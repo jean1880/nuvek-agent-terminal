@@ -581,12 +581,13 @@ fn scripted_codex_claude_codex_switch_routes_replies_and_recovers_a_failed_switc
         let fail = fail_claude.clone();
         let open = fixture.open();
         let env = minimal_env(fixture.dir.path());
-        session.set_adapter_factory(Rc::new(move |driver| {
+        session.set_adapter_factory(Rc::new(move |driver, _| {
             let mut args = open.extra_args.clone();
             if driver == Driver::Claude {
                 args.push("--claude".into());
             }
             Ok(AgentLaunch {
+                profile: None,
                 adapter: if driver == Driver::Claude {
                     Box::new(ClaudeAdapter::new())
                 } else {

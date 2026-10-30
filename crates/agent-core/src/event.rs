@@ -620,6 +620,19 @@ pub enum WorkerState {
 }
 
 impl WorkerState {
+    /// Every state, in declaration order (the store's CHECK list is compared with it).
+    pub const ALL: [WorkerState; 9] = [
+        WorkerState::Starting,
+        WorkerState::Running,
+        WorkerState::Waiting,
+        WorkerState::Completed,
+        WorkerState::Failed,
+        WorkerState::Stopped,
+        WorkerState::Closed,
+        WorkerState::Stopping,
+        WorkerState::Unknown,
+    ];
+
     /// Whether the worker may still be doing work: only an observed exit ends one, so a stop
     /// in progress still counts.
     pub fn is_active(self) -> bool {
@@ -640,6 +653,15 @@ pub enum WorkerOrigin {
     Native,
     /// Started through `cross_agent_spawn`.
     Supervised,
+}
+
+impl WorkerOrigin {
+    /// Every origin, in declaration order (the store's CHECK list is compared with it).
+    pub const ALL: [WorkerOrigin; 3] = [
+        WorkerOrigin::Root,
+        WorkerOrigin::Native,
+        WorkerOrigin::Supervised,
+    ];
 }
 
 /// What a background task runs. A kind this build does not know decodes as `Other`.
@@ -682,6 +704,44 @@ pub enum AgentCommandKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `WorkerState::ALL` and `WorkerOrigin::ALL` are hand-maintained: `next` has no wildcard, so
+    /// a new variant does not compile until it is walked, and the walk must equal `ALL`.
+    #[test]
+    fn worker_state_and_origin_all_are_exhaustive() {
+        fn next_state(s: WorkerState) -> Option<WorkerState> {
+            use WorkerState::*;
+            match s {
+                Starting => Some(Running),
+                Running => Some(Waiting),
+                Waiting => Some(Completed),
+                Completed => Some(Failed),
+                Failed => Some(Stopped),
+                Stopped => Some(Closed),
+                Closed => Some(Stopping),
+                Stopping => Some(Unknown),
+                Unknown => None,
+            }
+        }
+        fn next_origin(o: WorkerOrigin) -> Option<WorkerOrigin> {
+            use WorkerOrigin::*;
+            match o {
+                Root => Some(Native),
+                Native => Some(Supervised),
+                Supervised => None,
+            }
+        }
+        let mut states = vec![WorkerState::Starting];
+        while let Some(s) = next_state(*states.last().expect("non-empty")) {
+            states.push(s);
+        }
+        assert_eq!(states, WorkerState::ALL);
+        let mut origins = vec![WorkerOrigin::Root];
+        while let Some(o) = next_origin(*origins.last().expect("non-empty")) {
+            origins.push(o);
+        }
+        assert_eq!(origins, WorkerOrigin::ALL);
+    }
 
     #[test]
     fn envelope_round_trips_through_json() {

@@ -13,8 +13,10 @@
 //! never ruled out for good (an abandoned window would then hold the thread forever). Instead a
 //! refusal (the one that starts the wait, or one during it) backs off every copy already past
 //! its reset: it is not taken as stale again until it has waited as long as it had already been
-//! stale, at least [`BACKOFF_MIN`]. Each failed guess so at least doubles the next gap, so a
-//! genuinely full window costs a few failed turns spread ever wider, never a loop, and an
+//! stale, at least [`BACKOFF_MIN`]. The gaps so never shrink, and once a copy has been stale
+//! longer than that minimum each failed guess at least doubles the next one (refused at once
+//! past its reset: 900, 960, 1 920, 3 840 s, ...). A genuinely full window costs a few failed
+//! turns spread ever wider, never a loop, and an
 //! abandoned one is always tried again. A drop in usage or a new reset time is a new copy. A
 //! refusal also restarts the clock: only readings taken after it count, and a reset time it came
 //! after is dropped. When every window still holding the thread names a reset time ahead, the
@@ -485,6 +487,21 @@ mod tests {
         let mut wait = LimitWait::new(None, 6_000, &refused);
         assert_ne!(wait.step(7_999, Some((6_050, &refused))), Step::Continue);
         assert_eq!(wait.step(8_000, Some((6_050, &refused))), Step::Continue);
+        // Refused at once past its reset (a grace after it), and each continuation refused as
+        // soon as it is sent: the minimum holds first, then the gaps double (900, 960, 1 920,
+        // 3 840 s), never shrinking.
+        let mut refusal = 4_000 + GRACE;
+        for gap in [BACKOFF_MIN, 960, 1_920, 3_840] {
+            let mut wait = LimitWait::new(None, refusal, &refused);
+            let reading = Some((refusal + 1, &refused[..]));
+            assert_ne!(
+                wait.step(refusal + gap - 1, reading),
+                Step::Continue,
+                "{gap}"
+            );
+            assert_eq!(wait.step(refusal + gap, reading), Step::Continue, "{gap}");
+            refusal += gap;
+        }
         // A copy naming a new reset is a new copy: waited for while ahead, stale once past.
         let mut wait = LimitWait::new(None, 5_000, &refused);
         let renewed = [window("Weekly", 1.0, Some(20_000))];

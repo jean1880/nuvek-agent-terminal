@@ -275,8 +275,9 @@ Architectural mandates, standards, and workflows for this codebase.
   merged, so a window the agent stopped reporting keeps its last copy). Such a guess is never
   ruled out for good, since an abandoned window would then hold the thread forever: a refusal
   backs off each copy already past its reset for as long as it had been stale (at least 15
-  minutes), so every failed guess at least doubles the next gap (a few failed turns spread ever
-  wider, never a loop), and a copy whose usage drops or that names another reset is new. A
+  minutes), so the gaps never shrink and, once a copy has been stale longer than that minimum,
+  every failed guess at least doubles the next one (a few failed turns spread ever wider, never
+  a loop), and a copy whose usage drops or that names another reset is new. A
   refusal during a wait counts the same way, and readings from before it, or a reset time it
   came after, no longer count.
   Readings count from when windows last arrived (`updated_at`), never an account-only

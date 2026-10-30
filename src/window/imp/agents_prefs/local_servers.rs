@@ -235,6 +235,7 @@ impl AgentTerminalWindow {
         let brand = gtk4::Image::from_gicon(&crate::icons::driver_icon(Driver::Local));
         brand.set_pixel_size(20);
         row.add_prefix(&brand);
+        self.local_profile_budget_rows(server, dialog, &row);
 
         let switch = gtk4::Switch::builder()
             .active(!server.disabled)

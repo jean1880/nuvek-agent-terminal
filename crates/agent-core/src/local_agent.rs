@@ -218,7 +218,7 @@ impl Tool {
         .to_owned()
     }
 
-    fn schema(self) -> Value {
+    pub fn schema(self) -> Value {
         let (description, properties, required): (&str, Value, &[&str]) = match self {
             Tool::ReadFile => (
                 "Read a text file. Paths are relative to the working folder unless absolute.",
@@ -315,27 +315,6 @@ pub fn gate(tool: Tool, mode: Mode, outside: bool) -> Gate {
     }
 }
 
-/// The system prompt: who the agent is, where it works and how it may act.
-pub fn system_prompt(cwd: &str, mode: Mode) -> String {
-    let policy = match mode {
-        Mode::Plan => {
-            "You are in plan mode: you may read and search, but not change anything. Finish with a \
-             clear plan."
-        }
-        Mode::Ask => "The user approves each file change and command before it runs.",
-        Mode::AcceptEdits => {
-            "File changes in the working folder run at once; commands need approval."
-        }
-        Mode::Bypass => "Every tool call runs without asking.",
-    };
-    format!(
-        "You are a coding agent working in the folder {cwd}. Use the tools to read, search, edit \
-         and run commands there instead of guessing; relative paths are inside that folder. \
-         Prefer edit_file for small changes and keep changes minimal. {policy} When the task is \
-         done, reply with a short summary of what you did."
-    )
-}
-
 /// One message of the conversation, in the OpenAI chat shape every target server takes, and as
 /// the transcript keeps it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -427,6 +406,21 @@ pub fn chat_request(model: &str, messages: &[ChatMessage], tools: &[Tool]) -> Va
     });
     if !tools.is_empty() {
         body["tools"] = tools.iter().map(|t| t.schema()).collect();
+    }
+    body
+}
+
+/// Request construction with already selected complete schemas and an explicit output cap.
+pub fn schema_request(
+    model: &str,
+    messages: &[ChatMessage],
+    schemas: &[Value],
+    response_tokens: usize,
+) -> Value {
+    let mut body = chat_request(model, messages, &[]);
+    body["max_tokens"] = json!(response_tokens);
+    if !schemas.is_empty() {
+        body["tools"] = json!(schemas);
     }
     body
 }
@@ -757,6 +751,9 @@ impl LocalAdapter {
 }
 
 impl Adapter for LocalAdapter {
+    fn local_context(&self) -> Option<&crate::local_context::LocalLaunchContext> {
+        Some(&self.context)
+    }
     fn driver(&self) -> Driver {
         Driver::Local
     }

@@ -451,6 +451,9 @@ impl std::error::Error for AdapterError {}
 pub trait Adapter {
     fn driver(&self) -> Driver;
     fn capabilities(&self) -> &Capabilities;
+    fn local_context(&self) -> Option<&crate::local_context::LocalLaunchContext> {
+        None
+    }
     /// Full argv (program first) for this session.
     fn argv(&self, session: &OpenSession) -> Vec<String>;
     /// Lines to write as soon as the process starts (Claude `initialize`); may be empty.

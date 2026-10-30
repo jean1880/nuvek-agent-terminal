@@ -21,16 +21,14 @@ use agent_core::event::{
     ResponseCapability, StreamKind, TurnState, Usage,
 };
 use agent_core::local_agent::{
-    chat_request, error_message, gate, refuses_tools, system_prompt, tools_for, ChatMessage, Gate,
-    RunnerArgs, StreamEvent, StreamReader, Tool, ToolCall, APPROVAL_OPTIONS,
+    error_message, gate, refuses_tools, tools_for, ChatMessage, Gate, RunnerArgs, StreamEvent,
+    StreamReader, Tool, ToolCall, APPROVAL_OPTIONS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// The most model requests one turn may make: a model that keeps calling tools is stopped.
 const MAX_STEPS: usize = 60;
-/// The most of a tool's output the model is given back.
-const MAX_TOOL_OUTPUT: usize = 30_000;
 /// The longest a server may take to start answering (a model may have to load first).
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(600);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -40,14 +38,10 @@ const MAX_REPLY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_LINE_BYTES: u64 = 4 * 1024 * 1024;
 /// The longest a reply may go without a line before it counts as stalled.
 const STALL: Duration = Duration::from_secs(600);
-/// The most of the conversation (in characters of text) sent with a request: the oldest
-/// exchanges are left out past it, and a transcript larger than [`MAX_TRANSCRIPT_BYTES`] is not
-/// read back.
-const CONTEXT_BUDGET: usize = 400_000;
 const MAX_TRANSCRIPT_BYTES: u64 = 64 * 1024 * 1024;
 /// The most of the conversation kept at all (memory and file), in bytes of text: a few requests'
 /// worth, so the oldest exchanges go once they could never be sent again.
-const RETAIN_BUDGET: usize = 4 * CONTEXT_BUDGET;
+const RETAIN_BUDGET: usize = 1_600_000;
 
 /// One line of a streamed reply, or why the reply failed. The channel closing is its end.
 pub type ReplyLine = Result<String, String>;
@@ -289,6 +283,7 @@ enum Stop {
 }
 
 pub struct Runner<C: ChatClient, W: Write> {
+    turn_instructions: agent_core::local_context::InstructionSnapshot,
     context: agent_core::local_context::LocalLaunchContext,
     args: RunnerArgs,
     /// `None` only while a request is under way.
@@ -322,6 +317,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         Self {
             model: args.model.clone(),
             context: Default::default(),
+            turn_instructions: Default::default(),
             mode: args.mode,
             args,
             client: Some(client),
@@ -422,7 +418,11 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         };
         let transcript: Transcript = serde_json::from_str(&text)
             .map_err(|e| format!("The saved conversation is unreadable: {e}"))?;
-        self.messages = transcript.messages;
+        self.messages = transcript
+            .messages
+            .into_iter()
+            .filter(|m| m.role != "system")
+            .collect();
         if self.model.is_none() {
             self.model = transcript.model;
         }
@@ -523,6 +523,20 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         self.emit(Envelope::new(Event::TurnStarted {
             model: Some(model.clone()),
         }));
+        self.turn_instructions = match crate::local_instructions::discover(
+            &self.context.instructions,
+            Path::new(&self.args.cwd),
+            &crate::local_instructions::InstructionPaths::from_env(),
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(why) => {
+                self.emit(Envelope::turn_completed(
+                    TurnState::Failed,
+                    Some(&agent_core::redact::redact(&why)),
+                ));
+                return Ok(());
+            }
+        };
         // Earlier turns' reasoning is not sent again.
         agent_core::local_agent::forget_reasoning(&mut self.messages);
         self.messages.push(ChatMessage::new("user", text));
@@ -574,21 +588,51 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         commands: &Receiver<Option<Command>>,
         usage: &mut Usage,
     ) -> Result<StepEnd, StepError> {
-        let tools = if self.no_tools {
+        use agent_core::local_context::{
+            bound_result, compose_system, plan_request, reserve_batch, SchemaCandidate,
+        };
+        let candidates: Vec<_> = if self.no_tools {
             Vec::new()
         } else {
             tools_for(self.mode)
+                .into_iter()
+                .map(|tool| SchemaCandidate {
+                    tool: agent_core::local_mcp::ResolvedTool::builtin(tool, tool.schema()),
+                    priority: 0,
+                })
+                .collect()
         };
-        let mut messages = vec![ChatMessage::new(
-            "system",
-            system_prompt(&self.args.cwd, self.mode),
-        )];
-        messages.extend(
-            within_budget(&self.messages, CONTEXT_BUDGET)
-                .iter()
-                .cloned(),
+        let system = compose_system(
+            &self.args.cwd,
+            self.mode,
+            &self.turn_instructions,
+            !self.no_tools,
         );
-        let body = chat_request(model, &messages, &tools);
+        let plan = plan_request(
+            model,
+            &system,
+            &candidates,
+            &self.messages,
+            &self.context.budget,
+        )
+        .map_err(|why| {
+            StepError::Failed(format!(
+                "{why}\n{}",
+                self.turn_instructions.sources_summary()
+            ))
+        })?;
+        self.emit(Envelope::new(Event::Notice {
+            text: plan.summary(),
+        }));
+        for excluded in &plan.excluded {
+            self.emit(Envelope::new(Event::Notice {
+                text: format!(
+                    "Excluded tool {}: {} bytes; {}.",
+                    excluded.alias, excluded.bytes, excluded.reason
+                ),
+            }));
+        }
+        let body = plan.body;
         let (reply, ended, stopped) = self.stream(&body, commands, usage)?;
         // A call runs only from a reply that ended as the server meant it to: one the output
         // limit cut off, or that broke off before its end, may hold a half-written call.
@@ -623,18 +667,52 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         if reply.tool_calls.is_empty() {
             return Ok(StepEnd::Answered);
         }
+        let schemas = if self.no_tools {
+            Vec::new()
+        } else {
+            plan.schemas
+        };
+        let system = compose_system(
+            &self.args.cwd,
+            self.mode,
+            &self.turn_instructions,
+            !self.no_tools,
+        );
+        let reservation = match reserve_batch(
+            model,
+            &system,
+            &schemas,
+            &self.messages,
+            &self.context.budget,
+        ) {
+            Ok(bytes) => bytes,
+            Err(why) => {
+                // The call batch never became executable; keep the assistant text without
+                // orphaned calls or reasoning that would require tool answers.
+                if let Some(last) = self.messages.last_mut() {
+                    last.tool_calls.clear();
+                    last.reasoning_content = None;
+                }
+                return Err(StepError::Failed(why));
+            }
+        };
         for (at, call) in reply.tool_calls.iter().enumerate() {
-            match self.call(call, commands) {
-                Ok(output) => self
-                    .messages
-                    .push(ChatMessage::tool_result(&call.id, output)),
+            let advertised = schemas.iter().any(|schema| {
+                schema.pointer("/function/name").and_then(Value::as_str)
+                    == Some(call.function.name.as_str())
+            });
+            match self.call(call, commands, reservation, advertised) {
+                Ok(output) => self.messages.push(ChatMessage::tool_result(
+                    &call.id,
+                    bound_result(&agent_core::redact::redact(&output), reservation),
+                )),
                 Err(stop) => {
                     // Every call the reply made gets an answer, so the history stays one a
                     // server accepts: this one and the rest did not run.
                     for skipped in &reply.tool_calls[at..] {
                         self.messages.push(ChatMessage::tool_result(
                             &skipped.id,
-                            "Not run: the user stopped the turn.",
+                            bound_result("Not run: the user stopped the turn.", reservation),
                         ));
                     }
                     return Err(stop);
@@ -721,13 +799,28 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                            changing anything. Pick a model that supports tools to let it work."
                         .to_owned(),
                 }));
-                let mut retry = body.clone();
-                if let Some(map) = retry.as_object_mut() {
-                    map.remove("tools");
-                }
-                return self.stream(&retry, commands, usage);
+                let system = agent_core::local_context::compose_system(
+                    &self.args.cwd,
+                    self.mode,
+                    &self.turn_instructions,
+                    false,
+                );
+                let retry = agent_core::local_context::plan_request(
+                    body.get("model")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    &system,
+                    &[],
+                    &self.messages,
+                    &self.context.budget,
+                )
+                .map_err(StepError::Failed)?;
+                self.emit(Envelope::new(Event::Notice {
+                    text: retry.summary(),
+                }));
+                return self.stream(&retry.body, commands, usage);
             }
-            return Err(StepError::Failed(why));
+            return Err(StepError::Failed(format!("{why} {} No tool calls from this response ran; requests are not automatically replayed to shrink context.", self.context.budget.failure("the provider rejected or failed the request; check its configured context size"))));
         }
         Ok((reply, ended, None))
     }
@@ -831,6 +924,8 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         &mut self,
         call: &ToolCall,
         commands: &Receiver<Option<Command>>,
+        reservation: usize,
+        advertised: bool,
     ) -> Result<String, StepError> {
         if let Some(stop) = poll(commands, &mut self.deferred) {
             return Err(StepError::Stop(stop));
@@ -852,6 +947,10 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             None,
         ));
         let fail = |me: &mut Self, why: String| {
+            let why = agent_core::local_context::bound_result(
+                &agent_core::redact::redact(&why),
+                reservation.saturating_sub(7),
+            );
             me.emit(Envelope::item_completed(
                 &item,
                 ItemStatus::Failed,
@@ -860,6 +959,12 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             ));
             Ok(format!("Error: {why}"))
         };
+        if !advertised {
+            return fail(
+                self,
+                "This tool was not advertised for this request.".into(),
+            );
+        }
         let Some(tool) = tool else {
             return fail(
                 self,
@@ -939,7 +1044,10 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         }
         match result {
             Ok(output) => {
-                let output = truncate(&output, MAX_TOOL_OUTPUT);
+                let output = agent_core::local_context::bound_result(
+                    &agent_core::redact::redact(&output),
+                    reservation,
+                );
                 self.emit(Envelope::item_completed(
                     &item,
                     ItemStatus::Completed,
@@ -1057,25 +1165,6 @@ fn exchange_starts(messages: &[ChatMessage]) -> Vec<usize> {
     starts
 }
 
-/// The newest whole exchanges of `messages` whose text fits `budget` bytes. The latest exchange
-/// is kept whole even past the budget: the server then says if it is too long, and nothing is
-/// ever sent without what it answers.
-fn within_budget(messages: &[ChatMessage], budget: usize) -> &[ChatMessage] {
-    let starts = exchange_starts(messages);
-    let mut keep_from = messages.len();
-    let mut total = 0;
-    let mut end = messages.len();
-    for &start in starts.iter().rev() {
-        total += messages[start..end].iter().map(message_size).sum::<usize>();
-        if total > budget && keep_from < messages.len() {
-            break;
-        }
-        keep_from = start;
-        end = start;
-    }
-    &messages[keep_from..]
-}
-
 /// Drops the oldest whole exchanges of `messages` until `fits` accepts them, keeping at least the
 /// latest one.
 fn drop_oldest_until(messages: &mut Vec<ChatMessage>, fits: impl Fn(&[ChatMessage]) -> bool) {
@@ -1088,21 +1177,6 @@ fn drop_oldest_until(messages: &mut Vec<ChatMessage>, fits: impl Fn(&[ChatMessag
             None => return,
         }
     }
-}
-
-fn truncate(text: &str, max: usize) -> String {
-    if text.len() <= max {
-        return text.to_owned();
-    }
-    let mut cut = max;
-    while !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    format!(
-        "{}\n… ({} more bytes not shown)",
-        &text[..cut],
-        text.len() - cut
-    )
 }
 
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
@@ -1310,10 +1384,19 @@ mod tests {
     }
 
     fn start(args: RunnerArgs, script: Script, dir: PathBuf) -> Run {
+        start_with_context(args, script, dir, Default::default())
+    }
+
+    fn start_with_context(
+        args: RunnerArgs,
+        script: Script,
+        dir: PathBuf,
+        context: agent_core::local_context::LocalLaunchContext,
+    ) -> Run {
         let (commands, rx) = channel();
         commands
             .send(Some(Command::ConfigureLocal {
-                context: Box::default(),
+                context: Box::new(context),
             }))
             .unwrap();
         let (tx, events) = channel();
@@ -1352,6 +1435,183 @@ mod tests {
             } => Some((*state, usage.clone(), error.clone())),
             _ => None,
         }
+    }
+
+    #[test]
+    fn instructions_are_frozen_across_calls_reloaded_each_turn_and_never_saved() {
+        let work = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let file = work.path().join("AGENTS.md");
+        std::fs::write(&file, "first convention\npassword=canary-value-1234").unwrap();
+        let script = Script::new(vec![
+            Ok(tool_call(
+                "write",
+                "write_file",
+                json!({"file_path":"AGENTS.md", "content":"second convention"}),
+            )),
+            Ok(text(&["done"])),
+            Ok(text(&["next"])),
+        ]);
+        let mut context = agent_core::local_context::LocalLaunchContext::default();
+        context.instructions.global_files = vec![file.display().to_string()];
+        context.instructions.discover_ancestors = false;
+        let run = start_with_context(
+            args(work.path(), Mode::AcceptEdits),
+            script.clone(),
+            state.path().into(),
+            context,
+        );
+        run.send(prompt("change instructions"));
+        assert_eq!(run.wait_for(completed).0, TurnState::Completed);
+        run.send(prompt("next turn"));
+        assert_eq!(run.wait_for(completed).0, TurnState::Completed);
+        run.finish();
+        let bodies = script.bodies();
+        assert_eq!(bodies.len(), 3);
+        for body in &bodies[..2] {
+            let system = body["messages"][0]["content"].as_str().unwrap();
+            assert!(system.contains("first convention"));
+            assert!(!system.contains("canary-value-1234"));
+            assert!(!system.contains("second convention"));
+        }
+        assert!(bodies[2]["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("second convention"));
+        let saved = std::fs::read_to_string(state.path().join("s-1.json")).unwrap();
+        assert!(!saved.contains("first convention"));
+        assert!(!saved.contains("canary-value-1234"));
+    }
+
+    #[test]
+    fn missing_explicit_instructions_and_current_exchange_overflow_make_no_request() {
+        let work = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut context = agent_core::local_context::LocalLaunchContext::default();
+        context.instructions.global_files =
+            vec![work.path().join("missing.md").display().to_string()];
+        for (context, prompt_text, expected) in [
+            (context, "hi".into(), "missing.md"),
+            (Default::default(), "x".repeat(100_000), "current exchange"),
+        ] {
+            let script = Script::new(vec![]);
+            let run = start_with_context(
+                args(work.path(), Mode::Ask),
+                script.clone(),
+                state.path().into(),
+                context,
+            );
+            run.send(prompt(&prompt_text));
+            let (status, _, error) = run.wait_for(completed);
+            assert_eq!(status, TurnState::Failed);
+            assert!(error.unwrap().contains(expected));
+            run.finish();
+            assert!(script.bodies().is_empty());
+        }
+    }
+
+    #[test]
+    fn oversized_call_batch_runs_nothing_and_leaves_no_orphaned_history() {
+        let work = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let calls = json!([{"index":0,"id":"one","type":"function","function":{"name":"write_file","arguments":json!({"file_path":"one", "content":"x".repeat(30_000)}).to_string()}}, {"index":1,"id":"two","type":"function","function":{"name":"write_file","arguments":json!({"file_path":"two", "content":"x".repeat(30_000)}).to_string()}}]);
+        let script = Script::new(vec![
+            Ok(vec![
+                format!(
+                    "data: {}",
+                    json!({"choices":[{"delta":{"tool_calls":calls}}]})
+                ),
+                "data: [DONE]".into(),
+            ]),
+            Ok(text(&["recover"])),
+        ]);
+        let run = start(
+            args(work.path(), Mode::AcceptEdits),
+            script.clone(),
+            state.path().into(),
+        );
+        run.send(prompt("write both"));
+        let (status, _, error) = run.wait_for(completed);
+        assert_eq!(status, TurnState::Failed);
+        assert!(error.unwrap().contains("none of the calls ran"));
+        assert!(!work.path().join("one").exists());
+        assert!(!work.path().join("two").exists());
+        run.send(prompt("recover"));
+        assert_eq!(run.wait_for(completed).0, TurnState::Completed);
+        run.finish();
+        let saved: Transcript =
+            serde_json::from_slice(&std::fs::read(state.path().join("s-1.json")).unwrap()).unwrap();
+        assert!(saved
+            .messages
+            .iter()
+            .all(|m| m.tool_calls.is_empty() && m.tool_call_id.is_none()));
+    }
+
+    #[test]
+    fn reserved_results_are_bounded_and_next_request_fits() {
+        let work = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("large"), "é".repeat(20_000)).unwrap();
+        let script = Script::new(vec![
+            Ok(tool_call("one", "read_file", json!({"file_path":"large"}))),
+            Ok(text(&["done"])),
+        ]);
+        let run = start(
+            args(work.path(), Mode::Ask),
+            script.clone(),
+            state.path().into(),
+        );
+        run.send(prompt("read it"));
+        assert_eq!(run.wait_for(completed).0, TurnState::Completed);
+        run.finish();
+        let bodies = script.bodies();
+        let results: Vec<_> = bodies[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .collect();
+        let result = results[0]["content"].as_str().unwrap();
+        assert!(result.len() <= agent_core::local_context::MAX_RESULT_BYTES);
+        assert!(result.contains("truncated"));
+        assert!(
+            agent_core::local_context::estimated_tokens(
+                serde_json::to_vec(&bodies[1]).unwrap().len(),
+                bodies[1]["messages"].as_array().unwrap().len()
+            ) <= agent_core::local_context::ContextBudget::default().input_allowance()
+        );
+    }
+
+    #[test]
+    fn a_tool_call_after_toolless_fallback_is_shown_but_never_executed() {
+        let work = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let script = Script::new(vec![
+            Err("does not support tools".into()),
+            Ok(tool_call(
+                "hidden",
+                "write_file",
+                json!({"file_path":"hidden", "content":"must not run"}),
+            )),
+            Ok(text(&["done"])),
+        ]);
+        let run = start(
+            args(work.path(), Mode::AcceptEdits),
+            script.clone(),
+            state.path().into(),
+        );
+        run.send(prompt("try tools"));
+        let mut refusal_shown = false;
+        assert_eq!(run.wait_for(|e| {
+            if matches!(&e.event, Event::ItemCompleted { error: Some(why), .. } if why.contains("not advertised")) { refusal_shown = true; }
+            completed(e)
+        }).0, TurnState::Completed);
+        run.finish();
+        assert!(refusal_shown);
+        assert!(!work.path().join("hidden").exists());
+        let bodies = script.bodies();
+        assert!(bodies[1].get("tools").is_none());
+        assert!(bodies[2].get("tools").is_none());
     }
 
     #[test]
@@ -1738,59 +1998,6 @@ mod tests {
         let bodies = script.bodies();
         assert!(bodies[1].get("tools").is_none());
         assert!(bodies[2].get("tools").is_some());
-    }
-
-    #[test]
-    fn the_history_sent_is_whole_exchanges_and_never_parts_a_call_from_its_answer() {
-        let msg = |role: &str, n: usize| ChatMessage::new(role, "x".repeat(n));
-        let call = |n: usize| ChatMessage {
-            tool_calls: vec![ToolCall {
-                id: "c1".into(),
-                kind: "function".into(),
-                function: agent_core::local_agent::ToolFunction {
-                    name: "write_file".into(),
-                    arguments: "a".repeat(n),
-                },
-            }],
-            ..ChatMessage::new("assistant", "")
-        };
-        let all = vec![
-            msg("user", 50),
-            msg("assistant", 50),
-            msg("tool", 50),
-            msg("user", 10),
-            msg("assistant", 10),
-        ];
-        assert_eq!(within_budget(&all, 1000).len(), 5);
-        let kept = within_budget(&all, 100);
-        assert_eq!(kept.len(), 2);
-        assert_eq!(kept[0].role, "user");
-        // The latest exchange is kept whole, even alone past the budget.
-        assert_eq!(within_budget(&all, 1).len(), 2);
-        // A huge call then a short answer: the call, its answer and their question go together.
-        let big = vec![
-            msg("user", 10),
-            msg("user", 5),
-            call(450_000),
-            msg("tool", 5),
-        ];
-        let kept = within_budget(&big, 400_000);
-        assert_eq!(
-            kept.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
-            ["user", "assistant", "tool"]
-        );
-        // Reasoning counts.
-        let thought = ChatMessage {
-            reasoning_content: Some("r".repeat(500)),
-            ..msg("assistant", 1)
-        };
-        let reasoned = vec![msg("user", 1), msg("user", 1), thought];
-        assert_eq!(within_budget(&reasoned, 100).len(), 2);
-        // Kept history drops whole exchanges from the oldest.
-        let mut kept = all.clone();
-        drop_oldest_until(&mut kept, |m| m.len() <= 2);
-        assert_eq!(kept.len(), 2);
-        assert_eq!(kept[0].role, "user");
     }
 
     #[test]

@@ -2783,6 +2783,37 @@ fn configured_adapter(
     }
 }
 
+impl AgentTerminalWindow {
+    pub(super) fn refresh_local_contexts(&self) {
+        self.for_each_window(|window| {
+            let updates: Vec<_> = {
+                let config = window.config.borrow();
+                window
+                    .tabs
+                    .borrow()
+                    .iter()
+                    .filter_map(|tab| {
+                        let chat = tab.chat.as_ref()?;
+                        let session = chat.slot.get()?;
+                        if session.status().driver != Driver::Local {
+                            return None;
+                        }
+                        let profile = thread_profile_or_new(
+                            &config,
+                            chat.running_profile_id().as_deref(),
+                            Driver::Local,
+                        );
+                        Some((session, config.local_defaults.launch(&profile.local)))
+                    })
+                    .collect()
+            };
+            for (session, context) in updates {
+                session.stage_local_context(context);
+            }
+        });
+    }
+}
+
 /// The adapter for `driver`. Codex reports this app's version in `initialize`'s `clientInfo`.
 fn make_adapter(driver: Driver, program: &str) -> std::boxed::Box<dyn Adapter> {
     match driver {

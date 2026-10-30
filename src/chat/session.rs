@@ -301,6 +301,9 @@ fn accepted_model_choice(driver: Driver, requested: Option<&str>, reported: &str
 type PendingRule = (crate::always_allow::Action, Option<String>, Option<PathBuf>);
 
 struct Inner {
+    /// Settings changes are adopted by a resumed Local generation at the next prompt boundary.
+    pending_local_context:
+        RefCell<Option<Result<agent_core::local_context::LocalLaunchContext, String>>>,
     adapter: RefCell<Box<dyn Adapter>>,
     open: RefCell<OpenSession>,
     /// Writes are queued to the store writer (never run on this thread); the reads that need
@@ -912,6 +915,7 @@ impl ChatSession {
             native_id: open.resume.clone(),
         };
         let inner = Rc::new(Inner {
+            pending_local_context: RefCell::new(None),
             adapter: RefCell::new(adapter),
             open: RefCell::new(open),
             store,
@@ -1056,6 +1060,29 @@ impl ChatSession {
     /// refused move, a restart of the old agent) cannot bind the thread to it.
     pub fn launched_profile(&self) -> Option<String> {
         self.inner.launched_profile.borrow().clone()
+    }
+
+    pub fn stage_local_context(
+        &self,
+        context: Result<agent_core::local_context::LocalLaunchContext, String>,
+    ) {
+        if self.inner.adapter.borrow().driver() != Driver::Local {
+            return;
+        }
+        let context = context.and_then(|value| {
+            value.validate()?;
+            Ok(value)
+        });
+        let unchanged = context
+            .as_ref()
+            .is_ok_and(|value| self.inner.adapter.borrow().local_context() == Some(value));
+        let pending = if unchanged { None } else { Some(context) };
+        let changed = *self.inner.pending_local_context.borrow() != pending;
+        let restart_pending = pending.is_some();
+        *self.inner.pending_local_context.borrow_mut() = pending;
+        if changed && restart_pending {
+            self.note("Local settings saved: runner restart pending before the next prompt. The current turn keeps its snapshot.");
+        }
     }
 
     /// Lets the picker say, before a switch to agy, whether it could ask first
@@ -4040,9 +4067,42 @@ impl Inner {
         accepted
     }
 
+    fn prepare_local_context(&self) -> bool {
+        if self.adapter.borrow().driver() == Driver::Local && !self.state.borrow().running_turn {
+            let pending = self.pending_local_context.borrow_mut().take();
+            if let Some(context) = pending {
+                let context = match context {
+                    Ok(context) => context,
+                    Err(why) => {
+                        *self.pending_local_context.borrow_mut() = Some(Err(why.clone()));
+                        self.report(&AdapterError::Invalid(format!(
+                            "Local settings block this prompt: {why}"
+                        )));
+                        return false;
+                    }
+                };
+                self.stop_current();
+                if self.open.borrow().mode == Mode::Bypass {
+                    let mode = self.safe_mode.get();
+                    self.open.borrow_mut().mode = mode;
+                    self.state.borrow_mut().mode = mode;
+                    self.wanted_mode.set(mode);
+                    self.emit(Envelope::new(Event::ModeChanged { mode }));
+                }
+                *self.adapter.borrow_mut() =
+                    Box::new(agent_core::local_agent::LocalAdapter::new().with_context(context));
+                self.adapter_epoch.set(self.adapter_epoch.get() + 1);
+            }
+        }
+        true
+    }
+
     /// Sends `sent` as a prompt; true when the adapter took it.
     fn dispatch_sent_prompt(self: &Rc<Self>, sent: &str, handoff: Option<Handoff>) -> bool {
         if !self.root_prompt_allowed() {
+            return false;
+        }
+        if !self.prepare_local_context() {
             return false;
         }
         self.ensure_alive();
@@ -5177,6 +5237,7 @@ impl Inner {
         }
         *self.provider_thread.borrow_mut() = pt;
         *self.launched_profile.borrow_mut() = launch.profile.clone();
+        self.pending_local_context.borrow_mut().take();
         *self.adapter.borrow_mut() = launch.adapter;
         self.adapter_epoch.set(self.adapter_epoch.get() + 1);
         *self.launch_env.borrow_mut() = launch.env;
@@ -6442,6 +6503,83 @@ mod tests {
     mod handoff_tests;
     mod switch_tests;
     mod teardown_tests;
+
+    #[test]
+    fn local_settings_wait_for_a_turn_boundary_and_keep_the_native_conversation() {
+        in_loop(|_| {
+            let store = Rc::new(Store::open_in_memory().unwrap());
+            let thread = fresh(&store, "/work");
+            let (session, _) = harness(
+                Box::new(agent_core::local_agent::LocalAdapter::new()),
+                open_session("unused", vec![], "/work"),
+                &store,
+                &thread,
+            );
+            let inner = &session.inner;
+            let original_provider = inner.provider_thread.borrow().clone();
+            let mut context = agent_core::local_context::LocalLaunchContext::default();
+            context.budget.context_tokens = 65536;
+            inner.state.borrow_mut().running_turn = true;
+            inner.state.borrow_mut().native_id = Some("native-local".into());
+            session.stage_local_context(Ok(context.clone()));
+            assert!(inner.prepare_local_context());
+            assert_ne!(inner.adapter.borrow().local_context(), Some(&context));
+            assert!(inner.pending_local_context.borrow().is_some());
+            inner.state.borrow_mut().running_turn = false;
+            assert!(inner.prepare_local_context());
+            assert_eq!(inner.adapter.borrow().local_context(), Some(&context));
+            assert_eq!(
+                inner.state.borrow().native_id.as_deref(),
+                Some("native-local")
+            );
+            assert_eq!(*inner.provider_thread.borrow(), original_provider);
+            assert!(inner.pending_local_context.borrow().is_none());
+            session.stage_local_context(Err("invalid settings".into()));
+            assert!(!inner.prepare_local_context());
+            assert!(
+                !inner.prepare_local_context(),
+                "invalid settings continue to block instead of using stale settings"
+            );
+        });
+    }
+
+    #[test]
+    fn local_settings_do_not_follow_a_switch_to_another_profile_or_agent() {
+        in_loop(|_| {
+            let store = Rc::new(Store::open_in_memory().unwrap());
+            let thread = fresh(&store, "/work");
+            let (session, _) = harness(
+                Box::new(agent_core::local_agent::LocalAdapter::new()),
+                open_session("unused", vec![], "/work"),
+                &store,
+                &thread,
+            );
+            let mut pending = agent_core::local_context::LocalLaunchContext::default();
+            pending.budget.context_tokens = 65536;
+            session.stage_local_context(Ok(pending));
+            let mut next = agent_core::local_context::LocalLaunchContext::default();
+            next.budget.context_tokens = 131072;
+            let launch = launch_of(Box::new(
+                agent_core::local_agent::LocalAdapter::new().with_context(next.clone()),
+            ))
+            .unwrap();
+            let provider = session.inner.provider_thread.borrow().clone();
+            session.inner.install_agent(
+                Driver::Local,
+                provider,
+                launch,
+                Installed {
+                    model: None,
+                    selected: None,
+                    effort: None,
+                    native_id: Some("other-profile".into()),
+                },
+            );
+            assert!(session.inner.pending_local_context.borrow().is_none());
+            assert!(session.inner.prepare_local_context());
+            assert_eq!(session.inner.adapter.borrow().local_context(), Some(&next));
+        });
+    }
 
     const FIXTURE: &str = include_str!("../../crates/agent-core/tests/fixtures/agy-edit.ndjson");
     const CONVERSATION: &str = "3af90996-e4fe-44be-8d6c-ca20da039f6f";

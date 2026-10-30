@@ -1389,6 +1389,8 @@ impl ObjectImpl for AgentTerminalWindow {
         self.start_checkpoint_watch();
         self.watch_focus();
         self.report_config_problem();
+        // Every dialog shown here closes on a press outside it, as Escape does.
+        crate::dialogs::close_dialogs_on_outside_click(&*self.obj());
     }
 }
 

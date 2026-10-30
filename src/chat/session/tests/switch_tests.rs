@@ -46,7 +46,7 @@ fn slow_with(old: Driver, seed: impl FnOnce(&Store, &ThreadId)) -> Slow {
     };
     let (session, seen) = harness(FakeAdapter::boxed(old, &log), open, &handle, &thread);
     let factory_log = new_log.clone();
-    session.set_adapter_factory(Rc::new(move |d| {
+    session.set_adapter_factory(Rc::new(move |d, _| {
         launch_of(FakeAdapter::boxed(d, &factory_log))
     }));
     Slow {
@@ -244,7 +244,7 @@ fn a_failed_switch_never_sends_the_messages_written_for_its_new_agent_to_the_old
                 }
                 Failure::Factory => {
                     s.session
-                        .set_adapter_factory(Rc::new(|_| Err("Claude is not ready".into())));
+                        .set_adapter_factory(Rc::new(|_, _| Err("Claude is not ready".into())));
                     s.hold_writer(300);
                 }
             }
@@ -397,7 +397,7 @@ fn a_message_steered_while_a_switch_waits_never_reaches_the_outgoing_agent() {
             assert!(s.session.status().running_turn);
             if fails {
                 s.session
-                    .set_adapter_factory(Rc::new(|_| Err("agy is not ready".into())));
+                    .set_adapter_factory(Rc::new(|_, _| Err("agy is not ready".into())));
             }
             s.hold_writer(300);
             s.session
@@ -479,7 +479,7 @@ fn a_switch_whose_new_agent_cannot_spawn_holds_what_was_written_for_it() {
     in_loop(|ctx| {
         let s = slow(Driver::Agy);
         let new_log = s.new_log.clone();
-        s.session.set_adapter_factory(Rc::new(move |d| {
+        s.session.set_adapter_factory(Rc::new(move |d, _| {
             launch_of(FakeAdapter::unspawnable(d, &new_log))
         }));
         s.hold_writer(300);
@@ -553,7 +553,7 @@ fn a_close_drops_a_waiting_switch_without_a_notice() {
 fn hooked_agy_factory(dir: &Path, new_log: &Log, spawnable: bool) -> AdapterFactory {
     let dir = dir.to_owned();
     let log = new_log.clone();
-    Rc::new(move |d| {
+    Rc::new(move |d, _| {
         if d != Driver::Agy {
             return launch_of(FakeAdapter::boxed(d, &log));
         }
@@ -650,6 +650,182 @@ fn a_message_in_a_new_agents_unproven_start_still_asks_before_closing() {
             "a close before agy started would lose the message unasked"
         );
         let _ = release.send(());
+        s.session.shutdown(false);
+    });
+}
+
+/// A move to another profile of the same agent (another model server) is a new process on that
+/// profile, never a model change in the running one: the factory is asked for it by name and the
+/// thread's notice says where it went. A later model change stays on that process.
+#[test]
+fn a_move_to_another_server_of_the_same_agent_is_a_new_process_on_it() {
+    in_loop(|ctx| {
+        let s = slow(Driver::Claude);
+        let asked: Rc<RefCell<Vec<Option<String>>>> = Rc::default();
+        let (asked_in, factory_log) = (asked.clone(), s.new_log.clone());
+        s.session.set_adapter_factory(Rc::new(move |d, profile| {
+            asked_in.borrow_mut().push(profile.map(str::to_owned));
+            launch_of(FakeAdapter::boxed(d, &factory_log)).map(|mut launch| {
+                launch.profile = profile.map(str::to_owned);
+                launch
+            })
+        }));
+        s.session.switch_to(
+            Driver::Claude,
+            crate::chat::session::SwitchTarget {
+                profile: "p-gateway".into(),
+                label: "Claude on Gateway".into(),
+            },
+            Some("qwen3-coder".into()),
+            None,
+        );
+        assert!(
+            pump_until(ctx, 5, || !asked.borrow().is_empty()),
+            "no new process"
+        );
+        assert_eq!(*asked.borrow(), [Some("p-gateway".to_owned())]);
+        assert_eq!(
+            s.session.launched_profile().as_deref(),
+            Some("p-gateway"),
+            "the running process says what it was launched on"
+        );
+        assert!(has(&s.seen, |e| matches!(e, Event::Notice { text }
+            if text.starts_with("Switched to Claude on Gateway"))));
+        assert_eq!(s.session.status().driver, Driver::Claude);
+        // A plain model change afterwards is the running process's own: nothing is launched.
+        s.session.switch(Driver::Claude, Some("other".into()), None);
+        pump_until(ctx, 1, || false);
+        assert_eq!(asked.borrow().len(), 1);
+        s.session.shutdown(false);
+    });
+}
+
+/// A move to another server whose process cannot start goes back to the thread's own profile:
+/// the factory is asked again with no profile named.
+#[test]
+fn a_move_to_a_server_that_cannot_start_returns_to_the_threads_own_profile() {
+    in_loop(|ctx| {
+        let s = slow(Driver::Claude);
+        let asked: Rc<RefCell<Vec<Option<String>>>> = Rc::default();
+        let (asked_in, factory_log) = (asked.clone(), s.new_log.clone());
+        s.session.set_adapter_factory(Rc::new(move |d, profile| {
+            asked_in.borrow_mut().push(profile.map(str::to_owned));
+            match profile {
+                Some(p) => launch_of(FakeAdapter::unspawnable(d, &factory_log)).map(|mut l| {
+                    l.profile = Some(p.to_owned());
+                    l
+                }),
+                None => launch_of(FakeAdapter::boxed(d, &factory_log)),
+            }
+        }));
+        s.session.switch_to(
+            Driver::Claude,
+            crate::chat::session::SwitchTarget {
+                profile: "p-offline".into(),
+                label: "Claude on Offline".into(),
+            },
+            Some("qwen3-coder".into()),
+            None,
+        );
+        assert!(
+            pump_until(ctx, 5, || asked.borrow().len() >= 2),
+            "never rolled back: {:?}",
+            asked.borrow()
+        );
+        assert_eq!(*asked.borrow(), [Some("p-offline".to_owned()), None]);
+        assert_eq!(
+            s.session.launched_profile(),
+            None,
+            "back on the thread's own: nothing the window could commit"
+        );
+        s.session.shutdown(false);
+    });
+}
+
+/// Overlapping moves: A → B, then a move to C whose launch is refused. C installs nothing, so the
+/// running process is still B's and still says so: its start binds the thread to B.
+#[test]
+fn a_refused_move_leaves_the_running_process_launched_on_its_own_profile() {
+    in_loop(|ctx| {
+        let s = slow(Driver::Local);
+        let factory_log = s.new_log.clone();
+        s.session
+            .set_adapter_factory(Rc::new(move |d, profile| match profile {
+                Some("p-c") => Err("p-c has no key".into()),
+                _ => launch_of(FakeAdapter::boxed(d, &factory_log)).map(|mut launch| {
+                    launch.profile = profile.map(str::to_owned);
+                    launch
+                }),
+            }));
+        let target = |profile: &str| crate::chat::session::SwitchTarget {
+            profile: profile.into(),
+            label: format!("Local Model Server on {profile}"),
+        };
+        s.session
+            .switch_to(Driver::Local, target("p-b"), Some("qwen3:8b".into()), None);
+        assert!(pump_until(ctx, 5, || s
+            .session
+            .launched_profile()
+            .is_some()));
+        assert_eq!(s.session.launched_profile().as_deref(), Some("p-b"));
+        s.session
+            .switch_to(Driver::Local, target("p-c"), Some("gemma3".into()), None);
+        pump_until(ctx, 1, || false);
+        assert_eq!(
+            s.session.launched_profile().as_deref(),
+            Some("p-b"),
+            "the refused move to C changed nothing"
+        );
+        s.session.shutdown(false);
+    });
+}
+
+/// A → B, then a move to C that cannot spawn: the rollback goes back to B's process on B's
+/// profile (the factory is asked for B again), not to the profile the thread started on.
+#[test]
+fn a_failed_move_rolls_back_onto_the_profile_the_previous_process_ran_on() {
+    in_loop(|ctx| {
+        let s = slow(Driver::Local);
+        let asked: Rc<RefCell<Vec<Option<String>>>> = Rc::default();
+        let (asked_in, factory_log) = (asked.clone(), s.new_log.clone());
+        s.session.set_adapter_factory(Rc::new(move |d, profile| {
+            asked_in.borrow_mut().push(profile.map(str::to_owned));
+            let adapter = if profile == Some("p-c") {
+                FakeAdapter::unspawnable(d, &factory_log)
+            } else {
+                FakeAdapter::boxed(d, &factory_log)
+            };
+            launch_of(adapter).map(|mut launch| {
+                launch.profile = profile.map(str::to_owned);
+                launch
+            })
+        }));
+        let target = |profile: &str| crate::chat::session::SwitchTarget {
+            profile: profile.into(),
+            label: format!("Local Model Server on {profile}"),
+        };
+        s.session
+            .switch_to(Driver::Local, target("p-b"), Some("qwen3:8b".into()), None);
+        assert!(pump_until(ctx, 5, || s
+            .session
+            .launched_profile()
+            .is_some()));
+        s.session
+            .switch_to(Driver::Local, target("p-c"), Some("gemma3".into()), None);
+        assert!(
+            pump_until(ctx, 5, || asked.borrow().len() >= 3),
+            "never rolled back: {:?}",
+            asked.borrow()
+        );
+        assert_eq!(
+            *asked.borrow(),
+            [
+                Some("p-b".to_owned()),
+                Some("p-c".to_owned()),
+                Some("p-b".to_owned())
+            ]
+        );
+        assert_eq!(s.session.launched_profile().as_deref(), Some("p-b"));
         s.session.shutdown(false);
     });
 }

@@ -754,6 +754,8 @@ dialog.chat-panel bottom-sheet > sheet,
 .chat-panel list.boxed-list row:hover { background-color: alpha(@at_accent, 0.08); }
 .chat-panel .model-group { color: @at_fg_dim; font-weight: 700; font-size: 0.85em; letter-spacing: 0.06em; }
 .chat-panel .model-via { color: @at_warning; font-size: 0.8em; }
+.chat-panel .model-group-detail { font-size: 0.85em; }
+.chat-panel .model-group-current { color: @at_accent; font-size: 0.8em; font-weight: 600; }
 .chat-panel list.boxed-list row.current-model { background-color: alpha(@at_accent, 0.18); }
 .chat-panel statuspage .title { color: @at_fg_strong; }
 .chat-panel image.accent { color: @at_accent; }

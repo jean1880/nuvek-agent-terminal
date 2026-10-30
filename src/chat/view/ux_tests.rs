@@ -15,7 +15,14 @@ fn native_header_lifecycle_hints_survive_narrow_breakpoints() {
     let ctx = crate::testutil::native_init();
     for width in [360, 650, 950, 1100] {
         let header = header::Header::new();
-        header.set_agent(Driver::Claude, Some("claude-sonnet-5-5"), None, None);
+        // A Local thread names its server too: the widest chip there is.
+        header.set_agent(
+            Driver::Local,
+            Some("Ollama (RTX 4080)"),
+            Some("qwen2.5-coder:14b"),
+            None,
+            None,
+        );
         let window = gtk4::Window::new();
         window.set_default_size(width, 100);
         window.set_child(Some(&header.bin));

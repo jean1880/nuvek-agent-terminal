@@ -37,12 +37,16 @@ pub(crate) struct AppServices {
 /// attempt is this old (seconds), so repeated calls cannot storm a failing agent.
 pub(crate) const USAGE_REFRESH_FLOOR: i64 = 60;
 
+/// The models an agent offers as one of its profiles runs it.
+pub(crate) type ProfileModelsFn = Rc<dyn Fn(Driver, &Profile) -> Vec<CatalogModel>>;
+
 /// What `cross_agent_capabilities` reports about models and plan usage. The default knows no
 /// model, no usage and no tag file (tests that do not exercise it).
 #[derive(Clone)]
 pub(crate) struct CatalogServices {
-    /// The models a ready agent offers (none for an agent that is not ready).
-    pub models: Rc<dyn Fn(Driver) -> Vec<CatalogModel>>,
+    /// The models a ready agent offers as `profile` runs it (its own model server's, or the
+    /// vendor's); none for an agent that is not ready.
+    pub models: ProfileModelsFn,
     /// The agent's plan usage as last read; `None` when the app keeps none.
     pub usage: Rc<dyn Fn(Driver) -> Option<Snapshot>>,
     /// The tag file, cached and re-read off the main thread only when it changed.
@@ -54,7 +58,7 @@ pub(crate) struct CatalogServices {
 impl Default for CatalogServices {
     fn default() -> Self {
         Self {
-            models: Rc::new(|_| Vec::new()),
+            models: Rc::new(|_, _| Vec::new()),
             usage: Rc::new(|_| None),
             tags: Rc::new(|| -> LocalFuture<TagsState> {
                 Box::pin(std::future::ready(TagsState {

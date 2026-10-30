@@ -1,6 +1,7 @@
 //! The narrow application services used by the app-owned delegation supervisor.
 
 use super::*;
+use crate::chat::session::{ChatSession, SwitchTarget};
 use crate::chat::WorkerAction;
 use crate::delegation::seam::WorkerSubscriber;
 use crate::delegation::seam::{ChildStop, ResolvedChild};
@@ -305,25 +306,43 @@ pub(super) fn worker_action(slot: &SessionSlot, action: WorkerAction) -> bool {
     true
 }
 
+/// Switches the slot's session to `driver`, on `target`'s profile when one is named (another
+/// model server: a new process there, see [`crate::chat::session::ChatSession::switch_to`]).
 pub(super) fn switch(
     slot: &SessionSlot,
     driver: Driver,
     model: Option<String>,
     effort: Option<String>,
+    target: Option<SwitchTarget>,
 ) {
     let Some(session) = slot.get() else {
         return;
     };
+    let go = move |session: &ChatSession,
+                   model: Option<String>,
+                   effort: Option<String>,
+                   target: Option<SwitchTarget>| match target {
+        Some(target) => session.switch_to(driver, target, model, effort),
+        None => session.switch(driver, model, effort),
+    };
     let Some((supervisor, thread)) = crate::delegation::supervisor().zip(slot.thread.clone())
     else {
-        session.switch(driver, model, effort);
+        go(&session, model, effort, target);
         session.rebind_start();
         return;
     };
-    // The thread's own profile on its own agent; another agent's default on a switch.
-    let profile = match super::thread_owner(&thread) {
-        Some(window) => window.imp().thread_profile(&thread, driver),
-        None => SharedConfig::default()
+    // The profile the switch names; else the thread's own on its own agent, and another agent's
+    // default on a switch.
+    let named = target.as_ref().and_then(|t| {
+        SharedConfig::default()
+            .borrow()
+            .profile_by_id(&t.profile)
+            .cloned()
+    });
+    let profile = match (named, super::thread_owner(&thread)) {
+        (Some(named), _) => named,
+        (None, Some(window)) => window.imp().thread_profile(&thread, driver),
+        (None, None) => SharedConfig::default()
             .borrow()
             .agent_profile(driver)
             .cloned()
@@ -348,7 +367,7 @@ pub(super) fn switch(
             }
             return;
         }
-        session.switch(driver, model, effort);
+        go(&session, model, effort, target);
         if let Some(reason) = problem {
             session.note(unbound_notice(&reason));
         }
@@ -521,10 +540,12 @@ impl AgentTerminalWindow {
         crate::usage_file::install();
         let tags_cache = Rc::new(crate::model_tags_file::TagsCache::default());
         let catalog = crate::delegation::services::CatalogServices {
-            models: Rc::new(|driver| {
+            models: Rc::new(|driver, profile| {
                 let availability = AgentAvailability::shared();
+                let source = crate::config::profile_provider(profile, driver)
+                    .filter(|_| agent_core::provider::supports(driver));
                 crate::model_catalog::only_ready(
-                    crate::model_catalog::ModelCatalog::shared().models_of(driver),
+                    crate::model_catalog::ModelCatalog::shared().models_for(driver, source.as_ref()),
                     |d| availability.is_ready(d),
                 )
             }),

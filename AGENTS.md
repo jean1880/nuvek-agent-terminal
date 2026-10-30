@@ -304,9 +304,19 @@ Architectural mandates, standards, and workflows for this codebase.
   model on the command line (`provider::model_args`). A model change on a server is a resumed
   restart (`binds_thread_model`): Claude Code refuses a live `set_model` to an unknown id. The
   catalogue keeps a list per source any enabled profile uses (`ModelCatalog::models_for`,
-  `other_profile_sources`): each thread's picker (`ProfileModels`), its retirement judgement and
-  a delegated worker's effort check use the list of the source its own profile runs
-  (`profile_source`). An API key is never stored: the profile names the variable holding it,
+  `other_profile_sources`): a thread's retirement judgement and a delegated worker's effort check
+  use the list of the source its own profile runs (`profile_source`). Its picker shows one group
+  per source (`picker_specs`, `ModelCatalog::list_state`): each agent's vendor and every enabled
+  profile on a model server (every Local server) under its own name, kind and address, saying
+  when it lists nothing (checking, not reachable, no chat model). A row of another profile's group
+  moves the thread there (`ChatBackend::switch_profile`, `SwitchTarget`): always a new process on
+  that profile continuing from a handoff, even on the same agent. The process carries the profile
+  it was launched on (`AgentLaunch::profile`, `ChatSession::launched_profile`) and only its own
+  start binds the thread to it (`launched_binding`): a refused or rolled-back move binds nothing,
+  and the thread stays on its own profile. Until then the thread's profile is the running
+  process's (`ChatTab::running_profile_id`) for the picker, a pick, a restart and a fork, and a
+  rollback returns to the profile the previous process ran on. An API
+  key is never stored: the profile names the variable holding it,
   Codex is handed only that name, and the key the model list needs is read before a launch
   removes the vendor's variables (`probe::ProviderKey`, never printed).
 - **The Local agent is the app's own runner, gated like the CLIs**: `Driver::Local` threads run
@@ -472,6 +482,10 @@ epoch field) in `make package` and `packaging/build-deb.sh`; the rpm has `epoch 
   `indicators` entry rather than new Rust.
 - An indicator-style check has three states, never two. An unreadable indicator source
   must report unknown, never healthy.
+- A dialog closes on a press outside it, as Escape closes it (an alert answers its close
+  response; a dialog that refuses to close is asked, not forced). Every window that shows dialogs
+  calls `dialogs::close_dialogs_on_outside_click`, which hooks each dialog as it becomes the
+  window's `visible-dialog`; a new such window calls it too.
 - Settings apply as they are made, never on dialog close: a switch or dropdown at
   once, a text entry when committed (Enter, its apply button, or focus leaving it),
   and never with a half-typed value. Rows that can hold an invalid

@@ -465,9 +465,11 @@ impl Header {
         self.fit_height();
     }
 
+    /// The chip: the agent (and the model server it runs on, `server`), its model and effort.
     pub fn set_agent(
         &self,
         driver: Driver,
+        server: Option<&str>,
         model: Option<&str>,
         pending: Option<&str>,
         effort: Option<&str>,
@@ -479,7 +481,11 @@ impl Header {
         self.last_driver.set(Some(driver));
         self.brand
             .set_from_gicon(&crate::icons::driver_icon(driver));
-        self.agent.set_text(driver.info().label);
+        let agent = match server {
+            Some(server) => format!("{} · {server}", driver.info().label),
+            None => driver.info().label.to_owned(),
+        };
+        self.agent.set_text(&agent);
         let mut model_text = match pending {
             Some(target) => match model {
                 Some(previous) => format!("{previous} → {target} (pending)"),
@@ -502,7 +508,7 @@ impl Header {
         } else {
             self.chip.remove_css_class("pending");
         }
-        let name = format!("{} · {}", driver.info().label, model_text);
+        let name = format!("{agent} · {model_text}");
         self.chip
             .update_property(&[gtk4::accessible::Property::Label(&name)]);
         self.chip.set_tooltip_text(Some(&format!(

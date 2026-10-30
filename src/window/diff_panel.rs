@@ -533,6 +533,12 @@ impl DiffPanel {
             .content(&toolbar)
             .build();
         window.add_css_class("diff-window");
+        // A dialog over the popped-out panel closes on a press outside it, as Escape does.
+        window.connect_visible_dialog_notify(|window| {
+            if let Some(dialog) = window.visible_dialog() {
+                crate::dialogs::close_on_outside_click(&dialog);
+            }
+        });
         *self.detached.borrow_mut() = Some(window.clone());
         self.root.set_visible(false);
 

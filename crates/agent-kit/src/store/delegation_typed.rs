@@ -2373,29 +2373,23 @@ impl Store {
             },
         };
         let scope: Vec<&str> = q.scope.iter().map(WorkerId::as_str).collect();
-        let scope_json = serde_json::to_string(&scope)?;
         let scope_set: HashSet<&str> = scope.iter().copied().collect();
         let caller = q.filter.caller.as_str();
         let mut units: Vec<PageUnit> = Vec::new();
         let mut json_sum = q.snapshot.as_ref().map_or(0, json_len);
         let mut transport_sum = 0usize;
         {
-            // Membership is decided in SQL, so every row returned is a unit: the scope's links,
-            // plus (mailbox) the caller's incoming messages. The mailbox half walks
-            // `delegation_messages_mailbox` (recipient, event_seq), so outgoing or unrelated
-            // history is never visited; the scope half walks the links' worker index.
-            let mut stmt = self.conn.prepare(PAGE_SQL)?;
+            // Membership is decided in SQL, so every seq returned is a unit: the scope's links,
+            // plus (mailbox) the caller's incoming messages (`page_seqs`).
             let limit = i64::from(q.max_events).saturating_add(1);
-            let mut rows = stmt.query(params![
-                root.id,
+            let seqs = self.page_seqs(
+                &root.id,
                 i64_of(last),
-                scope_json,
-                q.filter.mailbox,
-                caller,
-                limit
-            ])?;
-            while let Some(r) = rows.next()? {
-                let seq: i64 = r.get(0)?;
+                &scope,
+                q.filter.mailbox.then_some(caller),
+                limit,
+            )?;
+            for seq in seqs {
                 #[cfg(test)]
                 PAGE_ROWS.with(|c| c.set(c.get() + 1));
                 let Some(unit) = self.page_unit(seq, &scope_set, caller, q.filter.mailbox)? else {
@@ -2901,6 +2895,44 @@ impl Store {
         })
     }
 
+    /// A page's candidate seqs after `last`, ascending, at most `limit`: each scope worker's links
+    /// and (with `mailbox_of`) that caller's incoming messages, merged without duplicates. Each
+    /// source is read through its own index in seq order and stops at `limit`, so the work is
+    /// bounded by the scope's size and the limit, never by the history before `last`.
+    fn page_seqs(
+        &self,
+        root: &str,
+        last: i64,
+        scope: &[&str],
+        mailbox_of: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<i64>> {
+        let mut seqs = BTreeSet::new();
+        let sources = scope
+            .iter()
+            .map(|w| (PAGE_SCOPE_SQL, *w))
+            .chain(mailbox_of.map(|c| (PAGE_MAILBOX_SQL, c)));
+        for (sql, who) in sources {
+            let mut stmt = self.conn.prepare_cached(sql)?;
+            let rows = stmt.query_map(params![who, last, root, limit], |r| r.get::<_, i64>(0))?;
+            for seq in rows {
+                seqs.insert(seq?);
+            }
+            #[cfg(test)]
+            PAGE_COST.with(|c| {
+                let (vm, scans) = c.get();
+                c.set((
+                    vm + stmt.reset_status(rusqlite::StatementStatus::VmStep),
+                    scans + stmt.reset_status(rusqlite::StatementStatus::FullscanStep),
+                ));
+            });
+        }
+        Ok(seqs
+            .into_iter()
+            .take(usize::try_from(limit).unwrap_or(usize::MAX))
+            .collect())
+    }
+
     fn worker_of_backing_thread(&self, thread: &str) -> Result<Option<WorkerRow>> {
         let id: Option<String> = self
             .conn
@@ -2915,9 +2947,11 @@ impl Store {
 
     /// Called by `delete_thread` inside its transaction: refuses while any delegated worker the
     /// delete would take is live (not closed, or with an active run), else removes that subtree's
-    /// delegation rows (links, aliases, messages, operations, runs, workers, and for a root its
-    /// root row). Returns the other hidden backing threads that go with it, for the caller to
-    /// delete too (so none is left to surface in the sidebar).
+    /// workers (for a root, its root row). The schema's cascades take everything they own: runs,
+    /// operations, messages and their replies, links and aliases; links and aliases of the deleted
+    /// threads' events and provider threads go with those. Returns the other hidden backing
+    /// threads that go with it, for the caller to delete too (so none is left to surface in the
+    /// sidebar).
     pub(crate) fn release_delegation_for_delete(&self, thread: &str) -> Result<Vec<String>> {
         let (workers, root_case, root) =
             if let Some(root) = self.delegation_root_of_thread(thread)? {
@@ -2962,80 +2996,18 @@ impl Store {
                 }
             }
         }
-        let t_json = serde_json::to_string(&threads)?;
-        const IN_W: &str = "(SELECT value FROM json_each(?1))";
-        let runs = self.ids_with(
-            &format!("SELECT id FROM delegation_runs WHERE worker_id IN {IN_W}"),
-            &[&w_json],
-        )?;
-        let r_json = serde_json::to_string(&runs)?;
+        // The operations the cascades take carry their epoch in `meta`, which no key reaches.
         let ops = self.ids_with(
             "SELECT id FROM delegation_operations
              WHERE principal_worker_id IN (SELECT value FROM json_each(?1))
                 OR target_worker_id IN (SELECT value FROM json_each(?1))
-                OR run_id IN (SELECT value FROM json_each(?2))",
-            &[&w_json, &r_json],
-        )?;
-        let o_json = serde_json::to_string(&ops)?;
-        let mut messages: BTreeSet<String> = self
-            .ids_with(
-                "SELECT id FROM delegation_messages
-                 WHERE sender_worker_id IN (SELECT value FROM json_each(?1))
-                    OR recipient_worker_id IN (SELECT value FROM json_each(?1))
-                    OR target_run_id IN (SELECT value FROM json_each(?2))
-                    OR recipient_run_id IN (SELECT value FROM json_each(?2))
-                    OR operation_id IN (SELECT value FROM json_each(?3))",
-                &[&w_json, &r_json, &o_json],
-            )?
-            .into_iter()
-            .collect();
-        loop {
-            let m_json = serde_json::to_string(&messages)?;
-            let replies = self.ids_with(
-                "SELECT id FROM delegation_messages WHERE reply_to IN (SELECT value FROM json_each(?1))",
-                &[&m_json],
-            )?;
-            let before = messages.len();
-            messages.extend(replies);
-            if messages.len() == before {
-                break;
-            }
-        }
-        let m_json = serde_json::to_string(&messages)?;
-        self.conn.execute(
-            "DELETE FROM delegation_event_links
-             WHERE worker_id IN (SELECT value FROM json_each(?1))
-                OR run_id IN (SELECT value FROM json_each(?2))
-                OR event_seq IN (SELECT seq FROM events
-                                 WHERE thread_id IN (SELECT value FROM json_each(?3)))",
-            params![w_json, r_json, t_json],
-        )?;
-        self.conn.execute(
-            "DELETE FROM delegation_native_aliases
-             WHERE worker_id IN (SELECT value FROM json_each(?1))
-                OR provider_thread_id IN (SELECT id FROM provider_threads
-                                          WHERE thread_id IN (SELECT value FROM json_each(?2)))",
-            params![w_json, t_json],
-        )?;
-        self.conn.execute(
-            "DELETE FROM delegation_messages WHERE id IN (SELECT value FROM json_each(?1))",
-            params![m_json],
+                OR run_id IN (SELECT r.id FROM delegation_runs r
+                              WHERE r.worker_id IN (SELECT value FROM json_each(?1)))",
+            &[&w_json],
         )?;
         for op in &ops {
             self.delete_meta(&carried_epoch_key(op))?;
         }
-        self.conn.execute(
-            "DELETE FROM delegation_operations WHERE id IN (SELECT value FROM json_each(?1))",
-            params![o_json],
-        )?;
-        self.conn.execute(
-            "DELETE FROM delegation_runs WHERE id IN (SELECT value FROM json_each(?1))",
-            params![r_json],
-        )?;
-        self.conn.execute(
-            "DELETE FROM delegation_workers WHERE id IN (SELECT value FROM json_each(?1))",
-            params![w_json],
-        )?;
         let now = self.now();
         if root_case {
             self.conn.execute(
@@ -3043,6 +3015,10 @@ impl Store {
                 params![root.id],
             )?;
         } else {
+            self.conn.execute(
+                "DELETE FROM delegation_workers WHERE id IN (SELECT value FROM json_each(?1))",
+                params![w_json],
+            )?;
             // Membership left the stream: older cursors must resynchronise.
             self.conn.execute(
                 "UPDATE delegation_roots SET stream_epoch = stream_epoch + 1, updated_at = ?2
@@ -3078,17 +3054,23 @@ struct Effect {
     complete_now: bool,
 }
 
-/// A page's candidate seqs: `?1` root, `?2` last seq, `?3` the scope (JSON array), `?4` mailbox,
-/// `?5` the caller, `?6` the row limit.
-const PAGE_SQL: &str = "SELECT event_seq FROM delegation_event_links
+/// One scope worker's next link seqs: `?1` worker, `?2` last seq, `?3` root, `?4` the row limit.
+/// Walks `(worker_id, event_seq)` in order and stops at the limit, so its work never grows with
+/// the worker's older history.
+const PAGE_SCOPE_SQL: &str = "SELECT event_seq FROM delegation_event_links
      INDEXED BY delegation_event_links_worker
-     WHERE root_id = ?1 AND event_seq > ?2
-       AND worker_id IN (SELECT value FROM json_each(?3))
-     UNION
-     SELECT event_seq FROM delegation_messages INDEXED BY delegation_messages_mailbox
-     WHERE ?4 AND recipient_worker_id = ?5 AND event_seq > ?2 AND root_id = ?1
-     ORDER BY 1
-     LIMIT ?6";
+     WHERE worker_id = ?1 AND event_seq > ?2 AND root_id = ?3
+     ORDER BY event_seq
+     LIMIT ?4";
+
+/// The caller's next incoming message seqs, by the same parameters: walks
+/// `delegation_messages_mailbox` (recipient, event_seq), so outgoing or unrelated history is never
+/// visited.
+const PAGE_MAILBOX_SQL: &str = "SELECT event_seq FROM delegation_messages
+     INDEXED BY delegation_messages_mailbox
+     WHERE recipient_worker_id = ?1 AND event_seq > ?2 AND root_id = ?3
+     ORDER BY event_seq
+     LIMIT ?4";
 
 /// A `ToolError` with every string in it scrubbed, recursively (message and nested details,
 /// sensitive keys masked whole), the way stored envelopes are.
@@ -3253,6 +3235,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     /// Test counter: candidate rows a page read examined.
     static PAGE_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test counter: VM steps and full-scan steps of the page queries `page_seqs` ran.
+    static PAGE_COST: std::cell::Cell<(i32, i32)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 #[cfg(test)]
@@ -5301,25 +5285,28 @@ mod tests {
             .expect("m")
             .iter()
             .all(|m| m["to"] == json!(f.root.worker.as_str())));
-        // Both halves of the query walk the (worker_id, event_seq) index, never the whole table.
-        let mut stmt =
-            f.s.conn
-                .prepare(&format!("EXPLAIN QUERY PLAN {PAGE_SQL}"))
-                .expect("plan");
-        let plan: Vec<String> = stmt
-            .query_map(params![f.root.root, 0, "[]", true, a.as_str(), 11], |r| {
-                r.get::<_, String>(3)
-            })
-            .expect("q")
-            .collect::<rusqlite::Result<_>>()
-            .expect("rows");
-        let links: Vec<&String> = plan
-            .iter()
-            .filter(|l| l.contains("delegation_event_links") || l.starts_with("SEARCH l"))
-            .collect();
-        assert!(!links.is_empty(), "{plan:?}");
-        for l in &links {
-            assert!(l.contains("INDEX"), "a full scan of the links: {plan:?}");
+        // Each source walks its index in seq order: no full scan, and no sort before the limit.
+        for sql in [PAGE_SCOPE_SQL, PAGE_MAILBOX_SQL] {
+            let mut stmt =
+                f.s.conn
+                    .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .expect("plan");
+            let plan: Vec<String> = stmt
+                .query_map(params![a.as_str(), 0, f.root.root, 11], |r| {
+                    r.get::<_, String>(3)
+                })
+                .expect("q")
+                .collect::<rusqlite::Result<_>>()
+                .expect("rows");
+            assert!(
+                plan.iter()
+                    .any(|l| l.starts_with("SEARCH") && l.contains("INDEX")),
+                "{plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|l| l.contains("TEMP B-TREE")),
+                "sorted before the limit: {plan:?}"
+            );
         }
     }
 
@@ -5471,24 +5458,50 @@ mod tests {
     }
 
     /// VM steps (SQLITE_STMTSTATUS_VM_STEP, the counter `sqlite3_progress_handler` ticks on)
-    /// and full-scan steps of one page query, run to completion.
+    /// and full-scan steps of one page's candidate read (`page_seqs`), run to completion.
     fn page_cost(
         s: &Store,
         root: &str,
         caller: &WorkerId,
-        scope: &str,
+        scope: &[&str],
         mailbox: bool,
+        limit: i64,
     ) -> (i32, i32) {
-        let mut stmt = s.conn.prepare(PAGE_SQL).expect("prepare");
-        let mut rows = stmt
-            .query(params![root, 0, scope, mailbox, caller.as_str(), 101])
-            .expect("query");
-        while rows.next().expect("row").is_some() {}
-        drop(rows);
-        (
-            stmt.get_status(rusqlite::StatementStatus::VmStep),
-            stmt.get_status(rusqlite::StatementStatus::FullscanStep),
-        )
+        PAGE_COST.with(|c| c.set((0, 0)));
+        s.page_seqs(root, 0, scope, mailbox.then_some(caller.as_str()), limit)
+            .expect("page seqs");
+        PAGE_COST.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn a_scoped_read_does_work_independent_of_the_workers_history() {
+        let f = fx();
+        let a = spawn(&f.s, &f.root.worker, "k1").worker.expect("w");
+        let links = |w: &WorkerId| -> i64 {
+            f.s.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM delegation_event_links WHERE worker_id = ?1",
+                    params![w.as_str()],
+                    |r| r.get(0),
+                )
+                .expect("count")
+        };
+        for i in 0..10 {
+            new_op(send(&f.s, &a, "parent", "report", "r", &format!("r{i}")));
+        }
+        let before = links(&a);
+        let scope = [a.as_str()];
+        let (small, small_scans) = page_cost(&f.s, &f.root.root, &a, &scope, false, 5);
+        for i in 10..1010 {
+            new_op(send(&f.s, &a, "parent", "report", "r", &format!("r{i}")));
+        }
+        assert!(links(&a) >= before + 1000, "the history grew");
+        let (large, large_scans) = page_cost(&f.s, &f.root.root, &a, &scope, false, 5);
+        assert_eq!((small_scans, large_scans), (0, 0), "no full scan");
+        assert!(
+            large <= small + 8,
+            "VM steps grew with the worker's history: {small} -> {large}"
+        );
     }
 
     #[test]
@@ -5499,11 +5512,11 @@ mod tests {
         for i in 0..10 {
             new_op(send(&f.s, &a, "parent", "report", "r", &format!("r{i}")));
         }
-        let (small, small_scans) = page_cost(&f.s, &f.root.root, &a, "[]", true);
+        let (small, small_scans) = page_cost(&f.s, &f.root.root, &a, &[], true, 101);
         for i in 10..1010 {
             new_op(send(&f.s, &a, "parent", "report", "r", &format!("r{i}")));
         }
-        let (large, large_scans) = page_cost(&f.s, &f.root.root, &a, "[]", true);
+        let (large, large_scans) = page_cost(&f.s, &f.root.root, &a, &[], true, 101);
         assert_eq!((small_scans, large_scans), (0, 0), "no full scan");
         assert!(
             large <= small + 8,
@@ -5515,7 +5528,7 @@ mod tests {
         let page = f.s.read_delegation_page(&q).expect("s").expect("page");
         assert!(seqs(&page.page).is_empty());
         // The root, the recipient of all 1010, still gets them through the same index.
-        let (_, root_scans) = page_cost(&f.s, &f.root.root, &f.root.worker, "[]", true);
+        let (_, root_scans) = page_cost(&f.s, &f.root.root, &f.root.worker, &[], true, 101);
         assert_eq!(root_scans, 0);
         let mut q = query(&f.root.worker, &f.root.worker, vec![], None);
         q.max_events = 10;

@@ -29,6 +29,7 @@ use crate::heal_tail::HealTails;
 pub mod delegation;
 pub mod delegation_typed;
 mod preflight;
+mod schema_v8;
 
 pub use preflight::{BACKUP_DIR, PRE_V4_BACKUP_KEY};
 
@@ -46,7 +47,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Schema version this build writes. Bump it and add a step to [`migrate`]. An existing store is
 /// only ever upgraded by the preflight (`preflight::run`), after a verified backup.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 /// `PRAGMA synchronous = FULL`: a durable control write's level.
 const SYNC_FULL: i64 = 2;
 /// [`Store::meta`] key of the native sessions whose threads the user deleted (JSON list of
@@ -3399,15 +3400,18 @@ impl Store {
 
     /// Whether the user has sent this thread a message (so there is something to hand over).
     /// Does not decode the events: it walks this thread's rows through the `(thread_id, seq)`
-    /// index and stops at the first one whose JSON mentions a user message. That is quick when
-    /// the user has written (the first prompt is early); a thread with no user message at all is
-    /// scanned in full (JSON text, no decoding). The kind is not a column, so this is a
-    /// substring test; adding an indexed `kind` column would make it constant, and is the upgrade
-    /// path if a thread's event count ever makes the empty case slow.
+    /// index and stops at the first user message. That is quick when the user has written (the
+    /// first prompt is early); a thread with no user message at all is scanned in full. The text
+    /// test only skips rows cheaply: a row counts when its event is the start of a user message
+    /// item, never because a tool input or a notice happens to hold the same word. Adding an
+    /// indexed `kind` column would make it constant, and is the upgrade path if a thread's event
+    /// count ever makes the empty case slow.
     pub fn has_messages(&self, thread: &str) -> Result<bool> {
         Ok(self.conn.query_row(
             "SELECT EXISTS (SELECT 1 FROM events
-                            WHERE thread_id = ?1 AND envelope_json LIKE '%\"user_message\"%')",
+                            WHERE thread_id = ?1 AND envelope_json LIKE '%\"user_message\"%'
+                              AND json_extract(envelope_json, '$.event.type') = 'item_started'
+                              AND json_extract(envelope_json, '$.event.kind') = 'user_message')",
             params![thread],
             |r| r.get(0),
         )?)
@@ -3966,6 +3970,10 @@ fn migrate_locked_to(conn: &Connection, current: i64, target: i64) -> Result<()>
         // The 'local' driver for delegation workers too, so a root thread can move to it.
         conn.execute_batch(delegation::SCHEMA_V7)?;
     }
+    if current < 8 && target >= 8 {
+        // The drivers reference table, ownership keys with cascades, and the missing indexes.
+        conn.execute_batch(schema_v8::SCHEMA_V8)?;
+    }
     let broken: Option<String> = conn
         .query_row(
             "SELECT \"table\" FROM pragma_foreign_key_check LIMIT 1",
@@ -4438,6 +4446,20 @@ mod tests {
         s.append_event(&t, None, &Envelope::new(Event::Unknown))
             .expect("event");
         assert!(!s.has_messages(&t).expect("only a notice"));
+        // A tool whose input holds the word is not a user message.
+        s.append_event(
+            &t,
+            None,
+            &Envelope::new(Event::ItemStarted {
+                kind: agent_core::event::ItemKind::Tool,
+                title: "t".into(),
+                input: Some(serde_json::json!({ "kind": "user_message" })),
+                parent: None,
+            })
+            .item("tool"),
+        )
+        .expect("tool");
+        assert!(!s.has_messages(&t).expect("only a tool naming it"));
         s.append_user_message(&t, None, "hello").expect("user");
         assert!(s.has_messages(&t).expect("one message"));
         let other = s.create_thread("/w", None).expect("other");
@@ -5252,20 +5274,399 @@ mod tests {
             .is_err(),
             "the lineage trigger is back"
         );
-        let indexes: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE tbl_name = 'delegation_workers'
-                 AND type IN ('index', 'trigger') AND name LIKE 'delegation_workers_%'",
-                [],
-                |r| r.get(0),
-            )
-            .expect("indexes");
-        assert_eq!(indexes, 5);
+        for name in [
+            "delegation_workers_root_id",
+            "delegation_workers_one_root",
+            "delegation_workers_parent",
+            "delegation_workers_depth",
+            "delegation_workers_lineage",
+        ] {
+            let kept: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE tbl_name = 'delegation_workers'
+                     AND name = ?1",
+                    params![name],
+                    |r| r.get(0),
+                )
+                .expect("index");
+            assert_eq!(kept, 1, "{name}");
+        }
         let fk: i64 = conn
             .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
             .expect("fk");
         assert_eq!(fk, 1);
         migrate(&conn).expect("a second run is a no-op");
+    }
+
+    /// A v7 store with a row in every table: two threads (a root's and a supervised child's
+    /// backing thread), their provider threads and events, the root and child workers, a run, an
+    /// operation, a message and its reply, a link and an alias.
+    fn v7_fixture() -> Connection {
+        let conn = Connection::open_in_memory().expect("open");
+        conn.pragma_update(None, "foreign_keys", "ON").expect("fk");
+        conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+            .expect("version table");
+        migrate_locked_to(&conn, 0, 7).expect("a v7 database");
+        conn.execute_batch(
+            "BEGIN;
+             INSERT INTO threads (id, title, cwd, created_at, updated_at)
+                 VALUES ('t1', 'root', '/w', 1, 2), ('t2', 'child', '/w', 3, 4);
+             INSERT INTO provider_threads (id, thread_id, driver, model, native_id, created_at,
+                 updated_at)
+                 VALUES ('p1', 't1', 'local', 'm', 'n1', 1, 2), ('p2', 't2', 'codex', 'm', NULL, 3, 4);
+             UPDATE threads SET active_provider_thread = 'p1' WHERE id = 't1';
+             INSERT INTO events (seq, thread_id, provider_thread_id, at, envelope_json)
+                 VALUES (1, 't1', 'p1', 5, '{}'), (2, 't2', 'p2', 6, '{}');
+             INSERT INTO meta (key, value) VALUES ('k', 'v');
+             INSERT INTO delegation_roots (id, root_thread_id, root_worker_id, task_state,
+                 policy_json, continuation_budget, created_at, updated_at)
+                 VALUES ('r1', 't1', 'w_root', 'active', '{}', 3, 1, 2);
+             INSERT INTO delegation_workers (id, root_id, parent_id, origin, depth, name, driver,
+                 profile_id, launch_json, backing_thread_id, state, workspace_json,
+                 delegation_status, created_at, updated_at)
+                 VALUES ('w_root', 'r1', NULL, 'root', 0, 'root', 'local', 'p', '{}', NULL,
+                         'running', '{}', 'available', 1, 2),
+                        ('w_kid', 'r1', 'w_root', 'supervised', 1, 'kid', 'codex', 'p', '{}',
+                         't2', 'closed', '{}', 'available', 1, 2);
+             INSERT INTO delegation_runs (id, worker_id, process_generation, provider_thread_id,
+                 authority_epoch, state, created_at, updated_at)
+                 VALUES ('run1', 'w_kid', 0, 'p2', 0, 'completed', 1, 2);
+             INSERT INTO delegation_operations (id, root_id, principal_worker_id, kind,
+                 idempotency_key, authority_epoch, canonical_request, resolution_json,
+                 receipt_json, dispatch_state, target_worker_id, run_id, created_at, updated_at)
+                 VALUES ('op1', 'r1', 'w_root', 'send', 'k1', 0, '{}', '{}', '{}', 'confirmed',
+                         'w_kid', 'run1', 1, 2);
+             INSERT INTO delegation_messages (id, root_id, operation_id, sender_worker_id,
+                 recipient_worker_id, kind, reply_to, body, delivery_policy, target_run_id,
+                 delivery_state, recipient_run_id, queued_at, updated_at, event_seq)
+                 VALUES ('m1', 'r1', 'op1', 'w_root', 'w_kid', 'instruction', NULL, 'go',
+                         'this_run', 'run1', 'provider_confirmed', 'run1', 1, 2, 1),
+                        ('m2', 'r1', NULL, 'w_kid', 'w_root', 'reply', 'm1', 'done',
+                         'next_turn', NULL, 'queued', NULL, 3, 4, NULL);
+             INSERT INTO delegation_event_links (event_seq, worker_id, root_id, run_id, category,
+                 process_generation)
+                 VALUES (2, 'w_kid', 'r1', 'run1', 'activity', 0);
+             INSERT INTO delegation_native_aliases (provider_thread_id, process_generation,
+                 native_worker_id, worker_id, created_at)
+                 VALUES ('p1', 0, 'native-1', 'w_kid', 1);
+             COMMIT;",
+        )
+        .expect("v7 rows");
+        conn
+    }
+
+    fn count(conn: &Connection, table: &str) -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .expect("count")
+    }
+
+    const V8_TABLES: [&str; 13] = [
+        "threads",
+        "provider_threads",
+        "events",
+        "meta",
+        "drivers",
+        "delegation_roots",
+        "delegation_workers",
+        "delegation_runs",
+        "delegation_operations",
+        "delegation_messages",
+        "delegation_event_links",
+        "delegation_native_aliases",
+        "schema_version",
+    ];
+
+    #[test]
+    fn a_v7_database_migrates_to_v8_keeping_every_row_and_rowid() {
+        let conn = v7_fixture();
+        let rowids = |table: &str| -> Vec<(i64, String)> {
+            conn.prepare(&format!("SELECT rowid, id FROM {table} ORDER BY rowid"))
+                .expect("prepare")
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .expect("query")
+                .collect::<std::result::Result<_, _>>()
+                .expect("rows")
+        };
+        let rowid_tables = [
+            "threads",
+            "provider_threads",
+            "delegation_roots",
+            "delegation_workers",
+            "delegation_runs",
+            "delegation_operations",
+            "delegation_messages",
+        ];
+        let before: Vec<_> = rowid_tables.iter().map(|t| rowids(t)).collect();
+        let counts: Vec<i64> = V8_TABLES
+            .iter()
+            .filter(|t| !matches!(**t, "drivers" | "schema_version"))
+            .map(|t| count(&conn, t))
+            .collect();
+
+        migrate(&conn).expect("migrate");
+
+        let version: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .expect("version");
+        assert_eq!(version, SCHEMA_VERSION);
+        let after: Vec<_> = rowid_tables.iter().map(|t| rowids(t)).collect();
+        assert_eq!(before, after, "rows and their rowids are kept");
+        let kept: Vec<i64> = V8_TABLES
+            .iter()
+            .filter(|t| !matches!(**t, "drivers" | "schema_version"))
+            .map(|t| count(&conn, t))
+            .collect();
+        assert_eq!(counts, kept);
+        let fk: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .expect("fk");
+        assert_eq!(fk, 1);
+        let broken: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .expect("fk check");
+        assert_eq!(broken, 0);
+        migrate(&conn).expect("a second run is a no-op");
+    }
+
+    #[test]
+    fn v8_refuses_rows_that_name_another_owner() {
+        let conn = v7_fixture();
+        migrate(&conn).expect("migrate");
+        let refused = |sql: &str| {
+            assert!(conn.execute_batch(sql).is_err(), "accepted: {sql}");
+        };
+        // A driver not in the reference table.
+        refused(
+            "INSERT INTO provider_threads (id, thread_id, driver, model, created_at, updated_at)
+             VALUES ('p9', 't1', 'gpt', 'm', 0, 0)",
+        );
+        refused("UPDATE delegation_workers SET driver = 'gpt' WHERE id = 'w_kid'");
+        // Another thread's provider thread, as the active one or on an event.
+        refused("UPDATE threads SET active_provider_thread = 'p2' WHERE id = 't1'");
+        refused("UPDATE threads SET active_provider_thread = 'nope' WHERE id = 't1'");
+        refused(
+            "INSERT INTO events (thread_id, provider_thread_id, at, envelope_json)
+             VALUES ('t1', 'p2', 9, '{}')",
+        );
+        refused("UPDATE provider_threads SET thread_id = 't2' WHERE id = 'p1'");
+        // A second root, to name its workers from the first.
+        conn.execute_batch(
+            "BEGIN;
+             INSERT INTO threads (id, title, cwd, created_at, updated_at)
+                 VALUES ('t3', 'other', '/w', 1, 2);
+             INSERT INTO delegation_roots (id, root_thread_id, root_worker_id, task_state,
+                 policy_json, continuation_budget, created_at, updated_at)
+                 VALUES ('r2', 't3', 'w_other', 'active', '{}', 3, 1, 2);
+             INSERT INTO delegation_workers (id, root_id, parent_id, origin, depth, name, driver,
+                 profile_id, launch_json, state, workspace_json, delegation_status, created_at,
+                 updated_at)
+                 VALUES ('w_other', 'r2', NULL, 'root', 0, 'o', 'claude', 'p', '{}', 'running',
+                         '{}', 'available', 1, 2);
+             INSERT INTO delegation_runs (id, worker_id, process_generation, authority_epoch,
+                 state, created_at, updated_at)
+                 VALUES ('run_other', 'w_other', 0, 0, 'completed', 1, 2);
+             COMMIT;",
+        )
+        .expect("a second root");
+        refused(
+            "INSERT INTO delegation_operations (id, root_id, principal_worker_id, kind,
+                 idempotency_key, authority_epoch, canonical_request, resolution_json,
+                 receipt_json, dispatch_state, target_worker_id, created_at, updated_at)
+             VALUES ('op9', 'r1', 'w_root', 'send', 'k9', 0, '{}', '{}', '{}', 'accepted',
+                     'w_other', 1, 2)",
+        );
+        refused(
+            "INSERT INTO delegation_messages (id, root_id, sender_worker_id, recipient_worker_id,
+                 kind, body, delivery_policy, delivery_state, queued_at, updated_at)
+             VALUES ('m9', 'r1', 'w_root', 'w_other', 'instruction', 'x', 'next_turn', 'queued',
+                     1, 2)",
+        );
+        // A run of a worker other than the recipient, as its target or the one it reached.
+        refused(
+            "INSERT INTO delegation_messages (id, root_id, sender_worker_id, recipient_worker_id,
+                 kind, body, delivery_policy, target_run_id, delivery_state, queued_at, updated_at)
+             VALUES ('m9', 'r1', 'w_kid', 'w_root', 'report', 'x', 'next_turn', 'run1', 'queued',
+                     1, 2)",
+        );
+        refused(
+            "INSERT INTO delegation_event_links (event_seq, worker_id, root_id, run_id, category)
+             VALUES (1, 'w_root', 'r1', 'run1', 'lifecycle')",
+        );
+        refused(
+            "INSERT INTO delegation_event_links (event_seq, worker_id, root_id, category)
+             VALUES (1, 'w_other', 'r1', 'lifecycle')",
+        );
+        // A NULL text key.
+        refused("INSERT INTO meta (key, value) VALUES (NULL, 'v')");
+        refused(
+            "INSERT INTO threads (id, title, cwd, created_at, updated_at)
+             VALUES (NULL, 'x', '/w', 1, 2)",
+        );
+    }
+
+    #[test]
+    fn v8_cascades_take_exactly_what_a_worker_and_a_root_own() {
+        let conn = v7_fixture();
+        migrate(&conn).expect("migrate");
+        // The child's subtree: its run, the operation targeting it, both messages (the
+        // instruction to it and its reply), its link and its alias. The root and its thread stay.
+        conn.execute("DELETE FROM delegation_workers WHERE id = 'w_kid'", [])
+            .expect("delete the child");
+        for table in [
+            "delegation_runs",
+            "delegation_operations",
+            "delegation_messages",
+            "delegation_event_links",
+            "delegation_native_aliases",
+        ] {
+            assert_eq!(count(&conn, table), 0, "{table}");
+        }
+        assert_eq!(count(&conn, "delegation_workers"), 1);
+        assert_eq!(count(&conn, "delegation_roots"), 1);
+        // Its backing thread was released, so it can go; the root's thread cannot while the
+        // root holds it (the release path must run first).
+        conn.execute("DELETE FROM threads WHERE id = 't2'", [])
+            .expect("the released backing thread");
+        assert!(conn
+            .execute("DELETE FROM threads WHERE id = 't1'", [])
+            .is_err());
+        // The root row takes its root worker.
+        conn.execute("DELETE FROM delegation_roots WHERE id = 'r1'", [])
+            .expect("delete the root");
+        assert_eq!(count(&conn, "delegation_workers"), 0);
+        // Then the thread takes its provider threads and events.
+        conn.execute("DELETE FROM threads WHERE id = 't1'", [])
+            .expect("delete the thread");
+        for table in ["threads", "provider_threads", "events"] {
+            assert_eq!(count(&conn, table), 0, "{table}");
+        }
+    }
+
+    #[test]
+    fn a_deleted_provider_thread_unlinks_its_events_and_runs() {
+        let conn = v7_fixture();
+        migrate(&conn).expect("migrate");
+        conn.execute("DELETE FROM provider_threads WHERE id = 'p2'", [])
+            .expect("delete a provider thread");
+        let (event, run): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT (SELECT provider_thread_id FROM events WHERE seq = 2),
+                        (SELECT provider_thread_id FROM delegation_runs WHERE id = 'run1')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("links");
+        assert_eq!((event, run), (None, None));
+        assert_eq!(count(&conn, "events"), 2, "the events themselves stay");
+    }
+
+    /// Every SQL value list (`CHECK (col IN (...))`) in the migrated schema, read back from
+    /// `sqlite_master`, against the Rust enum it mirrors; and the drivers table against
+    /// `Driver::ALL`. A new variant fails here until the schema gains it, and a new list fails
+    /// until it is registered.
+    #[test]
+    fn every_sql_value_list_matches_its_rust_enum() {
+        use agent_core::delegation::authority::TaskMode;
+        use agent_core::delegation::lifecycle::RunState;
+        use agent_core::delegation::mailbox::{DeliveryState, MessageKind};
+        use agent_core::delegation::wire::{DelegationStatusCode, DispatchState, EventCategory};
+        use agent_core::event::{WorkerOrigin, WorkerState};
+        use std::collections::{BTreeMap, BTreeSet};
+
+        fn names<T: serde::Serialize>(all: &[T]) -> BTreeSet<String> {
+            all.iter()
+                .map(|v| agent_core::serde_name::name_of(v).expect("a name"))
+                .collect()
+        }
+        let s = store();
+        let mut expected: BTreeMap<(&str, &str), BTreeSet<String>> = BTreeMap::new();
+        expected.insert(("delegation_workers", "origin"), names(&WorkerOrigin::ALL));
+        expected.insert(("delegation_workers", "state"), names(&WorkerState::ALL));
+        expected.insert(("delegation_workers", "task_mode"), names(&TaskMode::ALL));
+        expected.insert(
+            ("delegation_workers", "delegation_status"),
+            names(&DelegationStatusCode::ALL),
+        );
+        expected.insert(("delegation_runs", "state"), names(&RunState::ALL));
+        expected.insert(
+            ("delegation_operations", "dispatch_state"),
+            names(&DispatchState::ALL),
+        );
+        expected.insert(("delegation_messages", "kind"), names(&MessageKind::ALL));
+        expected.insert(
+            ("delegation_messages", "delivery_state"),
+            names(&DeliveryState::ALL),
+        );
+        expected.insert(
+            ("delegation_event_links", "category"),
+            names(&EventCategory::ALL),
+        );
+        // Lists that mirror no enum: a task's own state and two flags.
+        let not_enums = [
+            ("delegation_roots", "task_state"),
+            ("delegation_roots", "continuation_reserved"),
+            ("threads", "archived"),
+        ];
+
+        let tables: Vec<(String, String)> = s
+            .conn
+            .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'table' AND sql IS NOT NULL")
+            .expect("prepare")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .expect("query")
+            .collect::<std::result::Result<_, _>>()
+            .expect("tables");
+        let mut found: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+        for (table, sql) in &tables {
+            let mut rest = sql.as_str();
+            while let Some(at) = rest.find(" IN (") {
+                let column = rest[..at]
+                    .rsplit(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                let list = &rest[at + " IN (".len()..];
+                let end = list.find(')').expect("a closed list");
+                let values = list[..end]
+                    .split(',')
+                    .map(|v| v.trim().trim_matches('\'').to_owned())
+                    .collect();
+                found.insert((table.clone(), column), values);
+                rest = &list[end..];
+            }
+        }
+        for ((table, column), values) in &found {
+            let key = (table.as_str(), column.as_str());
+            if not_enums.contains(&key) {
+                continue;
+            }
+            let want = expected.get(&key).unwrap_or_else(|| {
+                panic!("{table}.{column} has a value list no enum is registered for")
+            });
+            assert_eq!(values, want, "{table}.{column}");
+        }
+        for key in expected.keys() {
+            assert!(
+                found.contains_key(&(key.0.to_owned(), key.1.to_owned())),
+                "{key:?} no longer has a value list"
+            );
+        }
+
+        let drivers: BTreeSet<String> = s
+            .conn
+            .prepare("SELECT key FROM drivers")
+            .expect("prepare")
+            .query_map([], |r| r.get(0))
+            .expect("query")
+            .collect::<std::result::Result<_, _>>()
+            .expect("drivers");
+        let all: BTreeSet<String> = agent_core::adapter::Driver::ALL
+            .iter()
+            .map(|d| d.info().key.to_owned())
+            .collect();
+        assert_eq!(drivers, all, "the drivers table is Driver::ALL");
     }
 
     #[test]

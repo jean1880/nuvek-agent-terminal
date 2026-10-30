@@ -2947,9 +2947,10 @@ impl Store {
 
     /// Called by `delete_thread` inside its transaction: refuses while any delegated worker the
     /// delete would take is live (not closed, or with an active run), else removes that subtree's
-    /// workers (for a root, its root row). The schema's cascades take everything they own: runs,
-    /// operations, messages and their replies, links and aliases; links and aliases of the deleted
-    /// threads' events and provider threads go with those. Returns the other hidden backing
+    /// workers (for a root, its root row). Their messages and every reply chained to them go
+    /// first, in one statement; the schema's cascades take the rest they own: runs, operations,
+    /// links and aliases, and the links and aliases of the deleted threads' events and provider
+    /// threads with those. Returns the other hidden backing
     /// threads that go with it, for the caller to delete too (so none is left to surface in the
     /// sidebar).
     pub(crate) fn release_delegation_for_delete(&self, thread: &str) -> Result<Vec<String>> {
@@ -3008,6 +3009,38 @@ impl Store {
         for op in &ops {
             self.delete_meta(&carried_epoch_key(op))?;
         }
+        // Messages go first, in one statement, with every reply that chains to them: `reply_to`
+        // does not cascade (a long chain would nest past SQLite's limit on foreign-key actions),
+        // and a reply left behind would refuse the delete.
+        let o_json = serde_json::to_string(&ops)?;
+        let mut messages: BTreeSet<String> = self
+            .ids_with(
+                "SELECT id FROM delegation_messages
+                 WHERE sender_worker_id IN (SELECT value FROM json_each(?1))
+                    OR recipient_worker_id IN (SELECT value FROM json_each(?1))
+                    OR operation_id IN (SELECT value FROM json_each(?2))",
+                &[&w_json, &o_json],
+            )?
+            .into_iter()
+            .collect();
+        let mut frontier: Vec<String> = messages.iter().cloned().collect();
+        while !frontier.is_empty() {
+            let f_json = serde_json::to_string(&frontier)?;
+            frontier = self
+                .ids_with(
+                    "SELECT id FROM delegation_messages
+                     WHERE reply_to IN (SELECT value FROM json_each(?1))",
+                    &[&f_json],
+                )?
+                .into_iter()
+                .filter(|id| messages.insert(id.clone()))
+                .collect();
+        }
+        let m_json = serde_json::to_string(&messages)?;
+        self.conn.execute(
+            "DELETE FROM delegation_messages WHERE id IN (SELECT value FROM json_each(?1))",
+            params![m_json],
+        )?;
         let now = self.now();
         if root_case {
             self.conn.execute(
@@ -4924,6 +4957,73 @@ mod tests {
                 assert_eq!(f.s.meta(&key).expect("q"), None, "{key} left behind");
             }
         }
+    }
+
+    /// A reply chain between the root and `child`, longer than SQLite's limit on nested
+    /// foreign-key actions (1000): deleting it must never depend on a cascade per link.
+    fn long_reply_chain(f: &Fx, child: &WorkerId) {
+        let mut prev: Option<String> = None;
+        for i in 0..1100 {
+            let id = format!("m_chain{i:06}");
+            let (from, to) = if i % 2 == 0 {
+                (f.root.worker.as_str(), child.as_str())
+            } else {
+                (child.as_str(), f.root.worker.as_str())
+            };
+            f.s.conn
+                .execute(
+                    "INSERT INTO delegation_messages (id, root_id, sender_worker_id,
+                         recipient_worker_id, kind, reply_to, body, delivery_policy,
+                         delivery_state, queued_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, 'reply', ?5, 'r', 'next_turn', 'queued', 1, 1)",
+                    params![id, f.root.root, from, to, prev],
+                )
+                .expect("reply");
+            prev = Some(id);
+        }
+    }
+
+    #[test]
+    fn a_root_with_a_reply_chain_past_the_cascade_limit_is_deleted() {
+        let f = fx();
+        let child = spawn(&f.s, &f.root.worker, "k1").worker.expect("w");
+        long_reply_chain(&f, &child);
+        f.s.close_and_revoke_for_delete(&f.root_thread)
+            .expect("s")
+            .expect("revoked");
+        f.s.delete_thread(&f.root_thread).expect("deleted");
+        let left: i64 =
+            f.s.conn
+                .query_row("SELECT COUNT(*) FROM delegation_messages", [], |r| r.get(0))
+                .expect("count");
+        assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn a_child_with_a_reply_chain_past_the_cascade_limit_is_deleted() {
+        let f = fx();
+        let child = spawn(&f.s, &f.root.worker, "k1").worker.expect("w");
+        let backing =
+            f.s.delegation_worker(child.as_str())
+                .expect("q")
+                .expect("row")
+                .backing_thread_id
+                .expect("t");
+        long_reply_chain(&f, &child);
+        f.s.close_and_revoke_for_delete(&backing)
+            .expect("s")
+            .expect("revoked");
+        f.s.delete_thread(&backing).expect("deleted");
+        let left: i64 =
+            f.s.conn
+                .query_row("SELECT COUNT(*) FROM delegation_messages", [], |r| r.get(0))
+                .expect("count");
+        assert_eq!(left, 0, "every message of the chain names the child");
+        assert!(f
+            .s
+            .delegation_worker(f.root.worker.as_str())
+            .expect("q")
+            .is_some());
     }
 
     #[test]

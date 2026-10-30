@@ -112,7 +112,7 @@ fn native_the_context_gauge_is_polled_after_a_turn_for_agents_that_do_not_push_i
     }
 }
 
-/// The strip lists every background task; a shell task opens its output, read from the agent
+/// The background shelf lists every task the sub-agent shelf does not; a shell task opens its output, read from the agent
 /// once a second (escapes stripped) until it ends, then once more, and never again after that.
 /// A sub-agent task whose item is not in the thread has nothing to open.
 #[test]
@@ -128,8 +128,9 @@ fn native_background_tasks_are_listed_and_a_shell_task_shows_its_output() {
     window.present();
     assert!(pump_until(&ctx, || view.width() > 0), "shown");
     let inner = view.inner().expect("built view");
-    let button = inner.background_button.widget().clone();
-    assert!(!button.is_visible(), "nothing in the background yet");
+    let shelf = inner.background_shelf.clone();
+    assert!(!shelf.shown(), "nothing in the background yet");
+    assert!(!inner.shelves.widget.is_visible(), "no shelf, no frame");
 
     let tasks = |tasks: Vec<BackgroundTask>| {
         view.apply(&Envelope::new(Event::BackgroundTasks { tasks }));
@@ -149,9 +150,12 @@ fn native_background_tasks_are_listed_and_a_shell_task_shows_its_output() {
             tool_use_id: Some("toolu_gone".to_owned()),
         },
     ]);
-    assert!(button.is_visible());
+    assert!(shelf.shown());
+    // Only the background shelf shows: it heads the frame, with no rule above it.
+    assert!(inner.shelves.widget.is_visible());
+    assert_eq!(inner.shelves.showing(), [(false, false), (true, false)]);
     assert_eq!(
-        inner.background_button.listed(),
+        shelf.listed(),
         [
             ("cargo test".to_owned(), true),
             ("Review".to_owned(), false)
@@ -199,7 +203,7 @@ fn native_background_tasks_are_listed_and_a_shell_task_shows_its_output() {
 
     // The task ends: one last read, whose empty answer (the file is gone) keeps what was shown.
     tasks(Vec::new());
-    assert!(!button.is_visible());
+    assert!(!shelf.shown());
     assert!(pump_until(&ctx, || reads().len() == 3), "the last read");
     reply(&reads()[2], "");
     assert_eq!(

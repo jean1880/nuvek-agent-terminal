@@ -1,11 +1,11 @@
-//! The sticky "sub-agents at work" card above the composer, so what the workers do never gets lost
-//! in the history. It shows a one-line summary ("2 workers active · 1 finished"), collapsed by
-//! default; opened, one row per docked sub-agent with what it is running now (`Run cargo test`,
+//! The sticky "sub-agents at work" shelf above the composer, so what the workers do never gets
+//! lost in the history. It shows a one-line summary ("2 workers active · 1 finished"), collapsed
+//! by default; opened, one row per docked sub-agent with what it is running now (`Run cargo test`,
 //! `Read src/config.rs`) or how it ended. A row opens that sub-agent on its own (the explorer's
-//! dialog).
+//! dialog). Built from the shared shelf parts (`shelf.rs`), as the background task shelf is.
 //!
 //! A sub-agent docks when it is seen running and stays docked after it finishes, until the next
-//! prompt is sent or "Clear finished" is pressed; then the card slides away once none runs.
+//! prompt is sent or "Clear finished" is pressed; then the shelf slides away once none runs.
 //! Sub-agents that finished before the thread was opened (replayed history) never dock: the
 //! header's sub-agent button lists those.
 
@@ -15,12 +15,12 @@ use std::rc::Rc;
 
 use gtk4::prelude::*;
 
-use super::cards::label;
 use super::model::{Body, SubagentSummary, ToolStatus, Transcript};
 use super::payload;
-use super::subagents::{brand_slot, counts, set_if_changed};
+use super::shelf::{Shelf, ShelfRow};
+use super::subagents::{counts, set_if_changed};
 
-/// The card's one-line summary: the running ones, then the finished ones still docked.
+/// The shelf's one-line summary: the running ones, then the finished ones still docked.
 pub fn title_text(running: usize, finished: usize, unknown: usize) -> String {
     let active = match running {
         1 => "1 worker active".to_owned(),
@@ -73,105 +73,32 @@ pub fn current_step(model: &Transcript, id: &str) -> Option<String> {
     )
 }
 
-/// One docked sub-agent's labels, set in place.
-struct Row {
-    row: gtk4::ListBoxRow,
-    /// Spins while it runs; hidden once it has finished.
-    spinner: gtk4::Spinner,
-    /// How it ended (`completed`, `failed`…); empty while it runs.
-    state: gtk4::Label,
-    name: gtk4::Label,
-    task: gtk4::Label,
-    now: gtk4::Label,
-    brand: gtk4::Image,
-}
-
-impl Row {
-    fn new() -> (gtk4::ListBoxRow, Self) {
-        let b = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
-        b.add_css_class("subagent-shelf-row");
-        let top = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        let brand = brand_slot(14);
-        top.append(&brand);
-        let spinner = gtk4::Spinner::builder().spinning(true).build();
-        spinner.add_css_class("thread-background");
-        top.append(&spinner);
-        let state = label("", &["subagent-state", "dim-label"]);
-        state.set_visible(false);
-        top.append(&state);
-        let name = label("", &["subagent-name"]);
-        name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        name.set_max_width_chars(20);
-        top.append(&name);
-        let task = label("", &["subagent-task", "dim-label"]);
-        task.set_hexpand(true);
-        task.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        top.append(&task);
-        b.append(&top);
-        let now = label("", &["subagent-now"]);
-        now.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        b.append(&now);
-        let row = gtk4::ListBoxRow::new();
-        row.set_child(Some(&b));
-        row.set_tooltip_text(Some("Open this sub-agent"));
-        (
-            row.clone(),
-            Self {
-                row,
-                spinner,
-                state,
-                name,
-                task,
-                now,
-                brand,
-            },
-        )
-    }
-
-    fn set(&self, agent: &SubagentSummary, now: Option<&str>) {
-        super::subagents::set_brand(&self.brand, agent.driver);
-        let running = agent.running();
-        // The widget's own `visible`, not `is_visible()`: that is false for every row while the
-        // card is collapsed, and a finished row would keep spinning once opened.
-        if self.spinner.property::<bool>("visible") != running {
-            self.spinner.set_visible(running);
-            self.spinner.set_spinning(running);
-        }
-        self.state.set_visible(!running);
-        set_if_changed(&self.state, if running { "" } else { agent.state_label() });
-        let activity = agent.activity.as_deref().or(now);
-        let now = activity
-            .map(|s| format!("Last reported activity: {s}"))
-            .unwrap_or_else(|| "Activity unavailable".to_owned());
-        self.row.set_tooltip_text(Some(&format!(
+/// Fills one docked sub-agent's row: its brand, whether it runs or how it ended, its task, and
+/// what it does now.
+fn fill(row: &ShelfRow, agent: &SubagentSummary, now: Option<&str>) {
+    super::subagents::set_brand(&row.mark, agent.driver);
+    row.set_running(agent.running(), agent.state_label());
+    let activity = agent.activity.as_deref().or(now);
+    let now = activity
+        .map(|s| format!("Last reported activity: {s}"))
+        .unwrap_or_else(|| "Activity unavailable".to_owned());
+    row.describe(
+        &format!(
             "{}\n{}\n{}\n{now}\nOpen this worker",
             agent.name,
             super::subagents::identity_text(agent),
             agent.task_text()
-        )));
-        self.row.update_property(&[
-            gtk4::accessible::Property::Label(&agent.name),
-            gtk4::accessible::Property::Description(&format!(
-                "{}; {}; {now}",
-                agent.state_label(),
-                agent.task_text()
-            )),
-        ]);
-        set_if_changed(&self.name, &agent.name);
-        set_if_changed(&self.task, agent.task_text());
-        set_if_changed(&self.now, &now);
-    }
+        ),
+        &agent.name,
+        &format!("{}; {}; {now}", agent.state_label(), agent.task_text()),
+    );
+    row.set_text(&agent.name, agent.task_text(), &now);
 }
 
 pub struct SubagentShelf {
-    pub revealer: gtk4::Revealer,
-    title: gtk4::Label,
-    /// The card itself; it opens and closes on its own toggle (read back by tests).
-    #[cfg_attr(not(test), allow(dead_code))]
-    fold: super::cards::Collapsible,
-    list: gtk4::ListBox,
-    /// The docked sub-agents behind the rows, in order, and their labels.
-    rows: RefCell<Vec<(String, Row)>>,
+    shelf: Shelf,
+    /// The docked sub-agents behind the rows, in order, and their rows.
+    rows: RefCell<Vec<(String, ShelfRow)>>,
     /// Every sub-agent seen running since the last prompt or "Clear finished": what stays docked
     /// after it finishes.
     docked: RefCell<HashSet<String>>,
@@ -183,48 +110,21 @@ impl SubagentShelf {
     /// `open` is called with a sub-agent's item id when its row is chosen; `cleared` after
     /// "Clear finished" emptied the dock, to redraw it.
     pub fn new(open: impl Fn(&str) + 'static, cleared: impl Fn() + 'static) -> Rc<Self> {
-        let title = label("", &["plan-title"]);
-        let list = gtk4::ListBox::new();
-        list.add_css_class("subagent-list");
-        list.set_selection_mode(gtk4::SelectionMode::None);
-        // A long list scrolls inside the card rather than pushing the composer away.
-        let scroller = gtk4::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk4::PolicyType::Never)
-            .vscrollbar_policy(gtk4::PolicyType::Automatic)
-            .propagate_natural_height(true)
-            .max_content_height(220)
-            .child(&list)
-            .build();
         let clear = gtk4::Button::builder()
             .label("Clear finished")
             .halign(gtk4::Align::End)
-            .css_classes(["flat"])
+            .css_classes(["flat", "shelf-action"])
             .tooltip_text("Take the finished workers off the dock")
             .visible(false)
             .build();
-        let body = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
-        body.append(&scroller);
-        body.append(&clear);
-        // Collapsed by default: one line until it is asked for.
-        let fold = super::cards::collapsible(
+        let shelf = Shelf::new(
             crate::icons::SUBAGENT_ICON,
-            &title,
-            &body,
-            false,
             "what the sub-agents are doing",
+            Some(&clear),
         );
-        fold.card.add_css_class("subagent-shelf");
-
-        let revealer = gtk4::Revealer::builder()
-            .transition_type(gtk4::RevealerTransitionType::SlideUp)
-            .reveal_child(false)
-            .child(&fold.card)
-            .build();
+        shelf.fold.card.add_css_class("subagent-shelf");
         let this = Rc::new(Self {
-            revealer,
-            title,
-            fold,
-            list,
+            shelf,
             rows: RefCell::new(Vec::new()),
             docked: RefCell::new(HashSet::new()),
             clear,
@@ -237,7 +137,7 @@ impl SubagentShelf {
             }
         });
         let weak = Rc::downgrade(&this);
-        this.list.connect_row_activated(move |_, row| {
+        this.shelf.list.connect_row_activated(move |_, row| {
             let Some(this) = weak.upgrade() else { return };
             let id = usize::try_from(row.index())
                 .ok()
@@ -249,6 +149,11 @@ impl SubagentShelf {
         this
     }
 
+    /// The shelf, for the stack above the composer.
+    pub fn revealer(&self) -> &gtk4::Revealer {
+        &self.shelf.revealer
+    }
+
     /// Follows the thread's sub-agents: a row per docked one (every one seen running since the
     /// last prompt or "Clear finished"), with its current step or how it ended; shown while any
     /// is docked. Rows are rebuilt only when the set of docked sub-agents changes.
@@ -258,31 +163,23 @@ impl SubagentShelf {
             docked.extend(agents.iter().filter(|a| a.running()).map(|a| a.id.clone()));
             agents.iter().filter(|a| docked.contains(&a.id)).collect()
         };
-        self.revealer.set_reveal_child(!shown.is_empty());
+        self.shelf.show(!shown.is_empty());
         if shown.is_empty() {
             return;
         }
         let (running, finished, unknown) = counts(shown.iter().copied());
-        set_if_changed(&self.title, &title_text(running, finished, unknown));
+        set_if_changed(&self.shelf.title, &title_text(running, finished, unknown));
         self.clear.set_visible(finished > 0);
         let same = {
             let rows = self.rows.borrow();
             rows.len() == shown.len() && rows.iter().zip(&shown).all(|((id, _), a)| *id == a.id)
         };
         if !same {
-            while let Some(child) = self.list.first_child() {
-                self.list.remove(&child);
-            }
-            let mut rows = Vec::with_capacity(shown.len());
-            for agent in &shown {
-                let (row, labels) = Row::new();
-                self.list.append(&row);
-                rows.push((agent.id.clone(), labels));
-            }
-            *self.rows.borrow_mut() = rows;
+            let rows = self.shelf.rebuild(shown.len());
+            *self.rows.borrow_mut() = shown.iter().map(|a| a.id.clone()).zip(rows).collect();
         }
-        for ((id, labels), agent) in self.rows.borrow().iter().zip(&shown) {
-            labels.set(agent, current_step(model, id).as_deref());
+        for ((id, row), agent) in self.rows.borrow().iter().zip(&shown) {
+            fill(row, agent, current_step(model, id).as_deref());
         }
     }
 
@@ -294,17 +191,15 @@ impl SubagentShelf {
 
     /// Opens the worker activity disclosure, including deterministic demo scenes.
     pub(crate) fn set_expanded(&self, expanded: bool) {
-        if self.fold.body.reveals_child() != expanded {
-            self.fold.toggle.emit_clicked();
-        }
+        self.shelf.set_expanded(expanded);
     }
 
-    /// Whether the card shows, whether it is open, and each row's current step (tests).
+    /// Whether the shelf shows, whether it is open, and each row's current step (tests).
     #[cfg(test)]
     pub fn state(&self) -> (bool, bool, Vec<String>) {
         (
-            self.revealer.reveals_child(),
-            self.fold.body.reveals_child(),
+            self.shelf.shown(),
+            self.shelf.expanded(),
             self.rows
                 .borrow()
                 .iter()
@@ -330,7 +225,7 @@ pub(crate) mod tests {
         shelf.set(&t, &workers);
         workers[0].lifecycle = Some(agent_core::event::WorkerState::Unknown);
         shelf.set(&t, &workers);
-        assert_eq!(shelf.title.text(), "1 worker unknown");
+        assert_eq!(shelf.shelf.title.text(), "1 worker unknown");
         assert!(!shelf.clear.property::<bool>("visible"));
         assert!(shelf.state().0);
     }
@@ -485,7 +380,7 @@ pub(crate) mod tests {
         *shelf_slot.borrow_mut() = Some(shelf.clone());
         // In a window, as in the app: activating a row moves focus, which needs a root.
         let window = gtk4::Window::new();
-        window.set_child(Some(&shelf.revealer));
+        window.set_child(Some(shelf.revealer()));
 
         shelf.set(&t, &t.subagents());
         assert_eq!(
@@ -497,12 +392,12 @@ pub(crate) mod tests {
             ),
             "shown, collapsed by default, with the running command"
         );
-        shelf.fold.toggle.emit_clicked();
+        shelf.shelf.fold.toggle.emit_clicked();
         assert!(shelf.state().1, "one click opens it");
-        shelf.fold.toggle.emit_clicked();
+        shelf.shelf.fold.toggle.emit_clicked();
         assert!(!shelf.state().1, "and another closes it");
 
-        let row = shelf.list.row_at_index(0).expect("a row");
+        let row = shelf.shelf.list.row_at_index(0).expect("a row");
         row.emit_by_name::<()>("activate", &[]);
         assert_eq!(*opened.borrow(), ["s1"], "the row opened its sub-agent");
 
@@ -512,7 +407,7 @@ pub(crate) mod tests {
             subagent("s2", "general-purpose"),
         ]);
         shelf.set(&two, &two.subagents());
-        assert_eq!(shelf.title.text(), "2 workers active");
+        assert_eq!(shelf.shelf.title.text(), "2 workers active");
         assert_eq!(
             shelf.state().2,
             [
@@ -534,7 +429,7 @@ pub(crate) mod tests {
         // card offers to clear them.
         shelf.set(&two, &finished);
         assert!(shelf.state().0, "still docked once they finish");
-        assert_eq!(shelf.title.text(), "2 workers finished");
+        assert_eq!(shelf.shelf.title.text(), "2 workers finished");
         // The `visible` property itself: `is_visible()` also needs every parent shown, and the
         // card is collapsed here.
         assert!(shelf.clear.property::<bool>("visible"));
@@ -567,7 +462,7 @@ pub(crate) mod tests {
         shelf.set(&two, &two.subagents());
         shelf.clear_finished();
         shelf.set(&two, &two.subagents());
-        assert_eq!(shelf.title.text(), "2 workers active");
+        assert_eq!(shelf.shelf.title.text(), "2 workers active");
         shelf_slot.borrow_mut().take();
         window.destroy();
     }

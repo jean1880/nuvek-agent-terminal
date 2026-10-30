@@ -2467,6 +2467,7 @@ impl Adapter for CodexAdapter {
             ));
         }
         match command {
+            Command::ConfigureLocal { .. } => Err(AdapterError::Unsupported("Local setup")),
             Command::Prompt { text } => {
                 if !self.prompt_starts_turn(&text) {
                     let Some(thread) = self.thread_id.clone() else {

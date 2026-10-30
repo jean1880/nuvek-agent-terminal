@@ -24,6 +24,8 @@ pub mod handoff_budget;
 pub mod import;
 pub mod limit_wait;
 pub mod local_agent;
+pub mod local_context;
+pub mod local_mcp;
 pub mod model_tags;
 pub mod provider;
 pub mod question_extract;

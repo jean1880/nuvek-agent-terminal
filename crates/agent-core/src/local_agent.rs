@@ -688,6 +688,7 @@ impl ThinkSplitter {
 /// The adapter: a codec over the runner's canonical pipes, keeping what `on_exit` must close.
 #[derive(Debug)]
 pub struct LocalAdapter {
+    context: crate::local_context::LocalLaunchContext,
     caps: Capabilities,
     started: bool,
     turn_open: bool,
@@ -704,6 +705,7 @@ impl Default for LocalAdapter {
 impl LocalAdapter {
     pub fn new() -> Self {
         Self {
+            context: Default::default(),
             caps: Capabilities::local(),
             started: false,
             turn_open: false,
@@ -716,6 +718,11 @@ impl LocalAdapter {
         serde_json::to_string(command)
             .map(|line| vec![Action::Write(vec![line])])
             .map_err(|e| AdapterError::Invalid(e.to_string()))
+    }
+
+    pub fn with_context(mut self, context: crate::local_context::LocalLaunchContext) -> Self {
+        self.context = context;
+        self
     }
 
     /// Tracks what `envelope` opens and closes.
@@ -778,7 +785,12 @@ impl Adapter for LocalAdapter {
     }
 
     fn handshake(&mut self) -> Vec<String> {
-        Vec::new()
+        match serde_json::to_string(&Command::ConfigureLocal {
+            context: Box::new(self.context.clone()),
+        }) {
+            Ok(line) => vec![line],
+            Err(_) => Vec::new(),
+        }
     }
 
     fn handshake_answered(&self) -> bool {
@@ -787,6 +799,9 @@ impl Adapter for LocalAdapter {
 
     fn encode(&mut self, command: Command) -> Result<Vec<Action>, AdapterError> {
         match &command {
+            Command::ConfigureLocal { .. } => {
+                Err(AdapterError::Unsupported("Local setup after handshake"))
+            }
             Command::Prompt { .. }
             | Command::Interrupt
             | Command::SetModel { .. }
@@ -867,6 +882,30 @@ pub const APPROVAL_OPTIONS: [Decision; 3] =
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn setup_is_typed_and_never_part_of_argv() {
+        use super::*;
+        let context = crate::local_context::LocalLaunchContext::default();
+        let mut adapter = LocalAdapter::new().with_context(context.clone());
+        let lines = adapter.handshake();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Command>(&lines[0]).unwrap(),
+            Command::ConfigureLocal {
+                context: Box::new(context)
+            }
+        );
+        assert!(!adapter.handshake_answered());
+        assert!(!adapter
+            .argv(&session())
+            .iter()
+            .any(|a| a.contains("context_tokens")));
+        assert!(adapter
+            .encode(Command::ConfigureLocal {
+                context: Box::default()
+            })
+            .is_err());
+    }
     use super::*;
 
     fn session() -> OpenSession {

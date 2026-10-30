@@ -244,8 +244,26 @@ pub fn main(args: &[String], user_agent: &str) -> i32 {
 pub fn read_commands(input: impl std::io::Read + Send + 'static) -> Receiver<Option<Command>> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        for line in std::io::BufReader::new(input).lines() {
-            let Ok(line) = line else { break };
+        let mut reader = std::io::BufReader::new(input);
+        loop {
+            let mut bytes = Vec::new();
+            // Includes startup configuration; oversized or unterminated frames end the input.
+            let Ok(count) = std::io::Read::take(
+                &mut reader,
+                agent_core::local_context::MAX_SETUP_BYTES as u64 + 1,
+            )
+            .read_until(b'\n', &mut bytes) else {
+                break;
+            };
+            if count == 0 {
+                break;
+            }
+            if count > agent_core::local_context::MAX_SETUP_BYTES || bytes.last() != Some(&b'\n') {
+                break;
+            }
+            let Ok(line) = String::from_utf8(bytes) else {
+                break;
+            };
             if line.trim().is_empty() {
                 continue;
             }
@@ -255,7 +273,7 @@ pub fn read_commands(input: impl std::io::Read + Send + 'static) -> Receiver<Opt
                         return;
                     }
                 }
-                Err(e) => eprintln!("agent-terminal --local-agent: unreadable command: {e}"),
+                Err(_) => eprintln!("agent-terminal --local-agent: unreadable command"),
             }
         }
         let _ = tx.send(None);
@@ -271,6 +289,7 @@ enum Stop {
 }
 
 pub struct Runner<C: ChatClient, W: Write> {
+    context: agent_core::local_context::LocalLaunchContext,
     args: RunnerArgs,
     /// `None` only while a request is under way.
     client: Option<C>,
@@ -302,6 +321,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             .unwrap_or_else(new_session_id);
         Self {
             model: args.model.clone(),
+            context: Default::default(),
             mode: args.mode,
             args,
             client: Some(client),
@@ -336,6 +356,21 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
 
     /// Runs until stdin closes; 0 then, 1 if the session could not start.
     pub fn run(&mut self, commands: &Receiver<Option<Command>>) -> i32 {
+        match commands.recv() {
+            Ok(Some(Command::ConfigureLocal { context })) => {
+                if let Err(why) = context.validate() {
+                    self.emit(Envelope::new(Event::Error { message: why }));
+                    return 1;
+                }
+                self.context = *context;
+            }
+            _ => {
+                self.emit(Envelope::new(Event::Error {
+                    message: "Local setup is required before any prompt.".into(),
+                }));
+                return 1;
+            }
+        }
         if let Err(why) = self.load() {
             self.emit(Envelope::new(Event::Error { message: why }));
             return 1;
@@ -1102,6 +1137,39 @@ fn new_session_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn setup_is_required_and_invalid_setup_never_acknowledged() {
+        for command in [
+            Command::Prompt {
+                text: "too early".into(),
+            },
+            Command::ConfigureLocal {
+                context: Box::new(agent_core::local_context::LocalLaunchContext {
+                    budget: agent_core::local_context::ContextBudget {
+                        context_tokens: 1,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            },
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (tx, rx) = channel();
+            tx.send(Some(command)).unwrap();
+            let mut out = Vec::new();
+            let code = Runner::new(
+                args(dir.path(), Mode::Ask),
+                Script::new(vec![]),
+                dir.path().join("state"),
+                &mut out,
+            )
+            .run(&rx);
+            assert_eq!(code, 1);
+            let text = String::from_utf8(out).unwrap();
+            assert!(!text.contains("session_started"));
+            assert!(text.contains("error"));
+        }
+    }
     use super::*;
     use agent_core::event::Event;
     use serde_json::json;
@@ -1243,6 +1311,11 @@ mod tests {
 
     fn start(args: RunnerArgs, script: Script, dir: PathBuf) -> Run {
         let (commands, rx) = channel();
+        commands
+            .send(Some(Command::ConfigureLocal {
+                context: Box::default(),
+            }))
+            .unwrap();
         let (tx, events) = channel();
         let done = std::thread::spawn(move || {
             Runner::new(args, script, dir, Lines(tx, Vec::new())).run(&rx)
@@ -1773,6 +1846,9 @@ mod tests {
             events,
             done,
         };
+        run.send(Command::ConfigureLocal {
+            context: Box::default(),
+        });
         run.send(prompt("go"));
         run.wait_for(|e| matches!(e.event, Event::ContentDelta { .. }).then_some(()));
         run.send(Command::Interrupt);

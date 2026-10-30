@@ -304,6 +304,10 @@ pub struct OpenSession {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
+    /// Internal Local startup handshake, acknowledged by SessionStarted after validation.
+    ConfigureLocal {
+        context: Box<crate::local_context::LocalLaunchContext>,
+    },
     Prompt {
         text: String,
     },

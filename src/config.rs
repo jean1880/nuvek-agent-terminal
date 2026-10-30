@@ -48,6 +48,8 @@ impl CliClient {
 /// `config.json` edit with no recompile.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Profile {
+    #[serde(default)]
+    pub local: agent_core::local_context::LocalProfileOptions,
     /// Stable opaque identity, `^[a-z0-9-]{1,64}$` (see [`new_profile_id`]). Unlike `name` it
     /// survives a rename and a reorder, so anything that must keep pointing at this profile
     /// refers to it by id. Absent in older files: migration assigns one, once, and persists it.
@@ -149,6 +151,7 @@ pub struct Profile {
 impl Default for Profile {
     fn default() -> Self {
         Profile {
+            local: Default::default(),
             id: new_profile_id(),
             name: String::new(),
             command: String::new(),
@@ -706,6 +709,7 @@ impl ThemeChoice {
 /// `scrollback_lines` into 0 rather than 10000. This is what lets settings be
 /// added and retired without invalidating existing config files.
 pub struct TerminalConfig {
+    pub local_defaults: agent_core::local_context::LocalDefaults,
     /// Retained so existing config files keep round-tripping, but no longer
     /// surfaced in Settings: nothing ever consumed it. Sourcing a script into the
     /// TTY before `exec` breaks the CLI's terminal handshake, so when this returns
@@ -1164,6 +1168,7 @@ impl CursorShapeChoice {
 impl Default for TerminalConfig {
     fn default() -> Self {
         Self {
+            local_defaults: Default::default(),
             startup_script: "~/.config/agent-terminal/startup.sh".to_string(),
             scrollback_lines: 10000,
             font_scale: 1.0,
@@ -1677,9 +1682,12 @@ impl TerminalConfig {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(format!("could not be read ({e})")),
         };
-        serde_json::from_str::<Self>(&content)
-            .map(|config| Some(config.normalize()))
-            .map_err(|e| format!("is not valid ({e})"))
+        let config: Self =
+            serde_json::from_str(&content).map_err(|e| format!("is not valid ({e})"))?;
+        config
+            .validate_local()
+            .map_err(|e| format!("is not valid ({e})"))?;
+        Ok(Some(config.normalize()))
     }
 
     /// Whether the settings file was changed by something other than this
@@ -1730,6 +1738,14 @@ impl TerminalConfig {
     }
 
     /// Like [`Self::save`], and says whether the settings reached the disk.
+    pub fn validate_local(&self) -> Result<(), String> {
+        self.local_defaults.validate()?;
+        for profile in &self.profiles {
+            self.local_defaults.launch(&profile.local)?;
+        }
+        Ok(())
+    }
+
     pub fn save_checked(&self) -> bool {
         self.save_to(&Self::config_path())
     }
@@ -1742,6 +1758,10 @@ impl TerminalConfig {
     /// save leaves either the previous config or the new one — never the
     /// half-written file a plain `fs::write` would produce.
     fn save_to(&self, path: &Path) -> bool {
+        if let Err(why) = self.validate_local() {
+            warn!("Not saving invalid Local settings: {why}");
+            return false;
+        }
         if self.save_blocked.get() {
             warn!(
                 "Not saving settings to {}: the file there is unusable and has no other copy",
@@ -1794,6 +1814,38 @@ impl TerminalConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_settings_round_trip_and_profile_copy_keeps_overrides() {
+        let mut config = TerminalConfig::default();
+        let id = config.add_local_server(agent_core::provider::ProviderKind::Ollama);
+        let profile = config.profiles.iter_mut().find(|p| p.id == id).unwrap();
+        profile.local.budget = Some(agent_core::local_context::ContextBudget {
+            context_tokens: 65536,
+            ..Default::default()
+        });
+        let copy = profile.duplicate("Copy");
+        assert_eq!(copy.local, profile.local);
+        assert_ne!(copy.id, profile.id);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        assert!(config.save_to(&path));
+        let loaded = TerminalConfig::read_config(&path).unwrap().unwrap();
+        assert_eq!(
+            loaded.profile_by_id(&id).unwrap().local,
+            config.profile_by_id(&id).unwrap().local
+        );
+        config
+            .profiles
+            .iter_mut()
+            .find(|p| p.id == id)
+            .unwrap()
+            .local
+            .mcp_server_ids
+            .push("unresolved".into());
+        let before = std::fs::read(&path).unwrap();
+        assert!(!config.save_to(&path));
+        assert_eq!(before, std::fs::read(&path).unwrap());
+    }
     use super::*;
     use std::io::Write;
 

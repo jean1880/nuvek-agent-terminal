@@ -1,7 +1,8 @@
-//! The background task explorer: a button on the thinking strip listing what runs in the
-//! background (sub-agents, shell commands), and a dialog that follows one shell task's output.
+//! The background task explorer: a shelf above the composer listing what runs in the background
+//! (shell commands, and sub-agents the sub-agent shelf does not already show), and a dialog that
+//! follows one shell task's output.
 //!
-//! The list opens a sub-agent in the sub-agent panel; a shell task opens [`TaskOutputPanel`],
+//! A row opens a sub-agent in the sub-agent panel; a shell task opens [`TaskOutputPanel`],
 //! which the view fills by polling the agent (`Control::TaskOutput`) while the dialog is open.
 //! The agent hands back only the end of the output (Claude: the last 8 KiB), so the panel says
 //! when it shows part of it.
@@ -15,8 +16,10 @@ use gtk4::prelude::*;
 
 use super::cards::{label, wrapped_text};
 use super::model::task_name;
-use super::panels::{follow_dialog, popover_list, scrolled};
+use super::panels::{follow_dialog, scrolled};
 use super::payload::TaskOutput;
+use super::shelf::Shelf;
+use super::subagents::set_if_changed;
 
 /// What a task is, as its row says.
 pub fn kind_text(kind: BackgroundTaskKind) -> &'static str {
@@ -41,72 +44,99 @@ pub struct ListedTask {
     pub openable: bool,
 }
 
-/// The strip's button and its popover list of background tasks.
-pub struct BackgroundButton {
-    button: gtk4::MenuButton,
-    list: gtk4::ListBox,
-    popover: gtk4::Popover,
+/// The shelf's one-line summary.
+pub fn title_text(n: usize) -> String {
+    match n {
+        1 => "1 task in the background".to_owned(),
+        n => format!("{n} tasks in the background"),
+    }
+}
+
+/// What a task's row says under its name.
+fn now_text(listed: &ListedTask) -> &'static str {
+    match (listed.openable, listed.task.kind) {
+        (true, BackgroundTaskKind::Agent) => "Open to follow this sub-agent",
+        (true, _) => "Open to follow its output",
+        (false, _) => "Nothing to show",
+    }
+}
+
+/// The background tasks' shelf above the composer, stacked with the sub-agents' and built from
+/// the same parts (`shelf.rs`): a one-line summary, collapsed by default; opened, a row per task
+/// that runs, which opens its output (or its sub-agent). Shown while any runs.
+pub struct BackgroundShelf {
+    shelf: Shelf,
     tasks: RefCell<Vec<ListedTask>>,
 }
 
-impl BackgroundButton {
+impl BackgroundShelf {
     /// `open` is called with the task the user picked.
     pub fn new(open: impl Fn(&BackgroundTask) + 'static) -> Rc<Self> {
-        let (list, popover) = popover_list(360);
-        let button = gtk4::MenuButton::new();
-        button.set_label("Show tasks");
-        button.add_css_class("flat");
-        button.set_valign(gtk4::Align::Center);
-        button.set_tooltip_text(Some("What runs in the background, and its output"));
-        button.set_popover(Some(&popover));
-        button.set_visible(false);
+        let shelf = Shelf::new(
+            "at-utilities-terminal-symbolic",
+            "what runs in the background",
+            None,
+        );
+        shelf.fold.card.add_css_class("background-shelf");
         let this = Rc::new(Self {
-            button,
-            list,
-            popover,
+            shelf,
             tasks: RefCell::new(Vec::new()),
         });
         let weak = Rc::downgrade(&this);
-        this.list.connect_row_activated(move |_, row| {
+        this.shelf.list.connect_row_activated(move |_, row| {
             let Some(this) = weak.upgrade() else { return };
             let picked = usize::try_from(row.index())
                 .ok()
                 .and_then(|i| this.tasks.borrow().get(i).cloned())
                 .filter(|t| t.openable);
             if let Some(picked) = picked {
-                this.popover.popdown();
                 open(&picked.task);
             }
         });
         this
     }
 
-    pub fn widget(&self) -> &gtk4::MenuButton {
-        &self.button
+    /// The shelf, for the stack above the composer.
+    pub fn revealer(&self) -> &gtk4::Revealer {
+        &self.shelf.revealer
     }
 
-    /// Shows `tasks`, or hides the button when there are none. Rows are rebuilt only when the
+    /// Shows `tasks`, or hides the shelf when there are none. Rows are rebuilt only when the
     /// list changed.
     pub fn set(&self, tasks: Vec<ListedTask>) {
-        self.button.set_visible(!tasks.is_empty());
-        if tasks.is_empty() {
-            self.popover.popdown();
-        }
-        self.button
-            .update_property(&[gtk4::accessible::Property::Label(&match tasks.len() {
-                1 => "Show the background task".to_owned(),
-                n => format!("Show the {n} background tasks"),
-            })]);
-        if *self.tasks.borrow() == tasks {
+        self.shelf.show(!tasks.is_empty());
+        if tasks.is_empty() || *self.tasks.borrow() == tasks {
+            *self.tasks.borrow_mut() = tasks;
             return;
         }
-        while let Some(row) = self.list.first_child() {
-            self.list.remove(&row);
-        }
-        for listed in &tasks {
-            self.list.append(&row(listed));
+        set_if_changed(&self.shelf.title, &title_text(tasks.len()));
+        let rows = self.shelf.rebuild(tasks.len());
+        for (row, listed) in rows.iter().zip(&tasks) {
+            let name = task_name(&listed.task);
+            let kind = kind_text(listed.task.kind);
+            let now = now_text(listed);
+            row.mark.set_icon_name(Some(kind_icon(listed.task.kind)));
+            row.set_running(true, "");
+            row.set_text(&name, kind, now);
+            row.describe(
+                &format!("{name}\n{kind}\n{now}"),
+                &name,
+                &format!("{kind}; {now}"),
+            );
+            row.row.set_activatable(listed.openable);
         }
         *self.tasks.borrow_mut() = tasks;
+    }
+
+    /// Opens or closes the shelf's list (demo scenes).
+    pub(crate) fn set_expanded(&self, expanded: bool) {
+        self.shelf.set_expanded(expanded);
+    }
+
+    /// Whether the shelf shows (tests).
+    #[cfg(test)]
+    pub fn shown(&self) -> bool {
+        self.shelf.shown()
     }
 
     /// The listed task names and whether each opens, in order (tests).
@@ -118,36 +148,6 @@ impl BackgroundButton {
             .map(|t| (task_name(&t.task), t.openable))
             .collect()
     }
-}
-
-fn row(listed: &ListedTask) -> gtk4::ListBoxRow {
-    let task = &listed.task;
-    let b = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
-    b.set_margin_top(6);
-    b.set_margin_bottom(6);
-    b.set_margin_start(8);
-    b.set_margin_end(8);
-    let icon = gtk4::Image::from_icon_name(kind_icon(task.kind));
-    icon.set_valign(gtk4::Align::Start);
-    b.append(&icon);
-    let text = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
-    let name = label(&task_name(task), &["subagent-name"]);
-    name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-    name.set_width_chars(16);
-    name.set_max_width_chars(48);
-    text.append(&name);
-    let kind = if listed.openable {
-        kind_text(task.kind).to_owned()
-    } else {
-        format!("{} · nothing to show", kind_text(task.kind))
-    };
-    let kind = label(&kind, &["subagent-status", "dim-label"]);
-    text.append(&kind);
-    b.append(&text);
-    let row = gtk4::ListBoxRow::new();
-    row.set_child(Some(&b));
-    row.set_activatable(listed.openable);
-    row
 }
 
 /// One background shell task's output, in a dialog that follows it until closed.

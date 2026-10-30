@@ -512,7 +512,7 @@ fn native_click_matrix() {
     // A shelf row: the sub-agent's name opens it.
     inner.subagent_shelf.set_expanded(true);
     settle(&ctx);
-    let name: gtk4::Label = find_with_class(&inner.subagent_shelf.revealer, "subagent-name");
+    let name: gtk4::Label = find_with_class(inner.subagent_shelf.revealer(), "subagent-name");
     let row: gtk4::ListBoxRow = ancestor(&name);
     press_reaches(&window, &name, &row).unwrap_or_else(|e| panic!("shelf row: {e}"));
     row.activate();

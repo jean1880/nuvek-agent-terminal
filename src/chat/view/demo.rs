@@ -118,7 +118,10 @@ pub fn configure_demo_view(view: &ChatView) {
                     usage.widget().popup();
                 }
             }
-            "workers" => inner.subagent_shelf.set_expanded(true),
+            "workers" => {
+                inner.subagent_shelf.set_expanded(true);
+                inner.background_shelf.set_expanded(true);
+            }
             "diff" => {
                 inner.transcript.expand_demo_changes("demo-edit");
             }
@@ -1483,7 +1486,7 @@ pub fn queue_envelopes() -> Vec<Envelope> {
 }
 
 fn codex_worker_script() -> Vec<Step> {
-    use agent_core::event::{WorkerSnapshot, WorkerState};
+    use agent_core::event::{BackgroundTask, BackgroundTaskKind, WorkerSnapshot, WorkerState};
     let workers = vec![
         WorkerSnapshot {
             id: "demo-designer".into(),
@@ -1529,6 +1532,10 @@ fn codex_worker_script() -> Vec<Step> {
         Step::Emit(snapshot("worker-demo-response", StreamKind::Assistant, "I’m waiting for **Mira** and **Ellis** to finish their reviews. **Rowan** has completed the protocol check; the earlier reviewer is closed.")),
         Step::Emit(completed("worker-demo-response", ItemStatus::Completed, None, None)),
         Step::Emit(Envelope::new(Event::WorkersUpdated { workers, waiting_for: vec!["demo-designer".into(), "demo-accessibility".into()] })),
+        Step::Emit(Envelope::new(Event::BackgroundTasks { tasks: vec![
+            BackgroundTask { id: "demo-tests".into(), kind: BackgroundTaskKind::Shell, description: Some("cargo test --workspace".into()), tool_use_id: None },
+            BackgroundTask { id: "demo-watch".into(), kind: BackgroundTaskKind::Shell, description: Some("npm run dev".into()), tool_use_id: None },
+        ] })),
     ]
 }
 

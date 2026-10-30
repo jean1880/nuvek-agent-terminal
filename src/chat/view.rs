@@ -32,6 +32,7 @@ mod panels;
 mod payload;
 pub(crate) mod permission;
 mod quick_replies;
+mod shelf;
 mod subagent_shelf;
 mod subagents;
 mod thinking;
@@ -204,8 +205,10 @@ pub(crate) struct Inner {
     delegation: RefCell<delegation::Workers>,
     worker_inspector: RefCell<Option<Rc<delegation::Inspector>>>,
     worker_flush_queued: Cell<bool>,
-    /// The thinking strip's list of background tasks.
-    background_button: Rc<background::BackgroundButton>,
+    /// The shelf under the sub-agents' listing the other background tasks.
+    background_shelf: Rc<background::BackgroundShelf>,
+    /// The sub-agent and background shelves, joined into one card above the composer.
+    shelves: Rc<shelf::ShelfStack>,
     /// The background shell task whose output is shown, while its dialog is open.
     task_panel: RefCell<Option<Rc<background::TaskOutputPanel>>>,
     /// The thread's folder: what the app's own `@` file index lists for agents that do not
@@ -266,7 +269,7 @@ impl ChatView {
                     }
                 },
             );
-            let background_button = background::BackgroundButton::new(on_inner_ref(
+            let background_shelf = background::BackgroundShelf::new(on_inner_ref(
                 weak,
                 |inner, task: &BackgroundTask| inner.open_background(task),
             ));
@@ -306,7 +309,8 @@ impl ChatView {
                 delegation: RefCell::new(delegation::Workers::default()),
                 worker_inspector: RefCell::new(None),
                 worker_flush_queued: Cell::new(false),
-                background_button,
+                background_shelf,
+                shelves: shelf::ShelfStack::new(),
                 task_panel: RefCell::new(None),
                 workspace: RefCell::new(None),
                 file_seq: Cell::new(0),
@@ -316,7 +320,8 @@ impl ChatView {
         });
 
         inner.header.set_subagents(inner.subagent_button.widget());
-        inner.thinking.append(inner.background_button.widget());
+        inner.shelves.push(inner.subagent_shelf.revealer());
+        inner.shelves.push(inner.background_shelf.revealer());
         view.append(&inner.header.bin);
         // Toasts cover the transcript only, never the shelves or the composer where the next
         // action is (see `ChatView::toast_overlay`).
@@ -332,7 +337,7 @@ impl ChatView {
         clamp.set_tightening_threshold(640);
         let column = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
         column.append(&inner.plan.revealer);
-        column.append(&inner.subagent_shelf.revealer);
+        column.append(&inner.shelves.widget);
         column.append(&inner.interruption.revealer);
         // Right above where the reply is typed: the one place the eye already is.
         column.append(&inner.thinking.revealer);
@@ -927,9 +932,10 @@ impl Inner {
             .then_some(BackgroundTarget::Output)
     }
 
-    /// The strip's background task list, from the model. `own` and `agents`: the model's
+    /// The background task shelf, from the model. `own` and `agents`: the model's
     /// [`Transcript::subagents`] and [`Transcript::subagents_with`] the delegation registry's
-    /// workers, which the caller has already computed.
+    /// workers, which the caller has already computed. A sub-agent the thread knows is on the
+    /// sub-agent shelf just above, so it is not listed twice.
     fn refresh_background(
         &self,
         own: &[model::SubagentSummary],
@@ -938,12 +944,17 @@ impl Inner {
         let tasks = self.model.borrow().background_with(agents);
         let listed = tasks
             .into_iter()
-            .map(|task| background::ListedTask {
-                openable: self.background_target(&task, own).is_some(),
-                task,
+            .filter_map(|task| {
+                let target = self.background_target(&task, own);
+                (!matches!(target, Some(BackgroundTarget::Subagent(_)))).then(|| {
+                    background::ListedTask {
+                        openable: target.is_some(),
+                        task,
+                    }
+                })
             })
             .collect();
-        self.background_button.set(listed);
+        self.background_shelf.set(listed);
     }
 
     fn open_background(self: &Rc<Self>, task: &BackgroundTask) {

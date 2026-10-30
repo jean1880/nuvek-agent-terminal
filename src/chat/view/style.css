@@ -118,10 +118,26 @@
 .subagent-status, .subagent-task { font-size: 0.85em; }
 .subagent-panel-title { font-weight: 700; font-size: 1.15em; color: @at_fg_strong; }
 .subagent-text { color: @at_fg; }
-/* The sticky running-sub-agents card above the composer (subagent_shelf.rs). */
-.subagent-shelf-row { padding: 6px 10px; }
-.subagent-shelf .subagent-list { background-color: transparent; }
-.subagent-now { font-family: monospace; font-size: 0.85em; color: @at_fg_soft; margin-left: 24px; }
+/* The shelves above the composer (shelf.rs): the sub-agents and the background tasks, joined into
+   one card. The frame draws the border and corners; each shelf after the first is divided from
+   the one above by a rule, so they stack as one surface rather than as loose cards. */
+.shelf-stack {
+    background-color: @at_surface;
+    border: 1px solid @at_border;
+    border-radius: 12px;
+}
+.shelf-stack .shelf { background-color: transparent; border: none; border-radius: 0; }
+.shelf-stack .shelf .plan-toggle { border-radius: 0; }
+.shelf-stack .shelf-joined > .shelf { border-top: 1px solid @at_border; }
+.shelf .shelf-title { color: @at_fg_strong; }
+.shelf-list { background-color: transparent; }
+.shelf-list row { border-radius: 8px; margin: 0 6px; }
+.shelf-list row:hover { background-color: alpha(@at_accent, 0.08); }
+.shelf-row { padding: 6px 8px; }
+.shelf-row .shelf-mark { color: @at_fg_dim; }
+.shelf-now { font-family: monospace; font-size: 0.85em; color: @at_fg_soft; margin-left: 22px; }
+.shelf-body { padding-bottom: 6px; }
+.shelf-action { margin-right: 6px; font-size: 0.9em; }
 .approval-remembers { font-size: 0.85em; }
 .usage-text.usage-tag { font-size: 0.75em; color: @at_fg_dim; min-width: 2.2em; }
 .usage-text.usage-warn { color: @at_warning; }

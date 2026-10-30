@@ -954,17 +954,13 @@ mod tests {
                 .collect::<rusqlite::Result<_>>()
                 .expect("rows")
         };
-        // v6 rebuilds `provider_threads` (and its index) to widen its driver check: that table
-        // is v6's change, not v4's, and is checked by its own migration test.
-        let rebuilt_in_v6 = |name: &str| name.starts_with("provider_threads");
-        let objects = |c: &Connection| -> Vec<(String, String, Option<String>)> {
-            objects(c)
-                .into_iter()
-                .filter(|(_, name, _)| !rebuilt_in_v6(name))
-                .collect()
-        };
+        // The v4 step alone: later steps rebuild v3 tables on purpose (v6 `provider_threads`, v8
+        // the reference table and linking), each checked by its own migration test.
         let before = objects(&read_only(&db));
-        drop(Store::open(&db).expect("open"));
+        {
+            let c = Connection::open(&db).expect("open");
+            super::super::migrate_locked_to(&c, 3, 4).expect("v4");
+        }
         let after = objects(&read_only(&db));
         let added: Vec<_> = after.iter().filter(|o| !before.contains(o)).collect();
         assert!(

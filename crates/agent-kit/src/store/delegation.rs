@@ -1593,7 +1593,9 @@ mod tests {
         let Tree { s, .. } = tree();
         s.insert_delegation_run(&run("r_1", "w_child", "running"))
             .expect("run");
-        s.insert_delegation_run(&run("r_root", "w_roroot", "running"))
+        // Another run of the same recipient: a misdelivered message is consumed in a run of its
+        // recipient other than the one targeted, never in another worker's run.
+        s.insert_delegation_run(&run("r_2", "w_child", "completed"))
             .expect("run");
         s.insert_delegation_operation(&op("op_1", "send", "k1"))
             .expect("op");
@@ -1624,7 +1626,7 @@ mod tests {
         assert!(!stored.body.contains("ghp_abcdefghij"), "{}", stored.body);
         s.set_delegation_message_delivery("m_1", "submitted", None, 2)
             .expect("submitted");
-        s.set_delegation_message_delivery("m_1", "misdelivered", Some("r_root"), 3)
+        s.set_delegation_message_delivery("m_1", "misdelivered", Some("r_2"), 3)
             .expect("observed in another run");
         // The observed run is set once, and a terminal state is final.
         assert!(s
@@ -1652,7 +1654,7 @@ mod tests {
                 stored.submitted_at,
                 stored.confirmed_at
             ),
-            (Some("r_root"), Some(5), Some(2), Some(3))
+            (Some("r_2"), Some(5), Some(2), Some(3))
         );
     }
 
@@ -1669,12 +1671,13 @@ mod tests {
         s.conn
             .execute_batch(
                 "ALTER TABLE delegation_event_links DROP COLUMN process_generation;
-            DELETE FROM schema_version WHERE version >= 5;",
+            DELETE FROM schema_version WHERE version = 5;",
             )
-            .expect("old v4 schema");
+            .expect("old v4 links");
         s.conn.execute("INSERT INTO delegation_event_links (event_seq,worker_id,root_id,run_id,category,invocation_id)
             VALUES (?1,'w_child','ro',NULL,'lifecycle',NULL)", params![seq]).expect("old link");
-        super::super::migrate(&s.conn).expect("upgrade");
+        // Only the v5 step: the later ones rebuild tables of a real older schema, not this one.
+        super::super::migrate_locked_to(&s.conn, 4, 5).expect("upgrade");
         super::super::migrate(&s.conn).expect("idempotent");
         let links = s.delegation_event_links(seq).expect("links");
         assert_eq!(links.len(), 1);

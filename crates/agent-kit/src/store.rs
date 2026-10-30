@@ -5577,8 +5577,8 @@ mod tests {
         assert_eq!(active, vec![None, None]);
     }
 
-    /// Every foreign key has an index led by one of its child columns (the primary key counts),
-    /// so deleting or updating a parent never scans the child table. `drivers` is exempt: its
+    /// Every foreign key has a full (not partial) index led by one of its child columns (the
+    /// primary key counts), so deleting or updating a parent never scans the child table. `drivers` is exempt: its
     /// rows are never deleted.
     #[test]
     fn every_foreign_key_child_column_is_indexed() {
@@ -5603,8 +5603,10 @@ mod tests {
             let leading: Vec<String> = s
                 .conn
                 .prepare(
+                    // A partial index serves only the rows its WHERE admits, never a parent's delete.
                     "SELECT ii.name FROM pragma_index_list(?1) il
-                     JOIN pragma_index_info(il.name) ii ON ii.seqno = 0",
+                     JOIN pragma_index_info(il.name) ii ON ii.seqno = 0
+                     WHERE il.partial = 0",
                 )
                 .expect("prepare")
                 .query_map(params![table], |r| r.get(0))

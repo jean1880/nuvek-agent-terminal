@@ -751,11 +751,17 @@ mod tests {
         )
         .expect("rows");
         for i in 0..EVENTS {
-            let pt = if i % 3 == 0 { None } else { Some("p1") };
+            // Each event names its own thread's provider thread (or none).
+            let (thread, provider) = if i % 2 == 0 {
+                ("t1", "p1")
+            } else {
+                ("t2", "p2")
+            };
+            let pt = if i % 3 == 0 { None } else { Some(provider) };
             conn.execute(
                 "INSERT INTO events (thread_id, provider_thread_id, at, envelope_json)
                  VALUES (?1, ?2, ?3, '{}')",
-                rusqlite::params![if i % 2 == 0 { "t1" } else { "t2" }, pt, i],
+                rusqlite::params![thread, pt, i],
             )
             .expect("event");
         }

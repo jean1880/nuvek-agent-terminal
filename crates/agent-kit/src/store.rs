@@ -5545,6 +5545,106 @@ mod tests {
     }
 
     #[test]
+    fn v8_clears_links_to_another_threads_provider_thread() {
+        let conn = v7_fixture();
+        // Older schemas let both links name another thread's provider thread.
+        conn.execute_batch(
+            "UPDATE threads SET active_provider_thread = 'p2' WHERE id = 't1';
+             INSERT INTO events (seq, thread_id, provider_thread_id, at, envelope_json)
+                 VALUES (3, 't1', 'p2', 7, '{}');",
+        )
+        .expect("legacy mismatches");
+        migrate(&conn).expect("migrate");
+        let links: Vec<(i64, Option<String>)> = conn
+            .prepare("SELECT seq, provider_thread_id FROM events ORDER BY seq")
+            .expect("prepare")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .expect("query")
+            .collect::<std::result::Result<_, _>>()
+            .expect("rows");
+        assert_eq!(
+            links,
+            vec![(1, Some("p1".into())), (2, Some("p2".into())), (3, None)],
+            "only the mismatched event loses its link"
+        );
+        let active: Vec<Option<String>> = conn
+            .prepare("SELECT active_provider_thread FROM threads ORDER BY id")
+            .expect("prepare")
+            .query_map([], |r| r.get(0))
+            .expect("query")
+            .collect::<std::result::Result<_, _>>()
+            .expect("rows");
+        assert_eq!(active, vec![None, None]);
+    }
+
+    /// Every foreign key has an index led by one of its child columns (the primary key counts),
+    /// so deleting or updating a parent never scans the child table. `drivers` is exempt: its
+    /// rows are never deleted.
+    #[test]
+    fn every_foreign_key_child_column_is_indexed() {
+        let s = store();
+        let tables: Vec<String> = s
+            .conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .expect("prepare")
+            .query_map([], |r| r.get(0))
+            .expect("query")
+            .collect::<std::result::Result<_, _>>()
+            .expect("tables");
+        for table in &tables {
+            let fks: Vec<(i64, String, String)> = s
+                .conn
+                .prepare("SELECT id, \"table\", \"from\" FROM pragma_foreign_key_list(?1)")
+                .expect("prepare")
+                .query_map(params![table], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .expect("query")
+                .collect::<std::result::Result<_, _>>()
+                .expect("fks");
+            let leading: Vec<String> = s
+                .conn
+                .prepare(
+                    "SELECT ii.name FROM pragma_index_list(?1) il
+                     JOIN pragma_index_info(il.name) ii ON ii.seqno = 0",
+                )
+                .expect("prepare")
+                .query_map(params![table], |r| r.get(0))
+                .expect("query")
+                .collect::<std::result::Result<_, _>>()
+                .expect("indexes");
+            let pk_first: Option<String> = s
+                .conn
+                .query_row(
+                    "SELECT name FROM pragma_table_info(?1) WHERE pk = 1",
+                    params![table],
+                    |r| r.get(0),
+                )
+                .optional()
+                .expect("pk");
+            let mut by_key: std::collections::BTreeMap<i64, (String, Vec<String>)> =
+                std::collections::BTreeMap::new();
+            for (id, parent, column) in fks {
+                by_key
+                    .entry(id)
+                    .or_insert((parent, Vec::new()))
+                    .1
+                    .push(column);
+            }
+            for (parent, columns) in by_key.values() {
+                if parent == "drivers" {
+                    continue;
+                }
+                assert!(
+                    columns
+                        .iter()
+                        .any(|c| leading.contains(c) || pk_first.as_ref() == Some(c)),
+                    "{table}({}) -> {parent} has no index led by its columns",
+                    columns.join(", ")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_deleted_provider_thread_unlinks_its_events_and_runs() {
         let conn = v7_fixture();
         migrate(&conn).expect("migrate");

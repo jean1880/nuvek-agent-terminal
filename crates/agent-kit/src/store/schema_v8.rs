@@ -7,10 +7,17 @@
 //!   key, and the delegation tables name their owners by composite keys, so an operation, message
 //!   or link can only name workers of its own root, and a run of its own worker. Rows owned by a
 //!   root, worker, run, operation, event or provider thread go with it (`ON DELETE CASCADE`).
-//!   Two references stay `NO ACTION` on purpose: a worker's backing thread and a message's event
-//!   are only removed through `release_delegation_for_delete`, which first refuses live workers.
+//!   Three references stay `NO ACTION` on purpose. A worker's backing thread and a message's
+//!   event are only removed through `release_delegation_for_delete`, which first refuses live
+//!   workers. A message's `reply_to` has no length limit on its chain, and SQLite nests one
+//!   foreign-key action per link up to a fixed depth (1000), so a cascade could not delete a long
+//!   conversation: the release path deletes a chain's messages in one statement instead.
 //! - Ownership a foreign key cannot express without nulling an owner column is a trigger: a
 //!   thread's active provider thread and an event's provider thread belong to that thread.
+//!   Triggers only judge later writes, and older schemas allowed either link to name another
+//!   thread's provider thread; such a link is wrong by definition, so the step clears it (the
+//!   thread then shows its latest provider thread, and the event names none) rather than refuse
+//!   the upgrade and leave the store unopenable.
 //! - Every foreign-key child column is indexed (a parent delete or `SET NULL` otherwise scans the
 //!   child table), with indexes for the lookups and orderings the queries use.
 //! - Text primary keys are `NOT NULL` (a rowid table's `TEXT PRIMARY KEY` otherwise allows NULL).
@@ -184,7 +191,7 @@ CREATE TABLE delegation_messages_v8 (
     sender_worker_id TEXT NOT NULL,
     recipient_worker_id TEXT NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN ('instruction', 'report', 'question', 'reply')),
-    reply_to TEXT REFERENCES delegation_messages(id) ON DELETE CASCADE,
+    reply_to TEXT REFERENCES delegation_messages(id),
     body TEXT NOT NULL,
     delivery_policy TEXT NOT NULL CHECK (length(delivery_policy) BETWEEN 1 AND 32),
     target_run_id TEXT,
@@ -274,6 +281,7 @@ ALTER TABLE delegation_event_links_v8 RENAME TO delegation_event_links;
 ALTER TABLE delegation_native_aliases_v8 RENAME TO delegation_native_aliases;
 
 CREATE INDEX threads_updated ON threads(updated_at);
+CREATE INDEX threads_active_provider ON threads(active_provider_thread);
 CREATE INDEX provider_threads_thread ON provider_threads(thread_id, created_at);
 CREATE INDEX provider_threads_native ON provider_threads(driver, native_id, created_at);
 CREATE INDEX events_provider_thread ON events(provider_thread_id);
@@ -311,6 +319,14 @@ CREATE INDEX delegation_event_links_worker ON delegation_event_links(worker_id, 
 CREATE INDEX delegation_event_links_run ON delegation_event_links(run_id);
 
 CREATE INDEX delegation_native_aliases_worker ON delegation_native_aliases(worker_id);
+
+UPDATE threads SET active_provider_thread = NULL
+WHERE active_provider_thread IS NOT NULL AND NOT EXISTS (SELECT 1 FROM provider_threads p
+      WHERE p.id = threads.active_provider_thread AND p.thread_id = threads.id);
+UPDATE events SET provider_thread_id = NULL
+WHERE seq IN (SELECT e.seq FROM provider_threads p
+              JOIN events e INDEXED BY events_provider_thread ON e.provider_thread_id = p.id
+              WHERE e.thread_id IS NOT p.thread_id);
 
 CREATE TRIGGER threads_active_provider_owned_insert BEFORE INSERT ON threads
 WHEN NEW.active_provider_thread IS NOT NULL AND NOT EXISTS (SELECT 1 FROM provider_threads

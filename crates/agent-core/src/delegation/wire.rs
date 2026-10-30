@@ -1316,6 +1316,18 @@ pub enum EventCategory {
     Error,
 }
 
+impl EventCategory {
+    /// Every category, in declaration order (the store's CHECK list is compared with it).
+    pub const ALL: [EventCategory; 6] = [
+        EventCategory::Lifecycle,
+        EventCategory::Activity,
+        EventCategory::Result,
+        EventCategory::Approval,
+        EventCategory::Message,
+        EventCategory::Error,
+    ];
+}
+
 /// One event unit of a page.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PageEvent {
@@ -1898,6 +1910,28 @@ mod tests {
             serde_json::to_value(c).expect("ser"),
             json!({"send": true, "this_run": "best_effort", "cancel": true, "close": false})
         );
+    }
+
+    /// `EventCategory::ALL` is hand-maintained: `next` has no wildcard, so a new category does not
+    /// compile until it is walked, and the walk must equal `ALL`.
+    #[test]
+    fn event_category_all_is_exhaustive() {
+        use EventCategory::*;
+        fn next(c: EventCategory) -> Option<EventCategory> {
+            match c {
+                Lifecycle => Some(Activity),
+                Activity => Some(Result),
+                Result => Some(Approval),
+                Approval => Some(Message),
+                Message => Some(Error),
+                Error => None,
+            }
+        }
+        let mut walked = vec![Lifecycle];
+        while let Some(c) = next(*walked.last().expect("non-empty")) {
+            walked.push(c);
+        }
+        assert_eq!(walked, EventCategory::ALL);
     }
 
     #[test]

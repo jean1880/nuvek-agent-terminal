@@ -272,9 +272,11 @@ Architectural mandates, standards, and workflows for this codebase.
   (probed at 2, 5, 10, then every 15 minutes, or just after the latest reset those windows
   name; any reading taken after the limit counts, so it may continue without a new probe). A
   window still shown full a minute past its own reset time counts as free (readings are
-  merged, so a window the agent stopped reporting keeps its last copy), unless the agent
-  refused work while that same copy was already past its reset: then it frees only when its
-  usage drops or it names another reset, so a wrong guess costs one failed turn, never a loop.
+  merged, so a window the agent stopped reporting keeps its last copy). A refusal whose every
+  exhausted window is already past its reset disproves those copies: each frees only when its
+  usage drops or it names another reset, so a wrong guess costs at most one failed turn per
+  window, never a loop. A refusal during a wait counts the same way, and readings from before
+  it, or a reset time it came after, no longer count.
   Readings count from when windows last arrived (`updated_at`), never an account-only
   update. agy's `/usage` side command never raises `RateLimited`: a reading is not a refusal. The window's minute sweep (`continue_after_limits`)
   then calls `ChatSession::continue_after_limit`, which sends the app's continue prompt as a

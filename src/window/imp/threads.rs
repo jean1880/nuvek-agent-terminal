@@ -3276,15 +3276,16 @@ impl AgentTerminalWindow {
         else {
             return;
         };
+        // What the agent's windows hold now names what stopped the thread, and which stale copies
+        // this refusal disproves.
+        let held = limit_windows(&AccountStatus::shared().snapshot(chat.driver).windows);
         match &mut chat.limit_wait {
-            Some(wait) => wait.learn(reset, now),
+            Some(wait) => wait.learn(reset, now, &held),
             None => {
                 info!(
                     "thread {thread} waits for its usage limit to reset (reset time known: {})",
                     reset.is_some()
                 );
-                // What the agent's windows hold now names what stopped the thread.
-                let held = limit_windows(&AccountStatus::shared().snapshot(chat.driver).windows);
                 chat.limit_wait = Some(LimitWait::new(reset, now, &held));
             }
         }

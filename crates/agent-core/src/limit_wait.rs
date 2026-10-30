@@ -7,10 +7,12 @@
 //! may not use); it continues once a reading taken after the limit shows every one of them
 //! free (or, if none was exhausted then, every window free). A window still shown exhausted a
 //! grace past its own reset time counts as free: readings are merged, so that copy is stale. A
-//! reading taken after the limit can show it so at any later tick, with no new probe. Unless the
-//! agent refused work while that same copy was already past its reset: then it frees only when
-//! its usage drops or it names another reset, so a wrong guess costs one failed turn, never a
-//! loop. When every window still holding the thread names a reset time, the next reading is
+//! reading taken after the limit can show it so at any later tick, with no new probe. A refusal
+//! (the one that starts the wait, or one during it) whose every exhausted window is already past
+//! its reset disproves those copies: each then frees only when its usage drops or it names
+//! another reset. So a wrong guess costs at most one failed turn per window, never a loop. A
+//! refusal also restarts the clock: only readings taken after it count, and a reset time it came
+//! after is dropped. When every window still holding the thread names a reset time, the next reading is
 //! taken just after the latest, which the thread shows as when it continues; only a reading
 //! decides. The caller supplies the clock and the readings; nothing here sends or probes anything.
 
@@ -69,10 +71,26 @@ pub struct LimitWait {
     checks: usize,
     /// The windows exhausted when the wait started: what stopped the thread.
     blocking: Vec<String>,
-    /// Windows already past their reset (key and reset time) when the agent refused work: the
-    /// refusal disproves that copy, so it is never taken as stale in this wait. Each frees only
-    /// when its usage drops or it names another reset, so a stale guess is made at most once.
+    /// Copies (key and reset time) a refusal disproved: never taken as stale in this wait. Each
+    /// frees only when its usage drops or it names another reset (see [`refuted_by`]).
     refuted: Vec<(String, Option<i64>)>,
+}
+
+/// The copies a refusal at `now` disproves, given the windows `held` then. Only when every
+/// exhausted window is past its own reset must one of them be what refused the work, so all of
+/// them are refuted. When any exhausted window is not (its reset is still ahead, or unknown),
+/// that window explains the refusal and no stale copy is disproved: an abandoned window beside a
+/// genuinely full one stays free to be judged stale once the full one frees. So a wrong stale
+/// guess costs at most one failed turn per window that held the thread.
+fn refuted_by(held: &[Window], now: i64) -> Vec<(String, Option<i64>)> {
+    let exhausted: Vec<&Window> = held.iter().filter(|w| w.exhausted()).collect();
+    if exhausted.is_empty() || !exhausted.iter().all(|w| w.past_reset(now)) {
+        return Vec::new();
+    }
+    exhausted
+        .into_iter()
+        .map(|w| (w.key.clone(), w.resets_at))
+        .collect()
 }
 
 impl LimitWait {
@@ -91,17 +109,13 @@ impl LimitWait {
                 .filter(|w| w.exhausted())
                 .map(|w| w.key.clone())
                 .collect(),
-            refuted: held
-                .iter()
-                .filter(|w| w.past_reset(now))
-                .map(|w| (w.key.clone(), w.resets_at))
-                .collect(),
+            refuted: refuted_by(held, now),
         }
     }
 
-    /// Free at `now`: not exhausted, or past its own reset (a stale copy) unless this wait's
-    /// refusal already disproved that same copy. If a stale guess is wrong, the next turn fails
-    /// on the limit and the new wait refutes it.
+    /// Free at `now`: not exhausted, or past its own reset (a stale copy) unless a refusal
+    /// disproved that same copy. If a stale guess is wrong, the next turn fails on the limit and
+    /// that refusal refutes it.
     fn free(&self, w: &Window, now: i64) -> bool {
         !w.exhausted()
             || (w.past_reset(now)
@@ -111,9 +125,20 @@ impl LimitWait {
                     .any(|(key, reset)| *key == w.key && *reset == w.resets_at))
     }
 
-    /// The agent refused work again at `now`, with `reset` if known: a later reset time than
-    /// the one waited for replaces it.
-    pub fn learn(&mut self, reset: Option<i64>, now: i64) {
+    /// The agent refused work again at `now` (a retry during the wait), with `reset` if known and
+    /// `held` its windows then. The refusal is evidence as at the start of a wait: readings from
+    /// before it no longer count, a reset time it came after is disproved, the copies it
+    /// disproves are refuted, and a later reset time than the one waited for replaces it.
+    pub fn learn(&mut self, reset: Option<i64>, now: i64, held: &[Window]) {
+        self.since = self.since.max(now);
+        if self.reset.is_some_and(|known| now >= known) {
+            self.reset = None;
+        }
+        for copy in refuted_by(held, now) {
+            if !self.refuted.contains(&copy) {
+                self.refuted.push(copy);
+            }
+        }
         if let Some(reset) = reset.filter(|r| *r > now) {
             self.reset = Some(self.reset.map_or(reset, |known| known.max(reset)));
         }
@@ -193,11 +218,58 @@ mod tests {
         assert_eq!(wait.step(1_000 + GRACE, None), Step::Continue);
         // A later reset reported again replaces it; an earlier or past one does not.
         let mut wait = LimitWait::new(Some(1_000), 100, &[]);
-        wait.learn(Some(900), 100);
-        wait.learn(Some(50), 100);
+        wait.learn(Some(900), 100, &[]);
+        wait.learn(Some(50), 100, &[]);
         assert_eq!(wait.reset(), Some(1_000));
-        wait.learn(Some(2_000), 100);
+        wait.learn(Some(2_000), 100, &[]);
         assert_eq!(wait.reset(), Some(2_000));
+        // A refusal after the reset it named disproves it: no blind continue at that time.
+        let mut wait = LimitWait::new(Some(1_000), 100, &[]);
+        wait.learn(None, 1_100, &[]);
+        assert_eq!(wait.reset(), None);
+        assert_ne!(wait.step(1_200, None), Step::Continue);
+    }
+
+    #[test]
+    fn a_refusal_during_a_wait_is_evidence_like_the_one_that_started_it() {
+        // Started at 100 with a reading at 200; the user retried at 4 100, past "Weekly"'s
+        // reset, and was refused again with that copy unchanged.
+        let copy = [window("Weekly", 1.0, Some(4_000))];
+        let mut wait = LimitWait::new(None, 100, &copy);
+        assert_eq!(wait.step(300, Some((200, &copy))), Step::Wait);
+        wait.learn(None, 4_100, &copy);
+        // The reading from before the refusal no longer counts, and the copy is refuted.
+        assert_ne!(wait.step(4_200, Some((200, &copy))), Step::Continue);
+        assert_ne!(wait.step(4_300, Some((4_250, &copy))), Step::Continue);
+        // A copy that changed after the refusal is judged afresh.
+        let freed = [window("Weekly", 0.2, Some(600_000))];
+        assert_eq!(wait.step(4_400, Some((4_350, &freed))), Step::Continue);
+    }
+
+    #[test]
+    fn a_window_that_explains_the_refusal_keeps_a_stale_copy_beside_it_unrefuted() {
+        // Refused at 5 000: "5-hour" is genuinely full (reset ahead) and explains it; "Weekly"
+        // is an abandoned copy past its reset. Only "5-hour" holds the thread.
+        let held = [
+            window("5-hour", 1.0, Some(9_000)),
+            window("Weekly", 1.0, Some(4_000)),
+        ];
+        let mut wait = LimitWait::new(None, 5_000, &held);
+        assert_eq!(wait.step(5_110, Some((5_100, &held))), Step::Wait);
+        assert_eq!(wait.reset(), Some(9_000));
+        // "5-hour" frees; "Weekly" is still the abandoned copy, judged stale: continue.
+        let later = [
+            window("5-hour", 0.0, Some(27_000)),
+            window("Weekly", 1.0, Some(4_000)),
+        ];
+        assert_eq!(wait.step(9_100, Some((9_070, &later))), Step::Continue);
+        // Had every full window been past its reset, the refusal would refute them all.
+        let all_stale = [
+            window("5-hour", 1.0, Some(3_000)),
+            window("Weekly", 1.0, Some(4_000)),
+        ];
+        let mut wait = LimitWait::new(None, 5_000, &all_stale);
+        assert_ne!(wait.step(10_000, Some((9_000, &all_stale))), Step::Continue);
     }
 
     #[test]

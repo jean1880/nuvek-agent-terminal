@@ -385,6 +385,16 @@ struct Inner {
     /// its rule is judged in (`None`: relative paths never resolve), by request id, so "Allow for
     /// session" / "Always allow" can record it.
     pending_rules: RefCell<HashMap<String, PendingRule>>,
+    local_mcp_proposals: RefCell<
+        HashMap<
+            String,
+            (
+                crate::always_allow::Rule,
+                Decision,
+                agent_core::local_mcp::ApprovalStamp,
+            ),
+        >,
+    >,
     /// This thread's session rules, each tagged with its agent; shared with agy's approval
     /// server, kept through a same-agent restart, cleared by a cross-agent switch.
     session_rules: crate::approval_server::SessionRules,
@@ -954,6 +964,7 @@ impl ChatSession {
             wanted_mode: Cell::new(wanted_mode),
             safe_mode: Cell::new(wanted_mode),
             pending_rules: RefCell::new(HashMap::new()),
+            local_mcp_proposals: RefCell::new(HashMap::new()),
             session_rules: crate::approval_server::SessionRules::default(),
             saved_rules: RefCell::new(
                 crate::always_allow::path().map(crate::always_allow::StoreCache::new),
@@ -1073,6 +1084,15 @@ impl ChatSession {
             value.validate()?;
             Ok(value)
         });
+        let restrictive = context.as_ref().map_or(true, |next| {
+            self.inner
+                .adapter
+                .borrow()
+                .local_context()
+                .is_some_and(|old| {
+                    agent_core::local_mcp::narrows(&old.mcp_servers, &next.mcp_servers)
+                })
+        });
         let unchanged = context
             .as_ref()
             .is_ok_and(|value| self.inner.adapter.borrow().local_context() == Some(value));
@@ -1080,6 +1100,11 @@ impl ChatSession {
         let changed = *self.inner.pending_local_context.borrow() != pending;
         let restart_pending = pending.is_some();
         *self.inner.pending_local_context.borrow_mut() = pending;
+        if changed && restart_pending && restrictive {
+            self.inner.stop_current();
+            self.note("Local MCP authority changed: pending approvals and active calls were stopped. The next prompt uses the saved settings.");
+            return;
+        }
         if changed && restart_pending {
             self.note("Local settings saved: runner restart pending before the next prompt. The current turn keeps its snapshot.");
         }
@@ -1658,6 +1683,24 @@ impl Inner {
             }
             Event::ApprovalResolved { .. } | Event::ApprovalExpired => {
                 if let Some(req) = &env.request {
+                    let proposed = self.local_mcp_proposals.borrow_mut().remove(req);
+                    if let Some((rule, expected, stamp)) = proposed {
+                        if matches!(&env.event, Event::ApprovalResolved {decision} if *decision == expected)
+                            && env
+                                .raw
+                                .as_ref()
+                                .and_then(|raw| {
+                                    serde_json::from_value::<agent_core::local_mcp::ApprovalStamp>(
+                                        raw.clone(),
+                                    )
+                                    .ok()
+                                })
+                                .as_ref()
+                                == Some(&stamp)
+                        {
+                            self.keep_rule(rule, expected);
+                        }
+                    }
                     self.pending_rules.borrow_mut().remove(req);
                     self.codex_permissions.borrow_mut().remove(req);
                     self.held_permissions.borrow_mut().remove(req);
@@ -2924,6 +2967,20 @@ impl Inner {
         else {
             return (env, false);
         };
+        if tool == agent_core::local_mcp::APPROVAL_TOOL {
+            let stamp =
+                serde_json::from_value::<agent_core::local_mcp::ApprovalCard>(input.clone())
+                    .ok()
+                    .map(|card| card.binding);
+            if driver != Driver::Local
+                || stamp.as_ref() != self.adapter.borrow().local_mcp_approval(&request).as_ref()
+                || stamp.is_none()
+            {
+                options.retain(|decision| matches!(decision, Decision::Deny | Decision::Cancel));
+                *remembers = None;
+                return (env, false);
+            }
+        }
         let action = crate::always_allow::Action::of(tool, input);
         let (workspace, cwd) = self.rule_dirs(input, action.as_ref());
         let home = Self::home();
@@ -3161,6 +3218,7 @@ impl Inner {
 
     /// Ends this thread's session approvals (a cross-agent switch); returns how many.
     fn end_session_rules(&self) -> usize {
+        self.local_mcp_proposals.borrow_mut().clear();
         self.pending_rules.borrow_mut().clear();
         let mut rules = self.session_rules.borrow_mut();
         let n = rules.rules.len();
@@ -3320,6 +3378,7 @@ impl Inner {
         self.reject_model_change();
         self.pending_rules.borrow_mut().clear();
         // The app-server process held Codex's session grants; they ended with it.
+        self.local_mcp_proposals.borrow_mut().clear();
         self.codex_permissions.borrow_mut().clear();
         self.held_permissions.borrow_mut().clear();
         self.codex_grants.borrow_mut().clear();
@@ -4340,9 +4399,20 @@ impl Inner {
         decision: Decision,
         custom_rule: Option<crate::always_allow::Rule>,
     ) {
+        // Recheck inherited authority before every provider-specific answer path.
+        let decision = self.child_answer(request, decision);
+        if self.adapter.borrow().driver() == Driver::Local
+            && self
+                .approval_inputs
+                .borrow()
+                .get(request)
+                .is_some_and(|(tool, _)| tool == agent_core::local_mcp::APPROVAL_TOOL)
+        {
+            self.respond_local_mcp(request, decision, custom_rule);
+            return;
+        }
         // Authority may narrow while a human is reading a card. Re-check at the actual
         // response boundary, including plain Allow; rule validation alone cannot protect it.
-        let decision = self.child_answer(request, decision);
         let permission = self.codex_permissions.borrow().get(request).cloned();
         if let Some(card) = permission {
             self.respond_codex_permissions(request, decision, &card, false);
@@ -4428,6 +4498,77 @@ impl Inner {
         if decision == Decision::Cancel {
             self.stopped_from_card();
         }
+    }
+
+    fn respond_local_mcp(
+        self: &Rc<Self>,
+        request: &str,
+        decision: Decision,
+        custom: Option<crate::always_allow::Rule>,
+    ) {
+        let stamp = self.adapter.borrow().local_mcp_approval(request);
+        let (mut decision, _, off) =
+            Self::answer_under_policy(decision, None, crate::always_allow::saved_rules_enabled());
+        let pending = self.pending_rules.borrow_mut().remove(request);
+        let bound = stamp.as_ref().is_some_and(|stamp| pending.as_ref().is_some_and(|(action,_,_)| matches!(action,crate::always_allow::Action::LocalMcp {grant} if grant == &stamp.grant)));
+        if !bound {
+            self.local_mcp_proposals.borrow_mut().remove(request);
+            if stamp.is_some() {
+                self.command(Command::Approve {
+                    request: request.into(),
+                    decision: Decision::Deny,
+                    updated_input: None,
+                    message: None,
+                });
+            }
+            self.emit(Envelope::new(Event::ApprovalExpired).request(request));
+            if decision == Decision::Cancel {
+                self.stopped_from_card();
+                self.command(Command::Interrupt);
+            }
+            return;
+        }
+        let Some(stamp) = stamp else {
+            return;
+        };
+        let mut proposed = None;
+        if matches!(decision, Decision::AllowForSession | Decision::AllowAlways) {
+            if custom.is_some() {
+                decision = Decision::Allow;
+                self.notice(
+                    "Allowed once; Local MCP grants cannot use a legacy or custom pattern.",
+                );
+            } else {
+                match self.plan_rule(pending.as_ref(), decision, None) {
+                    Ok((rule, _)) => proposed = Some((rule, decision, stamp)),
+                    Err(why) => {
+                        decision = Decision::Allow;
+                        self.notice(format!("Allowed once; no Local MCP rule was kept: {why}."));
+                    }
+                }
+            }
+        }
+        if let Some(proposed) = proposed {
+            self.local_mcp_proposals
+                .borrow_mut()
+                .insert(request.to_owned(), proposed);
+        }
+        if !self.command(Command::Approve {
+            request: request.to_owned(),
+            decision,
+            updated_input: None,
+            message: None,
+        }) {
+            self.local_mcp_proposals.borrow_mut().remove(request);
+        } else if off {
+            self.notice(crate::always_allow::ALLOWED_ONCE_SAVED_RULES_OFF);
+        }
+        if decision == Decision::Cancel {
+            self.stopped_from_card();
+            self.command(Command::Interrupt);
+        }
+        // Local acknowledges the bound answer. Only that acknowledgement may keep a rule;
+        // a stale or expired card must never create an optimistic session or saved grant.
     }
 
     fn finish_hook_approval(self: &Rc<Self>, request: &str, decision: Decision, answered: bool) {
@@ -6503,6 +6644,309 @@ mod tests {
     mod handoff_tests;
     mod switch_tests;
     mod teardown_tests;
+
+    fn local_mcp_frame(
+        request: &str,
+        generation: &str,
+        grant: agent_core::local_mcp::Grant,
+    ) -> Envelope {
+        use agent_core::local_mcp::{ApprovalCard, ApprovalStamp};
+        Envelope::new(Event::ApprovalRequested {
+            tool: agent_core::local_mcp::APPROVAL_TOOL.into(),
+            title: None,
+            input: serde_json::to_value(ApprovalCard {
+                binding: ApprovalStamp {
+                    request_id: request.into(),
+                    generation: generation.into(),
+                    call_id: format!("call-{request}"),
+                    grant,
+                },
+                server_label: "Example".into(),
+                arguments: serde_json::json!({}),
+            })
+            .unwrap(),
+            reason: None,
+            options: agent_core::local_mcp::APPROVAL_OPTIONS.to_vec(),
+            response: agent_core::event::ResponseCapability::Live,
+            remembers: None,
+        })
+        .request(request)
+    }
+    fn local_mcp_grant() -> agent_core::local_mcp::Grant {
+        agent_core::local_mcp::Grant {
+            server_id: "example".into(),
+            tool: "read".into(),
+            server_revision: "a".repeat(64),
+            schema_revision: "b".repeat(64),
+        }
+    }
+
+    #[test]
+    fn local_mcp_refused_cards_dismiss_for_deny_and_cancel_even_without_a_binding() {
+        for binding in [false, true] {
+            for decision in [Decision::Deny, Decision::Cancel] {
+                in_loop(|_| {
+                    let store = Rc::new(Store::open_in_memory().unwrap());
+                    let thread = fresh(&store, "/work");
+                    let (session, seen) = harness(
+                        Box::new(agent_core::local_agent::LocalAdapter::new()),
+                        open_session("unused", vec![], "/work"),
+                        &store,
+                        &thread,
+                    );
+                    let frame = local_mcp_frame("r1", "g1", local_mcp_grant());
+                    if binding {
+                        session
+                            .inner
+                            .adapter
+                            .borrow_mut()
+                            .feed(&serde_json::to_string(&frame).unwrap());
+                    }
+                    session.inner.apply(&frame);
+                    assert!(session
+                        .inner
+                        .open_approvals
+                        .borrow()
+                        .contains(&"r1".to_owned()));
+                    // A missing or stale action cannot grant, but refusal must still close it.
+                    session.respond_approval("r1", decision);
+                    assert!(!session
+                        .inner
+                        .open_approvals
+                        .borrow()
+                        .contains(&"r1".to_owned()));
+                    assert!(seen
+                        .borrow()
+                        .iter()
+                        .any(|e| e.request.as_deref() == Some("r1")
+                            && matches!(e.event, Event::ApprovalExpired)));
+                    assert!(session.inner.session_rules.borrow().rules.is_empty());
+                    assert!(session.inner.local_mcp_proposals.borrow().is_empty());
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn local_mcp_always_survives_stop_and_new_sessions_while_session_grants_stay_scoped() {
+        for decision in [Decision::AllowForSession, Decision::AllowAlways] {
+            in_loop(|ctx| {
+                let _policy = crate::always_allow::PolicyGuard::saved_rules(true);
+                let folder = tempfile::tempdir().unwrap();
+                let path = folder.path().join(crate::always_allow::FILE_NAME);
+                let store = Rc::new(Store::open_in_memory().unwrap());
+                let thread = fresh(&store, "/work");
+                let (session, _) = harness(
+                    Box::new(agent_core::local_agent::LocalAdapter::new()),
+                    open_session("unused", vec![], "/work"),
+                    &store,
+                    &thread,
+                );
+                *session.inner.saved_rules.borrow_mut() =
+                    Some(crate::always_allow::StoreCache::new(path.clone()));
+                let grant = local_mcp_grant();
+                let action = crate::always_allow::Action::LocalMcp {
+                    grant: grant.clone(),
+                };
+                let rule = crate::always_allow::Rule::from_action(
+                    &action,
+                    &crate::always_allow::Context {
+                        driver: "local",
+                        workspace: Path::new("/work"),
+                        cwd: None,
+                        home: None,
+                    },
+                )
+                .unwrap();
+                session.inner.keep_rule(rule, decision);
+                if decision == Decision::AllowAlways {
+                    saved_rules_once(ctx, folder.path(), 1);
+                }
+                session.inner.stop_current();
+                let frame = local_mcp_frame("r2", "g2", grant.clone());
+                session
+                    .inner
+                    .adapter
+                    .borrow_mut()
+                    .feed(&serde_json::to_string(&frame).unwrap());
+                assert!(
+                    session.inner.gate_approval(frame).1,
+                    "same session after Stop"
+                );
+                let other = fresh(&store, "/work");
+                let (next, _) = harness(
+                    Box::new(agent_core::local_agent::LocalAdapter::new()),
+                    open_session("unused", vec![], "/work"),
+                    &store,
+                    &other,
+                );
+                *next.inner.saved_rules.borrow_mut() =
+                    Some(crate::always_allow::StoreCache::new(path));
+                let frame = local_mcp_frame("r3", "g3", grant.clone());
+                next.inner
+                    .adapter
+                    .borrow_mut()
+                    .feed(&serde_json::to_string(&frame).unwrap());
+                assert_eq!(
+                    next.inner.gate_approval(frame).1,
+                    decision == Decision::AllowAlways
+                );
+                for definition in [false, true] {
+                    let mut changed = grant.clone();
+                    if definition {
+                        changed.server_revision = "c".repeat(64);
+                    } else {
+                        changed.schema_revision = "c".repeat(64);
+                    }
+                    let frame =
+                        local_mcp_frame(if definition { "r4" } else { "r5" }, "g3", changed);
+                    next.inner
+                        .adapter
+                        .borrow_mut()
+                        .feed(&serde_json::to_string(&frame).unwrap());
+                    assert!(!next.inner.gate_approval(frame).1);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn local_mcp_grants_wait_for_the_exact_runner_acknowledgement() {
+        use agent_core::local_mcp::{ApprovalStamp, Grant};
+        for answer in ["matching", "stale", "missing", "expired", "denied"] {
+            in_loop(|_| {
+                let store = Rc::new(Store::open_in_memory().unwrap());
+                let thread = fresh(&store, "/work");
+                let (session, _) = harness(
+                    Box::new(agent_core::local_agent::LocalAdapter::new()),
+                    open_session("unused", vec![], "/work"),
+                    &store,
+                    &thread,
+                );
+                let stamp = ApprovalStamp {
+                    request_id: "r1".into(),
+                    generation: "g1".into(),
+                    call_id: "c1".into(),
+                    grant: Grant {
+                        server_id: "example".into(),
+                        tool: "read".into(),
+                        server_revision: "a".repeat(64),
+                        schema_revision: "b".repeat(64),
+                    },
+                };
+                let action = crate::always_allow::Action::LocalMcp {
+                    grant: stamp.grant.clone(),
+                };
+                let rule = crate::always_allow::Rule::from_action(
+                    &action,
+                    &crate::always_allow::Context {
+                        driver: "local",
+                        workspace: Path::new("/work"),
+                        cwd: None,
+                        home: None,
+                    },
+                )
+                .unwrap();
+                session.inner.local_mcp_proposals.borrow_mut().insert(
+                    "r1".into(),
+                    (rule, Decision::AllowForSession, stamp.clone()),
+                );
+                assert!(session.inner.session_rules.borrow().rules.is_empty());
+                let event = if answer == "expired" {
+                    Event::ApprovalExpired
+                } else {
+                    Event::ApprovalResolved {
+                        decision: if answer == "denied" {
+                            Decision::Deny
+                        } else {
+                            Decision::AllowForSession
+                        },
+                    }
+                };
+                let mut env = Envelope::new(event).request("r1");
+                if answer != "missing" {
+                    let mut ack = stamp;
+                    if answer == "stale" {
+                        ack.generation = "other".into();
+                    }
+                    env = env.raw(serde_json::to_value(ack).unwrap());
+                }
+                session.inner.apply(&env);
+                assert!(session.inner.local_mcp_proposals.borrow().is_empty());
+                assert_eq!(
+                    session.inner.session_rules.borrow().rules.len(),
+                    usize::from(answer == "matching"),
+                    "{answer}"
+                );
+                // A duplicate or late acknowledgement cannot recreate a consumed proposal.
+                session.inner.apply(&env);
+                assert_eq!(
+                    session.inner.session_rules.borrow().rules.len(),
+                    usize::from(answer == "matching")
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn local_mcp_cards_require_a_live_adapter_binding() {
+        use agent_core::local_mcp::{ApprovalCard, ApprovalStamp, Grant};
+        in_loop(|_| {
+            let store = Rc::new(Store::open_in_memory().unwrap());
+            let thread = fresh(&store, "/work");
+            let (session, _) = harness(
+                Box::new(agent_core::local_agent::LocalAdapter::new()),
+                open_session("unused", vec![], "/work"),
+                &store,
+                &thread,
+            );
+            let stamp = ApprovalStamp {
+                request_id: "r1".into(),
+                generation: "g1".into(),
+                call_id: "c1".into(),
+                grant: Grant {
+                    server_id: "example".into(),
+                    tool: "read".into(),
+                    server_revision: "a".repeat(64),
+                    schema_revision: "b".repeat(64),
+                },
+            };
+            let frame = Envelope::new(Event::ApprovalRequested {
+                tool: agent_core::local_mcp::APPROVAL_TOOL.into(),
+                title: None,
+                input: serde_json::to_value(ApprovalCard {
+                    binding: stamp,
+                    server_label: "Example".into(),
+                    arguments: serde_json::json!({}),
+                })
+                .unwrap(),
+                reason: None,
+                options: agent_core::local_mcp::APPROVAL_OPTIONS.to_vec(),
+                response: agent_core::event::ResponseCapability::Live,
+                remembers: None,
+            })
+            .request("r1");
+            let (rejected, auto) = session.inner.gate_approval(frame.clone());
+            assert!(!auto);
+            assert!(
+                matches!(rejected.event, Event::ApprovalRequested {options,..} if options == [Decision::Deny])
+            );
+            session
+                .inner
+                .adapter
+                .borrow_mut()
+                .feed(&serde_json::to_string(&frame).unwrap());
+            let (accepted, auto) = session.inner.gate_approval(frame.clone());
+            assert!(!auto);
+            assert!(
+                matches!(accepted.event, Event::ApprovalRequested {options,..} if options.contains(&Decision::AllowForSession))
+            );
+            session.inner.adapter.borrow_mut().on_exit(Some(1));
+            assert!(
+                matches!(session.inner.gate_approval(frame).0.event, Event::ApprovalRequested {options,..} if options == [Decision::Deny])
+            );
+        });
+    }
 
     #[test]
     fn local_settings_wait_for_a_turn_boundary_and_keep_the_native_conversation() {

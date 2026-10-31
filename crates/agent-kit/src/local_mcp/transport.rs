@@ -19,6 +19,7 @@ pub(super) struct ClientTransport<R, W> {
     writer: Arc<tokio::sync::Mutex<Option<W>>>,
     pending: Arc<Mutex<BTreeSet<String>>>,
     pub stale: Arc<std::sync::atomic::AtomicBool>,
+    pub closed: Arc<std::sync::atomic::AtomicBool>,
     pub failure: Arc<Mutex<Option<&'static str>>>,
     pub received_bytes: Arc<std::sync::atomic::AtomicUsize>,
     ended: bool,
@@ -31,6 +32,7 @@ impl<R: AsyncRead, W: AsyncWrite> ClientTransport<R, W> {
             writer: Arc::new(tokio::sync::Mutex::new(Some(writer))),
             pending: Default::default(),
             stale: Default::default(),
+            closed: Default::default(),
             failure: Default::default(),
             received_bytes: Default::default(),
             ended: false,
@@ -38,6 +40,8 @@ impl<R: AsyncRead, W: AsyncWrite> ClientTransport<R, W> {
     }
     fn fail(&mut self, why: &'static str) {
         self.ended = true;
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
         if let Ok(mut failure) = self.failure.lock() {
             *failure = Some(why);
         }
@@ -150,8 +154,17 @@ where
     }
     async fn close(&mut self) -> io::Result<()> {
         self.ended = true;
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
         self.writer.lock().await.take();
         Ok(())
+    }
+}
+
+impl<R, W> Drop for ClientTransport<R, W> {
+    fn drop(&mut self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }
 

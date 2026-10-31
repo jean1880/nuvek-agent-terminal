@@ -16,11 +16,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_core::event::{Envelope, Event, ItemKind, ItemStatus, StreamKind};
+use agent_core::redact::redact;
 use agent_core::redact::stream::{
     Limits, StreamKey, StreamSanitiser, DEFAULT_MAX_STREAMS, DEFAULT_PER_STREAM_BYTES,
     KEEP_CAPACITY, KEY_FIELD_PREFIX_BYTES, MAX_KEY_FIELD_BYTES,
 };
-use agent_core::redact::{redact, redact_keyed};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 
@@ -360,19 +360,23 @@ pub fn event_kind(event: &Event) -> String {
 /// inherit it, so `{"tokens": ["..."]}` is judged by "tokens".
 fn scrub_value(key: Option<&str>, v: Value) -> Value {
     match v {
-        Value::String(s) => Value::String(match key {
-            Some(k) => redact_keyed(k, &s),
-            None => redact(&s),
-        }),
+        Value::String(s) => Value::String(agent_core::redact::structured::redact_text(key, &s)),
         Value::Array(a) => Value::Array(a.into_iter().map(|v| scrub_value(key, v)).collect()),
-        Value::Object(o) => Value::Object(
-            o.into_iter()
-                .map(|(k, v)| {
-                    let v = scrub_value(Some(&k), v);
-                    (k, v)
-                })
-                .collect(),
-        ),
+        Value::Object(o) => {
+            let mut masked = serde_json::Map::new();
+            for (k, v) in o {
+                let enclosing = key
+                    .filter(|key| agent_core::redact::is_sensitive_name(key))
+                    .unwrap_or(&k);
+                let v = scrub_value(Some(enclosing), v);
+                let mut safe_key = redact(&k);
+                while masked.contains_key(&safe_key) {
+                    safe_key.push('_');
+                }
+                masked.insert(safe_key, v);
+            }
+            Value::Object(masked)
+        }
         other => other,
     }
 }
@@ -4956,16 +4960,41 @@ mod tests {
             "api_key": "plain-secret-9981", // gitleaks:allow
             "nested": {"db": {"Password": "hunter2hunter2"}, "list": [{"client_secret": "abcdefgh5678"}]}, // gitleaks:allow
             "note": "fine"
+            ,"tokens":["array-private-1111",["nested-private-2222"],{"ordinary":["object-private-3333"]}]
         }));
         s.append_event(&t, None, &env).expect("append");
         let stored = serde_json::to_string(&s.events(&t, None, 10).expect("ev")).expect("json");
-        for leaked in ["plain-secret-9981", "hunter2hunter2", "abcdefgh5678"] {
+        for leaked in [
+            "plain-secret-9981",
+            "hunter2hunter2",
+            "abcdefgh5678",
+            "array-private",
+            "nested-private",
+            "object-private",
+        ] {
             assert!(!stored.contains(leaked), "{leaked} leaked: {stored}");
         }
         assert!(
             stored.contains("****9981") && stored.contains("\"fine\""),
             "{stored}"
         );
+    }
+
+    #[test]
+    fn json_encoded_sequences_and_keys_are_scrubbed_without_losing_records() {
+        let s = store();
+        let t = s.create_thread("/", None).unwrap();
+        let key = format!("ghp_{}", "a".repeat(32));
+        let encoded = format!("{{\"tokens\":[\"array-private-1111\",[\"nested-private-2222\"]]}}\n{{\"{key}\":\"visible\"}}\n");
+        let env = Envelope::new(Event::Unknown)
+            .raw(serde_json::json!({key.clone():"ordinary","encoded":encoded,"tail":"retained"}));
+        s.append_event(&t, None, &env).unwrap();
+        let stored = serde_json::to_string(&s.events(&t, None, 10).unwrap()).unwrap();
+        for part in [&key, "array-private", "nested-private"] {
+            assert!(!stored.contains(part));
+        }
+        assert!(stored.contains("retained"));
+        assert!(stored.contains("visible"));
     }
 
     #[test]

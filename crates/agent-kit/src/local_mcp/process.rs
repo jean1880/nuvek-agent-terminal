@@ -16,32 +16,201 @@ const STDERR_LINE_BYTES: usize = 128 * 1024;
 
 // No Debug implementations for resolved credentials or raw process data.
 #[derive(Clone, Default)]
-pub(super) struct Scrubber(Vec<String>);
+pub struct Scrubber(Vec<String>);
 impl Scrubber {
+    pub(super) fn for_configs(
+        configs: &[McpServerConfig],
+        effective: &BTreeMap<String, String>,
+    ) -> Self {
+        let mut values: Vec<String> = configs
+            .iter()
+            .filter(|c| c.enabled)
+            .flat_map(|c| c.env.values())
+            .filter_map(|v| match v {
+                EnvironmentValue::Reference { from_env } => effective.get(from_env),
+                _ => None,
+            })
+            .filter(|v| !v.is_empty())
+            .flat_map(|v| {
+                std::iter::once(v.clone()).chain(
+                    v.split(['\r', '\n'])
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_owned),
+                )
+            })
+            .collect();
+        values.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
+        values.dedup();
+        Self(values)
+    }
+    /// Strict hand-off: changed object keys cannot preserve call identity or schema meaning.
     pub fn value(&self, value: &mut serde_json::Value) -> Result<(), &'static str> {
+        if self.walk_value(None, value) {
+            Err("Arguments cannot be shown faithfully after secret masking: JSON keys, structure or escape spelling would change.")
+        } else {
+            Ok(())
+        }
+    }
+    /// Persistence must retain the surrounding record even when a key needs masking.
+    pub fn value_lossy(&self, value: &mut serde_json::Value) {
+        self.walk_value(None, value);
+    }
+    fn walk_value(&self, parent: Option<&str>, value: &mut serde_json::Value) -> bool {
+        self.walk_value_at(parent, value, 0, &mut (32 * 1024 * 1024))
+    }
+    fn walk_value_at(
+        &self,
+        parent: Option<&str>,
+        value: &mut serde_json::Value,
+        depth: usize,
+        remaining: &mut usize,
+    ) -> bool {
+        let cost = value.as_str().map_or(1, str::len);
+        if depth > 128 || cost > *remaining {
+            *value = serde_json::Value::String("[JSON masking limit exceeded.]".into());
+            return true;
+        }
+        *remaining -= cost;
         match value {
-            serde_json::Value::String(text) => *text = self.scrub(text),
-            serde_json::Value::Array(values) => {
-                for value in values {
-                    self.value(value)?;
+            serde_json::Value::String(text) => {
+                let mut nested_changed = false;
+                let masked = agent_core::redact::structured::mask_json(
+                    text,
+                    parent,
+                    |key, decoded, is_key| {
+                        if is_key {
+                            return self.scrub(decoded);
+                        }
+                        let mut value = serde_json::Value::String(decoded.into());
+                        nested_changed |= self.walk_value_at(key, &mut value, depth + 1, remaining);
+                        value
+                            .as_str()
+                            .unwrap_or("[Sensitive text withheld.]")
+                            .to_owned()
+                    },
+                );
+                match masked {
+                    Ok(Some(masked)) => {
+                        // Check original source provenance, never the generated mask markers.
+                        // Every decoded string was scrubbed by the callback; credentials in
+                        // syntax or spanning tokens cannot be masked as JSON string values.
+                        let residual = self.unmasked_json_secret(text, &masked.strings);
+                        *text = if residual {
+                            "[Sensitive JSON text withheld.]".into()
+                        } else {
+                            masked.text
+                        };
+                        masked.keys_changed || masked.spelling_changed || nested_changed || residual
+                    }
+                    Ok(None) => {
+                        *text = parent.map_or_else(
+                            || self.scrub(text),
+                            |key| agent_core::redact::redact_keyed(key, &self.scrub(text)),
+                        );
+                        false
+                    }
+                    Err(_) => {
+                        *text = "[Sensitive JSON text withheld.]".into();
+                        true
+                    }
                 }
+            }
+            serde_json::Value::Array(values) => {
+                let mut changed = false;
+                for value in values {
+                    changed |= self.walk_value_at(parent, value, depth + 1, remaining);
+                }
+                changed
             }
             serde_json::Value::Object(values) => {
-                for (key, value) in values {
-                    if self.scrub(key) != *key {
-                        return Err("MCP JSON contains a sensitive object key.");
+                let mut changed = false;
+                for (key, mut value) in std::mem::take(values) {
+                    let mut safe_key = self.scrub(&key);
+                    changed |= safe_key != key;
+                    // A sensitive ancestor remains authoritative through arrays and objects.
+                    let enclosing = parent
+                        .filter(|key| agent_core::redact::is_sensitive_name(key))
+                        .unwrap_or(&key);
+                    changed |=
+                        self.walk_value_at(Some(enclosing), &mut value, depth + 1, remaining);
+                    while values.contains_key(&safe_key) {
+                        safe_key.push('_');
                     }
-                    self.value(value)?;
-                    if let serde_json::Value::String(text) = value {
-                        *text = agent_core::redact::redact_keyed(key, text);
-                    }
+                    values.insert(safe_key, value);
                 }
+                changed
             }
-            _ => {}
+            _ => false,
         }
-        Ok(())
+    }
+
+    fn unmasked_json_secret(&self, text: &str, strings: &[std::ops::Range<usize>]) -> bool {
+        let mut at = 0;
+        let mut checked = None;
+        while at < text.len() {
+            if let Some(secret) = self
+                .0
+                .iter()
+                .find(|secret| !secret.is_empty() && text[at..].starts_with(secret.as_str()))
+            {
+                let index = strings.partition_point(|span| span.end <= at);
+                let Some(span) = strings
+                    .get(index)
+                    .filter(|span| span.start < at && at + secret.len() < span.end)
+                else {
+                    return true;
+                };
+                if checked != Some(index) {
+                    let original = &text[span.clone()];
+                    let decoded = serde_json::from_str::<String>(original);
+                    let masked = serde_json::from_str::<String>(&self.scrub_exact(original));
+                    // A lexical match crossing JSON escapes/delimiters may not be a decoded
+                    // secret value. Refuse rather than leave that source spelling exposed.
+                    if !matches!((decoded, masked), (Ok(decoded), Ok(masked)) if masked == self.scrub_exact(&decoded))
+                    {
+                        return true;
+                    }
+                    checked = Some(index);
+                }
+                at += secret.len();
+            } else if let Some(ch) = text[at..].chars().next() {
+                at += ch.len_utf8();
+            }
+        }
+        false
+    }
+    pub fn longest_secret(&self) -> usize {
+        self.0.first().map_or(0, String::len)
+    }
+    /// Emit only a prefix whose secret matches can be decided using the retained lookahead.
+    pub fn drain_stream(&self, pending: &mut String, complete: bool) -> String {
+        let limit = if complete {
+            pending.len()
+        } else {
+            pending.len().saturating_sub(self.longest_secret())
+        };
+        let mut at = 0;
+        let mut safe = String::new();
+        while at < limit {
+            if let Some(secret) = self
+                .0
+                .iter()
+                .find(|secret| pending[at..].starts_with(secret.as_str()))
+            {
+                safe.push_str("[REDACTED]");
+                at += secret.len();
+            } else if let Some(ch) = pending[at..].chars().next() {
+                safe.push(ch);
+                at += ch.len_utf8();
+            }
+        }
+        pending.drain(..at);
+        agent_core::redact::redact(&safe)
     }
     pub fn scrub(&self, text: &str) -> String {
+        agent_core::redact::redact(&self.scrub_exact(text))
+    }
+    fn scrub_exact(&self, text: &str) -> String {
         let mut safe = String::new();
         let mut at = 0;
         while at < text.len() {
@@ -57,7 +226,7 @@ impl Scrubber {
                 at += ch.len_utf8();
             }
         }
-        agent_core::redact::redact(&safe)
+        safe
     }
 }
 
@@ -328,6 +497,130 @@ mod tests {
             "id":"test","label":"Test","enabled":true,"command":"fixture","args":[],
             "cwd":"/","env":{},"tools":[],"approval":"ask","startup_timeout_secs":15,"call_timeout_secs":60
         })).unwrap()
+    }
+    #[test]
+    fn enclosing_sensitive_keys_mask_arrays_and_objects_and_lossy_keys_retain_records() {
+        let scrubber = Scrubber::default();
+        let mut value = json!({"tokens":["array-private-1111",["nested-private-2222"],{"innocent":["object-private-3333"]}],"safe":"visible"});
+        scrubber.value(&mut value).unwrap();
+        let encoded = value.to_string();
+        for secret in ["array-private", "nested-private", "object-private"] {
+            assert!(!encoded.contains(secret));
+        }
+        assert_eq!(value["safe"], "visible");
+        let key = format!("ghp_{}", "a".repeat(32));
+        let mut invalid = json!({key.clone():"retained","ordinary":"record"});
+        assert!(scrubber.value(&mut invalid).is_err());
+        let mut saved = json!({key.clone():"retained","ordinary":"record"});
+        scrubber.value_lossy(&mut saved);
+        assert_eq!(saved["ordinary"], "record");
+        assert!(!saved.to_string().contains(&key));
+        assert!(saved.to_string().contains("retained"));
+    }
+
+    #[test]
+    fn unfaithful_json_credentials_are_refused_before_approval() {
+        for secret in [
+            r#"{"ordinary":"json-private-1111"}"#,
+            r#"["json-private-2222"]"#,
+        ] {
+            let scrubber = Scrubber(vec![secret.into()]);
+            let mut value =
+                json!({"arguments":{"value":secret},"content":[{"type":"text","text":secret}]});
+            assert!(scrubber.value(&mut value).is_err());
+            assert!(!value.to_string().contains("json-private"));
+            assert!(value.to_string().contains("Sensitive JSON text withheld."));
+        }
+        let scrubber = Scrubber(vec!["password".into()]);
+        let mut value = json!({"text":r#"{"password":["opaque-private-12345"]}"#});
+        assert!(scrubber.value(&mut value).is_err());
+        assert!(!value.to_string().contains("opaque-private"));
+    }
+    #[test]
+    fn argument_text_is_masked_in_place_and_encoded_key_changes_refuse() {
+        let secret = "opaque-value-12345";
+        let scrubber = Scrubber(vec![secret.into()]);
+        for text in [
+            format!("[ -d . ] && echo visible # {secret}"),
+            format!("{{ echo visible; }} # {secret}"),
+            format!(" {{\n  \"value\" : \"{secret}\", \"visible\": true\n}} "),
+            format!("{{\"value\":\"{secret}\"}}\n{{\"second\":\"{secret}\"}}\n"),
+        ] {
+            let mut value = json!({"argument":text});
+            scrubber.value(&mut value).unwrap();
+            assert_eq!(value["argument"], text.replace(secret, "[REDACTED]"));
+        }
+        for text in [
+            format!("{{\"{secret}\":\"visible\"}}"),
+            format!(
+                "{{\"nested\":{}}}",
+                serde_json::to_string(&format!("{{\"{secret}\":\"visible\"}}")).unwrap()
+            ),
+        ] {
+            assert!(scrubber.value(&mut json!({"argument":text})).is_err());
+        }
+    }
+    #[test]
+    fn sensitive_parents_keep_encoded_containers_and_refuse_encoded_keys() {
+        let secret = "opaque-value-12345";
+        let scrubber = Scrubber(vec![secret.into()]);
+        for parent in ["key", "private_config", "tokens"] {
+            let text = r#"{"wipe":true,"values":["private-1111",{"ordinary":"private-2222"}]}"#;
+            let mut value = json!({parent:text});
+            scrubber.value(&mut value).unwrap();
+            let shown: serde_json::Value =
+                serde_json::from_str(value[parent].as_str().unwrap()).unwrap();
+            assert_eq!(shown["wipe"], true);
+            assert_eq!(shown["values"][0], "****1111");
+            assert_eq!(shown["values"][1]["ordinary"], "****2222");
+            let mut key = json!({parent:format!("{{\"{secret}\":\"visible\"}}")});
+            assert!(scrubber.value(&mut key).is_err());
+        }
+    }
+    #[test]
+    fn command_primitives_preserve_escapes_and_changed_json_escapes_refuse() {
+        let secret = "opaque-value-12345";
+        let scrubber = Scrubber(vec![secret.into()]);
+        let command = format!(r#""\u0065cho a\/b # {secret}""#);
+        let mut value = json!({"command":command});
+        scrubber.value(&mut value).unwrap();
+        assert_eq!(value["command"], command.replace(secret, "[REDACTED]"));
+        for text in [
+            format!(r#"{{"value":"\u0065cho # {secret}"}}"#),
+            format!(r#"{{"value":"echo a\/b # {secret}"}}"#),
+        ] {
+            assert!(scrubber.value(&mut json!({"argument":text})).is_err());
+        }
+    }
+    #[test]
+    fn residual_checks_ignore_inserted_markers_but_reject_original_syntax_secrets() {
+        for (secrets, input, expected) in [
+            (
+                vec!["ACT"],
+                r#"{"value":"ACT"}"#,
+                r#"{"value":"[REDACTED]"}"#,
+            ),
+            (
+                vec!["foo", "TED]"],
+                r#"{"tokens":["foo"]}"#,
+                r#"{"tokens":["****TED]"]}"#,
+            ),
+        ] {
+            let scrubber = Scrubber(secrets.into_iter().map(str::to_owned).collect());
+            let mut strict = json!({"argument":input});
+            scrubber.value(&mut strict).unwrap();
+            assert_eq!(strict["argument"], expected);
+            let mut saved = json!({"argument":input});
+            scrubber.value_lossy(&mut saved);
+            assert_eq!(saved, strict);
+        }
+        for (secret, input) in [
+            ("true", r#"{"value":true}"#),
+            (r#"\n"#, r#"{"value":"a\n ACT"}"#),
+        ] {
+            let scrubber = Scrubber(vec![secret.into(), "ACT".into()]);
+            assert!(scrubber.value(&mut json!({"argument":input})).is_err());
+        }
     }
     #[test]
     fn environment_only_exports_basics_and_explicit_values_and_rejects_controls() {

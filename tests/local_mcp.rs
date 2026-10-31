@@ -18,7 +18,7 @@ def send(value):
 def respond(request, result):
     send({'jsonrpc':'2.0','id':request['id'],'result':result})
 def tool(name='read'):
-    return {'name':name,'inputSchema':{'type':'object'}}
+    return {'name':name,'inputSchema':{'type':'object'},'annotations':{'readOnlyHint':True,'destructiveHint':False}}
 with open(folder + '/pids', 'a') as f: f.write(str(os.getpid()) + '\n')
 if scenario in ('descendant','stderr-flood','leader-exit','abrupt'):
     child = subprocess.Popen([sys.executable, '-c', 'import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(60)'])
@@ -73,6 +73,20 @@ for line in sys.stdin:
             result = {'tools':[dict(tool(str(page)),description='x'*700000)], 'nextCursor':str(page)}
         if scenario == 'duplicate': result['tools'] += [tool()]
         if scenario == 'secret-schema': result['tools'][0]['description'] = os.environ['TOKEN']
+        if scenario == 'content-change':
+            with open(folder + '/tool.json') as f: result['tools'] = [json.load(f)]
+        if scenario == 'strict-schema':
+            result['tools'][0]['inputSchema'] = {'type':'object','properties':{'value':{'type':'string','minLength':3}},'required':['value'],'additionalProperties':False}
+        if scenario == 'invalid-schema':
+            result['tools'][0]['inputSchema'] = {'type':'unknown-private-canary'}
+        if scenario == 'external-schema':
+            result['tools'][0]['inputSchema'] = {'$ref':'file:///tmp/private-canary.json'}
+        if scenario == 'backtracking-schema':
+            result['tools'][0]['inputSchema'] = {'type':'object','patternProperties':{'(?=private-canary)':{}}}
+        if scenario == 'budget-schema':
+            result['tools'].append(dict(tool('large'),description='x'*50000))
+        if scenario == 'changed-schema':
+            result['tools'][0]['inputSchema'] = {'type':'object','properties':{'value':{'type':'string','minLength':page}}}
         if scenario == 'environment':
             with open(folder + '/environment','w') as f: json.dump(dict(os.environ),f)
         result.update({'resultType':'complete','ttlMs':0,'cacheScope':'private'})
@@ -80,9 +94,20 @@ for line in sys.stdin:
         if scenario == 'changed' and page == 1:
             send({'jsonrpc':'2.0','method':'notifications/tools/list_changed'})
     elif method == 'tools/call':
+        with open(folder + '/executions','a') as f: f.write(json.dumps(request['params']) + '\n')
         if scenario == 'call-stall': time.sleep(60)
         if scenario == 'call-exit': sys.exit(0)
+        if scenario == 'call-error':
+            send({'jsonrpc':'2.0','id':request['id'],'error':{'code':-32000,'message':os.environ.get('TOKEN','error')}}); continue
+        if scenario == 'nested-secrets':
+            payload = {'tokens':['array-private-1111',['nested-private-2222'],{'ordinary':['object-private-3333']}]}
+            respond(request, {'resultType':'complete','content':[{'type':'text','text':json.dumps(payload)}], 'structuredContent':payload}); continue
+        if scenario == 'structured-result':
+            respond(request, {'resultType':'complete','isError':True,
+                'content':[{'type':'text','text':'雪'*20000},{'type':'image','data':'BINARY-CANARY'},{'type':'resource_link','uri':'https://example.com/no-fetch'}],
+                'structuredContent':{'nested':[{'value':os.environ.get('TOKEN','safe')}]}}); continue
         respond(request, {'resultType':'complete','content':[{'type':'text','text':os.environ.get('TOKEN','hello')}],'isError':True})
+        if scenario == 'changed-schema': send({'jsonrpc':'2.0','method':'notifications/tools/list_changed'})
 "#;
 
 fn config(folder: &Path, scenario: &str) -> McpServerConfig {
@@ -123,6 +148,93 @@ fn discover(session: &Session) -> Discovery {
         .unwrap()
         .recv_timeout(Duration::from_secs(20))
         .unwrap()
+}
+
+#[test]
+fn tool_content_revisions_survive_reconnect_and_unchanged_notifications_but_track_raw_metadata() {
+    let folder = tempfile::tempdir().unwrap();
+    let config = config(folder.path(), "changed");
+    let mut client = session(vec![config.clone()], BTreeMap::new());
+    let first = discover(&client)
+        .servers
+        .remove(0)
+        .registry
+        .remove(0)
+        .resolved;
+    std::thread::sleep(Duration::from_millis(50));
+    let refreshed = discover(&client)
+        .servers
+        .remove(0)
+        .registry
+        .remove(0)
+        .resolved;
+    assert_eq!(first.schema_revision, refreshed.schema_revision);
+    client.shutdown();
+    let mut client = session(vec![config.clone()], BTreeMap::new());
+    let restarted = discover(&client)
+        .servers
+        .remove(0)
+        .registry
+        .remove(0)
+        .resolved;
+    assert_eq!(first.schema_revision, restarted.schema_revision);
+    assert_eq!(first.server_revision, restarted.server_revision);
+    client.shutdown();
+    let mut definition = config;
+    definition.label = "Changed definition".into();
+    let mut client = session(vec![definition], BTreeMap::new());
+    let changed = discover(&client)
+        .servers
+        .remove(0)
+        .registry
+        .remove(0)
+        .resolved;
+    assert_eq!(first.schema_revision, changed.schema_revision);
+    assert_ne!(first.server_revision, changed.server_revision);
+    client.shutdown();
+    let config = crate::config(folder.path(), "content-change");
+    let mut revisions = std::collections::BTreeSet::new();
+    for tool in [
+        serde_json::json!({"name":"read","inputSchema":{"type":"object"},"description":"one"}),
+        serde_json::json!({"name":"read","inputSchema":{"type":"object"},"description":"two"}),
+        serde_json::json!({"name":"read","inputSchema":{"type":"object","required":["value"]},"description":"two"}),
+        serde_json::json!({"name":"read","inputSchema":{"type":"object"},"description":"two","annotations":{"readOnlyHint":true}}),
+    ] {
+        std::fs::write(folder.path().join("tool.json"), tool.to_string()).unwrap();
+        let mut client = session(vec![config.clone()], BTreeMap::new());
+        let tool = discover(&client)
+            .servers
+            .remove(0)
+            .registry
+            .remove(0)
+            .resolved;
+        assert!(revisions.insert(tool.schema_revision));
+        client.shutdown();
+    }
+    let mut config = crate::config(folder.path(), "secret-schema");
+    config.env.insert(
+        "TOKEN".into(),
+        EnvironmentValue::Reference {
+            from_env: "SOURCE".into(),
+        },
+    );
+    let mut raw_revisions = std::collections::BTreeSet::new();
+    let mut displayed = std::collections::BTreeSet::new();
+    for secret in ["opaque-private-value-one", "opaque-private-value-two"] {
+        let mut client = session(
+            vec![config.clone()],
+            BTreeMap::from([("SOURCE".into(), secret.into())]),
+        );
+        let snapshot = discover(&client).servers.remove(0);
+        assert!(raw_revisions.insert(snapshot.registry[0].resolved.schema_revision.clone()));
+        displayed.insert(snapshot.tools[0].description.clone());
+        client.shutdown();
+    }
+    assert_eq!(
+        displayed.len(),
+        1,
+        "displayed masking cannot replace raw content identity"
+    );
 }
 fn pids(folder: &Path) -> Vec<i32> {
     std::fs::read_to_string(folder.join("pids"))
@@ -641,4 +753,1311 @@ fn runner_stop_restarts_a_fresh_generation_and_stdin_eof_awaits_cleanup() {
         pids(folder.path()).iter().all(|pid| !alive(*pid)),
         "runner exited before cleanup"
     );
+}
+
+mod runner {
+    use super::*;
+    use agent_core::{
+        adapter::Command,
+        event::{Decision, Envelope, Event, TurnState},
+    };
+    use agent_kit::local_agent::{ChatClient, ReplyLine, Runner, RunnerInput};
+    use serde_json::{json, Value};
+    use std::{
+        collections::VecDeque,
+        io::Write,
+        sync::{
+            mpsc::{self, Receiver, Sender},
+            Arc, Mutex,
+        },
+    };
+
+    enum Reply {
+        Calls(Vec<(String, Value)>),
+        CallsAfterClose(PathBuf, Vec<(String, Value)>),
+        Cut(String),
+        Answer,
+        Stream {
+            field: &'static str,
+            chunks: Vec<String>,
+        },
+    }
+    struct Model {
+        replies: VecDeque<Reply>,
+        bodies: Arc<Mutex<Vec<Value>>>,
+    }
+    impl ChatClient for Model {
+        fn start(&mut self, body: &Value) -> Receiver<ReplyLine> {
+            self.bodies.lock().unwrap().push(body.clone());
+            let reply = match self.replies.pop_front().unwrap_or(Reply::Answer) {
+                Reply::CallsAfterClose(folder, calls) => {
+                    let pid = pids(&folder)[0];
+                    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+                    let guardian: i32 = stat
+                        .split_once(") ")
+                        .unwrap()
+                        .1
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    // SAFETY: PID belongs to our fixture process in the private test directory.
+                    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+                    let until = Instant::now() + Duration::from_secs(2);
+                    // The guardian keeps its inherited output descriptor until group cleanup.
+                    while (alive(pid) || alive(guardian)) && Instant::now() < until {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    assert!(!alive(pid) && !alive(guardian));
+                    std::thread::sleep(Duration::from_millis(50));
+                    Reply::Calls(calls)
+                }
+                other => other,
+            };
+            let (tx, rx) = mpsc::channel();
+            match reply {
+                Reply::CallsAfterClose(..) => unreachable!("closed before constructing the reply"),
+                Reply::Stream { field, chunks } => {
+                    for chunk in chunks {
+                        tx.send(Ok(format!(
+                            "data: {}",
+                            json!({"choices":[{"delta":{field:chunk}}]})
+                        )))
+                        .unwrap();
+                    }
+                    tx.send(Ok(
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}".into(),
+                    ))
+                    .unwrap();
+                    tx.send(Ok("data: [DONE]".into())).unwrap();
+                }
+                Reply::Calls(calls) => {
+                    let calls: Vec<_> = calls.into_iter().enumerate().map(|(index,(name,args))|
+                        json!({"index":index,"id":format!("call-{index}"),"type":"function","function":{"name":name,"arguments":args.to_string()}})).collect();
+                    tx.send(Ok(format!(
+                        "data: {}",
+                        json!({"choices":[{"delta":{"tool_calls":calls}}]})
+                    )))
+                    .unwrap();
+                    tx.send(Ok(
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}"
+                            .into(),
+                    ))
+                    .unwrap();
+                    tx.send(Ok("data: [DONE]".into())).unwrap();
+                }
+                Reply::Cut(name) => {
+                    tx.send(Ok(format!("data: {}",json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"cut","type":"function","function":{"name":name,"arguments":"{}"}}]}}]})))).unwrap();
+                    tx.send(Ok(
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}".into(),
+                    ))
+                    .unwrap();
+                }
+                Reply::Answer => {
+                    tx.send(Ok("data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}".into())).unwrap();
+                    tx.send(Ok("data: [DONE]".into())).unwrap();
+                }
+            }
+            rx
+        }
+    }
+    struct Output(Sender<Envelope>, Vec<u8>);
+    impl Write for Output {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.1.extend_from_slice(bytes);
+            while let Some(end) = self.1.iter().position(|b| *b == b'\n') {
+                let line: Vec<_> = self.1.drain(..=end).collect();
+                let _ = self.0.send(serde_json::from_slice(&line).unwrap());
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    struct Run {
+        input: Sender<RunnerInput>,
+        events: Receiver<Envelope>,
+        thread: std::thread::JoinHandle<i32>,
+        bodies: Arc<Mutex<Vec<Value>>>,
+        state: tempfile::TempDir,
+    }
+    impl Run {
+        fn new(
+            configs: Vec<McpServerConfig>,
+            mode: Mode,
+            env: BTreeMap<String, String>,
+            replies: Vec<Reply>,
+            budget: Option<agent_core::local_context::ContextBudget>,
+        ) -> Self {
+            let workspace = configs[0].cwd.clone();
+            let state = tempfile::tempdir().unwrap();
+            let bodies = Arc::new(Mutex::new(Vec::new()));
+            let model = Model {
+                replies: replies.into(),
+                bodies: bodies.clone(),
+            };
+            let session = session(configs.clone(), env);
+            let context = agent_core::local_context::LocalLaunchContext {
+                mcp_servers: configs,
+                budget: budget.unwrap_or_default(),
+                ..Default::default()
+            };
+            let (input, commands) = mpsc::channel();
+            let (out, events) = mpsc::channel();
+            let dir = state.path().to_owned();
+            let thread = std::thread::spawn(move || {
+                let args = agent_core::local_agent::RunnerArgs {
+                    server: "http://127.0.0.1:1".into(),
+                    cwd: workspace,
+                    model: Some("fixture".into()),
+                    mode,
+                    ..Default::default()
+                };
+                Runner::new(args, model, dir, Output(out, Vec::new()))
+                    .with_mcp_for_test(session)
+                    .run(&commands)
+            });
+            let run = Self {
+                input,
+                events,
+                thread,
+                bodies,
+                state,
+            };
+            run.send(Command::ConfigureLocal {
+                context: Box::new(context),
+            });
+            run
+        }
+        fn send(&self, command: Command) {
+            self.input.send(RunnerInput::Command(command)).unwrap();
+        }
+        fn next(&self) -> Envelope {
+            self.events
+                .recv_timeout(Duration::from_secs(12))
+                .expect("runner went quiet")
+        }
+        fn answer(&self, env: &Envelope, decision: Decision) {
+            let Event::ApprovalRequested { tool, input, .. } = &env.event else {
+                panic!("expected card")
+            };
+            if tool != agent_core::local_mcp::APPROVAL_TOOL {
+                self.send(Command::Approve {
+                    request: env.request.clone().unwrap(),
+                    decision,
+                    message: None,
+                    updated_input: None,
+                });
+                return;
+            }
+            let card: agent_core::local_mcp::ApprovalCard =
+                serde_json::from_value(input.clone()).unwrap();
+            self.send(Command::Approve {
+                request: env.request.clone().unwrap(),
+                decision,
+                message: None,
+                updated_input: Some(
+                    serde_json::to_value(agent_core::local_mcp::ApprovalAnswer {
+                        binding: card.binding,
+                        edited_arguments: None,
+                    })
+                    .unwrap(),
+                ),
+            });
+        }
+        fn turn(&self) -> Vec<Envelope> {
+            let mut events = Vec::new();
+            loop {
+                let env = self.next();
+                let complete = matches!(env.event, Event::TurnCompleted { .. });
+                if matches!(env.event, Event::ApprovalRequested { .. }) {
+                    self.answer(&env, Decision::Allow);
+                }
+                events.push(env);
+                if complete {
+                    return events;
+                }
+            }
+        }
+        fn finish(self) -> (Vec<Value>, String) {
+            self.input.send(RunnerInput::Closed).unwrap();
+            assert_eq!(self.thread.join().unwrap(), 0);
+            let transcript = std::fs::read_dir(self.state.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .find(|e| e.path().extension().is_some_and(|e| e == "json"))
+                .map(|e| std::fs::read_to_string(e.path()).unwrap())
+                .unwrap_or_default();
+            let bodies = self.bodies.lock().unwrap().clone();
+            (bodies, transcript)
+        }
+    }
+    fn mcp_alias() -> String {
+        agent_core::local_mcp::alias("fixture", "read").unwrap()
+    }
+
+    #[test]
+    fn split_environment_secrets_are_held_back_from_every_sse_delta() {
+        for field in ["content", "reasoning_content"] {
+            for chunks in [
+                vec!["canary-one-", "canary-two-canary-three"],
+                vec!["canary-one-", "canary-two-", "canary-three"],
+            ] {
+                let folder = tempfile::tempdir().unwrap();
+                let mut config = config(folder.path(), "modern");
+                config.env.insert(
+                    "TOKEN".into(),
+                    EnvironmentValue::Reference {
+                        from_env: "SOURCE".into(),
+                    },
+                );
+                let run = Run::new(
+                    vec![config],
+                    Mode::Ask,
+                    BTreeMap::from([(
+                        "SOURCE".into(),
+                        "canary-one-canary-two-canary-three".into(),
+                    )]),
+                    vec![Reply::Stream {
+                        field,
+                        chunks: chunks.iter().map(|s| s.to_string()).collect(),
+                    }],
+                    None,
+                );
+                run.send(Command::Prompt {
+                    text: "test".into(),
+                });
+                let events = run.turn();
+                let rendered = serde_json::to_string(&events).unwrap();
+                for part in ["canary-one", "canary-two", "canary-three"] {
+                    assert!(!rendered.contains(part), "{field}: leaked delta");
+                }
+                assert!(rendered.contains("REDACTED"));
+                let store = agent_kit::store::Store::open_in_memory().unwrap();
+                let thread = store.create_thread("/workspace", None).unwrap();
+                for event in events {
+                    store.append_event(&thread, None, &event).unwrap();
+                }
+                let persisted =
+                    serde_json::to_string(&store.events(&thread, None, 1000).unwrap()).unwrap();
+                let (_, transcript) = run.finish();
+                assert!(!persisted.contains("canary-one"));
+                assert!(!transcript.contains("canary-one"));
+            }
+        }
+    }
+
+    #[test]
+    fn sensitive_ancestor_keys_mask_arguments_text_results_and_structured_content() {
+        let folder = tempfile::tempdir().unwrap();
+        let run = Run::new(
+            vec![config(folder.path(), "nested-secrets")],
+            Mode::Ask,
+            BTreeMap::new(),
+            vec![Reply::Calls(vec![(
+                mcp_alias(),
+                json!({"tokens":["array-private-1111",["nested-private-2222"],{"ordinary":["object-private-3333"]}]}),
+            )])],
+            None,
+        );
+        run.send(Command::Prompt {
+            text: "test".into(),
+        });
+        let events = run.turn();
+        let store = agent_kit::store::Store::open_in_memory().unwrap();
+        let thread = store.create_thread("/workspace", None).unwrap();
+        for event in &events {
+            store.append_event(&thread, None, event).unwrap();
+        }
+        let persisted = serde_json::to_string(&store.events(&thread, None, 1000).unwrap()).unwrap();
+        let (bodies, transcript) = run.finish();
+        for safe in [
+            serde_json::to_string(&events).unwrap(),
+            persisted,
+            transcript,
+            serde_json::to_string(&bodies).unwrap(),
+        ] {
+            for part in ["array-private", "nested-private", "object-private"] {
+                assert!(!safe.contains(part), "sensitive ancestor leaked");
+            }
+        }
+        assert_eq!(calls(folder.path()).len(), 1);
+    }
+
+    #[test]
+    fn json_environment_credentials_never_escape_arguments_results_or_persistence() {
+        for secret in [
+            r#"{"ordinary":"json-private-1111"}"#,
+            r#"["json-private-2222"]"#,
+        ] {
+            let folder = tempfile::tempdir().unwrap();
+            let mut config = config(folder.path(), "modern");
+            config.env.insert(
+                "TOKEN".into(),
+                EnvironmentValue::Reference {
+                    from_env: "SOURCE".into(),
+                },
+            );
+            let run = Run::new(
+                vec![config],
+                Mode::Ask,
+                BTreeMap::from([("SOURCE".into(), secret.into())]),
+                vec![Reply::Calls(vec![(mcp_alias(), json!({"value":secret}))])],
+                None,
+            );
+            run.send(Command::Prompt {
+                text: "test".into(),
+            });
+            let events = run.turn();
+            let (bodies, transcript) = run.finish();
+            assert!(!serde_json::to_string(&events)
+                .unwrap()
+                .contains("json-private"));
+            assert!(!serde_json::to_string(&bodies)
+                .unwrap()
+                .contains("json-private"));
+            assert!(!transcript.contains("json-private"));
+        }
+    }
+
+    #[test]
+    fn disconnect_expires_pending_cards_and_late_answers_never_authorise_reconnection() {
+        let folder = tempfile::tempdir().unwrap();
+        let run = Run::new(
+            vec![config(folder.path(), "modern")],
+            Mode::Ask,
+            BTreeMap::new(),
+            vec![
+                Reply::Calls(vec![(mcp_alias(), json!({}))]),
+                Reply::Answer,
+                Reply::Calls(vec![(mcp_alias(), json!({}))]),
+            ],
+            None,
+        );
+        run.send(Command::Prompt {
+            text: "first".into(),
+        });
+        let card = loop {
+            let env = run.next();
+            if matches!(env.event, Event::ApprovalRequested { .. }) {
+                break env;
+            }
+        };
+        let pid = pids(folder.path())[0];
+        // SAFETY: this PID belongs to the fixture process recorded in our private directory.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        let events = run.turn();
+        assert!(events
+            .iter()
+            .any(|e| e.request == card.request && matches!(e.event, Event::ApprovalExpired)));
+        assert!(events.iter().any(|e| matches!(&e.event,Event::ItemCompleted {status:agent_core::event::ItemStatus::Failed,error:Some(error),..} if error.contains("The MCP connection closed before the call was approved."))));
+        assert!(!events.iter().any(
+            |e| e.request == card.request && matches!(e.event, Event::ApprovalResolved { .. })
+        ));
+        run.send(Command::Prompt {
+            text: "second".into(),
+        });
+        let fresh = loop {
+            let env = run.next();
+            if matches!(env.event, Event::ApprovalRequested { .. }) {
+                break env;
+            }
+        };
+        assert_ne!(card.request, fresh.request);
+        run.answer(&card, Decision::AllowAlways);
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(calls(folder.path()).is_empty());
+        run.answer(&fresh, Decision::Deny);
+        run.turn();
+        run.finish();
+        assert!(calls(folder.path()).is_empty());
+        assert_dead(folder.path());
+    }
+    fn calls(folder: &Path) -> Vec<Value> {
+        std::fs::read_to_string(folder.join("executions"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn approvals_show_the_executed_arguments_with_only_secret_values_masked() {
+        let secret = "opaque-value-12345";
+        let commands = [
+            format!("[ -d . ] && printf '%s' '{secret}' > marker"),
+            format!("{{ printf '%s' '{secret}' > marker; }}"),
+        ];
+        let arguments = commands
+            .into_iter()
+            .map(|command| ("run_command", json!({"command": command})))
+            .chain([
+                ("write_file", json!({"file_path": "marker", "content": format!("[link](example.com) # {secret}")})),
+                ("write_file", json!({"file_path": "marker", "content": format!("{{ \"value\" : \"{secret}\" }}")})),
+                ("mcp", json!({"value": format!("{{ \"value\" : \"{secret}\" }}")})),
+            ]);
+        for (tool, argument) in arguments {
+            let folder = tempfile::tempdir().unwrap();
+            let mut config = config(folder.path(), "modern");
+            config.env.insert(
+                "TOKEN".into(),
+                EnvironmentValue::Reference {
+                    from_env: "SOURCE".into(),
+                },
+            );
+            let name = if tool == "mcp" {
+                mcp_alias()
+            } else {
+                tool.into()
+            };
+            let run = Run::new(
+                vec![config],
+                Mode::Ask,
+                BTreeMap::from([("SOURCE".into(), secret.into())]),
+                vec![Reply::Calls(vec![(name, argument.clone())])],
+                None,
+            );
+            run.send(Command::Prompt {
+                text: "test".into(),
+            });
+            let events = run.turn();
+            let card = events
+                .iter()
+                .find_map(|e| match &e.event {
+                    Event::ApprovalRequested { input, .. } => Some(if tool == "mcp" {
+                        input["arguments"].clone()
+                    } else {
+                        input.clone()
+                    }),
+                    _ => None,
+                })
+                .expect("complete card");
+            let expected: Value =
+                serde_json::from_str(&argument.to_string().replace(secret, "[REDACTED]")).unwrap();
+            assert_eq!(card, expected);
+            if tool == "mcp" {
+                assert_eq!(calls(folder.path())[0]["arguments"], argument);
+            } else {
+                let actual = std::fs::read_to_string(folder.path().join("marker")).unwrap();
+                assert_eq!(
+                    actual,
+                    argument
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or(secret)
+                );
+            }
+            run.finish();
+        }
+        for (secret, argument) in [
+            (
+                "opaque-value-12345",
+                json!({"value":"{\"opaque-value-12345\":\"visible\"}"}),
+            ),
+            ("approval", json!({"value":"visible"})),
+        ] {
+            let folder = tempfile::tempdir().unwrap();
+            let mut config = config(folder.path(), "modern");
+            config.env.insert(
+                "TOKEN".into(),
+                EnvironmentValue::Reference {
+                    from_env: "SOURCE".into(),
+                },
+            );
+            let run = Run::new(
+                vec![config],
+                Mode::Ask,
+                BTreeMap::from([("SOURCE".into(), secret.into())]),
+                vec![Reply::Calls(vec![(mcp_alias(), argument)])],
+                None,
+            );
+            run.send(Command::Prompt {
+                text: "test".into(),
+            });
+            let events = run.turn();
+            assert!(!events
+                .iter()
+                .any(|e| matches!(e.event, Event::ApprovalRequested { .. })));
+            assert!(calls(folder.path()).is_empty());
+            run.finish();
+        }
+    }
+
+    #[test]
+    fn structural_approval_cards_preserve_sensitive_containers_and_mask_provenance() {
+        for (secret, argument, expected) in [
+            (
+                "ACT",
+                json!({"value":r#"{"message":"ACT"}"#}),
+                Some(json!({"value":r#"{"message":"[REDACTED]"}"#})),
+            ),
+            (
+                "opaque-value-12345",
+                json!({"private_config":r#"{"wipe":true}"#}),
+                Some(json!({"private_config":r#"{"wipe":true}"#})),
+            ),
+            (
+                "opaque-value-12345",
+                json!({"key":r#"{"opaque-value-12345":"visible"}"#}),
+                None,
+            ),
+            (
+                "opaque-value-12345",
+                json!({"value":r#"{"message":"\u0065cho a\/b opaque-value-12345"}"#}),
+                None,
+            ),
+        ] {
+            let folder = tempfile::tempdir().unwrap();
+            let mut config = config(folder.path(), "modern");
+            config.env.insert(
+                "TOKEN".into(),
+                EnvironmentValue::Reference {
+                    from_env: "SOURCE".into(),
+                },
+            );
+            let run = Run::new(
+                vec![config],
+                Mode::Ask,
+                BTreeMap::from([("SOURCE".into(), secret.into())]),
+                vec![Reply::Calls(vec![(mcp_alias(), argument.clone())])],
+                None,
+            );
+            run.send(Command::Prompt {
+                text: "test".into(),
+            });
+            let events = run.turn();
+            let card = events.iter().find_map(|event| match &event.event {
+                Event::ApprovalRequested { input, .. } => Some(input["arguments"].clone()),
+                _ => None,
+            });
+            assert_eq!(card, expected);
+            if card.is_some() {
+                assert_eq!(calls(folder.path())[0]["arguments"], argument);
+            } else {
+                assert!(calls(folder.path()).is_empty());
+                assert!(events.iter().any(|event| matches!(
+                    event.event,
+                    Event::ItemCompleted {
+                        status: agent_core::event::ItemStatus::Failed,
+                        ..
+                    }
+                )));
+            }
+            run.finish();
+        }
+    }
+
+    #[test]
+    fn prose_snapshots_match_streamed_deltas_and_preserve_json_formatting() {
+        let secret = "opaque-value-12345";
+        for reply in [
+            format!("[link](https://example.com) mentions {secret} and keeps the rest."),
+            format!("{{\n  \"message\" : \"{secret}\",\n  \"number\" : 2\n}}\n"),
+        ] {
+            let folder = tempfile::tempdir().unwrap();
+            let mut config = config(folder.path(), "modern");
+            config.env.insert(
+                "TOKEN".into(),
+                EnvironmentValue::Reference {
+                    from_env: "SOURCE".into(),
+                },
+            );
+            let run = Run::new(
+                vec![config],
+                Mode::Ask,
+                BTreeMap::from([("SOURCE".into(), secret.into())]),
+                vec![Reply::Stream {
+                    field: "content",
+                    chunks: vec![reply.clone()],
+                }],
+                None,
+            );
+            run.send(Command::Prompt {
+                text: "test".into(),
+            });
+            let events = run.turn();
+            let deltas = events
+                .iter()
+                .filter_map(|e| match &e.event {
+                    Event::ContentDelta { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            let snapshot = events
+                .iter()
+                .find_map(|e| match &e.event {
+                    Event::ContentSnapshot { text, .. } => Some(text),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(*snapshot, reply.replace(secret, "[REDACTED]"));
+            assert_eq!(*snapshot, deltas);
+            let (bodies, transcript) = run.finish();
+            assert_eq!(bodies.len(), 1);
+            assert!(!transcript.contains(secret));
+            let saved: Value = serde_json::from_str(&transcript).unwrap();
+            let assistant = saved["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|message| message["role"] == "assistant")
+                .unwrap();
+            assert_eq!(assistant["content"], reply.replace(secret, "[REDACTED]"));
+        }
+    }
+
+    #[test]
+    fn a_connection_closed_before_dispatch_never_opens_an_approval_card() {
+        let folder = tempfile::tempdir().unwrap();
+        let run = Run::new(
+            vec![config(folder.path(), "modern")],
+            Mode::Ask,
+            BTreeMap::new(),
+            vec![Reply::CallsAfterClose(
+                folder.path().to_owned(),
+                vec![(mcp_alias(), json!({}))],
+            )],
+            None,
+        );
+        run.send(Command::Prompt {
+            text: "test".into(),
+        });
+        let events = run.turn();
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e.event, Event::ApprovalRequested { .. })));
+        assert!(events.iter().any(|e|matches!(&e.event,Event::ItemCompleted {status:agent_core::event::ItemStatus::Failed,error:Some(error),..} if error.contains("The MCP connection closed before the call was approved."))));
+        assert!(calls(folder.path()).is_empty());
+        run.finish();
+    }
+
+    #[test]
+    fn each_mode_keeps_readonly_and_approval_separate_even_with_server_hints() {
+        for mode in [Mode::Plan, Mode::Ask, Mode::AcceptEdits, Mode::Bypass] {
+            for readonly in [true, false] {
+                for policy in [
+                    ApprovalPolicy::Ask,
+                    ApprovalPolicy::Allow,
+                    ApprovalPolicy::Deny,
+                ] {
+                    let folder = tempfile::tempdir().unwrap();
+                    let mut config = config(folder.path(), "modern");
+                    config.tools[0].read_only = readonly;
+                    config.approval = policy;
+                    let run = Run::new(
+                        vec![config],
+                        mode,
+                        BTreeMap::new(),
+                        vec![Reply::Calls(vec![(mcp_alias(), json!({}))])],
+                        None,
+                    );
+                    run.send(Command::Prompt {
+                        text: "test".into(),
+                    });
+                    let events = run.turn();
+                    let denied = policy == ApprovalPolicy::Deny || mode == Mode::Plan && !readonly;
+                    let asks = !denied && mode != Mode::Bypass && policy != ApprovalPolicy::Allow;
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|e| matches!(e.event, Event::ApprovalRequested { .. }))
+                            .count(),
+                        usize::from(asks),
+                        "{mode:?} {readonly} {policy:?}"
+                    );
+                    assert_eq!(
+                        calls(folder.path()).len(),
+                        usize::from(!denied),
+                        "{mode:?} {readonly} {policy:?}"
+                    );
+                    run.finish();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn registry_routes_exact_aliases_and_ignores_model_server_fields() {
+        let folder = tempfile::tempdir().unwrap();
+        let config = config(folder.path(), "modern");
+        let fake = "mcp__fixture__read".to_owned();
+        let run = Run::new(
+            vec![config],
+            Mode::Bypass,
+            BTreeMap::new(),
+            vec![Reply::Calls(vec![
+                (fake, json!({})),
+                (
+                    mcp_alias(),
+                    json!({"server":"forged-server","tool":"forged-tool"}),
+                ),
+            ])],
+            None,
+        );
+        run.send(Command::Prompt {
+            text: "test".into(),
+        });
+        run.turn();
+        assert_eq!(calls(folder.path()).len(), 1);
+        assert_eq!(calls(folder.path())[0]["name"], "read");
+        assert_eq!(
+            calls(folder.path())[0]["arguments"]["server"],
+            "forged-server"
+        );
+        let (bodies, _) = run.finish();
+        let tools = bodies[0]["tools"].as_array().unwrap();
+        assert!(tools[..6]
+            .iter()
+            .all(|t| !t["function"]["name"].as_str().unwrap().starts_with("mcp_")));
+        assert_eq!(tools.last().unwrap()["function"]["name"], mcp_alias());
+    }
+
+    #[test]
+    fn invalid_arguments_and_uncompilable_schemas_never_reach_approval_or_dispatch() {
+        for scenario in [
+            "strict-schema",
+            "invalid-schema",
+            "external-schema",
+            "backtracking-schema",
+        ] {
+            let folder = tempfile::tempdir().unwrap();
+            let run = Run::new(
+                vec![config(folder.path(), scenario)],
+                Mode::Bypass,
+                BTreeMap::new(),
+                vec![Reply::Calls(vec![(
+                    mcp_alias(),
+                    json!({"value":"private-canary","unexpected":true}),
+                )])],
+                None,
+            );
+            run.send(Command::Prompt {
+                text: "test".into(),
+            });
+            let events = run.turn();
+            assert!(events
+                .iter()
+                .all(|e| !matches!(e.event, Event::ApprovalRequested { .. })));
+            assert!(calls(folder.path()).is_empty(), "{scenario}");
+            if scenario != "strict-schema" {
+                assert!(events.iter().any(|e| matches!(&e.event,Event::Notice {text} if text.contains("could not compile"))));
+            }
+            run.finish();
+        }
+    }
+
+    #[test]
+    fn cut_off_replies_and_over_budget_batches_execute_nothing() {
+        let folder = tempfile::tempdir().unwrap();
+        let run = Run::new(
+            vec![config(folder.path(), "modern")],
+            Mode::Bypass,
+            BTreeMap::new(),
+            vec![Reply::Cut(mcp_alias())],
+            None,
+        );
+        run.send(Command::Prompt {
+            text: "test".into(),
+        });
+        let events = run.turn();
+        assert!(events.iter().any(|e| matches!(
+            e.event,
+            Event::TurnCompleted {
+                state: TurnState::Failed,
+                ..
+            }
+        )));
+        assert!(calls(folder.path()).is_empty());
+        run.finish();
+        let run = Run::new(
+            vec![config(folder.path(), "modern")],
+            Mode::Bypass,
+            BTreeMap::new(),
+            vec![Reply::Calls(vec![
+                (mcp_alias(), json!({"large":"x".repeat(100_000)})),
+                (mcp_alias(), json!({})),
+            ])],
+            None,
+        );
+        run.send(Command::Prompt {
+            text: "test".into(),
+        });
+        run.turn();
+        assert!(calls(folder.path()).is_empty());
+        run.finish();
+    }
+
+    #[test]
+    fn stale_bindings_and_argument_edits_require_a_new_validated_approval() {
+        let folder = tempfile::tempdir().unwrap();
+        let run = Run::new(
+            vec![config(folder.path(), "strict-schema")],
+            Mode::Ask,
+            BTreeMap::new(),
+            vec![Reply::Calls(vec![(mcp_alias(), json!({"value":"first"}))])],
+            None,
+        );
+        run.send(Command::Prompt {
+            text: "test".into(),
+        });
+        let card = loop {
+            let env = run.next();
+            if matches!(env.event, Event::ApprovalRequested { .. }) {
+                break env;
+            }
+        };
+        let Event::ApprovalRequested { input, .. } = &card.event else {
+            unreachable!()
+        };
+        let original: agent_core::local_mcp::ApprovalCard =
+            serde_json::from_value(input.clone()).unwrap();
+        for field in ["generation", "server", "schema", "request", "arguments"] {
+            let mut stamp = original.binding.clone();
+            match field {
+                "generation" => stamp.generation.push('x'),
+                "server" => stamp.grant.server_revision = "0".repeat(64),
+                "schema" => stamp.grant.schema_revision = "0".repeat(64),
+                "request" => stamp.request_id.push('x'),
+                _ => stamp.call_id.push('x'),
+            }
+            run.send(Command::Approve {
+                request: card.request.clone().unwrap(),
+                decision: Decision::Allow,
+                updated_input: Some(json!({"binding":stamp,"edited_arguments":null})),
+                message: None,
+            });
+        }
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(calls(folder.path()).is_empty());
+        run.send(Command::Approve {
+            request: card.request.clone().unwrap(),
+            decision: Decision::Allow,
+            updated_input: Some(
+                json!({"binding":original.binding,"edited_arguments":{"value":"edited"}}),
+            ),
+            message: None,
+        });
+        let fresh = loop {
+            let env = run.next();
+            if matches!(env.event, Event::ApprovalRequested { .. }) {
+                break env;
+            }
+        };
+        assert_ne!(fresh.request, card.request);
+        assert!(calls(folder.path()).is_empty());
+        run.answer(&fresh, Decision::Allow);
+        run.turn();
+        assert_eq!(calls(folder.path())[0]["arguments"]["value"], "edited");
+        run.finish();
+    }
+
+    #[test]
+    fn invalid_edited_arguments_expire_the_card_without_dispatch_or_a_replacement_card() {
+        let folder = tempfile::tempdir().unwrap();
+        let run = Run::new(
+            vec![config(folder.path(), "strict-schema")],
+            Mode::Ask,
+            BTreeMap::new(),
+            vec![Reply::Calls(vec![(mcp_alias(), json!({"value":"first"}))])],
+            None,
+        );
+        run.send(Command::Prompt {
+            text: "test".into(),
+        });
+        let card = loop {
+            let env = run.next();
+            if matches!(env.event, Event::ApprovalRequested { .. }) {
+                break env;
+            }
+        };
+        let Event::ApprovalRequested { input, .. } = &card.event else {
+            unreachable!()
+        };
+        let original: agent_core::local_mcp::ApprovalCard =
+            serde_json::from_value(input.clone()).unwrap();
+        run.send(Command::Approve {
+            request: card.request.clone().unwrap(),
+            decision: Decision::Allow,
+            updated_input: Some(json!({"binding":original.binding,"edited_arguments":{"value":1}})),
+            message: None,
+        });
+        let events = run.turn();
+        assert!(events
+            .iter()
+            .any(|env| env.request == card.request && matches!(env.event, Event::ApprovalExpired)));
+        assert!(!events
+            .iter()
+            .any(|env| matches!(env.event, Event::ApprovalRequested { .. })));
+        assert!(calls(folder.path()).is_empty());
+        run.finish();
+    }
+
+    #[test]
+    fn builtins_and_mcp_share_a_batch_and_dispatch_serially() {
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(folder.path().join("example.txt"), "fixture bytes").unwrap();
+        let run = Run::new(
+            vec![config(folder.path(), "modern")],
+            Mode::Bypass,
+            BTreeMap::new(),
+            vec![Reply::Calls(vec![
+                ("read_file".into(), json!({"file_path":"example.txt"})),
+                (mcp_alias(), json!({})),
+            ])],
+            None,
+        );
+        run.send(Command::Prompt {
+            text: "test".into(),
+        });
+        let events = run.turn();
+        let started: Vec<_> = events
+            .iter()
+            .filter_map(|env| match &env.event {
+                Event::ItemStarted { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .collect();
+        assert!(started.contains(&agent_core::event::ItemKind::McpTool));
+        let (bodies, _) = run.finish();
+        let tools: Vec<_> = bodies[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .collect();
+        assert_eq!(tools.len(), 2);
+        assert!(tools[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("fixture bytes"));
+        assert_eq!(calls(folder.path()).len(), 1);
+        assert!(bodies[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["function"]["name"] == "read_file"));
+        assert!(bodies[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["function"]["name"] == mcp_alias()));
+    }
+
+    #[test]
+    fn runner_remembers_no_approval_and_stop_expires_pending_and_cancels_a_call() {
+        let folder = tempfile::tempdir().unwrap();
+        let run = Run::new(
+            vec![config(folder.path(), "modern")],
+            Mode::Ask,
+            BTreeMap::new(),
+            vec![Reply::Calls(vec![
+                (mcp_alias(), json!({})),
+                (mcp_alias(), json!({})),
+            ])],
+            None,
+        );
+        run.send(Command::Prompt {
+            text: "test".into(),
+        });
+        let mut count = 0;
+        loop {
+            let env = run.next();
+            if matches!(env.event, Event::ApprovalRequested { .. }) {
+                count += 1;
+                run.answer(&env, Decision::AllowForSession);
+            }
+            if matches!(env.event, Event::TurnCompleted { .. }) {
+                break;
+            }
+        }
+        assert_eq!(count, 2);
+        run.finish();
+        for mode in [Mode::Ask, Mode::Bypass] {
+            let folder = tempfile::tempdir().unwrap();
+            let run = Run::new(
+                vec![config(folder.path(), "call-stall")],
+                mode,
+                BTreeMap::new(),
+                vec![Reply::Calls(vec![
+                    (mcp_alias(), json!({})),
+                    (mcp_alias(), json!({})),
+                ])],
+                None,
+            );
+            run.send(Command::Prompt {
+                text: "test".into(),
+            });
+            if mode == Mode::Ask {
+                loop {
+                    if matches!(run.next().event, Event::ApprovalRequested { .. }) {
+                        break;
+                    }
+                }
+            } else {
+                let until = Instant::now() + Duration::from_secs(3);
+                while calls(folder.path()).is_empty() && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            run.send(Command::Interrupt);
+            let events = run.turn();
+            assert!(events.iter().any(|e| matches!(
+                e.event,
+                Event::TurnCompleted {
+                    state: TurnState::Interrupted,
+                    ..
+                }
+            )));
+            assert_eq!(
+                calls(folder.path()).len(),
+                usize::from(mode == Mode::Bypass)
+            );
+            let (_, transcript) = run.finish();
+            let transcript: Value = serde_json::from_str(&transcript).unwrap();
+            assert_eq!(
+                transcript["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|m| m["role"] == "tool")
+                    .count(),
+                2
+            );
+            assert_dead(folder.path());
+        }
+    }
+
+    #[test]
+    fn errors_disconnects_and_timeouts_are_never_replayed() {
+        for scenario in ["call-stall", "call-exit", "call-error"] {
+            let folder = tempfile::tempdir().unwrap();
+            let run = Run::new(
+                vec![config(folder.path(), scenario)],
+                Mode::Bypass,
+                BTreeMap::new(),
+                vec![Reply::Calls(vec![(mcp_alias(), json!({}))])],
+                None,
+            );
+            run.send(Command::Prompt {
+                text: "test".into(),
+            });
+            run.turn();
+            assert_eq!(calls(folder.path()).len(), 1);
+            let (bodies, _) = run.finish();
+            assert_eq!(bodies.len(), 2);
+            let result = bodies[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["role"] == "tool")
+                .unwrap()["content"]
+                .as_str()
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(result).unwrap()["isError"],
+                true
+            );
+        }
+    }
+
+    #[test]
+    fn a_restrictive_mode_change_cancels_an_active_mcp_call_without_replay() {
+        let folder = tempfile::tempdir().unwrap();
+        let run = Run::new(
+            vec![config(folder.path(), "call-stall")],
+            Mode::Bypass,
+            BTreeMap::new(),
+            vec![Reply::Calls(vec![(mcp_alias(), json!({}))])],
+            None,
+        );
+        run.send(Command::Prompt {
+            text: "test".into(),
+        });
+        let until = Instant::now() + Duration::from_secs(4);
+        while calls(folder.path()).is_empty() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(calls(folder.path()).len(), 1);
+        run.send(Command::SetMode { mode: Mode::Ask });
+        let events = run.turn();
+        assert!(events
+            .iter()
+            .any(|env| matches!(env.event, Event::ModeChanged { mode: Mode::Ask })));
+        assert!(events.iter().any(|env| matches!(
+            env.event,
+            Event::TurnCompleted {
+                state: TurnState::Interrupted,
+                ..
+            }
+        )));
+        let (_, transcript) = run.finish();
+        assert_eq!(calls(folder.path()).len(), 1);
+        assert!(transcript.contains("outcome may be unknown"));
+        assert_dead(folder.path());
+    }
+
+    #[test]
+    fn secret_canaries_never_reach_cards_results_or_transcripts_even_after_disconnect() {
+        for scenario in ["modern", "structured-result", "call-error", "call-exit"] {
+            let folder = tempfile::tempdir().unwrap();
+            let mut config = config(folder.path(), scenario);
+            config.env.insert(
+                "TOKEN".into(),
+                EnvironmentValue::Reference {
+                    from_env: "SOURCE".into(),
+                },
+            );
+            let secret = "unpatterned-雪-\"credential\"-12345";
+            config.label = format!("Example {secret}");
+            let run = Run::new(
+                vec![config],
+                Mode::Ask,
+                BTreeMap::from([("SOURCE".into(), secret.into())]),
+                vec![Reply::Calls(vec![(
+                    mcp_alias(),
+                    json!({"nested":[{"value":secret}],"api_key":"another-private-value-123"}),
+                )])],
+                None,
+            );
+            run.send(Command::Prompt {
+                text: "test".into(),
+            });
+            let events = run.turn();
+            let rendered = serde_json::to_string(&events).unwrap();
+            assert!(!rendered.contains("unpatterned"));
+            assert!(!rendered.contains("another-private"));
+            let store = agent_kit::store::Store::open_in_memory().unwrap();
+            let thread = store.create_thread("/workspace", None).unwrap();
+            for event in &events {
+                store.append_event(&thread, None, event).unwrap();
+            }
+            let persisted =
+                serde_json::to_string(&store.events(&thread, None, 1000).unwrap()).unwrap();
+            assert!(!persisted.contains("unpatterned"));
+            assert!(!persisted.contains("another-private"));
+            let (bodies, transcript) = run.finish();
+            for body in &bodies {
+                let encoded = body.to_string();
+                assert!(!encoded.contains("unpatterned"));
+                assert!(!encoded.contains("another-private"));
+            }
+            assert!(
+                !transcript.contains("unpatterned"),
+                "{scenario}: {transcript}"
+            );
+            assert!(
+                !transcript.contains("another-private"),
+                "{scenario}: {transcript}"
+            );
+            assert_eq!(calls(folder.path()).len(), 1);
+            let result = bodies[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["role"] == "tool")
+                .unwrap()["content"]
+                .as_str()
+                .unwrap();
+            assert!(!result.contains("unpatterned"));
+            let parsed: Value = serde_json::from_str(result).unwrap();
+            assert_eq!(parsed["isError"], true);
+            assert!(result.len() <= 30000);
+            assert!(!result.contains("BINARY-CANARY"));
+            assert!(!result.contains("https://example.com/no-fetch"));
+        }
+    }
+
+    #[test]
+    fn whole_schema_exclusions_are_reported_once_and_never_execute() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut config = config(folder.path(), "budget-schema");
+        config.tools.push(McpToolPolicy {
+            name: "large".into(),
+            read_only: true,
+            approval: ApprovalPolicy::Inherit,
+        });
+        let large = agent_core::local_mcp::alias("fixture", "large").unwrap();
+        let run = Run::new(
+            vec![config],
+            Mode::Bypass,
+            BTreeMap::new(),
+            vec![
+                Reply::Calls(vec![(large.clone(), json!({})), (mcp_alias(), json!({}))]),
+                Reply::Calls(vec![(mcp_alias(), json!({}))]),
+            ],
+            None,
+        );
+        run.send(Command::Prompt {
+            text: "test".into(),
+        });
+        let events = run.turn();
+        assert_eq!(calls(folder.path()).len(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(
+                    |e| matches!(&e.event,Event::Notice {text} if text.starts_with("Excluded tool"))
+                )
+                .count(),
+            1
+        );
+        let (bodies, _) = run.finish();
+        for body in bodies {
+            assert!(body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|t| t["function"]["name"] != large));
+        }
+    }
+
+    #[test]
+    fn tool_list_changes_freeze_the_current_turn_and_invalidate_the_next_grant() {
+        let folder = tempfile::tempdir().unwrap();
+        let run = Run::new(
+            vec![config(folder.path(), "changed-schema")],
+            Mode::Ask,
+            BTreeMap::new(),
+            vec![
+                Reply::Calls(vec![(mcp_alias(), json!({"value":"abc"}))]),
+                Reply::Answer,
+                Reply::Calls(vec![(mcp_alias(), json!({"value":"abc"}))]),
+            ],
+            None,
+        );
+        let mut stamps = Vec::new();
+        for turn in ["one", "two"] {
+            run.send(Command::Prompt { text: turn.into() });
+            loop {
+                let env = run.next();
+                if let Event::ApprovalRequested { input, .. } = &env.event {
+                    stamps.push(
+                        serde_json::from_value::<agent_core::local_mcp::ApprovalCard>(
+                            input.clone(),
+                        )
+                        .unwrap()
+                        .binding,
+                    );
+                    run.answer(&env, Decision::AllowAlways);
+                }
+                if matches!(env.event, Event::TurnCompleted { .. }) {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        assert_eq!(stamps.len(), 2);
+        assert_ne!(
+            stamps[0].grant.schema_revision,
+            stamps[1].grant.schema_revision
+        );
+        assert_eq!(
+            stamps[0].grant.server_revision,
+            stamps[1].grant.server_revision
+        );
+        assert_eq!(calls(folder.path()).len(), 2);
+        run.finish();
+    }
 }

@@ -79,6 +79,7 @@ pub(crate) fn effect(driver: Driver, tool: &str, input: &Value) -> Effect {
                 ToolClass::Status | ToolClass::Exec | ToolClass::Unknown => Effect::Unknown,
             },
         },
+        Driver::Local if tool == agent_core::local_mcp::APPROVAL_TOOL => Effect::Mcp { own: false },
         Driver::Local => match agent_core::local_agent::Tool::from_name(tool) {
             Some(agent_core::local_agent::Tool::RunCommand) => Effect::Exec,
             Some(t) if t.writes() => Effect::Edit,
@@ -356,7 +357,7 @@ impl ApprovalGate for ChildAuthority {
                 read_auto_matchable(&abs, &root, self.home()) && canonically_inside(&abs, &root)
             }
             // A child uses no MCP server but agent-terminal's, which no rule covers.
-            Action::Mcp { .. } => false,
+            Action::Mcp { .. } | Action::LocalMcp { .. } => false,
         }
     }
 }
@@ -816,6 +817,20 @@ mod tests {
                 let v = f.gate(driver, mode).judge("Mystery", &json!({}), None);
                 assert!(is_ask_only(&v), "{driver:?} {mode:?}: {v:?}");
             }
+        }
+    }
+
+    #[test]
+    fn local_mcp_approval_is_unowned_mcp_and_cannot_bypass_child_authority() {
+        let f = Fixture::new();
+        let tool = agent_core::local_mcp::APPROVAL_TOOL;
+        assert_eq!(
+            effect(Driver::Local, tool, &json!({})),
+            Effect::Mcp { own: false }
+        );
+        for mode in TaskMode::ALL {
+            let gate = f.gate_with(Driver::Local, mode, Some(vec![]));
+            assert!(is_deny(&gate.judge(tool, &json!({}), None)));
         }
     }
 

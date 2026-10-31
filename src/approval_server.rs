@@ -1662,6 +1662,10 @@ pub(crate) fn remembers_text(
             path.clone()
         }
         crate::always_allow::Action::Mcp { server, tool } => format!("{server}/{tool}"),
+        crate::always_allow::Action::LocalMcp { grant } => format!(
+            "{}/{}; all arguments, only while the reviewed server/schema revisions remain active",
+            grant.server_id, grant.tool
+        ),
     }
 }
 

@@ -449,6 +449,9 @@ impl std::fmt::Display for AdapterError {
 impl std::error::Error for AdapterError {}
 
 pub trait Adapter {
+    fn local_mcp_approval(&self, _request: &str) -> Option<crate::local_mcp::ApprovalStamp> {
+        None
+    }
     fn driver(&self) -> Driver;
     fn capabilities(&self) -> &Capabilities;
     fn local_context(&self) -> Option<&crate::local_context::LocalLaunchContext> {

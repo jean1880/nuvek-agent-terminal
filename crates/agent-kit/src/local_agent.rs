@@ -350,6 +350,9 @@ enum Stop {
 }
 
 pub struct Runner<C: ChatClient, W: Write> {
+    mcp_connections: std::collections::BTreeMap<String, crate::local_mcp::ConnectionLease>,
+    registry: std::collections::BTreeMap<String, agent_core::local_mcp::RegistryTool>,
+    masks: crate::local_mcp::CredentialMasks,
     mcp: Option<crate::local_mcp::Session>,
     budget_notice_sent: bool,
     turn_instructions: agent_core::local_context::InstructionSnapshot,
@@ -377,6 +380,12 @@ pub struct Runner<C: ChatClient, W: Write> {
 }
 
 impl<C: ChatClient, W: Write> Runner<C, W> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_mcp_for_test(mut self, session: crate::local_mcp::Session) -> Self {
+        self.masks = session.masks();
+        self.mcp = Some(session);
+        self
+    }
     pub fn new(args: RunnerArgs, client: C, dir: PathBuf, out: W) -> Self {
         let session = args
             .resume
@@ -384,6 +393,9 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             .or_else(|| args.session_id.clone())
             .unwrap_or_else(new_session_id);
         Self {
+            mcp_connections: Default::default(),
+            registry: Default::default(),
+            masks: Default::default(),
             mcp: None,
             model: args.model.clone(),
             context: Default::default(),
@@ -409,11 +421,61 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
     }
 
     fn emit(&mut self, envelope: Envelope) {
-        if let Ok(line) = serde_json::to_string(&envelope) {
+        let Ok(mut value) = serde_json::to_value(&envelope) else {
+            return;
+        };
+        self.masks.value_lossy(&mut value);
+        match &envelope.event {
+            Event::ContentDelta { text, .. } | Event::ContentSnapshot { text, .. } => {
+                value["event"]["text"] = Value::String(self.masks.scrub(text));
+            }
+            Event::ItemCompleted { output, error, .. } => {
+                if let Some(output) = output {
+                    value["event"]["output"] = Value::String(self.masks.scrub(output));
+                }
+                if let Some(error) = error {
+                    value["event"]["error"] = Value::String(self.masks.scrub(error));
+                }
+            }
+            _ => {}
+        }
+        self.emit_value(value);
+    }
+
+    fn emit_value(&mut self, value: Value) {
+        if let Ok(line) = serde_json::to_string(&value) {
             // A closed stdout means the app is gone; the next read of stdin ends the run.
             let _ = writeln!(self.out, "{line}");
             let _ = self.out.flush();
         }
+    }
+
+    fn emit_approval(&mut self, envelope: Envelope) -> bool {
+        let Ok(mut value) = serde_json::to_value(&envelope) else {
+            return false;
+        };
+        let masked = self.masks.value(&mut value);
+        let intact = serde_json::from_value::<Envelope>(value.clone()).is_ok_and(|safe| {
+            safe.request == envelope.request
+                && safe.item == envelope.item
+                && match (&envelope.event, &safe.event) {
+                    (
+                        Event::ApprovalRequested { tool, input, .. },
+                        Event::ApprovalRequested {
+                            tool: shown,
+                            input: shown_input,
+                            ..
+                        },
+                    ) => tool == shown && input.get("binding") == shown_input.get("binding"),
+                    _ => false,
+                }
+        });
+        if masked.is_err() || !intact {
+            self.emit(Envelope::new(Event::Error {message:"The call was refused because its approval cannot be displayed faithfully after secret masking.".into()}));
+            return false;
+        }
+        self.emit_value(value);
+        true
     }
 
     fn id(&mut self, what: &str) -> String {
@@ -535,7 +597,6 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
     /// secret read from a file or typed in a prompt is never kept in the clear. The live
     /// conversation is left as it is, so this turn's next request still has it.
     fn save(&mut self) {
-        use agent_core::redact::redact;
         // What is kept is bounded, in whole exchanges, so it never grows past what can be sent.
         drop_oldest_until(&mut self.messages, |kept| {
             kept.iter().map(message_size).sum::<usize>() <= RETAIN_BUDGET
@@ -544,14 +605,14 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             .messages
             .iter()
             .map(|m| ChatMessage {
-                content: redact(&m.content),
+                content: m.content.clone(),
                 tool_calls: m
                     .tool_calls
                     .iter()
                     .map(|c| ToolCall {
                         function: agent_core::local_agent::ToolFunction {
                             name: c.function.name.clone(),
-                            arguments: redact(&c.function.arguments),
+                            arguments: self.safe_arguments(&c.function.arguments),
                         },
                         ..c.clone()
                     })
@@ -564,10 +625,12 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         // Never a file the loader would refuse: the oldest exchanges go until it fits, and with
         // only the latest left and still too large, nothing is kept.
         let encode = |messages: &[ChatMessage]| {
-            serde_json::to_vec(&Transcript {
+            let mut value = serde_json::to_value(Transcript {
                 model: self.model.clone(),
                 messages: messages.to_vec(),
-            })
+            })?;
+            self.masks.value_lossy(&mut value);
+            serde_json::to_vec(&value)
         };
         drop_oldest_until(&mut messages, |kept| {
             encode(kept).is_ok_and(|bytes| bytes.len() as u64 <= MAX_TRANSCRIPT_BYTES)
@@ -712,6 +775,8 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
     }
 
     fn prepare_mcp(&mut self, commands: &Receiver<RunnerInput>) -> Result<(), StepError> {
+        self.registry.clear();
+        self.mcp_connections.clear();
         if self.no_tools || !self.context.mcp_servers.iter().any(|server| server.enabled) {
             return Ok(());
         }
@@ -723,6 +788,9 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 )
                 .map_err(StepError::Failed)?,
             );
+            if let Some(session) = &self.mcp {
+                self.masks = session.masks();
+            }
         }
         let Some(session) = &self.mcp else {
             return Ok(());
@@ -736,9 +804,23 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 Ok(discovery) => {
                     let mut required_failed = false;
                     for server in discovery.servers {
+                        if let Some(connection) = server.connection {
+                            self.mcp_connections.insert(server.id.clone(), connection);
+                        }
                         required_failed |= server.required_failed;
                         for text in server.notices {
                             self.emit(Envelope::new(Event::Notice { text }));
+                        }
+                        for entry in server.registry {
+                            if self
+                                .registry
+                                .insert(entry.resolved.alias.clone(), entry)
+                                .is_some()
+                            {
+                                return Err(StepError::Failed(
+                                    "MCP alias collision; no calls were run.".into(),
+                                ));
+                            }
                         }
                     }
                     return if required_failed {
@@ -769,7 +851,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         use agent_core::local_context::{
             bound_result, compose_system, plan_request, reserve_batch, SchemaCandidate,
         };
-        let candidates: Vec<_> = if self.no_tools {
+        let mut candidates: Vec<_> = if self.no_tools {
             Vec::new()
         } else {
             tools_for(self.mode)
@@ -780,6 +862,22 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 })
                 .collect()
         };
+        if !self.no_tools {
+            candidates.extend(self.registry.values().map(|entry| {
+                SchemaCandidate {
+                    priority: match &entry.resolved.identity {
+                        agent_core::local_mcp::ToolIdentity::Mcp { server_id, .. } => self
+                            .context
+                            .mcp_servers
+                            .iter()
+                            .position(|s| &s.id == server_id)
+                            .unwrap_or(usize::MAX),
+                        _ => usize::MAX,
+                    },
+                    tool: entry.resolved.clone(),
+                }
+            }));
+        }
         let system = compose_system(
             &self.args.cwd,
             self.mode,
@@ -812,14 +910,22 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             let calls = runnable && !reply.tool_calls.is_empty();
             self.messages.push(ChatMessage {
                 tool_calls: if calls {
-                    reply.tool_calls.clone()
+                    reply
+                        .tool_calls
+                        .iter()
+                        .map(|call| {
+                            let mut safe = call.clone();
+                            safe.function.arguments = self.safe_arguments(&call.function.arguments);
+                            safe
+                        })
+                        .collect()
                 } else {
                     Vec::new()
                 },
                 // Sent back with its calls while this turn runs (`forget_reasoning`).
                 reasoning_content: (calls && !reply.reasoning.is_empty())
-                    .then(|| reply.reasoning.clone()),
-                ..ChatMessage::new("assistant", reply.text.clone())
+                    .then(|| self.safe_text(&reply.reasoning)),
+                ..ChatMessage::new("assistant", self.safe_text(&reply.text))
             });
         }
         if let Some(stop) = stopped {
@@ -875,21 +981,31 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             match self.call(call, commands, reservation, advertised) {
                 Ok(output) => self.messages.push(ChatMessage::tool_result(
                     &call.id,
-                    bound_result(&agent_core::redact::redact(&output), reservation),
+                    bound_result(&self.safe_text(&output), reservation),
                 )),
                 Err(stop) => {
-                    // Every call the reply made gets an answer, so the history stays one a
-                    // server accepts: this one and the rest did not run.
+                    // Every call gets an answer. The interrupted MCP call may already have
+                    // run; the remaining calls certainly did not.
                     let reason = if matches!(stop, StepError::Stop(Stop::InvalidInput(_))) {
                         "Not run: malformed input ended the turn."
                     } else {
                         "Not run: the user stopped the turn."
                     };
-                    for skipped in &reply.tool_calls[at..] {
-                        self.messages.push(ChatMessage::tool_result(
-                            &skipped.id,
-                            bound_result(reason, reservation),
-                        ));
+                    for (offset, skipped) in reply.tool_calls[at..].iter().enumerate() {
+                        let output = if offset == 0
+                            && self.registry.contains_key(&skipped.function.name)
+                        {
+                            // Cancellation can race with a server-side mutation. Never tell
+                            // a later request that the interrupted call certainly did not run.
+                            agent_core::local_mcp::result_text(
+                                &serde_json::json!({"isError":true,"content":[{"type":"text","text":"MCP call interrupted without a confirmed result; its outcome may be unknown. Do not retry automatically."}]}),
+                                reservation,
+                            )
+                        } else {
+                            bound_result(reason, reservation)
+                        };
+                        self.messages
+                            .push(ChatMessage::tool_result(&skipped.id, output));
                     }
                     return Err(stop);
                 }
@@ -1047,7 +1163,11 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 if let Some((_, all)) = &mut shown.reasoning {
                     all.push_str(&text);
                 }
-                self.emit(Envelope::delta(id, StreamKind::Reasoning, text));
+                shown.reasoning_pending.push_str(&text);
+                let safe = self.masks.drain_stream(&mut shown.reasoning_pending, false);
+                if !safe.is_empty() {
+                    self.emit(Envelope::delta(id, StreamKind::Reasoning, safe));
+                }
             }
             StreamEvent::Text(text) => {
                 // Reasoning ends where the answer starts.
@@ -1070,7 +1190,11 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 if let Some((_, all)) = &mut shown.text {
                     all.push_str(&text);
                 }
-                self.emit(Envelope::delta(id, StreamKind::Assistant, text));
+                shown.text_pending.push_str(&text);
+                let safe = self.masks.drain_stream(&mut shown.text_pending, false);
+                if !safe.is_empty() {
+                    self.emit(Envelope::delta(id, StreamKind::Assistant, safe));
+                }
             }
             StreamEvent::Usage(prompt, completion) => {
                 usage.input_tokens += prompt;
@@ -1082,6 +1206,10 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
 
     fn close_reasoning(&mut self, shown: &mut Shown) {
         if let Some((id, all)) = shown.reasoning.take() {
+            let safe = self.masks.drain_stream(&mut shown.reasoning_pending, true);
+            if !safe.is_empty() {
+                self.emit(Envelope::delta(&id, StreamKind::Reasoning, safe));
+            }
             self.emit(Envelope::snapshot(&id, StreamKind::Reasoning, all));
             self.emit(
                 Envelope::new(Event::Reasoning {
@@ -1102,6 +1230,10 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
     fn close_shown(&mut self, shown: &mut Shown, interrupted: bool) {
         self.close_reasoning(shown);
         if let Some((id, all)) = shown.text.take() {
+            let safe = self.masks.drain_stream(&mut shown.text_pending, true);
+            if !safe.is_empty() {
+                self.emit(Envelope::delta(&id, StreamKind::Assistant, safe));
+            }
             self.emit(Envelope::snapshot(&id, StreamKind::Assistant, all));
             let status = if interrupted {
                 ItemStatus::Interrupted
@@ -1121,12 +1253,20 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         reservation: usize,
         advertised: bool,
     ) -> Result<String, StepError> {
+        if let Some(entry) = self.registry.get(&call.function.name).cloned() {
+            return self.call_mcp(call, &entry, commands, reservation, advertised);
+        }
         if let Some(stop) = poll(commands, &mut self.deferred) {
             return Err(StepError::Stop(stop));
         }
         let item = self.id("tool");
         let tool = Tool::from_name(&call.function.name);
-        let input = call.input();
+        let input = call.input().and_then(|input| {
+            if let Some(tool) = tool {
+                tool.validate_arguments(&input).map_err(str::to_owned)?;
+            }
+            Ok(input)
+        });
         let (kind, title) = match (tool, &input) {
             (Some(t), Ok(v)) => (t.item_kind(), t.title(v)),
             (Some(t), Err(_)) => (t.item_kind(), call.function.name.clone()),
@@ -1169,6 +1309,10 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             Ok(input) => input,
             Err(why) => return fail(self, why),
         };
+        let mut displayed = input.clone();
+        if let Err(why) = self.masks.value(&mut displayed) {
+            return fail(self, why.into());
+        }
         let Some(ws) = self.workspace.clone() else {
             return fail(self, "The thread's folder is not open.".to_owned());
         };
@@ -1238,10 +1382,8 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         }
         match result {
             Ok(output) => {
-                let output = agent_core::local_context::bound_result(
-                    &agent_core::redact::redact(&output),
-                    reservation,
-                );
+                let output =
+                    agent_core::local_context::bound_result(&self.safe_text(&output), reservation);
                 self.emit(Envelope::item_completed(
                     &item,
                     ItemStatus::Completed,
@@ -1254,6 +1396,358 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         }
     }
 
+    fn safe_arguments(&self, arguments: &str) -> String {
+        match serde_json::from_str::<Value>(arguments) {
+            Ok(mut value) => {
+                self.masks.value_lossy(&mut value);
+                value.to_string()
+            }
+            _ => "{\"_redacted\":\"Invalid or sensitive arguments withheld\"}".into(),
+        }
+    }
+
+    fn safe_text(&self, text: &str) -> String {
+        self.masks.scrub(text)
+    }
+
+    fn poll_mcp(&mut self, commands: &Receiver<RunnerInput>, active: bool) -> Option<Stop> {
+        let stop = poll(commands, &mut self.deferred);
+        let mut modes = Vec::new();
+        self.deferred.retain(|command| {
+            if let Command::SetMode { mode } = command {
+                modes.push(*mode);
+                false
+            } else {
+                true
+            }
+        });
+        let mut narrowed = false;
+        for mode in modes {
+            narrowed |= self.mode == Mode::Bypass && mode != Mode::Bypass
+                || mode == Mode::Plan && self.mode != Mode::Plan;
+            self.mode = mode;
+            self.emit(Envelope::new(Event::ModeChanged { mode }));
+        }
+        if active && narrowed && stop.is_none() {
+            self.emit(Envelope::new(Event::Notice {
+                text:
+                    "MCP authority narrowed: the active call was stopped; its outcome is unknown."
+                        .into(),
+            }));
+            Some(Stop::Interrupted)
+        } else {
+            stop
+        }
+    }
+
+    fn call_mcp(
+        &mut self,
+        call: &ToolCall,
+        entry: &agent_core::local_mcp::RegistryTool,
+        commands: &Receiver<RunnerInput>,
+        reservation: usize,
+        advertised: bool,
+    ) -> Result<String, StepError> {
+        use agent_core::local_mcp::{
+            gate as mcp_gate, result_text, ApprovalBinding, ApprovalCard, ApprovalStamp, Grant,
+            ToolIdentity,
+        };
+        if let Some(stop) = self.poll_mcp(commands, false) {
+            return Err(StepError::Stop(stop));
+        }
+        let ToolIdentity::Mcp { server_id, name } = &entry.resolved.identity else {
+            return Err(StepError::Failed("Invalid MCP registry entry.".into()));
+        };
+        let item = self.id("mcp");
+        let title = format!("{} ({}) / {}", entry.label, server_id, name);
+        let grant = Grant {
+            server_id: server_id.clone(),
+            tool: name.clone(),
+            server_revision: entry.resolved.server_revision.clone(),
+            schema_revision: entry.resolved.schema_revision.clone(),
+        };
+        let connection = self.mcp_connections.get(server_id).cloned();
+        let mut input = if call.function.arguments.len() <= 65536 {
+            call.input()
+        } else {
+            Err("MCP arguments exceed 64 KiB.".into())
+        };
+        let shown = input
+            .as_ref()
+            .ok()
+            .cloned()
+            .and_then(|mut value| self.masks.value(&mut value).ok().map(|()| value));
+        self.emit(Envelope::item_started(&item,ItemKind::McpTool,&title,
+            Some(serde_json::json!({"server_id":server_id,"server_label":entry.label,"tool":name,"arguments":shown})),None));
+        let failed = |me: &mut Self, why: &str, status: ItemStatus| {
+            let reason = me.masks.scrub(why);
+            let output = result_text(
+                &serde_json::json!({"isError":true,"content":[{"type":"text","text":reason}]}),
+                reservation,
+            );
+            me.emit(Envelope::item_completed(&item, status, None, Some(&output)));
+            Ok(output)
+        };
+        // Identity came only from the frozen registry. Model-supplied fields are arguments,
+        // never routing information, and do not weaken any eligibility check.
+        if !advertised {
+            return failed(
+                self,
+                "This MCP tool was not advertised for this request.",
+                ItemStatus::Failed,
+            );
+        }
+        let Some(server) = self
+            .context
+            .mcp_servers
+            .iter()
+            .find(|s| &s.id == server_id)
+            .cloned()
+        else {
+            return failed(self, "This MCP server is not selected.", ItemStatus::Failed);
+        };
+        let Some(policy) = server.tools.iter().find(|t| &t.name == name).cloned() else {
+            return failed(
+                self,
+                "This MCP tool is not allowlisted.",
+                ItemStatus::Failed,
+            );
+        };
+        loop {
+            let arguments = match input {
+                Ok(ref input) => input.clone(),
+                Err(_) => {
+                    return failed(
+                        self,
+                        "MCP arguments must be valid JSON and at most 64 KiB.",
+                        ItemStatus::Failed,
+                    )
+                }
+            };
+            if let Err(why) = entry.validator.validate(&arguments) {
+                return failed(self, why, ItemStatus::Failed);
+            }
+            let mut shown = arguments.clone();
+            if let Err(why) = self.masks.value(&mut shown) {
+                return failed(self, why, ItemStatus::Failed);
+            }
+            match mcp_gate(&server, &policy, self.mode, true) {
+                Gate::Refuse(why) => return failed(self, why, ItemStatus::Declined),
+                Gate::Run => break,
+                Gate::Ask => {
+                    let Some(connection) = &connection else {
+                        return failed(self, "MCP connection is unavailable.", ItemStatus::Failed);
+                    };
+                    if !connection.is_open() {
+                        return failed(
+                            self,
+                            "The MCP connection closed before the call was approved.",
+                            ItemStatus::Failed,
+                        );
+                    }
+                    let request = self.id("approval");
+                    let stamp = ApprovalStamp {
+                        request_id: request.clone(),
+                        generation: self.generation.clone(),
+                        call_id: self.id("binding"),
+                        grant: grant.clone(),
+                    };
+                    let binding = ApprovalBinding {
+                        stamp: stamp.clone(),
+                        arguments: arguments.clone(),
+                    };
+                    let card = ApprovalCard {
+                        binding: stamp,
+                        server_label: entry.label.clone(),
+                        // Emit from the original once: preflight masking must not feed its
+                        // inserted markers into another masking pass.
+                        arguments: arguments.clone(),
+                    };
+                    if !self.emit_approval(Envelope::new(Event::ApprovalRequested {
+                        tool:agent_core::local_mcp::APPROVAL_TOOL.into(),title:Some(title.clone()),
+                        input:serde_json::to_value(card).map_err(|_| StepError::Failed("MCP approval encoding failed.".into()))?,
+                        reason:Some("Read-only status is separate from approval. Arbitrary MCP calls have no filesystem containment exemption.".into()),
+                        options:agent_core::local_mcp::APPROVAL_OPTIONS.to_vec(),response:ResponseCapability::Live,
+                        remembers:Some("Allow for session covers this session; Always allow also covers future sessions. Both cover all arguments for this reviewed tool and its server/schema content revisions. Changed definitions or schemas invalidate the grant.".into()),
+                    }).request(&request)) {return failed(self, "MCP approval could not be displayed safely.", ItemStatus::Declined);}
+                    let answer = self.wait_mcp_approval(&binding, connection, commands)?;
+                    match answer {
+                        McpAnswer::Disconnected => {
+                            return failed(
+                                self,
+                                "The MCP connection closed before the call was approved.",
+                                ItemStatus::Failed,
+                            )
+                        }
+                        McpAnswer::Edited(edited) => {
+                            input = Ok(edited);
+                            continue;
+                        }
+                        McpAnswer::Declined => {
+                            return failed(
+                                self,
+                                "The user declined this MCP call. Do not retry it.",
+                                ItemStatus::Declined,
+                            )
+                        }
+                        McpAnswer::Allowed => {}
+                    }
+                    // Recheck after waiting: a restrictive mode change cannot be approved away.
+                    if matches!(mcp_gate(&server, &policy, self.mode, true), Gate::Refuse(_)) {
+                        return failed(
+                            self,
+                            "The current mode refuses this MCP call.",
+                            ItemStatus::Declined,
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+        let arguments = match input {
+            Ok(Value::Object(arguments)) => arguments,
+            _ => return failed(self, "Invalid MCP arguments.", ItemStatus::Failed),
+        };
+        let Some(session) = &self.mcp else {
+            return failed(
+                self,
+                "The MCP connection is unavailable.",
+                ItemStatus::Failed,
+            );
+        };
+        let Some(connection) = &connection else {
+            return failed(self, "MCP connection is unavailable.", ItemStatus::Failed);
+        };
+        let response =
+            match session.call_frozen(server_id.clone(), name.clone(), arguments, connection) {
+                Ok(response) => response,
+                Err(why) => return failed(self, &why, ItemStatus::Failed),
+            };
+        loop {
+            if let Some(stop) = self.poll_mcp(commands, true) {
+                self.stop_mcp();
+                self.emit(Envelope::item_completed(
+                    &item,
+                    ItemStatus::Interrupted,
+                    None,
+                    Some("MCP call interrupted; its outcome is unknown."),
+                ));
+                return Err(StepError::Stop(stop));
+            }
+            match response.recv_timeout(Duration::from_millis(20)) {
+                Ok(Ok(mut value)) => {
+                    if self.masks.value(&mut value).is_err() {
+                        return failed(
+                            self,
+                            "Sensitive MCP result keys were withheld.",
+                            ItemStatus::Failed,
+                        );
+                    }
+                    let is_error = value
+                        .get("isError")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let output = result_text(&value, reservation);
+                    self.emit(Envelope::item_completed(
+                        &item,
+                        if is_error {
+                            ItemStatus::Failed
+                        } else {
+                            ItemStatus::Completed
+                        },
+                        Some(&output),
+                        None,
+                    ));
+                    return Ok(output);
+                }
+                Ok(Err(why)) => return failed(self, &why, ItemStatus::Failed),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return failed(
+                        self,
+                        "MCP connection lost; the outcome is unknown and the call was not retried.",
+                        ItemStatus::Failed,
+                    )
+                }
+            }
+        }
+    }
+
+    fn wait_mcp_approval(
+        &mut self,
+        binding: &agent_core::local_mcp::ApprovalBinding,
+        connection: &crate::local_mcp::ConnectionLease,
+        commands: &Receiver<RunnerInput>,
+    ) -> Result<McpAnswer, StepError> {
+        use agent_core::local_mcp::ApprovalAnswer;
+        let request = &binding.stamp.request_id;
+        loop {
+            if !connection.is_open() {
+                self.emit(Envelope::new(Event::ApprovalExpired).request(request));
+                return Ok(McpAnswer::Disconnected);
+            }
+            match commands.recv_timeout(Duration::from_millis(20)) {
+                Ok(RunnerInput::Command(Command::Approve {
+                    request: answered,
+                    decision,
+                    updated_input,
+                    ..
+                })) if &answered == request => {
+                    if !connection.is_open() {
+                        self.emit(Envelope::new(Event::ApprovalExpired).request(request));
+                        return Ok(McpAnswer::Disconnected);
+                    }
+                    let answer = updated_input
+                        .and_then(|value| serde_json::from_value::<ApprovalAnswer>(value).ok());
+                    let Some(answer) = answer.filter(|answer| answer.binding == binding.stamp)
+                    else {
+                        continue;
+                    };
+                    if let Some(edited) = answer.edited_arguments {
+                        self.emit(Envelope::new(Event::ApprovalExpired).request(request));
+                        return Ok(McpAnswer::Edited(edited));
+                    }
+                    self.emit(
+                        Envelope::new(Event::ApprovalResolved { decision })
+                            .request(request)
+                            .raw(serde_json::to_value(&binding.stamp).unwrap_or(Value::Null)),
+                    );
+                    return Ok(
+                        if matches!(
+                            decision,
+                            Decision::Allow | Decision::AllowAlways | Decision::AllowForSession
+                        ) {
+                            McpAnswer::Allowed
+                        } else {
+                            McpAnswer::Declined
+                        },
+                    );
+                }
+                Ok(RunnerInput::Command(Command::SetMode { mode })) => {
+                    self.mode = mode;
+                    self.emit(Envelope::new(Event::ModeChanged { mode }));
+                    self.emit(Envelope::new(Event::ApprovalExpired).request(request));
+                    return Ok(McpAnswer::Edited(binding.arguments.clone()));
+                }
+                Ok(RunnerInput::Command(Command::Interrupt)) => {
+                    self.emit(Envelope::new(Event::ApprovalExpired).request(request));
+                    return Err(StepError::Stop(Stop::Interrupted));
+                }
+                Ok(RunnerInput::Invalid(why)) => {
+                    self.emit(Envelope::new(Event::ApprovalExpired).request(request));
+                    return Err(StepError::Stop(Stop::InvalidInput(why)));
+                }
+                Ok(RunnerInput::Closed) | Err(RecvTimeoutError::Disconnected) => {
+                    self.emit(Envelope::new(Event::ApprovalExpired).request(request));
+                    return Err(StepError::Stop(Stop::Closed));
+                }
+                Ok(RunnerInput::Command(Command::Approve { .. })) => {}
+                Ok(RunnerInput::Command(other)) => self.deferred.push(other),
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
+
     /// Asks the user, and waits for the answer (or an interrupt).
     fn ask(
         &mut self,
@@ -1263,7 +1757,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         commands: &Receiver<RunnerInput>,
     ) -> Result<Decision, StepError> {
         let request = self.id("approval");
-        self.emit(
+        if !self.emit_approval(
             Envelope::new(Event::ApprovalRequested {
                 tool: tool.name().to_owned(),
                 title: Some(title.to_owned()),
@@ -1274,7 +1768,9 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 remembers: None,
             })
             .request(&request),
-        );
+        ) {
+            return Ok(Decision::Deny);
+        }
         loop {
             match commands.recv_timeout(Duration::from_secs(3600)) {
                 Ok(RunnerInput::Command(Command::Approve {
@@ -1309,6 +1805,12 @@ enum StepEnd {
     Answered,
     Continue,
 }
+enum McpAnswer {
+    Disconnected,
+    Allowed,
+    Declined,
+    Edited(Value),
+}
 
 enum StepError {
     Stop(Stop),
@@ -1320,6 +1822,8 @@ enum StepError {
 struct Shown {
     reasoning: Option<(String, String)>,
     text: Option<(String, String)>,
+    reasoning_pending: String,
+    text_pending: String,
 }
 
 /// Looks at what arrived without waiting: an interrupt (or a closed stdin) stops the reply;
@@ -1372,7 +1876,7 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 
 /// A fresh session id: 32 hex characters from the process's random hasher state, the clock and a
 /// counter (the crate has no RNG dependency; only uniqueness matters).
-fn new_session_id() -> String {
+pub(crate) fn new_session_id() -> String {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1616,6 +2120,223 @@ mod tests {
             session_id: Some("s-1".into()),
             ..RunnerArgs::default()
         }
+    }
+
+    #[test]
+    fn builtin_spoof_fields_and_wrong_types_never_reach_approval_or_execution() {
+        for mode in [Mode::Ask, Mode::AcceptEdits, Mode::Bypass] {
+            for tool in Tool::ALL {
+                let schema = tool.schema();
+                let fields = &schema["function"]["parameters"];
+                let mut base = json!({});
+                for name in fields["required"].as_array().unwrap() {
+                    base[name.as_str().unwrap()] = json!("marker");
+                }
+                if tool == Tool::RunCommand {
+                    base["command"] = json!("touch marker");
+                }
+                let mut invalid = Vec::new();
+                for key in [
+                    "CommandLine",
+                    "cmd",
+                    "cwd",
+                    "file_path",
+                    "content",
+                    "changes",
+                    "edits",
+                    "old_string",
+                ] {
+                    if fields["properties"].get(key).is_none() {
+                        let mut input = base.clone();
+                        input[key] = json!("git status");
+                        invalid.push(input);
+                    }
+                }
+                for key in fields["properties"].as_object().unwrap().keys() {
+                    let mut input = base.clone();
+                    input[key] = Value::Null;
+                    invalid.push(input);
+                }
+                for input in invalid {
+                    let folder = tempfile::tempdir().unwrap();
+                    let script = Script::new(vec![
+                        Ok(tool_call("c1", tool.name(), input.clone())),
+                        Ok(text(&["done"])),
+                    ]);
+                    let run = start(
+                        args(folder.path(), mode),
+                        script,
+                        folder.path().join("state"),
+                    );
+                    run.send(Command::Prompt {
+                        text: "test".into(),
+                    });
+                    let mut failed = false;
+                    loop {
+                        let env = run.events.recv_timeout(Duration::from_secs(3)).unwrap();
+                        // The app's saved rules are consulted only for ApprovalRequested.
+                        assert!(
+                            !matches!(env.event, Event::ApprovalRequested { .. }),
+                            "{} {input}",
+                            tool.name()
+                        );
+                        failed |= matches!(
+                            env.event,
+                            Event::ItemCompleted {
+                                status: ItemStatus::Failed,
+                                ..
+                            }
+                        );
+                        if matches!(env.event, Event::TurnCompleted { .. }) {
+                            break;
+                        }
+                    }
+                    assert!(failed);
+                    assert!(!folder.path().join("marker").exists());
+                    assert!(crate::local_tools::run(
+                        tool,
+                        &input,
+                        &crate::local_tools::Workspace::open(folder.path()).unwrap(),
+                        false,
+                        &std::sync::atomic::AtomicBool::new(false)
+                    )
+                    .is_err());
+                    assert_eq!(run.finish().1, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unsafe_builtin_argument_keys_fail_without_waiting_and_history_remains_resumable() {
+        let work = tempfile::tempdir().unwrap();
+        let key = format!("ghp_{}", "x".repeat(32));
+        let script = Script::new(vec![
+            Ok(tool_call(
+                "c1",
+                "run_command",
+                json!({"command":"touch marker",key.clone():"ordinary"}),
+            )),
+            Ok(text(&["done"])),
+        ]);
+        let run = start(
+            args(work.path(), Mode::Ask),
+            script,
+            work.path().join("state"),
+        );
+        run.send(Command::Prompt {
+            text: "test".into(),
+        });
+        let mut seen = Vec::new();
+        loop {
+            let env = run.events.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert!(!matches!(env.event, Event::ApprovalRequested { .. }));
+            let done = matches!(env.event, Event::TurnCompleted { .. });
+            seen.push(env);
+            if done {
+                break;
+            }
+        }
+        let (_, code) = run.finish();
+        assert_eq!(code, 0);
+        assert!(!work.path().join("marker").exists());
+        let saved = std::fs::read_dir(work.path().join("state"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let saved = std::fs::read_to_string(saved).unwrap();
+        assert!(!saved.contains(&key));
+        let transcript: Transcript = serde_json::from_str(&saved).unwrap();
+        assert_eq!(
+            transcript
+                .messages
+                .iter()
+                .filter(|m| m.role == "tool")
+                .count(),
+            1
+        );
+        assert!(transcript.messages.iter().any(|m| m.content == "test"));
+        assert!(!serde_json::to_string(&seen).unwrap().contains(&key));
+    }
+
+    #[test]
+    fn unsafe_approval_envelopes_are_refused_instead_of_waited_on() {
+        let work = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let mut runner = Runner::new(
+            args(work.path(), Mode::Ask),
+            Script::new(vec![]),
+            work.path().join("state"),
+            &mut out,
+        );
+        let key = format!("ghp_{}", "a".repeat(32));
+        let frame = Envelope::new(Event::ApprovalRequested {
+            tool: "run_command".into(),
+            title: None,
+            input: json!({key:"value"}),
+            reason: None,
+            options: APPROVAL_OPTIONS.to_vec(),
+            response: ResponseCapability::Live,
+            remembers: None,
+        })
+        .request("r1");
+        assert!(!runner.emit_approval(frame));
+        let events: Vec<Envelope> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(matches!(events[0].event, Event::Error { .. }));
+    }
+
+    #[test]
+    fn a_missing_mcp_lease_fails_without_emitting_an_approval_card() {
+        use agent_core::local_mcp::{CompiledSchema, RegistryTool, ResolvedTool, ToolIdentity};
+        let work = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let mut runner = Runner::new(
+            args(work.path(), Mode::Ask),
+            Script::new(vec![]),
+            work.path().join("state"),
+            &mut out,
+        );
+        runner.context.mcp_servers.push(serde_json::from_value(json!({"id":"test","label":"Test","enabled":true,"command":"fixture","args":[],"cwd":"/","env":{},"tools":[{"name":"read","read_only":true}],"approval":"ask","startup_timeout_secs":1,"call_timeout_secs":1})).unwrap());
+        let entry = RegistryTool {
+            resolved: ResolvedTool {
+                identity: ToolIdentity::Mcp {
+                    server_id: "test".into(),
+                    name: "read".into(),
+                },
+                alias: "mcp_test".into(),
+                schema: json!({}),
+                server_revision: "a".repeat(64),
+                schema_revision: "b".repeat(64),
+            },
+            label: "Test".into(),
+            validator: CompiledSchema::compile(&json!({"type":"object"})).unwrap(),
+        };
+        let call: ToolCall = serde_json::from_value(json!({"id":"call-1","type":"function","function":{"name":"mcp_test","arguments":"{}"}})).unwrap();
+        let (_keep, commands) = channel();
+        assert!(runner
+            .call_mcp(&call, &entry, &commands, 1000, true)
+            .is_ok());
+        let events: Vec<Envelope> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e.event, Event::ApprovalRequested { .. })));
+        assert!(events.iter().any(|e| matches!(
+            e.event,
+            Event::ItemCompleted {
+                status: ItemStatus::Failed,
+                ..
+            }
+        )));
     }
 
     fn prompt(text: &str) -> Command {

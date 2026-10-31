@@ -29,6 +29,9 @@ allow = [
     "ISC",
     "BSD-3-Clause",
     "CDLA-Permissive-2.0",
+    # MCP tool-argument validation (jsonschema → referencing → fluent-uri): borrow-or-share is
+    # MIT No Attribution, MIT without the attribution clause.
+    "MIT-0",
 ]
 # Allowances not (yet) used by the tree are fine: Zlib is listed ahead of the rusqlite bump.
 unused-allowed-license = "allow"

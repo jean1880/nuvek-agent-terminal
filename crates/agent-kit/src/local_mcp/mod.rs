@@ -3,4 +3,5 @@ mod client;
 mod process;
 mod transport;
 
-pub use client::{Discovery, ServerDiscovery, Session};
+pub use client::{ConnectionLease, Discovery, ServerDiscovery, Session};
+pub use process::Scrubber as CredentialMasks;

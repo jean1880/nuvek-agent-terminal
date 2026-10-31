@@ -1,8 +1,11 @@
-//! Session-owned stdio MCP discovery. Model dispatch is deliberately not exposed here.
+//! Session-owned stdio MCP discovery and serial, non-replayed requests.
 use super::process;
 
 use agent_core::adapter::Mode;
-use agent_core::local_mcp::{ApprovalPolicy, McpServerConfig};
+use agent_core::local_mcp::{
+    alias, revision, ApprovalPolicy, CompiledSchema, McpServerConfig, RegistryTool, ResolvedTool,
+    ToolIdentity,
+};
 use rmcp::{
     model::{ClientConfig, PaginatedRequestParams, ProtocolVersion, Tool},
     service::{RoleClient, RunningService},
@@ -56,6 +59,20 @@ pub struct ServerDiscovery {
     pub tools: Vec<Tool>,
     pub notices: Vec<String>,
     pub required_failed: bool,
+    pub registry: Vec<RegistryTool>,
+    pub connection: Option<ConnectionLease>,
+}
+
+/// Process-local lifetime identity, separate from rememberable tool content revisions.
+#[derive(Clone)]
+pub struct ConnectionLease {
+    id: String,
+    closed: Arc<AtomicBool>,
+}
+impl ConnectionLease {
+    pub fn is_open(&self) -> bool {
+        !self.closed.load(Ordering::Acquire)
+    }
 }
 
 struct Handler;
@@ -78,6 +95,9 @@ struct Server {
     discovered_count: usize,
     discovered_bytes: usize,
     offered: BTreeSet<String>,
+    validators: BTreeMap<String, CompiledSchema>,
+    connection: ConnectionLease,
+    revisions: BTreeMap<String, String>,
 }
 impl Server {
     async fn close(&mut self) {
@@ -91,10 +111,12 @@ impl Server {
         let wire_start = self.received_bytes.load(Ordering::Relaxed);
         self.client.clear_response_cache().await;
         let mut cursor = None;
+        let mut revisions = BTreeMap::new();
         let mut cursors = BTreeSet::new();
         let mut names = BTreeSet::new();
         let mut tools = Vec::new();
         let mut notices = Vec::new();
+        let mut validators = BTreeMap::new();
         let mut count = 0usize;
         let mut bytes = 0usize;
         for _ in 0..MAX_PAGES {
@@ -132,6 +154,21 @@ impl Server {
                     notices
                         .push("An MCP tool was excluded because its schema exceeds 64 KiB.".into());
                 } else {
+                    // Fingerprint original metadata before masking changes any displayed field.
+                    let content_revision = revision(&tool).map_err(str::to_owned)?;
+                    let validator = match CompiledSchema::compile(&serde_json::Value::Object(
+                        (*tool.input_schema).clone(),
+                    )) {
+                        Ok(validator) => validator,
+                        Err(why) => {
+                            notices.push(
+                                self.process
+                                    .scrubber
+                                    .scrub(&format!("MCP tool {} unavailable: {why}", tool.name)),
+                            );
+                            continue;
+                        }
+                    };
                     let mut safe =
                         serde_json::to_value(&tool).map_err(|_| "Invalid MCP schema encoding.")?;
                     self.process.scrubber.value(&mut safe)?;
@@ -153,6 +190,8 @@ impl Server {
                         serde_json::from_value(safe)
                             .map_err(|_| "MCP schema could not be scrubbed safely.")?,
                     );
+                    validators.insert(tool.name.to_string(), validator);
+                    revisions.insert(tool.name.to_string(), content_revision);
                 }
             }
             cursor = page.next_cursor;
@@ -166,6 +205,8 @@ impl Server {
                     self.notices = notices;
                     self.discovered_count = count;
                     self.discovered_bytes = bytes.max(wire_bytes);
+                    self.validators = validators;
+                    self.revisions = revisions;
                     return Ok(());
                 }
             }
@@ -182,7 +223,7 @@ impl Server {
         self.process.diagnostic(reason)
     }
     fn snapshot(&self, mode: Mode) -> ServerDiscovery {
-        let tools = self
+        let tools: Vec<_> = self
             .tools
             .iter()
             .filter(|tool| {
@@ -195,11 +236,27 @@ impl Server {
             })
             .cloned()
             .collect();
+        let registry = tools.iter().filter_map(|tool| {
+            let alias = alias(&self.config.id, &tool.name).ok()?;
+            let definition = revision(&self.config).ok()?;
+            let schema_revision = self.revisions.get(tool.name.as_ref())?.clone();
+            let schema = serde_json::json!({"type":"function","function":{
+                "name":alias,
+                "description":self.process.scrubber.scrub(&format!("{} ({}) / {}\n{}", self.config.label,self.config.id,tool.name,tool.description.as_deref().unwrap_or(""))),
+                "parameters":tool.input_schema
+            }});
+            Some(RegistryTool { resolved: ResolvedTool {
+                identity:ToolIdentity::Mcp {server_id:self.config.id.clone(),name:tool.name.to_string()},
+                alias, schema, server_revision:definition, schema_revision,
+            }, label:self.process.scrubber.scrub(&self.config.label), validator:self.validators.get(tool.name.as_ref())?.clone() })
+        }).collect();
         ServerDiscovery {
             id: self.config.id.clone(),
             tools,
             notices: self.notices.clone(),
             required_failed: false,
+            registry,
+            connection: Some(self.connection.clone()),
         }
     }
 }
@@ -210,6 +267,8 @@ fn failed(config: &McpServerConfig, reason: String) -> ServerDiscovery {
         tools: Vec::new(),
         notices: vec![format!("MCP server {} unavailable: {reason}", config.id)],
         required_failed: config.required,
+        registry: Vec::new(),
+        connection: None,
     }
 }
 
@@ -230,6 +289,7 @@ async fn start(
     let (mut process, transport) =
         process::Process::spawn(&config, &effective, &executable, deadline, &mut cancel).await?;
     let stale = transport.stale.clone();
+    let closed = transport.closed.clone();
     let failure = transport.failure.clone();
     let received_bytes = transport.received_bytes.clone();
     let startup = Handler.serve_with_lifecycle(
@@ -266,6 +326,12 @@ async fn start(
         discovered_count: 0,
         discovered_bytes: 0,
         offered: BTreeSet::new(),
+        validators: BTreeMap::new(),
+        connection: ConnectionLease {
+            id: crate::local_agent::new_session_id(),
+            closed,
+        },
+        revisions: BTreeMap::new(),
     };
     let result = tokio::select! {
         _ = cancelled(&mut cancel) => Err("MCP discovery cancelled.".into()),
@@ -286,6 +352,7 @@ enum Request {
         reply: std::sync::mpsc::SyncSender<Discovery>,
     },
     Call {
+        connection: Option<String>,
         server_id: String,
         name: String,
         arguments: serde_json::Map<String, serde_json::Value>,
@@ -296,6 +363,7 @@ enum Request {
 /// One dedicated current-thread runtime per Local session. All cross-thread queues are
 /// bounded; the blocking runner polls its own commands while a discovery is outstanding.
 pub struct Session {
+    masks: process::Scrubber,
     tx: tokio::sync::mpsc::Sender<Request>,
     cancel: tokio::sync::watch::Sender<bool>,
     done: std::sync::mpsc::Receiver<()>,
@@ -337,6 +405,7 @@ impl Session {
                 return Err("MCP session contains duplicate server IDs.".into());
             }
         }
+        let masks = process::Scrubber::for_configs(&configs, &effective);
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         let (cancel, cancelled) = tokio::sync::watch::channel(false);
         let (done_tx, done) = std::sync::mpsc::sync_channel(1);
@@ -367,6 +436,7 @@ impl Session {
             })
             .map_err(|_| "Could not start MCP runtime thread.")?;
         Ok(Self {
+            masks,
             tx,
             cancel,
             done,
@@ -380,14 +450,44 @@ impl Session {
             .map_err(|_| "MCP runtime is busy or unavailable.")?;
         Ok(receiver)
     }
+    /// Apply all resolved credential masks before arguments reach stdout or a transcript.
+    pub fn scrub(&self, value: serde_json::Value) -> Result<serde_json::Value, String> {
+        let mut value = value;
+        self.masks.value(&mut value).map_err(str::to_owned)?;
+        Ok(value)
+    }
+    pub fn masks(&self) -> process::Scrubber {
+        self.masks.clone()
+    }
     /// Low-level single request, for an already authorised frozen-registry entry. The Local
-    /// model loop does not use this API; its authority and result conversion belong there.
+    /// model loop checks authority and converts results before and after this call.
     /// No MRTR follow-up, reconnect or replay is performed after an ambiguous outcome.
     pub fn call_discovered(
         &self,
         server_id: String,
         name: String,
         arguments: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<std::sync::mpsc::Receiver<Result<serde_json::Value, String>>, String> {
+        self.call_on_connection(server_id, name, arguments, None)
+    }
+    pub fn call_frozen(
+        &self,
+        server_id: String,
+        name: String,
+        arguments: serde_json::Map<String, serde_json::Value>,
+        connection: &ConnectionLease,
+    ) -> Result<std::sync::mpsc::Receiver<Result<serde_json::Value, String>>, String> {
+        if !connection.is_open() {
+            return Err("The reviewed MCP connection has closed.".into());
+        }
+        self.call_on_connection(server_id, name, arguments, Some(connection.id.clone()))
+    }
+    fn call_on_connection(
+        &self,
+        server_id: String,
+        name: String,
+        arguments: serde_json::Map<String, serde_json::Value>,
+        connection: Option<String>,
     ) -> Result<std::sync::mpsc::Receiver<Result<serde_json::Value, String>>, String> {
         if server_id.len() > 64
             || name.len() > 256
@@ -401,6 +501,7 @@ impl Session {
         let (reply, receiver) = std::sync::mpsc::sync_channel(1);
         self.tx
             .try_send(Request::Call {
+                connection,
                 server_id,
                 name,
                 arguments,
@@ -439,6 +540,7 @@ async fn worker(
         let request = tokio::select! { _ = cancelled(&mut cancel) => break, request = requests.recv() => match request { Some(request) => request, None => break } };
         match request {
             Request::Call {
+                connection,
                 server_id,
                 name,
                 arguments,
@@ -447,6 +549,8 @@ async fn worker(
                 let index = servers.iter().position(|s| {
                     s.as_ref().is_some_and(|s| {
                         s.config.id == server_id
+                            && s.connection.is_open()
+                            && connection.as_ref().is_none_or(|id| id == &s.connection.id)
                             && s.offered.contains(&name)
                             && s.config.approval != ApprovalPolicy::Deny
                             && s.config
@@ -459,6 +563,15 @@ async fn worker(
                     let Some(server) = servers[index].as_mut() else {
                         continue;
                     };
+                    if server.validators.get(&name).is_none_or(|v| {
+                        v.validate(&serde_json::Value::Object(arguments.clone()))
+                            .is_err()
+                    }) {
+                        let _ = reply.try_send(Err(
+                            "MCP arguments do not match the advertised input schema.".into(),
+                        ));
+                        continue;
+                    }
                     let call = server.client.call_tool_once(
                         rmcp::model::CallToolRequestParams::new(name).with_arguments(arguments),
                     );

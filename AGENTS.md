@@ -387,9 +387,14 @@ Architectural mandates, standards, and workflows for this codebase.
   wins; server annotations grant nothing). A card shows the server, the original tool name
   and exactly the arguments that run, secrets masked in place
   (`agent_core::redact::structured`); a call whose card cannot be shown faithfully is refused.
-  An answer is bound to its request id and runner generation; a session or saved grant to the
-  server definition and schema content revisions, so a changed definition, schema or
-  reconnection invalidates it. Stop, session end, EOF or a narrowing setting ends every server
+  A pending approval is bound to its request id, the runner generation and the connection it
+  was raised on: a disconnection or reconnection expires the card, and a late answer never
+  authorises a replacement call. A session or saved grant is bound to the server definition's
+  and the tool schema's content revisions, not to a connection: it survives a reconnection
+  that advertises the same content, and a changed definition or schema asks again
+  (`tool_content_revisions_survive_reconnect_and_unchanged_notifications_but_track_raw_metadata`
+  and `disconnect_expires_pending_cards_and_late_answers_never_authorise_reconnection` prove
+  the two). Stop, session end, EOF or a narrowing setting ends every server
   of the session, idle ones included, the guardian killing the group on the runner's death
   through a private lifetime pipe; the next turn starts a fresh generation. A thread's MCP
   panel toggle never re-enables a definition Settings has disabled. Resolved credential

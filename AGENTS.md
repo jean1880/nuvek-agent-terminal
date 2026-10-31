@@ -360,8 +360,9 @@ Architectural mandates, standards, and workflows for this codebase.
   folders (read with `fdopendir`, no `/proc` needed; opened only when their turn comes, so the
   open folders never outnumber the depth), never follows a link, and never reads a sensitive or
   hard-linked file or a home's dotfiles, even approved: inside the folder as reads judge them,
-  outside it by the whole resolved path wherever the search started. What it could not open is
-  counted in its result, never silently dropped. A command's group is killed before its shell is reaped
+  outside it by the whole resolved path wherever the search started. What it withheld and what
+  it could not open are counted in its result, never silently dropped (generated trees such as
+  `.git` and `target` aside). A command's group is killed before its shell is reaped
   (never when someone else reaped it), so the group id is never one reused by another process.
   The runner keeps
   no approval: the app's own scoped rules answer the cards they cover. A write is bound to what

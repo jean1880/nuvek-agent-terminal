@@ -190,8 +190,8 @@ asks before commands and before writing outside the folder. Reads run unasked in
 folder; in every mode, Plan included, the agent asks before reading outside it, reading a
 sensitive file (git, hook, editor and agent configuration, instruction files, a file with a
 second hard link and, when the folder is your home or above it, your home's dotfiles) or
-searching all of your home. A search never reads those files, even once approved: the agent
-has to name one to read it, and that asks. Its conversation is kept under
+searching all of your home. A search never reads those files, even once approved, and says
+how many it left out: the agent has to name one to read it, and that asks. Its conversation is kept under
 `~/.local/state/agent-terminal/local`, so a thread resumes where it was.
 
 Use a model that supports tool calling (Qwen 3 and later, Llama 3.1 and later, Mistral, and

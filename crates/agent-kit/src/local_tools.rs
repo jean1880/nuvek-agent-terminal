@@ -733,6 +733,7 @@ fn search(input: &Value, ws: &Workspace, cancel: &AtomicBool) -> Result<String, 
     let top_entries = listed(&top).map_err(|e| format!("Cannot list {}: {e}", root.display()))?;
     let mut matches = Vec::new();
     let mut unread = 0usize;
+    let mut withheld = 0usize;
     let mut more = false;
     // Folders to visit: the open folder they are in, their name, and where they are.
     let mut stack: Vec<(Rc<OwnedFd>, std::ffi::OsString, PathBuf)> = Vec::new();
@@ -765,15 +766,18 @@ fn search(input: &Value, ws: &Workspace, cancel: &AtomicBool) -> Result<String, 
                 return Err("Stopped by the user.".to_owned());
             }
             let rel = dir_rel.join(&name);
+            // Generated trees go unremarked; anything else withheld is counted and said.
+            if kind == Kind::Folder && SKIPPED_DIRS.iter().any(|s| name == *s) {
+                continue;
+            }
             if skipped(&rel) {
+                withheld += 1;
                 continue;
             }
             // Not followed: a link, a pipe or a device is never read.
             match kind {
                 Kind::Folder => {
-                    if !SKIPPED_DIRS.iter().any(|s| name == *s) {
-                        folders.push((dir.clone(), name, rel));
-                    }
+                    folders.push((dir.clone(), name, rel));
                     continue;
                 }
                 Kind::Other => continue,
@@ -797,6 +801,7 @@ fn search(input: &Value, ws: &Workspace, cancel: &AtomicBool) -> Result<String, 
                 continue;
             };
             if hard_linked(&meta) {
+                withheld += 1;
                 continue;
             }
             let path = root.join(&rel);
@@ -834,6 +839,12 @@ fn search(input: &Value, ws: &Workspace, cancel: &AtomicBool) -> Result<String, 
     if unread > 0 {
         out.push_str(&format!(
             "\n… {unread} folders or files could not be opened, so the search is incomplete"
+        ));
+    }
+    if withheld > 0 {
+        out.push_str(&format!(
+            "\n… {withheld} sensitive or hard-linked files or folders were not searched; read \
+             one by name to see it (that asks first)"
         ));
     }
     Ok(out)
@@ -1113,6 +1124,14 @@ mod tests {
 
     fn ws(cwd: &Path) -> Workspace {
         Workspace::open(cwd).expect("workspace")
+    }
+
+    /// The note a search ends with when it withheld `n` files or folders.
+    fn withheld(n: usize) -> String {
+        format!(
+            "\n… {n} sensitive or hard-linked files or folders were not searched; read one by \
+             name to see it (that asks first)"
+        )
     }
 
     /// [`run`] with no Stop, and no write outside approved.
@@ -1457,8 +1476,8 @@ mod tests {
             )
             .unwrap()
         };
-        assert_eq!(search(false), "src/a.rs:1: needle");
-        assert_eq!(search(true), "src/a.rs:1: needle");
+        assert_eq!(search(false), format!("src/a.rs:1: needle{}", withheld(1)));
+        assert_eq!(search(true), format!("src/a.rs:1: needle{}", withheld(1)));
     }
 
     #[test]
@@ -1498,7 +1517,11 @@ mod tests {
             &AtomicBool::new(false),
         )
         .unwrap();
-        assert_eq!(found, "src/a.rs:1: needle", "no link is followed: {found}");
+        assert_eq!(
+            found,
+            format!("src/a.rs:1: needle{}", withheld(1)),
+            "no link is followed"
+        );
     }
 
     #[test]
@@ -1581,7 +1604,11 @@ mod tests {
                 &AtomicBool::new(false),
             )
             .unwrap();
-            assert!(found.starts_with("No line contains"), "{root:?}: {found}");
+            // It says what it withheld, so "no line" is never taken for "not there".
+            assert!(
+                found.starts_with("No line contains") && found.ends_with(&withheld(1)),
+                "{root:?}: {found}"
+            );
         }
     }
 
@@ -1677,7 +1704,10 @@ mod tests {
             &AtomicBool::new(false),
         )
         .unwrap();
-        assert_eq!(found, "projects/app/notes.md:1: PRIVATE KEY");
+        assert_eq!(
+            found,
+            format!("projects/app/notes.md:1: PRIVATE KEY{}", withheld(1))
+        );
         // The same from a folder outside it, approved to search home.
         let elsewhere = dir();
         let outside = Workspace::open_with_home(elsewhere.path(), Some(home.path())).unwrap();
@@ -1689,7 +1719,10 @@ mod tests {
             &AtomicBool::new(false),
         )
         .unwrap();
-        assert_eq!(found, "projects/app/notes.md:1: PRIVATE KEY");
+        assert_eq!(
+            found,
+            format!("projects/app/notes.md:1: PRIVATE KEY{}", withheld(1))
+        );
         // A project below home is not exposed to home's dotfiles.
         let below = home.path().join("projects/app");
         let project = Workspace::open_with_home(&below, Some(home.path())).unwrap();

@@ -18,6 +18,23 @@ use std::time::{Duration, Instant};
 /// own worst case ([`wait_exit`] kills after five seconds), with room for its exit to be seen.
 const STOPPING_WAIT: Duration = Duration::from_secs(8);
 
+/// The bounded wait for a process already stopping, timed from when an admission first found no
+/// worker left to pause, never from the admission's start: time spent pausing workers of its own
+/// does not use it up. A pause made meanwhile starts it again.
+#[derive(Debug, Default)]
+struct StoppingWait(Option<Instant>);
+
+impl StoppingWait {
+    /// Whether it may wait a little longer at `now`; the first call starts the clock.
+    fn may_wait(&mut self, now: Instant) -> bool {
+        now.saturating_duration_since(*self.0.get_or_insert(now)) < STOPPING_WAIT
+    }
+
+    fn restart(&mut self) {
+        self.0 = None;
+    }
+}
+
 pub(super) async fn wait_exit(watch: &ExitWatch) {
     let started = Instant::now();
     let mut killed = false;
@@ -318,7 +335,7 @@ impl Supervisor {
         except: Option<&WorkerId>,
     ) -> Result<LaunchSlot, ToolError> {
         let mut tried: Vec<WorkerId> = Vec::new();
-        let started = Instant::now();
+        let mut stopping = StoppingWait::default();
         loop {
             let usage = self.usage(root);
             if usage.live_processes < self.limits.live_processes_app {
@@ -332,7 +349,7 @@ impl Supervisor {
                 .find(|id| Some(id) != except && !tried.contains(id));
             let Some(worker) = next else {
                 // Another start's pause (or any stop) is under way: its exit frees a slot.
-                if usage.stopping_processes > 0 && started.elapsed() < STOPPING_WAIT {
+                if usage.stopping_processes > 0 && stopping.may_wait(Instant::now()) {
                     glib::timeout_future(Duration::from_millis(20)).await;
                     continue;
                 }
@@ -345,6 +362,7 @@ impl Supervisor {
             let Some(watch) = self.pause_child(&worker) else {
                 continue;
             };
+            stopping.restart();
             let generation = self
                 .state
                 .borrow()
@@ -360,5 +378,28 @@ impl Supervisor {
             }
             self.notify_registry();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_stopping_wait_runs_from_the_first_wait_and_a_pause_restarts_it() {
+        let t0 = Instant::now();
+        let mut wait = StoppingWait::default();
+        // Started late in a long admission: the full window is still there.
+        let first = t0 + Duration::from_secs(30);
+        assert!(wait.may_wait(first));
+        assert!(wait.may_wait(first + STOPPING_WAIT - Duration::from_millis(1)));
+        assert!(!wait.may_wait(first + STOPPING_WAIT));
+        wait.restart();
+        let later = first + Duration::from_secs(60);
+        assert!(
+            wait.may_wait(later),
+            "a pause made meanwhile starts it again"
+        );
+        assert!(!wait.may_wait(later + STOPPING_WAIT));
     }
 }

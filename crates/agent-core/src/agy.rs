@@ -620,6 +620,7 @@ impl Adapter for AgyAdapter {
 
     fn encode(&mut self, command: Command) -> Result<Vec<Action>, AdapterError> {
         match command {
+            Command::ConfigureLocal { .. } => Err(AdapterError::Unsupported("Local setup")),
             Command::Prompt { text } => {
                 // The first token is matched case-insensitively after leading whitespace. Any
                 // other `/word` is forwarded as agent text (custom commands and skills).

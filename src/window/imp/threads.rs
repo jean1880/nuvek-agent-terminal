@@ -2714,7 +2714,7 @@ fn agent_launch_with(
         return Err(not_ready_reason(driver, &Availability::Missing));
     };
     let (extra_args, env) = profile_launch(&profile, driver, resolved.env, &clear)?;
-    let adapter = make_adapter(driver, &program);
+    let adapter = configured_adapter(driver, &program, &config.borrow(), &profile)?;
     let approval = match driver {
         // Claude, Codex and the Local runner raise approvals over their own protocol, not the
         // hook socket.
@@ -2765,6 +2765,53 @@ fn not_ready_reason(driver: Driver, state: &Availability) -> String {
         Availability::Missing | Availability::Ready(_) => "is not available",
     };
     format!("{} {why}.", driver.info().label)
+}
+
+fn configured_adapter(
+    driver: Driver,
+    program: &str,
+    config: &crate::config::TerminalConfig,
+    profile: &Profile,
+) -> Result<std::boxed::Box<dyn Adapter>, String> {
+    if driver == Driver::Local {
+        let context = config.local_defaults.launch(&profile.local)?;
+        Ok(std::boxed::Box::new(
+            agent_core::local_agent::LocalAdapter::new().with_context(context),
+        ))
+    } else {
+        Ok(make_adapter(driver, program))
+    }
+}
+
+impl AgentTerminalWindow {
+    pub(super) fn refresh_local_contexts(&self) {
+        self.for_each_window(|window| {
+            let updates: Vec<_> = {
+                let config = window.config.borrow();
+                window
+                    .tabs
+                    .borrow()
+                    .iter()
+                    .filter_map(|tab| {
+                        let chat = tab.chat.as_ref()?;
+                        let session = chat.slot.get()?;
+                        if session.status().driver != Driver::Local {
+                            return None;
+                        }
+                        let profile = thread_profile_or_new(
+                            &config,
+                            chat.running_profile_id().as_deref(),
+                            Driver::Local,
+                        );
+                        Some((session, config.local_defaults.launch(&profile.local)))
+                    })
+                    .collect()
+            };
+            for (session, context) in updates {
+                session.stage_local_context(context);
+            }
+        });
+    }
 }
 
 /// The adapter for `driver`. Codex reports this app's version in `initialize`'s `clientInfo`.
@@ -5896,7 +5943,13 @@ impl AgentTerminalWindow {
             approval_hook: false,
             delegation: None,
         };
-        let adapter = make_adapter(driver, &program);
+        let adapter = match configured_adapter(driver, &program, &self.config.borrow(), profile) {
+            Ok(adapter) => adapter,
+            Err(why) => {
+                view.apply(&Envelope::new(Event::Error { message: why }));
+                return;
+            }
+        };
         let approval = match driver {
             // These raise approvals over their own protocol, not the hook socket.
             Driver::Claude | Driver::Codex | Driver::Local => Err(None),

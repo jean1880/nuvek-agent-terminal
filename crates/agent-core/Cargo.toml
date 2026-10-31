@@ -12,3 +12,5 @@ publish = false
 serde = { workspace = true }
 serde_json = { workspace = true }
 pulldown-cmark = { workspace = true }
+jsonschema = { version = "=0.60.2", default-features = false }
+sha2 = { version = "=0.10.9", default-features = false }

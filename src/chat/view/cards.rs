@@ -1963,7 +1963,10 @@ fn approval_input_text(tool: &str, input: &Value) -> (String, bool) {
             APPROVAL_LINE_CHARS,
         );
     }
-    let kind = if tool.starts_with("mcp__") || tool == "call_mcp_tool" {
+    let kind = if tool.starts_with("mcp__")
+        || tool == "call_mcp_tool"
+        || tool == agent_core::local_mcp::APPROVAL_TOOL
+    {
         ItemKind::McpTool
     } else {
         ItemKind::Tool
@@ -2251,7 +2254,7 @@ impl ApprovalCard {
                     Decision::AllowAlways => false,
                 });
             }
-            let rule_menu = permission.is_none();
+            let rule_menu = permission.is_none() && a.tool != agent_core::local_mcp::APPROVAL_TOOL;
             // Allow is not the suggested button for a request warned about: a permission
             // request's broad grant, or a git command that can lose work or rewrite history.
             let calm = permission.as_ref().is_none_or(|p| p.allow_is_calm())
@@ -3623,6 +3626,26 @@ pub(crate) mod tests {
             None,
         );
         assert!(!card.raw.is_visible());
+
+        let arguments =
+            serde_json::json!({"nested":{"value":"x".repeat(10000),"credential":"****1234"}});
+        let input = serde_json::json!({
+            "binding":{"request_id":"r1","generation":"g1","call_id":"c1","grant":{
+                "server_id":"example","tool":"read","server_revision":"a".repeat(64),"schema_revision":"b".repeat(64)
+            }},"server_label":"Example server","arguments":arguments
+        });
+        let (card, _) = codex_card(
+            agent_core::local_mcp::APPROVAL_TOOL,
+            input,
+            agent_core::local_mcp::APPROVAL_OPTIONS.to_vec(),
+            None,
+        );
+        assert!(card.raw.is_visible());
+        let full: Value = serde_json::from_str(&card.raw_section.full.borrow()).unwrap();
+        assert_eq!(full["arguments"], arguments);
+        assert_eq!(full["server_label"], "Example server");
+        assert_eq!(full["binding"]["grant"]["server_id"], "example");
+        assert_eq!(full["binding"]["grant"]["tool"], "read");
 
         let plan = "# Ship the parity wave\n\n1. Deny sends decline\n2. Stop turn cancels\n";
         let (card, _) = codex_card(

@@ -5,6 +5,7 @@
 //! [`stream::StreamSanitiser`], which applies these same rules incrementally.
 
 pub mod stream;
+pub mod structured;
 
 /// Prefixes of well-known credential formats. A token starting with one, and
 /// long enough to be a real credential, is masked wherever it appears.
@@ -930,7 +931,8 @@ fn looks_like_code(rest: &str) -> bool {
     rest.contains(" = ") || rest.ends_with([';', '{', ','])
 }
 
-fn is_sensitive_name(name: &str) -> bool {
+/// Whether a structured field or environment name denotes credential material.
+pub fn is_sensitive_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     SENSITIVE_NAME_PARTS.iter().any(|part| upper.contains(part))
 }

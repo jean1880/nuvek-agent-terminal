@@ -17,6 +17,8 @@ use crate::config::{FieldChange, Profile};
 use crate::model_catalog::ModelCatalog;
 
 mod delegation;
+mod local_context;
+mod local_mcp;
 mod local_servers;
 
 /// The default-mode dropdown, by index both ways.
@@ -792,6 +794,7 @@ impl AgentTerminalWindow {
             // The Local agent is a list of servers, each its own profile.
             if driver.is_built_in() {
                 page.add(&self.local_servers_group(dialog));
+                page.add(&self.local_context_group(dialog));
                 continue;
             }
             page.add(&self.agent_group(driver, dialog, &switches));

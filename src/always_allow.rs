@@ -1034,6 +1034,7 @@ pub enum Action {
     Edit { path: String },
     Read { path: String },
     Mcp { server: String, tool: String },
+    LocalMcp { grant: agent_core::local_mcp::Grant },
 }
 
 /// Every path a Codex patch approval writes (its `changes`, which the adapter takes from the item
@@ -1079,7 +1080,7 @@ impl Action {
             Self::Shell { .. } => ActionKind::Shell,
             Self::Edit { .. } => ActionKind::Edit,
             Self::Read { .. } => ActionKind::Read,
-            Self::Mcp { .. } => ActionKind::Mcp,
+            Self::Mcp { .. } | Self::LocalMcp { .. } => ActionKind::Mcp,
         }
     }
 
@@ -1088,6 +1089,13 @@ impl Action {
     /// every path argument the call carries ([`crate::approval_server::named_paths`] plus
     /// `notebook_path`): two different paths, a non-text path value or none at all is `None`.
     pub fn of(tool: &str, input: &Value) -> Option<Self> {
+        if tool == agent_core::local_mcp::APPROVAL_TOOL {
+            let card: agent_core::local_mcp::ApprovalCard =
+                serde_json::from_value(input.clone()).ok()?;
+            return card.binding.valid().then_some(Self::LocalMcp {
+                grant: card.binding.grant,
+            });
+        }
         let kind = ActionKind::of_tool(tool)?;
         let path = || -> Option<String> {
             let named = crate::approval_server::named_paths(input)?;
@@ -1133,6 +1141,7 @@ impl Action {
             Self::Shell { command } => command.clone(),
             Self::Edit { path } | Self::Read { path } => path.clone(),
             Self::Mcp { server, tool } => format!("{server}/{tool}"),
+            Self::LocalMcp { grant } => format!("{}/{}", grant.server_id, grant.tool),
         }
     }
 }
@@ -1152,6 +1161,7 @@ pub struct Context<'a> {
 /// command matches by (`None` when it is not a simple command), the canonical path of a file
 /// call (`None` when it cannot be made absolute).
 struct Probe {
+    local: bool,
     workspace_key: String,
     cwd_key: Option<String>,
     argv: Option<Vec<String>>,
@@ -1270,6 +1280,7 @@ impl Context<'_> {
             .as_deref()
             .map(crate::approval_server::canonical_target);
         Probe {
+            local: self.driver == "local",
             workspace_key: self.workspace_key(),
             cwd_key: self.cwd.map(canonical_or_raw),
             argv,
@@ -1292,7 +1303,9 @@ pub enum Target {
         prefix: bool,
     },
     /// A canonical absolute path.
-    Path { path: String },
+    Path {
+        path: String,
+    },
     /// A canonical absolute folder: an edit of any file below it. "Allow for session" on an edit
     /// keeps the file's folder ([`session_folder`]); a typed edit pattern ending in `/` is one.
     /// Session only ([`Rule::check`]); matched through
@@ -1311,7 +1324,13 @@ pub enum Target {
         handle: FolderHandle,
     },
     /// One MCP server's tool (`*`: any tool of that server).
-    Mcp { server: String, tool: String },
+    Mcp {
+        server: String,
+        tool: String,
+    },
+    LocalMcp {
+        grant: agent_core::local_mcp::Grant,
+    },
 }
 
 /// How long a rule is kept.
@@ -1435,6 +1454,9 @@ impl Rule {
     /// not a simple one, or a path is outside the workspace or sensitive. What may be kept for a
     /// scope is [`Self::check`]'s.
     pub fn from_action(action: &Action, ctx: &Context) -> Result<Self, String> {
+        if matches!(action, Action::LocalMcp { .. }) && ctx.driver != "local" {
+            return Err("Local MCP grants require the Local agent".into());
+        }
         if has_secret(&action.text()) {
             return Err("it contains a secret".to_owned());
         }
@@ -1475,6 +1497,12 @@ impl Rule {
                 Target::Mcp {
                     server: server.clone(),
                     tool: tool.clone(),
+                },
+                None,
+            ),
+            Action::LocalMcp { grant } => (
+                Target::LocalMcp {
+                    grant: grant.clone(),
                 },
                 None,
             ),
@@ -1576,6 +1604,13 @@ impl Rule {
     /// for session" on a runner, wrapper or interpreter only as the exact command, never a
     /// pattern.
     pub fn check(&self, scope: Scope) -> Result<(), String> {
+        if let Target::LocalMcp { grant } = &self.target {
+            return if grant.valid() && self.kind == ActionKind::Mcp {
+                Ok(())
+            } else {
+                Err("Invalid revision-bound Local MCP rule.".into())
+            };
+        }
         if let Target::Dir { .. } = &self.target {
             // A standing write grant over a whole folder is too much to keep for good: a later
             // session's files there are not ones the user has seen.
@@ -1714,6 +1749,9 @@ impl Rule {
             (Target::Mcp { server, tool }, Action::Mcp { server: s, tool: t }) => {
                 server == s && (tool == "*" || tool == t)
             }
+            (Target::LocalMcp { grant }, Action::LocalMcp { grant: other }) => {
+                probe.local && grant == other && grant.valid()
+            }
             _ => false,
         }
     }
@@ -1740,6 +1778,10 @@ impl Rule {
             Target::Path { path } => path.clone(),
             Target::Dir { dir, .. } => format!("{dir}/"),
             Target::Mcp { server, tool } => format!("{server}/{tool}"),
+            Target::LocalMcp { grant } => format!(
+                "{}/{} (reviewed server/schema revisions; all arguments)",
+                grant.server_id, grant.tool
+            ),
         }
     }
 
@@ -1767,6 +1809,7 @@ pub fn dialog_prefill(tool: &str, input: &Value) -> String {
         Some(Action::Edit { path }) if path.len() > 1 => path.trim_end_matches('/').to_owned(),
         Some(Action::Edit { path } | Action::Read { path }) => path,
         Some(Action::Mcp { server, tool }) => format!("{server}/{tool}"),
+        Some(Action::LocalMcp { grant }) => format!("{}/{}", grant.server_id, grant.tool),
         None => String::new(),
     }
 }
@@ -1794,6 +1837,7 @@ pub fn offerable(action: &Action, ctx: &Context) -> bool {
         Action::Shell { command } => command_tokens(command).is_some_and(|a| !argv_has_secret(&a)),
         Action::Edit { path } | Action::Read { path } => ctx.absolute(path).is_some(),
         Action::Mcp { .. } => true,
+        Action::LocalMcp { .. } => ctx.driver == "local",
     }
 }
 
@@ -1805,7 +1849,7 @@ pub fn always_offerable(action: &Action) -> bool {
             !has_secret(command) && command_tokens(command).is_some_and(|a| !argv_has_secret(&a))
         }
         Action::Edit { path } | Action::Read { path } => !has_secret(path),
-        Action::Mcp { .. } => true,
+        Action::Mcp { .. } | Action::LocalMcp { .. } => true,
     }
 }
 
@@ -1840,6 +1884,9 @@ pub fn decide_as_shown(
     shown: Option<&Path>,
 ) -> Result<Rule, String> {
     let action = action.ok_or("nothing in this request can be remembered")?;
+    if matches!(action, Action::LocalMcp { .. }) && custom.is_some() {
+        return Err("Local MCP grants cannot use a legacy or custom pattern.".into());
+    }
     if !offerable(action, ctx) {
         return Err("this call cannot be remembered".to_owned());
     }
@@ -2341,7 +2388,7 @@ impl AlwaysRules {
                     argv_text(argv),
                 ),
                 Target::Mcp { server, tool } => ("mcp", format!("{server}/{tool}")),
-                Target::Path { .. } | Target::Dir { .. } => continue,
+                Target::Path { .. } | Target::Dir { .. } | Target::LocalMcp { .. } => continue,
             };
             let quoted = toml_string(&entry);
             if entry.is_empty() || new_content.contains(&quoted) {
@@ -2416,7 +2463,7 @@ impl AlwaysRules {
             }
             Target::Argv { argv, .. } => Some(format!("Bash({})", argv_text(argv))),
             Target::Mcp { server, tool } => Some(format!("mcp__{server}__{tool}")),
-            Target::Path { .. } | Target::Dir { .. } => None,
+            Target::Path { .. } | Target::Dir { .. } | Target::LocalMcp { .. } => None,
         })
     }
 
@@ -2425,7 +2472,10 @@ impl AlwaysRules {
             // agy's `command(…)` is a prefix: an exact rule is not exported there.
             Target::Argv { argv, prefix: true } => Some(format!("command({})", argv_text(argv))),
             Target::Mcp { server, tool } => Some(format!("mcp({server}/{tool})")),
-            Target::Argv { .. } | Target::Path { .. } | Target::Dir { .. } => None,
+            Target::Argv { .. }
+            | Target::Path { .. }
+            | Target::Dir { .. }
+            | Target::LocalMcp { .. } => None,
         })
     }
 
@@ -3822,6 +3872,66 @@ mod tests {
             cwd,
             home: None,
         }
+    }
+
+    #[test]
+    fn local_mcp_grants_never_authorise_another_provider_or_a_legacy_identity() {
+        let grant = agent_core::local_mcp::Grant {
+            server_id: "example".into(),
+            tool: "read".into(),
+            server_revision: "a".repeat(64),
+            schema_revision: "b".repeat(64),
+        };
+        let stamp = agent_core::local_mcp::ApprovalStamp {
+            request_id: "r1".into(),
+            generation: "g1".into(),
+            call_id: "c1".into(),
+            grant,
+        };
+        let card = agent_core::local_mcp::ApprovalCard {
+            binding: stamp,
+            server_label: "Example".into(),
+            arguments: serde_json::json!({}),
+        };
+        let action = Action::of(
+            agent_core::local_mcp::APPROVAL_TOOL,
+            &serde_json::to_value(card).unwrap(),
+        )
+        .unwrap();
+        let local = ctx("local", Path::new("/workspace"), None);
+        let rule = Rule::from_action(&action, &local).unwrap();
+        let rules = AlwaysRules {
+            rules: vec![rule.clone()],
+        };
+        assert!(rules.matches_any(&action, &local));
+        assert!(rules.matches_session(&action, &local));
+        for driver in ["agy", "claude", "codex"] {
+            let other = ctx(driver, local.workspace, None);
+            assert!(!offerable(&action, &other));
+            assert!(Rule::from_action(&action, &other).is_err());
+            assert!(!rule.matches(&action, &other));
+            assert!(!rules.matches_any(&action, &other));
+            let mut forged = rule.clone();
+            forged.origin = driver.into();
+            assert!(!AlwaysRules {
+                rules: vec![forged]
+            }
+            .matches_session(&action, &other));
+        }
+        let legacy = Rule::from_action(
+            &Action::Mcp {
+                server: "example".into(),
+                tool: "*".into(),
+            },
+            &local,
+        )
+        .unwrap();
+        assert!(!legacy.matches(&action, &local));
+        let mut revised = action.clone();
+        if let Action::LocalMcp { grant } = &mut revised {
+            grant.schema_revision = "c".repeat(64);
+        }
+        assert!(!rule.matches(&revised, &local));
     }
 
     /// `Rule::new(..)` then [`Rule::complete`], in one step.

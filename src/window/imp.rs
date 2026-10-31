@@ -1650,6 +1650,7 @@ impl AgentTerminalWindow {
             )
         };
         *self.config.borrow_mut() = *new;
+        self.refresh_local_contexts();
         if clear_changed {
             // An agent's env file is read against these patterns: read them again, at once, so a
             // launch (which only uses a resolution already made) finds every agent resolved.

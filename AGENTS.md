@@ -60,7 +60,10 @@ Architectural mandates, standards, and workflows for this codebase.
     recognises), `provider` (a profile's local or self-hosted model server, Ollama, LM Studio or
     LiteLLM: what Claude and Codex are started with to use it, and its model list read) and the
     per-agent adapters and pure policies built on it, `local_agent` among them (the Local
-    agent's runner arguments, tools, mode gate, request body and streamed-reply reader).
+    agent's runner arguments, tools, mode gate, request body and streamed-reply reader),
+    `local_context` (its instruction settings, precedence, prompt composition and the
+    whole-request budget planner) and `local_mcp` (its MCP server definitions, tool identity
+    and aliases, the mode gate and the revision-bound approval card).
   - `crates/agent-kit` (GTK-free; blocking process and file I/O): `git`
     (git plumbing for turn checkpoints and diffs: shells out, but its parsers
     and filters are pure), `diff` (diff bases, numstat, line classification,
@@ -71,8 +74,13 @@ Architectural mandates, standards, and workflows for this codebase.
     `handoff` (hand-off briefs, session readers, quota detection),
     `sessions` (`SessionFormat`, session IDs, transcript lookup and listing),
     `paths` (`~` expansion), `provider_models` (a model server's model list), `local_agent` and
-    `local_tools` (the Local agent's runner: its chat client, loop, transcript and tools) and `exec` (child
-    processes with a timeout).
+    `local_tools` (the Local agent's runner: its chat client, loop, transcript and tools),
+    `local_instructions` (its bounded instruction-file discovery and reads), `mcp_transport`
+    (bounded JSON-RPC framing shared with the delegation bridge), `local_mcp` (`client`: the
+    `rmcp` client on one runtime thread per session, discovery and calls; `process`: the exact
+    child environment, credential masks and scrubbed stderr; `import`: the pure Codex
+    `config.toml` reader), `mcp_guardian` (the `--local-mcp-guardian` role that owns each MCP
+    process group) and `exec` (child processes with a timeout).
   - `agent-kit`'s `store` is the SQLite thread store (threads, provider
     threads, scrubbed events, app meta such as the open-thread list).
     `store_writer` is the one thread that writes it: the app's main thread
@@ -95,7 +103,9 @@ Architectural mandates, standards, and workflows for this codebase.
     the menu itself is data in `window/sidebar_model.rs`), `window/imp/closing.rs` (closing a
     window waits for its agents' real exits with the window up, never by blocking at quit; past
     150 ms it shows the closing screen, drawn by `window/imp/pack_animation.rs`),
-    `window/imp/agents_prefs.rs` (Settings → Agents),
+    `window/imp/agents_prefs.rs` (Settings → Agents; `agents_prefs/local_context.rs` and
+    `local_mcp.rs` are the Local Instructions and Tools group: instruction files, budgets, MCP
+    server definitions, discovery and the Codex import),
     `window/sidebar_model.rs` (pure sidebar logic), `window/diff_panel.rs` (the
     diff panel's widgets and its "Open a PR" bar; it pops out into its own window, keeping its
     place, hidden, as its identity, and docks back when that window closes or its page leaves),
@@ -348,7 +358,52 @@ Architectural mandates, standards, and workflows for this codebase.
   It is never a delegation parent or child (`RouteBlocker::LocalAgentNoBridge`). Its
   conversation is a `0600` file under `$XDG_STATE_HOME/agent-terminal/local`, which uninstall
   removes with the state folder.
-- **Localhost bound**: interacts only with the local shell; exposes no ports. The outbound
+- **The Local agent's instructions and MCP tools are the user's, configured in the app, never
+  found at launch**: the runner takes one validated `LocalLaunchContext` on stdin
+  (`Command::ConfigureLocal`, before any prompt; never argv). Instruction files
+  (`agent_kit::local_instructions`) are read once per turn, in order: the native
+  `$XDG_CONFIG_HOME/agent-terminal/AGENTS.md`, the configured global files, then each ancestor
+  of the canonical thread folder from `/` down (`AGENTS.override.md`, else `AGENTS.md`, else
+  `CLAUDE.md` when the fallback is on). Symlinks are followed, but a file is opened without
+  blocking, must be regular UTF-8 and is read at most to its cap; a configured file that is
+  missing, oversize or over the static budget blocks the turn with its path and reason, never
+  truncated. The composed system message is redacted, and no instruction can change the gate,
+  the approvals or the environment. Every request is planned whole
+  (`local_context::plan_request`): policy, instructions, schemas, newest whole exchanges and
+  the response reserve; a call batch runs only when every result's room is reserved first.
+  MCP servers (`local_defaults.mcp_servers`, selected per profile) are stdio child processes
+  started only at a turn or by Settings → Discover tools, never by opening Settings or
+  importing. Each runs under a guardian (`--local-mcp-guardian`) in its own process group,
+  with a minimal exact environment (`PATH`, `HOME`, locale, `TMPDIR`, `XDG_RUNTIME_DIR`, plus
+  the definition's references and literals; never a control variable), bounded frames (1 MiB),
+  discovery (256 tools a server, 1,024 a session), schemas (64 KiB, compiled with a linear
+  regex engine, no external `$ref`), arguments (64 KiB) and stderr tail (64 KiB). A turn's
+  registry is frozen at its start: the model sees short aliases (`mcp_<hash>`), routed only
+  through that registry, never a model-supplied server or tool name. Eligibility comes before
+  approval: enabled in Settings, selected, allowlisted by exact name, advertised this turn,
+  valid arguments, then the mode (`local_mcp::gate`: Plan runs only a tool the user declared
+  read-only; Accept edits grants MCP nothing; Bypass skips only the prompt), then the policy
+  (the server's for its reviewed allowlist, a tool override only narrows it, Deny always
+  wins; server annotations grant nothing). A card shows the server, the original tool name
+  and exactly the arguments that run, secrets masked in place
+  (`agent_core::redact::structured`); a call whose card cannot be shown faithfully is refused.
+  A pending approval is bound to its request id, the runner generation and the connection it
+  was raised on: a disconnection or reconnection expires the card, and a late answer never
+  authorises a replacement call. A session or saved grant is bound to the server definition's
+  and the tool schema's content revisions, not to a connection: it survives a reconnection
+  that advertises the same content, and a changed definition or schema asks again
+  (`tool_content_revisions_survive_reconnect_and_unchanged_notifications_but_track_raw_metadata`
+  and `disconnect_expires_pending_cards_and_late_answers_never_authorise_reconnection` prove
+  the two). Stop, session end, EOF or a narrowing setting ends every server
+  of the session, idle ones included, the guardian killing the group on the runner's death
+  through a private lifetime pipe; the next turn starts a fresh generation. A thread's MCP
+  panel toggle never re-enables a definition Settings has disabled. Resolved credential
+  values are masked exactly, whole and by fragment, in arguments, results, errors, stderr,
+  events, the transcript and the store, before truncation. `tests/local_mcp.rs` proves these
+  with fixture servers; `local_mcp_real_stdio` runs the official filesystem server when
+  `LOCAL_MCP_TEST_COMMAND` names an installed copy.
+- **Localhost bound**: interacts only with the local shell; exposes no ports. MCP servers for
+  the Local agent are local child processes on pipes, never a network transport. The outbound
   connections are three. The update check (`agent_kit::update`): a single HTTPS GET of the
   repository's latest GitHub release, off the main thread, with a timeout. It runs once per
   process a few seconds after startup unless Settings → "Check for Updates at Startup" is off

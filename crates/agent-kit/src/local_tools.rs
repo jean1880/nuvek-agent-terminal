@@ -152,6 +152,7 @@ pub fn run(
     may_leave: bool,
     cancel: &AtomicBool,
 ) -> Result<String, String> {
+    tool.validate_arguments(input).map_err(str::to_owned)?;
     match tool {
         Tool::ReadFile => read_file(input, &ws.cwd),
         Tool::ListDir => list_dir(input, &ws.cwd),

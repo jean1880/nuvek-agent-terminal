@@ -218,14 +218,14 @@ impl Tool {
         .to_owned()
     }
 
-    fn schema(self) -> Value {
+    pub fn schema(self) -> Value {
         let (description, properties, required): (&str, Value, &[&str]) = match self {
             Tool::ReadFile => (
                 "Read a text file. Paths are relative to the working folder unless absolute.",
                 json!({
                     "file_path": {"type": "string", "description": "The file to read"},
-                    "offset": {"type": "integer", "description": "First line to read, from 1"},
-                    "limit": {"type": "integer", "description": "How many lines to read"}
+                    "offset": {"type": "integer", "minimum": 0, "description": "First line to read, from 1"},
+                    "limit": {"type": "integer", "minimum": 0, "description": "How many lines to read"}
                 }),
                 &["file_path"],
             ),
@@ -264,7 +264,7 @@ impl Tool {
                 "Run a shell command in the working folder and return its output.",
                 json!({
                     "command": {"type": "string", "description": "The command line, run by sh -c"},
-                    "timeout_secs": {"type": "integer", "description": "How long it may run (default 120, at most 600)"}
+                    "timeout_secs": {"type": "integer", "minimum": 0, "description": "How long it may run (default 120, at most 600)"}
                 }),
                 &["command"],
             ),
@@ -274,9 +274,43 @@ impl Tool {
             "function": {
                 "name": self.name(),
                 "description": description,
-                "parameters": {"type": "object", "properties": properties, "required": required}
+                "parameters": {"type": "object", "properties": properties, "required": required, "additionalProperties": false}
             }
         })
+    }
+
+    /// Built-ins accept exactly their advertised fields; card aliases for other agents must
+    /// never become a second interpretation of the Local executor's arguments.
+    pub fn validate_arguments(self, input: &Value) -> Result<(), &'static str> {
+        let object = input
+            .as_object()
+            .ok_or("Tool arguments must be an object.")?;
+        let schema = self.schema();
+        let parameters = &schema["function"]["parameters"];
+        let properties = &parameters["properties"];
+        if parameters["required"].as_array().is_none_or(|required| {
+            required
+                .iter()
+                .any(|name| name.as_str().is_none_or(|name| !object.contains_key(name)))
+        }) {
+            return Err("A required tool argument is missing.");
+        }
+        for (key, value) in object {
+            let Some(field) = properties.get(key) else {
+                return Err("Tool arguments contain an unknown field.");
+            };
+            let valid = match field["type"].as_str() {
+                Some("string") => value.is_string(),
+                Some("boolean") => value.is_boolean(),
+                // These fields are read as u64 by the executor, including their bounds.
+                Some("integer") => value.as_u64().is_some(),
+                _ => false,
+            };
+            if !valid {
+                return Err("A tool argument has the wrong type or range.");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -313,27 +347,6 @@ pub fn gate(tool: Tool, mode: Mode, outside: bool) -> Gate {
         Mode::AcceptEdits if tool != Tool::RunCommand && !outside => Gate::Run,
         Mode::Ask | Mode::AcceptEdits => Gate::Ask,
     }
-}
-
-/// The system prompt: who the agent is, where it works and how it may act.
-pub fn system_prompt(cwd: &str, mode: Mode) -> String {
-    let policy = match mode {
-        Mode::Plan => {
-            "You are in plan mode: you may read and search, but not change anything. Finish with a \
-             clear plan."
-        }
-        Mode::Ask => "The user approves each file change and command before it runs.",
-        Mode::AcceptEdits => {
-            "File changes in the working folder run at once; commands need approval."
-        }
-        Mode::Bypass => "Every tool call runs without asking.",
-    };
-    format!(
-        "You are a coding agent working in the folder {cwd}. Use the tools to read, search, edit \
-         and run commands there instead of guessing; relative paths are inside that folder. \
-         Prefer edit_file for small changes and keep changes minimal. {policy} When the task is \
-         done, reply with a short summary of what you did."
-    )
 }
 
 /// One message of the conversation, in the OpenAI chat shape every target server takes, and as
@@ -427,6 +440,21 @@ pub fn chat_request(model: &str, messages: &[ChatMessage], tools: &[Tool]) -> Va
     });
     if !tools.is_empty() {
         body["tools"] = tools.iter().map(|t| t.schema()).collect();
+    }
+    body
+}
+
+/// Request construction with already selected complete schemas and an explicit output cap.
+pub fn schema_request(
+    model: &str,
+    messages: &[ChatMessage],
+    schemas: &[Value],
+    response_tokens: usize,
+) -> Value {
+    let mut body = chat_request(model, messages, &[]);
+    body["max_tokens"] = json!(response_tokens);
+    if !schemas.is_empty() {
+        body["tools"] = json!(schemas);
     }
     body
 }
@@ -688,11 +716,14 @@ impl ThinkSplitter {
 /// The adapter: a codec over the runner's canonical pipes, keeping what `on_exit` must close.
 #[derive(Debug)]
 pub struct LocalAdapter {
+    context: crate::local_context::LocalLaunchContext,
     caps: Capabilities,
     started: bool,
     turn_open: bool,
     open_items: BTreeSet<String>,
     pending: BTreeSet<String>,
+    mcp_pending: std::collections::BTreeMap<String, crate::local_mcp::ApprovalStamp>,
+    mcp_answered: BTreeSet<String>,
 }
 
 impl Default for LocalAdapter {
@@ -704,11 +735,14 @@ impl Default for LocalAdapter {
 impl LocalAdapter {
     pub fn new() -> Self {
         Self {
+            context: Default::default(),
             caps: Capabilities::local(),
             started: false,
             turn_open: false,
             open_items: BTreeSet::new(),
             pending: BTreeSet::new(),
+            mcp_pending: Default::default(),
+            mcp_answered: Default::default(),
         }
     }
 
@@ -716,6 +750,11 @@ impl LocalAdapter {
         serde_json::to_string(command)
             .map(|line| vec![Action::Write(vec![line])])
             .map_err(|e| AdapterError::Invalid(e.to_string()))
+    }
+
+    pub fn with_context(mut self, context: crate::local_context::LocalLaunchContext) -> Self {
+        self.context = context;
+        self
     }
 
     /// Tracks what `envelope` opens and closes.
@@ -734,14 +773,25 @@ impl LocalAdapter {
                     self.open_items.remove(item);
                 }
             }
-            Event::ApprovalRequested { .. } => {
+            Event::ApprovalRequested { tool, input, .. } => {
                 if let Some(request) = &envelope.request {
                     self.pending.insert(request.clone());
+                    if tool == crate::local_mcp::APPROVAL_TOOL {
+                        if let Ok(card) =
+                            serde_json::from_value::<crate::local_mcp::ApprovalCard>(input.clone())
+                        {
+                            if card.binding.valid() && &card.binding.request_id == request {
+                                self.mcp_pending.insert(request.clone(), card.binding);
+                            }
+                        }
+                    }
                 }
             }
             Event::ApprovalResolved { .. } | Event::ApprovalExpired => {
                 if let Some(request) = &envelope.request {
                     self.pending.remove(request);
+                    self.mcp_pending.remove(request);
+                    self.mcp_answered.remove(request);
                 }
             }
             _ => {}
@@ -750,6 +800,16 @@ impl LocalAdapter {
 }
 
 impl Adapter for LocalAdapter {
+    fn local_mcp_approval(&self, request: &str) -> Option<crate::local_mcp::ApprovalStamp> {
+        if self.mcp_answered.contains(request) {
+            None
+        } else {
+            self.mcp_pending.get(request).cloned()
+        }
+    }
+    fn local_context(&self) -> Option<&crate::local_context::LocalLaunchContext> {
+        Some(&self.context)
+    }
     fn driver(&self) -> Driver {
         Driver::Local
     }
@@ -778,7 +838,12 @@ impl Adapter for LocalAdapter {
     }
 
     fn handshake(&mut self) -> Vec<String> {
-        Vec::new()
+        match serde_json::to_string(&Command::ConfigureLocal {
+            context: Box::new(self.context.clone()),
+        }) {
+            Ok(line) => vec![line],
+            Err(_) => Vec::new(),
+        }
     }
 
     fn handshake_answered(&self) -> bool {
@@ -787,6 +852,9 @@ impl Adapter for LocalAdapter {
 
     fn encode(&mut self, command: Command) -> Result<Vec<Action>, AdapterError> {
         match &command {
+            Command::ConfigureLocal { .. } => {
+                Err(AdapterError::Unsupported("Local setup after handshake"))
+            }
             Command::Prompt { .. }
             | Command::Interrupt
             | Command::SetModel { .. }
@@ -797,12 +865,62 @@ impl Adapter for LocalAdapter {
                         "no pending request {request}"
                     )));
                 }
-                Self::write(&command)
+                if let Command::Approve {
+                    request,
+                    decision,
+                    updated_input,
+                    message,
+                } = command
+                {
+                    if let Some(binding) = self.mcp_pending.get(&request) {
+                        if self.mcp_answered.contains(&request) {
+                            return Err(AdapterError::Invalid(
+                                "MCP approval was already answered.".into(),
+                            ));
+                        }
+                        let encoded = Self::write(&Command::Approve {
+                            request: request.clone(),
+                            decision,
+                            message,
+                            updated_input: Some(
+                                serde_json::to_value(crate::local_mcp::ApprovalAnswer {
+                                    binding: binding.clone(),
+                                    edited_arguments: updated_input,
+                                })
+                                .map_err(|_| {
+                                    AdapterError::Invalid(
+                                        "MCP approval binding could not be encoded.".into(),
+                                    )
+                                })?,
+                            ),
+                        });
+                        if encoded.is_ok() {
+                            self.mcp_answered.insert(request);
+                        }
+                        return encoded;
+                    }
+                    return Self::write(&Command::Approve {
+                        request,
+                        decision,
+                        updated_input,
+                        message,
+                    });
+                }
+                Err(AdapterError::Invalid(
+                    "Invalid Local approval command.".into(),
+                ))
             }
             Command::Steer { .. } => Err(AdapterError::Unsupported("messages during a turn")),
             Command::DelegatedSteer { .. } => Err(AdapterError::Unsupported("delegated steering")),
             Command::Answer { .. } => Err(AdapterError::Unsupported("questions")),
             Command::SubmitForm { .. } => Err(AdapterError::Unsupported("forms")),
+            Command::Control {
+                control:
+                    crate::adapter::Control::McpStatus
+                    | crate::adapter::Control::McpToggle { .. }
+                    | crate::adapter::Control::McpReconnect { .. },
+                ..
+            } => Self::write(&command),
             Command::Control { .. } => Err(AdapterError::Unsupported("this control")),
         }
     }
@@ -830,6 +948,8 @@ impl Adapter for LocalAdapter {
     }
 
     fn on_exit(&mut self, code: Option<i32>) -> Vec<Envelope> {
+        self.mcp_pending.clear();
+        self.mcp_answered.clear();
         let mut out = Vec::new();
         for item in std::mem::take(&mut self.open_items) {
             out.push(Envelope::item_completed(
@@ -867,6 +987,93 @@ pub const APPROVAL_OPTIONS: [Decision; 3] =
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn builtin_arguments_match_exact_declared_fields_and_types() {
+        for tool in Tool::ALL {
+            let schema = tool.schema();
+            let parameters = &schema["function"]["parameters"];
+            assert_eq!(parameters["additionalProperties"], false);
+            let mut input = json!({});
+            for name in parameters["required"].as_array().unwrap() {
+                input[name.as_str().unwrap()] = json!("value");
+            }
+            assert!(tool.validate_arguments(&input).is_ok());
+            for key in [
+                "CommandLine",
+                "cwd",
+                "cmd",
+                "file_path",
+                "content",
+                "changes",
+                "edits",
+                "old_string",
+            ] {
+                if parameters["properties"].get(key).is_none() {
+                    let mut invalid = input.clone();
+                    invalid[key] = json!("spoof");
+                    assert!(
+                        tool.validate_arguments(&invalid).is_err(),
+                        "{} {key}",
+                        tool.name()
+                    );
+                }
+            }
+            for (key, field) in parameters["properties"].as_object().unwrap() {
+                for wrong in [Value::Null, json!([]), json!({}), json!(1.5)] {
+                    let mut invalid = input.clone();
+                    invalid[key] = wrong;
+                    assert!(
+                        tool.validate_arguments(&invalid).is_err(),
+                        "{} {key}",
+                        tool.name()
+                    );
+                }
+                let mut valid = input.clone();
+                valid[key] = match field["type"].as_str().unwrap() {
+                    "string" => json!("value"),
+                    "integer" => json!(1),
+                    "boolean" => json!(false),
+                    _ => unreachable!(),
+                };
+                assert!(tool.validate_arguments(&valid).is_ok());
+            }
+            for name in parameters["required"].as_array().unwrap() {
+                let mut invalid = input.clone();
+                invalid
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(name.as_str().unwrap());
+                assert!(tool.validate_arguments(&invalid).is_err());
+            }
+            for invalid in [Value::Null, json!([]), json!("value")] {
+                assert!(tool.validate_arguments(&invalid).is_err());
+            }
+        }
+    }
+    #[test]
+    fn setup_is_typed_and_never_part_of_argv() {
+        use super::*;
+        let context = crate::local_context::LocalLaunchContext::default();
+        let mut adapter = LocalAdapter::new().with_context(context.clone());
+        let lines = adapter.handshake();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Command>(&lines[0]).unwrap(),
+            Command::ConfigureLocal {
+                context: Box::new(context)
+            }
+        );
+        assert!(!adapter.handshake_answered());
+        assert!(!adapter
+            .argv(&session())
+            .iter()
+            .any(|a| a.contains("context_tokens")));
+        assert!(adapter
+            .encode(Command::ConfigureLocal {
+                context: Box::default()
+            })
+            .is_err());
+    }
     use super::*;
 
     fn session() -> OpenSession {
@@ -1205,6 +1412,95 @@ data: [DONE]"#;
                 id: "c".into(),
                 control: crate::adapter::Control::McpStatus
             })
+            .is_ok());
+        for control in [
+            crate::adapter::Control::McpReconnect {
+                server: "selected".into(),
+            },
+            crate::adapter::Control::McpToggle {
+                server: "selected".into(),
+                enabled: false,
+            },
+        ] {
+            assert!(a
+                .encode(Command::Control {
+                    id: "control".into(),
+                    control
+                })
+                .is_ok());
+        }
+        assert!(a
+            .encode(Command::Control {
+                id: "unsupported".into(),
+                control: crate::adapter::Control::Usage
+            })
             .is_err());
+    }
+
+    #[test]
+    fn mcp_answers_bind_the_displayed_revision_and_only_encode_once() {
+        use crate::local_mcp::{ApprovalAnswer, ApprovalCard, ApprovalStamp, Grant};
+        let stamp = ApprovalStamp {
+            request_id: "r1".into(),
+            generation: "g1".into(),
+            call_id: "c1".into(),
+            grant: Grant {
+                server_id: "example".into(),
+                tool: "read".into(),
+                server_revision: "a".repeat(64),
+                schema_revision: "b".repeat(64),
+            },
+        };
+        let card = ApprovalCard {
+            binding: stamp.clone(),
+            server_label: "Example".into(),
+            arguments: json!({"value":"masked"}),
+        };
+        let frame = Envelope::new(Event::ApprovalRequested {
+            tool: crate::local_mcp::APPROVAL_TOOL.into(),
+            title: None,
+            input: serde_json::to_value(card).unwrap(),
+            reason: None,
+            options: crate::local_mcp::APPROVAL_OPTIONS.to_vec(),
+            response: crate::event::ResponseCapability::Live,
+            remembers: None,
+        })
+        .request("r1");
+        let mut adapter = LocalAdapter::new();
+        adapter.feed(&serde_json::to_string(&frame).unwrap());
+        assert_eq!(adapter.local_mcp_approval("r1"), Some(stamp.clone()));
+        let answer = Command::Approve {
+            request: "r1".into(),
+            decision: Decision::AllowAlways,
+            updated_input: Some(json!({"value":"edited"})),
+            message: None,
+        };
+        let encoded = adapter.encode(answer.clone()).unwrap();
+        let Action::Write(lines) = &encoded[0] else {
+            panic!("write");
+        };
+        let Command::Approve {
+            updated_input: Some(value),
+            ..
+        } = serde_json::from_str::<Command>(&lines[0]).unwrap()
+        else {
+            panic!("approval");
+        };
+        assert_eq!(
+            serde_json::from_value::<ApprovalAnswer>(value).unwrap(),
+            ApprovalAnswer {
+                binding: stamp,
+                edited_arguments: Some(json!({"value":"edited"}))
+            }
+        );
+        assert!(adapter.local_mcp_approval("r1").is_none());
+        assert!(adapter.encode(answer.clone()).is_err());
+        adapter.feed(
+            &serde_json::to_string(&Envelope::new(Event::ApprovalExpired).request("r1")).unwrap(),
+        );
+        assert!(adapter.encode(answer).is_err());
+        adapter.feed(&serde_json::to_string(&frame).unwrap());
+        adapter.on_exit(Some(1));
+        assert!(adapter.local_mcp_approval("r1").is_none());
     }
 }

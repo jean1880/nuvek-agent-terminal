@@ -164,7 +164,7 @@ impl Capabilities {
             live_approvals: true,
             interrupt_keeps_process: true,
             file_suggestions: false,
-            mcp_panel: false,
+            mcp_panel: true,
             settings_panel: false,
             model_list: true,
             context_usage: false,

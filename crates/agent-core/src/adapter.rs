@@ -304,6 +304,10 @@ pub struct OpenSession {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
+    /// Internal Local startup handshake, acknowledged by SessionStarted after validation.
+    ConfigureLocal {
+        context: Box<crate::local_context::LocalLaunchContext>,
+    },
     Prompt {
         text: String,
     },
@@ -445,8 +449,14 @@ impl std::fmt::Display for AdapterError {
 impl std::error::Error for AdapterError {}
 
 pub trait Adapter {
+    fn local_mcp_approval(&self, _request: &str) -> Option<crate::local_mcp::ApprovalStamp> {
+        None
+    }
     fn driver(&self) -> Driver;
     fn capabilities(&self) -> &Capabilities;
+    fn local_context(&self) -> Option<&crate::local_context::LocalLaunchContext> {
+        None
+    }
     /// Full argv (program first) for this session.
     fn argv(&self, session: &OpenSession) -> Vec<String>;
     /// Lines to write as soon as the process starts (Claude `initialize`); may be empty.

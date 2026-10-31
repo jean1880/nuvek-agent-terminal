@@ -1373,6 +1373,7 @@ impl Adapter for ClaudeAdapter {
 
     fn encode(&mut self, command: Command) -> Result<Vec<Action>, AdapterError> {
         let line = match command {
+            Command::ConfigureLocal { .. } => return Err(AdapterError::Unsupported("Local setup")),
             // A steer is the same user line: written while a turn runs, Claude folds it into
             // that turn (one `result`, no new `init`); written as the turn ends, it starts the
             // next one, which opens with its own `init` like any prompt.

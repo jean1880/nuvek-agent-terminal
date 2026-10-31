@@ -64,6 +64,7 @@ comments, absolute paths (no `~` or `$HOME`).
 |---|---|
 | `RUST_LOG` | Log filter for the app's output in a failing test's stderr (`debug`, `agent_terminal::window=debug`, …) |
 | `AGENT_TERMINAL_BENCH_DB` | A scratch **copy** of a real `threads.db` for the store's append benchmark (`make bench T=append_bench`). Never your live store |
+| `LOCAL_MCP_TEST_COMMAND` | The absolute path of an installed, version-pinned official filesystem MCP server (`npm install --prefix <own folder> @modelcontextprotocol/server-filesystem@<version>`, then its `node_modules/.bin/mcp-server-filesystem`) for the Local agent's live stdio check, `make test-one T=local_mcp_real_stdio`: the real runner, client and guardian against a temporary directory. Downloads nothing, reads no home folder; unset, the test passes without running |
 
 **Make variables** (on the command line: `make test NEXTEST_PROFILE=ci`)
 

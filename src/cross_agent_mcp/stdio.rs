@@ -1,5 +1,7 @@
 //! Bounded newline framing before rmcp sees a message. The SDK's default stdio transport
 //! reads an unbounded line and can echo an unbounded request id, so neither is used here.
+use agent_kit::mcp_transport::FrameReader;
+pub(super) use agent_kit::mcp_transport::{bounded_ids, bounded_wire_ids};
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::io;
@@ -7,11 +9,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_core::delegation::ipc::MAX_FRAME;
-use agent_core::delegation::wire::request_id_ok;
 use rmcp::service::{RoleServer, RxJsonRpcMessage, TxJsonRpcMessage};
 use rmcp::transport::Transport;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 
 type Cancel = Arc<dyn Fn() + Send + Sync>;
@@ -120,9 +121,7 @@ impl BoundedStdio {
 }
 
 pub(super) struct BoundedTransport<R, W> {
-    reader: BufReader<R>,
-    /// Survives cancellation of `receive`, including a partial line.
-    line: Vec<u8>,
+    reader: FrameReader<R>,
     writer: Arc<Mutex<Option<W>>>,
     pending: Arc<std::sync::Mutex<BTreeSet<String>>>,
     cancellations: CancellationRegistry,
@@ -132,8 +131,7 @@ pub(super) struct BoundedTransport<R, W> {
 impl<R: AsyncRead, W: AsyncWrite> BoundedTransport<R, W> {
     pub(super) fn with_io(reader: R, writer: W) -> Self {
         Self {
-            reader: BufReader::new(reader),
-            line: Vec::new(),
+            reader: FrameReader::new(reader, MAX_FRAME),
             writer: Arc::new(Mutex::new(Some(writer))),
             pending: Arc::default(),
             cancellations: CancellationRegistry::default(),
@@ -151,7 +149,15 @@ impl<R, W: AsyncWrite + Unpin> BoundedTransport<R, W> {
     /// Writes a reply the transport answers by itself. A reply that cannot be written means the
     /// transport is dead: it is marked ended and `None` is returned.
     async fn reply_or_end(&mut self, value: Value) -> Option<()> {
-        if write_value(&self.writer, value).await.is_err() {
+        if agent_kit::mcp_transport::write_value(
+            &self.writer,
+            value,
+            MAX_FRAME,
+            Duration::from_secs(5),
+        )
+        .await
+        .is_err()
+        {
             self.ended = true;
             return None;
         }
@@ -159,146 +165,8 @@ impl<R, W: AsyncWrite + Unpin> BoundedTransport<R, W> {
     }
 }
 
-async fn write_value<W: AsyncWrite + Unpin>(
-    writer: &Arc<Mutex<Option<W>>>,
-    value: Value,
-) -> io::Result<()> {
-    let mut bytes =
-        serde_json::to_vec(&value).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
-    if bytes.len() >= MAX_FRAME {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "MCP response exceeds its frame budget",
-        ));
-    }
-    bytes.push(b'\n');
-    tokio::time::timeout(Duration::from_secs(5), async {
-        let mut guard = writer.lock().await;
-        let writer = guard
-            .as_mut()
-            .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
-        writer.write_all(&bytes).await?;
-        writer.flush().await
-    })
-    .await
-    .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
-}
-
 fn rpc_error(code: i32, message: &str, id: Value) -> Value {
     json!({"jsonrpc":"2.0", "id": id, "error":{"code":code,"message":message}})
-}
-
-/// Checks the response id and a cancellation's target before typed SDK dispatch. It never
-/// serialises the full request into an error or includes a rejected id in a response.
-pub(super) fn bounded_ids(value: &Value) -> bool {
-    let within =
-        |id: &Value| serde_json::to_string(id).is_ok_and(|encoded| request_id_ok(&encoded));
-    value.get("id").is_none_or(within)
-        && (value.get("method").and_then(Value::as_str) != Some("notifications/cancelled")
-            || value
-                .get("params")
-                .and_then(|params| params.get("requestId"))
-                .is_none_or(within))
-}
-
-/// Measure the original encoding as well: serde_json normalises numeric exponents and
-/// Unicode escapes, which must not make a 257-byte wire id pass the 256-byte bound.
-pub(super) fn bounded_wire_ids(line: &[u8]) -> bool {
-    let mut valid = true;
-    let _ = visit_field(line, "id", &mut |id| valid &= id.len() <= 256);
-    let _ = visit_field(line, "params", &mut |params| {
-        let _ = visit_field(params, "requestId", &mut |id| valid &= id.len() <= 256);
-    });
-    valid
-}
-
-fn visit_field(object: &[u8], wanted: &str, visitor: &mut dyn FnMut(&[u8])) -> Option<()> {
-    fn ws(bytes: &[u8], mut at: usize) -> usize {
-        while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
-            at += 1;
-        }
-        at
-    }
-    fn end(bytes: &[u8], at: usize) -> Option<usize> {
-        match *bytes.get(at)? {
-            b'"' => {
-                let mut cursor = at + 1;
-                while let Some(byte) = bytes.get(cursor) {
-                    match byte {
-                        b'\\' => cursor += 2,
-                        b'"' => return Some(cursor + 1),
-                        _ => cursor += 1,
-                    }
-                }
-                None
-            }
-            b'{' | b'[' => {
-                let mut cursor = at + 1;
-                let mut depth = 1usize;
-                while let Some(byte) = bytes.get(cursor) {
-                    match byte {
-                        b'"' => cursor = end(bytes, cursor)?,
-                        b'{' | b'[' => {
-                            depth += 1;
-                            cursor += 1;
-                        }
-                        b'}' | b']' => {
-                            depth -= 1;
-                            cursor += 1;
-                            if depth == 0 {
-                                return Some(cursor);
-                            }
-                        }
-                        _ => cursor += 1,
-                    }
-                }
-                None
-            }
-            _ => {
-                let mut cursor = at;
-                while bytes
-                    .get(cursor)
-                    .is_some_and(|byte| !byte.is_ascii_whitespace() && !b",]}".contains(byte))
-                {
-                    cursor += 1;
-                }
-                (cursor > at).then_some(cursor)
-            }
-        }
-    }
-    let mut cursor = ws(object, 0);
-    if object.get(cursor) != Some(&b'{') {
-        return None;
-    }
-    cursor += 1;
-    loop {
-        cursor = ws(object, cursor);
-        if object.get(cursor) == Some(&b'}') {
-            return Some(());
-        }
-        if object.get(cursor) != Some(&b'"') {
-            return None;
-        }
-        let key_end = end(object, cursor)?;
-        let key: String = serde_json::from_slice(&object[cursor..key_end]).ok()?;
-        cursor = ws(object, key_end);
-        if object.get(cursor) != Some(&b':') {
-            return None;
-        }
-        cursor = ws(object, cursor + 1);
-        let value_end = end(object, cursor)?;
-        if key == wanted {
-            visitor(&object[cursor..value_end]);
-        }
-        cursor = ws(object, value_end);
-        if object.get(cursor) == Some(&b'}') {
-            return Some(());
-        }
-        if object.get(cursor) != Some(&b',') {
-            return None;
-        }
-        cursor += 1;
-    }
 }
 
 impl<R, W> Transport<RoleServer> for BoundedTransport<R, W>
@@ -330,7 +198,8 @@ where
                     cancellations.completed(&id);
                 }
             }
-            write_value(&writer, value).await
+            agent_kit::mcp_transport::write_value(&writer, value, MAX_FRAME, Duration::from_secs(5))
+                .await
         }
     }
 
@@ -339,30 +208,13 @@ where
             return None;
         }
         loop {
-            // fill_buf/consume are cancellation safe; reserve only what this line needs.
-            loop {
-                let chunk = match self.reader.fill_buf().await {
-                    Ok(chunk) if !chunk.is_empty() => chunk,
-                    _ => {
-                        self.ended = true;
-                        return None;
-                    }
-                };
-                let end = chunk.iter().position(|byte| *byte == b'\n');
-                let taken = end.map_or(chunk.len(), |index| index + 1);
-                let payload = taken - usize::from(end.is_some());
-                if self.line.len().saturating_add(payload) > MAX_FRAME {
-                    // Oversize terminates the bridge: never try to resynchronise.
+            let line = match self.reader.next_frame().await {
+                Ok(Some(line)) => line,
+                _ => {
                     self.ended = true;
                     return None;
                 }
-                self.line.extend_from_slice(&chunk[..taken]);
-                self.reader.consume(taken);
-                if end.is_some() {
-                    break;
-                }
-            }
-            let line = std::mem::take(&mut self.line);
+            };
             if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }

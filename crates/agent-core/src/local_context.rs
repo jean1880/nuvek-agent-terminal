@@ -42,9 +42,12 @@ impl InstructionSettings {
         if self
             .global_files
             .iter()
-            .any(|p| p.trim().is_empty() || p.contains('\0') || p.len() > 4096)
+            .any(|p| p.trim().is_empty() || p.contains('\0'))
         {
             return Err("An instruction path is empty or contains a NUL.".into());
+        }
+        if self.global_files.iter().any(|p| p.len() > 4096) {
+            return Err("An instruction path exceeds the 4096-byte limit.".into());
         }
         Ok(())
     }
@@ -568,6 +571,18 @@ mod tests {
     use crate::local_agent::{ChatMessage, Tool, ToolCall, ToolFunction};
     use crate::local_mcp::{ResolvedTool, ToolIdentity};
     use serde_json::json;
+
+    #[test]
+    fn long_instruction_paths_report_the_byte_limit() {
+        let settings = InstructionSettings {
+            global_files: vec!["é".repeat(2049)],
+            ..Default::default()
+        };
+        let error = settings.validate().unwrap_err();
+        assert!(error.contains("4096-byte"));
+        assert!(!error.contains("empty"));
+        assert!(!error.contains("NUL"));
+    }
 
     fn candidate(
         server: Option<&str>,

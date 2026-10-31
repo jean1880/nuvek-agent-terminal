@@ -116,7 +116,7 @@ impl Discovery<'_> {
     ) -> Result<bool, String> {
         let file = match OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY)
             .open(path)
         {
             Ok(file) => file,
@@ -253,6 +253,85 @@ pub fn preview(
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opening_an_instruction_tty_never_acquires_a_controlling_terminal() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+        const CHILD_TTY: &str = "AGENT_TERMINAL_TEST_INSTRUCTION_TTY";
+        if let Some(path) = std::env::var_os(CHILD_TTY) {
+            let has_terminal = || {
+                OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+                    .open("/dev/tty")
+                    .is_ok()
+            };
+            assert!(
+                !has_terminal(),
+                "the isolated session starts without a controlling terminal"
+            );
+            let tmp = tempfile::tempdir().unwrap();
+            let settings = InstructionSettings {
+                discover_ancestors: false,
+                global_files: vec![PathBuf::from(path).display().to_string()],
+                ..Default::default()
+            };
+            assert!(
+                discover(&settings, tmp.path(), &InstructionPaths::default())
+                    .unwrap_err()
+                    .contains("regular file")
+            );
+            assert!(
+                !has_terminal(),
+                "rejecting the device must not acquire it as the session's controlling terminal"
+            );
+            return;
+        }
+        // SAFETY: posix_openpt returns a new descriptor or -1; success is owned below.
+        let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+        assert!(
+            master >= 0,
+            "cannot allocate test PTY: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: master is a fresh descriptor transferred to one owner.
+        let master = unsafe { OwnedFd::from_raw_fd(master) };
+        // SAFETY: both calls operate on the owned PTY master.
+        assert_eq!(unsafe { libc::grantpt(master.as_raw_fd()) }, 0);
+        // SAFETY: the descriptor is still the open PTY master.
+        assert_eq!(unsafe { libc::unlockpt(master.as_raw_fd()) }, 0);
+        let mut name = [0u8; 256];
+        // SAFETY: the buffer has the stated length and the owned descriptor is a PTY master.
+        assert_eq!(
+            unsafe { libc::ptsname_r(master.as_raw_fd(), name.as_mut_ptr().cast(), name.len()) },
+            0
+        );
+        let name = std::ffi::CStr::from_bytes_until_nul(&name)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child.args(["--exact", "local_instructions::tests::opening_an_instruction_tty_never_acquires_a_controlling_terminal", "--nocapture"]).env(CHILD_TTY, name);
+        // SAFETY: setsid is async-signal-safe; the child only reads errno if it fails, then execs.
+        unsafe {
+            child.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let output = child.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn preview_uses_selected_paths_and_reports_only_metadata_even_on_budget_failure() {

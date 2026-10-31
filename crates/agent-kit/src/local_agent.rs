@@ -24,6 +24,7 @@ use agent_core::local_agent::{
     error_message, gate, refuses_tools, tools_for, ChatMessage, Gate, RunnerArgs, StreamEvent,
     StreamReader, Tool, ToolCall, APPROVAL_OPTIONS,
 };
+use agent_core::local_context::{exchange_starts, ContextBudget, RequestPlan};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -180,6 +181,42 @@ fn plain_error(e: &ureq::Error) -> String {
     }
 }
 
+/// Only an explicit input-context rejection warrants advice about the context budget.
+fn provider_failure(why: &str, budget: &ContextBudget) -> String {
+    let lower = why.to_ascii_lowercase();
+    let context_rejection = !["http 401", "http 403"]
+        .iter()
+        .any(|status| lower.contains(status))
+        && [
+            "context_length_exceeded",
+            "context_window_exceeded",
+            "maximum context length",
+            "context length exceeded",
+            "context window exceeded",
+            "exceeds the context",
+            "exceeds context",
+            "exceed context",
+            "context is too long",
+            "context too large",
+            "prompt is too long",
+            "prompt too long",
+            "too many input tokens",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker));
+    let hint = if context_rejection {
+        format!(
+            " {}",
+            budget.failure(
+                "the provider rejected the input context; check its configured context size"
+            )
+        )
+    } else {
+        String::new()
+    };
+    format!("{why}{hint} No tool calls from this response ran; the request was not automatically replayed.")
+}
+
 /// The conversation as the transcript file keeps it.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Transcript {
@@ -233,44 +270,71 @@ pub fn main(args: &[String], user_agent: &str) -> i32 {
     runner.run(&commands)
 }
 
-/// Reads stdin on its own thread: each line a command (`None` once stdin closes), so a turn can
-/// look for an interrupt or an answer while it waits on the server.
-pub fn read_commands(input: impl std::io::Read + Send + 'static) -> Receiver<Option<Command>> {
+/// Local stdin transport, keeping malformed frames out of the canonical command protocol.
+#[derive(Debug)]
+pub enum RunnerInput {
+    Command(Command),
+    Closed,
+    /// Fixed diagnostics only: rejected frames may contain credentials or instructions.
+    Invalid(&'static str),
+}
+
+/// Reads stdin on its own thread: each line a command (`Closed` once stdin closes), so a turn can
+/// look for an interrupt or an answer while it waits on the server. Invalid input is terminal.
+pub fn read_commands(input: impl std::io::Read + Send + 'static) -> Receiver<RunnerInput> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut reader = std::io::BufReader::new(input);
         loop {
             let mut bytes = Vec::new();
             // Includes startup configuration; oversized or unterminated frames end the input.
-            let Ok(count) = std::io::Read::take(
+            let count = match std::io::Read::take(
                 &mut reader,
                 agent_core::local_context::MAX_SETUP_BYTES as u64 + 1,
             )
-            .read_until(b'\n', &mut bytes) else {
-                break;
+            .read_until(b'\n', &mut bytes)
+            {
+                Ok(count) => count,
+                Err(_) => {
+                    let _ = tx.send(RunnerInput::Invalid("Could not read Local command input."));
+                    return;
+                }
             };
             if count == 0 {
                 break;
             }
-            if count > agent_core::local_context::MAX_SETUP_BYTES || bytes.last() != Some(&b'\n') {
-                break;
+            if count > agent_core::local_context::MAX_SETUP_BYTES {
+                let _ = tx.send(RunnerInput::Invalid(
+                    "Local command exceeds the startup frame limit.",
+                ));
+                return;
+            }
+            if bytes.last() != Some(&b'\n') {
+                let _ = tx.send(RunnerInput::Invalid(
+                    "Local command frame is missing its newline.",
+                ));
+                return;
             }
             let Ok(line) = String::from_utf8(bytes) else {
-                break;
+                let _ = tx.send(RunnerInput::Invalid("Local command is not valid UTF-8."));
+                return;
             };
             if line.trim().is_empty() {
                 continue;
             }
             match serde_json::from_str::<Command>(&line) {
                 Ok(command) => {
-                    if tx.send(Some(command)).is_err() {
+                    if tx.send(RunnerInput::Command(command)).is_err() {
                         return;
                     }
                 }
-                Err(_) => eprintln!("agent-terminal --local-agent: unreadable command"),
+                Err(_) => {
+                    let _ = tx.send(RunnerInput::Invalid("Malformed Local command JSON; check the startup configuration and command format."));
+                    return;
+                }
             }
         }
-        let _ = tx.send(None);
+        let _ = tx.send(RunnerInput::Closed);
     });
     rx
 }
@@ -278,11 +342,13 @@ pub fn read_commands(input: impl std::io::Read + Send + 'static) -> Receiver<Opt
 /// How a turn ended early.
 enum Stop {
     Interrupted,
+    InvalidInput(&'static str),
     /// Stdin closed: the app is gone.
     Closed,
 }
 
 pub struct Runner<C: ChatClient, W: Write> {
+    budget_notice_sent: bool,
     turn_instructions: agent_core::local_context::InstructionSnapshot,
     context: agent_core::local_context::LocalLaunchContext,
     args: RunnerArgs,
@@ -318,6 +384,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             model: args.model.clone(),
             context: Default::default(),
             turn_instructions: Default::default(),
+            budget_notice_sent: false,
             mode: args.mode,
             args,
             client: Some(client),
@@ -350,10 +417,16 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         format!("{what}-{}-{}", self.generation, self.next_id)
     }
 
-    /// Runs until stdin closes; 0 then, 1 if the session could not start.
-    pub fn run(&mut self, commands: &Receiver<Option<Command>>) -> i32 {
+    /// Runs until stdin closes; 0 then, 1 for failed startup or invalid command input.
+    pub fn run(&mut self, commands: &Receiver<RunnerInput>) -> i32 {
         match commands.recv() {
-            Ok(Some(Command::ConfigureLocal { context })) => {
+            Ok(RunnerInput::Invalid(why)) => {
+                self.emit(Envelope::new(Event::Error {
+                    message: why.into(),
+                }));
+                return 1;
+            }
+            Ok(RunnerInput::Command(Command::ConfigureLocal { context })) => {
                 if let Err(why) = context.validate() {
                     self.emit(Envelope::new(Event::Error { message: why }));
                     return 1;
@@ -386,14 +459,27 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         loop {
             let next = if self.deferred.is_empty() {
                 match commands.recv() {
-                    Ok(Some(command)) => command,
-                    Ok(None) | Err(_) => return 0,
+                    Ok(RunnerInput::Command(command)) => command,
+                    Ok(RunnerInput::Closed) | Err(_) => return 0,
+                    Ok(RunnerInput::Invalid(why)) => {
+                        self.emit(Envelope::new(Event::Error {
+                            message: why.into(),
+                        }));
+                        return 1;
+                    }
                 }
             } else {
                 self.deferred.remove(0)
             };
-            if let Err(Stop::Closed) = self.handle(next, commands) {
-                return 0;
+            match self.handle(next, commands) {
+                Err(Stop::Closed) => return 0,
+                Err(Stop::InvalidInput(why)) => {
+                    self.emit(Envelope::new(Event::Error {
+                        message: why.into(),
+                    }));
+                    return 1;
+                }
+                Ok(()) | Err(Stop::Interrupted) => {}
             }
         }
     }
@@ -486,11 +572,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         }
     }
 
-    fn handle(
-        &mut self,
-        command: Command,
-        commands: &Receiver<Option<Command>>,
-    ) -> Result<(), Stop> {
+    fn handle(&mut self, command: Command, commands: &Receiver<RunnerInput>) -> Result<(), Stop> {
         match command {
             Command::Prompt { text } => self.turn(text, commands),
             Command::SetModel { model, .. } => {
@@ -511,7 +593,8 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
     }
 
     /// One turn: the prompt, then model requests and tool calls until the model answers.
-    fn turn(&mut self, text: String, commands: &Receiver<Option<Command>>) -> Result<(), Stop> {
+    fn turn(&mut self, text: String, commands: &Receiver<RunnerInput>) -> Result<(), Stop> {
+        self.budget_notice_sent = false;
         let Some(model) = self.model.clone() else {
             self.emit(Envelope::new(Event::TurnStarted { model: None }));
             self.emit(Envelope::turn_completed(
@@ -539,6 +622,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         };
         // Earlier turns' reasoning is not sent again.
         agent_core::local_agent::forget_reasoning(&mut self.messages);
+        let exchange_start = self.messages.len();
         self.messages.push(ChatMessage::new("user", text));
         let mut usage = Usage::default();
         let mut result = Ok(());
@@ -557,6 +641,9 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                     break;
                 }
                 Err(StepError::Failed(why)) => {
+                    if step == 0 && self.messages.len() == exchange_start + 1 {
+                        self.messages.pop();
+                    }
                     failure = Some(why);
                     break;
                 }
@@ -565,6 +652,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         self.save();
         let usage = (usage.input_tokens + usage.output_tokens > 0).then_some(usage);
         let (state, error) = match (&result, failure) {
+            (Err(Stop::InvalidInput(why)), _) => (TurnState::Failed, Some((*why).into())),
             (Err(_), _) => (TurnState::Interrupted, None),
             (Ok(()), Some(why)) => (TurnState::Failed, Some(why)),
             (Ok(()), None) => (TurnState::Completed, None),
@@ -585,7 +673,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
     fn step(
         &mut self,
         model: &str,
-        commands: &Receiver<Option<Command>>,
+        commands: &Receiver<RunnerInput>,
         usage: &mut Usage,
     ) -> Result<StepEnd, StepError> {
         use agent_core::local_context::{
@@ -621,19 +709,9 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 self.turn_instructions.sources_summary()
             ))
         })?;
-        self.emit(Envelope::new(Event::Notice {
-            text: plan.summary(),
-        }));
-        for excluded in &plan.excluded {
-            self.emit(Envelope::new(Event::Notice {
-                text: format!(
-                    "Excluded tool {}: {} bytes; {}.",
-                    excluded.alias, excluded.bytes, excluded.reason
-                ),
-            }));
-        }
+        self.report_budget(&plan);
         let body = plan.body;
-        let (reply, ended, stopped) = self.stream(&body, commands, usage)?;
+        let (reply, ended, stopped) = self.stream(model, &body, commands, usage)?;
         // A call runs only from a reply that ended as the server meant it to: one the output
         // limit cut off, or that broke off before its end, may hold a half-written call.
         let complete = ended && reply.finish_reason.as_deref() != Some("length");
@@ -692,6 +770,9 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 if let Some(last) = self.messages.last_mut() {
                     last.tool_calls.clear();
                     last.reasoning_content = None;
+                    if last.content.is_empty() {
+                        self.messages.pop();
+                    }
                 }
                 return Err(StepError::Failed(why));
             }
@@ -709,10 +790,15 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 Err(stop) => {
                     // Every call the reply made gets an answer, so the history stays one a
                     // server accepts: this one and the rest did not run.
+                    let reason = if matches!(stop, StepError::Stop(Stop::InvalidInput(_))) {
+                        "Not run: malformed input ended the turn."
+                    } else {
+                        "Not run: the user stopped the turn."
+                    };
                     for skipped in &reply.tool_calls[at..] {
                         self.messages.push(ChatMessage::tool_result(
                             &skipped.id,
-                            bound_result("Not run: the user stopped the turn.", reservation),
+                            bound_result(reason, reservation),
                         ));
                     }
                     return Err(stop);
@@ -728,8 +814,9 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
     /// server is silent.
     fn stream(
         &mut self,
+        model: &str,
         body: &Value,
-        commands: &Receiver<Option<Command>>,
+        commands: &Receiver<RunnerInput>,
         usage: &mut Usage,
     ) -> Result<(agent_core::local_agent::Reply, bool, Option<Stop>), StepError> {
         let mut reader = StreamReader::new();
@@ -806,23 +893,39 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                     false,
                 );
                 let retry = agent_core::local_context::plan_request(
-                    body.get("model")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
+                    model,
                     &system,
                     &[],
                     &self.messages,
                     &self.context.budget,
                 )
                 .map_err(StepError::Failed)?;
-                self.emit(Envelope::new(Event::Notice {
-                    text: retry.summary(),
-                }));
-                return self.stream(&retry.body, commands, usage);
+                self.report_budget(&retry);
+                return self.stream(model, &retry.body, commands, usage);
             }
-            return Err(StepError::Failed(format!("{why} {} No tool calls from this response ran; requests are not automatically replayed to shrink context.", self.context.budget.failure("the provider rejected or failed the request; check its configured context size"))));
+            return Err(StepError::Failed(provider_failure(
+                &why,
+                &self.context.budget,
+            )));
         }
         Ok((reply, ended, None))
+    }
+
+    fn report_budget(&mut self, plan: &RequestPlan) {
+        if !self.budget_notice_sent || !plan.excluded.is_empty() {
+            self.emit(Envelope::new(Event::Notice {
+                text: plan.summary(),
+            }));
+            self.budget_notice_sent = true;
+        }
+        for excluded in &plan.excluded {
+            self.emit(Envelope::new(Event::Notice {
+                text: format!(
+                    "Excluded tool {}: {} bytes; {}.",
+                    excluded.alias, excluded.bytes, excluded.reason
+                ),
+            }));
+        }
     }
 
     fn show(&mut self, shown: &mut Shown, event: StreamEvent, usage: &mut Usage) {
@@ -923,7 +1026,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
     fn call(
         &mut self,
         call: &ToolCall,
-        commands: &Receiver<Option<Command>>,
+        commands: &Receiver<RunnerInput>,
         reservation: usize,
         advertised: bool,
     ) -> Result<String, StepError> {
@@ -1066,7 +1169,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         tool: Tool,
         title: &str,
         input: &Value,
-        commands: &Receiver<Option<Command>>,
+        commands: &Receiver<RunnerInput>,
     ) -> Result<Decision, StepError> {
         let request = self.id("approval");
         self.emit(
@@ -1083,7 +1186,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         );
         loop {
             match commands.recv_timeout(Duration::from_secs(3600)) {
-                Ok(Some(Command::Approve {
+                Ok(RunnerInput::Command(Command::Approve {
                     request: answered,
                     decision,
                     ..
@@ -1093,13 +1196,17 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                     );
                     return Ok(decision);
                 }
-                Ok(Some(Command::Interrupt)) => {
+                Ok(RunnerInput::Invalid(why)) => {
+                    self.emit(Envelope::new(Event::ApprovalExpired).request(&request));
+                    return Err(StepError::Stop(Stop::InvalidInput(why)));
+                }
+                Ok(RunnerInput::Command(Command::Interrupt)) => {
                     self.emit(Envelope::new(Event::ApprovalExpired).request(&request));
                     return Err(StepError::Stop(Stop::Interrupted));
                 }
-                Ok(Some(other)) => self.deferred.push(other),
+                Ok(RunnerInput::Command(other)) => self.deferred.push(other),
                 Err(RecvTimeoutError::Timeout) => {}
-                Ok(None) | Err(RecvTimeoutError::Disconnected) => {
+                Ok(RunnerInput::Closed) | Err(RecvTimeoutError::Disconnected) => {
                     return Err(StepError::Stop(Stop::Closed))
                 }
             }
@@ -1126,14 +1233,15 @@ struct Shown {
 
 /// Looks at what arrived without waiting: an interrupt (or a closed stdin) stops the reply;
 /// anything else waits for the turn's end.
-fn poll(commands: &Receiver<Option<Command>>, deferred: &mut Vec<Command>) -> Option<Stop> {
+fn poll(commands: &Receiver<RunnerInput>, deferred: &mut Vec<Command>) -> Option<Stop> {
     loop {
         match commands.try_recv() {
-            Ok(Some(Command::Interrupt)) => return Some(Stop::Interrupted),
+            Ok(RunnerInput::Command(Command::Interrupt)) => return Some(Stop::Interrupted),
+            Ok(RunnerInput::Invalid(why)) => return Some(Stop::InvalidInput(why)),
             // A stale answer (its card is gone) is dropped.
-            Ok(Some(Command::Approve { .. })) => {}
-            Ok(Some(other)) => deferred.push(other),
-            Ok(None) | Err(TryRecvError::Disconnected) => return Some(Stop::Closed),
+            Ok(RunnerInput::Command(Command::Approve { .. })) => {}
+            Ok(RunnerInput::Command(other)) => deferred.push(other),
+            Ok(RunnerInput::Closed) | Err(TryRecvError::Disconnected) => return Some(Stop::Closed),
             Err(TryRecvError::Empty) => return None,
         }
     }
@@ -1147,22 +1255,6 @@ fn message_size(m: &ChatMessage) -> usize {
             .iter()
             .map(|c| c.function.arguments.len() + c.function.name.len() + c.id.len())
             .sum::<usize>()
-}
-
-/// Where each exchange of `messages` starts: at every user message (and at 0, for anything
-/// before the first). An exchange is a question and everything that answers it, so cutting only
-/// at these never parts a tool call from its answer.
-fn exchange_starts(messages: &[ChatMessage]) -> Vec<usize> {
-    let mut starts: Vec<usize> = messages
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| m.role == "user")
-        .map(|(at, _)| at)
-        .collect();
-    if starts.first() != Some(&0) && !messages.is_empty() {
-        starts.insert(0, 0);
-    }
-    starts
 }
 
 /// Drops the oldest whole exchanges of `messages` until `fits` accepts them, keeping at least the
@@ -1229,7 +1321,7 @@ mod tests {
         ] {
             let dir = tempfile::tempdir().unwrap();
             let (tx, rx) = channel();
-            tx.send(Some(command)).unwrap();
+            tx.send(RunnerInput::Command(command)).unwrap();
             let mut out = Vec::new();
             let code = Runner::new(
                 args(dir.path(), Mode::Ask),
@@ -1259,6 +1351,7 @@ mod tests {
     struct Script {
         replies: Arc<Mutex<Vec<Reply>>>,
         bodies: Arc<Mutex<Vec<Value>>>,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl Script {
@@ -1266,6 +1359,7 @@ mod tests {
             Self {
                 replies: Arc::new(Mutex::new(replies)),
                 bodies: Arc::default(),
+                cancelled: Arc::default(),
             }
         }
         fn bodies(&self) -> Vec<Value> {
@@ -1277,6 +1371,10 @@ mod tests {
     const STALL_MARK: &str = "<stall>";
 
     impl ChatClient for Script {
+        fn cancel(&mut self) {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         fn start(&mut self, body: &Value) -> Receiver<ReplyLine> {
             self.bodies.lock().unwrap().push(body.clone());
             let (tx, rx) = channel();
@@ -1354,7 +1452,7 @@ mod tests {
     }
 
     struct Run {
-        commands: Sender<Option<Command>>,
+        commands: Sender<RunnerInput>,
         events: Receiver<Envelope>,
         done: std::thread::JoinHandle<i32>,
     }
@@ -1373,11 +1471,19 @@ mod tests {
             }
         }
         fn send(&self, command: Command) {
-            self.commands.send(Some(command)).unwrap();
+            self.commands.send(RunnerInput::Command(command)).unwrap();
         }
         /// Closes stdin and returns every event left, and the exit code.
         fn finish(self) -> (Vec<Envelope>, i32) {
-            self.commands.send(None).unwrap();
+            self.commands.send(RunnerInput::Closed).unwrap();
+            let code = self.done.join().unwrap();
+            (self.events.try_iter().collect(), code)
+        }
+
+        fn invalid_input(self) -> (Vec<Envelope>, i32) {
+            self.commands
+                .send(RunnerInput::Invalid("Malformed Local command JSON."))
+                .unwrap();
             let code = self.done.join().unwrap();
             (self.events.try_iter().collect(), code)
         }
@@ -1395,7 +1501,7 @@ mod tests {
     ) -> Run {
         let (commands, rx) = channel();
         commands
-            .send(Some(Command::ConfigureLocal {
+            .send(RunnerInput::Command(Command::ConfigureLocal {
                 context: Box::new(context),
             }))
             .unwrap();
@@ -1435,6 +1541,359 @@ mod tests {
             } => Some((*state, usage.clone(), error.clone())),
             _ => None,
         }
+    }
+
+    #[test]
+    fn malformed_startup_frames_emit_safe_errors_and_never_acknowledge_setup() {
+        let work = tempfile::tempdir().unwrap();
+        let canary = "private-input-canary";
+        for input in [
+            format!("{{\"type\":\"configure_local\",\"context\":{{\"budget\":{{\"context_tokens\":\"{canary}\"}}}}}}\n").into_bytes(),
+            b"{\n".to_vec(),
+            vec![0xff, b'\n'],
+            vec![b'x'; agent_core::local_context::MAX_SETUP_BYTES + 1],
+            format!("{{\"type\":\"configure_local\",\"context\":{{\"extra\":\"{canary}\"}}}}").into_bytes(),
+        ] {
+            let commands = read_commands(std::io::Cursor::new(input));
+            let mut out = Vec::new();
+            assert_eq!(Runner::new(args(work.path(), Mode::Ask), Script::new(vec![]), work.path().join("state"), &mut out).run(&commands), 1);
+            let output = String::from_utf8(out).unwrap();
+            assert!(!output.contains(canary));
+            let events: Vec<Envelope> = output.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+            assert_eq!(events.len(), 1);
+            assert!(matches!(&events[0].event, Event::Error { message } if message.starts_with("Local command") || message.starts_with("Malformed Local command")));
+            assert!(commands.recv_timeout(Duration::from_secs(1)).is_err(), "the reader exits instead of sending another frame");
+        }
+    }
+
+    #[test]
+    fn malformed_setup_exits_even_when_stdin_remains_open() {
+        use std::os::fd::FromRawFd;
+        let mut fds = [-1; 2];
+        // SAFETY: pipe receives storage for two file descriptors, owned below on success.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: pipe returned two new, distinct descriptors, each transferred exactly once.
+        let (reader, mut writer) = unsafe {
+            (
+                std::fs::File::from_raw_fd(fds[0]),
+                std::fs::File::from_raw_fd(fds[1]),
+            )
+        };
+        let commands = read_commands(reader);
+        let work = tempfile::tempdir().unwrap();
+        let run_args = args(work.path(), Mode::Ask);
+        let state = work.path().join("state");
+        let (tx, events) = channel();
+        let done = std::thread::spawn(move || {
+            Runner::new(run_args, Script::new(vec![]), state, Lines(tx, vec![])).run(&commands)
+        });
+        writer
+            .write_all(b"{\"type\":\"configure_local\",\"context\":false}\n")
+            .unwrap();
+        let event = events
+            .recv_timeout(Duration::from_secs(2))
+            .expect("malformed startup must not wait for EOF");
+        assert!(
+            matches!(&event.event, Event::Error { message } if message.contains("Malformed Local command"))
+        );
+        assert_eq!(done.join().unwrap(), 1);
+        drop(writer);
+    }
+
+    #[test]
+    fn malformed_input_after_setup_is_terminal() {
+        let work = tempfile::tempdir().unwrap();
+        let (tx, commands) = channel();
+        tx.send(RunnerInput::Command(Command::ConfigureLocal {
+            context: Box::default(),
+        }))
+        .unwrap();
+        tx.send(RunnerInput::Invalid("Malformed Local command JSON."))
+            .unwrap();
+        let mut out = Vec::new();
+        assert_eq!(
+            Runner::new(
+                args(work.path(), Mode::Ask),
+                Script::new(vec![]),
+                work.path().join("state"),
+                &mut out
+            )
+            .run(&commands),
+            1
+        );
+        let events: Vec<Envelope> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(matches!(events[0].event, Event::SessionStarted { .. }));
+        assert!(matches!(events[1].event, Event::Error { .. }));
+    }
+
+    #[test]
+    fn malformed_input_cancels_a_silent_stream_and_never_dispatches_deferred_prompts() {
+        let work = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut lines = text(&["partial answer"]);
+        lines.pop();
+        lines.push(STALL_MARK.into());
+        let script = Script::new(vec![Ok(lines)]);
+        let run = start(
+            args(work.path(), Mode::Ask),
+            script.clone(),
+            state.path().into(),
+        );
+        run.send(prompt("start"));
+        run.wait_for(|e| matches!(e.event, Event::ContentDelta { .. }).then_some(()));
+        run.send(prompt("must stay deferred"));
+        let (events, code) = run.invalid_input();
+        assert_eq!(code, 1);
+        assert!(script.cancelled.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(script.bodies().len(), 1);
+        assert!(events
+            .iter()
+            .any(|e| matches!(completed(e), Some((TurnState::Failed, _, _)))));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e.event, Event::Error { .. })));
+    }
+
+    #[test]
+    fn malformed_input_expires_approval_and_records_unexecuted_call_results() {
+        let work = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let script = Script::new(vec![Ok(tool_call(
+            "write",
+            "write_file",
+            json!({"file_path":"untouched", "content":"no"}),
+        ))]);
+        let run = start(args(work.path(), Mode::Ask), script, state.path().into());
+        run.send(prompt("write"));
+        run.wait_for(|e| matches!(e.event, Event::ApprovalRequested { .. }).then_some(()));
+        let (events, code) = run.invalid_input();
+        assert_eq!(code, 1);
+        assert!(!work.path().join("untouched").exists());
+        assert!(events
+            .iter()
+            .any(|e| matches!(e.event, Event::ApprovalExpired)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(completed(e), Some((TurnState::Failed, _, _)))));
+        let saved: Transcript =
+            serde_json::from_slice(&std::fs::read(state.path().join("s-1.json")).unwrap()).unwrap();
+        assert_eq!(
+            saved.messages.last().unwrap().tool_call_id.as_deref(),
+            Some("write")
+        );
+        assert!(saved
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .contains("malformed input"));
+    }
+
+    #[test]
+    fn malformed_input_cancels_an_approved_command() {
+        let work = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let script = Script::new(vec![Ok(tool_call(
+            "sleep",
+            "run_command",
+            json!({"command":"sleep 30"}),
+        ))]);
+        let run = start(args(work.path(), Mode::Ask), script, state.path().into());
+        run.send(prompt("run"));
+        let request = run.wait_for(|e| {
+            matches!(e.event, Event::ApprovalRequested { .. }).then(|| e.request.clone().unwrap())
+        });
+        run.send(Command::Approve {
+            request,
+            decision: Decision::Allow,
+            updated_input: None,
+            message: None,
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        let (events, code) = run.invalid_input();
+        assert_eq!(code, 1);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(events
+            .iter()
+            .any(|e| matches!(completed(e), Some((TurnState::Failed, _, _)))));
+    }
+
+    #[test]
+    fn an_oversize_prompt_is_not_saved_or_sent_with_the_next_prompt() {
+        let work = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let script = Script::new(vec![Ok(text(&["normal answer"]))]);
+        let run = start(
+            args(work.path(), Mode::Ask),
+            script.clone(),
+            state.path().into(),
+        );
+        let rejected = format!("rejected-oversize-marker{}", "x".repeat(100_000));
+        run.send(prompt(&rejected));
+        assert_eq!(run.wait_for(completed).0, TurnState::Failed);
+        let saved: Transcript =
+            serde_json::from_slice(&std::fs::read(state.path().join("s-1.json")).unwrap()).unwrap();
+        assert!(saved.messages.is_empty());
+        run.send(prompt("normal prompt"));
+        assert_eq!(run.wait_for(completed).0, TurnState::Completed);
+        run.finish();
+        let bodies = script.bodies();
+        assert_eq!(bodies.len(), 1);
+        assert!(!bodies[0].to_string().contains("rejected-oversize-marker"));
+        let saved: Transcript =
+            serde_json::from_slice(&std::fs::read(state.path().join("s-1.json")).unwrap()).unwrap();
+        assert_eq!(
+            saved
+                .messages
+                .iter()
+                .map(|m| m.role.as_str())
+                .collect::<Vec<_>>(),
+            ["user", "assistant"]
+        );
+        assert_eq!(saved.messages[0].content, "normal prompt");
+    }
+
+    #[test]
+    fn provider_failures_only_suggest_a_budget_change_for_context_rejection() {
+        let work = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        for why in [
+            "HTTP 401: authentication failed",
+            "HTTP 403: permission denied",
+            "Could not reach the model server: the connection failed",
+            "The model server stopped answering.",
+            "HTTP 500: internal error",
+            "HTTP 400: context_length_exceeded",
+            "maximum context length is 8192 tokens",
+            "Input length exceeds the context window",
+        ] {
+            let script = Script::new(vec![Err(why.into())]);
+            let run = start(
+                args(work.path(), Mode::Ask),
+                script.clone(),
+                state.path().into(),
+            );
+            run.send(prompt("test error"));
+            let (status, _, error) = run.wait_for(completed);
+            assert_eq!(status, TurnState::Failed);
+            let error = error.unwrap();
+            assert!(error.contains(why));
+            assert_eq!(
+                error.contains("check its configured context size"),
+                why.contains("context")
+            );
+            assert_eq!(
+                error.contains("Estimated input allowance"),
+                why.contains("context")
+            );
+            run.finish();
+            assert_eq!(script.bodies().len(), 1, "no automatic retry");
+        }
+    }
+
+    #[test]
+    fn budget_notices_are_once_per_turn_across_multiple_requests_and_fallback() {
+        let work = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let script = Script::new(vec![
+            Ok(tool_call("read", "list_dir", json!({"path":"."}))),
+            Err("does not support tools".into()),
+            Ok(text(&["first answer"])),
+            Ok(text(&["second answer"])),
+        ]);
+        let run = start(
+            args(work.path(), Mode::Ask),
+            script.clone(),
+            state.path().into(),
+        );
+        let mut notices = 0;
+        for prompt_text in ["first", "second"] {
+            run.send(prompt(prompt_text));
+            assert_eq!(run.wait_for(|e| {
+                if matches!(&e.event, Event::Notice { text } if text.starts_with("Local request:")) { notices += 1; }
+                completed(e)
+            }).0, TurnState::Completed);
+        }
+        run.finish();
+        assert_eq!(script.bodies().len(), 4);
+        assert_eq!(notices, 2);
+    }
+
+    #[test]
+    fn excluded_tools_still_report_the_effective_budget_after_the_first_notice() {
+        use agent_core::local_context::{plan_request, SchemaCandidate};
+        use agent_core::local_mcp::{ResolvedTool, ToolIdentity};
+        let work = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let mut runner = Runner::new(
+            args(work.path(), Mode::Ask),
+            Script::new(vec![]),
+            work.path().join("state"),
+            &mut out,
+        );
+        let plan = plan_request("m", "policy", &[], &[], &Default::default()).unwrap();
+        runner.report_budget(&plan);
+        runner.report_budget(&plan);
+        let excluded = plan_request(
+            "m",
+            "policy",
+            &[SchemaCandidate {
+                priority: 0,
+                tool: ResolvedTool {
+                    identity: ToolIdentity::Mcp {
+                        server_id: "docs".into(),
+                        name: "large".into(),
+                    },
+                    alias: "large".into(),
+                    schema: json!({"description":"x".repeat(70_000)}),
+                    server_revision: "1".into(),
+                    schema_revision: "1".into(),
+                },
+            }],
+            &[],
+            &Default::default(),
+        )
+        .unwrap();
+        runner.report_budget(&excluded);
+        let events: Vec<Envelope> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.iter().filter(|e| matches!(&e.event, Event::Notice { text } if text.starts_with("Local request:"))).count(), 2);
+        assert!(events.iter().any(|e| matches!(&e.event, Event::Notice { text } if text.starts_with("Excluded tool large:"))));
+    }
+
+    #[test]
+    fn fallback_uses_the_explicit_model_instead_of_reading_it_from_json() {
+        let work = tempfile::tempdir().unwrap();
+        let script = Script::new(vec![
+            Err("does not support tools".into()),
+            Ok(text(&["fallback answer"])),
+        ]);
+        let mut runner = Runner::new(
+            args(work.path(), Mode::Ask),
+            script.clone(),
+            work.path().join("state"),
+            Vec::new(),
+        );
+        runner.messages.push(ChatMessage::new("user", "hello"));
+        let (_tx, commands) = channel();
+        let result = runner.stream(
+            "chosen-model",
+            &json!({"tools":[Tool::ReadFile.schema()]}),
+            &commands,
+            &mut Usage::default(),
+        );
+        assert!(result.is_ok());
+        let bodies = script.bodies();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[1]["model"], "chosen-model");
     }
 
     #[test]
@@ -1536,6 +1995,12 @@ mod tests {
         assert!(error.unwrap().contains("none of the calls ran"));
         assert!(!work.path().join("one").exists());
         assert!(!work.path().join("two").exists());
+        let rejected: Transcript =
+            serde_json::from_slice(&std::fs::read(state.path().join("s-1.json")).unwrap()).unwrap();
+        assert!(
+            rejected.messages.is_empty(),
+            "an empty rejected assistant and its unanswered prompt are both removed"
+        );
         run.send(prompt("recover"));
         assert_eq!(run.wait_for(completed).0, TurnState::Completed);
         run.finish();
@@ -1545,6 +2010,11 @@ mod tests {
             .messages
             .iter()
             .all(|m| m.tool_calls.is_empty() && m.tool_call_id.is_none()));
+        assert!(saved
+            .messages
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .all(|m| !m.content.is_empty()));
     }
 
     #[test]

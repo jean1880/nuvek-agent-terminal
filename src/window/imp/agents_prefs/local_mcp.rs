@@ -1,4 +1,5 @@
 //! Explicit Local MCP configuration. Constructing these rows never starts a process.
+use super::local_context::show_outcome;
 use super::*;
 use agent_core::local_mcp::{ApprovalPolicy, EnvironmentValue, McpServerConfig, McpToolPolicy};
 use std::collections::BTreeMap;
@@ -45,6 +46,7 @@ impl AgentTerminalWindow {
         let id = server.id.clone();
         let apply_id = id.clone();
         let (entry, error) = validated_entry(title, help, &saved);
+        let (weak_entry, weak_error) = (entry.downgrade(), error.downgrade());
         self.commit_only_entry(
             &entry,
             &error,
@@ -61,11 +63,23 @@ impl AgentTerminalWindow {
                 crate::config::field_change(parsed, &imp.config.borrow().local_defaults, commit)
             },
             move |imp, value| {
-                if let Some(value) = value {
-                    if value.mcp_servers.iter().any(|s| s.id == apply_id) {
-                        imp.save_local_defaults(value);
+                let Some(value) = value else {
+                    return;
+                };
+                if !value.mcp_servers.iter().any(|s| s.id == apply_id) {
+                    return;
+                }
+                match imp.save_local_defaults(value) {
+                    Ok(()) => {
                         if let Some(after) = &after {
                             after();
+                        }
+                    }
+                    Err(why) => {
+                        if let (Some(entry), Some(error)) =
+                            (weak_entry.upgrade(), weak_error.upgrade())
+                        {
+                            show_validation(&entry, &error, help, Some(&why));
                         }
                     }
                 }
@@ -106,8 +120,10 @@ impl AgentTerminalWindow {
                 ApprovalPolicy::Deny => "Deny",
             })
             .collect();
+        const POLICY_HELP: &str = "Deny always wins; a tool override only narrows the server's.";
         let row = adw::ComboRow::builder()
             .title("Approval Policy")
+            .subtitle(POLICY_HELP)
             .model(&gtk4::StringList::new(&labels))
             .selected(options.iter().position(|p| *p == policy).unwrap_or(0) as u32)
             .build();
@@ -120,17 +136,31 @@ impl AgentTerminalWindow {
                 let Some(policy) = options.get(row.selected() as usize).copied() else {
                     return;
                 };
-                let mut value = obj.imp().config.borrow().local_defaults.clone();
+                let imp = obj.imp();
+                let saved = imp.config.borrow().local_defaults.clone();
+                let mut value = saved.clone();
+                let mut previous = None;
                 if let Some(server) = value.mcp_servers.iter_mut().find(|s| s.id == id) {
                     if let Some(name) = &name {
                         if let Some(tool) = server.tools.iter_mut().find(|t| &t.name == name) {
-                            tool.approval = policy;
+                            previous = Some(std::mem::replace(&mut tool.approval, policy));
                         }
                     } else {
-                        server.approval = policy;
+                        previous = Some(std::mem::replace(&mut server.approval, policy));
                     }
                 }
-                obj.imp().save_local_defaults(value);
+                if value == saved {
+                    // Nothing to save, or a revert's own notification.
+                    return;
+                }
+                let outcome = imp.save_local_defaults(value);
+                if outcome.is_err() {
+                    if let Some(index) = previous.and_then(|p| options.iter().position(|o| *o == p))
+                    {
+                        row.set_selected(index as u32);
+                    }
+                }
+                show_outcome(row.upcast_ref::<adw::ActionRow>(), POLICY_HELP, &outcome);
             }
         ));
         parent.add_row(&row);
@@ -176,9 +206,11 @@ impl AgentTerminalWindow {
                         .title(&policy.name)
                         .use_markup(false)
                         .build();
+                    const READ_HELP: &str =
+                        "Eligible in Plan; still asks unless separately approved";
                     let read = adw::SwitchRow::builder()
                         .title("Declared Read-only")
-                        .subtitle("Eligible in Plan; still asks unless separately approved")
+                        .subtitle(READ_HELP)
                         .active(policy.read_only)
                         .build();
                     let (sid, name) = (id.clone(), policy.name.clone());
@@ -186,7 +218,9 @@ impl AgentTerminalWindow {
                         #[weak]
                         obj,
                         move |r| {
-                            let mut value = obj.imp().config.borrow().local_defaults.clone();
+                            let imp = obj.imp();
+                            let saved = imp.config.borrow().local_defaults.clone();
+                            let mut value = saved.clone();
                             if let Some(t) = value
                                 .mcp_servers
                                 .iter_mut()
@@ -195,7 +229,14 @@ impl AgentTerminalWindow {
                             {
                                 t.read_only = r.is_active();
                             }
-                            obj.imp().save_local_defaults(value);
+                            if value == saved {
+                                return;
+                            }
+                            let outcome = imp.save_local_defaults(value);
+                            if outcome.is_err() {
+                                r.set_active(!r.is_active());
+                            }
+                            show_outcome(r.upcast_ref::<adw::ActionRow>(), READ_HELP, &outcome);
                         }
                     ));
                     row.add_row(&read);
@@ -215,6 +256,8 @@ impl AgentTerminalWindow {
                         b.connect_clicked(glib::clone!(
                             #[weak]
                             obj,
+                            #[weak]
+                            row,
                             move |_| {
                                 let mut value = obj.imp().config.borrow().local_defaults.clone();
                                 if let Some(s) = value.mcp_servers.iter_mut().find(|s| s.id == sid)
@@ -225,7 +268,11 @@ impl AgentTerminalWindow {
                                         }
                                     }
                                 }
-                                obj.imp().save_local_defaults(value);
+                                let outcome = obj.imp().save_local_defaults(value);
+                                show_outcome(&row, "", &outcome);
+                                if outcome.is_err() {
+                                    return;
+                                }
                                 if let Some(fill) = weak.upgrade().and_then(|r| r.borrow().clone())
                                 {
                                     fill();
@@ -258,12 +305,23 @@ impl AgentTerminalWindow {
     ) -> adw::ExpanderRow {
         let obj = self.obj();
         let row=adw::ExpanderRow::builder().title(format!("{} ({})",server.label,server.id)).subtitle("Definitions are shared. Select this ID on each Local model profile. No process starts until a turn or explicit discovery.").use_markup(false).build();
-        for (title, active, required) in [
-            ("Enabled", server.enabled, false),
-            ("Required for Turns", server.required, true),
+        for (title, subtitle, active, required) in [
+            (
+                "Enabled",
+                "Off in Settings stays off: a thread's session toggle cannot re-enable it",
+                server.enabled,
+                false,
+            ),
+            (
+                "Required for Turns",
+                "A turn is blocked when this server fails to start",
+                server.required,
+                true,
+            ),
         ] {
             let toggle = adw::SwitchRow::builder()
                 .title(title)
+                .subtitle(subtitle)
                 .active(active)
                 .build();
             let id = server.id.clone();
@@ -271,7 +329,9 @@ impl AgentTerminalWindow {
                 #[weak]
                 obj,
                 move |t| {
-                    let mut value = obj.imp().config.borrow().local_defaults.clone();
+                    let imp = obj.imp();
+                    let saved = imp.config.borrow().local_defaults.clone();
+                    let mut value = saved.clone();
                     if let Some(s) = value.mcp_servers.iter_mut().find(|s| s.id == id) {
                         if required {
                             s.required = t.is_active();
@@ -279,7 +339,15 @@ impl AgentTerminalWindow {
                             s.enabled = t.is_active();
                         }
                     }
-                    obj.imp().save_local_defaults(value);
+                    if value == saved {
+                        // Nothing to save, or a revert's own notification.
+                        return;
+                    }
+                    let outcome = imp.save_local_defaults(value);
+                    if outcome.is_err() {
+                        t.set_active(!t.is_active());
+                    }
+                    show_outcome(t.upcast_ref::<adw::ActionRow>(), subtitle, &outcome);
                 }
             ));
             row.add_row(&toggle);
@@ -505,7 +573,14 @@ impl AgentTerminalWindow {
             .label("Remove definition")
             .valign(gtk4::Align::Center)
             .build();
-        let remove_row=adw::ActionRow::builder().title("Remove Server and Profile Selections").subtitle("Stops affected running Local sessions; removed definitions are no longer selected.").build();
+        const REMOVE_HELP: &str =
+            "Stops affected running Local sessions; removed definitions are no longer selected.";
+        let remove_row = adw::ActionRow::builder()
+            .title("Remove Server and Profile Selections")
+            .subtitle(REMOVE_HELP)
+            .subtitle_lines(0)
+            .use_markup(false)
+            .build();
         remove_row.add_suffix(&remove);
         row.add_row(&remove_row);
         let id = server.id.clone();
@@ -514,6 +589,8 @@ impl AgentTerminalWindow {
             obj,
             #[weak]
             row,
+            #[weak]
+            remove_row,
             move |_| {
                 let imp = obj.imp();
                 let mut config = imp.config.borrow().clone();
@@ -521,12 +598,14 @@ impl AgentTerminalWindow {
                 for profile in &mut config.profiles {
                     profile.local.mcp_server_ids.retain(|s| s != &id);
                 }
-                if config.local_defaults.validate().is_err()
-                    || config
+                let outcome = config.local_defaults.validate().and_then(|()| {
+                    config
                         .profiles
                         .iter()
-                        .any(|p| config.local_defaults.launch(&p.local).is_err())
-                {
+                        .try_for_each(|p| config.local_defaults.launch(&p.local).map(|_| ()))
+                });
+                show_outcome(&remove_row, REMOVE_HELP, &outcome);
+                if outcome.is_err() {
                     return;
                 }
                 *imp.config.borrow_mut() = config;
@@ -568,13 +647,15 @@ impl AgentTerminalWindow {
         for server in &self.config.borrow().local_defaults.mcp_servers {
             servers.add_row(&self.mcp_server_row(dialog, server, ids.clone(), &profile, &folder));
         }
+        const ID_HELP: &str = "A unique stable ID: lowercase letters, digits and hyphens.";
         let (entry,error)=validated_entry("Add MCP Server ID","A unique stable ID: lowercase letters, digits and hyphens. New definitions are disabled and unreviewed.","");
         let weak = entry.downgrade();
+        let weak_error = error.downgrade();
         let weak_dialog = dialog.downgrade();
         self.commit_only_entry(
             &entry,
             &error,
-            "A unique stable ID: lowercase letters, digits and hyphens.",
+            ID_HELP,
             &self.agent_edit_timer(dialog),
             |imp, text, commit| {
                 if text.trim().is_empty() {
@@ -599,21 +680,27 @@ impl AgentTerminalWindow {
                 folder,
                 move |imp: &AgentTerminalWindow,
                       value: Option<agent_core::local_context::LocalDefaults>| {
-                    if let Some(value) = value {
-                        let last = value.mcp_servers.last().cloned();
-                        imp.save_local_defaults(value);
-                        if let (Some(server), Some(dialog)) = (last, weak_dialog.upgrade()) {
-                            servers.add_row(&obj.imp().mcp_server_row(
-                                &dialog,
-                                &server,
-                                ids.clone(),
-                                &profile,
-                                &folder,
-                            ));
+                    let Some(value) = value else {
+                        return;
+                    };
+                    let last = value.mcp_servers.last().cloned();
+                    if let Err(why) = imp.save_local_defaults(value) {
+                        if let (Some(entry), Some(error)) = (weak.upgrade(), weak_error.upgrade()) {
+                            show_validation(&entry, &error, ID_HELP, Some(&why));
                         }
-                        if let Some(entry) = weak.upgrade() {
-                            entry.set_text("");
-                        }
+                        return;
+                    }
+                    if let (Some(server), Some(dialog)) = (last, weak_dialog.upgrade()) {
+                        servers.add_row(&obj.imp().mcp_server_row(
+                            &dialog,
+                            &server,
+                            ids.clone(),
+                            &profile,
+                            &folder,
+                        ));
+                    }
+                    if let Some(entry) = weak.upgrade() {
+                        entry.set_text("");
                     }
                 }
             ),
@@ -716,6 +803,78 @@ mod tests {
                 "Changed"
             );
             assert!(!marker.exists());
+            window.close();
+        });
+    }
+
+    #[test]
+    fn refused_switch_and_remove_revert_the_widget_and_show_the_reason() {
+        crate::testutil::in_loop(|_| {
+            let app = crate::window::imp::test_support::test_app("org.test.LocalMcpRefused", false);
+            let window = crate::window::AgentTerminalWindow::new(&app);
+            // Three definitions sharing a label: every save, and every removal of one of them,
+            // leaves a duplicate, so validation refuses it.
+            for id in ["first", "second", "third"] {
+                let mut server = new_server(id);
+                server.label = "shared".into();
+                window
+                    .imp()
+                    .config
+                    .borrow_mut()
+                    .local_defaults
+                    .mcp_servers
+                    .push(server);
+            }
+            let dialog = adw::PreferencesDialog::new();
+            let group = window.imp().local_context_group(&dialog);
+            let switches = crate::testutil::find_all::<adw::SwitchRow>(group.upcast_ref());
+            let enabled = switches.iter().find(|s| s.title() == "Enabled").unwrap();
+            let original = enabled.subtitle().unwrap().to_string();
+            enabled.set_active(true);
+            assert!(!enabled.is_active(), "a refused save reverts the switch");
+            assert!(enabled.has_css_class("error"));
+            assert!(enabled.subtitle().unwrap().contains("unique"));
+            assert!(!window.imp().config.borrow().local_defaults.mcp_servers[0].enabled);
+            let buttons = crate::testutil::find_all::<gtk4::Button>(group.upcast_ref());
+            let remove = buttons
+                .iter()
+                .find(|b| b.label().as_deref() == Some("Remove definition"))
+                .unwrap();
+            let rows = crate::testutil::find_all::<adw::ActionRow>(group.upcast_ref());
+            let remove_row = rows
+                .iter()
+                .find(|r| r.title() == "Remove Server and Profile Selections")
+                .unwrap();
+            remove.emit_clicked();
+            assert_eq!(
+                window
+                    .imp()
+                    .config
+                    .borrow()
+                    .local_defaults
+                    .mcp_servers
+                    .len(),
+                3
+            );
+            assert!(remove_row.has_css_class("error"));
+            assert!(remove_row.subtitle().unwrap().contains("unique"));
+            // Once the saved state is valid again, the next accepted save clears the notice.
+            for (index, server) in window
+                .imp()
+                .config
+                .borrow_mut()
+                .local_defaults
+                .mcp_servers
+                .iter_mut()
+                .enumerate()
+            {
+                server.label = format!("label-{index}");
+            }
+            enabled.set_active(true);
+            assert!(enabled.is_active());
+            assert!(!enabled.has_css_class("error"));
+            assert_eq!(enabled.subtitle().unwrap(), original);
+            assert!(window.imp().config.borrow().local_defaults.mcp_servers[0].enabled);
             window.close();
         });
     }

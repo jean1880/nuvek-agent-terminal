@@ -115,8 +115,9 @@ impl AgentTerminalWindow {
                 match server.into_config(&mappings[index]) {Ok(server)=>{added.push(server.clone());defaults.mcp_servers.push(server);},Err(why)=>{let (_,entry,error)=&selections.borrow()[index];entry.add_css_class("error");error.set_subtitle(why);return;}}
             }
             if let Err(why)=local_context::validate_defaults(obj.imp(),&defaults){summary.set_subtitle(&why);return;}
-            drop(borrowed);data.borrow_mut().take();
-            obj.imp().save_local_defaults(defaults);
+            drop(borrowed);
+            if let Err(why)=obj.imp().save_local_defaults(defaults){summary.set_subtitle(&why);return;}
+            data.borrow_mut().take();
             if let Some(dialog)=weak_dialog.upgrade() {
                 let ids=Rc::new(obj.imp().config.borrow().local_servers().iter().map(|p|p.id.clone()).collect::<Vec<_>>());
                 for server in &added {servers.add_row(&obj.imp().mcp_server_row(&dialog,server,ids.clone(),&discovery_profile,&folder));}

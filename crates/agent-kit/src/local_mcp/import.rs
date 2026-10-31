@@ -471,6 +471,12 @@ fn parse_server(
             Vec::new(),
         ));
     }
+    if package_runner_shell(basename, &args) {
+        return Err((
+            "A package runner's --call (-c) runs a shell string; it is not imported.",
+            Vec::new(),
+        ));
+    }
     if args.iter().any(|arg| {
         let name = arg
             .split('=')
@@ -779,6 +785,17 @@ fn interpreter_code(command: &str, args: &[String]) -> bool {
     })
 }
 
+/// `npx -c`/`--call` (and the same flag on its bun and pnpm equivalents) hands the rest of the
+/// line to a shell: indirection, not a direct executable.
+fn package_runner_shell(command: &str, args: &[String]) -> bool {
+    matches!(command, "npx" | "bunx" | "pnpx")
+        && args.iter().any(|arg| {
+            arg == "--call"
+                || arg.starts_with("--call=")
+                || arg.starts_with('-') && !arg.starts_with("--") && arg.contains('c')
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -960,12 +977,29 @@ MODE='safe-mode'
             "command='server'\n[mcp_servers.docs.env]\nNODE_OPTIONS='--require private.js'",
             "command='server'\nenv_vars=['LD_PRELOAD']",
             "command='server'\n[mcp_servers.docs.env]\nAGENT_TERMINAL_DELEGATION_CAP='opaque-private-canary'",
+            "command='npx'\nargs=['-c','opaque-private-canary']",
+            "command='npx'\nargs=['-y','--call','opaque-private-canary']",
+            "command='/usr/bin/npx'\nargs=['--call=opaque-private-canary']",
+            "command='npx'\nargs=['-yc','opaque-private-canary']",
+            "command='bunx'\nargs=['-c','opaque-private-canary']",
+            "command='pnpx'\nargs=['--call','opaque-private-canary']",
         ] {
             let preview = parse(&format!("[mcp_servers.docs]\n{definition}"));
             assert!(preview.servers.is_empty(), "{definition}");
             assert_eq!(preview.issues.len(), 1);
             assert!(!preview.summary().contains("opaque-private-canary"));
         }
+    }
+    #[test]
+    fn package_runners_without_a_shell_flag_still_import() {
+        let server = only(
+            "[mcp_servers.docs]\ncommand='npx'\nargs=['-y','--package=example','example-server']\nenabled_tools=['read']",
+        );
+        assert_eq!(server.command_name, "npx");
+        assert!(package_runner_shell("npx", &["-c".into()]));
+        assert!(package_runner_shell("pnpx", &["--call=".into()]));
+        assert!(!package_runner_shell("npx", &["--package=example".into()]));
+        assert!(!package_runner_shell("server", &["-c".into()]));
     }
     #[test]
     fn managed_bridge_is_skipped_and_unrelated_definitions_survive() {

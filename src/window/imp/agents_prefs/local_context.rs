@@ -35,14 +35,84 @@ fn set_budget_value(budget: &mut ContextBudget, field: usize, value: usize) {
     }
 }
 
-impl AgentTerminalWindow {
-    pub(super) fn save_local_defaults(&self, value: LocalDefaults) {
-        if validate_defaults(self, &value).is_err() {
-            return;
+/// A row whose subtitle can carry a refused save's reason.
+pub(super) trait SubtitledRow: IsA<gtk4::Widget> {
+    fn put_subtitle(&self, text: &str);
+}
+impl SubtitledRow for adw::ActionRow {
+    fn put_subtitle(&self, text: &str) {
+        self.set_subtitle(text);
+    }
+}
+impl SubtitledRow for adw::ExpanderRow {
+    fn put_subtitle(&self, text: &str) {
+        self.set_subtitle(text);
+    }
+}
+
+/// Shows a switch, dropdown or button row's save outcome as the text-entry path shows one: a
+/// refusal turns the row red and puts the reason in its subtitle; the next accepted save
+/// restores `original`. The caller has already put the widget back to the saved state.
+pub(super) fn show_outcome<R: SubtitledRow>(row: &R, original: &str, outcome: &Result<(), String>) {
+    match outcome {
+        Ok(()) => {
+            row.remove_css_class("error");
+            row.put_subtitle(original);
         }
+        Err(reason) => {
+            row.add_css_class("error");
+            row.put_subtitle(&format!(
+                "{reason}. The previous saved value is still in use."
+            ));
+        }
+    }
+}
+
+impl AgentTerminalWindow {
+    /// Saves the defaults when every profile can still launch on them; the reason otherwise,
+    /// with nothing changed.
+    pub(super) fn save_local_defaults(&self, value: LocalDefaults) -> Result<(), String> {
+        validate_defaults(self, &value)?;
         self.config.borrow_mut().local_defaults = value;
         self.schedule_config_save();
         self.refresh_local_contexts();
+        Ok(())
+    }
+
+    /// A switch row editing the defaults: a refused save reverts the switch and shows why.
+    fn local_switch(
+        &self,
+        title: &str,
+        subtitle: &'static str,
+        active: bool,
+        edit: impl Fn(&mut LocalDefaults, bool) + 'static,
+    ) -> adw::SwitchRow {
+        let obj = self.obj();
+        let row = adw::SwitchRow::builder()
+            .title(title)
+            .subtitle(subtitle)
+            .active(active)
+            .build();
+        row.connect_active_notify(glib::clone!(
+            #[weak]
+            obj,
+            move |row| {
+                let imp = obj.imp();
+                let saved = imp.config.borrow().local_defaults.clone();
+                let mut value = saved.clone();
+                edit(&mut value, row.is_active());
+                if value == saved {
+                    // Nothing to save, or a revert's own notification.
+                    return;
+                }
+                let outcome = imp.save_local_defaults(value);
+                if outcome.is_err() {
+                    row.set_active(!row.is_active());
+                }
+                show_outcome(row.upcast_ref::<adw::ActionRow>(), subtitle, &outcome);
+            }
+        ));
+        row
     }
 
     fn local_number_row(
@@ -55,6 +125,7 @@ impl AgentTerminalWindow {
     ) {
         const HELP: &str = "A positive integer. Invalid budgets are not saved; counts are token estimates and byte ceilings.";
         let (entry, error) = validated_entry(title, HELP, &text);
+        let (weak_entry, weak_error) = (entry.downgrade(), error.downgrade());
         self.commit_only_entry(
             &entry,
             &error,
@@ -73,9 +144,15 @@ impl AgentTerminalWindow {
                     });
                 crate::config::field_change(parsed, &imp.config.borrow().local_defaults, commit)
             },
-            |imp, value| {
+            move |imp, value| {
                 if let Some(value) = value {
-                    imp.save_local_defaults(value);
+                    if let Err(why) = imp.save_local_defaults(value) {
+                        if let (Some(entry), Some(error)) =
+                            (weak_entry.upgrade(), weak_error.upgrade())
+                        {
+                            show_validation(&entry, &error, HELP, Some(&why));
+                        }
+                    }
                 }
             },
         );
@@ -87,7 +164,6 @@ impl AgentTerminalWindow {
         &self,
         dialog: &adw::PreferencesDialog,
     ) -> adw::PreferencesGroup {
-        let obj = self.obj();
         let saved = self.config.borrow().local_defaults.clone();
         let group = adw::PreferencesGroup::builder()
             // A group title is Pango markup: a bare ampersand renders it blank.
@@ -97,38 +173,18 @@ impl AgentTerminalWindow {
         let native = adw::ActionRow::builder().title("Native Global Instructions").subtitle("$XDG_CONFIG_HOME/agent-terminal/AGENTS.md (or ~/.config/agent-terminal/AGENTS.md), when present, is always first.").use_markup(false).subtitle_lines(0).build();
         group.add(&native);
         self.local_global_files(&group, dialog);
-        let ancestors = adw::SwitchRow::builder()
-            .title("Discover Ancestor Instructions")
-            .subtitle(
-                "From / to the canonical working folder: AGENTS.override.md, otherwise AGENTS.md",
-            )
-            .active(saved.instructions.discover_ancestors)
-            .build();
-        ancestors.connect_active_notify(glib::clone!(
-            #[weak]
-            obj,
-            move |row| {
-                let mut value = obj.imp().config.borrow().local_defaults.clone();
-                value.instructions.discover_ancestors = row.is_active();
-                obj.imp().save_local_defaults(value);
-            }
+        group.add(&self.local_switch(
+            "Discover Ancestor Instructions",
+            "From / to the canonical working folder: AGENTS.override.md, otherwise AGENTS.md",
+            saved.instructions.discover_ancestors,
+            |value, on| value.instructions.discover_ancestors = on,
         ));
-        group.add(&ancestors);
-        let fallback = adw::SwitchRow::builder()
-            .title("Use CLAUDE.md as a Fallback")
-            .subtitle("Only when neither AGENTS.override.md nor AGENTS.md exists in that directory")
-            .active(saved.instructions.claude_fallback)
-            .build();
-        fallback.connect_active_notify(glib::clone!(
-            #[weak]
-            obj,
-            move |row| {
-                let mut value = obj.imp().config.borrow().local_defaults.clone();
-                value.instructions.claude_fallback = row.is_active();
-                obj.imp().save_local_defaults(value);
-            }
+        group.add(&self.local_switch(
+            "Use CLAUDE.md as a Fallback",
+            "Only when neither AGENTS.override.md nor AGENTS.md exists in that directory",
+            saved.instructions.claude_fallback,
+            |value, on| value.instructions.claude_fallback = on,
         ));
-        group.add(&fallback);
         self.local_number_row(
             dialog,
             &group,
@@ -170,9 +226,11 @@ impl AgentTerminalWindow {
         type Refill = Rc<dyn Fn()>;
         let refill: Rc<RefCell<Option<Refill>>> = Rc::default();
         let weak_refill = Rc::downgrade(&refill);
+        const FILES_HELP: &str =
+            "Applied after the native global file and before project instructions";
         let files = adw::ExpanderRow::builder()
             .title("Additional Global Files, in Order")
-            .subtitle("Applied after the native global file and before project instructions")
+            .subtitle(FILES_HELP)
             .build();
         let rows: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::default();
         let fill: Refill = Rc::new(glib::clone!(
@@ -220,6 +278,8 @@ impl AgentTerminalWindow {
                         button.connect_clicked(glib::clone!(
                             #[weak]
                             obj,
+                            #[weak]
+                            files,
                             move |_| {
                                 let mut value = obj.imp().config.borrow().local_defaults.clone();
                                 let paths = &mut value.instructions.global_files;
@@ -234,7 +294,11 @@ impl AgentTerminalWindow {
                                     }
                                     _ => return,
                                 }
-                                obj.imp().save_local_defaults(value);
+                                let outcome = obj.imp().save_local_defaults(value);
+                                show_outcome(&files, FILES_HELP, &outcome);
+                                if outcome.is_err() {
+                                    return;
+                                }
                                 if let Some(fill) =
                                     weak_refill.upgrade().and_then(|r| r.borrow().clone())
                                 {
@@ -253,7 +317,7 @@ impl AgentTerminalWindow {
         fill();
         group.add(&files);
         let (add, error) = validated_entry("Add Global Instruction File", PATH_HELP, "");
-        let weak_add = add.downgrade();
+        let (weak_add, weak_error) = (add.downgrade(), error.downgrade());
         self.commit_only_entry(
             &add,
             &error,
@@ -269,14 +333,20 @@ impl AgentTerminalWindow {
                 crate::config::field_change(parsed, &imp.config.borrow().local_defaults, commit)
             },
             move |imp, value| {
-                if let Some(value) = value {
-                    imp.save_local_defaults(value);
-                    if let Some(add) = weak_add.upgrade() {
+                let Some(value) = value else {
+                    return;
+                };
+                let (Some(add), Some(error)) = (weak_add.upgrade(), weak_error.upgrade()) else {
+                    return;
+                };
+                match imp.save_local_defaults(value) {
+                    Ok(()) => {
                         add.set_text("");
+                        if let Some(fill) = refill.borrow().clone() {
+                            fill();
+                        }
                     }
-                    if let Some(fill) = refill.borrow().clone() {
-                        fill();
-                    }
+                    Err(why) => show_validation(&add, &error, PATH_HELP, Some(&why)),
                 }
             },
         );

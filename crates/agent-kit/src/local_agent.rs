@@ -360,6 +360,9 @@ pub struct Runner<C: ChatClient, W: Write> {
     last_mcp_status: Value,
     turn_instructions: agent_core::local_context::InstructionSnapshot,
     context: agent_core::local_context::LocalLaunchContext,
+    /// The servers Settings had enabled when this generation was configured: the ceiling a
+    /// session toggle can re-enable up to. A definition disabled in Settings stays disabled.
+    launch_enabled: std::collections::BTreeSet<String>,
     args: RunnerArgs,
     /// `None` only while a request is under way.
     client: Option<C>,
@@ -402,6 +405,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             mcp: None,
             model: args.model.clone(),
             context: Default::default(),
+            launch_enabled: Default::default(),
             turn_instructions: Default::default(),
             budget_notice_sent: false,
             last_budget: None,
@@ -424,6 +428,17 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
 
     fn transcript_path(&self) -> PathBuf {
         self.dir.join(format!("{}.json", self.session))
+    }
+
+    /// Adopts a validated generation snapshot and records which servers it enables.
+    fn configure(&mut self, context: agent_core::local_context::LocalLaunchContext) {
+        self.launch_enabled = context
+            .mcp_servers
+            .iter()
+            .filter(|server| server.enabled)
+            .map(|server| server.id.clone())
+            .collect();
+        self.context = context;
     }
 
     fn emit(&mut self, envelope: Envelope) {
@@ -515,7 +530,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                     self.emit(Envelope::new(Event::Error { message: why }));
                     return 1;
                 }
-                self.context = *context;
+                self.configure(*context);
             }
             _ => {
                 self.emit(Envelope::new(Event::Error {
@@ -695,18 +710,25 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         let result: Result<Value, String> = match control {
             Control::McpStatus => self.mcp_status(commands),
             Control::McpToggle { server, enabled } => {
-                if let Some(index) = self.context.mcp_servers.iter().position(|c| c.id == server) {
-                    if self.context.mcp_servers[index].enabled != enabled {
-                        // Rebuilding at the next boundary keeps every process on one immutable
-                        // configuration. A narrowing has already interrupted its turn.
-                        self.stop_mcp();
-                        self.context.mcp_servers[index].enabled = enabled;
-                        self.registry.clear();
-                        self.mcp_connections.clear();
+                match self.context.mcp_servers.iter().position(|c| c.id == server) {
+                    None => Err("MCP server is not selected.".into()),
+                    // Settings is the ceiling: a session toggle only restores what the
+                    // generation was launched with.
+                    Some(_) if enabled && !self.launch_enabled.contains(&server) => {
+                        Err("MCP server is disabled in Settings; enable it there first.".into())
                     }
-                    Ok(serde_json::json!({"enabled":enabled,"restartPending":enabled}))
-                } else {
-                    Err("MCP server is not selected.".into())
+                    Some(index) => {
+                        if self.context.mcp_servers[index].enabled != enabled {
+                            // Rebuilding at the next boundary keeps every process on one
+                            // immutable configuration. A narrowing has already interrupted
+                            // its turn.
+                            self.stop_mcp();
+                            self.context.mcp_servers[index].enabled = enabled;
+                            self.registry.clear();
+                            self.mcp_connections.clear();
+                        }
+                        Ok(serde_json::json!({"enabled":enabled,"restartPending":enabled}))
+                    }
                 }
             }
             Control::McpReconnect { server } => {
@@ -2176,9 +2198,12 @@ mod tests {
             folder.path().join("state"),
             Vec::<u8>::new(),
         );
-        runner.context.mcp_servers = vec![serde_json::from_value(json!({
-            "id":"selected","label":"Selected","enabled":true,"command":"missing-test-command","args":[],"cwd":".","env":{},"tools":[],"approval":"ask","startup_timeout_secs":1,"call_timeout_secs":1
-        })).unwrap()];
+        runner.configure(agent_core::local_context::LocalLaunchContext {
+            mcp_servers: vec![serde_json::from_value(json!({
+                "id":"selected","label":"Selected","enabled":true,"command":"missing-test-command","args":[],"cwd":".","env":{},"tools":[],"approval":"ask","startup_timeout_secs":1,"call_timeout_secs":1
+            })).unwrap()],
+            ..Default::default()
+        });
         let (_tx, rx) = std::sync::mpsc::channel();
         assert_eq!(
             runner.mcp_status(&rx).unwrap()["mcpServers"][0]["status"],
@@ -2218,6 +2243,57 @@ mod tests {
             &rx,
         );
         assert!(runner.context.mcp_servers == before);
+        assert!(runner.mcp.is_none());
+    }
+
+    #[test]
+    fn session_toggle_never_enables_a_server_settings_disabled() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut runner = Runner::new(
+            args(folder.path(), Mode::Ask),
+            Script::new(vec![]),
+            folder.path().join("state"),
+            Vec::<u8>::new(),
+        );
+        let server = |id: &str, enabled: bool| -> agent_core::local_mcp::McpServerConfig {
+            serde_json::from_value(json!({
+                "id":id,"label":id,"enabled":enabled,"command":"missing-test-command","args":[],"cwd":".","env":{},"tools":[],"approval":"ask","startup_timeout_secs":1,"call_timeout_secs":1
+            })).unwrap()
+        };
+        runner.configure(agent_core::local_context::LocalLaunchContext {
+            mcp_servers: vec![server("off", false), server("on", true)],
+            ..Default::default()
+        });
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let toggle = |runner: &mut Runner<Script, Vec<u8>>, id: &str, enabled: bool| {
+            runner.out.clear();
+            runner.mcp_control(
+                "toggle",
+                agent_core::adapter::Control::McpToggle {
+                    server: id.into(),
+                    enabled,
+                },
+                &rx,
+            );
+            let line = runner.out.split(|b| *b == b'\n').next().unwrap();
+            let reply: Envelope = serde_json::from_slice(line).unwrap();
+            matches!(reply.event, Event::ControlResult { error: None, .. })
+        };
+        assert!(
+            !toggle(&mut runner, "off", true),
+            "a Settings-disabled server cannot be enabled for the session"
+        );
+        assert!(!runner.context.mcp_servers[0].enabled);
+        assert_eq!(
+            runner.mcp_status(&rx).unwrap()["mcpServers"][0]["status"],
+            "disabled"
+        );
+        // Disabling it again, or disabling and restoring one Settings enabled, stays allowed.
+        assert!(toggle(&mut runner, "off", false));
+        assert!(toggle(&mut runner, "on", false));
+        assert!(!runner.context.mcp_servers[1].enabled);
+        assert!(toggle(&mut runner, "on", true));
+        assert!(runner.context.mcp_servers[1].enabled);
         assert!(runner.mcp.is_none());
     }
 

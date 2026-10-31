@@ -241,26 +241,29 @@ BEGIN SELECT RAISE(ABORT, 'only an accepted delegation operation carries an epoc
 const V8_CARRIED_EPOCH_PREFIX: &str = "delegation_operation_epoch:";
 
 /// Moves the carried epochs kept in `meta` before v9 into `delegation_operations.carried_epoch`:
-/// only an accepted operation's (anything else was stale), then every such row goes, orphans
-/// included. A value that is not an epoch fails the migration.
+/// only an accepted operation's (anything else was stale, and is never read), then every such
+/// row goes, orphans included. An accepted operation's value that is not an epoch fails the
+/// migration.
 pub(crate) fn migrate_v9_carried_epochs(conn: &rusqlite::Connection) -> Result<()> {
     let rows: Vec<(String, String)> = {
-        let mut stmt =
-            conn.prepare("SELECT key, value FROM meta WHERE substr(key, 1, ?1) = ?2 ORDER BY key")?;
+        let mut stmt = conn.prepare(
+            "SELECT o.id, m.value FROM meta m
+             JOIN delegation_operations o ON o.id = substr(m.key, ?1 + 1)
+             WHERE substr(m.key, 1, ?1) = ?2 AND o.dispatch_state = 'accepted'
+             ORDER BY o.id",
+        )?;
         let prefix_len = V8_CARRIED_EPOCH_PREFIX.len() as i64;
         let rows = stmt.query_map(params![prefix_len, V8_CARRIED_EPOCH_PREFIX], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })?;
         rows.collect::<rusqlite::Result<_>>()?
     };
-    for (key, value) in &rows {
-        let op = &key[V8_CARRIED_EPOCH_PREFIX.len()..];
+    for (op, value) in &rows {
         let epoch: i64 = value.parse().ok().filter(|e| *e >= 0).ok_or_else(|| {
             StoreError::Upgrade(format!("the stored epoch of {op} is unreadable"))
         })?;
         conn.execute(
-            "UPDATE delegation_operations SET carried_epoch = ?2
-             WHERE id = ?1 AND dispatch_state = 'accepted'",
+            "UPDATE delegation_operations SET carried_epoch = ?2 WHERE id = ?1",
             params![op, epoch],
         )?;
     }

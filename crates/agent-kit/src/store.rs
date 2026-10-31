@@ -5665,11 +5665,11 @@ mod tests {
         conn.execute_batch(
             "INSERT INTO meta (key, value) VALUES
                  ('delegation_operation_epoch:op2', '3'),
-                 ('delegation_operation_epoch:op1', '2'),
-                 ('delegation_operation_epoch:op_gone', '1');",
+                 ('delegation_operation_epoch:op1', 'garbled'),
+                 ('delegation_operation_epoch:op_gone', 'also garbled');",
         )
         .expect("legacy carried epochs");
-        migrate(&conn).expect("migrate");
+        migrate(&conn).expect("stale rows are dropped unread, garbled or not");
         let carried: Vec<(String, Option<i64>)> = conn
             .prepare("SELECT id, carried_epoch FROM delegation_operations ORDER BY id")
             .expect("prepare")

@@ -140,6 +140,16 @@ impl Scrubber {
                 }
                 changed
             }
+            serde_json::Value::Number(_) | serde_json::Value::Bool(_) => {
+                let text = value.to_string();
+                if self.0.iter().any(|secret| secret == &text) {
+                    *value = serde_json::Value::String("[REDACTED]".into());
+                    // Replacing a primitive with a string changes the approval's value type.
+                    true
+                } else {
+                    false
+                }
+            }
             _ => false,
         }
     }
@@ -498,6 +508,51 @@ mod tests {
             "cwd":"/","env":{},"tools":[],"approval":"ask","startup_timeout_secs":15,"call_timeout_secs":60
         })).unwrap()
     }
+    #[test]
+    fn referenced_numeric_and_boolean_secrets_refuse_strict_handoffs_and_are_not_stored() {
+        use agent_core::event::{Envelope, Event};
+
+        for (secret, primitive) in [
+            ("1234567890", json!(1234567890_u64)),
+            ("17", json!(17)),
+            ("true", json!(true)),
+            ("false", json!(false)),
+        ] {
+            let mut server = config();
+            server.env.insert(
+                "TOKEN".into(),
+                EnvironmentValue::Reference {
+                    from_env: "SOURCE".into(),
+                },
+            );
+            let scrubber = Scrubber::for_configs(
+                &[server],
+                &BTreeMap::from([("SOURCE".into(), secret.into())]),
+            );
+            let original = json!({"ordinary":[primitive],"retained":"visible"});
+            let mut strict = original.clone();
+            assert!(scrubber.value(&mut strict).is_err());
+            assert_eq!(strict["ordinary"][0], "[REDACTED]");
+
+            let mut saved = original;
+            scrubber.value_lossy(&mut saved);
+            let store = crate::store::Store::open_in_memory().unwrap();
+            let thread = store.create_thread("/workspace", None).unwrap();
+            store
+                .append_event(&thread, None, &Envelope::new(Event::Unknown).raw(saved))
+                .unwrap();
+            let events = store.events(&thread, None, 10).unwrap();
+            let raw = events[0].1.raw.as_ref().unwrap();
+            assert_eq!(raw["ordinary"][0], "[REDACTED]");
+            assert_eq!(raw["retained"], "visible");
+        }
+
+        let mut ordinary = json!({"count":17,"ready":true,"unavailable":false});
+        let original = ordinary.clone();
+        Scrubber::default().value(&mut ordinary).unwrap();
+        assert_eq!(ordinary, original);
+    }
+
     #[test]
     fn enclosing_sensitive_keys_mask_arrays_and_objects_and_lossy_keys_retain_records() {
         let scrubber = Scrubber::default();

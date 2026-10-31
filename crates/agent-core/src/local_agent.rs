@@ -914,6 +914,13 @@ impl Adapter for LocalAdapter {
             Command::DelegatedSteer { .. } => Err(AdapterError::Unsupported("delegated steering")),
             Command::Answer { .. } => Err(AdapterError::Unsupported("questions")),
             Command::SubmitForm { .. } => Err(AdapterError::Unsupported("forms")),
+            Command::Control {
+                control:
+                    crate::adapter::Control::McpStatus
+                    | crate::adapter::Control::McpToggle { .. }
+                    | crate::adapter::Control::McpReconnect { .. },
+                ..
+            } => Self::write(&command),
             Command::Control { .. } => Err(AdapterError::Unsupported("this control")),
         }
     }
@@ -1404,6 +1411,28 @@ data: [DONE]"#;
             .encode(Command::Control {
                 id: "c".into(),
                 control: crate::adapter::Control::McpStatus
+            })
+            .is_ok());
+        for control in [
+            crate::adapter::Control::McpReconnect {
+                server: "selected".into(),
+            },
+            crate::adapter::Control::McpToggle {
+                server: "selected".into(),
+                enabled: false,
+            },
+        ] {
+            assert!(a
+                .encode(Command::Control {
+                    id: "control".into(),
+                    control
+                })
+                .is_ok());
+        }
+        assert!(a
+            .encode(Command::Control {
+                id: "unsupported".into(),
+                control: crate::adapter::Control::Usage
             })
             .is_err());
     }

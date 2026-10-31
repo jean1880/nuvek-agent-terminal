@@ -18,6 +18,7 @@ use crate::model_catalog::ModelCatalog;
 
 mod delegation;
 mod local_context;
+mod local_mcp;
 mod local_servers;
 
 /// The default-mode dropdown, by index both ways.

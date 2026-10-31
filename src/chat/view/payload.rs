@@ -71,6 +71,67 @@ pub struct McpServer {
     pub detail: Option<String>,
 }
 
+/// Local's request estimate is independent of whether any MCP process has started.
+pub fn mcp_budget(v: &Value) -> Option<String> {
+    let budget = v.get("budget")?;
+    let summary = budget
+        .get("summary")
+        .and_then(Value::as_str)
+        .unwrap_or("No model request planned yet");
+    let excluded = budget
+        .get("excludedTools")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| {
+                    v.as_str().map(str::to_owned).or_else(|| {
+                        Some(format!(
+                            "{}: {} bytes; {}",
+                            v.get("alias")?.as_str()?,
+                            v.get("bytes")?,
+                            v.get("reason")?.as_str()?
+                        ))
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    Some(agent_core::redact::redact(&format!(
+        "{summary}\nContext: {}; response reserve: {}; safety reserve: {}\nEstimated input allowance: {}; static byte cap: {}{}",
+        budget.get("contextTokens").unwrap_or(&Value::Null),
+        budget.get("responseTokens").unwrap_or(&Value::Null),
+        budget.get("safetyTokens").unwrap_or(&Value::Null),
+        budget.get("inputAllowance").unwrap_or(&Value::Null),
+        budget.get("staticCapBytes").unwrap_or(&Value::Null),
+        if excluded.is_empty() {
+            String::new()
+        } else {
+            format!("\nExcluded tools:\n{excluded}")
+        }
+    )))
+}
+
+#[cfg(test)]
+mod local_budget_tests {
+    #[test]
+    fn budget_status_shows_estimates_and_exclusions_even_without_servers() {
+        let value = serde_json::json!({"budget":{"summary":"Estimated request: 200 tokens","inputAllowance":24576,"staticCapBytes":49152,"excludedTools":[{"alias":"search","bytes":1024,"reason":"static cap"}]},"mcpServers":[]});
+        let text = super::mcp_budget(&value).unwrap();
+        for expected in [
+            "200 tokens",
+            "24576",
+            "49152",
+            "Excluded tools",
+            "search: 1024 bytes",
+            "static cap",
+        ] {
+            assert!(text.contains(expected), "{text}");
+        }
+        assert!(super::mcp_budget(&serde_json::json!({"mcpServers":[]})).is_none());
+    }
+}
+
 /// `mcp_status` (Claude: `{mcpServers:[{name, status, serverInfo}]}`).
 pub fn mcp_servers(v: &Value) -> Vec<McpServer> {
     list(v, &["mcpServers", "servers", "mcp_servers"])

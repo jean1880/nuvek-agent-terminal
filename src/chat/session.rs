@@ -4513,14 +4513,12 @@ impl Inner {
         let bound = stamp.as_ref().is_some_and(|stamp| pending.as_ref().is_some_and(|(action,_,_)| matches!(action,crate::always_allow::Action::LocalMcp {grant} if grant == &stamp.grant)));
         if !bound {
             self.local_mcp_proposals.borrow_mut().remove(request);
-            if stamp.is_some() {
-                self.command(Command::Approve {
-                    request: request.into(),
-                    decision: Decision::Deny,
-                    updated_input: None,
-                    message: None,
-                });
-            }
+            self.command(Command::Approve {
+                request: request.into(),
+                decision: Decision::Deny,
+                updated_input: None,
+                message: None,
+            });
             self.emit(Envelope::new(Event::ApprovalExpired).request(request));
             if decision == Decision::Cancel {
                 self.stopped_from_card();
@@ -6724,6 +6722,51 @@ mod tests {
                     assert!(session.inner.local_mcp_proposals.borrow().is_empty());
                 });
             }
+        }
+    }
+
+    #[test]
+    fn local_mcp_unbound_answers_send_a_denial_before_dismissing_the_card() {
+        for decision in [Decision::Allow, Decision::Deny, Decision::Cancel] {
+            in_loop(|_| {
+                let store = Rc::new(Store::open_in_memory().unwrap());
+                let thread = fresh(&store, "/work");
+                let log: Log = Rc::default();
+                let (session, seen) = harness(
+                    FakeAdapter::boxed(Driver::Local, &log),
+                    open_session("unused", vec![], "/work"),
+                    &store,
+                    &thread,
+                );
+                let frame = local_mcp_frame("r1", "g1", local_mcp_grant());
+                session.inner.apply(&frame);
+                assert!(session
+                    .inner
+                    .adapter
+                    .borrow()
+                    .local_mcp_approval("r1")
+                    .is_none());
+                session.respond_approval("r1", decision);
+                assert!(log.borrow().iter().any(|command| matches!(
+                    command,
+                    Command::Approve {
+                        request,
+                        decision: Decision::Deny,
+                        updated_input: None,
+                        ..
+                    } if request == "r1"
+                )));
+                assert!(seen.borrow().iter().any(|event| {
+                    event.request.as_deref() == Some("r1")
+                        && matches!(event.event, Event::ApprovalExpired)
+                }));
+                assert!(!session
+                    .inner
+                    .open_approvals
+                    .borrow()
+                    .contains(&"r1".to_owned()));
+                assert!(session.inner.local_mcp_proposals.borrow().is_empty());
+            });
         }
     }
 

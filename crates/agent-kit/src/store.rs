@@ -377,6 +377,8 @@ fn scrub_value(key: Option<&str>, v: Value) -> Value {
             }
             Value::Object(masked)
         }
+        // Token counts and capability flags are typed event fields too. Only a caller with
+        // configured credential values can distinguish secret numeric or boolean primitives.
         other => other,
     }
 }
@@ -4948,6 +4950,32 @@ mod tests {
             .expect("rename");
         assert!(!title(&s).contains("ghp_abcdefghij"), "{}", title(&s));
         assert!(title(&s).contains("****0123"));
+    }
+
+    #[test]
+    fn numeric_usage_and_boolean_flags_remain_typed_without_configured_credentials() {
+        let usage = agent_core::event::Usage {
+            input_tokens: 1234567890,
+            output_tokens: 123456789,
+            cached_input_tokens: 12345678,
+            reasoning_tokens: 1234567,
+        };
+        let event = scrub_envelope(
+            Envelope::new(Event::TurnCompleted {
+                state: agent_core::event::TurnState::Completed,
+                usage: Some(usage.clone()),
+                cost_usd: None,
+                error: None,
+            })
+            .raw(serde_json::json!({"key_present":true,"token_enabled":false})),
+        )
+        .unwrap();
+        assert!(
+            matches!(event.event, Event::TurnCompleted {usage:Some(ref stored),..} if stored == &usage)
+        );
+        let raw = event.raw.unwrap();
+        assert_eq!(raw["key_present"], true);
+        assert_eq!(raw["token_enabled"], false);
     }
 
     #[test]

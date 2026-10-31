@@ -1123,6 +1123,169 @@ mod runner {
     }
 
     #[test]
+    fn explicit_reconnect_replaces_the_process_and_toggle_stops_without_hidden_restart() {
+        use agent_core::adapter::Control;
+        let folder = tempfile::tempdir().unwrap();
+        let run = Run::new(
+            vec![config(folder.path(), "modern")],
+            Mode::Ask,
+            BTreeMap::new(),
+            vec![],
+            None,
+        );
+        let control = |id: &str, control| {
+            run.send(Command::Control {
+                id: id.into(),
+                control,
+            });
+            loop {
+                let event = run.next();
+                if event.request.as_deref() == Some(id) {
+                    if let Event::ControlResult { ok, error } = event.event {
+                        assert!(error.is_none(), "{error:?}");
+                        break ok.unwrap_or(Value::Null);
+                    }
+                }
+            }
+        };
+        assert_eq!(
+            control("initial", Control::McpStatus)["mcpServers"][0]["status"],
+            "stopped"
+        );
+        assert!(pids(folder.path()).is_empty());
+        control(
+            "connect",
+            Control::McpReconnect {
+                server: "fixture".into(),
+            },
+        );
+        assert_eq!(
+            control("connected", Control::McpStatus)["mcpServers"][0]["status"],
+            "connected"
+        );
+        let first = pids(folder.path());
+        assert_eq!(first.len(), 1);
+        control(
+            "replace",
+            Control::McpReconnect {
+                server: "fixture".into(),
+            },
+        );
+        assert_eq!(pids(folder.path()).len(), 2);
+        assert!(first.into_iter().all(|pid| !alive(pid)));
+        control(
+            "disable",
+            Control::McpToggle {
+                server: "fixture".into(),
+                enabled: false,
+            },
+        );
+        assert_dead(folder.path());
+        assert_eq!(
+            control("disabled", Control::McpStatus)["mcpServers"][0]["status"],
+            "disabled"
+        );
+        assert_eq!(
+            control(
+                "enable",
+                Control::McpToggle {
+                    server: "fixture".into(),
+                    enabled: true
+                }
+            )["restartPending"],
+            true
+        );
+        assert_eq!(
+            control("stopped", Control::McpStatus)["mcpServers"][0]["status"],
+            "stopped"
+        );
+        assert_eq!(pids(folder.path()).len(), 2);
+        assert!(calls(folder.path()).is_empty());
+        run.finish();
+    }
+
+    #[test]
+    fn pending_mcp_approval_answers_status_and_refuses_busy_mutations_without_queueing_them() {
+        let folder = tempfile::tempdir().unwrap();
+        let config = config(folder.path(), "modern");
+        let server = config.id.clone();
+        let run = Run::new(
+            vec![config],
+            Mode::Ask,
+            BTreeMap::new(),
+            vec![Reply::Calls(vec![(mcp_alias(), json!({}))]), Reply::Answer],
+            None,
+        );
+        run.send(Command::Prompt {
+            text: "test".into(),
+        });
+        let card = loop {
+            let event = run.next();
+            if matches!(event.event, Event::ApprovalRequested { .. }) {
+                break event;
+            }
+        };
+        let original_pids = pids(folder.path());
+        run.send(Command::Control {
+            id: "status-pending".into(),
+            control: agent_core::adapter::Control::McpStatus,
+        });
+        run.send(Command::Control {
+            id: "reconnect-busy".into(),
+            control: agent_core::adapter::Control::McpReconnect {
+                server: server.clone(),
+            },
+        });
+        run.send(Command::Control {
+            id: "enable-busy".into(),
+            control: agent_core::adapter::Control::McpToggle {
+                server: server.clone(),
+                enabled: true,
+            },
+        });
+        let mut received = std::collections::BTreeSet::new();
+        while received.len() < 3 {
+            let event = run.next();
+            assert!(!matches!(
+                event.event,
+                Event::ApprovalResolved { .. } | Event::TurnCompleted { .. }
+            ));
+            if let Event::ControlResult { ok, error } = &event.event {
+                let id = event.request.as_deref().unwrap();
+                if id == "status-pending" {
+                    assert!(error.is_none());
+                    assert_eq!(ok.as_ref().unwrap()["mcpServers"][0]["status"], "connected");
+                } else {
+                    assert!(error.as_ref().is_some_and(|error| error.contains("busy")));
+                }
+                received.insert(id.to_owned());
+            }
+        }
+        assert!(calls(folder.path()).is_empty());
+        assert_eq!(pids(folder.path()), original_pids);
+        run.answer(&card, Decision::Deny);
+        let events = run.turn();
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event.event, Event::ControlResult { .. })));
+        run.send(Command::Control {
+            id: "status-idle".into(),
+            control: agent_core::adapter::Control::McpStatus,
+        });
+        loop {
+            let event = run.next();
+            if event.request.as_deref() == Some("status-idle") {
+                break;
+            }
+            assert!(!matches!(event.event, Event::ControlResult { .. }));
+        }
+        assert_eq!(pids(folder.path()), original_pids);
+        assert!(calls(folder.path()).is_empty());
+        run.finish();
+        assert_dead(folder.path());
+    }
+
+    #[test]
     fn disconnect_expires_pending_cards_and_late_answers_never_authorise_reconnection() {
         let folder = tempfile::tempdir().unwrap();
         let run = Run::new(
@@ -1590,7 +1753,81 @@ mod runner {
     }
 
     #[test]
-    fn stale_bindings_and_argument_edits_require_a_new_validated_approval() {
+    fn missing_malformed_and_stale_bindings_decline_the_answered_call_without_waiting() {
+        for field in [
+            "missing",
+            "malformed",
+            "generation",
+            "server",
+            "schema",
+            "request",
+            "arguments",
+        ] {
+            let folder = tempfile::tempdir().unwrap();
+            let run = Run::new(
+                vec![config(folder.path(), "strict-schema")],
+                Mode::Ask,
+                BTreeMap::new(),
+                vec![Reply::Calls(vec![(mcp_alias(), json!({"value":"first"}))])],
+                None,
+            );
+            run.send(Command::Prompt {
+                text: "test".into(),
+            });
+            let card = loop {
+                let env = run.next();
+                if matches!(env.event, Event::ApprovalRequested { .. }) {
+                    break env;
+                }
+            };
+            let Event::ApprovalRequested { input, .. } = &card.event else {
+                unreachable!()
+            };
+            let original: agent_core::local_mcp::ApprovalCard =
+                serde_json::from_value(input.clone()).unwrap();
+            let mut stamp = original.binding;
+            match field {
+                "generation" => stamp.generation.push('x'),
+                "server" => stamp.grant.server_revision = "0".repeat(64),
+                "schema" => stamp.grant.schema_revision = "0".repeat(64),
+                "request" => stamp.request_id.push('x'),
+                "arguments" => stamp.call_id.push('x'),
+                _ => {}
+            }
+            let updated_input = match field {
+                "missing" => None,
+                "malformed" => Some(json!({"binding":null})),
+                _ => Some(json!({"binding":stamp,"edited_arguments":null})),
+            };
+            run.send(Command::Approve {
+                request: card.request.clone().unwrap(),
+                decision: Decision::Allow,
+                updated_input,
+                message: None,
+            });
+            let events = run.turn();
+            assert!(
+                events.iter().any(|env| {
+                    env.request == card.request
+                        && matches!(
+                            env.event,
+                            Event::ApprovalResolved {
+                                decision: Decision::Deny
+                            }
+                        )
+                }),
+                "{field}"
+            );
+            assert!(!events
+                .iter()
+                .any(|env| matches!(env.event, Event::ApprovalRequested { .. })));
+            assert!(calls(folder.path()).is_empty(), "{field}");
+            run.finish();
+        }
+    }
+
+    #[test]
+    fn argument_edits_require_a_new_validated_approval() {
         let folder = tempfile::tempdir().unwrap();
         let run = Run::new(
             vec![config(folder.path(), "strict-schema")],
@@ -1613,24 +1850,6 @@ mod runner {
         };
         let original: agent_core::local_mcp::ApprovalCard =
             serde_json::from_value(input.clone()).unwrap();
-        for field in ["generation", "server", "schema", "request", "arguments"] {
-            let mut stamp = original.binding.clone();
-            match field {
-                "generation" => stamp.generation.push('x'),
-                "server" => stamp.grant.server_revision = "0".repeat(64),
-                "schema" => stamp.grant.schema_revision = "0".repeat(64),
-                "request" => stamp.request_id.push('x'),
-                _ => stamp.call_id.push('x'),
-            }
-            run.send(Command::Approve {
-                request: card.request.clone().unwrap(),
-                decision: Decision::Allow,
-                updated_input: Some(json!({"binding":stamp,"edited_arguments":null})),
-                message: None,
-            });
-        }
-        std::thread::sleep(Duration::from_millis(40));
-        assert!(calls(folder.path()).is_empty());
         run.send(Command::Approve {
             request: card.request.clone().unwrap(),
             decision: Decision::Allow,

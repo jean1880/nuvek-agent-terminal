@@ -355,6 +355,9 @@ pub struct Runner<C: ChatClient, W: Write> {
     masks: crate::local_mcp::CredentialMasks,
     mcp: Option<crate::local_mcp::Session>,
     budget_notice_sent: bool,
+    last_budget: Option<String>,
+    last_excluded: Vec<Value>,
+    last_mcp_status: Value,
     turn_instructions: agent_core::local_context::InstructionSnapshot,
     context: agent_core::local_context::LocalLaunchContext,
     args: RunnerArgs,
@@ -401,6 +404,9 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             context: Default::default(),
             turn_instructions: Default::default(),
             budget_notice_sent: false,
+            last_budget: None,
+            last_excluded: Vec::new(),
+            last_mcp_status: serde_json::json!({"mcpServers":[]}),
             mode: args.mode,
             args,
             client: Some(client),
@@ -670,9 +676,219 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 self.emit(Envelope::new(Event::ModeChanged { mode }));
                 Ok(())
             }
+            Command::Control { id, control } => {
+                self.mcp_control(&id, control, commands);
+                Ok(())
+            }
             // Nothing to interrupt or answer between turns.
             _ => Ok(()),
         }
+    }
+
+    fn mcp_control(
+        &mut self,
+        id: &str,
+        control: agent_core::adapter::Control,
+        commands: &Receiver<RunnerInput>,
+    ) {
+        use agent_core::adapter::Control;
+        let result: Result<Value, String> = match control {
+            Control::McpStatus => self.mcp_status(commands),
+            Control::McpToggle { server, enabled } => {
+                if let Some(index) = self.context.mcp_servers.iter().position(|c| c.id == server) {
+                    if self.context.mcp_servers[index].enabled != enabled {
+                        // Rebuilding at the next boundary keeps every process on one immutable
+                        // configuration. A narrowing has already interrupted its turn.
+                        self.stop_mcp();
+                        self.context.mcp_servers[index].enabled = enabled;
+                        self.registry.clear();
+                        self.mcp_connections.clear();
+                    }
+                    Ok(serde_json::json!({"enabled":enabled,"restartPending":enabled}))
+                } else {
+                    Err("MCP server is not selected.".into())
+                }
+            }
+            Control::McpReconnect { server } => {
+                if !self
+                    .context
+                    .mcp_servers
+                    .iter()
+                    .any(|c| c.id == server && c.enabled)
+                {
+                    Err("MCP server is not selected and enabled.".into())
+                } else {
+                    if self.mcp.is_none() {
+                        match crate::local_mcp::Session::new(
+                            self.context.mcp_servers.clone(),
+                            Path::new(&self.args.cwd),
+                        ) {
+                            Ok(session) => {
+                                self.masks = session.masks();
+                                self.mcp = Some(session);
+                            }
+                            Err(why) => {
+                                self.emit(
+                                    Envelope::new(Event::ControlResult {
+                                        ok: None,
+                                        error: Some(why),
+                                    })
+                                    .request(id),
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    match self
+                        .mcp
+                        .as_ref()
+                        .ok_or_else(|| "MCP runtime unavailable.".to_owned())
+                        .and_then(|s| s.reconnect(server, self.mode))
+                    {
+                        Ok(reply) => self
+                            .wait_control(reply, commands)
+                            .and_then(|result| result)
+                            .map(|()| Value::Null),
+                        Err(why) => Err(why),
+                    }
+                }
+            }
+            _ => Err("This Local control is not supported.".into()),
+        };
+        let (ok, error) = match result {
+            Ok(value) => (Some(value), None),
+            Err(why) => (None, Some(why)),
+        };
+        self.emit(Envelope::new(Event::ControlResult { ok, error }).request(id));
+    }
+
+    fn wait_control<T>(
+        &mut self,
+        reply: Receiver<T>,
+        commands: &Receiver<RunnerInput>,
+    ) -> Result<T, String> {
+        loop {
+            if self.poll_commands(commands).is_some() {
+                self.stop_mcp();
+                return Err("MCP control interrupted.".into());
+            }
+            match reply.recv_timeout(Duration::from_millis(20)) {
+                Ok(value) => return Ok(value),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err("MCP runtime ended during control.".into())
+                }
+            }
+        }
+    }
+
+    fn mcp_status(&mut self, commands: &Receiver<RunnerInput>) -> Result<Value, String> {
+        let status = match &self.mcp {
+            Some(session) => {
+                let reply = session.status()?;
+                self.wait_control(reply, commands)?
+            }
+            None => serde_json::json!({"mcpServers":self.context.mcp_servers.iter().map(|c|
+                serde_json::json!({"name":c.id,"enabled":c.enabled,"status":if c.enabled {"stopped"} else {"disabled"},"scope":c.label})
+            ).collect::<Vec<_>>()}),
+        };
+        self.last_mcp_status = status.clone();
+        Ok(self.decorate_mcp_status(status))
+    }
+
+    fn decorate_mcp_status(&self, mut status: Value) -> Value {
+        status["budget"] = serde_json::json!({"summary":self.last_budget,"excludedTools":self.last_excluded,
+            "inputAllowance":self.context.budget.input_allowance(),"staticCapBytes":self.context.budget.static_context_bytes,
+            "contextTokens":self.context.budget.context_tokens,"responseTokens":self.context.budget.response_tokens,"safetyTokens":self.context.budget.safety_tokens});
+        if let Some(rows) = status["mcpServers"].as_array_mut() {
+            for row in rows {
+                let existing = row["scope"].as_str().unwrap_or("");
+                row["scope"] = Value::String(format!(
+                    "{existing}; {}",
+                    self.last_budget
+                        .as_deref()
+                        .unwrap_or("No model request planned yet")
+                ));
+            }
+        }
+        status
+    }
+
+    /// Last discovered metadata with current lease liveness. No actor request is queued behind
+    /// a potentially long call, and neither status nor an unavailable cache starts a server.
+    fn cached_mcp_status(&self) -> Value {
+        let rows: Vec<_> = self
+            .context
+            .mcp_servers
+            .iter()
+            .map(|config| {
+                let previous = self.last_mcp_status["mcpServers"]
+                    .as_array()
+                    .and_then(|rows| {
+                        rows.iter()
+                            .find(|row| row["name"].as_str() == Some(config.id.as_str()))
+                    });
+                let mut row = previous
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({"name":config.id,"scope":config.label}));
+                let state = if !config.enabled {
+                    "disabled"
+                } else if self.mcp.is_none() {
+                    "stopped"
+                } else {
+                    match self.mcp_connections.get(&config.id) {
+                        Some(lease) if lease.is_open() => "connected",
+                        Some(_) => "failed",
+                        None => previous
+                            .and_then(|row| row["status"].as_str())
+                            .unwrap_or("stopped"),
+                    }
+                };
+                row["enabled"] = Value::Bool(config.enabled);
+                row["status"] = Value::String(state.into());
+                row
+            })
+            .collect();
+        self.decorate_mcp_status(serde_json::json!({"mcpServers":rows}))
+    }
+
+    /// Controls that cannot safely wait beyond the panel's response deadline. Widening is
+    /// refused while busy rather than executing later after the UI has reported a timeout.
+    fn handle_busy_control(&mut self, command: &Command) -> bool {
+        use agent_core::adapter::Control;
+        let Command::Control { id, control } = command else {
+            return false;
+        };
+        if restrictive_toggle(command, &self.context.mcp_servers) {
+            return false;
+        }
+        let result = match control {
+            Control::McpStatus => Some(Ok(self.cached_mcp_status())),
+            Control::McpReconnect { .. } | Control::McpToggle { .. } => Some(Err(
+                "The agent is busy; retry this MCP change after the turn finishes.".to_owned(),
+            )),
+            _ => None,
+        };
+        let Some(result) = result else {
+            return false;
+        };
+        let (ok, error) = match result {
+            Ok(value) => (Some(value), None),
+            Err(why) => (None, Some(why)),
+        };
+        self.emit(Envelope::new(Event::ControlResult { ok, error }).request(id));
+        true
+    }
+
+    fn poll_commands(&mut self, commands: &Receiver<RunnerInput>) -> Option<Stop> {
+        let stop = poll(commands, &mut self.deferred, &self.context.mcp_servers);
+        let waiting = std::mem::take(&mut self.deferred);
+        for command in waiting {
+            if !self.handle_busy_control(&command) {
+                self.deferred.push(command);
+            }
+        }
+        stop
     }
 
     /// One turn: the prompt, then model requests and tool calls until the model answers.
@@ -797,13 +1013,18 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         };
         let discovery = session.discover(self.mode).map_err(StepError::Failed)?;
         loop {
-            if let Some(stop) = poll(commands, &mut self.deferred) {
+            if let Some(stop) = self.poll_commands(commands) {
                 return Err(StepError::Stop(stop));
             }
             match discovery.recv_timeout(Duration::from_millis(20)) {
                 Ok(discovery) => {
                     let mut required_failed = false;
+                    let mut rows = Vec::new();
                     for server in discovery.servers {
+                        rows.push(serde_json::json!({"name":server.id,
+                            "enabled":true,"status":if server.connection.as_ref().is_some_and(|lease|lease.is_open()) {"connected"} else {"failed"},
+                            "scope":server.notices.join("; "),
+                            "excludedTools":server.available_tools.len().saturating_sub(server.registry.len())}));
                         if let Some(connection) = server.connection {
                             self.mcp_connections.insert(server.id.clone(), connection);
                         }
@@ -823,6 +1044,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                             }
                         }
                     }
+                    self.last_mcp_status = serde_json::json!({"mcpServers":rows});
                     return if required_failed {
                         Err(StepError::Failed(
                             "A required MCP server is unavailable.".into(),
@@ -1038,7 +1260,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         let lines = client.start(body);
         let mut last_line = std::time::Instant::now();
         loop {
-            if let Some(stop) = poll(commands, &mut self.deferred) {
+            if let Some(stop) = self.poll_commands(commands) {
                 stopped = Some(stop);
                 break; // the request is ended below
             }
@@ -1119,6 +1341,15 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
     }
 
     fn report_budget(&mut self, plan: &RequestPlan) {
+        self.last_budget = Some(plan.summary());
+        self.last_excluded = plan
+            .excluded
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+            "alias":tool.alias,"bytes":tool.bytes,"reason":tool.reason})
+            })
+            .collect();
         if !self.budget_notice_sent {
             self.emit(Envelope::new(Event::Notice {
                 text: plan.summary(),
@@ -1256,7 +1487,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         if let Some(entry) = self.registry.get(&call.function.name).cloned() {
             return self.call_mcp(call, &entry, commands, reservation, advertised);
         }
-        if let Some(stop) = poll(commands, &mut self.deferred) {
+        if let Some(stop) = self.poll_commands(commands) {
             return Err(StepError::Stop(stop));
         }
         let item = self.id("tool");
@@ -1361,7 +1592,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         let mut stop = None;
         while !worker.is_finished() {
             if stop.is_none() {
-                if let Some(s) = poll(commands, &mut self.deferred) {
+                if let Some(s) = self.poll_commands(commands) {
                     cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                     stop = Some(s);
                 }
@@ -1411,7 +1642,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
     }
 
     fn poll_mcp(&mut self, commands: &Receiver<RunnerInput>, active: bool) -> Option<Stop> {
-        let stop = poll(commands, &mut self.deferred);
+        let stop = self.poll_commands(commands);
         let mut modes = Vec::new();
         self.deferred.retain(|command| {
             if let Command::SetMode { mode } = command {
@@ -1701,7 +1932,13 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                         .and_then(|value| serde_json::from_value::<ApprovalAnswer>(value).ok());
                     let Some(answer) = answer.filter(|answer| answer.binding == binding.stamp)
                     else {
-                        continue;
+                        self.emit(
+                            Envelope::new(Event::ApprovalResolved {
+                                decision: Decision::Deny,
+                            })
+                            .request(request),
+                        );
+                        return Ok(McpAnswer::Declined);
                     };
                     if let Some(edited) = answer.edited_arguments {
                         self.emit(Envelope::new(Event::ApprovalExpired).request(request));
@@ -1742,6 +1979,14 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                     return Err(StepError::Stop(Stop::Closed));
                 }
                 Ok(RunnerInput::Command(Command::Approve { .. })) => {}
+                Ok(RunnerInput::Command(other))
+                    if restrictive_toggle(&other, &self.context.mcp_servers) =>
+                {
+                    self.deferred.insert(0, other);
+                    self.emit(Envelope::new(Event::ApprovalExpired).request(request));
+                    return Err(StepError::Stop(Stop::Interrupted));
+                }
+                Ok(RunnerInput::Command(other)) if self.handle_busy_control(&other) => {}
                 Ok(RunnerInput::Command(other)) => self.deferred.push(other),
                 Err(RecvTimeoutError::Timeout) => {}
             }
@@ -1791,6 +2036,14 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                     self.emit(Envelope::new(Event::ApprovalExpired).request(&request));
                     return Err(StepError::Stop(Stop::Interrupted));
                 }
+                Ok(RunnerInput::Command(other))
+                    if restrictive_toggle(&other, &self.context.mcp_servers) =>
+                {
+                    self.deferred.insert(0, other);
+                    self.emit(Envelope::new(Event::ApprovalExpired).request(request));
+                    return Err(StepError::Stop(Stop::Interrupted));
+                }
+                Ok(RunnerInput::Command(other)) if self.handle_busy_control(&other) => {}
                 Ok(RunnerInput::Command(other)) => self.deferred.push(other),
                 Err(RecvTimeoutError::Timeout) => {}
                 Ok(RunnerInput::Closed) | Err(RecvTimeoutError::Disconnected) => {
@@ -1828,10 +2081,26 @@ struct Shown {
 
 /// Looks at what arrived without waiting: an interrupt (or a closed stdin) stops the reply;
 /// anything else waits for the turn's end.
-fn poll(commands: &Receiver<RunnerInput>, deferred: &mut Vec<Command>) -> Option<Stop> {
+fn restrictive_toggle(
+    command: &Command,
+    selected: &[agent_core::local_mcp::McpServerConfig],
+) -> bool {
+    matches!(command, Command::Control { control:agent_core::adapter::Control::McpToggle {server,enabled:false},.. }
+        if selected.iter().any(|c| c.id == *server && c.enabled))
+}
+
+fn poll(
+    commands: &Receiver<RunnerInput>,
+    deferred: &mut Vec<Command>,
+    selected: &[agent_core::local_mcp::McpServerConfig],
+) -> Option<Stop> {
     loop {
         match commands.try_recv() {
             Ok(RunnerInput::Command(Command::Interrupt)) => return Some(Stop::Interrupted),
+            Ok(RunnerInput::Command(command)) if restrictive_toggle(&command, selected) => {
+                deferred.insert(0, command);
+                return Some(Stop::Interrupted);
+            }
             Ok(RunnerInput::Invalid(why)) => return Some(Stop::InvalidInput(why)),
             // A stale answer (its card is gone) is dropped.
             Ok(RunnerInput::Command(Command::Approve { .. })) => {}
@@ -1898,6 +2167,96 @@ pub(crate) fn new_session_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runtime_status_and_session_toggle_do_not_start_servers() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut runner = Runner::new(
+            args(folder.path(), Mode::Ask),
+            Script::new(vec![]),
+            folder.path().join("state"),
+            Vec::<u8>::new(),
+        );
+        runner.context.mcp_servers = vec![serde_json::from_value(json!({
+            "id":"selected","label":"Selected","enabled":true,"command":"missing-test-command","args":[],"cwd":".","env":{},"tools":[],"approval":"ask","startup_timeout_secs":1,"call_timeout_secs":1
+        })).unwrap()];
+        let (_tx, rx) = std::sync::mpsc::channel();
+        assert_eq!(
+            runner.mcp_status(&rx).unwrap()["mcpServers"][0]["status"],
+            "stopped"
+        );
+        runner.mcp_control(
+            "off",
+            agent_core::adapter::Control::McpToggle {
+                server: "selected".into(),
+                enabled: false,
+            },
+            &rx,
+        );
+        assert_eq!(
+            runner.mcp_status(&rx).unwrap()["mcpServers"][0]["status"],
+            "disabled"
+        );
+        runner.mcp_control(
+            "on",
+            agent_core::adapter::Control::McpToggle {
+                server: "selected".into(),
+                enabled: true,
+            },
+            &rx,
+        );
+        assert_eq!(
+            runner.mcp_status(&rx).unwrap()["mcpServers"][0]["status"],
+            "stopped"
+        );
+        assert!(runner.mcp.is_none());
+        let before = runner.context.mcp_servers.clone();
+        runner.mcp_control(
+            "bad",
+            agent_core::adapter::Control::McpReconnect {
+                server: "unknown".into(),
+            },
+            &rx,
+        );
+        assert!(runner.context.mcp_servers == before);
+        assert!(runner.mcp.is_none());
+    }
+
+    #[test]
+    fn restrictive_mcp_toggle_interrupts_only_an_enabled_selected_server() {
+        let config: agent_core::local_mcp::McpServerConfig = serde_json::from_value(json!({
+            "id":"selected","label":"Selected","enabled":true,"command":"fixture","args":[],"cwd":".","env":{},"tools":[],"approval":"ask","startup_timeout_secs":15,"call_timeout_secs":60
+        })).unwrap();
+        for (server, enabled, interrupts) in [
+            ("selected", false, true),
+            ("selected", true, false),
+            ("unknown", false, false),
+        ] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send(RunnerInput::Command(Command::Control {
+                id: "toggle".into(),
+                control: agent_core::adapter::Control::McpToggle {
+                    server: server.into(),
+                    enabled,
+                },
+            }))
+            .unwrap();
+            let mut deferred = vec![Command::Prompt {
+                text: "already queued".into(),
+            }];
+            assert_eq!(
+                matches!(
+                    poll(&rx, &mut deferred, std::slice::from_ref(&config)),
+                    Some(Stop::Interrupted)
+                ),
+                interrupts
+            );
+            assert_eq!(deferred.len(), 2);
+            if interrupts {
+                assert!(matches!(deferred.first(), Some(Command::Control { .. })));
+            }
+        }
+    }
+
     #[test]
     fn setup_is_required_and_invalid_setup_never_acknowledged() {
         for command in [

@@ -3,10 +3,13 @@
 use super::*;
 use agent_core::local_context::{ContextBudget, LocalDefaults};
 
-const SETTINGS_HELP: &str = "Changes are saved when committed. A running turn keeps its snapshot; a resumed runner adopts changes before the next prompt. Files are reloaded each turn. MCP processes and tool discovery are not available yet.";
+const SETTINGS_HELP: &str = "Changes apply when committed. Wider access applies next turn; restricting access stops the current runner and expires approvals. A restart may be pending until its next prompt. Files reload each turn. MCP discovery runs only when you choose Discover tools.";
 const PATH_HELP: &str = "An additional instruction file; absolute, folder-relative, ~/ or $XDG_CONFIG_HOME/ paths. A missing configured file blocks the turn.";
 
-fn validate_defaults(imp: &AgentTerminalWindow, value: &LocalDefaults) -> Result<(), String> {
+pub(super) fn validate_defaults(
+    imp: &AgentTerminalWindow,
+    value: &LocalDefaults,
+) -> Result<(), String> {
     value.validate()?;
     for profile in &imp.config.borrow().profiles {
         value.launch(&profile.local)?;
@@ -33,7 +36,7 @@ fn set_budget_value(budget: &mut ContextBudget, field: usize, value: usize) {
 }
 
 impl AgentTerminalWindow {
-    fn save_local_defaults(&self, value: LocalDefaults) {
+    pub(super) fn save_local_defaults(&self, value: LocalDefaults) {
         if validate_defaults(self, &value).is_err() {
             return;
         }
@@ -158,6 +161,7 @@ impl AgentTerminalWindow {
             );
         }
         self.local_preview_rows(&group);
+        self.local_mcp_rows(dialog, &group);
         group
     }
 
@@ -435,6 +439,7 @@ impl AgentTerminalWindow {
         parent: &adw::ExpanderRow,
     ) {
         let obj = self.obj();
+        self.local_profile_mcp_rows(server, dialog, parent);
         let id = server.id.clone();
         let toggle = adw::SwitchRow::builder().title("Override Request Budget").subtitle("Off follows app defaults. On stores all four values for this profile; changes apply before the next prompt.").active(server.local.budget.is_some()).build();
         toggle.connect_active_notify(glib::clone!(

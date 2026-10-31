@@ -13,6 +13,7 @@ agent-core = { path = "../agent-core" }
 rusqlite = { version = "0.41", features = ["bundled", "backup"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = "=1.1.8"
 tracing = { workspace = true }
 rmcp = { workspace = true, features = ["client"] }
 tokio = { workspace = true, features = ["rt", "time", "io-util", "net", "process", "sync"] }

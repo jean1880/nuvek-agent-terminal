@@ -1,5 +1,6 @@
 //! Session-owned bounded stdio MCP clients and process supervision.
 mod client;
+pub mod import;
 mod process;
 mod transport;
 

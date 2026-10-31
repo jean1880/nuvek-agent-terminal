@@ -20,6 +20,16 @@ use crate::chat::{ChatBackend, ModelSource, SessionStatus};
 
 type Reply = Box<dyn FnOnce(Result<Value, String>)>;
 
+fn control_timeout(driver: agent_core::adapter::Driver, control: &Control) -> u64 {
+    if driver == agent_core::adapter::Driver::Local
+        && matches!(control, Control::McpReconnect { .. })
+    {
+        315
+    } else {
+        30
+    }
+}
+
 /// Routes `ControlResult`s to whoever asked, by request id.
 #[derive(Default)]
 pub struct Requests {
@@ -37,6 +47,8 @@ impl Requests {
         control: Control,
         reply: impl FnOnce(Result<Value, String>) + 'static,
     ) -> String {
+        // Local startup is configurable up to 300 seconds, plus bounded group cleanup.
+        let seconds = control_timeout(backend.status().driver, &control);
         let id = backend.control(control);
         let early = self.early.borrow_mut().remove(&id);
         match early {
@@ -48,10 +60,10 @@ impl Requests {
                 let weak = Rc::downgrade(self);
                 let request = id.clone();
                 let timeout = glib::spawn_future_local(async move {
-                    glib::timeout_future(std::time::Duration::from_secs(30)).await;
+                    glib::timeout_future(std::time::Duration::from_secs(seconds)).await;
                     if let Some(requests) = weak.upgrade() {
                         requests.timeouts.borrow_mut().remove(&request);
-                        requests.expire(&request);
+                        requests.expire_after(&request, seconds);
                     }
                 });
                 self.timeouts.borrow_mut().insert(id.clone(), timeout);
@@ -61,13 +73,18 @@ impl Requests {
     }
 
     /// Ends only a request that is still waiting; a late timer never becomes an early reply.
+    #[cfg(test)]
     pub fn expire(&self, id: &str) {
+        self.expire_after(id, 30);
+    }
+
+    fn expire_after(&self, id: &str, seconds: u64) {
         self.cancel_timeout(id);
         let reply = self.pending.borrow_mut().remove(id);
         if let Some(reply) = reply {
-            reply(Err(
-                "The agent did not answer within 30 seconds. Try again.".to_owned(),
-            ));
+            reply(Err(format!(
+                "The agent did not answer within {seconds} seconds. Try again."
+            )));
         }
     }
 
@@ -892,14 +909,14 @@ fn load_mcp(ctx: &PanelCtx, stack: &gtk4::Stack) {
             #[weak]
             stack,
             move |result| {
-                let servers = match result {
-                    Ok(v) => payload::mcp_servers(&v),
+                let (servers, budget) = match result {
+                    Ok(v) => (payload::mcp_servers(&v), payload::mcp_budget(&v)),
                     Err(e) => {
                         show_error(&stack, &e);
                         return;
                     }
                 };
-                if servers.is_empty() {
+                if servers.is_empty() && budget.is_none() {
                     let page = adw::StatusPage::new();
                     crate::icons::set_status_icon(&page, "at-network-server-symbolic");
                     page.set_title("No MCP servers");
@@ -908,6 +925,15 @@ fn load_mcp(ctx: &PanelCtx, stack: &gtk4::Stack) {
                     return;
                 }
                 let list = boxed_list();
+                if let Some(budget) = budget {
+                    let row = adw::ActionRow::builder()
+                        .title("Effective Local Budget (estimates)")
+                        .subtitle(budget)
+                        .use_markup(false)
+                        .subtitle_lines(0)
+                        .build();
+                    list.append(&row);
+                }
                 for s in servers {
                     let row = adw::ActionRow::new();
                     row.set_use_markup(false);
@@ -1263,6 +1289,32 @@ pub fn context_panel(ctx: &PanelCtx, fallback: Option<Gauge>) {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn local_reconnect_deadline_covers_configurable_startup_without_affecting_other_controls() {
+        use agent_core::adapter::{Control, Driver};
+        assert_eq!(
+            super::control_timeout(
+                Driver::Local,
+                &Control::McpReconnect {
+                    server: "example".into()
+                }
+            ),
+            315
+        );
+        assert_eq!(
+            super::control_timeout(
+                Driver::Codex,
+                &Control::McpReconnect {
+                    server: "example".into()
+                }
+            ),
+            30
+        );
+        assert_eq!(
+            super::control_timeout(Driver::Local, &Control::McpStatus),
+            30
+        );
+    }
     use super::*;
 
     #[test]

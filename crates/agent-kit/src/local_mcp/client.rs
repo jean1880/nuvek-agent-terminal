@@ -56,6 +56,8 @@ pub struct Discovery {
 }
 pub struct ServerDiscovery {
     pub id: String,
+    /// All discovered names for explicit Settings review, never execution authority.
+    pub available_tools: Vec<String>,
     pub tools: Vec<Tool>,
     pub notices: Vec<String>,
     pub required_failed: bool,
@@ -252,6 +254,11 @@ impl Server {
         }).collect();
         ServerDiscovery {
             id: self.config.id.clone(),
+            available_tools: self
+                .tools
+                .iter()
+                .map(|tool| self.process.scrubber.scrub(tool.name.as_ref()))
+                .collect(),
             tools,
             notices: self.notices.clone(),
             required_failed: false,
@@ -264,6 +271,7 @@ impl Server {
 fn failed(config: &McpServerConfig, reason: String) -> ServerDiscovery {
     ServerDiscovery {
         id: config.id.clone(),
+        available_tools: Vec::new(),
         tools: Vec::new(),
         notices: vec![format!("MCP server {} unavailable: {reason}", config.id)],
         required_failed: config.required,
@@ -347,6 +355,14 @@ async fn start(
 }
 
 enum Request {
+    Status {
+        reply: std::sync::mpsc::SyncSender<serde_json::Value>,
+    },
+    Reconnect {
+        server_id: String,
+        mode: Mode,
+        reply: std::sync::mpsc::SyncSender<Result<(), String>>,
+    },
     Discover {
         mode: Mode,
         reply: std::sync::mpsc::SyncSender<Discovery>,
@@ -379,15 +395,26 @@ impl Session {
         Self::with_executable(configs, executable, effective)
     }
     pub fn new(configs: Vec<McpServerConfig>, workspace: &std::path::Path) -> Result<Self, String> {
-        let configs = resolve_workspaces(configs, workspace);
-        Self::with_executable(
+        Self::with_environment(
             configs,
-            std::env::current_exe().map_err(|_| "Could not locate MCP guardian executable.")?,
+            workspace,
             std::env::vars_os()
                 .filter_map(|(key, value)| {
                     Some((key.into_string().ok()?, value.into_string().ok()?))
                 })
                 .collect(),
+        )
+    }
+    /// Explicit discovery in Settings uses the selected profile's effective environment.
+    pub fn with_environment(
+        configs: Vec<McpServerConfig>,
+        workspace: &std::path::Path,
+        effective: BTreeMap<String, String>,
+    ) -> Result<Self, String> {
+        Self::with_executable(
+            resolve_workspaces(configs, workspace),
+            std::env::current_exe().map_err(|_| "Could not locate MCP guardian executable.")?,
+            effective,
         )
     }
     fn with_executable(
@@ -447,6 +474,30 @@ impl Session {
         let (reply, receiver) = std::sync::mpsc::sync_channel(1);
         self.tx
             .try_send(Request::Discover { mode, reply })
+            .map_err(|_| "MCP runtime is busy or unavailable.")?;
+        Ok(receiver)
+    }
+    /// Reads current state only. This never starts a configured server.
+    pub fn status(&self) -> Result<std::sync::mpsc::Receiver<serde_json::Value>, String> {
+        let (reply, receiver) = std::sync::mpsc::sync_channel(1);
+        self.tx
+            .try_send(Request::Status { reply })
+            .map_err(|_| "MCP runtime is busy or unavailable.")?;
+        Ok(receiver)
+    }
+    /// Explicitly reconnect one enabled selected definition; never starts its siblings.
+    pub fn reconnect(
+        &self,
+        server_id: String,
+        mode: Mode,
+    ) -> Result<std::sync::mpsc::Receiver<Result<(), String>>, String> {
+        let (reply, receiver) = std::sync::mpsc::sync_channel(1);
+        self.tx
+            .try_send(Request::Reconnect {
+                server_id,
+                mode,
+                reply,
+            })
             .map_err(|_| "MCP runtime is busy or unavailable.")?;
         Ok(receiver)
     }
@@ -536,9 +587,78 @@ async fn worker(
     mut cancel: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut servers: Vec<Option<Server>> = (0..configs.len()).map(|_| None).collect();
+    let mut failures: Vec<Option<String>> = (0..configs.len()).map(|_| None).collect();
     loop {
         let request = tokio::select! { _ = cancelled(&mut cancel) => break, request = requests.recv() => match request { Some(request) => request, None => break } };
         match request {
+            Request::Status { reply } => {
+                let rows: Vec<_> = configs.iter().enumerate().map(|(index, config)| {
+                    let server = servers[index].as_ref();
+                    let state = if !config.enabled { "disabled" }
+                        else if server.is_some_and(|server| server.connection.is_open()) { "connected" }
+                        else if server.is_some() || failures[index].is_some() { "failed" } else { "stopped" };
+                    let notices = server.map(|s| s.notices.clone()).unwrap_or_default();
+                    let excluded = server.map_or(0, |s| s.discovered_count.saturating_sub(s.offered.len()));
+                    let detail = failures[index].clone().or_else(|| server.filter(|s| !s.connection.is_open()).map(|s| s.reason("MCP connection closed.")));
+                    serde_json::json!({"name":config.id,"status":state,"enabled":config.enabled,
+                        "scope":format!("{}; {} excluded tools{}",config.label,excluded,detail.as_ref().map(|s|format!("; {s}")).unwrap_or_default()),
+                        "excludedTools":excluded,"notices":notices})
+                }).collect();
+                let _ = reply.try_send(serde_json::json!({"mcpServers":rows}));
+            }
+            Request::Reconnect {
+                server_id,
+                mode,
+                reply,
+            } => {
+                let Some(index) = configs.iter().position(|c| c.id == server_id && c.enabled)
+                else {
+                    let _ = reply.try_send(Err("MCP server is not selected and enabled.".into()));
+                    continue;
+                };
+                if let Some(mut previous) = servers[index].take() {
+                    previous.close().await;
+                }
+                match start(
+                    configs[index].clone(),
+                    effective.clone(),
+                    executable.clone(),
+                    cancel.clone(),
+                )
+                .await
+                {
+                    Ok(mut server) => {
+                        let count: usize =
+                            servers.iter().flatten().map(|s| s.discovered_count).sum();
+                        let bytes: usize =
+                            servers.iter().flatten().map(|s| s.discovered_bytes).sum();
+                        if count + server.discovered_count > MAX_SESSION_TOOLS
+                            || bytes + server.discovered_bytes > MAX_SESSION_BYTES
+                        {
+                            server.close().await;
+                            let why =
+                                "MCP session discovery exceeded its total tool or byte bound."
+                                    .to_owned();
+                            failures[index] = Some(why.clone());
+                            let _ = reply.try_send(Err(why));
+                        } else {
+                            server.offered = server
+                                .snapshot(mode)
+                                .tools
+                                .iter()
+                                .map(|t| t.name.to_string())
+                                .collect();
+                            servers[index] = Some(server);
+                            failures[index] = None;
+                            let _ = reply.try_send(Ok(()));
+                        }
+                    }
+                    Err(why) => {
+                        failures[index] = Some(why.clone());
+                        let _ = reply.try_send(Err(why));
+                    }
+                }
+            }
             Request::Call {
                 connection,
                 server_id,
@@ -594,6 +714,7 @@ async fn worker(
                         Err(reason) => {
                             server.close().await;
                             servers[index] = None;
+                            failures[index] = Some(reason.clone());
                             Err(reason)
                         }
                     }
@@ -652,10 +773,12 @@ async fn worker(
                     for (index, result) in results {
                         match result {
                             Ok(mut server) => {
+                                failures[index] = None;
                                 if total + server.discovered_count > MAX_SESSION_TOOLS
                                     || bytes + server.discovered_bytes > MAX_SESSION_BYTES
                                 {
                                     server.close().await;
+                                    failures[index] = Some("MCP session discovery exceeded its total tool or byte bound.".into());
                                     discovery.servers.push(failed(&configs[index], "MCP session discovery exceeded its total tool or byte bound.".into()));
                                 } else {
                                     total += server.discovered_count;
@@ -667,7 +790,10 @@ async fn worker(
                                     servers[index] = Some(server);
                                 }
                             }
-                            Err(reason) => discovery.servers.push(failed(&configs[index], reason)),
+                            Err(reason) => {
+                                failures[index] = Some(reason.clone());
+                                discovery.servers.push(failed(&configs[index], reason));
+                            }
                         }
                     }
                 }
@@ -690,6 +816,44 @@ async fn worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn status_and_rejected_reconnects_never_start_servers() {
+        let config: McpServerConfig = serde_json::from_value(serde_json::json!({
+            "id":"selected","label":"Selected","enabled":true,"command":"missing-test-command","args":[],"cwd":".","env":{},"tools":[],"approval":"ask","startup_timeout_secs":1,"call_timeout_secs":1
+        })).unwrap();
+        let mut disabled = config.clone();
+        disabled.id = "disabled".into();
+        disabled.enabled = false;
+        let mut session = Session::with_executable(
+            vec![config, disabled],
+            PathBuf::from("/missing-test-guardian"),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        for server in ["unknown", "disabled"] {
+            let value = session
+                .status()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            assert_eq!(value["mcpServers"][0]["status"], "stopped");
+            assert_eq!(value["mcpServers"][1]["status"], "disabled");
+            assert!(session
+                .reconnect(server.into(), Mode::Ask)
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .is_err());
+        }
+        let value = session
+            .status()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(value["mcpServers"][0]["status"], "stopped");
+        session.shutdown();
+    }
+
     #[test]
     fn workspace_cwd_uses_the_thread_directory_without_shell_expansion() {
         let mut config: McpServerConfig = serde_json::from_value(serde_json::json!({

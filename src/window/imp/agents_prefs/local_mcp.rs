@@ -835,6 +835,24 @@ mod tests {
             assert!(enabled.has_css_class("error"));
             assert!(enabled.subtitle().unwrap().contains("unique"));
             assert!(!window.imp().config.borrow().local_defaults.mcp_servers[0].enabled);
+            let combos = crate::testutil::find_all::<adw::ComboRow>(group.upcast_ref());
+            let policy = combos
+                .iter()
+                .find(|c| c.title() == "Approval Policy")
+                .unwrap();
+            let chosen = policy.selected();
+            policy.set_selected(chosen + 1);
+            assert_eq!(
+                policy.selected(),
+                chosen,
+                "a refused save reverts the dropdown"
+            );
+            assert!(policy.has_css_class("error"));
+            assert!(policy.subtitle().unwrap().contains("unique"));
+            assert_eq!(
+                window.imp().config.borrow().local_defaults.mcp_servers[0].approval,
+                ApprovalPolicy::Ask
+            );
             let buttons = crate::testutil::find_all::<gtk4::Button>(group.upcast_ref());
             let remove = buttons
                 .iter()

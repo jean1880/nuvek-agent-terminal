@@ -102,10 +102,17 @@ pub struct Workspace {
     /// Where it led when opened.
     root: PathBuf,
     folder: OwnedFd,
+    /// The user's home, resolved, for the dotfile rule of [`read_must_ask`]; `None` applies none.
+    home: Option<PathBuf>,
 }
 
 impl Workspace {
+    /// [`Self::open_with_home`] with `$HOME`.
     pub fn open(cwd: &Path) -> Result<Self, String> {
+        Self::open_with_home(cwd, std::env::var_os("HOME").map(PathBuf::from).as_deref())
+    }
+
+    pub fn open_with_home(cwd: &Path, home: Option<&Path>) -> Result<Self, String> {
         let root = cwd
             .canonicalize()
             .map_err(|e| format!("Cannot open the thread's folder {}: {e}", cwd.display()))?;
@@ -120,7 +127,37 @@ impl Workspace {
             cwd: cwd.to_path_buf(),
             root,
             folder,
+            home: home.and_then(|h| h.canonicalize().ok()),
         })
+    }
+
+    /// Whether the folder is the user's home or above it, so home's dotfiles are inside it.
+    fn holds_home(&self) -> Option<&Path> {
+        self.home.as_deref().filter(|h| h.starts_with(&self.root))
+    }
+
+    /// Whether `target` (resolved, inside the folder) is sensitive: a name
+    /// `agent_core::sensitive` lists below the folder, or, when the folder holds home, a
+    /// top-level dotfile or dot-folder of home.
+    fn sensitive(&self, target: &Path) -> bool {
+        let lowered = |rel: &Path| -> Vec<String> {
+            rel.components()
+                .filter_map(|c| match c {
+                    Component::Normal(n) => Some(n.to_string_lossy().to_ascii_lowercase()),
+                    _ => None,
+                })
+                .collect()
+        };
+        if target
+            .strip_prefix(&self.root)
+            .is_ok_and(|rel| agent_core::sensitive::names_sensitive(&lowered(rel)))
+        {
+            return true;
+        }
+        self.holds_home()
+            .and_then(|home| target.strip_prefix(home).ok())
+            .and_then(|rel| lowered(rel).into_iter().next())
+            .is_some_and(|first| first.starts_with('.'))
     }
 
     pub fn cwd(&self) -> &Path {
@@ -134,6 +171,37 @@ pub fn inside(ws: &Workspace, path: &str) -> bool {
     resolved(&absolute(&ws.cwd, path)).is_some_and(|p| p.starts_with(&ws.root))
 }
 
+/// The path a read-only `tool` call names: `file_path` for a read, `path` for a listing, and
+/// for a search its `path` or the folder itself.
+fn read_path(tool: Tool, input: &Value) -> Option<&str> {
+    let key = if tool == Tool::ReadFile {
+        "file_path"
+    } else {
+        "path"
+    };
+    input
+        .get(key)
+        .and_then(Value::as_str)
+        .or((tool == Tool::Search).then_some("."))
+}
+
+/// Whether a read-only `tool` call must ask, as the agy hook's policy asks for a read: its path
+/// leads outside the folder (links followed; one that cannot be resolved counts as outside),
+/// names a sensitive file ([`Workspace::sensitive`]), or, for a search, is the user's home or
+/// above it. Anything it cannot tell asks.
+pub fn read_must_ask(ws: &Workspace, tool: Tool, input: &Value) -> bool {
+    let Some(target) = read_path(tool, input).and_then(|p| resolved(&absolute(&ws.cwd, p))) else {
+        return true;
+    };
+    if !target.starts_with(&ws.root) || ws.sensitive(&target) {
+        return true;
+    }
+    tool == Tool::Search
+        && ws
+            .holds_home()
+            .is_some_and(|home| home.starts_with(&target))
+}
+
 fn text<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {
     input
         .get(key)
@@ -142,8 +210,10 @@ fn text<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {
 }
 
 /// Runs `tool` with `input` in the thread's folder: what the model is told, or why it failed.
-/// `may_leave` says a write outside the folder was approved (or every request is: Bypass);
-/// without it a write that now leads outside is refused. `cancel` stops a running command (its
+/// `may_leave` says a call past the folder was approved (or every request is: Bypass): a write
+/// outside it, or a read [`read_must_ask`] asks for. Without it a write that now leads outside
+/// is refused, a read is judged again just before it runs (refused if it now must ask), and a
+/// search skips the sensitive files under its folder. `cancel` stops a running command (its
 /// whole process group) or a search, when it is set.
 pub fn run(
     tool: Tool,
@@ -153,10 +223,16 @@ pub fn run(
     cancel: &AtomicBool,
 ) -> Result<String, String> {
     tool.validate_arguments(input).map_err(str::to_owned)?;
+    if !tool.writes() && !may_leave && read_must_ask(ws, tool, input) {
+        return Err(format!(
+            "{} now leads outside the folder or to a sensitive file; nothing was read",
+            read_path(tool, input).unwrap_or_default()
+        ));
+    }
     match tool {
         Tool::ReadFile => read_file(input, &ws.cwd),
         Tool::ListDir => list_dir(input, &ws.cwd),
-        Tool::Search => search(input, &ws.cwd, cancel),
+        Tool::Search => search(input, ws, may_leave, cancel),
         Tool::WriteFile => write_file(input, ws, may_leave),
         Tool::EditFile => edit_file(input, ws, may_leave),
         Tool::RunCommand => run_command(input, ws, cancel),
@@ -343,18 +419,21 @@ fn read_file(input: &Value, cwd: &Path) -> Result<String, String> {
         .and_then(Value::as_u64)
         .map_or(DEFAULT_READ_LINES, |l| l.max(1) as usize);
     let total = content.lines().count();
+    // The model picks both: neither may overflow, whatever it sends.
+    let start = (offset - 1).min(total);
+    let end = start.saturating_add(limit).min(total);
     let mut out: String = content
         .lines()
         .enumerate()
-        .skip(offset - 1)
-        .take(limit)
+        .skip(start)
+        .take(end - start)
         .map(|(i, line)| format!("{:>6}\t{line}\n", i + 1))
         .collect();
-    if offset - 1 + limit < total {
+    if end < total {
         out.push_str(&format!(
             "… {} more lines (read on with offset {})\n",
-            total - (offset - 1 + limit),
-            offset + limit
+            total - end,
+            end + 1
         ));
     }
     if out.is_empty() {
@@ -394,15 +473,31 @@ fn list_dir(input: &Value, cwd: &Path) -> Result<String, String> {
     })
 }
 
-fn search(input: &Value, cwd: &Path, cancel: &AtomicBool) -> Result<String, String> {
+/// `approved`: the search was allowed past the folder, so nothing under it is skipped as
+/// sensitive.
+fn search(
+    input: &Value,
+    ws: &Workspace,
+    approved: bool,
+    cancel: &AtomicBool,
+) -> Result<String, String> {
     let pattern = text(input, "pattern")?;
     if pattern.is_empty() {
         return Err("pattern is empty".to_owned());
     }
     let root = absolute(
-        cwd,
+        &ws.cwd,
         input.get("path").and_then(Value::as_str).unwrap_or("."),
     );
+    // Entries are named below `root` as given; judged where it led (it was resolved inside).
+    let real_root = resolved(&root);
+    let skipped = |path: &Path| {
+        !approved
+            && real_root.as_ref().is_none_or(|real| {
+                path.strip_prefix(&root)
+                    .map_or(true, |rel| ws.sensitive(&real.join(rel)))
+            })
+    };
     let mut matches = Vec::new();
     let mut stack = vec![root.clone()];
     let mut more = false;
@@ -421,6 +516,9 @@ fn search(input: &Value, cwd: &Path, cancel: &AtomicBool) -> Result<String, Stri
                 continue;
             };
             let path = entry.path();
+            if skipped(&path) {
+                continue;
+            }
             if kind.is_dir() {
                 let name = entry.file_name();
                 if !SKIPPED_DIRS.iter().any(|s| name == *s) {
@@ -655,32 +753,58 @@ fn run_command(input: &Value, ws: &Workspace, cancel: &AtomicBool) -> Result<Str
         // SAFETY: killpg with the group this child leads; at worst it names no process.
         unsafe { libc::killpg(group, libc::SIGKILL) };
     };
+    // Whether the shell has exited, left unreaped: its pid, and so the group's id, stays taken
+    // until it is reaped, so `kill_group` can never reach a group that reused the id.
+    let exited = || -> std::io::Result<bool> {
+        // SAFETY: an all-zero siginfo_t is a valid value for waitid to fill.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `group` is this child's pid; WNOHANG never blocks, WNOWAIT reaps nothing.
+        let r = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                group as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if r != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: waitid filled `info`; si_pid is 0 when the child has not exited.
+        Ok(unsafe { info.si_pid() } != 0)
+    };
     let deadline = Instant::now() + Duration::from_secs(secs);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if cancel.load(Ordering::Relaxed) => {
+    loop {
+        match exited() {
+            Ok(true) => break,
+            Ok(false) if cancel.load(Ordering::Relaxed) => {
                 kill_group();
                 let _ = child.wait();
                 return Err("Stopped by the user.".to_owned());
             }
-            Ok(None) if Instant::now() >= deadline => {
+            Ok(false) if Instant::now() >= deadline => {
                 kill_group();
                 let _ = child.wait();
                 return Err(format!(
                     "The command did not finish within {secs}s and was ended."
                 ));
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Ok(false) => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => {
                 kill_group();
+                let _ = child.wait();
                 return Err(format!("Could not wait for the command: {e}"));
             }
         }
-    };
-    // A background job it left in its group would keep the drains reading: end the group, then
-    // take what the pipes gave within a short grace.
+    }
+    // A background job it left in its group would keep the drains reading: end the group while
+    // the shell still holds its id, then reap it and take what the pipes gave within a short
+    // grace.
     kill_group();
+    let status = child
+        .wait()
+        .map_err(|e| format!("Could not wait for the command: {e}"))?;
     let grace = Instant::now() + Duration::from_millis(500);
     let (out, out_dropped) = collect(stdout, grace);
     let (err, err_dropped) = collect(stderr, grace);
@@ -885,8 +1009,15 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("nothing was written"), "{err}");
         assert!(!other.path().join("absent").exists());
-        // A device is not read, whatever its size says.
-        let err = go(Tool::ReadFile, &json!({"file_path": "/dev/zero"}), cwd).unwrap_err();
+        // A device is not read, whatever its size says, even approved.
+        let err = run(
+            Tool::ReadFile,
+            &json!({"file_path": "/dev/zero"}),
+            &ws(cwd),
+            true,
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
         assert!(err.contains("not a regular file"), "{err}");
         assert!(
             Workspace::open(Path::new("/no/such/folder")).is_err(),
@@ -961,6 +1092,161 @@ mod tests {
         assert!(page.contains("1 more lines (read on with offset 3)"));
         assert!(go(Tool::ReadFile, &json!({"file_path": "nope"}), d.path()).is_err());
         assert!(go(Tool::ReadFile, &json!({}), d.path()).is_err());
+    }
+
+    #[test]
+    fn paging_never_overflows_whatever_the_model_sends() {
+        let d = dir();
+        std::fs::write(d.path().join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let read = |offset: u64, limit: u64| {
+            go(
+                Tool::ReadFile,
+                &json!({"file_path": "a.txt", "offset": offset, "limit": limit}),
+                d.path(),
+            )
+            .unwrap()
+        };
+        assert_eq!(read(u64::MAX, 1), "(empty)");
+        assert_eq!(read(u64::MAX, u64::MAX), "(empty)");
+        assert_eq!(read(4, 10), "(empty)", "just past the end");
+        assert_eq!(read(3, u64::MAX), "     3\tthree\n");
+        assert_eq!(
+            read(1, 2),
+            "     1\tone\n     2\ttwo\n… 1 more lines (read on with offset 3)\n"
+        );
+    }
+
+    #[test]
+    fn a_read_past_the_folder_or_of_a_sensitive_file_must_ask() {
+        let d = dir();
+        let cwd = d.path();
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        std::fs::write(cwd.join("src/a.rs"), "needle\n").unwrap();
+        std::fs::write(cwd.join(".envrc"), "export KEY=needle\n").unwrap();
+        let other = dir();
+        std::os::unix::fs::symlink(other.path(), cwd.join("link")).unwrap();
+        let pinned = Workspace::open_with_home(cwd, None).unwrap();
+        let read = |p: &str| read_must_ask(&pinned, Tool::ReadFile, &json!({"file_path": p}));
+        assert!(!read("src/a.rs"));
+        assert!(!read("src/not-yet.rs"));
+        assert!(read("/etc/hostname"), "outside");
+        assert!(read("../x"), "outside by name");
+        assert!(read("link/x"), "a link out");
+        assert!(
+            read(".git/config") && read(".envrc") && read("AGENTS.md"),
+            "sensitive"
+        );
+        assert!(
+            read_must_ask(&pinned, Tool::ReadFile, &json!({})),
+            "no path"
+        );
+        assert!(!read_must_ask(
+            &pinned,
+            Tool::ListDir,
+            &json!({"path": "."})
+        ));
+        assert!(read_must_ask(&pinned, Tool::ListDir, &json!({"path": "/"})));
+        assert!(!read_must_ask(
+            &pinned,
+            Tool::Search,
+            &json!({"pattern": "x"})
+        ));
+
+        // Unapproved, a read that must ask is refused even if the gate was passed somehow;
+        // approved, it runs.
+        let unapproved = |input: &Value| {
+            run(
+                Tool::ReadFile,
+                input,
+                &pinned,
+                false,
+                &AtomicBool::new(false),
+            )
+        };
+        let outside = other.path().join("o.txt");
+        std::fs::write(&outside, "secret\n").unwrap();
+        let input = json!({"file_path": outside.to_str().unwrap()});
+        assert!(unapproved(&input).unwrap_err().contains("nothing was read"));
+        let approved = run(
+            Tool::ReadFile,
+            &input,
+            &pinned,
+            true,
+            &AtomicBool::new(false),
+        );
+        assert!(approved.unwrap().contains("secret"));
+
+        // An unapproved search skips sensitive files; an approved one does not.
+        let search = |approved: bool| {
+            run(
+                Tool::Search,
+                &json!({"pattern": "needle"}),
+                &pinned,
+                approved,
+                &AtomicBool::new(false),
+            )
+            .unwrap()
+        };
+        assert_eq!(search(false), "src/a.rs:1: needle");
+        assert!(search(true).contains(".envrc:1:"));
+    }
+
+    #[test]
+    fn a_folder_that_holds_home_asks_for_its_dotfiles_and_a_search_of_it() {
+        let home = dir();
+        std::fs::create_dir_all(home.path().join(".ssh")).unwrap();
+        std::fs::create_dir_all(home.path().join("projects/app")).unwrap();
+        // The thread's folder is home itself.
+        let at_home = Workspace::open_with_home(home.path(), Some(home.path())).unwrap();
+        let read =
+            |w: &Workspace, p: &str| read_must_ask(w, Tool::ReadFile, &json!({"file_path": p}));
+        assert!(read(&at_home, ".ssh/id_ed25519"));
+        assert!(read(&at_home, ".bashrc"));
+        assert!(!read(&at_home, "projects/app/main.rs"));
+        let search = |w: &Workspace, p: &str| {
+            read_must_ask(w, Tool::Search, &json!({"pattern": "x", "path": p}))
+        };
+        assert!(search(&at_home, "."), "a search of all of home");
+        assert!(!search(&at_home, "projects"));
+        // A project below home is not exposed to home's dotfiles.
+        let below = home.path().join("projects/app");
+        let project = Workspace::open_with_home(&below, Some(home.path())).unwrap();
+        std::fs::write(below.join(".prettierrc"), "{}").unwrap();
+        assert!(!read(&project, ".prettierrc"));
+        assert!(!search(&project, "."));
+    }
+
+    #[test]
+    fn a_finished_command_ends_its_group_and_keeps_its_status() {
+        let d = dir();
+        let out = go(
+            Tool::RunCommand,
+            &json!({"command": "sleep 30 & echo $! > bg; echo hi; exit 4"}),
+            d.path(),
+        )
+        .unwrap();
+        assert!(out.contains("hi") && out.contains("(exit code 4)"), "{out}");
+        let pid: libc::pid_t = std::fs::read_to_string(d.path().join("bg"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // The job it left behind was ended with its group (only a zombie may remain). The kill
+        // is delivered asynchronously, so give it a moment.
+        let alive = || {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .unwrap_or_default()
+                .rsplit(')')
+                .next()
+                .and_then(|rest| rest.split_whitespace().next())
+                .is_some_and(|s| s != "Z" && s != "X")
+        };
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while alive() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!alive(), "the background job outlived its command");
     }
 
     #[test]

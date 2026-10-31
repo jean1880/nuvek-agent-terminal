@@ -28,6 +28,7 @@ use std::time::Duration;
 use agent_core::adapter::Mode;
 use agent_core::approval::{self, ApprovalQuery, ApprovalReply};
 use agent_core::event::{Decision, Envelope, Event, ResponseCapability};
+use agent_core::sensitive::names_sensitive;
 use gtk4::gio::{self, prelude::*};
 use gtk4::glib;
 use serde_json::Value;
@@ -238,40 +239,6 @@ fn contained(target: &Path, workspace: &Path) -> bool {
     true
 }
 
-/// Directory or file names that run code outside the agent when found anywhere below the
-/// workspace: git hooks and config (`.git`, also a worktree's `.git` file), direnv, editor task
-/// and launch configs, dev containers, hook managers, Cargo's `runner`/`build` config.
-const SENSITIVE_NAMES: &[&str] = &[
-    ".git",
-    ".envrc",
-    ".direnv",
-    ".vscode",
-    ".idea",
-    ".devcontainer",
-    ".husky",
-    ".pre-commit-config.yaml",
-    ".cargo",
-    ".gitlab-ci.yml",
-    ".circleci",
-    // Project-level agent config: hooks, permissions and MCP servers the next agent run obeys.
-    ".claude",
-    ".gemini",
-    ".agents",
-    ".mcp.json",
-    ".codex",
-    // Other version control, editor and tool configs that run code.
-    ".hg",
-    ".zed",
-    ".exrc",
-    ".nvim.lua",
-    "mise.toml",
-    // Agent instruction files: the next agent run follows what they say. Names are compared
-    // lowercased.
-    "agents.md",
-    "claude.md",
-    "gemini.md",
-];
-
 /// `target` below `base`, as components, trying `base` as given and then resolved (the target
 /// may be named by either the user's path or the real one).
 fn relative_to(target: &Path, base: &Path) -> Option<PathBuf> {
@@ -294,21 +261,14 @@ fn names(rel: &Path) -> Vec<String> {
 /// Whether editing `target` (inside `workspace`) can run code outside the agent, so that
 /// `AcceptEdits` must still ask. Lexical, on top of [`contained`].
 ///
-/// Sensitive: any path with a component in [`SENSITIVE_NAMES`]; `.github/workflows/**`; and,
+/// Sensitive: any path `agent_core::sensitive::names_sensitive` names; and,
 /// when the workspace is `home` or an ancestor of it, a top-level dotfile or anything under a
 /// top-level dot-directory of `home` (shell rc files, `~/.config` autostart and systemd user
 /// units, `~/.ssh`, `~/.gemini/config/hooks.json`, which is this gate's own wiring, `~/.claude`).
 /// Paths under `home` that do not start with a dot (`~/projects/x`) are ordinary.
 fn sensitive_target(target: &Path, workspace: &Path, home: Option<&Path>) -> bool {
-    if let Some(rel) = relative_to(target, workspace) {
-        let parts = names(&rel);
-        if parts.iter().any(|p| SENSITIVE_NAMES.contains(&p.as_str()))
-            || parts
-                .windows(2)
-                .any(|w| w[0] == ".github" && w[1] == "workflows")
-        {
-            return true;
-        }
+    if relative_to(target, workspace).is_some_and(|rel| names_sensitive(&names(&rel))) {
+        return true;
     }
     let Some(home) = home else {
         return false;
@@ -325,16 +285,11 @@ fn sensitive_target(target: &Path, workspace: &Path, home: Option<&Path>) -> boo
 }
 
 /// Whether `target` (absolute) is one the sensitive list names wherever it is, not only inside a
-/// workspace: a component in [`SENSITIVE_NAMES`], `.github/workflows`, or a top-level dotfile
-/// or dot-directory of `home`. For grants that reach outside the workspace (Codex permission
+/// workspace: one `agent_core::sensitive::names_sensitive` names, or a top-level dotfile or
+/// dot-directory of `home`. For grants that reach outside the workspace (Codex permission
 /// requests), where [`sensitive_target`]'s workspace-relative view would miss them.
 pub(crate) fn sensitive_anywhere(target: &Path, home: Option<&Path>) -> bool {
-    let parts = names(target);
-    if parts.iter().any(|p| SENSITIVE_NAMES.contains(&p.as_str()))
-        || parts
-            .windows(2)
-            .any(|w| w[0] == ".github" && w[1] == "workflows")
-    {
+    if names_sensitive(&names(target)) {
         return true;
     }
     home.and_then(|home| relative_to(target, home))

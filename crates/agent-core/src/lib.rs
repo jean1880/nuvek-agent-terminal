@@ -31,6 +31,7 @@ pub mod provider;
 pub mod question_extract;
 pub mod quota;
 pub mod redact;
+pub mod sensitive;
 pub mod serde_name;
 pub mod shell_words;
 #[cfg(test)]

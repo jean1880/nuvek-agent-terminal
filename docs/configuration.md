@@ -186,7 +186,11 @@ A server is ready when it lists at least one chat model. Its threads pick from i
 models, and keep the server they were opened on. The agent works in the thread's folder with
 six tools (read a file, list a folder, search, write a file, edit a file, run a command).
 Writes and commands follow the mode: Plan only reads, Ask asks before each, Accept edits
-asks before commands and before writing outside the folder. Its conversation is kept under
+asks before commands and before writing outside the folder. Reads run unasked inside the
+folder; in every mode, Plan included, the agent asks before reading outside it, reading a
+sensitive file (git, hook, editor and agent configuration, instruction files and, when the
+folder is your home, its dotfiles) or searching all of your home, and a search it was not
+asked about skips those files. Its conversation is kept under
 `~/.local/state/agent-terminal/local`, so a thread resumes where it was.
 
 Use a model that supports tool calling (Qwen 3 and later, Llama 3.1 and later, Mistral, and

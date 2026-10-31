@@ -333,13 +333,20 @@ pub enum Gate {
     Refuse(&'static str),
 }
 
-/// The gate for `tool` in `mode`. `outside` says the call writes a path outside the working
-/// folder (or one that cannot be resolved): that always asks unless every request is approved
-/// (Bypass). The runner remembers no answer: "Allow for session" and "Always allow" run the one
-/// call, and the app's own rules (scoped as each card says) answer later cards it covers.
+/// The gate for `tool` in `mode`. `outside` says the call reaches past what may run unasked: a
+/// write of a path outside the working folder (or one that cannot be resolved), or a read
+/// outside it, of a sensitive file, or a search from home or above (`local_tools::read_must_ask`).
+/// That always asks unless every request is approved (Bypass), a read in Plan mode included:
+/// a plan refuses mutation, not disclosure. The runner remembers no answer: "Allow for session"
+/// and "Always allow" run the one call, and the app's own rules (scoped as each card says)
+/// answer later cards it covers.
 pub fn gate(tool: Tool, mode: Mode, outside: bool) -> Gate {
     if !tool.writes() {
-        return Gate::Run;
+        return if outside && mode != Mode::Bypass {
+            Gate::Ask
+        } else {
+            Gate::Run
+        };
     }
     match mode {
         Mode::Plan => Gate::Refuse("Plan mode is read-only: describe the change instead."),
@@ -1153,10 +1160,13 @@ mod tests {
     #[test]
     fn the_gate_follows_the_mode() {
         use Tool::*;
+        // A read inside the folder runs; one past it asks in every mode, Plan included.
         for tool in [ReadFile, ListDir, Search] {
             for mode in [Mode::Ask, Mode::Plan, Mode::AcceptEdits] {
-                assert_eq!(gate(tool, mode, true), Gate::Run);
+                assert_eq!(gate(tool, mode, false), Gate::Run);
+                assert_eq!(gate(tool, mode, true), Gate::Ask, "{tool:?} {mode:?}");
             }
+            assert_eq!(gate(tool, Mode::Bypass, true), Gate::Run);
         }
         assert!(matches!(gate(EditFile, Mode::Plan, false), Gate::Refuse(_)));
         assert_eq!(gate(EditFile, Mode::Ask, false), Gate::Ask);

@@ -755,6 +755,421 @@ fn runner_stop_restarts_a_fresh_generation_and_stdin_eof_awaits_cleanup() {
     );
 }
 
+/// Processes other than `except` whose command line names `marker`: (pid, process group),
+/// read from `/proc`.
+fn processes_naming(marker: &str, except: u32) -> Vec<(i32, i32)> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|pid| *pid != except as i32 && alive(*pid))
+        .filter(|pid| {
+            std::fs::read(format!("/proc/{pid}/cmdline"))
+                .is_ok_and(|line| String::from_utf8_lossy(&line).contains(marker))
+        })
+        .filter_map(|pid| {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let group = stat
+                .rsplit_once(") ")?
+                .1
+                .split_whitespace()
+                .nth(2)?
+                .parse()
+                .ok()?;
+            Some((pid, group))
+        })
+        .collect()
+}
+
+/// A loopback OpenAI-compatible chat endpoint that answers each request with the next scripted
+/// SSE reply (a plain answer once the script runs out) and records every request body.
+struct ScriptedModel {
+    base: String,
+    bodies: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+}
+impl ScriptedModel {
+    fn start(replies: Vec<String>) -> Self {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = bodies.clone();
+        std::thread::spawn(move || {
+            let mut replies = std::collections::VecDeque::from(replies);
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    break;
+                };
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                    head.push(byte[0]);
+                }
+                let length: usize = String::from_utf8_lossy(&head)
+                    .to_lowercase()
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                let mut body = vec![0; length];
+                let _ = stream.read_exact(&mut body);
+                if let Ok(value) = serde_json::from_slice(&body) {
+                    recorded.lock().unwrap().push(value);
+                }
+                let reply = replies.pop_front().unwrap_or_else(Self::answer);
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{reply}",
+                        reply.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        });
+        Self { base, bodies }
+    }
+    fn answer() -> String {
+        "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into()
+    }
+    fn calls(calls: &[(&str, serde_json::Value)]) -> String {
+        let calls: Vec<_> = calls
+            .iter()
+            .enumerate()
+            .map(|(index, (name, args))| {
+                serde_json::json!({"index":index,"id":format!("call-{index}"),"type":"function","function":{"name":name,"arguments":args.to_string()}})
+            })
+            .collect();
+        format!(
+            "data: {}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n",
+            serde_json::json!({"choices":[{"delta":{"tool_calls":calls}}]})
+        )
+    }
+}
+
+/// The real agent-terminal runner over its pipes, with the production client and guardian.
+struct LiveRunner {
+    child: std::process::Child,
+    input: std::process::ChildStdin,
+    events: std::sync::mpsc::Receiver<agent_core::event::Envelope>,
+}
+impl LiveRunner {
+    fn start(
+        model: &ScriptedModel,
+        cwd: &Path,
+        state: &Path,
+        context: agent_core::local_context::LocalLaunchContext,
+    ) -> Self {
+        use std::io::BufRead;
+        let mut child = std::process::Command::new(executable())
+            .args([
+                "--local-agent",
+                "--server",
+                &model.base,
+                "--cwd",
+                cwd.to_str().unwrap(),
+                "--mode",
+                "plan",
+                "--model",
+                "fixture",
+            ])
+            .env("XDG_STATE_HOME", state)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take().unwrap();
+        let output = child.stdout.take().unwrap();
+        let (tx, events) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(output).lines() {
+                let Ok(line) = line else { break };
+                if let Ok(envelope) = serde_json::from_str(&line) {
+                    if tx.send(envelope).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        let run = Self {
+            child,
+            input,
+            events,
+        };
+        run.send(&agent_core::adapter::Command::ConfigureLocal {
+            context: Box::new(context),
+        });
+        run
+    }
+    fn send(&self, command: &agent_core::adapter::Command) {
+        use std::io::Write;
+        let mut input = &self.input;
+        writeln!(input, "{}", serde_json::to_string(command).unwrap()).unwrap();
+    }
+    fn next(&self) -> agent_core::event::Envelope {
+        self.events
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the runner went quiet")
+    }
+    /// The turn's events up to its completion; `on_card` answers each approval card.
+    fn turn(
+        &self,
+        text: &str,
+        mut on_card: impl FnMut(&agent_core::event::Envelope),
+    ) -> Vec<agent_core::event::Envelope> {
+        use agent_core::event::Event;
+        self.send(&agent_core::adapter::Command::Prompt { text: text.into() });
+        let mut events = Vec::new();
+        loop {
+            let envelope = self.next();
+            let complete = matches!(envelope.event, Event::TurnCompleted { .. });
+            if matches!(envelope.event, Event::ApprovalRequested { .. }) {
+                on_card(&envelope);
+            }
+            events.push(envelope);
+            if complete {
+                return events;
+            }
+        }
+    }
+    fn finish(mut self) {
+        drop(self.input);
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                assert!(status.success());
+                return;
+            }
+            if Instant::now() >= until {
+                self.child.kill().unwrap();
+                panic!("the runner did not exit after stdin closed");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// Opt-in: the official filesystem MCP server, already installed and pinned by whoever runs
+/// this, named by `LOCAL_MCP_TEST_COMMAND`. Nothing is downloaded, and no real home folder is
+/// read: the server's only allowed directory, the thread folder and the state folder are
+/// temporary. Unset, the test passes without running.
+#[test]
+fn local_mcp_real_stdio() {
+    use agent_core::{
+        adapter::{Command, Mode},
+        event::{Decision, Event, ItemStatus},
+        local_mcp::{alias, ApprovalAnswer, ApprovalCard, APPROVAL_TOOL},
+    };
+    let Some(command) = std::env::var_os("LOCAL_MCP_TEST_COMMAND") else {
+        eprintln!("local_mcp_real_stdio: LOCAL_MCP_TEST_COMMAND is unset; nothing run");
+        return;
+    };
+    let command = PathBuf::from(command);
+    assert!(
+        command.is_absolute() && command.is_file(),
+        "LOCAL_MCP_TEST_COMMAND must be the absolute path of an installed server"
+    );
+    let root = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let folder = root.path().canonicalize().unwrap();
+    let fixture = folder.join("fixture.txt");
+    let original = "fixture bytes 雪 0123\nsecond line\n";
+    let replacement = "written through MCP after approval\n";
+    std::fs::write(&fixture, original).unwrap();
+    let config: McpServerConfig = serde_json::from_value(serde_json::json!({
+        "id":"files","label":"Files","enabled":true,"required":true,
+        "command":command.to_str().unwrap(),"args":[folder.to_str().unwrap()],
+        "cwd":folder.to_str().unwrap(),"env":{},
+        // A tool override only narrows the server's policy: the server approves its reviewed
+        // allowlist, and the write is narrowed back to asking.
+        "tools":[
+            {"name":"read_text_file","read_only":true,"approval":"inherit"},
+            {"name":"write_file","read_only":false,"approval":"ask"}
+        ],
+        "approval":"allow","startup_timeout_secs":60,"call_timeout_secs":60
+    }))
+    .unwrap();
+    let read = alias("files", "read_text_file").unwrap();
+    let write = alias("files", "write_file").unwrap();
+    let read_call = (
+        read.as_str(),
+        serde_json::json!({"path": fixture.to_str().unwrap()}),
+    );
+    let write_call = (
+        write.as_str(),
+        serde_json::json!({"path": fixture.to_str().unwrap(), "content": replacement}),
+    );
+    let model = ScriptedModel::start(vec![
+        // Plan: the approved read-only read runs; the write is refused.
+        ScriptedModel::calls(std::slice::from_ref(&read_call)),
+        ScriptedModel::calls(std::slice::from_ref(&write_call)),
+        ScriptedModel::answer(),
+        // Ask: the write waits for its card, then runs once approved.
+        ScriptedModel::calls(std::slice::from_ref(&write_call)),
+    ]);
+    let run = LiveRunner::start(
+        &model,
+        &folder,
+        state.path(),
+        agent_core::local_context::LocalLaunchContext {
+            mcp_servers: vec![config],
+            ..Default::default()
+        },
+    );
+    let marker = folder.to_str().unwrap().to_owned();
+    let runner_pid = run.child.id();
+    assert!(
+        processes_naming(&marker, runner_pid).is_empty(),
+        "setup starts no server"
+    );
+
+    let events = run.turn("read the fixture, then try to write it", |envelope| {
+        panic!(
+            "Plan asks for nothing: {}",
+            serde_json::to_string(envelope).unwrap()
+        )
+    });
+    let outputs: Vec<_> = events
+        .iter()
+        .filter_map(|e| match &e.event {
+            Event::ItemCompleted { output, status, .. } => Some((output.clone(), *status)),
+            _ => None,
+        })
+        .collect();
+    let read_back = outputs
+        .iter()
+        .filter(|(_, status)| *status == ItemStatus::Completed)
+        .filter_map(|(output, _)| {
+            serde_json::from_str::<serde_json::Value>(output.as_deref()?).ok()
+        })
+        .find_map(|result| result["content"][0].as_str().map(str::to_owned));
+    assert_eq!(
+        read_back.as_deref(),
+        Some(original),
+        "the read-only read ran and returned the exact fixture: {outputs:?}"
+    );
+    assert!(
+        outputs
+            .iter()
+            .any(|(_, status)| *status == ItemStatus::Failed),
+        "the write is refused in Plan: {outputs:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&fixture).unwrap(),
+        original,
+        "Plan never writes"
+    );
+    let bodies = model.bodies.lock().unwrap().clone();
+    let offered = |body: &serde_json::Value| -> Vec<String> {
+        body["tools"]
+            .as_array()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|t| t["function"]["name"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert!(offered(&bodies[0]).contains(&read));
+    assert!(
+        !offered(&bodies[0]).contains(&write),
+        "Plan offers no writing MCP tool"
+    );
+    let first = processes_naming(&marker, runner_pid);
+    assert!(!first.is_empty(), "the server is a live child process");
+    let first_group = first[0].1;
+    assert!(first.iter().all(|(_, group)| *group == first_group));
+    assert_ne!(first_group, std::process::id() as i32);
+
+    run.send(&Command::SetMode { mode: Mode::Ask });
+    let mut card = None;
+    let events = run.turn("now write it", |envelope| {
+        assert!(card.is_none(), "one card for one write");
+        assert_eq!(
+            std::fs::read_to_string(&fixture).unwrap(),
+            original,
+            "nothing is written before approval"
+        );
+        let Event::ApprovalRequested { tool, input, .. } = &envelope.event else {
+            unreachable!()
+        };
+        assert_eq!(tool, APPROVAL_TOOL);
+        let shown: ApprovalCard = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(shown.arguments["content"], replacement);
+        run.send(&Command::Approve {
+            request: envelope.request.clone().unwrap(),
+            decision: Decision::Allow,
+            message: None,
+            updated_input: Some(
+                serde_json::to_value(ApprovalAnswer {
+                    binding: shown.binding,
+                    edited_arguments: None,
+                })
+                .unwrap(),
+            ),
+        });
+        card = Some(envelope.request.clone());
+    });
+    assert!(card.is_some(), "Ask asked before the write");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e.event, Event::ApprovalRequested { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(&fixture).unwrap(),
+        replacement,
+        "the approved write landed exactly"
+    );
+    assert_eq!(
+        processes_naming(&marker, runner_pid)
+            .iter()
+            .map(|(pid, _)| *pid)
+            .collect::<Vec<_>>(),
+        first.iter().map(|(pid, _)| *pid).collect::<Vec<_>>(),
+        "the same generation served both turns"
+    );
+
+    run.send(&Command::Interrupt);
+    let until = Instant::now() + Duration::from_secs(10);
+    while first.iter().any(|(pid, _)| alive(*pid)) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        first.iter().all(|(pid, _)| !alive(*pid)),
+        "Stop ends the recorded process group"
+    );
+    assert!(processes_naming(&marker, runner_pid).is_empty());
+
+    let events = run.turn("again", |_| panic!("a plain answer asks for nothing"));
+    assert!(events
+        .iter()
+        .any(|e| matches!(e.event, Event::TurnCompleted { .. })));
+    let second = processes_naming(&marker, runner_pid);
+    assert!(
+        !second.is_empty(),
+        "the next turn starts a fresh generation"
+    );
+    assert_ne!(second[0].1, first_group, "a new process group");
+    assert!(first.iter().all(|(pid, _)| !alive(*pid)));
+
+    run.finish();
+    let until = Instant::now() + Duration::from_secs(10);
+    while second.iter().any(|(pid, _)| alive(*pid)) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        second.iter().all(|(pid, _)| !alive(*pid)),
+        "session end leaves no server behind"
+    );
+}
+
 mod runner {
     use super::*;
     use agent_core::{

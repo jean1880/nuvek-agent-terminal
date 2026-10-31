@@ -357,8 +357,11 @@ Architectural mandates, standards, and workflows for this codebase.
   every dot-named path and every search asks. An unapproved read is judged again just before it
   runs and opened from the pinned folder one component at a time without following a link
   (`open_inside`), so a folder swapped for a link meanwhile fails it. A search walks open
-  folders, never follows a link, and never reads a sensitive or hard-linked file or, from a home
-  or above, its dotfiles, even approved. A command's group is killed before its shell is reaped
+  folders (read with `fdopendir`, no `/proc` needed; opened only when their turn comes, so the
+  open folders never outnumber the depth), never follows a link, and never reads a sensitive or
+  hard-linked file or a home's dotfiles, even approved: inside the folder as reads judge them,
+  outside it by the whole resolved path wherever the search started. What it could not open is
+  counted in its result, never silently dropped. A command's group is killed before its shell is reaped
   (never when someone else reaped it), so the group id is never one reused by another process.
   The runner keeps
   no approval: the app's own scoped rules answer the cards they cover. A write is bound to what

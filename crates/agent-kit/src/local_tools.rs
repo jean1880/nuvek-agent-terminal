@@ -314,7 +314,8 @@ fn open_for_read(ws: &Workspace, shown: &Path, leaf: libc::c_int) -> Result<Owne
         Some(opened) => opened.map_err(|e| {
             if e.raw_os_error() == Some(libc::ELOOP) || e.raw_os_error() == Some(libc::ENOTDIR) {
                 format!(
-                    "A folder on the way to {} changed (it is a link now), so nothing was read",
+                    "{} is not as it was judged (a part of its path is not a folder, or is a \
+                     link now), so nothing was read",
                     shown.display()
                 )
             } else {
@@ -325,10 +326,84 @@ fn open_for_read(ws: &Workspace, shown: &Path, leaf: libc::c_int) -> Result<Owne
     }
 }
 
-/// The entries of an open folder, by name.
-fn entries_of(dir: &OwnedFd) -> std::io::Result<std::fs::ReadDir> {
-    // The magic link reopens this very folder, not whatever its path names now.
-    std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+/// What an entry of a folder is, never following a link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Folder,
+    File,
+    Other,
+}
+
+/// The entries of an open folder (`.` and `..` left out), read from the folder itself, so
+/// neither its path nor `/proc` is needed.
+fn entries_of(dir: &OwnedFd) -> std::io::Result<Vec<(std::ffi::OsString, Kind)>> {
+    let dup = dir.try_clone()?;
+    // SAFETY: on success fdopendir owns `dup`'s descriptor, released by closedir below; on
+    // failure it owns nothing and `dup` closes it.
+    let stream = unsafe { libc::fdopendir(dup.as_raw_fd()) };
+    if stream.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    std::mem::forget(dup);
+    // A duplicate shares its position with the folder it came from (the pinned folder among
+    // them, listed again and again): always read from the start.
+    // SAFETY: `stream` is open.
+    unsafe { libc::rewinddir(stream) };
+    let mut out = Vec::new();
+    let result = loop {
+        // SAFETY: `stream` is open; errno is reset so an end can be told from a failure.
+        let ent = unsafe {
+            *libc::__errno_location() = 0;
+            libc::readdir(stream)
+        };
+        if ent.is_null() {
+            let err = std::io::Error::last_os_error();
+            break if err.raw_os_error().unwrap_or(0) == 0 {
+                Ok(())
+            } else {
+                Err(err)
+            };
+        }
+        // SAFETY: readdir returned an entry valid until the next call; its name is
+        // NUL-terminated, and the name is copied before that call.
+        let (name, d_type) = unsafe {
+            (
+                std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()).to_owned(),
+                (*ent).d_type,
+            )
+        };
+        if matches!(name.as_bytes(), b"." | b"..") {
+            continue;
+        }
+        let kind = match d_type {
+            libc::DT_DIR => Kind::Folder,
+            libc::DT_REG => Kind::File,
+            libc::DT_UNKNOWN => {
+                // SAFETY: an all-zero stat is valid for fstatat to fill; `name` is
+                // NUL-terminated and `dir` an open folder.
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                let r = unsafe {
+                    libc::fstatat(
+                        dir.as_raw_fd(),
+                        name.as_ptr(),
+                        &mut st,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                };
+                match st.st_mode & libc::S_IFMT {
+                    _ if r != 0 => Kind::Other,
+                    libc::S_IFDIR => Kind::Folder,
+                    libc::S_IFREG => Kind::File,
+                    _ => Kind::Other,
+                }
+            }
+            _ => Kind::Other,
+        };
+        out.push((OsStr::from_bytes(name.as_bytes()).to_owned(), kind));
+    };
+    // SAFETY: `stream` is open and closed once, here.
+    unsafe { libc::closedir(stream) };
+    result.map(|()| out)
 }
 
 fn text<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -579,12 +654,13 @@ fn list_dir(input: &Value, ws: &Workspace) -> Result<String, String> {
     let dir = open_for_read(ws, &path, libc::O_DIRECTORY | libc::O_RDONLY)?;
     let entries = entries_of(&dir).map_err(|e| format!("Cannot list {}: {e}", path.display()))?;
     let mut names: Vec<String> = entries
-        .filter_map(Result::ok)
-        .map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            match e.file_type() {
-                Ok(t) if t.is_dir() => format!("{name}/"),
-                _ => name,
+        .into_iter()
+        .map(|(name, kind)| {
+            let name = name.to_string_lossy().into_owned();
+            if kind == Kind::Folder {
+                format!("{name}/")
+            } else {
+                name
             }
         })
         .collect();
@@ -604,10 +680,14 @@ fn list_dir(input: &Value, ws: &Workspace) -> Result<String, String> {
 
 /// Walks the folder a search names (bound to the thread's folder when inside it, see
 /// [`open_for_read`]) from open folders only, never following a link. Whether or not it was
-/// approved, it never reads a sensitive file (the list, below the search's root or the thread's
-/// folder), a file with a second hard link, nor, from a home or above one, that home's
-/// dotfiles: a read by name, which asks, is the way to see one.
+/// approved, it never reads a sensitive file, a file with a second hard link, nor a home's
+/// dotfiles: inside the thread's folder as [`Workspace::sensitive`] judges them (with names
+/// below the search's root, and home's dotfiles when the search starts at a home or above);
+/// outside it, by the whole resolved path, wherever the search started. A read by name, which
+/// asks, is the way to see one. A folder is opened only when its turn comes, so the open
+/// folders never outnumber the depth; what could not be opened or read is counted and said.
 fn search(input: &Value, ws: &Workspace, cancel: &AtomicBool) -> Result<String, String> {
+    use std::rc::Rc;
     let pattern = text(input, "pattern")?;
     if pattern.is_empty() {
         return Err("pattern is empty".to_owned());
@@ -620,58 +700,100 @@ fn search(input: &Value, ws: &Workspace, cancel: &AtomicBool) -> Result<String, 
         .ok_or_else(|| format!("{} leads through a link that names nothing", root.display()))?;
     let skipped = |rel: &Path| {
         let real = real_root.join(rel);
-        agent_core::sensitive::names_sensitive(&lowered(rel))
-            || ws.sensitive(&real)
-            || ws.home_dotfile(&real_root, &real)
+        if real.starts_with(&ws.root) {
+            return agent_core::sensitive::names_sensitive(&lowered(rel))
+                || ws.sensitive(&real)
+                || ws.home_dotfile(&real_root, &real);
+        }
+        agent_core::sensitive::names_sensitive(&lowered(&real))
+            || if ws.homes.is_empty() {
+                lowered(&real).iter().any(|n| n.starts_with('.'))
+            } else {
+                ws.homes.iter().any(|home| {
+                    real.strip_prefix(home).is_ok_and(|rel| {
+                        lowered(rel)
+                            .into_iter()
+                            .next()
+                            .is_some_and(|first| first.starts_with('.'))
+                    })
+                })
+            }
     };
-    let top = open_for_read(ws, &root, libc::O_DIRECTORY | libc::O_RDONLY)?;
+    let listed = |dir: &OwnedFd| -> std::io::Result<Vec<(std::ffi::OsString, Kind)>> {
+        let mut entries = entries_of(dir)?;
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(entries)
+    };
+    let top = Rc::new(open_for_read(
+        ws,
+        &root,
+        libc::O_DIRECTORY | libc::O_RDONLY,
+    )?);
+    // Its own folder unreadable is an error, never an empty result.
+    let top_entries = listed(&top).map_err(|e| format!("Cannot list {}: {e}", root.display()))?;
     let mut matches = Vec::new();
-    let mut stack = vec![(top, PathBuf::new())];
+    let mut unread = 0usize;
     let mut more = false;
-    'walk: while let Some((dir, dir_rel)) = stack.pop() {
-        let Ok(entries) = entries_of(&dir) else {
-            continue;
+    // Folders to visit: the open folder they are in, their name, and where they are.
+    let mut stack: Vec<(Rc<OwnedFd>, std::ffi::OsString, PathBuf)> = Vec::new();
+    let mut current = Some((top, PathBuf::new(), top_entries));
+    'walk: loop {
+        let (dir, dir_rel, entries) = match current.take() {
+            Some(next) => next,
+            None => {
+                let Some((parent, name, rel)) = stack.pop() else {
+                    break;
+                };
+                let flags = libc::O_DIRECTORY | libc::O_RDONLY | libc::O_NOFOLLOW;
+                let opened = cstring(&name)
+                    .ok()
+                    .and_then(|c| open_at(Some(&parent), &c, flags, 0).ok());
+                let Some(sub) = opened else {
+                    unread += 1;
+                    continue;
+                };
+                let Ok(entries) = listed(&sub) else {
+                    unread += 1;
+                    continue;
+                };
+                (Rc::new(sub), rel, entries)
+            }
         };
-        let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
-        entries.sort_by_key(|e| e.file_name());
-        for entry in entries {
+        let mut folders = Vec::new();
+        for (name, kind) in entries {
             if cancel.load(Ordering::Relaxed) {
                 return Err("Stopped by the user.".to_owned());
             }
-            // Not followed: a link, a pipe or a device is never read.
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            let name = entry.file_name();
             let rel = dir_rel.join(&name);
             if skipped(&rel) {
                 continue;
             }
-            let Ok(c_name) = cstring(&name) else {
-                continue;
-            };
-            if kind.is_dir() {
-                if !SKIPPED_DIRS.iter().any(|s| name == *s) {
-                    let flags = libc::O_DIRECTORY | libc::O_RDONLY | libc::O_NOFOLLOW;
-                    if let Ok(sub) = open_at(Some(&dir), &c_name, flags, 0) {
-                        stack.push((sub, rel));
+            // Not followed: a link, a pipe or a device is never read.
+            match kind {
+                Kind::Folder => {
+                    if !SKIPPED_DIRS.iter().any(|s| name == *s) {
+                        folders.push((dir.clone(), name, rel));
                     }
+                    continue;
                 }
-                continue;
-            }
-            if !kind.is_file() {
-                continue;
+                Kind::Other => continue,
+                Kind::File => {}
             }
             // Opened in its folder without following a link or blocking, read only if still a
             // regular file with no second hard link.
             let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW;
-            let Ok(fd) = open_at(Some(&dir), &c_name, flags, 0) else {
+            let Some(fd) = cstring(&name)
+                .ok()
+                .and_then(|c| open_at(Some(&dir), &c, flags, 0).ok())
+            else {
+                unread += 1;
                 continue;
             };
             let Ok(meta) = fd
                 .try_clone()
                 .and_then(|f| std::fs::File::from(f).metadata())
             else {
+                unread += 1;
                 continue;
             };
             if hard_linked(&meta) {
@@ -696,14 +818,22 @@ fn search(input: &Value, ws: &Workspace, cancel: &AtomicBool) -> Result<String, 
                 }
             }
         }
+        // Visited in name order: the stack takes the last first.
+        stack.extend(folders.into_iter().rev());
     }
-    if matches.is_empty() {
-        return Ok(format!("No line contains {pattern:?}."));
-    }
-    let mut out = matches.join("\n");
+    let mut out = if matches.is_empty() {
+        format!("No line contains {pattern:?}.")
+    } else {
+        matches.join("\n")
+    };
     if more {
         out.push_str(&format!(
             "\n… more than {MAX_MATCHES} matches; narrow the search"
+        ));
+    }
+    if unread > 0 {
+        out.push_str(&format!(
+            "\n… {unread} folders or files could not be opened, so the search is incomplete"
         ));
     }
     Ok(out)
@@ -1426,6 +1556,68 @@ mod tests {
         std::os::unix::fs::symlink(other.path(), cwd.join("sub")).unwrap();
         let opened = open_inside(&pinned, &target, libc::O_RDONLY).expect("inside");
         assert!(opened.is_err(), "the link is never followed");
+    }
+
+    #[test]
+    fn an_approved_search_rooted_in_a_secret_folder_outside_reads_nothing_of_it() {
+        let home = dir();
+        std::fs::create_dir_all(home.path().join(".ssh")).unwrap();
+        std::fs::write(home.path().join(".ssh/id_ed25519"), "PRIVATE KEY\n").unwrap();
+        let repo = dir();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        std::fs::write(
+            repo.path().join(".git/config"),
+            "url = https://PRIVATE KEY@example.com\n",
+        )
+        .unwrap();
+        let work = dir();
+        let pinned = Workspace::open_with_home(work.path(), Some(home.path())).unwrap();
+        for root in [home.path().join(".ssh"), repo.path().join(".git")] {
+            let found = run(
+                Tool::Search,
+                &json!({"pattern": "PRIVATE KEY", "path": root.to_str().unwrap()}),
+                &pinned,
+                true,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            assert!(found.starts_with("No line contains"), "{root:?}: {found}");
+        }
+    }
+
+    #[test]
+    fn a_search_wider_than_the_open_file_limit_misses_nothing() {
+        let d = dir();
+        // More sibling folders than a default soft limit of 1024 open files.
+        for i in 0..2500 {
+            std::fs::create_dir(d.path().join(format!("f{i:04}"))).unwrap();
+        }
+        std::fs::write(d.path().join("f2499/last.txt"), "needle\n").unwrap();
+        let found = go(Tool::Search, &json!({"pattern": "needle"}), d.path()).unwrap();
+        assert_eq!(found, "f2499/last.txt:1: needle");
+    }
+
+    #[test]
+    fn the_folder_lists_the_same_every_time_and_through_a_link_inside() {
+        let d = dir();
+        std::fs::create_dir(d.path().join("sub")).unwrap();
+        std::fs::write(d.path().join("sub/a.txt"), "").unwrap();
+        std::os::unix::fs::symlink(d.path().join("sub"), d.path().join("alias")).unwrap();
+        let pinned = ws(d.path());
+        let list = |p: &str| {
+            run(
+                Tool::ListDir,
+                &json!({"path": p}),
+                &pinned,
+                false,
+                &AtomicBool::new(false),
+            )
+            .unwrap()
+        };
+        // The pinned folder's own handle is listed each time: never from where it last stopped.
+        assert_eq!(list("."), "alias\nsub/");
+        assert_eq!(list("."), "alias\nsub/");
+        assert_eq!(list("alias"), "a.txt");
     }
 
     #[test]

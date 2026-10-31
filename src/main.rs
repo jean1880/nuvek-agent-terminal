@@ -56,6 +56,9 @@ const APP_ID: &str = "ca.nuvek.AgentTerminal";
 
 /// Application entry point.
 fn main() -> glib::ExitCode {
+    if std::env::args().nth(1).as_deref() == Some(agent_kit::mcp_guardian::GUARDIAN_FLAG) {
+        return glib::ExitCode::from(agent_kit::mcp_guardian::main() as u8);
+    }
     // A stdio MCP server has no GTK, display or GApplication lifecycle.
     if std::env::args().nth(1).as_deref() == Some(agent_core::delegation::BRIDGE_ARG) {
         return match cross_agent_mcp::run() {

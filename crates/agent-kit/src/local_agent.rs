@@ -329,6 +329,8 @@ pub fn read_commands(input: impl std::io::Read + Send + 'static) -> Receiver<Run
                     }
                 }
                 Err(_) => {
+                    // App and runner ship in one binary: an unparsable command is a fatal
+                    // protocol mismatch, never something to skip while awaiting more input.
                     let _ = tx.send(RunnerInput::Invalid("Malformed Local command JSON; check the startup configuration and command format."));
                     return;
                 }
@@ -348,6 +350,7 @@ enum Stop {
 }
 
 pub struct Runner<C: ChatClient, W: Write> {
+    mcp: Option<crate::local_mcp::Session>,
     budget_notice_sent: bool,
     turn_instructions: agent_core::local_context::InstructionSnapshot,
     context: agent_core::local_context::LocalLaunchContext,
@@ -381,6 +384,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             .or_else(|| args.session_id.clone())
             .unwrap_or_else(new_session_id);
         Self {
+            mcp: None,
             model: args.model.clone(),
             context: Default::default(),
             turn_instructions: Default::default(),
@@ -419,6 +423,18 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
 
     /// Runs until stdin closes; 0 then, 1 for failed startup or invalid command input.
     pub fn run(&mut self, commands: &Receiver<RunnerInput>) -> i32 {
+        let code = self.run_inner(commands);
+        self.stop_mcp();
+        code
+    }
+
+    fn stop_mcp(&mut self) {
+        if let Some(mut mcp) = self.mcp.take() {
+            mcp.shutdown();
+        }
+    }
+
+    fn run_inner(&mut self, commands: &Receiver<RunnerInput>) -> i32 {
         match commands.recv() {
             Ok(RunnerInput::Invalid(why)) => {
                 self.emit(Envelope::new(Event::Error {
@@ -575,6 +591,10 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
     fn handle(&mut self, command: Command, commands: &Receiver<RunnerInput>) -> Result<(), Stop> {
         match command {
             Command::Prompt { text } => self.turn(text, commands),
+            Command::Interrupt => {
+                self.stop_mcp();
+                Ok(())
+            }
             Command::SetModel { model, .. } => {
                 // Another model may take tools: it is offered them again.
                 self.no_tools = false;
@@ -620,6 +640,25 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 return Ok(());
             }
         };
+        if let Err(error) = self.prepare_mcp(commands) {
+            self.stop_mcp();
+            let (state, message) = match &error {
+                StepError::Stop(Stop::InvalidInput(why)) => (TurnState::Failed, Some(*why)),
+                StepError::Stop(_) => (TurnState::Interrupted, None),
+                StepError::Failed(why) => (TurnState::Failed, Some(why.as_str())),
+            };
+            self.emit(Envelope::turn_completed(state, message));
+            return match error {
+                StepError::Stop(stop) => {
+                    if matches!(stop, Stop::Interrupted) {
+                        Ok(())
+                    } else {
+                        Err(stop)
+                    }
+                }
+                StepError::Failed(_) => Ok(()),
+            };
+        }
         // Earlier turns' reasoning is not sent again.
         agent_core::local_agent::forget_reasoning(&mut self.messages);
         let exchange_start = self.messages.len();
@@ -663,9 +702,60 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             cost_usd: None,
             error,
         }));
+        if result.is_err() {
+            self.stop_mcp();
+        }
         match result {
             Err(Stop::Interrupted) => Ok(()),
             other => other,
+        }
+    }
+
+    fn prepare_mcp(&mut self, commands: &Receiver<RunnerInput>) -> Result<(), StepError> {
+        if self.no_tools || !self.context.mcp_servers.iter().any(|server| server.enabled) {
+            return Ok(());
+        }
+        if self.mcp.is_none() {
+            self.mcp = Some(
+                crate::local_mcp::Session::new(
+                    self.context.mcp_servers.clone(),
+                    Path::new(&self.args.cwd),
+                )
+                .map_err(StepError::Failed)?,
+            );
+        }
+        let Some(session) = &self.mcp else {
+            return Ok(());
+        };
+        let discovery = session.discover(self.mode).map_err(StepError::Failed)?;
+        loop {
+            if let Some(stop) = poll(commands, &mut self.deferred) {
+                return Err(StepError::Stop(stop));
+            }
+            match discovery.recv_timeout(Duration::from_millis(20)) {
+                Ok(discovery) => {
+                    let mut required_failed = false;
+                    for server in discovery.servers {
+                        required_failed |= server.required_failed;
+                        for text in server.notices {
+                            self.emit(Envelope::new(Event::Notice { text }));
+                        }
+                    }
+                    return if required_failed {
+                        Err(StepError::Failed(
+                            "A required MCP server is unavailable.".into(),
+                        ))
+                    } else {
+                        Ok(())
+                    };
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(StepError::Failed(
+                        "MCP runtime ended during discovery.".into(),
+                    ))
+                }
+            }
         }
     }
 
@@ -881,6 +971,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         if let Some(why) = failure {
             if !self.no_tools && body.get("tools").is_some() && refuses_tools(&why) {
                 self.no_tools = true;
+                self.stop_mcp();
                 self.emit(Envelope::new(Event::Notice {
                     text: "This model cannot use tools, so it answers without reading or \
                            changing anything. Pick a model that supports tools to let it work."
@@ -912,19 +1003,19 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
     }
 
     fn report_budget(&mut self, plan: &RequestPlan) {
-        if !self.budget_notice_sent || !plan.excluded.is_empty() {
+        if !self.budget_notice_sent {
             self.emit(Envelope::new(Event::Notice {
                 text: plan.summary(),
             }));
             self.budget_notice_sent = true;
-        }
-        for excluded in &plan.excluded {
-            self.emit(Envelope::new(Event::Notice {
-                text: format!(
-                    "Excluded tool {}: {} bytes; {}.",
-                    excluded.alias, excluded.bytes, excluded.reason
-                ),
-            }));
+            for excluded in &plan.excluded {
+                self.emit(Envelope::new(Event::Notice {
+                    text: format!(
+                        "Excluded tool {}: {} bytes; {}.",
+                        excluded.alias, excluded.bytes, excluded.reason
+                    ),
+                }));
+            }
         }
     }
 
@@ -1825,7 +1916,7 @@ mod tests {
     }
 
     #[test]
-    fn excluded_tools_still_report_the_effective_budget_after_the_first_notice() {
+    fn budget_and_each_exclusion_are_reported_only_once_per_turn() {
         use agent_core::local_context::{plan_request, SchemaCandidate};
         use agent_core::local_mcp::{ResolvedTool, ToolIdentity};
         let work = tempfile::tempdir().unwrap();
@@ -1837,8 +1928,6 @@ mod tests {
             &mut out,
         );
         let plan = plan_request("m", "policy", &[], &[], &Default::default()).unwrap();
-        runner.report_budget(&plan);
-        runner.report_budget(&plan);
         let excluded = plan_request(
             "m",
             "policy",
@@ -1860,13 +1949,15 @@ mod tests {
         )
         .unwrap();
         runner.report_budget(&excluded);
+        runner.report_budget(&excluded);
+        runner.report_budget(&plan);
         let events: Vec<Envelope> = String::from_utf8(out)
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(events.iter().filter(|e| matches!(&e.event, Event::Notice { text } if text.starts_with("Local request:"))).count(), 2);
-        assert!(events.iter().any(|e| matches!(&e.event, Event::Notice { text } if text.starts_with("Excluded tool large:"))));
+        assert_eq!(events.iter().filter(|e| matches!(&e.event, Event::Notice { text } if text.starts_with("Local request:"))).count(), 1);
+        assert_eq!(events.iter().filter(|e| matches!(&e.event, Event::Notice { text } if text.starts_with("Excluded tool large:"))).count(), 1);
     }
 
     #[test]
@@ -2688,4 +2779,20 @@ mod tests {
         assert_eq!(sessions_dir(None, None), None);
         assert!(agent_core::local_agent::valid_session_id(&new_session_id()));
     }
+}
+#[test]
+fn command_eof_is_clean_only_on_a_frame_boundary() {
+    let mut frame = serde_json::to_vec(&Command::Interrupt).unwrap();
+    let input = read_commands(std::io::Cursor::new(frame.clone()));
+    assert!(matches!(input.recv().unwrap(), RunnerInput::Invalid(_)));
+    assert!(input.recv().is_err());
+    frame.push(b'\n');
+    let input = read_commands(std::io::Cursor::new(frame));
+    assert!(matches!(
+        input.recv().unwrap(),
+        RunnerInput::Command(Command::Interrupt)
+    ));
+    assert!(matches!(input.recv().unwrap(), RunnerInput::Closed));
+    let input = read_commands(std::io::Cursor::new(Vec::<u8>::new()));
+    assert!(matches!(input.recv().unwrap(), RunnerInput::Closed));
 }

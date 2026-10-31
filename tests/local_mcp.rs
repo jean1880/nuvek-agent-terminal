@@ -787,18 +787,27 @@ fn processes_naming(marker: &str, except: u32) -> Vec<(i32, i32)> {
 /// SSE reply (a plain answer once the script runs out) and records every request body.
 struct ScriptedModel {
     base: String,
+    address: std::net::SocketAddr,
     bodies: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 impl ScriptedModel {
     fn start(replies: Vec<String>) -> Self {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
+        let address = listener.local_addr().unwrap();
+        let base = format!("http://{address}");
         let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = bodies.clone();
-        std::thread::spawn(move || {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = stop.clone();
+        let thread = std::thread::spawn(move || {
             let mut replies = std::collections::VecDeque::from(replies);
             for stream in listener.incoming() {
+                if stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
                 let Ok(mut stream) = stream else {
                     break;
                 };
@@ -829,7 +838,13 @@ impl ScriptedModel {
                 let _ = stream.shutdown(std::net::Shutdown::Both);
             }
         });
-        Self { base, bodies }
+        Self {
+            base,
+            address,
+            bodies,
+            stop,
+            thread: Some(thread),
+        }
     }
     fn answer() -> String {
         "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into()
@@ -848,22 +863,37 @@ impl ScriptedModel {
         )
     }
 }
+impl Drop for ScriptedModel {
+    /// Stops the listener thread: a last connection wakes `accept`, which then sees the flag.
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect_timeout(&self.address, Duration::from_secs(2));
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
 
-/// The real agent-terminal runner over its pipes, with the production client and guardian.
+/// The real agent-terminal runner over its pipes, with the production client and guardian, in
+/// a private environment: temporary `HOME` and XDG folders, and `PATH` alone passed through
+/// (the installed server's `node` shebang needs it). Dropping it ends the runner, bounded,
+/// before the folders it ran in go.
 struct LiveRunner {
     child: std::process::Child,
-    input: std::process::ChildStdin,
+    input: Option<std::process::ChildStdin>,
     events: std::sync::mpsc::Receiver<agent_core::event::Envelope>,
+    reader: Option<std::thread::JoinHandle<()>>,
 }
 impl LiveRunner {
     fn start(
         model: &ScriptedModel,
         cwd: &Path,
-        state: &Path,
+        home: &Path,
         context: agent_core::local_context::LocalLaunchContext,
     ) -> Self {
         use std::io::BufRead;
-        let mut child = std::process::Command::new(executable())
+        let mut command = std::process::Command::new(executable());
+        command
             .args([
                 "--local-agent",
                 "--server",
@@ -875,7 +905,22 @@ impl LiveRunner {
                 "--model",
                 "fixture",
             ])
-            .env("XDG_STATE_HOME", state)
+            .env_clear()
+            .env("HOME", home);
+        if let Some(path) = std::env::var_os("PATH") {
+            command.env("PATH", path);
+        }
+        for (name, folder) in [
+            ("XDG_CONFIG_HOME", "config"),
+            ("XDG_DATA_HOME", "data"),
+            ("XDG_STATE_HOME", "state"),
+            ("XDG_CACHE_HOME", "cache"),
+        ] {
+            let folder = home.join(folder);
+            std::fs::create_dir_all(&folder).unwrap();
+            command.env(name, folder);
+        }
+        let mut child = command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -884,7 +929,7 @@ impl LiveRunner {
         let input = child.stdin.take().unwrap();
         let output = child.stdout.take().unwrap();
         let (tx, events) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        let reader = std::thread::spawn(move || {
             for line in std::io::BufReader::new(output).lines() {
                 let Ok(line) = line else { break };
                 if let Ok(envelope) = serde_json::from_str(&line) {
@@ -896,8 +941,9 @@ impl LiveRunner {
         });
         let run = Self {
             child,
-            input,
+            input: Some(input),
             events,
+            reader: Some(reader),
         };
         run.send(&agent_core::adapter::Command::ConfigureLocal {
             context: Box::new(context),
@@ -906,8 +952,31 @@ impl LiveRunner {
     }
     fn send(&self, command: &agent_core::adapter::Command) {
         use std::io::Write;
-        let mut input = &self.input;
+        let mut input = self.input.as_ref().expect("the runner is still running");
         writeln!(input, "{}", serde_json::to_string(command).unwrap()).unwrap();
+    }
+    /// Closes stdin, waits up to ten seconds for the runner's own exit, kills and reaps it
+    /// otherwise, then joins the reader. `Some` is the runner's own exit status.
+    fn shutdown(&mut self) -> Option<std::process::ExitStatus> {
+        self.input.take();
+        let until = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if Instant::now() < until => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                _ => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    break None;
+                }
+            }
+        };
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+        status
     }
     fn next(&self) -> agent_core::event::Envelope {
         self.events
@@ -936,18 +1005,17 @@ impl LiveRunner {
         }
     }
     fn finish(mut self) {
-        drop(self.input);
-        let until = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                assert!(status.success());
-                return;
-            }
-            if Instant::now() >= until {
-                self.child.kill().unwrap();
-                panic!("the runner did not exit after stdin closed");
-            }
-            std::thread::sleep(Duration::from_millis(20));
+        let status = self.shutdown();
+        assert!(
+            status.is_some_and(|s| s.success()),
+            "the runner exits cleanly after stdin closes: {status:?}"
+        );
+    }
+}
+impl Drop for LiveRunner {
+    fn drop(&mut self) {
+        if self.reader.is_some() {
+            self.shutdown();
         }
     }
 }
@@ -972,8 +1040,9 @@ fn local_mcp_real_stdio() {
         command.is_absolute() && command.is_file(),
         "LOCAL_MCP_TEST_COMMAND must be the absolute path of an installed server"
     );
+    // Declared before the model and the runner, so they are dropped after both have ended.
     let root = tempfile::tempdir().unwrap();
-    let state = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
     let folder = root.path().canonicalize().unwrap();
     let fixture = folder.join("fixture.txt");
     let original = "fixture bytes 雪 0123\nsecond line\n";
@@ -1013,9 +1082,15 @@ fn local_mcp_real_stdio() {
     let run = LiveRunner::start(
         &model,
         &folder,
-        state.path(),
+        home.path(),
         agent_core::local_context::LocalLaunchContext {
             mcp_servers: vec![config],
+            // No instruction file of this machine reaches the run: the temporary home has
+            // none, and no ancestor of the temporary folder is discovered.
+            instructions: agent_core::local_context::InstructionSettings {
+                discover_ancestors: false,
+                ..Default::default()
+            },
             ..Default::default()
         },
     );

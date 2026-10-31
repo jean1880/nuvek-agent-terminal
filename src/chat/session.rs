@@ -7377,6 +7377,10 @@ mod tests {
                 life(false, false, false),
                 "up once it reported"
             );
+            // The process started at construction is replaced by the reload, and may or may not
+            // have logged its launch before it was stopped: count from the one that is up.
+            let launched = lines(tmp.path().join("args.log")).len();
+            assert!(launched >= 1);
             assert_eq!(
                 session.inner.suspend_blocker(false),
                 Some("no conversation yet to resume"),
@@ -7432,7 +7436,7 @@ mod tests {
             )));
             assert_eq!(
                 lines(tmp.path().join("args.log")).len(),
-                1,
+                launched,
                 "nothing started"
             );
             assert!(!has(&seen, |e| matches!(e, Event::Error { .. })));
@@ -7459,15 +7463,19 @@ mod tests {
                 "the prompt never reached a resumed agent"
             );
             let launches = lines(tmp.path().join("args.log"));
-            assert_eq!(launches.len(), 2, "{launches:?}");
-            assert!(!launches[0].contains("--resume"), "{launches:?}");
-            assert!(launches[1].contains("--resume=s1"), "{launches:?}");
+            assert_eq!(launches.len(), launched + 1, "one resume: {launches:?}");
             assert!(
-                launches[1].contains("--permission-mode plan"),
+                launches[..launched].iter().all(|l| !l.contains("--resume")),
+                "{launches:?}"
+            );
+            let resumed = &launches[launched];
+            assert!(resumed.contains("--resume=s1"), "{launches:?}");
+            assert!(
+                resumed.contains("--permission-mode plan"),
                 "the resume starts in the mode picked while paused: {launches:?}"
             );
             assert!(
-                launches[1].contains("--model opus"),
+                resumed.contains("--model opus"),
                 "the resume starts with the model picked while paused: {launches:?}"
             );
             assert!(
@@ -7613,6 +7621,9 @@ mod tests {
                 e,
                 Event::TurnCompleted { .. }
             ))));
+            // The process started at construction may or may not have logged before the reload
+            // replaced it: count from the one that is up.
+            let launched = lines(tmp.path().join("args.log")).len();
             session.send_prompt("first");
             assert!(pump_until(ctx, 10, || seen
                 .borrow()
@@ -7632,17 +7643,18 @@ mod tests {
             session.send_prompt("after a pause");
             assert!(pump_until(ctx, 10, || lines(tmp.path().join("args.log"))
                 .len()
-                == 2));
+                == launched + 1));
             let launches = lines(tmp.path().join("args.log"));
+            let resumed = &launches[launched];
             assert!(
-                launches[1].contains("--model m"),
+                resumed.contains("--model m"),
                 "the reported model is kept: {launches:?}"
             );
             assert!(
-                !launches[1].contains("--model default"),
+                !resumed.contains("--model default"),
                 "never the sentinel: {launches:?}"
             );
-            assert!(launches[1].contains("--effort high"), "{launches:?}");
+            assert!(resumed.contains("--effort high"), "{launches:?}");
         });
     }
 

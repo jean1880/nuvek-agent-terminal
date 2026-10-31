@@ -2,12 +2,23 @@
 
 ## Model Context Protocol Rust SDK
 
-The headless `--cross-agent-mcp` mode links the official Rust MCP SDK (`rmcp` 3.5.1,
+The headless `--cross-agent-mcp` mode and the Local agent's MCP client
+(`agent_kit::local_mcp`) link the official Rust MCP SDK (`rmcp` 3.5.1,
 <https://github.com/modelcontextprotocol/rust-sdk>, MIT) and Tokio (MIT). The SDK handles
 the MCP lifecycle; Agent Terminal validates delegation schemas and owns local IPC,
-permissions and process supervision. Tokio runs only in the headless bridge process.
-These crates are compiled into the existing executable; no additional runtime service
-is installed. Their licences are checked by the repository's cargo-deny policy.
+permissions and process supervision. Tokio runs only in the headless bridge process and
+on the Local agent's MCP runtime thread. These crates are compiled into the existing
+executable; no additional runtime service is installed. Their licences are checked by the
+repository's cargo-deny policy.
+
+## Local agent MCP support crates
+
+The Local agent validates MCP tool arguments against each server's advertised input
+schema with `jsonschema` 0.60.2 (<https://github.com/Stranger6667/jsonschema>, MIT),
+built without its default features and with a linear-time regex engine, so a
+server-supplied schema cannot make validation backtrack. The Codex importer reads
+`config.toml` with `toml` 1.1.8 (<https://github.com/toml-rs/toml>, MIT or Apache-2.0).
+Both are compiled into the executable and covered by the cargo-deny policy.
 
 ## T3 Code
 

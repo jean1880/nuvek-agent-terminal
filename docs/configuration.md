@@ -136,6 +136,7 @@ until it is fixed.
 | `indicators` | `[]` | Header status lights. See [Status indicators](reference.md#status-indicators) |
 | `turn_command` | none | A command run when a turn ends (`{id}`, `{dir}` are filled in) |
 | `clear_env` | session markers | Variables removed from a spawned agent's environment (`*` matches a prefix) |
+| `local_defaults` | see below | The Local agent's instruction files, request budget and MCP server definitions. See [Local instructions and tools](#local-instructions-and-tools) |
 
 ### Profiles
 
@@ -195,6 +196,115 @@ and llama.cpp its Jinja templates (`--jinja`). A model that cannot use tools sti
 without reading or changing anything, and the thread says so.
 
 The Local agent cannot take part in cross-agent delegation.
+
+### Local instructions and tools
+
+Settings → Agents → **Local Instructions & Tools** gives the Local agent your instruction
+files and MCP tools. Every setting applies when committed; widening applies at the next
+turn, while disabling or restricting stops the affected Local sessions and expires their
+approvals. The settings are app-wide (`local_defaults`); each Local server profile selects
+its MCP servers and may override the instruction settings or the budget (`local`):
+
+```jsonc
+{
+  "local_defaults": {
+    "instructions": {
+      "global_files": ["~/.codex/AGENTS.md"],   // after the native file, before project files
+      "discover_ancestors": true,
+      "claude_fallback": false,
+      "max_file_bytes": 32768,
+      "max_total_bytes": 131072
+    },
+    "budget": {
+      "context_tokens": 32768,                  // estimates: the model's tokenizer is unknown
+      "response_tokens": 4096,
+      "safety_tokens": 4096,
+      "static_context_bytes": 49152
+    },
+    "mcp_servers": [
+      {
+        "id": "files", "label": "Files", "enabled": true, "required": false,
+        "command": "/path/to/mcp-server-filesystem", "args": ["."],  // passed exactly
+        "cwd": "$WORKSPACE",                                           // the thread's folder
+        "env": { "SERVICE_TOKEN": { "from_env": "SERVICE_TOKEN" }, "MODE": "quiet" },
+        "tools": [
+          { "name": "read_text_file", "read_only": true,  "approval": "inherit" },
+          { "name": "write_file",     "read_only": false, "approval": "ask" }
+        ],
+        "approval": "allow",
+        "startup_timeout_secs": 15, "call_timeout_secs": 60
+      }
+    ]
+  },
+  "profiles": [
+    { "name": "Workstation", "driver": "local", "command": "agent-terminal",
+      "local": { "mcp_server_ids": ["files"] } }
+  ]
+}
+```
+
+**Instructions.** Each turn reads, in order: `$XDG_CONFIG_HOME/agent-terminal/AGENTS.md`
+(`~/.config/agent-terminal/AGENTS.md`) when present; the **Additional Global Files** in their
+order (absolute, `~/` or `$XDG_CONFIG_HOME/` paths, with quick-add buttons for
+`~/.codex/AGENTS.md` and `~/.claude/CLAUDE.md`); then, with **Discover Ancestor
+Instructions** on, every folder from `/` down to the thread's folder, taking
+`AGENTS.override.md`, otherwise `AGENTS.md`, otherwise `CLAUDE.md` when **Use CLAUDE.md as a
+Fallback** is on. Folders below the thread's are not discovered. A missing standard file is
+normal; a configured file that is missing, unreadable, not UTF-8 or over the **Instruction
+File Cap** blocks the turn and says so, as does a total over the **Total Instruction Cap** or
+the **Static Context Cap**: nothing is cut short. Instructions shape the agent's work; none
+can change the mode gate, the approvals, the environment or the server definitions.
+**Instruction Preview** lists what a folder would load (paths, order and estimated cost,
+never the text).
+
+**Budget.** Every request is planned as a whole: the policy and instructions, the tool
+schemas, the newest whole exchanges that fit, and the response reserve. **Context Tokens**
+less the **Response Reserve** and **Safety Margin** is the input allowance; the **Static
+Context Cap** bounds the instructions and schemas in bytes. Built-in tools fit first, then
+MCP tools in their priority order (the profile's server order, then each server's tool
+order); a whole tool that does not fit is left out, and the thread says which. A request whose current
+exchange alone does not fit stops before it is sent; a batch of tool calls runs only when
+there is room for every result.
+
+**MCP servers.** A definition is an executable with an argument list (run directly, no shell
+expansion, and no `$WORKSPACE` substitution: a relative path is resolved by the server in
+its working folder), a working folder (`$WORKSPACE`, `$WORKSPACE/sub`, a relative path
+under the thread's folder, or an absolute one), environment variables
+(a literal, or `{ "from_env": "NAME" }` to copy a variable from the profile's environment;
+credentials are references, never values, and the app shows names only), timeouts (startup
+1–300 s, calls 1–600 s), an exact **Allowed Tools** list in priority order and an approval
+policy. Each server is a local child process on pipes, started at a turn for the profiles
+that select it, never by opening Settings. **Discover tools** is the one Settings action
+that starts a server: it lists the tool names the server advertises, for a profile's
+environment and a folder, and stops it again; discovery allowlists and approves nothing.
+Every allowed tool has two separate declarations you make: **Declared Read-only** makes it
+eligible in Plan, and its **Approval Policy** (`inherit`, `ask`, `allow`, `deny`) narrows the
+server's (`ask`, `allow`, `deny`); `deny` always wins, and a tool can never be more
+permissive than its server. The server's own annotations grant neither. **Enabled** is the
+ceiling for a thread's MCP panel toggle: a definition disabled here cannot be enabled for a
+session. **Required for Turns** blocks a turn when that server fails to start; otherwise a
+failed server is reported and the rest keep working.
+
+In a Local thread the mode decides first: Plan runs only read-only tools, Ask and Accept
+edits ask for any tool unless its policy is `allow`, and dangerous permissive mode skips the
+prompt (a disabled, unselected, unlisted or unadvertised tool, or invalid arguments, is
+refused in every mode). An approval card shows the server, the tool's real name and exactly
+the arguments that will run, with secret values masked. **Allow for session** and **Always
+allow** cover that tool's arguments for the server's definition and the tool's schema as they
+are now; a changed definition or schema asks again. The thread's MCP panel shows each
+server's state, the tools left out of the budget and the effective budget, and offers
+Reconnect and a session-only toggle. Stop ends every server of the session; the next prompt
+starts them fresh.
+
+**Codex import.** **Codex Configuration to Import** reads a `config.toml` you choose
+(`~/.codex/config.toml` by default, read once, never rereading it at launch): **Preview
+import** lists each stdio `mcp_servers` entry with its executable name, exact tools
+(`enabled_tools` less `disabled_tools`) and environment variable names, then **Import
+selected** adds the definitions you tick. An entry without an explicit allowlist arrives
+disabled and unreviewed; none arrives read-only or approved. Entries with another transport,
+interpolation, shell or package-runner indirection (`sh -c`, `npx --call`), source files,
+literal credentials or `agent-terminal` itself are reported, not imported; a credential
+must be mapped to a variable name before its entry can be imported.
 
 ### Claude and Codex on a model server
 

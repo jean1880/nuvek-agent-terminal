@@ -188,9 +188,10 @@ six tools (read a file, list a folder, search, write a file, edit a file, run a 
 Writes and commands follow the mode: Plan only reads, Ask asks before each, Accept edits
 asks before commands and before writing outside the folder. Reads run unasked inside the
 folder; in every mode, Plan included, the agent asks before reading outside it, reading a
-sensitive file (git, hook, editor and agent configuration, instruction files and, when the
-folder is your home, its dotfiles) or searching all of your home, and a search it was not
-asked about skips those files. Its conversation is kept under
+sensitive file (git, hook, editor and agent configuration, instruction files, a file with a
+second hard link and, when the folder is your home or above it, your home's dotfiles) or
+searching all of your home. A search never reads those files, even once approved: the agent
+has to name one to read it, and that asks. Its conversation is kept under
 `~/.local/state/agent-terminal/local`, so a thread resumes where it was.
 
 Use a model that supports tool calling (Qwen 3 and later, Llama 3.1 and later, Mistral, and

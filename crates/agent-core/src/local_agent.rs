@@ -209,7 +209,12 @@ impl Tool {
         match self {
             Tool::ReadFile => format!("Read {}", field("file_path")),
             Tool::ListDir => format!("List {}", field("path")),
-            Tool::Search => format!("Search for {}", field("pattern")),
+            Tool::Search => match input.get("path").and_then(Value::as_str) {
+                Some(path) if !path.trim().is_empty() => {
+                    format!("Search for {} in {path}", field("pattern"))
+                }
+                _ => format!("Search for {}", field("pattern")),
+            },
             Tool::WriteFile => format!("Write {}", field("file_path")),
             Tool::EditFile => format!("Edit {}", field("file_path")),
             Tool::RunCommand => field("command").to_owned(),
@@ -1182,6 +1187,18 @@ mod tests {
         assert_eq!(gate(RunCommand, Mode::Bypass, true), Gate::Run);
         assert!(tools_for(Mode::Plan).iter().all(|t| !t.writes()));
         assert_eq!(tools_for(Mode::Ask).len(), Tool::ALL.len());
+    }
+
+    #[test]
+    fn a_search_card_says_where_it_searches() {
+        assert_eq!(
+            Tool::Search.title(&json!({"pattern": "KEY", "path": "/home/u"})),
+            "Search for KEY in /home/u"
+        );
+        assert_eq!(
+            Tool::Search.title(&json!({"pattern": "KEY"})),
+            "Search for KEY"
+        );
     }
 
     #[test]

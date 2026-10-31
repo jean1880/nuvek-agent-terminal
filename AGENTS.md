@@ -348,13 +348,19 @@ Architectural mandates, standards, and workflows for this codebase.
   model (`AgentAvailability::server_ready`). Its tools (`agent_kit::local_tools`) pass
   `local_agent::gate` first: Plan offers and runs no writing tool, Ask asks before every write
   and command, Accept edits asks before commands and before any write outside the thread's
-  folder (`local_tools::inside`, links followed, a dangling one counted outside). Reads are gated
-  as the agy hook gates them: a read outside the folder, of a sensitive file (the shared
-  `agent_core::sensitive` list, plus home's dotfiles when the folder holds home) or a search
-  from home or above asks in every mode, Plan included (`local_tools::read_must_ask`); an
-  unapproved read is judged again just before it runs, and an unapproved search skips sensitive
-  files. A command's group is killed before its shell is reaped, so the group id is never one
-  reused by another process. The runner keeps
+  folder (`local_tools::inside`, links followed, a dangling one counted outside). Reads follow
+  the agy hook's read policy, except that a link staying inside the folder is judged where it
+  leads: a read outside the folder, of a sensitive file (the shared `agent_core::sensitive`
+  list, a file with a second hard link, and a home's dotfiles when the folder is that home or
+  above it) or a search from a home or above asks in every mode, Plan included
+  (`local_tools::read_must_ask`). Homes are `$HOME` and the account's own; with neither known,
+  every dot-named path and every search asks. An unapproved read is judged again just before it
+  runs and opened from the pinned folder one component at a time without following a link
+  (`open_inside`), so a folder swapped for a link meanwhile fails it. A search walks open
+  folders, never follows a link, and never reads a sensitive or hard-linked file or, from a home
+  or above, its dotfiles, even approved. A command's group is killed before its shell is reaped
+  (never when someone else reaped it), so the group id is never one reused by another process.
+  The runner keeps
   no approval: the app's own scoped rules answer the cards they cover. A write is bound to what
   was judged: its folders are opened one at a time without following a link
   (`local_tools::write_target`), so a folder swapped for a link meanwhile fails it, and one judged

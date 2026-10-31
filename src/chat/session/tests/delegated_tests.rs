@@ -2617,6 +2617,62 @@ fn the_thinking_retry_never_replays_news_that_was_given_back() {
     });
 }
 
+/// A continuation (or a wake) that reached no process takes back only the copy it kept for
+/// Claude's pre-init replay: a user's prompt kept there with the very same text stays.
+#[test]
+fn a_dropped_continuation_takes_back_only_its_own_kept_copy() {
+    use crate::chat::session::limit::CONTINUE_PROMPT;
+    use crate::chat::session::{ContinueOutcome, WakeOutcome};
+    in_loop(|ctx| {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, &dir.path().to_string_lossy());
+        let (sink, _seen) = make_sink();
+        // Exits before its init, and the exit is not handled yet: a write goes nowhere.
+        let open = scripted(dir.path(), "IFS= read -r handshake\nsleep 4 & exit 1");
+        let session = ChatSession::with_env(
+            Box::new(agent_core::claude::ClaudeAdapter::new()),
+            open,
+            store,
+            thread,
+            sink,
+            Err(None),
+            minimal_env(dir.path()),
+        );
+        let exited = |s: &ChatSession| {
+            s.inner
+                .proc
+                .borrow()
+                .as_ref()
+                .is_some_and(|p| !p.is_alive())
+        };
+        assert!(pump_until(ctx, 10, || exited(&session)));
+        assert!(session.status().alive, "the exit is not handled yet");
+        let kept = |s: &ChatSession| -> Vec<String> {
+            s.inner
+                .pre_init_prompts
+                .borrow()
+                .iter()
+                .map(|k| k.text.clone())
+                .collect()
+        };
+        for text in [CONTINUE_PROMPT, "news to wake with"] {
+            session.inner.pre_init_prompts.borrow_mut().push(Sent {
+                text: text.to_owned(),
+                handoff: None,
+            });
+        }
+        assert_eq!(session.continue_after_limit(), ContinueOutcome::Busy);
+        assert_eq!(session.wake_with("news to wake with"), WakeOutcome::Busy);
+        assert_eq!(
+            kept(&session),
+            vec![CONTINUE_PROMPT.to_owned(), "news to wake with".to_owned()],
+            "the user's copies stay, the dropped sends leave none"
+        );
+        session.shutdown(false);
+    });
+}
+
 /// The same as a live message: one written mid-turn into Claude's refused `--thinking-display`
 /// start gives its news back, and the restart replays the user's own text only.
 #[test]

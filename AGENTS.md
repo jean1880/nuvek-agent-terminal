@@ -104,7 +104,7 @@ Architectural mandates, standards, and workflows for this codebase.
     window waits for its agents' real exits with the window up, never by blocking at quit; past
     150 ms it shows the closing screen, drawn by `window/imp/pack_animation.rs`),
     `window/imp/agents_prefs.rs` (Settings → Agents; `agents_prefs/local_context.rs` and
-    `local_mcp.rs` are the Local Instructions & Tools group: instruction files, budgets, MCP
+    `local_mcp.rs` are the Local Instructions and Tools group: instruction files, budgets, MCP
     server definitions, discovery and the Codex import),
     `window/sidebar_model.rs` (pure sidebar logic), `window/diff_panel.rs` (the
     diff panel's widgets and its "Open a PR" bar; it pops out into its own window, keeping its

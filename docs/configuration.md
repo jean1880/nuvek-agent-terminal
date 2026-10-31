@@ -199,7 +199,7 @@ The Local agent cannot take part in cross-agent delegation.
 
 ### Local instructions and tools
 
-Settings → Agents → **Local Instructions & Tools** gives the Local agent your instruction
+Settings → Agents → **Local Instructions and Tools** gives the Local agent your instruction
 files and MCP tools. Every setting applies when committed; widening applies at the next
 turn, while disabling or restricting stops the affected Local sessions and expires their
 approvals. The settings are app-wide (`local_defaults`); each Local server profile selects

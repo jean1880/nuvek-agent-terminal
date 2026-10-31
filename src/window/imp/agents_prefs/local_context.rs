@@ -166,8 +166,9 @@ impl AgentTerminalWindow {
     ) -> adw::PreferencesGroup {
         let saved = self.config.borrow().local_defaults.clone();
         let group = adw::PreferencesGroup::builder()
-            // A group title is Pango markup: a bare ampersand renders it blank.
-            .title("Local Instructions &amp; Tools")
+            // No ampersand: a group title is Pango markup, and an escaped `&amp;` still fails the
+            // title check (`assert_titles_render`) on libadwaita 1.5.
+            .title("Local Instructions and Tools")
             .description(SETTINGS_HELP)
             .build();
         let native = adw::ActionRow::builder().title("Native Global Instructions").subtitle("$XDG_CONFIG_HOME/agent-terminal/AGENTS.md (or ~/.config/agent-terminal/AGENTS.md), when present, is always first.").use_markup(false).subtitle_lines(0).build();

@@ -47,7 +47,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Schema version this build writes. Bump it and add a step to [`migrate`]. An existing store is
 /// only ever upgraded by the preflight (`preflight::run`), after a verified backup.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 /// `PRAGMA synchronous = FULL`: a durable control write's level.
 const SYNC_FULL: i64 = 2;
 /// [`Store::meta`] key of the native sessions whose threads the user deleted (JSON list of
@@ -3980,6 +3980,12 @@ fn migrate_locked_to(conn: &Connection, current: i64, target: i64) -> Result<()>
         // The drivers reference table, ownership keys with cascades, and the missing indexes.
         conn.execute_batch(schema_v8::SCHEMA_V8)?;
     }
+    if current < 9 && target >= 9 {
+        // An accepted operation's carried epoch moves from `meta` into a column the schema
+        // keeps valid.
+        conn.execute_batch(delegation::SCHEMA_V9)?;
+        delegation::migrate_v9_carried_epochs(conn)?;
+    }
     let broken: Option<String> = conn
         .query_row(
             "SELECT \"table\" FROM pragma_foreign_key_check LIMIT 1",
@@ -5632,6 +5638,117 @@ mod tests {
             .collect::<std::result::Result<_, _>>()
             .expect("rows");
         assert_eq!(active, vec![None, None]);
+    }
+
+    /// [`v7_fixture`] brought to v8, with an accepted operation `op2` beside the confirmed `op1`.
+    fn v8_fixture() -> Connection {
+        let conn = v7_fixture();
+        conn.pragma_update(None, "foreign_keys", "OFF")
+            .expect("fk off");
+        migrate_locked_to(&conn, 7, 8).expect("a v8 database");
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .expect("fk on");
+        conn.execute_batch(
+            "INSERT INTO delegation_operations (id, root_id, principal_worker_id, kind,
+                 idempotency_key, authority_epoch, canonical_request, resolution_json,
+                 receipt_json, dispatch_state, target_worker_id, run_id, created_at, updated_at)
+                 VALUES ('op2', 'r1', 'w_root', 'send', 'k2', 0, '{}', '{}', '{}', 'accepted',
+                         'w_kid', NULL, 1, 2);",
+        )
+        .expect("an accepted operation");
+        conn
+    }
+
+    #[test]
+    fn a_v8_database_moves_only_an_accepted_operations_carried_epoch_into_its_column() {
+        let conn = v8_fixture();
+        conn.execute_batch(
+            "INSERT INTO meta (key, value) VALUES
+                 ('delegation_operation_epoch:op2', '3'),
+                 ('delegation_operation_epoch:op1', '2'),
+                 ('delegation_operation_epoch:op_gone', '1');",
+        )
+        .expect("legacy carried epochs");
+        migrate(&conn).expect("migrate");
+        let carried: Vec<(String, Option<i64>)> = conn
+            .prepare("SELECT id, carried_epoch FROM delegation_operations ORDER BY id")
+            .expect("prepare")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .expect("query")
+            .collect::<std::result::Result<_, _>>()
+            .expect("rows");
+        assert_eq!(
+            carried,
+            vec![("op1".into(), None), ("op2".into(), Some(3))],
+            "only the accepted operation keeps its carried epoch"
+        );
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM meta WHERE key LIKE 'delegation_operation_epoch:%'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(left, 0, "every legacy row goes, the orphan included");
+        assert_eq!(count(&conn, "meta"), 1, "other meta stays");
+        migrate(&conn).expect("a second run is a no-op");
+    }
+
+    #[test]
+    fn an_unreadable_carried_epoch_fails_the_v9_step_and_changes_nothing() {
+        let conn = v8_fixture();
+        conn.execute_batch(
+            "INSERT INTO meta (key, value) VALUES ('delegation_operation_epoch:op2', 'many');",
+        )
+        .expect("an unreadable epoch");
+        assert!(matches!(migrate(&conn), Err(StoreError::Upgrade(_))));
+        let version: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .expect("version");
+        assert_eq!(version, 8, "rolled back");
+    }
+
+    #[test]
+    fn only_an_accepted_operation_holds_a_carried_epoch() {
+        let conn = v8_fixture();
+        migrate(&conn).expect("migrate");
+        conn.execute(
+            "UPDATE delegation_operations SET carried_epoch = 1 WHERE id = 'op2'",
+            [],
+        )
+        .expect("an accepted operation carries one");
+        assert!(
+            conn.execute(
+                "UPDATE delegation_operations SET dispatch_state = 'dispatch_reserved'
+                 WHERE id = 'op2'",
+                [],
+            )
+            .is_err(),
+            "leaving accepted without dropping it is refused"
+        );
+        assert!(conn
+            .execute(
+                "UPDATE delegation_operations SET carried_epoch = 1 WHERE id = 'op1'",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO delegation_operations (id, root_id, principal_worker_id, kind,
+                     idempotency_key, authority_epoch, canonical_request, resolution_json,
+                     receipt_json, dispatch_state, target_worker_id, run_id, created_at,
+                     updated_at, carried_epoch)
+                     VALUES ('op3', 'r1', 'w_root', 'send', 'k3', 0, '{}', '{}', '{}',
+                             'confirmed', 'w_kid', NULL, 1, 2, 1)",
+                [],
+            )
+            .is_err());
+        conn.execute(
+            "UPDATE delegation_operations SET dispatch_state = 'dispatch_reserved',
+                 carried_epoch = NULL WHERE id = 'op2'",
+            [],
+        )
+        .expect("dropped in the same statement");
     }
 
     /// Every foreign key has a full (not partial) index led by one of its child columns (the

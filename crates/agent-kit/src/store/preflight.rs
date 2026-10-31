@@ -740,14 +740,18 @@ mod tests {
             .expect("wal");
         conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL)")
             .expect("version table");
+        // As the real migration runs its steps: table rebuilds need foreign keys off.
+        conn.execute_batch("PRAGMA foreign_keys = OFF")
+            .expect("foreign keys off");
         conn.execute_batch("BEGIN IMMEDIATE").expect("begin");
         migrate_locked_to(&conn, 0, version).expect("old schema");
         conn.execute_batch(
             "INSERT INTO threads (id, title, cwd, created_at, updated_at, active_provider_thread)
-                 VALUES ('t1', 'first', '/w', 1, 2, 'p1'), ('t2', 'second', '/w', 3, 4, NULL);
+                 VALUES ('t1', 'first', '/w', 1, 2, NULL), ('t2', 'second', '/w', 3, 4, NULL);
              INSERT INTO provider_threads (id, thread_id, driver, model, native_id, created_at, updated_at)
                  VALUES ('p1', 't1', 'claude', 'opus', 'native-1', 1, 2),
-                        ('p2', 't2', 'agy', 'gemini', NULL, 3, 4);",
+                        ('p2', 't2', 'agy', 'gemini', NULL, 3, 4);
+             UPDATE threads SET active_provider_thread = 'p1' WHERE id = 't1';",
         )
         .expect("rows");
         for i in 0..EVENTS {

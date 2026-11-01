@@ -2944,20 +2944,19 @@ impl Store {
             } else {
                 return Ok(Vec::new());
             };
-        let live: Vec<&WorkerId> = workers
+        // A lookup that fails refuses the delete: it never counts a worker as closed.
+        let mut live: Vec<&WorkerId> = Vec::new();
+        for w in workers
             .iter()
             .filter(|w| !root_case || w.as_str() != root.root_worker_id)
-            .filter(|w| {
-                let row = self.delegation_worker(w.as_str()).ok().flatten();
-                let open = row.is_none_or(|r| r.state != "closed");
-                let running = self
-                    .active_delegation_run(w.as_str())
-                    .ok()
-                    .flatten()
-                    .is_some();
-                open || running
-            })
-            .collect();
+        {
+            let open = self
+                .delegation_worker(w.as_str())?
+                .is_none_or(|r| r.state != "closed");
+            if open || self.active_delegation_run(w.as_str())?.is_some() {
+                live.push(w);
+            }
+        }
         if !live.is_empty() {
             return Err(StoreError::Failed(format!(
                 "the thread has {} live delegated worker(s); close and revoke them first",

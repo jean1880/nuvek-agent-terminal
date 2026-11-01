@@ -913,3 +913,24 @@ fn a_childs_report_is_done_at_acceptance_and_survives_its_exit() {
     let replayed = new_op_or_replay(send(&f.s, &child, "parent", "report", "done", "r1"));
     assert_eq!(replayed["replayed"], json!(true));
 }
+
+/// A worker whose run cannot be read is never taken for one with no run: the delete is refused.
+#[test]
+fn an_unreadable_run_refuses_the_delete() {
+    let f = fx();
+    let child = spawn(&f.s, &f.root.worker, "k1");
+    let worker = child.worker.expect("w");
+    let run = child.run.expect("run");
+    f.s.set_delegation_worker_state(worker.as_str(), "closed", None, 9)
+        .expect("close");
+    // Still active, and unreadable: its last update is no time.
+    f.s.conn
+        .execute(
+            "UPDATE delegation_runs SET updated_at = 'x' WHERE id = ?1",
+            [run.as_str()],
+        )
+        .expect("corrupt");
+    assert!(f.s.active_delegation_run(worker.as_str()).is_err());
+    assert!(f.s.delete_thread(&f.root_thread).is_err());
+    assert!(f.s.delegation_worker(worker.as_str()).expect("q").is_some());
+}

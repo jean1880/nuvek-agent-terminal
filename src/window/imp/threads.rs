@@ -81,6 +81,19 @@ fn reads_vendor_quota(
     driver != Driver::Local && profile_source(config, profile_id, driver).is_none()
 }
 
+/// Whose usage limit a thread's events on `driver` come from: the agent, on the model server its
+/// running process was launched on ([`ChatSession::launched_server`]), never the server the live
+/// configuration now gives its profile. No session yet: the vendor's.
+fn limit_source(
+    driver: Driver,
+    session: Option<&ChatSession>,
+) -> agent_core::limit_wait::AgentSource {
+    agent_core::limit_wait::AgentSource {
+        driver,
+        server: session.and_then(ChatSession::launched_server),
+    }
+}
+
 /// When the limit a refusal reports resets (epoch seconds), when it says: only a rate limit
 /// names a time.
 fn limit_reset_of(event: &Event) -> Option<i64> {
@@ -2764,6 +2777,7 @@ fn agent_launch_with(
     };
     Ok(AgentLaunch {
         profile: None,
+        server: launch_source(&profile, driver).map(|source| source.provider),
         adapter,
         program,
         extra_args,
@@ -6044,6 +6058,8 @@ impl AgentTerminalWindow {
             session.shutdown(true);
             return;
         }
+        // Whose usage limit it hits: the server of the profile it was launched with.
+        session.set_launched_server(source.map(|source| source.provider));
         let (thread_for, dir_for) = (thread.to_owned(), dir.to_owned());
         session.set_adapter_factory(Rc::new(move |d, profile| {
             agent_launch(d, &thread_for, &dir_for, profile)
@@ -6219,16 +6235,10 @@ impl AgentTerminalWindow {
             // The agent is at work again, or the thread runs another agent now and it is up: the
             // limit it waited out is not this one's any more. A switch only asked for, or one
             // whose agent never starts (it rolls back), keeps the wait. Where the agent runs is
-            // its own process's profile: a move to a model server of the same agent is another.
-            let source = agent_core::limit_wait::AgentSource {
-                driver,
-                server: profile_source(
-                    &self.config.borrow(),
-                    chat.running_profile_id().as_deref(),
-                    driver,
-                )
-                .map(|source| source.provider),
-            };
+            // the server its process was launched on, never the live Settings (a profile moved
+            // onto or off a server since is not a move of this process): a move to a model server
+            // of the same agent is another source.
+            let source = limit_source(driver, chat.slot.get().as_deref());
             let moved_on = chat.limit.moved_on(&source, &env.event);
             if chat.limit_wait.is_some() && (moved_on || limit_over(&env.event)) {
                 chat.end_limit_wait();

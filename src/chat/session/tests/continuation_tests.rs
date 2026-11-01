@@ -105,6 +105,7 @@ impl Thread {
         let env = minimal_env(&new);
         session.set_adapter_factory(Rc::new(move |driver, _| {
             Ok(AgentLaunch {
+                server: None,
                 profile: None,
                 adapter: Box::new(Relabelled {
                     inner: agent_core::claude::ClaudeAdapter::new(),
@@ -292,6 +293,7 @@ fn a_switch_that_rolls_back_keeps_the_limit_wait_for_wakes() {
         let env = minimal_env(&t.new);
         t.session.set_adapter_factory(Rc::new(move |driver, _| {
             Ok(AgentLaunch {
+                server: None,
                 profile: None,
                 adapter: Box::new(Relabelled {
                     inner: agent_core::claude::ClaudeAdapter::new(),
@@ -318,6 +320,67 @@ fn a_switch_that_rolls_back_keeps_the_limit_wait_for_wakes() {
             t.session.wake_blocker(),
             Some("the thread waits for its usage limit")
         );
+        t.session.shutdown(false);
+    });
+}
+
+/// Whose limit a process hits is the server it was launched on: Settings moving its profile off
+/// that server later changes nothing for that process, so its next turn is not a move off the
+/// limit. Only a new launch reads the profile again.
+#[test]
+fn the_server_a_process_was_launched_on_outlives_a_settings_change() {
+    use agent_core::limit_wait::{AgentSource, LimitRecord};
+    use agent_core::provider::{ModelProvider, ProviderKind};
+    in_loop(|ctx| {
+        let t = Thread::new(ctx);
+        let ollama = ModelProvider::new(ProviderKind::Ollama);
+        let factory = |server: Option<ModelProvider>, dir: &Path| -> AdapterFactory {
+            let launch = super::answering_claude(dir);
+            let env = minimal_env(dir);
+            Rc::new(move |driver, _| {
+                Ok(AgentLaunch {
+                    server: server.clone(),
+                    profile: None,
+                    adapter: Box::new(Relabelled {
+                        inner: agent_core::claude::ClaudeAdapter::new(),
+                        driver,
+                    }),
+                    program: launch.program.clone(),
+                    extra_args: launch.extra_args.clone(),
+                    default_model: None,
+                    default_effort: None,
+                    env: env.clone(),
+                    approval: Err(None),
+                })
+            })
+        };
+        t.session
+            .set_adapter_factory(factory(Some(ollama.clone()), &t.new));
+        t.session.switch(Driver::Codex, None, None);
+        assert!(pump_until(ctx, 10, || t.session.status().driver
+            == Driver::Codex
+            && t.idle()
+            && t.session.inner.rollback.borrow().is_none()));
+        assert_eq!(t.session.launched_server(), Some(ollama.clone()));
+        let source = || AgentSource {
+            driver: t.session.status().driver,
+            server: t.session.launched_server(),
+        };
+        let mut record = LimitRecord::default();
+        let refused = Event::TurnCompleted {
+            state: TurnState::Failed,
+            usage: None,
+            cost_usd: None,
+            error: Some("You've hit your usage limit".into()),
+        };
+        assert!(record.observe(&source(), &refused));
+
+        // Settings move the profile off the server: the next launch would read that.
+        t.session.set_adapter_factory(factory(None, &t.new));
+        t.session.send_prompt("again");
+        assert!(pump_until(ctx, 10, || t.idle() && t.sent_new().contains("again")));
+        assert_eq!(t.session.launched_server(), Some(ollama));
+        assert!(!record.moved_on(&source(), &Event::TurnStarted { model: None }));
         t.session.shutdown(false);
     });
 }

@@ -321,8 +321,8 @@ Architectural mandates, standards, and workflows for this codebase.
   continuation ends a stop that held the root). While the thread waits, sub-agent news does not wake it (`TurnPurpose::Wake`); it
   arrives after the continuation. The wait ends when the agent works again (`limit_over`, the
   one test for the window and the session), the thread switches agent or moves its agent to or
-  from a model server (`AgentSource`: the agent and the server its process's profile runs it
-  on; the hand-off included; once the new agent is up, `LimitRecord::moved_on`, so a switch that
+  from a model server (`AgentSource`: the agent and the server its process was launched on,
+  `ChatSession::launched_server`, never the live Settings; the hand-off included; once the new agent is up, `LimitRecord::moved_on`, so a switch that
   rolls back keeps it, in the window and the session alike), the
   user stops it, the user picks "Don't Continue" on its banner, or the setting
   goes off. "Continue in …" on the limit's banner (and a bare `/handoff` while the thread is

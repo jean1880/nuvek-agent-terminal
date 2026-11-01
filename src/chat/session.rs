@@ -83,6 +83,9 @@ pub struct AgentLaunch {
     /// window binds the thread to it once this process's session starts
     /// ([`ChatSession::launched_profile`]), and never for another process.
     pub profile: Option<String>,
+    /// The model server the profile this was built from runs the agent on (`None`: its vendor),
+    /// as it was at launch ([`ChatSession::launched_server`]): whose usage limit the process hits.
+    pub server: Option<agent_core::provider::ModelProvider>,
 }
 
 /// `Continued on <new model> (<old> was retired)`.
@@ -333,6 +336,9 @@ struct Inner {
     /// The profile the installed agent was launched on by a switch ([`AgentLaunch::profile`]);
     /// `None` for the thread's own. Replaced at every install, rollbacks included.
     launched_profile: RefCell<Option<String>>,
+    /// The model server the installed agent was launched on ([`AgentLaunch::server`]); replaced
+    /// at every install, rollbacks included.
+    launched_server: RefCell<Option<agent_core::provider::ModelProvider>>,
     /// Whether a switch to agy now would get its approval hook (the window's cached proof). Only
     /// says so before the switch; the launch itself proves the hook as always.
     agy_can_ask: RefCell<Option<Rc<dyn Fn() -> bool>>>,
@@ -943,6 +949,7 @@ impl ChatSession {
             factory: RefCell::new(None),
             switch_target: RefCell::new(None),
             launched_profile: RefCell::new(None),
+            launched_server: RefCell::new(None),
             agy_can_ask: RefCell::new(None),
             launch_env: RefCell::new(env),
             proc: RefCell::new(None),
@@ -1073,6 +1080,19 @@ impl ChatSession {
     /// refused move, a restart of the old agent) cannot bind the thread to it.
     pub fn launched_profile(&self) -> Option<String> {
         self.inner.launched_profile.borrow().clone()
+    }
+
+    /// The model server the installed agent was launched on (`None`: its vendor), from the
+    /// profile it was launched with, whatever Settings say of that profile since: whose usage
+    /// limit it hits. A restart of the same agent keeps it, as it keeps the launch.
+    pub fn launched_server(&self) -> Option<agent_core::provider::ModelProvider> {
+        self.inner.launched_server.borrow().clone()
+    }
+
+    /// The model server the first process was launched on (the window's own start, not a
+    /// switch's [`AgentLaunch`]): see [`Self::launched_server`].
+    pub fn set_launched_server(&self, server: Option<agent_core::provider::ModelProvider>) {
+        *self.inner.launched_server.borrow_mut() = server;
     }
 
     pub fn stage_local_context(
@@ -5403,6 +5423,7 @@ impl Inner {
         // agent is up, and a switch that rolls back keeps it.
         *self.provider_thread.borrow_mut() = pt;
         *self.launched_profile.borrow_mut() = launch.profile.clone();
+        *self.launched_server.borrow_mut() = launch.server.clone();
         self.pending_local_context.borrow_mut().take();
         *self.adapter.borrow_mut() = launch.adapter;
         self.adapter_epoch.set(self.adapter_epoch.get() + 1);
@@ -9032,6 +9053,7 @@ mod tests {
 
     fn launch_of(adapter: Box<dyn Adapter>) -> Result<AgentLaunch, String> {
         Ok(AgentLaunch {
+            server: None,
             profile: None,
             adapter,
             program: "unused".into(),
@@ -9065,6 +9087,7 @@ mod tests {
                 .launch(Driver::Codex, None)
                 .unwrap();
                 Ok(AgentLaunch {
+                    server: None,
                     profile: None,
                     adapter: FakeAdapter::boxed(d, &codex_log),
                     program: "/bin/true".into(),
@@ -9106,6 +9129,7 @@ mod tests {
             session.set_adapter_factory(Rc::new(move |d, _| {
                 count.set(count.get() + 1);
                 Ok(AgentLaunch {
+                    server: None,
                     profile: None,
                     adapter: match d {
                         Driver::Claude => Box::new(agent_core::claude::ClaudeAdapter::new()),
@@ -10374,6 +10398,7 @@ mod tests {
                 )
                 .expect("bind");
                 Ok(AgentLaunch {
+                    server: None,
                     profile: None,
                     adapter: Box::new(AgyAdapter::new("agy")),
                     program: "/bin/sh".into(),

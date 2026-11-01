@@ -420,7 +420,8 @@ Architectural mandates, standards, and workflows for this codebase.
   and `disconnect_expires_pending_cards_and_late_answers_never_authorise_reconnection` prove
   the two). Stop, session end, EOF or a narrowing setting ends every server
   of the session, idle ones included, the guardian killing the group on the runner's death
-  through a private lifetime pipe; the next turn starts a fresh generation. A thread's MCP
+  through a private lifetime pipe (it reaps the leader only after killing its group, so the group
+  id is never one reused by another process); the next turn starts a fresh generation. A thread's MCP
   panel toggle never re-enables a definition Settings has disabled. Resolved credential
   values are masked exactly, whole and by fragment, in arguments, results, errors, stderr,
   events, the transcript and the store, before truncation. `tests/local_mcp.rs` proves these

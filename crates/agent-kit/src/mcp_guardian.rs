@@ -79,6 +79,9 @@ fn run() -> io::Result<()> {
     // The server owns the only read end of its stdin now. Closing the runner's writer
     // therefore delivers EOF even while this supervisor is alive.
     drop(input);
+    // The leader stays unreaped until its group is killed: its pid, and so the group's id,
+    // stays taken, so neither signal can reach a group that reused the id.
+    let mut reapable = true;
     loop {
         let mut descriptor = libc::pollfd {
             fd: lifetime.as_raw_fd(),
@@ -86,12 +89,26 @@ fn run() -> io::Result<()> {
             revents: 0,
         };
         let polled = unsafe { libc::poll(&mut descriptor, 1, 20) };
-        if (polled > 0 && descriptor.revents != 0) || !matches!(child.try_wait(), Ok(None)) {
+        if polled > 0 && descriptor.revents != 0 {
             break;
+        }
+        match exited(group) {
+            Ok(true) => break,
+            Ok(false) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            // Reaped by someone else: its id may be another process's group already.
+            Err(e) if e.raw_os_error() == Some(libc::ECHILD) => {
+                reapable = false;
+                break;
+            }
+            Err(_) => break,
         }
         if polled < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
             break;
         }
+    }
+    if !reapable {
+        return Ok(());
     }
     // Group cleanup is unconditional: even a clean leader exit can leave descendants
     // holding stdout/stderr open. Deliberately escaped groups are outside this ownership.
@@ -99,11 +116,7 @@ fn run() -> io::Result<()> {
     unsafe {
         libc::kill(-group, libc::SIGTERM);
     }
-    let until = Instant::now() + Duration::from_millis(200);
-    while Instant::now() < until {
-        let _ = child.try_wait();
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    std::thread::sleep(Duration::from_millis(200));
     unsafe {
         libc::kill(-group, libc::SIGKILL);
     }
@@ -115,4 +128,44 @@ fn run() -> io::Result<()> {
         std::thread::sleep(Duration::from_millis(10));
     }
     Ok(())
+}
+
+/// Whether the child `pid` has exited, leaving it unreaped (`WNOWAIT`).
+fn exited(pid: i32) -> io::Result<bool> {
+    // SAFETY: an all-zero siginfo_t is a valid value for waitid to fill.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `pid` is this process's child; WNOHANG never blocks, WNOWAIT reaps nothing.
+    let r = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if r != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: waitid filled `info`; si_pid is 0 when the child has not exited.
+    Ok(unsafe { info.si_pid() } != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_exited_leader_is_seen_without_being_reaped() {
+        let mut child = Command::new("true").spawn().unwrap();
+        let pid = child.id() as i32;
+        let until = Instant::now() + Duration::from_secs(5);
+        while !exited(pid).unwrap() {
+            assert!(Instant::now() < until, "the child never exited");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Still unreaped: its pid (and group id) stays taken until this wait.
+        assert!(exited(pid).unwrap());
+        assert!(child.try_wait().unwrap().is_some());
+        assert_eq!(exited(pid).unwrap_err().raw_os_error(), Some(libc::ECHILD));
+    }
 }

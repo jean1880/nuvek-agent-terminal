@@ -445,8 +445,7 @@ Architectural mandates, standards, and workflows for this codebase.
   Local agent's chat requests (`agent_kit::local_agent::HttpChat`): streamed POSTs of
   `<base>/v1/chat/completions` to the address the user configured for that server, only while
   one of its threads runs a turn, redirects not followed, never through a proxy, the key sent
-  only as a bearer token
-  read from the variable the profile names. Never add any other request. Two user actions reach GitHub without the app making a
+  only as a bearer token read from the variable the profile names. Never add any other request. Two user actions reach GitHub without the app making a
   request: the diff panel's "Open a PR" hands GitHub's compare URL (built from the remote,
   credentials dropped: `agent_kit::github`) to the browser, and "Push & Open PR" runs one
   `git push` (never forced, after a confirmation that shows the command) through the user's own

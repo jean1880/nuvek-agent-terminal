@@ -729,41 +729,82 @@ fn replace_refused(e: &std::io::Error) -> bool {
     )
 }
 
+/// `fstat(2)` of an open file.
+fn stat_fd(fd: &OwnedFd) -> std::io::Result<libc::stat> {
+    // SAFETY: `st` is written by fstat only; `fd` is an open file descriptor.
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd.as_raw_fd(), &mut st) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(st)
+    }
+}
+
+/// Whether `now` is still the regular file `was` describes, with one link.
+fn same_single_file(now: &libc::stat, was: &libc::stat) -> bool {
+    now.st_mode & libc::S_IFMT == libc::S_IFREG
+        && now.st_dev == was.st_dev
+        && now.st_ino == was.st_ino
+        && now.st_nlink == 1
+}
+
 /// Writes `content` over the file `name` in `dir` in place: the old way, for a file that cannot
-/// be replaced. It is opened without following a link or blocking, and written only if it is
-/// still the regular file `was` describes with one link.
+/// be replaced. Nothing is opened for writing before it is known what it is: the name is first
+/// opened only as a reference (`O_PATH`, never following a link, which opens no device and no
+/// pipe) and checked to be the regular file `was` describes with one link; only that file is
+/// then opened for writing, through `/proc/self/fd`, and checked again. Without `/proc` it is
+/// refused rather than opened blind.
 fn write_in_place(
     dir: &OwnedFd,
     name: &CString,
     was: &libc::stat,
     content: &str,
 ) -> std::io::Result<()> {
+    write_in_place_via(dir, name, was, content, "/proc/self/fd")
+}
+
+/// [`write_in_place`], with the folder of the process's open files given (`/proc/self/fd`).
+fn write_in_place_via(
+    dir: &OwnedFd,
+    name: &CString,
+    was: &libc::stat,
+    content: &str,
+    fd_folder: &str,
+) -> std::io::Result<()> {
     use std::io::Write;
-    let fd = open_at(
-        Some(dir),
-        name,
-        libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-        0,
-    )?;
-    // SAFETY: `now` is written by fstat only; `fd` is an open file descriptor owned here.
-    let now = unsafe {
-        let mut now: libc::stat = std::mem::zeroed();
-        if libc::fstat(fd.as_raw_fd(), &mut now) != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        now
-    };
-    let file = std::fs::File::from(fd);
-    if now.st_mode & libc::S_IFMT != libc::S_IFREG
-        || now.st_dev != was.st_dev
-        || now.st_ino != was.st_ino
-        || now.st_nlink != 1
-    {
-        return Err(std::io::Error::other("it changed since it was checked"));
+    let changed = || std::io::Error::other("it changed since it was checked");
+    let reference = open_at(Some(dir), name, libc::O_PATH | libc::O_NOFOLLOW, 0)?;
+    if !same_single_file(&stat_fd(&reference)?, was) {
+        return Err(changed());
     }
+    let reopen =
+        CString::new(format!("{fd_folder}/{}", reference.as_raw_fd())).map_err(|_| changed())?;
+    let fd = open_at(None, &reopen, libc::O_WRONLY | libc::O_NONBLOCK, 0).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            std::io::Error::other(
+                "it cannot be replaced, and without /proc it is not written in place",
+            )
+        } else {
+            e
+        }
+    })?;
+    if !same_single_file(&stat_fd(&fd)?, was) {
+        return Err(changed());
+    }
+    let file = std::fs::File::from(fd);
     file.set_len(0)?;
     (&file).write_all(content.as_bytes())?;
     file.sync_all()
+}
+
+/// Gives the open file `file` the owner and group `uid` and `gid` (`fchown(2)`).
+fn chown_file(file: &std::fs::File, uid: libc::uid_t, gid: libc::gid_t) -> std::io::Result<()> {
+    // SAFETY: `file` is an open file descriptor.
+    if unsafe { libc::fchown(file.as_raw_fd(), uid, gid) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Writes `content` as the file `name` in the open folder `dir`, whole or not at all: it is
@@ -771,9 +812,11 @@ fn write_in_place(
 /// a part and a failed write leaves the old file as it was. What is there must be a regular file
 /// (a link is never followed nor replaced, a pipe is never opened) and, unless `approved`, have
 /// no second hard link (with one, only this name gets the new content). The new file keeps the
-/// old one's permissions and, where it may, its owner and group. A file with one link that
-/// cannot be replaced (its folder read-only to us, or a mount of its own) is written in place
-/// instead, as before. The new file is removed on every failure.
+/// old one's permissions, owner and group. A file with one link that cannot be replaced (its
+/// folder read-only to us, or a mount of its own), or whose owner or group the new file could
+/// not take, is written in place instead ([`write_in_place`]); a file with a second link whose
+/// owner or group cannot be kept is replaced readable by its new owner only. The new file is
+/// removed on every failure.
 fn write_at(
     dir: &OwnedFd,
     name: &CString,
@@ -781,7 +824,20 @@ fn write_at(
     content: &str,
     approved: bool,
 ) -> Result<(), String> {
+    write_at_with(dir, name, shown, content, approved, chown_file)
+}
+
+/// [`write_at`], with `chown` giving the new file its owner and group.
+fn write_at_with(
+    dir: &OwnedFd,
+    name: &CString,
+    shown: &Path,
+    content: &str,
+    approved: bool,
+    chown: impl Fn(&std::fs::File, libc::uid_t, libc::gid_t) -> std::io::Result<()>,
+) -> Result<(), String> {
     use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
     let fail = |e: std::io::Error| format!("Cannot write {}: {e}", shown.display());
     let existing = match stat_at(dir, name) {
         Ok(st) if st.st_mode & libc::S_IFMT != libc::S_IFREG => {
@@ -801,10 +857,10 @@ fn write_at(
         Err(e) => return Err(fail(e)),
     };
     // In place only for a file with one link: with two, the card said the other keeps its content.
-    let in_place = |e: std::io::Error| match &existing {
-        Some(st) if st.st_nlink == 1 && replace_refused(&e) => {
-            write_in_place(dir, name, st, content).map_err(fail)
-        }
+    let single = existing.filter(|st| st.st_nlink == 1);
+    let in_place = |st: &libc::stat| write_in_place(dir, name, st, content).map_err(fail);
+    let refused = |e: std::io::Error| match &single {
+        Some(st) if replace_refused(&e) => in_place(st),
         _ => Err(fail(e)),
     };
     let temp = temp_name(name);
@@ -816,17 +872,22 @@ fn write_at(
     ) {
         Ok(fd) => fd,
         // Nothing was made: a folder we may not write in.
-        Err(e) => return in_place(e),
+        Err(e) => return refused(e),
     };
     let file = std::fs::File::from(fd);
+    // Whether the new file took the old one's owner and group.
+    let mut owned = true;
     let written = (|| {
         (&file).write_all(content.as_bytes())?;
         if let Some(st) = &existing {
-            use std::os::unix::fs::PermissionsExt;
-            // Best effort: only the owner's group may be kept by an ordinary user.
-            // SAFETY: `file` is an open file descriptor owned here.
-            unsafe { libc::fchown(file.as_raw_fd(), st.st_uid, st.st_gid) };
-            file.set_permissions(std::fs::Permissions::from_mode(st.st_mode & 0o777))?;
+            owned = chown(&file, st.st_uid, st.st_gid).is_ok();
+            // Never more readable than meant: without its group, only its new owner reads it.
+            let mode = if owned {
+                st.st_mode & 0o777
+            } else {
+                st.st_mode & 0o700
+            };
+            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
         }
         file.sync_all()
     })();
@@ -839,6 +900,11 @@ fn write_at(
     if let Err(e) = written {
         remove_temp();
         return Err(fail(e));
+    }
+    // The owner or group could not be kept: the file itself is written, keeping both.
+    if let (false, Some(st)) = (owned, &single) {
+        remove_temp();
+        return in_place(st);
     }
     // SAFETY: `dir` is an open folder; `temp` and `name` are valid NUL-terminated strings.
     let renamed = unsafe {
@@ -853,7 +919,7 @@ fn write_at(
         let e = std::io::Error::last_os_error();
         remove_temp();
         // Only a refused replace may fall back to writing in place.
-        return in_place(e);
+        return refused(e);
     }
     Ok(())
 }
@@ -2040,6 +2106,81 @@ mod tests {
         result.unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
         assert_eq!(names, ["f.txt"], "no temporary file is left");
+    }
+
+    /// The open folder of `path`, and the stat of the file there.
+    fn opened(path: &Path) -> (OwnedFd, CString, libc::stat) {
+        let dir = open_at(
+            None,
+            &cstring(path.parent().unwrap().as_os_str()).unwrap(),
+            libc::O_DIRECTORY | libc::O_RDONLY,
+            0,
+        )
+        .unwrap();
+        let name = cstring(path.file_name().unwrap()).unwrap();
+        let st = stat_at(&dir, &name).unwrap();
+        (dir, name, st)
+    }
+
+    #[test]
+    fn an_in_place_write_opens_nothing_for_writing_before_it_is_checked() {
+        let d = dir();
+        let file = d.path().join("f.txt");
+        std::fs::write(&file, "old").unwrap();
+        let (folder, name, was) = opened(&file);
+        // A pipe swapped in: never opened for writing, so nothing waits for a reader.
+        std::fs::remove_file(&file).unwrap();
+        let path = CString::new(file.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid path string; makes a FIFO in the test's own folder.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+        let err = write_in_place(&folder, &name, &was, "new").unwrap_err();
+        assert!(err.to_string().contains("changed"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // The same file, but no folder to reopen it through: refused, left as it was.
+        std::fs::remove_file(&file).unwrap();
+        std::fs::write(&file, "old").unwrap();
+        let (folder, name, was) = opened(&file);
+        let err = write_in_place_via(&folder, &name, &was, "new", "/no/such/proc").unwrap_err();
+        assert!(err.to_string().contains("without /proc"), "{err}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old");
+        write_in_place(&folder, &name, &was, "new").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
+    }
+
+    #[test]
+    fn a_file_whose_group_cannot_be_kept_is_written_in_place_or_left_unreadable_to_others() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let refuse = |_: &std::fs::File, _, _| Err(std::io::Error::from_raw_os_error(libc::EPERM));
+        let d = dir();
+        let file = d.path().join("f.txt");
+        std::fs::write(&file, "old").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let inode = std::fs::metadata(&file).unwrap().ino();
+        let (folder, name, _) = opened(&file);
+        write_at_with(&folder, &name, &file, "new", false, refuse).unwrap();
+        let meta = std::fs::metadata(&file).unwrap();
+        assert_eq!(
+            meta.ino(),
+            inode,
+            "written in place, keeping its owner and group"
+        );
+        assert_eq!(meta.permissions().mode() & 0o777, 0o640);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
+        // With a second link it cannot be written in place: its replacement is the owner's alone.
+        let other = d.path().join("g.txt");
+        std::fs::hard_link(&file, &other).unwrap();
+        write_at_with(&folder, &name, &file, "newer", true, refuse).unwrap();
+        let meta = std::fs::metadata(&file).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "newer");
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "new");
+        let mut names: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["f.txt", "g.txt"], "no temporary file is left");
     }
 
     #[test]

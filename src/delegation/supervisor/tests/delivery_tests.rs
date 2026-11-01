@@ -242,6 +242,54 @@ fn a_follow_up_reserved_under_a_stale_epoch_is_refused_as_stale() {
     });
 }
 
+/// A cancel accepted while a sibling's revocation is still being committed waits it out and
+/// goes out under the new epoch, rather than failing on the change.
+#[test]
+fn a_cancel_accepted_during_a_siblings_revocation_still_cancels() {
+    in_context(async {
+        let (_dir, sup, root) = harness();
+        let worker = spawn_holding(&sup, &root, "cancel-revoking").await;
+        let hold = Rc::new(std::cell::Cell::new(true));
+        sup.state.borrow_mut().hold_cancel_accept = Some(hold.clone());
+        let result: Rc<RefCell<Option<Result<Value, ToolError>>>> = Rc::default();
+        {
+            let (sup, worker, root, slot) =
+                (sup.clone(), worker.clone(), root.clone(), result.clone());
+            glib::spawn_future_local(async move {
+                let r = sup
+                    .cancel_worker_call(&root, cancel_request(&worker, "cancel-revoking"))
+                    .await;
+                *slot.borrow_mut() = Some(r);
+            });
+        }
+        glib::timeout_future(Duration::from_millis(30)).await;
+        // A sibling's close is latched, not yet committed, as the acceptance ends.
+        sup.state
+            .borrow_mut()
+            .roots
+            .get_mut(&root)
+            .unwrap()
+            .revoking = true;
+        hold.set(false);
+        glib::timeout_future(Duration::from_millis(100)).await;
+        assert!(result.borrow().is_none(), "it waits for the revocation");
+        sup.state
+            .borrow_mut()
+            .roots
+            .get_mut(&root)
+            .unwrap()
+            .revoking = false;
+        pump_until(|| result.borrow().is_some()).await;
+        let receipt = result.borrow_mut().take().unwrap().expect("cancelled");
+        let op = receipt["operation_id"].as_str().unwrap().to_owned();
+        pump_until(|| {
+            sup.state.borrow().workers[&worker].run.is_none() && dispatch(&sup, &op) == "confirmed"
+        })
+        .await;
+        stop(&sup).await;
+    });
+}
+
 /// A binding staged for `worker` that never launched (a launch about to start).
 fn plant_staged(sup: &Rc<Supervisor>, worker: &WorkerId) {
     let binding = PreparedBinding {

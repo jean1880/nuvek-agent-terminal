@@ -291,7 +291,19 @@ Architectural mandates, standards, and workflows for this codebase.
   every failed guess at least doubles the next one (a few failed turns spread ever wider, never
   a loop), and a copy whose usage drops or that names another reset is new. A
   refusal during a wait counts the same way, and readings from before it, or a reset time it
-  came after, no longer count.
+  came after, no longer count. A refused continuation holds the thread whatever its windows say
+  (every one shown free, or none reported): the thread keeps a record from one wait to the next
+  (`LimitRecord`, kept by "Don't Continue" and a new wait, reset only when the agent works
+  again or the thread switches agent), and each continuation refused before the agent works
+  again waits at least 15 minutes, then at least double the last gap, up to 6 hours, before the
+  next (`LimitWait::back_off`); a refusal of the user's own retry keeps the last gap, never
+  shrinking it. A wait no reading can end (no reset time, and no window reported, a blocking
+  window missing from the readings, or one still full that names no reset time) continues blind
+  15 minutes after its last refusal, and only once every time a window still holding it names
+  has passed; a refusal of that guess is a refused continuation like any other, so the guesses
+  double up to 6 hours. A thread whose profile runs a model server, and the Local agent, read no
+  vendor windows (another thread's reading of the vendor says nothing of them) and are never
+  probed for one: their waits end that way.
   Readings count from when windows last arrived (`updated_at`), never an account-only
   update. agy's `/usage` side command never raises `RateLimited`: a reading is not a refusal. The window's minute sweep (`continue_after_limits`)
   then calls `ChatSession::continue_after_limit`, which sends the app's continue prompt as a
@@ -299,9 +311,12 @@ Architectural mandates, standards, and workflows for this codebase.
   waiting for a prompt rides on it and is spent as a user prompt's would be; the prompt is never
   stored as the user's message. Never into a running turn or anything else a wake waits for
   (`TurnPurpose::LimitContinue`), never for a delegated worker, never for a root the user
-  stopped. While the thread waits, sub-agent news does not wake it (`TurnPurpose::Wake`); it
-  arrives after the continuation. The wait ends when the agent works again, the thread switches
-  agent (the hand-off included), the user picks "Don't Continue" on its banner, or the setting
+  stopped (Stop ends its wait, delegation or not, and the session refuses a continuation until
+  the user speaks again). While the thread waits, sub-agent news does not wake it (`TurnPurpose::Wake`); it
+  arrives after the continuation. The wait ends when the agent works again (`limit_over`, the
+  one test for the window and the session), the thread switches agent (the hand-off included;
+  once the new agent is up, `LimitRecord::moved_on`, so a switch that rolls back keeps it), the
+  user stops it, the user picks "Don't Continue" on its banner, or the setting
   goes off. "Continue in …" on the limit's banner (and a bare `/handoff` while the thread is
   stopped by its limit) switches and then continues the work in the new agent with the handoff,
   as a busy switch does. `limit_wait::tests`, the session tests

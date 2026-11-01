@@ -537,7 +537,8 @@ struct Inner {
     /// Turns started by sub-agent news since the user last spoke (see
     /// [`agent_core::delegation::wake::MAX_CONSECUTIVE_WAKES`]).
     auto_wakes: Cell<u32>,
-    /// The user stopped this root: no sub-agent news wakes it until the user speaks again.
+    /// The user stopped this root (Stop, with or without a delegation supervisor): no sub-agent
+    /// news wakes it, and no usage-limit continuation starts, until the user speaks again.
     wakes_held: Cell<bool>,
     /// Sub-agent news the supervisor holds for the user while this root is in dangerous
     /// permissive mode ([`delegated::HeldNews`]).
@@ -1465,6 +1466,11 @@ impl Inner {
     }
 
     fn apply(&self, env: &Envelope) {
+        // The agent works again: the thread no longer waits for its usage limit. The window ends
+        // its own wait on the same event, by the same test.
+        if agent_core::limit_wait::limit_over(&env.event) {
+            self.limit_waiting.set(false);
+        }
         match &env.event {
             Event::SessionStarted {
                 native_id, model, ..
@@ -5102,8 +5108,9 @@ impl Inner {
     }
 
     /// A turn ended on its own (not stopped by the app), `state`: a switch about to continue it
-    /// has nothing left to continue, and a completed turn after a prompt means the agent works
-    /// again, so the thread no longer waits for a usage limit.
+    /// has nothing left to continue, and a completed turn after a prompt is new work a "Continue
+    /// in" no longer applies to. Whether the thread still waits for its usage limit is
+    /// [`agent_core::limit_wait::limit_over`]'s, as the window judges it (see [`Self::apply`]).
     fn turn_ended_on_its_own(&self, state: TurnState) {
         self.switch_interrupted.set(false);
         let unprepared = self
@@ -5115,7 +5122,6 @@ impl Inner {
             self.switch_continuation.borrow_mut().take();
         }
         if state == TurnState::Completed && self.prompted.get() {
-            self.limit_waiting.set(false);
             // The agent works again: a "Continue in" asked while it was stopped is moot.
             self.continue_on_switch_to.set(None);
             self.work_epoch.set(self.work_epoch.get().wrapping_add(1));
@@ -6531,6 +6537,11 @@ impl ChatBackend for ChatSession {
     }
 
     fn interrupt(&self) {
+        // The user stopped this root, delegation or not: nothing continues it on its own (a
+        // usage-limit continuation, sub-agent news) until the user speaks again.
+        if self.inner.child.is_none() {
+            self.inner.wakes_held.set(true);
+        }
         self.inner.end_pending_switch();
         self.inner.command(Command::Interrupt);
     }
@@ -7318,17 +7329,18 @@ mod tests {
     }
 
     /// [`idle_claude`] that answers each prompt as a real Claude does: an `init` opening the
-    /// turn, a line of text, then its result.
+    /// turn, a line of text (a message of its own each time), then its result.
     fn answering_claude(dir: &Path) -> OpenSession {
         scripted(
             dir,
             "IFS= read -r handshake\n\
              echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"model\":\"m\",\"claude_code_version\":\"2.1.293\"}'\n\
              echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\n\
+             n=0\n\
              while IFS= read -r line; do printf '%s\\n' \"$line\" >> \"$D/prompts.log\"; \
-             case \"$line\" in *'\"type\":\"user\"'*) \
+             case \"$line\" in *'\"type\":\"user\"'*) n=$((n+1)); \
              echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"model\":\"m\",\"claude_code_version\":\"2.1.293\"}'; \
-             echo '{\"type\":\"assistant\",\"uuid\":\"u1\",\"parent_tool_use_id\":null,\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}'; \
+             echo '{\"type\":\"assistant\",\"uuid\":\"u'$n'\",\"parent_tool_use_id\":null,\"message\":{\"id\":\"m'$n'\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}'; \
              echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}';; esac; done",
         )
     }

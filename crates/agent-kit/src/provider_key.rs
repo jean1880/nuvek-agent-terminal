@@ -96,6 +96,11 @@ fn random_id() -> std::io::Result<String> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Whether `id` names an instance ([`random_id`]: 32 lowercase hex digits).
+fn is_instance_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// This app instance's claim on the key folder: its random id and the exclusive lock it holds
 /// on `<id>.lock` while it runs. Its key files are named for it, so a later instance can tell
 /// them from its own whatever the pids.
@@ -147,10 +152,13 @@ impl Instance {
         self.root.join(format!("{}-{n}.key", self.id))
     }
 
-    /// Removes this instance's key files that are still there: at exit, once its agents are
-    /// gone. Returns how many.
+    /// Removes this instance's key files that are still there, then its lock file (unlinked
+    /// while still held, so no sweep takes it meanwhile): at exit, once its agents are gone.
+    /// Returns how many key files went.
     pub fn remove_own_keys(&self) -> usize {
-        remove_keys_of(&self.root, &self.id)
+        let removed = remove_keys_of(&self.root, &self.id);
+        let _ = std::fs::remove_file(self.root.join(format!("{}.lock", self.id)));
+        removed
     }
 }
 
@@ -240,6 +248,7 @@ pub fn sweep_stale(root: &Path, except: Option<&str>) -> usize {
         .collect();
     let mut removed = 0;
     let mut live: Vec<&str> = Vec::new();
+    let mut gone: Vec<&str> = Vec::new();
     for name in &names {
         let Some(id) = name.strip_suffix(".lock").filter(|id| !id.starts_with('.')) else {
             continue;
@@ -262,6 +271,7 @@ pub fn sweep_stale(root: &Path, except: Option<&str>) -> usize {
             continue;
         }
         // Gone: its keys, then its lock (unlinked while still held, so no one takes it).
+        gone.push(id);
         removed += remove_keys_of(root, id);
         if std::fs::remove_file(&path).is_ok() {
             removed += 1;
@@ -275,6 +285,12 @@ pub fn sweep_stale(root: &Path, except: Option<&str>) -> usize {
         else {
             continue;
         };
+        // A key named for an instance whose lock this read did not see is left alone: its lock
+        // may have been renamed into place while the folder was read. Only an older scheme's
+        // leftover (not named for an instance) goes without its lock.
+        if is_instance_id(id) && !gone.contains(&id) {
+            continue;
+        }
         if !live.contains(&id) && std::fs::remove_file(root.join(name)).is_ok() {
             removed += 1;
         }
@@ -390,5 +406,22 @@ mod tests {
         std::mem::forget(left);
         assert_eq!(me.remove_own_keys(), 1);
         assert!(!left_path.exists());
+        assert!(
+            !root.join(format!("{}.lock", me.id())).exists(),
+            "an instance leaves its lock behind at exit"
+        );
+    }
+
+    /// A key named for an instance whose lock the sweep did not see (renamed into place while
+    /// the folder was read) is never taken for a leftover.
+    #[test]
+    fn a_key_whose_instance_lock_was_not_seen_is_kept() {
+        let runtime = tempfile::tempdir().unwrap();
+        let root = key_root(runtime.path().to_str()).unwrap();
+        let me = Instance::claim(&root).unwrap();
+        let unseen = root.join(format!("{}-0.key", "0123456789abcdef0123456789abcdef"));
+        std::fs::write(&unseen, "k").unwrap();
+        assert_eq!(sweep_stale(&root, Some(me.id())), 0);
+        assert!(unseen.exists());
     }
 }

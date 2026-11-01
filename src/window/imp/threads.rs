@@ -6218,8 +6218,18 @@ impl AgentTerminalWindow {
             }
             // The agent is at work again, or the thread runs another agent now and it is up: the
             // limit it waited out is not this one's any more. A switch only asked for, or one
-            // whose agent never starts (it rolls back), keeps the wait.
-            let moved_on = chat.limit.moved_on(driver, &env.event);
+            // whose agent never starts (it rolls back), keeps the wait. Where the agent runs is
+            // its own process's profile: a move to a model server of the same agent is another.
+            let source = agent_core::limit_wait::AgentSource {
+                driver,
+                server: profile_source(
+                    &self.config.borrow(),
+                    chat.running_profile_id().as_deref(),
+                    driver,
+                )
+                .map(|source| source.provider),
+            };
+            let moved_on = chat.limit.moved_on(&source, &env.event);
             if chat.limit_wait.is_some() && (moved_on || limit_over(&env.event)) {
                 chat.end_limit_wait();
             }
@@ -6237,7 +6247,7 @@ impl AgentTerminalWindow {
             }
             refused = chat
                 .limit
-                .observe(driver, &env.event)
+                .observe(&source, &env.event)
                 .then(|| chat.limit_reset_seen.take());
             let after = match &env.event {
                 Event::TurnStarted { .. } => {

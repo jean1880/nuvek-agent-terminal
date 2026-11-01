@@ -548,8 +548,9 @@ struct Inner {
     /// queue. Cleared by every start and every teardown.
     provider_session_up: Cell<Option<u64>>,
     /// The window waits for this thread's usage limit to reset (`continue_after_limit`): sub-agent
-    /// news does not wake it meanwhile; only the continuation starts a turn. Cleared by the window,
-    /// by a turn that completes, and by a switch to another agent.
+    /// news does not wake it meanwhile; only the continuation starts a turn. Cleared by the window
+    /// (which ends its wait once a switch's new agent is up) and by the agent working again
+    /// ([`agent_core::limit_wait::limit_over`]); never by a switch alone, which may roll back.
     limit_waiting: Cell<bool>,
     /// The continuation a busy switch owes its task ([`SwitchContinuation`]).
     switch_continuation: RefCell<Option<SwitchContinuation>>,
@@ -5387,10 +5388,8 @@ impl Inner {
         launch: AgentLaunch,
         installed: Installed,
     ) -> (Mode, bool, bool) {
-        // The limit the thread waited out was the old agent's.
-        if self.adapter.borrow().driver() != driver {
-            self.limit_waiting.set(false);
-        }
+        // A limit wait is not ended here: the window ends it (`set_limit_wait`) once the new
+        // agent is up, and a switch that rolls back keeps it.
         *self.provider_thread.borrow_mut() = pt;
         *self.launched_profile.borrow_mut() = launch.profile.clone();
         self.pending_local_context.borrow_mut().take();

@@ -278,6 +278,50 @@ fn a_switch_to_another_agent_ends_the_limit_wait_for_wakes() {
     });
 }
 
+/// A switch whose new agent cannot start rolls back to the agent the thread waits for: the
+/// session still holds sub-agent news for the limit, as the window still waits.
+#[test]
+fn a_switch_that_rolls_back_keeps_the_limit_wait_for_wakes() {
+    in_loop(|ctx| {
+        let t = Thread::new(ctx);
+        t.session.send_prompt("first");
+        assert!(pump_until(ctx, 10, || t.idle()));
+        t.session.set_limit_wait(true);
+
+        let launch = super::answering_claude(&t.new);
+        let env = minimal_env(&t.new);
+        t.session.set_adapter_factory(Rc::new(move |driver, _| {
+            Ok(AgentLaunch {
+                profile: None,
+                adapter: Box::new(Relabelled {
+                    inner: agent_core::claude::ClaudeAdapter::new(),
+                    driver,
+                }),
+                program: if driver == Driver::Codex {
+                    "/nonexistent/agent-terminal-test-codex".into()
+                } else {
+                    launch.program.clone()
+                },
+                extra_args: launch.extra_args.clone(),
+                default_model: None,
+                default_effort: None,
+                env: env.clone(),
+                approval: Err(None),
+            })
+        }));
+        t.session.switch(Driver::Codex, None, None);
+        assert!(pump_until(ctx, 10, || t.session.status().driver
+            == Driver::Claude
+            && t.idle()
+            && t.session.inner.rollback.borrow().is_none()));
+        assert_eq!(
+            t.session.wake_blocker(),
+            Some("the thread waits for its usage limit")
+        );
+        t.session.shutdown(false);
+    });
+}
+
 /// The turn the limit refused carried a handoff (the thread had just switched agent): the
 /// continuation carries it, through the same path as a user prompt (in flight, then spent once
 /// its turn answers), and is shown as the app's notice, never stored as the user's message.

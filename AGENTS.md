@@ -407,11 +407,14 @@ Architectural mandates, standards, and workflows for this codebase.
   reused by another process. The runner keeps no approval: the app's own scoped rules answer
   the cards they cover. A write is whole or nothing: written to a new file beside its target
   (named `.agent-terminal-write.<name>.<pid>-<n>.tmp`, removed on every failure), which then
-  replaces it (`renameat`), keeping its permissions and, where it may, its owner and group; a
-  link there is never followed nor written through, a pipe never opened, and an unapproved one
-  with a second hard link is refused (an approved one's card says only that name gets the new
-  content). A file with one link that cannot be replaced (its folder not writable, or a mount of
-  its own) is written in place instead, once checked to be the file judged. An edit is made only to UTF-8 text. Files are opened without blocking and read only
+  replaces it (`renameat`), keeping its permissions, owner and group; a link there is never
+  followed nor written through, a pipe never opened, and an unapproved one with a second hard
+  link is refused (an approved one's card says only that name gets the new content). A file
+  with one link that cannot be replaced (its folder not writable, or a mount of its own), or
+  whose owner or group the new file cannot take, is written in place instead: opened first
+  only as a reference (`O_PATH`), checked to be the regular file judged with one link, then
+  reopened for writing through `/proc/self/fd` and checked again (without `/proc`, refused).
+  One with a second link whose group cannot be kept is replaced readable by its owner only. An edit is made only to UTF-8 text. Files are opened without blocking and read only
   when regular, at most a fixed size. Commands run in their own process group, killed on Stop
   or timeout, their output capped and never waited on past a short grace. Stop ends a
   request's connection (`ChatClient::cancel`). A call from a reply that was cut off or broke

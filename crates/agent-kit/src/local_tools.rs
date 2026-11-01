@@ -469,6 +469,11 @@ fn open_at(
 /// refused (it was opened without blocking, so a pipe never hangs the open), and the read itself
 /// is bounded, whatever the file's size said.
 fn read_open(fd: OwnedFd, shown: &Path, max: u64) -> Result<String, String> {
+    read_open_bytes(fd, shown, max).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// [`read_open`]'s bytes, as they are.
+fn read_open_bytes(fd: OwnedFd, shown: &Path, max: u64) -> Result<Vec<u8>, String> {
     let file = std::fs::File::from(fd);
     let meta = file
         .metadata()
@@ -493,7 +498,7 @@ fn read_open(fd: OwnedFd, shown: &Path, max: u64) -> Result<String, String> {
     if bytes.len() as u64 > max {
         return Err(format!("{} grew too large to read whole", shown.display()));
     }
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(bytes)
 }
 
 /// The folder a write of `path` lands in, and the file's name in it. The path is resolved as
@@ -883,7 +888,13 @@ fn edit_file(input: &Value, ws: &Workspace, may_leave: bool) -> Result<String, S
         0,
     )
     .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
-    let content = read_open(fd, &path, MAX_READ_BYTES)?;
+    // Edited as text only when it is text: a lossy reading would rewrite every other byte.
+    let content = String::from_utf8(read_open_bytes(fd, &path, MAX_READ_BYTES)?).map_err(|_| {
+        format!(
+            "{} is not UTF-8 text, so it cannot be edited; nothing was changed",
+            path.display()
+        )
+    })?;
     let count = content.matches(old).count();
     let all = input
         .get("replace_all")
@@ -1786,6 +1797,22 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "a c a");
         edit("a", "x", true).unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "x c x");
+    }
+
+    #[test]
+    fn an_edit_of_a_file_that_is_not_utf8_changes_nothing() {
+        let d = dir();
+        let file = d.path().join("latin1.txt");
+        let bytes = b"caf\xe9 old\n".to_vec();
+        std::fs::write(&file, &bytes).unwrap();
+        let err = go(
+            Tool::EditFile,
+            &json!({"file_path": "latin1.txt", "old_string": "old", "new_string": "new"}),
+            d.path(),
+        )
+        .unwrap_err();
+        assert!(err.contains("not UTF-8"), "{err}");
+        assert_eq!(std::fs::read(&file).unwrap(), bytes);
     }
 
     #[test]

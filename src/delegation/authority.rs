@@ -16,11 +16,12 @@ use super::seam::{ApprovalGate, AuthorityParams, Effect, GateVerdict, LiveAuthor
 use crate::always_allow::Action;
 use crate::approval_server::{
     canonical_target, classify, classify_call, edit_targets, path_auto_matchable,
-    read_auto_matchable, ToolClass,
+    read_auto_matchable, sole_str, ToolClass,
 };
 
-/// Argument names agy's `call_mcp_tool` names its server by (as `always_allow::Action::of`).
-const AGY_SERVER_KEYS: [&str; 4] = ["ServerName", "server_name", "server", "Server"];
+/// Argument names agy's MCP tools name their server by (as `always_allow::Action::of`), each
+/// matched without regard to case.
+pub(crate) const AGY_SERVER_KEYS: [&str; 3] = ["ServerName", "server_name", "server"];
 
 /// `mcp__<server>__<tool>` as an MCP effect; `None` for any other shape.
 fn mcp_prefixed(tool: &str) -> Option<Effect> {
@@ -30,16 +31,12 @@ fn mcp_prefixed(tool: &str) -> Option<Effect> {
     })
 }
 
-/// agy's `call_mcp_tool`: ours only when every server key it carries names `agent_terminal` and
-/// there is at least one.
+/// agy's `call_mcp_tool`, `list_resources` and `read_resource`: ours only when every server
+/// argument it carries, matched as agy matches names (without regard to case), names
+/// `agent_terminal` and there is at least one.
 fn agy_mcp(input: &Value) -> Effect {
-    let named: Vec<&str> = AGY_SERVER_KEYS
-        .iter()
-        .filter_map(|k| input.get(*k))
-        .map(|v| v.as_str().unwrap_or(""))
-        .collect();
     Effect::Mcp {
-        own: !named.is_empty() && named.iter().all(|s| *s == SERVER_NAME),
+        own: sole_str(input, &AGY_SERVER_KEYS) == Some(SERVER_NAME),
     }
 }
 
@@ -479,6 +476,10 @@ mod tests {
             json!({}),
             json!({"ServerName": "agent_terminal", "server": "github"}),
             json!({"ServerName": 7}),
+            // agy matches names without regard to case and the last one wins.
+            json!({"ServerName": "agent_terminal", "serverName": "github"}),
+            json!({"servername": "github"}),
+            json!({"SERVER_NAME": "github", "ServerName": "agent_terminal"}),
         ] {
             assert_eq!(
                 effect(Driver::Agy, "call_mcp_tool", &foreign),
@@ -906,6 +907,11 @@ mod tests {
             assert!(is_deny(&agy.judge(
                 "call_mcp_tool",
                 &json!({"ServerName": "github"}),
+                None
+            )));
+            assert!(is_deny(&agy.judge(
+                "call_mcp_tool",
+                &json!({"ServerName": "agent_terminal", "serverName": "github"}),
                 None
             )));
             let codex = f.gate(Driver::Codex, mode);

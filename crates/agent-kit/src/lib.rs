@@ -22,6 +22,7 @@ pub mod mcp_guardian;
 pub mod mcp_transport;
 pub mod native;
 pub mod paths;
+pub mod provider_key;
 pub mod provider_models;
 pub mod restore;
 pub mod sessions;

@@ -39,9 +39,10 @@ Architectural mandates, standards, and workflows for this codebase.
   spawn environment, never bytes written to the terminal. The one text before `exec` is a
   terminal tab's model provider (`utils::apply_provider_env`): the user's rc runs after the
   spawn environment and may export the vendor's variables again, so POSIX `unset`/`export`
-  builtins put the provider's back. It names variables only, never a value: each value, the
-  key among them, comes in the spawn environment under a private `__AT_PROVIDER_` name that
-  is copied and then unset. A shell that is not POSIX (fish, csh) refuses such a tab.
+  builtins put the provider's back. It names variables only, never a value: each value comes
+  in the spawn environment under a private `__AT_PROVIDER_` name that is copied and then
+  unset. The key is not among them: it is in the tab's key file. A shell that is not POSIX
+  (fish, csh) refuses such a tab.
 - **Threads over a hidden tab view**: the window is an `adw::OverlaySplitView`
   whose sidebar lists the store's threads. Its content is an `adw::TabView` with
   no tab bar: one page per open thread or terminal. Each page is tracked in an
@@ -338,10 +339,20 @@ Architectural mandates, standards, and workflows for this codebase.
   (`agent_core::provider`: Claude through `ANTHROPIC_BASE_URL`, with the vendor's own credential
   variables removed, all pinned again by a `--settings` overlay, since a settings file's `env`
   wins over the process environment; the overlay never holds the key. The credential sent is
-  always the profile's key or the placeholder: the overlay's `apiKeyHelper` prints
-  `provider::CLAUDE_KEY_VAR`, set only by the app, and blanks every other credential
-  (`CLAUDE_UNSET`), so a settings file's helper or tokens are never used (seen live with Claude
-  Code 2.1.309: the helper of the overlay beats theirs and the process's token). A profile's own
+  always the profile's key or the placeholder, and the key is never in Claude's environment
+  (every child Claude starts inherits it, scrubbed or not): each process (thread, worker,
+  terminal tab) gets a key file of its own (`agent_kit::provider_key`, `0600`, `O_EXCL` and
+  `O_NOFOLLOW`, in `0700` folders under `$XDG_RUNTIME_DIR/agent-terminal/provider-keys`, never
+  `/tmp`: without a runtime directory the start is refused), written off the main thread right
+  before the spawn (`agent_proc::write_key_file`; `provider::CLAUDE_KEY_VAR` only carries the key
+  there and is never exported, and the variable the key was read from is unset) and removed
+  when that process exits (`SpawnSpec::key_file`; a tab's on `child-exited`); start-up sweeps
+  those of dead processes. The overlay's `apiKeyHelper` is `cat` of that file (no key: a
+  constant printing the placeholder), it blanks every other credential (`CLAUDE_UNSET`) and
+  `BASH_ENV`/`ENV` (so a settings file runs no code in the helper's shell), and a settings
+  file's helper or tokens are never used (seen live with Claude Code 2.1.309: the helper of the
+  overlay beats theirs and the process's token). A start whose helper was not bound to a file is
+  refused (`provider::needs_key_file`). A profile's own
   `--settings` is merged under it (`provider::with_profile_settings`: inline JSON only, a file
   refuses the start, never dropped). Codex through a `-c`
   provider of the app's own id). Every chat launch path

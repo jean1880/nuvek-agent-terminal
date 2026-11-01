@@ -873,6 +873,9 @@ mod tests {
         ] {
             assert!(folders.contains(&PathBuf::from(expected)), "{expected}");
         }
+        // The model servers' key files go with the runtime folder they live in.
+        let keys = crate::provider_key::key_root(i.xdg_runtime.as_deref()).unwrap();
+        assert!(folders.iter().any(|f| keys.starts_with(f)), "{keys:?}");
         // A relative override is not followed: it would name another folder from each place
         // the uninstall is run.
         assert!(!folders.iter().any(|f| f.starts_with("relative")));

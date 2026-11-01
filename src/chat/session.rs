@@ -2092,6 +2092,7 @@ impl Inner {
             cwd: (!open.cwd.is_empty()).then(|| open.cwd.clone()),
             env,
             unset,
+            key_file: Default::default(),
         }
     }
 
@@ -2261,6 +2262,12 @@ impl Inner {
         prompts: Vec<QueuedPrompt>,
         news: Vec<TakenNews>,
     ) {
+        // A model server's key never enters the agent's environment: it goes to a key file for
+        // this one process, written off the main thread before the spawn.
+        if let Some(key) = crate::agent_proc::take_provider_key(&mut spec) {
+            self.spawn_with_key_file(generation, spec, key, writes, prompts, news);
+            return;
+        }
         if self.adapter.borrow().driver() != Driver::Agy || self.hooks.is_none() {
             self.spawn_spec_now(generation, spec, None);
             self.flush_or_keep(generation, writes, prompts, news);
@@ -2374,6 +2381,56 @@ impl Inner {
             }
             inner.spawn_spec_now(generation, spec, Some(facts));
             inner.flush_or_keep(generation, pending.writes, pending.prompts, pending.news);
+        });
+    }
+
+    /// Spawns `spec` once `key` is in a key file of its own ([`crate::agent_proc::write_key_file`]),
+    /// holding the start's writes meanwhile, as a hook check does. A start stopped or replaced
+    /// meanwhile is dropped (its file with it); one whose file cannot be written is refused.
+    fn spawn_with_key_file(
+        self: &Rc<Self>,
+        generation: u64,
+        mut spec: SpawnSpec,
+        key: String,
+        writes: Vec<String>,
+        prompts: Vec<QueuedPrompt>,
+        news: Vec<TakenNews>,
+    ) {
+        *self.starting.borrow_mut() = Some(PendingStart {
+            generation,
+            writes,
+            prompts,
+            news,
+        });
+        self.state.borrow_mut().alive = true;
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let written = crate::agent_proc::write_key_file(&mut spec.argv, key).await;
+            let Some(inner) = weak.upgrade() else { return };
+            if inner.generation.get() != generation || inner.stopping.get() {
+                return;
+            }
+            let Some(pending) = inner
+                .starting
+                .borrow_mut()
+                .take_if(|p| p.generation == generation)
+            else {
+                return;
+            };
+            match written {
+                Ok(file) => {
+                    spec.key_file = file;
+                    inner.spawn_spec_now(generation, spec, None);
+                    inner.flush_or_keep(generation, pending.writes, pending.prompts, pending.news);
+                }
+                Err(reason) => {
+                    inner.error(format!("The agent was not started: {reason}."));
+                    if inner.generation.get() == generation {
+                        inner.finish_process(Some(1), false);
+                        inner.keep_unsent_prompts(pending.prompts);
+                    }
+                }
+            }
         });
     }
 

@@ -4058,8 +4058,17 @@ impl AgentTerminalWindow {
             Some(driver) => threads::start_model(p, driver),
             None => p.effective_default_model(None),
         });
+        // Where the tab's key file goes, named now (no I/O) so the command line can point
+        // Claude's key helper at it; written off the main thread before the spawn.
+        let key_path = crate::agent_proc::prepare_key_path();
         let on_provider = match profile
-            .map(|p| crate::utils::with_provider_args(p, terminal_model.as_deref()))
+            .map(|p| {
+                crate::utils::with_provider_args(
+                    p,
+                    terminal_model.as_deref(),
+                    key_path.as_deref().map_err(String::as_str),
+                )
+            })
             .transpose()
         {
             Ok(p) => p,
@@ -4179,8 +4188,9 @@ impl AgentTerminalWindow {
                         env_strs.push(format!("{key}={value}"));
                     }
                 }
+                let mut key_file = crate::agent_proc::KeyFileHold::default();
                 if let Some((provider, driver)) = &provider {
-                    match crate::utils::apply_provider_env(
+                    let key = match crate::utils::apply_provider_env(
                         provider,
                         *driver,
                         terminal_model.as_deref(),
@@ -4189,13 +4199,47 @@ impl AgentTerminalWindow {
                     ) {
                         // Run after the user's rc, which may export the vendor's variables
                         // again: environment only, nothing written to the terminal.
-                        Ok(prelude) => command[1] = format!("{prelude}{}", command[1]),
+                        Ok((prelude, key)) => {
+                            command[1] = format!("{prelude}{}", command[1]);
+                            key
+                        }
                         Err(why) => {
                             refuse_terminal(&obj, &stack, &terminal, &why);
                             return;
                         }
+                    };
+                    // The key goes to the file the command line's key helper reads.
+                    if let Some(key) = key {
+                        let written = match key_path {
+                            Ok(path) => crate::agent_proc::write_key_at(path, key).await,
+                            Err(why) => Err(why),
+                        };
+                        match written {
+                            Ok(file) => key_file = file,
+                            Err(why) => {
+                                refuse_terminal(&obj, &stack, &terminal, &why);
+                                return;
+                            }
+                        }
                     }
                 }
+                // Kept until the tab's process exits (or the tab goes), then removed.
+                let key_file = std::rc::Rc::new(RefCell::new(Some(key_file)));
+                let exited: std::rc::Rc<RefCell<Option<glib::SignalHandlerId>>> =
+                    std::rc::Rc::new(RefCell::new(None));
+                let id = terminal.connect_child_exited(glib::clone!(
+                    #[strong]
+                    key_file,
+                    #[strong]
+                    exited,
+                    move |terminal, _| {
+                        drop(key_file.take());
+                        if let Some(id) = exited.borrow_mut().take() {
+                            terminal.disconnect(id);
+                        }
+                    }
+                ));
+                exited.replace(Some(id));
 
                 let env_ptrs: Vec<&str> = env_strs.iter().map(String::as_str).collect();
                 spawn_with_exact_env(
@@ -4208,12 +4252,16 @@ impl AgentTerminalWindow {
                         obj,
                         #[weak]
                         stack,
+                        #[strong]
+                        key_file,
                         move |result| {
                             match result {
                                 Ok(_) => {
                                     info!("Terminal process spawned, waiting for content...")
                                 }
                                 Err(err) => {
+                                    // No process will read it.
+                                    drop(key_file.take());
                                     error!("Error spawning terminal: {}", err);
                                     // Show the terminal anyway so the error is visible.
                                     stack.set_visible_child_name("terminal");

@@ -1961,7 +1961,12 @@ impl Inner {
         }
         self.switch_held.set(true);
         let to = to.map_or("the new agent", |d| d.info().long_label);
-        let current = self.adapter.borrow().driver().info().long_label;
+        let current = match self.adapter.borrow().driver().info().long_label {
+            // The new agent may already be the one running (stopped after it was installed, or
+            // a move between profiles of one agent): name it once.
+            label if label == to => "the agent this thread runs now",
+            label => label,
+        };
         let (messages, were, wait, them) = if queued == 1 {
             ("1 message".to_owned(), "was", "It waits", "it")
         } else {
@@ -2431,11 +2436,25 @@ impl Inner {
                     inner.spawn_spec_now(generation, spec, None);
                     inner.flush_or_keep(generation, pending.writes, pending.prompts, pending.news);
                 }
-                // As a spawn that failed: a switch's new agent goes back to the old one, and the
-                // start's messages are kept for the agent that runs next.
                 Err(reason) => {
-                    inner.not_spawned(format!("The agent was not started: {reason}."));
-                    inner.flush_or_keep(generation, pending.writes, pending.prompts, pending.news);
+                    let message = format!("The agent was not started: {reason}.");
+                    // A switch's new agent goes back to the old one, as one that could not be
+                    // spawned does, and the start's messages are kept for the agent that runs
+                    // next.
+                    if inner.rollback.borrow().is_some() {
+                        inner.not_spawned(message);
+                        inner.flush_or_keep(
+                            generation,
+                            pending.writes,
+                            pending.prompts,
+                            pending.news,
+                        );
+                        return;
+                    }
+                    // Any other start ends as a refused one always has.
+                    inner.error(message);
+                    inner.finish_process(Some(1), false);
+                    inner.keep_unsent_prompts(pending.prompts);
                 }
             }
         });

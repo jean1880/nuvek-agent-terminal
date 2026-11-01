@@ -278,6 +278,12 @@ fn a_stop_that_drops_a_switch_continuation_never_sends_what_it_carried() {
             ),
             "the hold is not said"
         );
+        // Claude to Claude: the agent is named once, never as both ends of the switch.
+        assert!(
+            has(&s.seen, |e| matches!(e, Event::Notice { text }
+                if text.contains("send the queue to the agent this thread runs now"))),
+            "the running agent is named as if it were another"
+        );
         s.session.shutdown(false);
     });
 }

@@ -17,6 +17,11 @@ const MAX_SERVER_REQUESTS: usize = 128;
 /// Notifications read between two responses before the rest count as dropped. None is ever
 /// kept (only `tools/list_changed` marks discovery stale), so a chatty server costs no memory.
 const MAX_NOTIFICATIONS: usize = 128;
+/// Notifications between two responses past which the connection fails: a server streaming
+/// them for ever would otherwise keep this runtime's reader busy, idle or not. Far above any
+/// progress or log stream of a real call (10,000 frames, or 16 MiB of them).
+const NOTIFICATION_CEILING_FRAMES: usize = 10_000;
+const NOTIFICATION_CEILING_BYTES: usize = 16 * 1024 * 1024;
 
 pub(super) struct ClientTransport<R, W> {
     reader: FrameReader<R>,
@@ -88,6 +93,7 @@ where
         }
         let mut requests = 0usize;
         let mut notifications = 0usize;
+        let mut notification_bytes = 0usize;
         loop {
             let line = match self.reader.next_frame().await {
                 Ok(Some(line)) => line,
@@ -128,15 +134,24 @@ where
                         return None;
                     }
                     if write_value(&self.writer, json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"Client requests are unsupported"}}), MAX_FRAME, Duration::from_secs(5)).await.is_err() { self.fail("MCP reverse response could not be written."); return None; }
-                } else if value.get("method").and_then(Value::as_str)
-                    == Some("notifications/tools/list_changed")
-                {
-                    self.stale.store(true, std::sync::atomic::Ordering::Release);
                 } else {
-                    // Progress and log messages are never kept; past the limit they are
-                    // counted as dropped, never a reason to end the connection.
                     notifications += 1;
-                    if notifications > MAX_NOTIFICATIONS {
+                    notification_bytes = notification_bytes.saturating_add(line.len());
+                    if notifications > NOTIFICATION_CEILING_FRAMES
+                        || notification_bytes > NOTIFICATION_CEILING_BYTES
+                    {
+                        self.fail(
+                            "MCP server exceeded the notification ceiling between responses.",
+                        );
+                        return None;
+                    }
+                    if value.get("method").and_then(Value::as_str)
+                        == Some("notifications/tools/list_changed")
+                    {
+                        self.stale.store(true, std::sync::atomic::Ordering::Release);
+                    } else if notifications > MAX_NOTIFICATIONS {
+                        // Progress and log messages are never kept; past the limit they are
+                        // counted as dropped until the ceiling ends the connection.
                         self.dropped = self.dropped.saturating_add(1);
                     }
                 }
@@ -252,6 +267,43 @@ mod tests {
                 let mut transport = ClientTransport::new(input.as_bytes(), writer);
                 assert!(transport.receive().await.is_none());
                 assert!(transport.failure.lock().unwrap().is_some());
+
+                // A stream that never stops ends at the ceiling, by count or by bytes.
+                let padded = format!(
+                    "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{{\"data\":\"{}\"}}}}\n",
+                    "x".repeat(512 * 1024)
+                );
+                for input in [
+                    format!(
+                        "{}{response}",
+                        notification.repeat(NOTIFICATION_CEILING_FRAMES + 1)
+                    ),
+                    format!(
+                        "{}{response}",
+                        padded.repeat(NOTIFICATION_CEILING_BYTES / (512 * 1024) + 1)
+                    ),
+                ] {
+                    let (writer, _peer) = tokio::io::duplex(4096);
+                    let mut transport = ClientTransport::new(input.as_bytes(), writer);
+                    assert!(transport.receive().await.is_none());
+                    assert!(transport
+                        .failure
+                        .lock()
+                        .unwrap()
+                        .is_some_and(|why| why.contains("notification ceiling")));
+                }
+                // Just under it, the response still arrives.
+                let input = format!(
+                    "{}{response}",
+                    notification.repeat(NOTIFICATION_CEILING_FRAMES)
+                );
+                let (writer, _peer) = tokio::io::duplex(4096);
+                let mut transport = ClientTransport::new(input.as_bytes(), writer);
+                let request =
+                    serde_json::from_value(json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
+                        .unwrap();
+                transport.send(request).await.unwrap();
+                assert!(transport.receive().await.is_some());
             });
     }
 

@@ -429,8 +429,9 @@ Architectural mandates, standards, and workflows for this codebase.
   importing. Each runs under a guardian (`--local-mcp-guardian`) in its own process group,
   with a minimal exact environment (`PATH`, `HOME`, locale, `TMPDIR`, `XDG_RUNTIME_DIR`, plus
   the definition's references and literals; never a control variable), bounded frames (1 MiB),
-  server requests (128 between responses, each refused; notifications are never kept, and past
-  128 between responses are counted as dropped, never a reason to end the connection),
+  server requests (128 between responses, each refused; notifications are never kept: past
+  128 between responses they are counted as dropped, and only past 10,000 or 16 MiB of them
+  between responses does the connection end, so an endless stream cannot spin its reader),
   discovery (256 tools a server, 1,024 a session), schemas (64 KiB, compiled with a linear
   regex engine, no external `$ref`), arguments (64 KiB) and stderr tail (64 KiB). A turn's
   registry is frozen at its start: the model sees short aliases (`mcp_<hash>`), routed only

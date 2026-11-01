@@ -600,7 +600,8 @@ impl StreamReader {
             slot.id = id.to_owned();
         }
         let function = &call["function"];
-        if let Some(name) = function["name"].as_str() {
+        // Some servers send the whole name again with every fragment: a repeat is not added.
+        if let Some(name) = function["name"].as_str().filter(|n| *n != slot.name) {
             slot.name.push_str(name);
         }
         match &function["arguments"] {
@@ -1284,6 +1285,28 @@ data: [DONE]"#;
             .collect();
         assert_eq!(inputs, [json!({"file_path": "a.rs"}), json!({"path": "."})]);
         assert_eq!(reply.tool_calls[1].id, "b");
+    }
+
+    #[test]
+    fn a_name_sent_again_with_every_fragment_is_kept_once() {
+        let mut reader = StreamReader::new();
+        for line in [
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"read_file","arguments":"{\"file_path\":"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read_file","arguments":"\"a.rs\"}"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"b","function":{"name":"list_","arguments":"{}"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"name":"dir"}}]},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ] {
+            reader.feed(line);
+        }
+        let (reply, _) = reader.finish();
+        assert_eq!(reply.tool_calls[0].function.name, "read_file");
+        assert_eq!(
+            reply.tool_calls[0].input(),
+            Ok(json!({"file_path": "a.rs"}))
+        );
+        // A name that is split, not repeated, is still put together.
+        assert_eq!(reply.tool_calls[1].function.name, "list_dir");
     }
 
     #[test]

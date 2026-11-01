@@ -306,7 +306,8 @@ Architectural mandates, standards, and workflows for this codebase.
   window missing from the readings, or one still full that names no reset time) continues blind
   15 minutes after its last refusal, and only once every time a window still holding it names
   has passed; a refusal of that guess is a refused continuation like any other, so the guesses
-  double up to 6 hours. A thread whose profile runs a model server, and the Local agent, read no
+  double up to 6 hours. A thread whose process was launched on a model server
+  (`ChatSession::launched_server`, never the live Settings), and the Local agent, read no
   vendor windows (another thread's reading of the vendor says nothing of them) and are never
   probed for one: their waits end that way.
   Readings count from when windows last arrived (`updated_at`), never an account-only
@@ -321,8 +322,8 @@ Architectural mandates, standards, and workflows for this codebase.
   continuation ends a stop that held the root). While the thread waits, sub-agent news does not wake it (`TurnPurpose::Wake`); it
   arrives after the continuation. The wait ends when the agent works again (`limit_over`, the
   one test for the window and the session), the thread switches agent or moves its agent to or
-  from a model server (`AgentSource`: the agent and the server its process's profile runs it
-  on; the hand-off included; once the new agent is up, `LimitRecord::moved_on`, so a switch that
+  from a model server (`AgentSource`: the agent and the server its process was launched on,
+  `ChatSession::launched_server`, never the live Settings; the hand-off included; once the new agent is up, `LimitRecord::moved_on`, so a switch that
   rolls back keeps it, in the window and the session alike), the
   user stops it, the user picks "Don't Continue" on its banner, or the setting
   goes off. "Continue in …" on the limit's banner (and a bare `/handoff` while the thread is

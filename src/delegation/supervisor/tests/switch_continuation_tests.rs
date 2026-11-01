@@ -277,6 +277,7 @@ async fn busy_root(
     let program = new_script.to_string_lossy().into_owned();
     session.set_adapter_factory(Rc::new(move |driver, _| {
         Ok(AgentLaunch {
+            server: None,
             profile: None,
             adapter: Box::new(Relabelled {
                 inner: agent_core::claude::ClaudeAdapter::new(),

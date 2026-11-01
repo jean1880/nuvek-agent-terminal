@@ -257,7 +257,7 @@ impl Supervisor {
             });
         }
     }
-    async fn reserve_run(&self, entry: &Delivery) -> Result<Option<RunId>, ToolError> {
+    pub(super) async fn reserve_run(&self, entry: &Delivery) -> Result<Option<RunId>, ToolError> {
         if !matches!(entry.input.plan, DeliveryPlan::StartTurn) {
             return Ok(None);
         }
@@ -282,15 +282,18 @@ impl Supervisor {
                 s.atomically(|s| {
                     if let Some(run) = s.active_delegation_run(worker.as_str())? {
                         return RunId::parse(&run.id)
+                            .map(Ok)
                             .map_err(|e| agent_kit::store::StoreError::Failed(e.to_string()));
                     }
                     let root = s
                         .delegation_root_of_worker(&worker)?
                         .ok_or(agent_kit::store::StoreError::WriterGone)?;
+                    // The authority moved on: refused as stale, never a storage failure.
                     if root.authority_epoch != epoch.0 as i64 {
-                        return Err(agent_kit::store::StoreError::Failed(
-                            "stale authority while reserving follow-up".into(),
-                        ));
+                        return Ok(Err(error(
+                            ErrorCode::StaleEpoch,
+                            "stale authority while reserving follow-up",
+                        )));
                     }
                     let suffix = s.new_id()?.replace('-', "");
                     let run = RunId::from_suffix(&suffix)
@@ -308,10 +311,10 @@ impl Supervisor {
                         created_at: super::supervisor::now(),
                         updated_at: super::supervisor::now(),
                     })?;
-                    Ok(run)
+                    Ok(Ok(run))
                 })
             })
-            .await?;
+            .await??;
         if let Some(w) = self.state.borrow_mut().workers.get_mut(&entry.worker) {
             w.run = Some(run.clone());
         }

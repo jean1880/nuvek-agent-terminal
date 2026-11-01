@@ -209,6 +209,39 @@ fn an_auto_send_whose_run_ends_during_its_acceptance_waits_for_the_next_turn() {
     });
 }
 
+/// A follow-up run reserved under an epoch that moved on is refused as stale, never reported
+/// as a storage failure.
+#[test]
+fn a_follow_up_reserved_under_a_stale_epoch_is_refused_as_stale() {
+    in_context(async {
+        let (_dir, sup, root) = harness();
+        let worker = spawn_idle(&sup, &root, "stale-follow-up").await;
+        let current = sup.epoch(&root).unwrap();
+        let entry = crate::delegation::deferred::Delivery {
+            worker: worker.clone(),
+            input: crate::delegation::seam::DelegatedInput {
+                operation: OperationId::from_suffix(&"5".repeat(32)).unwrap(),
+                epoch: agent_core::delegation::AuthorityEpoch(current.0 + 1),
+                source: crate::delegation::seam::InputSource::Message {
+                    id: MessageId::from_suffix(&"5".repeat(32)).unwrap(),
+                    kind: agent_core::delegation::mailbox::MessageKind::Instruction,
+                },
+                from: root.clone(),
+                from_label: "root".into(),
+                text: "later".into(),
+                plan: agent_core::delegation::mailbox::DeliveryPlan::StartTurn,
+                tag: "stale".into(),
+            },
+            policy: Delivery::NextTurn,
+            reserved: true,
+        };
+        let e = sup.reserve_run(&entry).await.expect_err("stale");
+        assert_eq!(e.code, ErrorCode::StaleEpoch, "{e:?}");
+        assert!(sup.state.borrow().workers[&worker].run.is_none());
+        stop(&sup).await;
+    });
+}
+
 /// A binding staged for `worker` that never launched (a launch about to start).
 fn plant_staged(sup: &Rc<Supervisor>, worker: &WorkerId) {
     let binding = PreparedBinding {

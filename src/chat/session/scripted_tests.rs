@@ -587,6 +587,7 @@ fn scripted_codex_claude_codex_switch_routes_replies_and_recovers_a_failed_switc
                 args.push("--claude".into());
             }
             Ok(AgentLaunch {
+                server: None,
                 profile: None,
                 adapter: if driver == Driver::Claude {
                     Box::new(ClaudeAdapter::new())
@@ -654,6 +655,49 @@ fn scripted_codex_claude_codex_switch_routes_replies_and_recovers_a_failed_switc
         assert!(fixture.frames().iter().any(|f| f["connection"] == 4
             && f["dir"] == "in"
             && f["frame"]["result"] == json!({"decision": "accept"})));
+        session.shutdown(false);
+    });
+}
+
+/// A busy switch to another profile of the same agent that cannot start leaves the running
+/// turn alone: nothing is sent into it to "continue" a task that never moved.
+#[test]
+fn a_failed_busy_switch_to_another_profile_sends_nothing_into_the_old_turn() {
+    in_loop(|ctx| {
+        let fixture = Fixture::new();
+        let session = fixture.session();
+        fixture.prompt(&session, "pending");
+        let pending = fixture.wait_pending(ctx);
+        session.set_adapter_factory(Rc::new(|_, _| Err("The other profile is off.".into())));
+        session.switch_to(
+            Driver::Codex,
+            SwitchTarget {
+                profile: "other".into(),
+                label: "Other".into(),
+            },
+            None,
+            None,
+        );
+        fixture.wait(ctx, "the switch is refused", || {
+            fixture
+                .seen
+                .borrow()
+                .iter()
+                .any(|e| matches!(&e.event, Event::Error { message } if message.contains("is off")))
+        });
+        // Whatever a continuation would have written has had its chance.
+        let until = std::time::Instant::now() + Duration::from_millis(200);
+        pump_until(ctx, 1, || std::time::Instant::now() > until);
+        assert_eq!(session.status().driver, Driver::Codex);
+        assert!(session.status().alive);
+        assert!(session.inner.switch_continuation.borrow().is_none());
+        let continued = fixture
+            .incoming()
+            .iter()
+            .any(|f| f.to_string().contains("Continue the unfinished task"));
+        assert!(!continued, "no continuation went to the old process");
+        session.respond_approval(&pending, Decision::Allow);
+        fixture.wait_finished(ctx);
         session.shutdown(false);
     });
 }

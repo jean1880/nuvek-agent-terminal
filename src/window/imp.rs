@@ -26,7 +26,7 @@ use crate::config::{Profile, SessionFormat};
 use crate::dialogs::confirm_dialog;
 use crate::handoff::QuotaState;
 use crate::theme::Theme;
-use crate::utils::{get_startup_command, resolve_profile, resolve_working_directory, Launch};
+use crate::utils::{resolve_profile, resolve_working_directory, Launch};
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk4::glib;
@@ -4068,12 +4068,13 @@ impl AgentTerminalWindow {
                 return;
             }
         };
-        let command = get_startup_command(on_provider.as_ref(), launch);
-        let env_file = profile.and_then(|p| p.env_file.clone());
-        info!(
-            "Spawning terminal with shell: {}, command: {:?}",
-            shell, command
-        );
+        // Made a shell command only once Claude's key helper is bound to the tab's key file,
+        // written off the main thread below.
+        let mut argv = crate::utils::startup_argv(on_provider.as_ref(), launch);
+        let env_file = profile
+            .and_then(|p| p.env_file.clone())
+            .filter(|f| !f.trim().is_empty());
+        info!("Spawning terminal with shell: {}, argv: {:?}", shell, argv);
 
         // Switch off the loading screen as soon as the command prints anything,
         // then disconnect: this signal fires on every screen update for the life
@@ -4157,11 +4158,18 @@ impl AgentTerminalWindow {
                 if let Some(path) = env_file {
                     // With the patterns: an export of a cleared variable equal to its inherited
                     // value is kept, since the block below no longer has it to fall back on.
-                    let extra = gtk4::gio::spawn_blocking(move || {
-                        crate::utils::load_env_file_for_profile(&path, &clear).unwrap_or_default()
+                    let read = gtk4::gio::spawn_blocking(move || {
+                        crate::utils::load_env_file_for_profile(&path, &clear)
                     })
                     .await
-                    .unwrap_or_default();
+                    .unwrap_or_else(|_| Err("reading the environment file failed".to_owned()));
+                    let extra = match crate::utils::terminal_env_file(read, provider.is_some()) {
+                        Ok(extra) => extra,
+                        Err(why) => {
+                            refuse_terminal(&obj, &stack, &terminal, &why);
+                            return;
+                        }
+                    };
 
                     // Later entries win in the environment block, so appending
                     // lets the profile override an inherited value.
@@ -4170,17 +4178,70 @@ impl AgentTerminalWindow {
                         env_strs.push(format!("{key}={value}"));
                     }
                 }
+                let mut key_file = crate::agent_proc::KeyFileHold::default();
+                let mut prelude = String::new();
                 if let Some((provider, driver)) = &provider {
-                    if let Err(why) = crate::utils::apply_provider_env(
+                    let key = match crate::utils::apply_provider_env(
                         provider,
                         *driver,
                         terminal_model.as_deref(),
+                        &shell,
                         &mut env_strs,
                     ) {
-                        refuse_terminal(&obj, &stack, &terminal, &why);
-                        return;
+                        // Run after the user's rc, which may export the vendor's variables
+                        // again: environment only, nothing written to the terminal.
+                        Ok((text, key)) => {
+                            prelude = text;
+                            key
+                        }
+                        Err(why) => {
+                            refuse_terminal(&obj, &stack, &terminal, &why);
+                            return;
+                        }
+                    };
+                    // The key goes to the file the command line's key helper reads.
+                    if let (Some(key), Some(argv)) = (key, argv.as_mut()) {
+                        match crate::agent_proc::write_key_file(argv, key).await {
+                            Ok(file) => key_file = file,
+                            Err(why) => {
+                                refuse_terminal(&obj, &stack, &terminal, &why);
+                                return;
+                            }
+                        }
                     }
                 }
+                // A key helper never bound to a key file never starts.
+                if argv
+                    .as_deref()
+                    .is_some_and(agent_core::provider::needs_key_file)
+                {
+                    refuse_terminal(
+                        &obj,
+                        &stack,
+                        &terminal,
+                        "Cannot start: the model server's key was not prepared for this tab.",
+                    );
+                    return;
+                }
+                let mut command = crate::utils::exec_command(argv.as_deref());
+                command[1] = format!("{prelude}{}", command[1]);
+                // Kept until the tab's process exits (or the tab goes), then removed.
+                let key_file = std::rc::Rc::new(RefCell::new(Some(key_file)));
+                let exited: std::rc::Rc<RefCell<Option<glib::SignalHandlerId>>> =
+                    std::rc::Rc::new(RefCell::new(None));
+                let id = terminal.connect_child_exited(glib::clone!(
+                    #[strong]
+                    key_file,
+                    #[strong]
+                    exited,
+                    move |terminal, _| {
+                        drop(key_file.take());
+                        if let Some(id) = exited.borrow_mut().take() {
+                            terminal.disconnect(id);
+                        }
+                    }
+                ));
+                exited.replace(Some(id));
 
                 let env_ptrs: Vec<&str> = env_strs.iter().map(String::as_str).collect();
                 spawn_with_exact_env(
@@ -4193,12 +4254,16 @@ impl AgentTerminalWindow {
                         obj,
                         #[weak]
                         stack,
+                        #[strong]
+                        key_file,
                         move |result| {
                             match result {
                                 Ok(_) => {
                                     info!("Terminal process spawned, waiting for content...")
                                 }
                                 Err(err) => {
+                                    // No process will read it.
+                                    drop(key_file.take());
                                     error!("Error spawning terminal: {}", err);
                                     // Show the terminal anyway so the error is visible.
                                     stack.set_visible_child_name("terminal");

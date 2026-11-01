@@ -158,6 +158,7 @@ fn registered_theme_resolves_bundled_icons() {
         icons::CLAUDE_ICON,
         icons::AGY_ICON,
         icons::CODEX_ICON,
+        icons::LOCAL_ICON,
         icons::THINKING_ICON,
         icons::APP_ICON,
         "at-chat-message-new-symbolic",

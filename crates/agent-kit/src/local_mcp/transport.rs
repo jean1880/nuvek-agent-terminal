@@ -7,12 +7,51 @@ use std::{
     future::Future,
     io,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
 pub(super) const MAX_FRAME: usize = 1024 * 1024;
-const MAX_UNSOLICITED: usize = 128;
+/// Server requests (each answered with an error) allowed between two responses.
+const MAX_SERVER_REQUESTS: usize = 128;
+/// Notifications read between two responses before the rest count as dropped. None is ever
+/// kept (only `tools/list_changed` marks discovery stale), so a chatty server costs no memory.
+const MAX_NOTIFICATIONS: usize = 128;
+/// The notification rate past which the connection fails: more than 2,000 frames, or 8 MiB
+/// of them, within one fixed 10 s window (so at most twice that across a window boundary).
+/// A server streaming them without pause would otherwise keep this runtime's reader busy,
+/// idle or not; a server that logs now and then, for hours, never comes near it.
+const NOTIFICATION_RATE_FRAMES: usize = 2_000;
+const NOTIFICATION_RATE_BYTES: usize = 8 * 1024 * 1024;
+const NOTIFICATION_WINDOW: Duration = Duration::from_secs(10);
+
+/// The time source of the notification rate; tests supply their own.
+type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+/// Notifications read in the current rate window.
+struct RateWindow {
+    clock: Clock,
+    start: Option<Instant>,
+    frames: usize,
+    bytes: usize,
+}
+impl RateWindow {
+    /// Counts one notification; false once the rate is passed.
+    fn admit(&mut self, bytes: usize) -> bool {
+        let now = (self.clock)();
+        if self
+            .start
+            .is_none_or(|start| now.saturating_duration_since(start) >= NOTIFICATION_WINDOW)
+        {
+            self.start = Some(now);
+            self.frames = 0;
+            self.bytes = 0;
+        }
+        self.frames += 1;
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.frames <= NOTIFICATION_RATE_FRAMES && self.bytes <= NOTIFICATION_RATE_BYTES
+    }
+}
 
 pub(super) struct ClientTransport<R, W> {
     reader: FrameReader<R>,
@@ -22,12 +61,24 @@ pub(super) struct ClientTransport<R, W> {
     pub closed: Arc<std::sync::atomic::AtomicBool>,
     pub failure: Arc<Mutex<Option<&'static str>>>,
     pub received_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    /// Notifications past [`MAX_NOTIFICATIONS`] in one wait for a response.
+    dropped: usize,
+    rate: RateWindow,
     ended: bool,
 }
 
 impl<R: AsyncRead, W: AsyncWrite> ClientTransport<R, W> {
     pub fn new(reader: R, writer: W) -> Self {
+        Self::with_clock(reader, writer, Arc::new(Instant::now))
+    }
+    fn with_clock(reader: R, writer: W, clock: Clock) -> Self {
         Self {
+            rate: RateWindow {
+                clock,
+                start: None,
+                frames: 0,
+                bytes: 0,
+            },
             reader: FrameReader::new(reader, MAX_FRAME),
             writer: Arc::new(tokio::sync::Mutex::new(Some(writer))),
             pending: Default::default(),
@@ -35,6 +86,7 @@ impl<R: AsyncRead, W: AsyncWrite> ClientTransport<R, W> {
             closed: Default::default(),
             failure: Default::default(),
             received_bytes: Default::default(),
+            dropped: 0,
             ended: false,
         }
     }
@@ -79,7 +131,9 @@ where
         if self.ended {
             return None;
         }
-        for _ in 0..MAX_UNSOLICITED {
+        let mut requests = 0usize;
+        let mut notifications = 0usize;
+        loop {
             let line = match self.reader.next_frame().await {
                 Ok(Some(line)) => line,
                 Ok(None) => {
@@ -112,11 +166,28 @@ where
                         self.fail("Invalid MCP request ID.");
                         return None;
                     }
+                    // Each request costs a written answer: a server that keeps asking fails.
+                    requests += 1;
+                    if requests > MAX_SERVER_REQUESTS {
+                        self.fail("MCP server exceeded the server request limit.");
+                        return None;
+                    }
                     if write_value(&self.writer, json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"Client requests are unsupported"}}), MAX_FRAME, Duration::from_secs(5)).await.is_err() { self.fail("MCP reverse response could not be written."); return None; }
-                } else if value.get("method").and_then(Value::as_str)
-                    == Some("notifications/tools/list_changed")
-                {
-                    self.stale.store(true, std::sync::atomic::Ordering::Release);
+                } else {
+                    notifications += 1;
+                    if !self.rate.admit(line.len()) {
+                        self.fail("MCP server exceeded the notification rate limit.");
+                        return None;
+                    }
+                    if value.get("method").and_then(Value::as_str)
+                        == Some("notifications/tools/list_changed")
+                    {
+                        self.stale.store(true, std::sync::atomic::Ordering::Release);
+                    } else if notifications > MAX_NOTIFICATIONS {
+                        // Progress and log messages are never kept; past the limit they are
+                        // counted as dropped unless their rate ends the connection.
+                        self.dropped = self.dropped.saturating_add(1);
+                    }
                 }
                 tokio::task::yield_now().await;
                 continue;
@@ -149,8 +220,6 @@ where
                 }
             }
         }
-        self.fail("MCP server exceeded the unsolicited frame limit.");
-        None
     }
     async fn close(&mut self) -> io::Result<()> {
         self.ended = true;
@@ -165,6 +234,13 @@ impl<R, W> Drop for ClientTransport<R, W> {
     fn drop(&mut self) {
         self.closed
             .store(true, std::sync::atomic::Ordering::Release);
+        if self.dropped > 0 {
+            // A count only: notification contents never reach a log.
+            eprintln!(
+                "agent-terminal: an MCP server sent {} notifications past the limit of {MAX_NOTIFICATIONS} between responses; they were dropped.",
+                self.dropped
+            );
+        }
     }
 }
 
@@ -193,6 +269,105 @@ mod tests {
                         .unwrap()
                         .unwrap()
                         .contains("secret-canary"));
+                }
+            });
+    }
+
+    #[test]
+    fn chatty_notifications_are_dropped_and_only_server_requests_are_bounded() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let notification =
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n";
+                let response = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n";
+                let input = format!("{}{response}", notification.repeat(1000));
+                let (writer, _peer) = tokio::io::duplex(4096);
+                let mut transport = ClientTransport::new(input.as_bytes(), writer);
+                let request =
+                    serde_json::from_value(json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
+                        .unwrap();
+                transport.send(request).await.unwrap();
+                assert!(transport.receive().await.is_some());
+                assert_eq!(transport.dropped, 1000 - MAX_NOTIFICATIONS);
+                assert!(transport.failure.lock().unwrap().is_none());
+
+                let ask =
+                    "{\"jsonrpc\":\"2.0\",\"id\":\"r\",\"method\":\"sampling/createMessage\"}\n";
+                let input = format!("{}{response}", ask.repeat(MAX_SERVER_REQUESTS + 1));
+                let (writer, _peer) = tokio::io::duplex(1024 * 1024);
+                let mut transport = ClientTransport::new(input.as_bytes(), writer);
+                assert!(transport.receive().await.is_none());
+                assert!(transport.failure.lock().unwrap().is_some());
+            });
+    }
+
+    /// A clock that moves on by `step` each time it is read: one read per notification.
+    fn stepping(step: Duration) -> Clock {
+        let now = Arc::new(Mutex::new(Instant::now()));
+        Arc::new(move || {
+            let mut now = now.lock().unwrap();
+            *now += step;
+            *now
+        })
+    }
+
+    #[test]
+    fn a_slow_trickle_of_notifications_survives_and_a_burst_ends_the_connection() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let notification =
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{}}\n";
+                let response = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n";
+                let padded = format!(
+                    "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{{\"data\":\"{}\"}}}}\n",
+                    "x".repeat(512 * 1024)
+                );
+                let run = |input: String, step: Duration| async move {
+                    let (writer, _peer) = tokio::io::duplex(4096);
+                    let mut transport =
+                        ClientTransport::with_clock(input.as_bytes(), writer, stepping(step));
+                    let request =
+                        serde_json::from_value(json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
+                            .unwrap();
+                    transport.send(request).await.unwrap();
+                    let answered = transport.receive().await.is_some();
+                    let failure = *transport.failure.lock().unwrap();
+                    (answered, failure)
+                };
+                // One log line every 2 s for almost seven idle hours, then the response.
+                let (answered, failure) = run(
+                    format!("{}{response}", notification.repeat(12_000)),
+                    Duration::from_secs(2),
+                )
+                .await;
+                assert!(answered && failure.is_none());
+                // As fast as the window allows, but no faster, also survives.
+                let (answered, _) = run(
+                    format!("{}{response}", notification.repeat(NOTIFICATION_RATE_FRAMES)),
+                    Duration::ZERO,
+                )
+                .await;
+                assert!(answered);
+                // A burst past the rate ends it, by count or by bytes.
+                for input in [
+                    format!(
+                        "{}{response}",
+                        notification.repeat(NOTIFICATION_RATE_FRAMES + 1)
+                    ),
+                    format!(
+                        "{}{response}",
+                        padded.repeat(NOTIFICATION_RATE_BYTES / (512 * 1024) + 1)
+                    ),
+                ] {
+                    let (answered, failure) = run(input, Duration::from_millis(1)).await;
+                    assert!(!answered);
+                    assert!(failure.is_some_and(|why| why.contains("notification rate")));
                 }
             });
     }

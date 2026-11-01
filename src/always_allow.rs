@@ -1124,8 +1124,11 @@ impl Action {
                         tool: tool.to_owned(),
                     });
                 }
-                let server = first_str(input, &["ServerName", "server_name", "server", "Server"])?;
-                let tool = first_str(input, &["ToolName", "tool_name", "tool", "Name"])?;
+                // agy matches argument names without regard to case and acts on the last one,
+                // so every spelling present must agree.
+                use crate::approval_server::sole_str;
+                let server = sole_str(input, &["ServerName", "server_name", "server"])?;
+                let tool = sole_str(input, &["ToolName", "tool_name", "tool", "Name"])?;
                 Some(Self::Mcp {
                     server: server.to_owned(),
                     tool: tool.to_owned(),
@@ -5500,6 +5503,27 @@ mod tests {
         .expect("agy mcp");
         assert!(r.matches(&agy_mcp, &agy));
         assert!(!r.matches(&shell("fs/read"), &agy));
+    }
+
+    #[test]
+    fn an_agy_mcp_call_whose_spellings_disagree_is_no_action() {
+        for input in [
+            serde_json::json!({"ServerName": "fs", "serverName": "github", "ToolName": "read"}),
+            serde_json::json!({"ServerName": "fs", "ToolName": "read", "toolname": "write"}),
+            serde_json::json!({"ServerName": "fs", "SERVER": 7, "ToolName": "read"}),
+        ] {
+            assert_eq!(Action::of("call_mcp_tool", &input), None, "{input}");
+        }
+        assert_eq!(
+            Action::of(
+                "call_mcp_tool",
+                &serde_json::json!({"servername": "fs", "ServerName": "fs", "ToolName": "read"}),
+            ),
+            Some(Action::Mcp {
+                server: "fs".into(),
+                tool: "read".into()
+            })
+        );
     }
 
     #[test]

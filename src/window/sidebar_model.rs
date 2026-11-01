@@ -2,7 +2,6 @@
 //! and relative time. No GTK, so it is tested without a display.
 
 use agent_core::adapter::{Driver, Mode};
-use agent_core::event::{Event, ItemKind, TurnState};
 
 /// What a sidebar row opens.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -619,23 +618,9 @@ pub fn safe_handoff_target(
 }
 
 /// Whether `event` shows a rate-limited agent answering again, so its banner (and its
-/// "Continue in …") can go: an item of its own, or a turn that completed with output. A turn
-/// merely starting is not: Claude starts one itself to read a finished task, and a retry the
-/// limit refuses starts one too; hiding the banner then took the offer away (2026-10-11). Only a
-/// top-level item counts: a sub-agent started before the limit can still stream under it.
-pub fn limit_over(event: &Event) -> bool {
-    match event {
-        Event::ItemStarted {
-            kind, parent: None, ..
-        } => *kind != ItemKind::UserMessage,
-        Event::TurnCompleted {
-            state: TurnState::Completed,
-            usage: Some(usage),
-            ..
-        } => usage.output_tokens > 0,
-        _ => false,
-    }
-}
+/// "Continue in …") can go: the same test that ends a thread's limit wait, in the window and in
+/// its session.
+pub use agent_core::limit_wait::limit_over;
 
 /// The wait banner's title while a thread waits for `driver`'s usage limit to reset; `clock`:
 /// the reset's local time, when known.
@@ -1886,7 +1871,7 @@ mod tests {
     /// retry the limit refused. None of those ends the limit; an answer does.
     #[test]
     fn only_an_answer_ends_a_rate_limit() {
-        use agent_core::event::Usage;
+        use agent_core::event::{Event, ItemKind, TurnState, Usage};
         let completed = |output_tokens| Event::TurnCompleted {
             state: TurnState::Completed,
             usage: Some(Usage {

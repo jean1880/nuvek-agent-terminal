@@ -790,9 +790,23 @@ fn launch_argv(profile: &Profile, launch: Launch<'_>) -> Vec<String> {
 /// A profile that cannot do what `launch` asks — resume, or take a prompt —
 /// starts a plain session with a warning. Callers are expected to pick a
 /// capable profile first; this is only the safety net.
+#[cfg(test)]
 pub fn get_startup_command(profile: Option<&Profile>, launch: Launch<'_>) -> Vec<String> {
-    match profile {
-        Some(profile) => {
+    exec_command(startup_argv(profile, launch).as_deref())
+}
+
+/// The argv a terminal tab of `profile` runs for `launch`, before it is made a shell command
+/// ([`exec_command`]); `None` without a profile (the user's own shell). Kept apart so a tab can
+/// bind its key file into it first.
+pub fn startup_argv(profile: Option<&Profile>, launch: Launch<'_>) -> Option<Vec<String>> {
+    profile.map(|profile| launch_argv(profile, launch))
+}
+
+/// The `$SHELL` arguments that `exec` `argv` (from [`startup_argv`]), each element shell-quoted;
+/// with none, the user's own shell.
+pub fn exec_command(argv: Option<&[String]>) -> Vec<String> {
+    match argv {
+        Some(argv) => {
             // `exec` is critical: it replaces the wrapping interactive shell with the
             // CLI so the CLI directly owns the controlling terminal (session leader).
             // Without it, `zsh -ic "claude"` runs claude as a *child job* of the shell,
@@ -803,10 +817,7 @@ pub fn get_startup_command(profile: Option<&Profile>, launch: Launch<'_>) -> Vec
             // the TTY at this point disrupts the CLI's initial terminal handshake.
             // A profile's env_file contributes environment instead, merged into the
             // spawn environment rather than sourced into the terminal.
-            let argv: Vec<String> = launch_argv(profile, launch)
-                .iter()
-                .map(|a| shell_quote(a))
-                .collect();
+            let argv: Vec<String> = argv.iter().map(|a| shell_quote(a)).collect();
             vec!["-ic".to_string(), format!("exec {}", argv.join(" "))]
         }
         None => vec!["-ic".to_string(), "exec $SHELL".to_string()],
@@ -829,6 +840,9 @@ pub fn terminal_provider(
 
 /// `profile` with its model provider's arguments after its own, for a terminal tab's command
 /// line. An `Err` refuses the tab: it never starts on the vendor's models.
+///
+/// With a key variable, Claude's key helper is left for the spawn to bind to the tab's key file
+/// (`agent_proc::write_key_file`): a command line still holding it never starts.
 pub fn with_provider_args(profile: &Profile, model: Option<&str>) -> Result<Profile, String> {
     let mut profile = profile.clone();
     if crate::config::profile_driver(&profile).is_some_and(agent_core::adapter::Driver::is_built_in)
@@ -837,7 +851,7 @@ pub fn with_provider_args(profile: &Profile, model: Option<&str>) -> Result<Prof
     }
     if let Some((provider, driver)) = terminal_provider(&profile) {
         let label = provider.kind.label();
-        let args = provider
+        let mut args = provider
             .args(driver)
             .map_err(|why| format!("Cannot start on {label}: {why}."))?;
         // The CLI is told its model: left to itself it starts on its own setting, which names
@@ -848,7 +862,10 @@ pub fn with_provider_args(profile: &Profile, model: Option<&str>) -> Result<Prof
                  this profile, or try again once its models are listed."
             )
         })?;
-        profile.args.extend(args);
+        agent_core::provider::bind_thread_model_args(&mut args, Some(model));
+        // A `--settings` of the profile's own is merged under Claude's overlay, never dropped.
+        profile.args = agent_core::provider::with_profile_settings(&profile.args, args)
+            .map_err(|why| format!("Cannot start on {label}: {why}"))?;
         profile
             .args
             .extend(agent_core::provider::model_args(driver, model));
@@ -856,16 +873,58 @@ pub fn with_provider_args(profile: &Profile, model: Option<&str>) -> Result<Prof
     Ok(profile)
 }
 
+/// What a terminal tab takes from its profile's env file (`read`): its variables, or none when
+/// it cannot be read. A tab on a model server (`on_provider`) refuses to start instead: the file
+/// may hold the server's key or the settings the profile needs there.
+pub fn terminal_env_file(
+    read: Result<Vec<(String, String)>, String>,
+    on_provider: bool,
+) -> Result<Vec<(String, String)>, String> {
+    match read {
+        Ok(vars) => Ok(vars),
+        Err(why) if on_provider => Err(format!("Cannot start on the model server: {why}.")),
+        Err(why) => {
+            warn!("Starting the terminal without its environment file: {why}");
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// The prefix of the private names a terminal tab's provider values reach its shell under.
+const PROVIDER_ENV_PREFIX: &str = "__AT_PROVIDER_";
+
+/// Whether `shell` (`$SHELL`, a path) runs `-c` text in POSIX syntax, where `unset` and
+/// `export` are builtins. fish, csh and the like do not.
+fn posix_shell(shell: &str) -> bool {
+    let name = shell.rsplit('/').next().unwrap_or(shell);
+    matches!(
+        name,
+        "sh" | "ash" | "bash" | "dash" | "ksh" | "ksh93" | "mksh" | "oksh" | "yash" | "zsh"
+    )
+}
+
 /// Applies a terminal tab's model provider to its environment block (`NAME=value` entries,
-/// later ones winning): the key comes from the block, the vendor's own variables go, the
-/// provider's are added, with Claude's own model names bound to `model` (the profile's default:
-/// the one the tab's CLI starts on). An `Err` refuses the tab.
+/// later ones winning) and returns the shell text that finishes the job, to put before the
+/// startup command's `exec`. The key comes from the block and the vendor's own variables go;
+/// the provider's values, with Claude's own model names bound to `model` (the profile's default:
+/// the one the tab's CLI starts on), are added under private names ([`PROVIDER_ENV_PREFIX`]).
+///
+/// `$SHELL -ic` runs the user's rc after the block is in place, and an rc may export the
+/// vendor's variables again. So the returned text, run after the rc, unsets the vendor's
+/// variables, copies each private value into its real name and unsets the private names. It is
+/// builtins and variable names only, never a value (the key never reaches argv), and writes
+/// nothing to the terminal. Empty when the provider sets no variable (Codex takes its provider
+/// on the command line). An `Err` refuses the tab, also when `shell` is not a POSIX shell.
+///
+/// The key itself is not among them: it is returned beside the text, for the tab's key file,
+/// which Claude's key helper reads; neither the shell nor the CLI ever has it.
 pub fn apply_provider_env(
     provider: &agent_core::provider::ModelProvider,
     driver: agent_core::adapter::Driver,
     model: Option<&str>,
+    shell: &str,
     env: &mut Vec<String>,
-) -> Result<(), String> {
+) -> Result<(String, Option<String>), String> {
     let value_of = |env: &[String], name: &str| {
         let prefix = format!("{name}=");
         env.iter()
@@ -881,14 +940,52 @@ pub fn apply_provider_env(
         .launch(driver, key.as_deref())
         .map_err(|why| format!("Cannot start on {}: {why}.", provider.kind.label()))?;
     agent_core::provider::bind_thread_model(&mut launch.env, model);
+    // The key goes to the tab's key file, never into its shell or the CLI's environment.
+    let key = launch
+        .env
+        .iter()
+        .position(|(k, _)| k == agent_core::provider::CLAUDE_KEY_VAR)
+        .map(|at| launch.env.remove(at).1);
+    let label = provider.kind.label();
+    if launch.env.is_empty() && launch.unset.is_empty() {
+        return Ok((String::new(), key));
+    }
+    if !posix_shell(shell) {
+        return Err(format!(
+            "Cannot start on {label}: a terminal tab on a model server needs sh, bash, zsh or \
+             another POSIX shell as $SHELL, not {shell}. Open it as a chat thread instead."
+        ));
+    }
+    let names_ok = launch
+        .unset
+        .iter()
+        .chain(launch.env.iter().map(|(k, _)| k))
+        .all(|name| agent_core::provider::valid_env_name(name));
+    if !names_ok {
+        return Err(format!(
+            "Cannot start on {label}: a variable name it sets is not one."
+        ));
+    }
     env.retain(|e| {
-        !launch
-            .unset
-            .iter()
-            .any(|name| e.split_once('=').is_some_and(|(k, _)| k == name))
+        e.split_once('=').is_none_or(|(k, _)| {
+            !k.starts_with(PROVIDER_ENV_PREFIX) && !launch.unset.iter().any(|name| name == k)
+        })
     });
-    env.extend(launch.env.into_iter().map(|(k, v)| format!("{k}={v}")));
-    Ok(())
+    let mut prelude = String::new();
+    if !launch.unset.is_empty() {
+        prelude.push_str(&format!("unset {}; ", launch.unset.join(" ")));
+    }
+    let mut private = Vec::new();
+    for (name, value) in launch.env {
+        let hidden = format!("{PROVIDER_ENV_PREFIX}{name}");
+        prelude.push_str(&format!("export {name}=\"${{{hidden}}}\"; "));
+        env.push(format!("{hidden}={value}"));
+        private.push(hidden);
+    }
+    if !private.is_empty() {
+        prelude.push_str(&format!("unset {}; ", private.join(" ")));
+    }
+    Ok((prelude, key))
 }
 
 #[cfg(test)]
@@ -925,6 +1022,58 @@ mod tests {
         assert!(resumed[1].contains("'-m' 'qwen3-coder'"), "{resumed:?}");
         // No model known: refused, never left to the CLI's own (vendor) setting.
         assert!(with_provider_args(&on(ProviderKind::Ollama, None), None).is_err());
+        // Claude's settings overlay names the tab's model.
+        let claude = with_provider_args(
+            &Profile {
+                command: "claude".into(),
+                driver: None,
+                ..on(ProviderKind::Ollama, None)
+            },
+            Some("qwen3-coder"),
+        )
+        .unwrap();
+        let at = claude.args.iter().position(|a| a == "--settings").unwrap();
+        let overlay = &claude.args[at + 1];
+        assert!(
+            overlay.contains("\"ANTHROPIC_MODEL\":\"qwen3-coder\""),
+            "{overlay}"
+        );
+        assert!(!overlay.contains(agent_core::provider::THREAD_MODEL));
+        // With a key, its helper is left for the spawn to bind to the tab's key file: the
+        // command line names no key, and is not started until it is bound.
+        let keyed = Profile {
+            command: "claude".into(),
+            driver: None,
+            ..on(ProviderKind::LiteLlm, Some("GW_KEY"))
+        };
+        let mut argv = startup_argv(
+            Some(&with_provider_args(&keyed, Some("m")).unwrap()),
+            Launch::Fresh,
+        )
+        .unwrap();
+        assert!(agent_core::provider::needs_key_file(&argv));
+        assert!(agent_core::provider::bind_key_file_args(
+            &mut argv,
+            "/run/u/k.key"
+        ));
+        assert!(!agent_core::provider::needs_key_file(&argv));
+        let command = exec_command(Some(&argv));
+        assert!(command[1].contains("cat -- "), "{command:?}");
+        // A `--settings` of the profile's own is merged into it, or refuses the tab.
+        let own = |value: &str| Profile {
+            command: "claude".into(),
+            driver: None,
+            args: vec!["--settings".into(), value.into()],
+            ..on(ProviderKind::Ollama, None)
+        };
+        let merged = with_provider_args(&own(r#"{"theme":"dark"}"#), Some("qwen3-coder")).unwrap();
+        assert_eq!(merged.args.iter().filter(|a| *a == "--settings").count(), 1);
+        assert!(
+            merged.args[1].contains("\"theme\":\"dark\""),
+            "{:?}",
+            merged.args
+        );
+        assert!(with_provider_args(&own("/home/u/claude.json"), Some("qwen3-coder")).is_err());
 
         let (provider, driver) = terminal_provider(&Profile {
             command: "claude".into(),
@@ -939,27 +1088,48 @@ mod tests {
             "CLAUDE_CODE_OAUTH_TOKEN=vendor".to_owned(),
             "ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-from-the-shell".to_owned(),
         ];
-        apply_provider_env(&provider, driver, Some("qwen3-coder"), &mut env).unwrap();
-        assert!(env.contains(&"ANTHROPIC_BASE_URL=http://gw:4000".to_owned()));
+        let (prelude, key) =
+            apply_provider_env(&provider, driver, Some("qwen3-coder"), "/bin/zsh", &mut env)
+                .unwrap();
+        // The key is handed back for the tab's key file: neither the shell nor the CLI gets it.
+        assert_eq!(key.as_deref(), Some("gateway-key"));
+        assert!(!env.iter().any(|e| e.contains("gateway-key")), "{env:?}");
+        // The values reach the shell under private names, copied into place after its rc ran.
+        let private = |name: &str| format!("{PROVIDER_ENV_PREFIX}{name}");
+        assert!(env.contains(&format!("{}=http://gw:4000", private("ANTHROPIC_BASE_URL"))));
         // Claude's own model names are the tab's model, the shell's value gone.
-        assert!(env.contains(&"ANTHROPIC_DEFAULT_HAIKU_MODEL=qwen3-coder".to_owned()));
-        assert!(env.contains(&"ANTHROPIC_MODEL=qwen3-coder".to_owned()));
+        assert!(env.contains(&format!(
+            "{}=qwen3-coder",
+            private("ANTHROPIC_DEFAULT_HAIKU_MODEL")
+        )));
         assert!(!env
             .iter()
             .any(|e| e.contains("claude-haiku-from-the-shell")));
-        let mut unknown = vec!["ANTHROPIC_API_KEY=k".to_owned()];
-        apply_provider_env(&provider, driver, None, &mut unknown).unwrap();
-        assert!(!unknown
-            .iter()
-            .any(|e| e.contains(agent_core::provider::THREAD_MODEL)));
-        assert!(env.contains(&"ANTHROPIC_AUTH_TOKEN=gateway-key".to_owned()));
         assert!(!env
             .iter()
             .any(|e| e.starts_with("ANTHROPIC_API_KEY=")
                 || e.starts_with("CLAUDE_CODE_OAUTH_TOKEN=")));
+        // The prelude names no value, the key least of all: only builtins and variable names.
+        assert!(!prelude.contains("gateway-key") && !prelude.contains("http://gw"));
+        assert!(prelude.starts_with("unset "), "{prelude}");
+        assert!(
+            !prelude.contains("export AGENT_TERMINAL_PROVIDER_KEY"),
+            "{prelude}"
+        );
+        assert!(prelude.ends_with("; "), "{prelude}");
+        let mut unknown = vec!["ANTHROPIC_API_KEY=k".to_owned()];
+        apply_provider_env(&provider, driver, None, "/bin/sh", &mut unknown).unwrap();
+        assert!(!unknown
+            .iter()
+            .any(|e| e.contains(agent_core::provider::THREAD_MODEL)));
+        // A shell whose syntax the prelude is not written in is refused.
+        let mut fish = vec!["ANTHROPIC_API_KEY=k".to_owned()];
+        let why =
+            apply_provider_env(&provider, driver, None, "/usr/bin/fish", &mut fish).unwrap_err();
+        assert!(why.contains("fish"), "{why}");
         // The key variable is not in the block: refused.
         let mut bare = vec!["HOME=/h".to_owned()];
-        assert!(apply_provider_env(&provider, driver, None, &mut bare).is_err());
+        assert!(apply_provider_env(&provider, driver, None, "/bin/sh", &mut bare).is_err());
         assert!(with_provider_args(
             &Profile {
                 provider: Some(ModelProvider {
@@ -978,6 +1148,103 @@ mod tests {
             ..on(ProviderKind::Ollama, None)
         };
         assert_eq!(with_provider_args(&shell, None).unwrap(), shell);
+    }
+
+    #[test]
+    fn a_terminal_tab_on_a_model_server_refuses_an_unreadable_env_file() {
+        let vars = vec![("GW_KEY".to_owned(), "k".to_owned())];
+        assert_eq!(terminal_env_file(Ok(vars.clone()), true), Ok(vars));
+        let failed = || load_env_file_checked("/nonexistent/env.sh");
+        let why = terminal_env_file(failed(), true).unwrap_err();
+        assert!(why.contains("environment file"), "{why}");
+        // Without a server the tab starts as before, without the file's variables.
+        assert_eq!(terminal_env_file(failed(), false), Ok(Vec::new()));
+    }
+
+    /// A terminal tab's shell runs the user's rc before the command, and an rc may export the
+    /// vendor's variables: the provider's are put back after it, right before the `exec`.
+    #[test]
+    fn a_terminal_tabs_rc_cannot_put_the_vendors_variables_back() {
+        use agent_core::adapter::Driver;
+        use agent_core::provider::{ModelProvider, ProviderKind};
+        let home = tempfile::tempdir().unwrap();
+        let rc = "export ANTHROPIC_API_KEY=vendor-key\n\
+                  export ANTHROPIC_BASE_URL=https://vendor.example\n\
+                  export ANTHROPIC_AUTH_TOKEN=vendor-token\n\
+                  export ANTHROPIC_MODEL=opus\n";
+        for file in [".bashrc", ".zshrc"] {
+            std::fs::write(home.path().join(file), rc).unwrap();
+        }
+        let provider = ModelProvider {
+            kind: ProviderKind::LiteLlm,
+            base_url: Some("http://gw:4000".into()),
+            api_key_env: Some("GW_KEY".into()),
+        };
+        let command = get_startup_command(Some(&profile("Env", "env")), Launch::Fresh);
+        let mut ran = 0;
+        for shell in [
+            "/bin/sh",
+            "/bin/bash",
+            "/usr/bin/bash",
+            "/bin/zsh",
+            "/usr/bin/zsh",
+        ] {
+            if !std::path::Path::new(shell).exists() {
+                continue;
+            }
+            let mut env = vec![
+                format!("HOME={}", home.path().display()),
+                format!("ZDOTDIR={}", home.path().display()),
+                // sh -i reads $ENV.
+                format!("ENV={}", home.path().join(".bashrc").display()),
+                "PATH=/usr/bin:/bin".to_owned(),
+                "GW_KEY=gateway-key".to_owned(),
+            ];
+            let (prelude, key) = apply_provider_env(
+                &provider,
+                Driver::Claude,
+                Some("qwen3-coder"),
+                shell,
+                &mut env,
+            )
+            .unwrap();
+            // The key is the tab's key file's, not the shell's.
+            assert_eq!(key.as_deref(), Some("gateway-key"));
+            let script = format!("{prelude}{}", command[1]);
+            let out = std::process::Command::new(shell)
+                .args([command[0].as_str(), script.as_str()])
+                .env_clear()
+                .envs(env.iter().filter_map(|e| e.split_once('=')))
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            let seen = String::from_utf8_lossy(&out.stdout);
+            let has = |line: &str| seen.lines().any(|l| l == line);
+            assert!(has("ANTHROPIC_BASE_URL=http://gw:4000"), "{shell}: {seen}");
+            // The key is nowhere in the CLI's environment, nor the variable it came from.
+            assert!(!seen.contains("gateway-key"), "{shell}: {seen}");
+            assert!(!seen.contains("GW_KEY="), "{shell}: {seen}");
+            assert!(!seen.contains("ANTHROPIC_AUTH_TOKEN="), "{shell}: {seen}");
+            assert!(has("ANTHROPIC_MODEL=qwen3-coder"), "{shell}: {seen}");
+            assert!(!seen.contains("ANTHROPIC_API_KEY="), "{shell}: {seen}");
+            assert!(!seen.contains("vendor"), "{shell}: {seen}");
+            assert!(!seen.contains(PROVIDER_ENV_PREFIX), "{shell}: {seen}");
+            // Nothing but the command's own output: the prelude writes nothing.
+            assert!(seen.lines().all(|l| l.contains('=')), "{shell}: {seen}");
+            ran += 1;
+        }
+        assert!(ran > 0, "no POSIX shell to run");
+
+        // Codex is given its provider on the command line: nothing to put back, any shell.
+        let mut env = vec!["GW_KEY=gateway-key".to_owned()];
+        let prelude = apply_provider_env(
+            &provider,
+            Driver::Codex,
+            Some("m"),
+            "/usr/bin/fish",
+            &mut env,
+        );
+        assert_eq!(prelude, Ok((String::new(), None)));
     }
 
     /// The new-thread folder table: the most specific folder that exists wins, and only an

@@ -74,6 +74,11 @@ impl Thread {
     /// A root thread on an answering Claude, whose switches start another answering Claude
     /// under the asked agent's name, settled after its prompt-less first turn.
     fn new(ctx: &glib::MainContext) -> Self {
+        Self::on(ctx, super::answering_claude)
+    }
+
+    /// [`Self::new`] whose first agent is `first` (run in the thread's folder).
+    fn on(ctx: &glib::MainContext, first: fn(&Path) -> OpenSession) -> Self {
         let dir = tempfile::tempdir().expect("dir");
         let old = dir.path().join("old");
         let new = dir.path().join("new");
@@ -84,7 +89,7 @@ impl Thread {
         let (sink, seen) = make_sink();
         let session = ChatSession::with_options(
             Box::new(agent_core::claude::ClaudeAdapter::new()),
-            super::answering_claude(&old),
+            first(&old),
             SessionStore::from(store.clone()),
             thread.clone(),
             sink,
@@ -100,6 +105,7 @@ impl Thread {
         let env = minimal_env(&new);
         session.set_adapter_factory(Rc::new(move |driver, _| {
             Ok(AgentLaunch {
+                server: None,
                 profile: None,
                 adapter: Box::new(Relabelled {
                     inner: agent_core::claude::ClaudeAdapter::new(),
@@ -195,6 +201,58 @@ fn a_limit_wait_holds_wakes_but_never_the_continuation() {
     });
 }
 
+/// Stop ends the wait of a root no delegation supervisor knows: it never continues on its own
+/// until the user speaks to it again.
+#[test]
+fn a_root_the_user_stopped_never_continues_after_its_limit() {
+    in_loop(|ctx| {
+        let t = Thread::new(ctx);
+        t.session.send_prompt("first");
+        assert!(pump_until(ctx, 10, || t.idle()
+            && t.session.inner.has_conversation.get()));
+        t.session.set_limit_wait(true);
+
+        t.session.interrupt();
+        assert_eq!(t.session.continue_after_limit(), ContinueOutcome::Refused);
+        assert!(!t.sent_old().contains("Your usage limit has reset"));
+
+        // The user wrote again: a later limit continues the thread as before.
+        t.session.send_prompt("again");
+        assert!(pump_until(ctx, 10, || t.idle() && t.sent_old().contains("again")));
+        t.session.set_limit_wait(true);
+        assert_eq!(t.session.continue_after_limit(), ContinueOutcome::Started);
+        t.session.shutdown(false);
+    });
+}
+
+/// The session and its window agree on when the agent works again
+/// ([`agent_core::limit_wait::limit_over`]): a turn that completes with nothing to show does not
+/// end the wait for sub-agent news while the window still waits; an answer does.
+#[test]
+fn a_turn_with_no_output_does_not_end_the_limit_wait_for_wakes() {
+    in_loop(|ctx| {
+        let t = Thread::on(ctx, super::idle_claude);
+        t.session.send_prompt("first");
+        assert!(pump_until(ctx, 10, || t.idle() && t.sent_old().contains("first")));
+
+        t.session.set_limit_wait(true);
+        t.session.send_prompt("retry");
+        assert!(pump_until(ctx, 10, || t.idle()
+            && t.sent_old().contains("retry")
+            && t.seen
+                .borrow()
+                .iter()
+                .filter(|e| matches!(e.event, Event::TurnCompleted { .. }))
+                .count()
+                >= 3));
+        assert_eq!(
+            t.session.wake_blocker(),
+            Some("the thread waits for its usage limit")
+        );
+        t.session.shutdown(false);
+    });
+}
+
 /// A thread waiting for its usage limit that switches to another agent waits for nothing any
 /// more: the next sub-agent news wakes the new agent.
 #[test]
@@ -217,6 +275,115 @@ fn a_switch_to_another_agent_ends_the_limit_wait_for_wakes() {
             && t.session.inner.pending_handoff.borrow().is_none()));
         assert_eq!(t.session.wake_with("news after"), WakeOutcome::Started);
         assert!(pump_until(ctx, 10, || t.sent_new().contains("news after")));
+        t.session.shutdown(false);
+    });
+}
+
+/// A switch whose new agent cannot start rolls back to the agent the thread waits for: the
+/// session still holds sub-agent news for the limit, as the window still waits.
+#[test]
+fn a_switch_that_rolls_back_keeps_the_limit_wait_for_wakes() {
+    in_loop(|ctx| {
+        let t = Thread::new(ctx);
+        t.session.send_prompt("first");
+        assert!(pump_until(ctx, 10, || t.idle()));
+        t.session.set_limit_wait(true);
+
+        let launch = super::answering_claude(&t.new);
+        let env = minimal_env(&t.new);
+        t.session.set_adapter_factory(Rc::new(move |driver, _| {
+            Ok(AgentLaunch {
+                server: None,
+                profile: None,
+                adapter: Box::new(Relabelled {
+                    inner: agent_core::claude::ClaudeAdapter::new(),
+                    driver,
+                }),
+                program: if driver == Driver::Codex {
+                    "/nonexistent/agent-terminal-test-codex".into()
+                } else {
+                    launch.program.clone()
+                },
+                extra_args: launch.extra_args.clone(),
+                default_model: None,
+                default_effort: None,
+                env: env.clone(),
+                approval: Err(None),
+            })
+        }));
+        t.session.switch(Driver::Codex, None, None);
+        assert!(pump_until(ctx, 10, || t.session.status().driver
+            == Driver::Claude
+            && t.idle()
+            && t.session.inner.rollback.borrow().is_none()));
+        assert_eq!(
+            t.session.wake_blocker(),
+            Some("the thread waits for its usage limit")
+        );
+        t.session.shutdown(false);
+    });
+}
+
+/// Whose limit a process hits is the server it was launched on: Settings moving its profile off
+/// that server later changes nothing for that process: its next turn is not a move off the
+/// limit, and its wait does not start reading the vendor's usage windows. Only a new launch reads
+/// the profile again.
+#[test]
+fn the_server_a_process_was_launched_on_outlives_a_settings_change() {
+    use agent_core::limit_wait::{AgentSource, LimitRecord};
+    use agent_core::provider::{ModelProvider, ProviderKind};
+    in_loop(|ctx| {
+        let t = Thread::new(ctx);
+        let ollama = ModelProvider::new(ProviderKind::Ollama);
+        let factory = |server: Option<ModelProvider>, dir: &Path| -> AdapterFactory {
+            let launch = super::answering_claude(dir);
+            let env = minimal_env(dir);
+            Rc::new(move |driver, _| {
+                Ok(AgentLaunch {
+                    server: server.clone(),
+                    profile: None,
+                    adapter: Box::new(Relabelled {
+                        inner: agent_core::claude::ClaudeAdapter::new(),
+                        driver,
+                    }),
+                    program: launch.program.clone(),
+                    extra_args: launch.extra_args.clone(),
+                    default_model: None,
+                    default_effort: None,
+                    env: env.clone(),
+                    approval: Err(None),
+                })
+            })
+        };
+        t.session
+            .set_adapter_factory(factory(Some(ollama.clone()), &t.new));
+        t.session.switch(Driver::Codex, None, None);
+        assert!(pump_until(ctx, 10, || t.session.status().driver
+            == Driver::Codex
+            && t.idle()
+            && t.session.inner.rollback.borrow().is_none()));
+        assert_eq!(t.session.launched_server(), Some(ollama.clone()));
+        let source = || AgentSource {
+            driver: t.session.status().driver,
+            server: t.session.launched_server(),
+        };
+        let mut record = LimitRecord::default();
+        let refused = Event::TurnCompleted {
+            state: TurnState::Failed,
+            usage: None,
+            cost_usd: None,
+            error: Some("You've hit your usage limit".into()),
+        };
+        assert!(record.observe(&source(), &refused));
+
+        // Settings move the profile off the server: the next launch would read that.
+        t.session.set_adapter_factory(factory(None, &t.new));
+        t.session.send_prompt("again");
+        assert!(pump_until(ctx, 10, || t.idle() && t.sent_new().contains("again")));
+        assert_eq!(t.session.launched_server(), Some(ollama));
+        assert!(!record.moved_on(&source(), &Event::TurnStarted { model: None }));
+        // Nor does that process's wait start reading the vendor's usage windows.
+        assert!(!source().has_vendor_quota());
         t.session.shutdown(false);
     });
 }
@@ -301,6 +468,35 @@ fn continue_in_another_agent_starts_a_continuation_there() {
             t.sent_new().matches("Continue the unfinished task").count(),
             1
         );
+        t.session.shutdown(false);
+    });
+}
+
+/// "Stop and Switch" stops the turn without marking the thread stopped by the user: a later limit
+/// wait still continues it. And the switch's continuation, the user's own request for the work to
+/// go on, ends a stop that held the root (a delegation root's supervisor holds it on that stop).
+#[test]
+fn a_stop_for_a_switch_never_holds_the_thread_from_continuing() {
+    in_loop(|ctx| {
+        let t = Thread::new(ctx);
+        t.session.send_prompt("first");
+        assert!(pump_until(ctx, 10, || t.idle()
+            && t.session.inner.has_conversation.get()));
+        t.session.interrupt_for_switch();
+        assert!(!t.session.wakes_held());
+        t.session.set_limit_wait(true);
+        assert_eq!(t.session.continue_after_limit(), ContinueOutcome::Started);
+        assert!(pump_until(ctx, 10, || t.idle()));
+
+        t.session.hold_wakes();
+        assert!(t
+            .session
+            .continue_after_switch_to(Driver::Codex, t.session.work_epoch()));
+        t.session.switch(Driver::Codex, None, None);
+        assert!(pump_until(ctx, 10, || t
+            .sent_new()
+            .contains("Continue the unfinished task")));
+        assert!(!t.session.wakes_held());
         t.session.shutdown(false);
     });
 }

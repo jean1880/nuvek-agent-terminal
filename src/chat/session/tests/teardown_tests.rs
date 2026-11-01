@@ -242,7 +242,8 @@ fn a_replacement_that_dies_before_starting_gives_the_message_back() {
 }
 
 /// A busy switch whose replacement cannot spawn rolls back to the old agent and sends no
-/// continuation: the message it took over is queued again, never lost.
+/// continuation: the message it took over is given back to the old agent once, never lost and
+/// never left waiting for the user.
 #[test]
 fn a_switch_that_rolls_back_keeps_the_unspawned_message() {
     in_loop(|_| {
@@ -260,17 +261,20 @@ fn a_switch_that_rolls_back_keeps_the_unspawned_message() {
         plant_unspawned(&store, &thread, &session, "append one line", true);
         session.switch(Driver::Claude, Some("sonnet".into()), None);
         assert_eq!(session.status().driver, Driver::Agy, "rolled back");
+        // It was the old agent's all along, not written for the new one: it goes to the old
+        // agent once nothing runs there, without waiting for the user to write again.
+        if session.status().running_turn {
+            turn_completed(&session, TurnState::Completed);
+        }
+        let sent = prompts(&log);
         assert_eq!(
-            session
-                .inner
-                .queued_prompts
-                .borrow()
-                .iter()
-                .filter(|q| q.text == "append one line")
+            sent.iter()
+                .filter(|p| p.ends_with("append one line"))
                 .count(),
             1,
-            "queued again for the old agent"
+            "{sent:?}"
         );
+        assert!(session.inner.queued_prompts.borrow().is_empty());
         session.shutdown(false);
     });
 }

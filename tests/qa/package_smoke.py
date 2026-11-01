@@ -61,7 +61,8 @@ def installed(directory, expected_commit, manifest_path):
             raise ValueError("installed executable bytes differ from the downloaded package")
         result = qa_env.run_logged([str(installed_binary), "--help"], artifacts / "startup.log", env, 30)
         output = (artifacts / "startup.log").read_text(errors="replace")
-        reported = re.findall(r"Starting Agent Terminal \(v([^\)]+)\)", output)
+        # The --help summary names the build; the startup log line reaches stderr only on a TTY.
+        reported = re.findall(r"^Agent Terminal v(\S+)$", output, re.MULTILINE)
         result.update({"commit": expected_commit, "version": version, "reported_versions": reported, "installed_binary_sha256": installed_hash, "passed": False, "coverage": "package identity and startup; source-native UX is gated separately"})
         report = artifacts / "identity.json"
         report.write_text(json.dumps(result, indent=2) + "\n")

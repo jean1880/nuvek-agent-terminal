@@ -173,13 +173,13 @@ pub fn default_codex_path(
 /// Blocking I/O: call off the UI thread. The selected path may be a projection symlink, but
 /// regular-file and length checks apply to the opened descriptor. Nonblocking open rejects
 /// FIFOs/devices without waiting, and a capped descriptor read catches subsequent file growth.
-pub fn read_codex(path: &Path, fallback_cwd: &Path) -> Result<ImportPreview, ImportError> {
+pub fn read_codex(path: &Path) -> Result<ImportPreview, ImportError> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY)
         .open(path)
         .map_err(|_| "Could not open the selected Codex configuration.")?;
-    parse_codex(&read_selected(file)?, fallback_cwd)
+    parse_codex(&read_selected(file)?)
 }
 
 fn read_selected(file: File) -> Result<String, ImportError> {
@@ -202,7 +202,7 @@ fn read_selected(file: File) -> Result<String, ImportError> {
 /// Pure parser. It never follows includes, expands variables, sources shells or reads secrets.
 /// Only the top-level mcp_servers table is considered; profiles and other harness sections
 /// are not merged. Malformed TOML errors deliberately discard the parser's source excerpts.
-pub fn parse_codex(text: &str, fallback_cwd: &Path) -> Result<ImportPreview, ImportError> {
+pub fn parse_codex(text: &str) -> Result<ImportPreview, ImportError> {
     if text.len() > MAX_IMPORT_BYTES {
         return Err("The selected Codex configuration exceeds 1 MiB.");
     }
@@ -293,7 +293,7 @@ pub fn parse_codex(text: &str, fallback_cwd: &Path) -> Result<ImportPreview, Imp
             ));
             continue;
         }
-        let result = parse_server(name, &id, value, fallback_cwd, &known_literals);
+        let result = parse_server(name, &id, value, &known_literals);
         match result {
             Ok((server, ignored)) => {
                 if !ignored.is_empty() {
@@ -325,7 +325,6 @@ fn parse_server(
     label: &str,
     id: &str,
     value: &toml::Value,
-    fallback_cwd: &Path,
     known_literals: &[&str],
 ) -> Result<(ServerPreview, Vec<String>), ServerError> {
     const INVALID: &str = "The MCP stdio definition has invalid fields or bounds.";
@@ -347,6 +346,7 @@ fn parse_server(
             | "enabled_tools"
             | "disabled_tools"
             | "startup_timeout_sec"
+            | "startup_timeout_ms"
             | "tool_timeout_sec"
             | "transport"
             | "type" => {}
@@ -503,20 +503,24 @@ fn parse_server(
             Vec::new(),
         ));
     }
+    // Codex starts a server with no `cwd` in the session's folder: the thread's, here.
     let cwd = match fields.get("cwd") {
-        Some(v) => v.as_str().ok_or((INVALID, vec!["cwd".into()]))?,
-        None => fallback_cwd.to_str().ok_or((INVALID, vec!["cwd".into()]))?,
+        Some(v) => {
+            let cwd = v.as_str().ok_or((INVALID, vec!["cwd".into()]))?;
+            if cwd.is_empty()
+                || cwd.len() > 4096
+                || !direct_text(cwd)
+                || contains_literal(cwd, known_literals)
+            {
+                return Err((
+                    "The MCP working directory must be explicit and contain no interpolation.",
+                    vec!["cwd".into()],
+                ));
+            }
+            cwd
+        }
+        None => "$WORKSPACE",
     };
-    if cwd.is_empty()
-        || cwd.len() > 4096
-        || !direct_text(cwd)
-        || contains_literal(cwd, known_literals)
-    {
-        return Err((
-            "The MCP working directory must be explicit and contain no interpolation.",
-            vec!["cwd".into()],
-        ));
-    }
     let allowlist = fields.contains_key("enabled_tools");
     let enabled_tools = strings(fields.get("enabled_tools"), 256, 65536)
         .map_err(|_| (INVALID, vec!["enabled_tools".into()]))?;
@@ -623,9 +627,20 @@ fn parse_server(
             })
             .collect(),
         approval: ApprovalPolicy::Ask,
-        startup_timeout_secs: seconds(fields, "startup_timeout_sec", 15, 300)
-            .map_err(|_| (INVALID, vec!["startup_timeout_sec".into()]))?,
-        call_timeout_secs: seconds(fields, "tool_timeout_sec", 60, 600)
+        startup_timeout_secs: seconds(
+            fields,
+            "startup_timeout_sec",
+            Some("startup_timeout_ms"),
+            15,
+            300,
+        )
+        .map_err(|_| {
+            (
+                INVALID,
+                vec!["startup_timeout_sec".into(), "startup_timeout_ms".into()],
+            )
+        })?,
+        call_timeout_secs: seconds(fields, "tool_timeout_sec", None, 60, 600)
             .map_err(|_| (INVALID, vec!["tool_timeout_sec".into()]))?,
     };
     candidate.validate().map_err(|_| (INVALID, Vec::new()))?;
@@ -679,10 +694,36 @@ fn boolean(fields: &toml::Table, key: &str, default: bool) -> Result<bool, ()> {
         .map_or(Ok(default), |v| v.as_bool().ok_or(()))
 }
 
-fn seconds(fields: &toml::Table, key: &str, default: u64, max: u64) -> Result<u64, ()> {
-    let value = fields.get(key).map_or(Ok(default), |v| {
-        v.as_integer().and_then(|v| u64::try_from(v).ok()).ok_or(())
-    })?;
+/// A Codex timeout in whole seconds, rounded up. As Codex reads them: `<key>_sec` is an integer
+/// or a float of seconds, and `<key>_ms` (startup only) an integer of milliseconds that counts
+/// only when `<key>_sec` is absent.
+fn seconds(
+    fields: &toml::Table,
+    key: &str,
+    millis: Option<&str>,
+    default: u64,
+    max: u64,
+) -> Result<u64, ()> {
+    let millis = millis.and_then(|m| fields.get(m));
+    // Codex refuses its whole file for a `_ms` that is not a whole number, even beside `_sec`.
+    if millis.is_some_and(|v| v.as_integer().is_none_or(|v| v < 0)) {
+        return Err(());
+    }
+    let value = match (fields.get(key), millis) {
+        (Some(toml::Value::Integer(v)), _) => u64::try_from(*v).map_err(|_| ())?,
+        (Some(toml::Value::Float(v)), _) if v.is_finite() && *v >= 0.0 => {
+            // Bounded before the cast, so it never saturates into range.
+            if v.ceil() > max as f64 {
+                return Err(());
+            }
+            v.ceil() as u64
+        }
+        (Some(_), _) => return Err(()),
+        (None, Some(ms)) => u64::try_from(ms.as_integer().ok_or(())?)
+            .map_err(|_| ())?
+            .div_ceil(1000),
+        (None, None) => default,
+    };
     if (1..=max).contains(&value) {
         Ok(value)
     } else {
@@ -800,7 +841,7 @@ fn package_runner_shell(command: &str, args: &[String]) -> bool {
 mod tests {
     use super::*;
     fn parse(text: &str) -> ImportPreview {
-        parse_codex(text, Path::new("/work/project")).unwrap()
+        parse_codex(text).unwrap()
     }
     fn only(text: &str) -> ServerPreview {
         let mut preview = parse(text);
@@ -833,7 +874,14 @@ tool_timeout_sec = 90
             .into_config(&BTreeMap::new())
             .unwrap();
         assert!(config.enabled);
-        assert_eq!(config.cwd, "/work/project");
+        // No `cwd`: the thread's folder at launch, as Codex uses its session's.
+        assert_eq!(config.cwd, "$WORKSPACE");
+        assert_eq!(
+            only("[mcp_servers.docs]\ncommand='docs-server'\ncwd='/srv/docs'")
+                .candidate
+                .cwd,
+            "/srv/docs"
+        );
         assert_eq!(config.approval, ApprovalPolicy::Ask);
         assert_eq!(
             config
@@ -851,6 +899,55 @@ tool_timeout_sec = 90
             (config.startup_timeout_secs, config.call_timeout_secs),
             (30, 90)
         );
+    }
+    #[test]
+    fn codex_timeouts_in_float_seconds_or_milliseconds_round_up_to_whole_seconds() {
+        for (fields, expected) in [
+            (
+                "startup_timeout_sec = 2.5\ntool_timeout_sec = 90.25",
+                (3, 91),
+            ),
+            ("startup_timeout_sec = 0.2", (1, 60)),
+            ("startup_timeout_ms = 2500", (3, 60)),
+            ("startup_timeout_ms = 1000", (1, 60)),
+            // `_sec` wins over `_ms`, as in Codex.
+            (
+                "startup_timeout_sec = 30\nstartup_timeout_ms = 2500",
+                (30, 60),
+            ),
+            (
+                "startup_timeout_sec = 300.0\ntool_timeout_sec = 600",
+                (300, 600),
+            ),
+        ] {
+            let config = only(&format!(
+                "[mcp_servers.docs]\ncommand='docs-server'\n{fields}"
+            ))
+            .candidate;
+            assert_eq!(
+                (config.startup_timeout_secs, config.call_timeout_secs),
+                expected,
+                "{fields}"
+            );
+        }
+        for fields in [
+            "startup_timeout_sec = 300.5",
+            "startup_timeout_sec = 0.0",
+            "startup_timeout_sec = -1.5",
+            "startup_timeout_sec = nan",
+            "startup_timeout_sec = inf",
+            "startup_timeout_ms = 0",
+            "startup_timeout_ms = 2500.5",
+            "startup_timeout_ms = 300001",
+            "startup_timeout_sec = 3\nstartup_timeout_ms = 'soon'",
+            "tool_timeout_sec = 600.01",
+            "tool_timeout_sec = '60'",
+        ] {
+            let preview = parse(&format!(
+                "[mcp_servers.docs]\ncommand='docs-server'\n{fields}"
+            ));
+            assert!(preview.servers.is_empty(), "{fields}");
+        }
     }
     #[test]
     fn absent_empty_or_fully_excluded_allowlist_never_enables() {
@@ -1029,7 +1126,7 @@ MODE='safe-mode'
         for index in 0..65 {
             too_many.push_str(&format!("[mcp_servers.s{index}]\ncommand='server'\n"));
         }
-        assert!(parse_codex(&too_many, Path::new("/work")).is_err());
+        assert!(parse_codex(&too_many).is_err());
         for definition in [
             "command='server'\nenv_vars=['TOKEN','TOKEN']",
             "command='server'\nenv_vars=['MODE']\n[mcp_servers.docs.env]\nMODE='ordinary'",
@@ -1045,11 +1142,7 @@ MODE='safe-mode'
     }
     #[test]
     fn malformed_and_invalid_fields_do_not_echo_source_values() {
-        let error = parse_codex(
-            "[mcp_servers.docs]\ncommand='private-canary",
-            Path::new("/work"),
-        )
-        .unwrap_err();
+        let error = parse_codex("[mcp_servers.docs]\ncommand='private-canary").unwrap_err();
         assert!(!error.contains("private-canary"));
         for definition in [
             "command=42",
@@ -1064,7 +1157,7 @@ MODE='safe-mode'
             assert!(preview.servers.is_empty());
             assert!(!preview.summary().contains("private-canary"));
         }
-        assert!(parse_codex("imports=['private-canary']", Path::new("/work")).is_err());
+        assert!(parse_codex("imports=['private-canary']").is_err());
     }
     #[test]
     fn unsupported_field_names_and_unmerged_profiles_are_visible_without_values() {
@@ -1082,23 +1175,20 @@ MODE='safe-mode'
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "[mcp_servers.docs]\ncommand='docs-server'").unwrap();
-        assert_eq!(
-            read_codex(&path, Path::new("/work")).unwrap().servers.len(),
-            1
-        );
+        assert_eq!(read_codex(&path).unwrap().servers.len(), 1);
         let link = dir.path().join("projection.toml");
         std::os::unix::fs::symlink(&path, &link).unwrap();
-        assert!(read_codex(&link, Path::new("/work")).is_ok());
-        assert!(read_codex(dir.path(), Path::new("/work")).is_err());
+        assert!(read_codex(&link).is_ok());
+        assert!(read_codex(dir.path()).is_err());
         let fifo = dir.path().join("fifo");
         let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
-        assert!(read_codex(&fifo, Path::new("/work")).is_err());
+        assert!(read_codex(&fifo).is_err());
         std::fs::write(&path, vec![b'x'; MAX_IMPORT_BYTES + 1]).unwrap();
-        assert!(read_codex(&path, Path::new("/work")).is_err());
+        assert!(read_codex(&path).is_err());
         std::fs::write(&path, [0xff]).unwrap();
-        assert!(read_codex(&path, Path::new("/work")).is_err());
-        assert!(parse_codex(&"x".repeat(MAX_IMPORT_BYTES + 1), Path::new("/work")).is_err());
+        assert!(read_codex(&path).is_err());
+        assert!(parse_codex(&"x".repeat(MAX_IMPORT_BYTES + 1)).is_err());
     }
     #[test]
     fn default_path_uses_only_caller_supplied_locations() {

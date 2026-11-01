@@ -8,10 +8,10 @@ use std::future::Future;
 use std::rc::Rc;
 use std::thread::LocalKey;
 
+use crate::model_catalog::ServerSource;
 use agent_core::adapter::Driver;
 use agent_core::catalog::CatalogModel;
 use agent_core::event::{Account, QuotaWindow};
-use agent_core::provider::ModelProvider;
 use gtk4::glib;
 
 use crate::agent_proc::AgentEnv;
@@ -31,7 +31,7 @@ pub struct ProbeTargets {
     targets: Vec<(agent_core::adapter::Driver, ProbeTarget)>,
     /// The model servers agents run on ([`agent_core::provider`]), with their keys: their model
     /// list comes from the server, and their vendor's account is never probed.
-    providers: Vec<(agent_core::adapter::Driver, ModelProvider, ProviderKey)>,
+    providers: Vec<(agent_core::adapter::Driver, ServerSource, ProviderKey)>,
     /// The sources other profiles of an agent use, when not the agent's own: another model
     /// server, or (`None`) the vendor while the agent's own profile is on a server. Their lists
     /// are fetched with the agent's, so each thread's picker shows what its profile can run.
@@ -45,7 +45,7 @@ pub struct ProbeTargets {
 pub struct OtherSource {
     pub driver: agent_core::adapter::Driver,
     /// The model server; `None`: the vendor.
-    pub source: Option<ModelProvider>,
+    pub source: Option<ServerSource>,
     pub key: ProviderKey,
     pub target: ProbeTarget,
 }
@@ -99,7 +99,7 @@ impl ProbeTargets {
     pub fn uses_other(
         &self,
         driver: agent_core::adapter::Driver,
-        source: Option<&ModelProvider>,
+        source: Option<&ServerSource>,
     ) -> bool {
         self.other_sources
             .iter()
@@ -109,7 +109,7 @@ impl ProbeTargets {
     /// These targets, with `providers` naming the agents that run on a model server.
     pub fn with_providers(
         mut self,
-        providers: Vec<(agent_core::adapter::Driver, ModelProvider, ProviderKey)>,
+        providers: Vec<(agent_core::adapter::Driver, ServerSource, ProviderKey)>,
     ) -> Self {
         self.providers = providers;
         self
@@ -119,7 +119,7 @@ impl ProbeTargets {
     pub fn provider(
         &self,
         driver: agent_core::adapter::Driver,
-    ) -> Option<(&ModelProvider, &ProviderKey)> {
+    ) -> Option<(&ServerSource, &ProviderKey)> {
         self.providers
             .iter()
             .find(|(d, _, _)| *d == driver)
@@ -424,7 +424,8 @@ mod tests {
         };
         let targets = ProbeTargets::new(vec![(Driver::Claude, env_file)]).with_providers(vec![(
             Driver::Claude,
-            ModelProvider::new(agent_core::provider::ProviderKind::LiteLlm),
+            agent_core::provider::ModelProvider::new(agent_core::provider::ProviderKind::LiteLlm)
+                .into(),
             key,
         )]);
         let shown = format!("{targets:?}");

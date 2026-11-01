@@ -21,8 +21,163 @@
 //! refusal also restarts the clock: only readings taken after it count, and a reset time it came
 //! after is dropped. When every window still holding the thread names a reset time ahead, the
 //! next reading is taken just after the latest, which the thread shows as when it continues;
-//! only a reading decides. The caller supplies the clock and the readings; nothing here sends or
-//! probes anything.
+//! only a reading decides.
+//!
+//! A refusal no window explains (every window shown free, or none reported) would loop just the
+//! same, each new wait continuing on its first reading. So the thread keeps a [`LimitRecord`]
+//! from one wait to the next, until the agent works again: each continuation refused meanwhile
+//! holds the next wait off ([`LimitWait::back_off`]) for at least [`BACKOFF_MIN`], then at least
+//! double the last gap, up to [`BACKOFF_MAX`].
+//!
+//! Some waits no reading can end: no reset time, and no window reported (an API key, a model
+//! server, the Local agent), a blocking window missing from the readings, or one still full that
+//! names no reset time. Such a wait continues blind [`BACKOFF_MIN`] after its last refusal (and
+//! once every time a window still holding it names has passed); a refusal of that guess is a
+//! refused continuation, so the guesses spread out by the same back-off. The caller supplies the
+//! clock and the readings; nothing here sends or probes anything.
+
+use crate::adapter::Driver;
+use crate::event::{Event, ItemKind, TurnState};
+use crate::provider::ModelProvider;
+
+/// Whether `event` shows the agent at work again, so the thread no longer waits for (or is
+/// stopped by) its usage limit: an item of its own, or a turn that completed with output. The one
+/// test of it, for the window and the session alike. A turn merely starting is not: Claude starts
+/// one itself to read a finished task, and a retry the limit refuses starts one too; hiding the
+/// banner then took the offer away (2026-10-11). Nor is a turn that completed with nothing to
+/// show. Only a top-level item counts: a sub-agent started before the limit can still stream
+/// under it.
+pub fn limit_over(event: &Event) -> bool {
+    match event {
+        Event::ItemStarted {
+            kind, parent: None, ..
+        } => *kind != ItemKind::UserMessage,
+        Event::TurnCompleted {
+            state: TurnState::Completed,
+            usage: Some(usage),
+            ..
+        } => usage.output_tokens > 0,
+        _ => false,
+    }
+}
+
+/// Whether `event` says the agent refused the thread's work over its usage limit: only a turn
+/// that failed for quota ([`crate::quota::is_quota_exhausted`]). A rate limit alone is not (agy
+/// raises one for a tool's own 429, and a usage reading may name a window the thread does not
+/// use), nor a turn that failed on one (a 429 passes on its own); one inside the turn only says
+/// when the limit resets.
+pub fn limit_refused(event: &Event) -> bool {
+    match event {
+        Event::TurnCompleted {
+            state: TurnState::Failed,
+            error,
+            ..
+        } => error
+            .as_deref()
+            .is_some_and(crate::quota::is_quota_exhausted),
+        _ => false,
+    }
+}
+
+/// What a thread keeps of its usage limit whether or not it waits for it, from one wait to the
+/// next: that the limit stopped it (set by a refusal, [`limit_refused`]; a banner's rate limit, a
+/// usage reading at 100 % or a tool's 429 never set it), and the back-off its refused
+/// continuations built up ([`Self::backoff`]). Kept until the agent works again
+/// ([`limit_over`]) or the thread runs another agent; ending a wait ("Don't Continue", a
+/// continuation sent) keeps it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LimitRecord {
+    refused: bool,
+    /// A continuation went out since the agent last worked (or since the last refusal counted).
+    continued: bool,
+    /// The back-off the last refused continuation earned, in seconds; 0 before any.
+    gap: i64,
+    /// Where the agent whose limit this is runs: the one that last refused.
+    agent: Option<AgentSource>,
+}
+
+/// Where a thread's agent runs, which is whose limit it hits: the agent, and the model server
+/// its profile runs it on (`None`: the vendor's own). Claude on its vendor and Claude on a server
+/// are two sources, with limits of their own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSource {
+    pub driver: Driver,
+    pub server: Option<ModelProvider>,
+}
+
+impl AgentSource {
+    /// `driver` on its vendor.
+    pub fn vendor(driver: Driver) -> Self {
+        Self {
+            driver,
+            server: None,
+        }
+    }
+
+    /// Whether the agent here uses its vendor's quota, whose usage windows a wait may read: not
+    /// on a model server, nor the Local agent (its server is the user's own). Without one, a
+    /// wait ends on its back-off alone.
+    pub fn has_vendor_quota(&self) -> bool {
+        self.driver != Driver::Local && self.server.is_none()
+    }
+}
+
+impl LimitRecord {
+    /// Reads one of the thread's events, from its agent running at `source` then; returns
+    /// whether it is a refusal.
+    pub fn observe(&mut self, source: &AgentSource, event: &Event) -> bool {
+        if limit_over(event) {
+            *self = Self::default();
+            return false;
+        }
+        let refused = limit_refused(event);
+        if refused {
+            self.refused = true;
+            self.agent = Some(source.clone());
+        }
+        refused
+    }
+
+    /// Whether `event`, from the agent at `source`, shows the thread on another agent or model
+    /// server than the one whose limit this is, and that agent up (its session or a turn
+    /// started): a switch or a move that has taken, so the old source's limit is not waited out.
+    /// Not before: a switch whose agent never starts rolls back to the old one, still limited.
+    pub fn moved_on(&self, source: &AgentSource, event: &Event) -> bool {
+        self.agent.as_ref().is_some_and(|agent| agent != source)
+            && matches!(
+                event,
+                Event::SessionStarted { .. } | Event::TurnStarted { .. }
+            )
+    }
+
+    /// Whether the limit stopped the thread and its agent has not worked since.
+    pub fn stopped(&self) -> bool {
+        self.refused
+    }
+
+    /// The thread runs another agent now: the old one's limit is not its own.
+    pub fn forget(&mut self) {
+        *self = Self::default();
+    }
+
+    /// The thread was sent its continuation: a refusal before the agent works again is one of it.
+    pub fn continued(&mut self) {
+        self.continued = true;
+    }
+
+    /// The least a refusal just observed holds the thread ([`LimitWait::back_off`]). The first
+    /// since the agent last worked holds it for nothing more (its reset time or windows decide);
+    /// each one of a continuation at least [`BACKOFF_MIN`] and at least double the last, up to
+    /// [`BACKOFF_MAX`]; any other (the user's own retry) as long as the last. So refusals no
+    /// window explains (every window shown free, or none reported) never loop, and the gaps
+    /// never shrink.
+    pub fn backoff(&mut self) -> i64 {
+        if std::mem::take(&mut self.continued) {
+            self.gap = self.gap.saturating_mul(2).clamp(BACKOFF_MIN, BACKOFF_MAX);
+        }
+        self.gap
+    }
+}
 
 /// Seconds past a reset time before continuing: the provider's clock and ours may differ.
 pub const GRACE: i64 = 60;
@@ -30,8 +185,13 @@ pub const GRACE: i64 = 60;
 /// Seconds between quota readings while no reset time is known: 2, 5, 10, then every 15 min.
 const POLL: [i64; 4] = [2 * 60, 5 * 60, 10 * 60, 15 * 60];
 
-/// The shortest wait before a copy a refusal came after is taken as stale again.
+/// The shortest wait before a copy a refusal came after is taken as stale again, and the first
+/// back-off a refused continuation earns ([`LimitRecord::backoff`]).
 pub const BACKOFF_MIN: i64 = 15 * 60;
+
+/// The longest back-off refused continuations earn: a limit that has reset is never waited out
+/// for days.
+pub const BACKOFF_MAX: i64 = 6 * 60 * 60;
 
 /// One quota window as the wait reads it.
 #[derive(Debug, Clone, PartialEq)]
@@ -84,6 +244,19 @@ pub struct LimitWait {
     blocking: Vec<String>,
     /// Copies a refusal came after (see [`BackedOff`]): not taken as stale until their gap ends.
     backed_off: Vec<BackedOff>,
+    /// Never continued before this, whatever a reset time or a reading says: the back-off the
+    /// thread's refused continuations earned ([`Self::back_off`]).
+    not_before: i64,
+    /// When the thread is tried again though nothing said the limit is over: no reset time is
+    /// known and no window still holding it names one (an agent that reports no windows, or a
+    /// full window with no reset time). [`BACKOFF_MIN`] after the last refusal.
+    blind_at: i64,
+    /// The latest time a window still holding the thread names (its reset, or the end of a
+    /// back-off), in the last reading that counted: a blind try waits for it too.
+    named: Option<i64>,
+    /// No reading has counted yet, or a window still holding the thread in the last one names
+    /// no time: only then is it tried blind.
+    unnamed: bool,
 }
 
 /// A copy (key and reset time) that was already past its reset when the agent refused work.
@@ -129,7 +302,17 @@ impl LimitWait {
                 .map(|w| w.key.clone())
                 .collect(),
             backed_off: backed_off_by(held, now),
+            not_before: now,
+            blind_at: now.saturating_add(BACKOFF_MIN),
+            named: None,
+            unnamed: true,
         }
+    }
+
+    /// A refusal at `now` earned the thread `gap` seconds ([`LimitRecord::backoff`]): it does not
+    /// continue before then. Only ever later.
+    pub fn back_off(&mut self, now: i64, gap: i64) {
+        self.not_before = self.not_before.max(now.saturating_add(gap));
     }
 
     /// Free at `now`: not exhausted, or past its own reset (a stale copy) once any back-off a
@@ -147,22 +330,32 @@ impl LimitWait {
     /// Until when a window that is not free holds the thread, if known: its reset still ahead,
     /// else the end of the back-off a refusal put on that copy.
     fn holds_until(&self, w: &Window, now: i64) -> Option<i64> {
-        w.resets_at.filter(|r| *r > now).or_else(|| {
-            self.backed_off
-                .iter()
-                .find(|b| b.key == w.key && Some(b.reset) == w.resets_at && now < b.until)
-                .map(|b| b.until)
-        })
+        // A reset within the grace still holds it (`past_reset`).
+        w.resets_at
+            .filter(|r| r.saturating_add(GRACE) > now)
+            .or_else(|| {
+                self.backed_off
+                    .iter()
+                    .find(|b| b.key == w.key && Some(b.reset) == w.resets_at && now < b.until)
+                    .map(|b| b.until)
+            })
     }
 
     /// The agent refused work again at `now` (a retry during the wait), with `reset` if known and
     /// `held` its windows then. The refusal is evidence as at the start of a wait: readings from
-    /// before it no longer count, a reset time it came after is disproved, the copies past their
+    /// before it no longer count, a reset time it came after (the agent's, or the one the windows
+    /// named) is disproved, the copies past their
     /// reset are backed off, and a later reset time than the one waited for replaces it.
     pub fn learn(&mut self, reset: Option<i64>, now: i64, held: &[Window]) {
         self.since = self.since.max(now);
+        self.blind_at = self.blind_at.max(now.saturating_add(BACKOFF_MIN));
+        self.named = None;
+        self.unnamed = true;
         if self.reset.is_some_and(|known| now >= known) {
             self.reset = None;
+        }
+        if self.expected.is_some_and(|named| now >= named) {
+            self.expected = None;
         }
         for copy in backed_off_by(held, now) {
             self.backed_off
@@ -174,13 +367,39 @@ impl LimitWait {
         }
     }
 
-    /// When the limit resets, if known: what the thread says it waits for.
+    /// When the limit resets, if known: what the thread says it waits for (no earlier than its
+    /// back-off ends).
     pub fn reset(&self) -> Option<i64> {
-        self.reset.or(self.expected)
+        self.reset
+            .or(self.expected)
+            .map(|at| at.max(self.not_before))
     }
 
     /// What to do at `now`. `reading`: the agent's latest quota windows and when they arrived.
+    /// Never [`Step::Continue`] before the back-off ends.
     pub fn step(&mut self, now: i64, reading: Option<(i64, &[Window])>) -> Step {
+        let judged = self.judge(now, reading);
+        if (judged == Step::Continue || self.blind_due(now)) && now >= self.not_before {
+            Step::Continue
+        } else if judged == Step::Continue {
+            Step::Wait
+        } else {
+            judged
+        }
+    }
+
+    /// Nothing will say the limit is over (no reset time, and no window reported or one still
+    /// holding the thread that names no time): it is tried again once `blind_at` has
+    /// passed, and every time a window still holding it names too. A refusal of that try backs
+    /// the next one off further ([`LimitRecord::backoff`]).
+    fn blind_due(&self, now: i64) -> bool {
+        self.reset.is_none()
+            && self.unnamed
+            && now >= self.blind_at
+            && self.named.is_none_or(|at| now >= at.saturating_add(GRACE))
+    }
+
+    fn judge(&mut self, now: i64, reading: Option<(i64, &[Window])>) -> Step {
         if let Some(reset) = self.reset {
             return if now >= reset.saturating_add(GRACE) {
                 Step::Continue
@@ -204,17 +423,21 @@ impl LimitWait {
             // When every window still holding the thread says when it stops (its reset ahead, or
             // the end of a back-off), the next reading waits for the latest of them; one that
             // does not keeps the backoff.
-            let latest = windows
+            let holding: Vec<Option<i64>> = windows
                 .iter()
                 .filter(|w| !self.free(w, now))
                 .filter(|w| self.blocking.is_empty() || self.blocking.contains(&w.key))
                 .map(|w| self.holds_until(w, now))
-                .collect::<Option<Vec<i64>>>()
-                .and_then(|resets| resets.into_iter().max());
-            if let Some(latest) = latest {
-                if self.expected != Some(latest) {
-                    self.expected = Some(latest);
-                    self.next_check = latest.saturating_add(GRACE);
+                .collect();
+            self.named = holding.iter().flatten().max().copied();
+            // None holding it, yet not freed: a blocking window is missing from the reading.
+            self.unnamed = holding.is_empty() || holding.iter().any(Option::is_none);
+            if !self.unnamed {
+                if let Some(latest) = self.named {
+                    if self.expected != Some(latest) {
+                        self.expected = Some(latest);
+                        self.next_check = latest.saturating_add(GRACE);
+                    }
                 }
             }
         }
@@ -238,6 +461,174 @@ mod tests {
             used,
             resets_at,
         }
+    }
+
+    fn failed(error: &str) -> Event {
+        Event::TurnCompleted {
+            state: TurnState::Failed,
+            usage: None,
+            cost_usd: None,
+            error: Some(error.into()),
+        }
+    }
+
+    fn answered() -> Event {
+        Event::ItemStarted {
+            kind: ItemKind::AssistantMessage,
+            title: String::new(),
+            input: None,
+            parent: None,
+        }
+    }
+
+    #[test]
+    fn only_a_refusal_stops_a_thread_by_its_limit_until_the_agent_works() {
+        use crate::event::QuotaWindow;
+        let mut record = LimitRecord::default();
+        // A tool's 429 (agy raises a rate limit for it), a usage reading at 100 %, a quota error
+        // outside a turn and a turn failed on a rate limit alone do not stop the thread.
+        for not_a_refusal in [
+            Event::RateLimited {
+                resets_at: None,
+                detail: None,
+            },
+            Event::QuotaUpdated {
+                account: None,
+                windows: vec![QuotaWindow {
+                    group: None,
+                    label: "5-hour".into(),
+                    used: 1.0,
+                    resets_at: None,
+                }],
+            },
+            Event::Error {
+                message: "You have exhausted your quota".into(),
+            },
+            failed("429 Too Many Requests"),
+        ] {
+            assert!(
+                !record.observe(&AgentSource::vendor(Driver::Claude), &not_a_refusal),
+                "{not_a_refusal:?}"
+            );
+            assert!(!record.stopped(), "{not_a_refusal:?}");
+        }
+        assert!(record.observe(
+            &AgentSource::vendor(Driver::Claude),
+            &failed("You've hit your session limit")
+        ));
+        assert!(record.stopped());
+        // A turn starting, or completing with nothing to show, is not the agent working again.
+        record.observe(
+            &AgentSource::vendor(Driver::Claude),
+            &Event::TurnStarted { model: None },
+        );
+        assert!(record.stopped());
+        record.observe(&AgentSource::vendor(Driver::Claude), &answered());
+        assert!(!record.stopped());
+        record.observe(
+            &AgentSource::vendor(Driver::Claude),
+            &failed("You've hit your session limit"),
+        );
+        record.forget();
+        assert!(!record.stopped());
+    }
+
+    #[test]
+    fn only_another_agent_that_is_up_moves_a_thread_off_its_limit() {
+        let mut record = LimitRecord::default();
+        let up = Event::SessionStarted {
+            native_id: "s".into(),
+            model: None,
+            cwd: None,
+        };
+        let claude = AgentSource::vendor(Driver::Claude);
+        let codex = AgentSource::vendor(Driver::Codex);
+        assert!(!record.moved_on(&codex, &up), "no limit yet");
+        record.observe(&claude, &failed("You've hit your session limit"));
+        // The switch's own notice comes from the new agent before it has started: a switch that
+        // never starts rolls back to Claude, which is still limited.
+        let notice = Event::Notice {
+            text: "Switched to Codex".into(),
+        };
+        assert!(!record.moved_on(&codex, &notice));
+        assert!(!record.moved_on(&claude, &up), "the same agent");
+        assert!(record.moved_on(&codex, &up));
+        assert!(record.moved_on(&codex, &Event::TurnStarted { model: None }));
+        // The same agent on a model server is another source: its vendor's limit is not its own.
+        let on_server = AgentSource {
+            driver: Driver::Claude,
+            server: Some(crate::provider::ModelProvider::new(
+                crate::provider::ProviderKind::Ollama,
+            )),
+        };
+        assert!(record.moved_on(&on_server, &up));
+        // Only the vendor's own has a vendor quota to read.
+        assert!(claude.has_vendor_quota());
+        assert!(!on_server.has_vendor_quota());
+        assert!(!AgentSource::vendor(Driver::Local).has_vendor_quota());
+        // And back from the server to the vendor.
+        let mut record = LimitRecord::default();
+        record.observe(&on_server, &failed("You've hit your usage limit"));
+        assert!(!record.moved_on(&on_server, &up));
+        assert!(record.moved_on(&claude, &up));
+    }
+
+    /// When each wait ends with a continuation: the first tick (each minute from `refusal`) at
+    /// which `wait` continues on `reading`.
+    fn continues_after(wait: &mut LimitWait, refusal: i64, reading: &[Window]) -> i64 {
+        let mut t = refusal + 60;
+        while wait.step(t, Some((refusal + 1, reading))) != Step::Continue {
+            t += 60;
+            assert!(t < refusal + 10 * BACKOFF_MAX, "never continues");
+        }
+        t - refusal
+    }
+
+    #[test]
+    fn refused_continuations_no_window_explains_back_off_ever_wider() {
+        // Every window shows usage left, yet the agent refuses each continuation at once: no
+        // window explains it, so only the record of refusals keeps it from looping.
+        let free = [window("5-hour", 0.2, Some(10_000_000))];
+        let refuse = failed("You've hit your session limit");
+        let mut record = LimitRecord::default();
+        assert!(record.observe(&AgentSource::vendor(Driver::Claude), &refuse));
+        let mut wait = LimitWait::new(None, 1_000, &free);
+        wait.back_off(1_000, record.backoff());
+        // The first refusal: a reading taken after it decides at once.
+        assert_eq!(continues_after(&mut wait, 1_000, &free), 60);
+        let mut sent = 1_060;
+        let mut gaps = Vec::new();
+        for _ in 0..7 {
+            record.continued();
+            let refusal = sent + 5;
+            assert!(record.observe(&AgentSource::vendor(Driver::Claude), &refuse));
+            // Each refusal starts a new wait; the record outlives the one before.
+            let mut wait = LimitWait::new(None, refusal, &free);
+            wait.back_off(refusal, record.backoff());
+            let gap = continues_after(&mut wait, refusal, &free);
+            gaps.push(gap);
+            sent = refusal + gap;
+        }
+        // At least the minimum, then each at least double the last, up to the cap.
+        assert_eq!(gaps, [900, 1_800, 3_600, 7_200, 14_400, 21_600, 21_600]);
+        // The user's own retry refused meanwhile (no continuation since) keeps the gap.
+        assert!(record.observe(&AgentSource::vendor(Driver::Claude), &refuse));
+        let mut wait = LimitWait::new(None, sent, &free);
+        wait.back_off(sent, record.backoff());
+        assert_eq!(continues_after(&mut wait, sent, &free), BACKOFF_MAX);
+        // Once the agent works again the record starts over.
+        record.observe(&AgentSource::vendor(Driver::Claude), &answered());
+        assert!(record.observe(&AgentSource::vendor(Driver::Claude), &refuse));
+        let mut wait = LimitWait::new(None, sent, &free);
+        wait.back_off(sent, record.backoff());
+        assert_eq!(continues_after(&mut wait, sent, &free), 60);
+        // A refusal during a wait backs it off the same way.
+        record.continued();
+        let mut wait = LimitWait::new(None, sent, &free);
+        assert!(record.observe(&AgentSource::vendor(Driver::Claude), &refuse));
+        wait.learn(None, sent + 30, &free);
+        wait.back_off(sent + 30, record.backoff());
+        assert_eq!(continues_after(&mut wait, sent + 30, &free), BACKOFF_MIN);
     }
 
     #[test]
@@ -279,6 +670,23 @@ mod tests {
         wait.learn(None, 4_100, &copy);
         let freed = [window("Weekly", 0.2, Some(600_000))];
         assert_eq!(wait.step(4_400, Some((4_350, &freed))), Step::Continue);
+    }
+
+    #[test]
+    fn a_refusal_after_the_time_the_windows_named_disproves_it() {
+        // "Weekly" says it resets at 9 000: shown as when the thread continues. A refusal at
+        // 9 100 came after it, so that time is no longer shown.
+        let at_limit = [window("Weekly", 1.0, Some(9_000))];
+        let mut wait = LimitWait::new(None, 100, &at_limit);
+        assert_eq!(wait.step(300, Some((200, &at_limit))), Step::Wait);
+        assert_eq!(wait.reset(), Some(9_000));
+        wait.learn(None, 9_100, &at_limit);
+        assert_eq!(wait.reset(), None);
+        // One still ahead stays.
+        let mut wait = LimitWait::new(None, 100, &at_limit);
+        assert_eq!(wait.step(300, Some((200, &at_limit))), Step::Wait);
+        wait.learn(None, 500, &at_limit);
+        assert_eq!(wait.reset(), Some(9_000));
     }
 
     #[test]
@@ -333,6 +741,8 @@ mod tests {
         // A reset already past is no reset.
         let mut wait = LimitWait::new(Some(50), 100, &[]);
         assert_eq!(wait.reset(), None);
+        // Held off past the end of this schedule: no blind continuation meanwhile.
+        wait.back_off(100, 10_000);
         assert_eq!(wait.step(100, None), Step::Wait);
         assert_eq!(wait.step(100 + 119, None), Step::Wait);
         assert_eq!(wait.step(100 + 120, None), Step::Probe);
@@ -342,6 +752,57 @@ mod tests {
         assert_eq!(wait.step(520 + 600, None), Step::Probe);
         assert_eq!(wait.step(1_120 + 900, None), Step::Probe);
         assert_eq!(wait.step(2_020 + 900, None), Step::Probe);
+    }
+
+    #[test]
+    fn a_wait_nothing_can_end_continues_on_the_back_off() {
+        // No reset time and no usage windows (an API key, a model server, the Local agent): no
+        // reading will ever free the thread, so it is tried again once the back-off has passed.
+        for reading in [None, Some((200, &[][..]))] {
+            let mut wait = LimitWait::new(None, 100, &[]);
+            assert_ne!(wait.step(100 + BACKOFF_MIN - 1, reading), Step::Continue);
+            assert_eq!(wait.step(100 + BACKOFF_MIN, reading), Step::Continue);
+        }
+        // A full window with no reset time (one the agent stopped reporting keeps its copy): the
+        // same, whatever the readings say.
+        let open = [window("Weekly", 1.0, None)];
+        let mut wait = LimitWait::new(None, 100, &open);
+        let reading = Some((200, &open[..]));
+        assert_ne!(wait.step(100 + BACKOFF_MIN - 1, reading), Step::Continue);
+        assert_eq!(wait.step(100 + BACKOFF_MIN, reading), Step::Continue);
+        // Beside a full window that names its reset, it waits for that one.
+        let mixed = [
+            window("5-hour", 1.0, Some(20_000)),
+            window("Weekly", 1.0, None),
+        ];
+        let mut wait = LimitWait::new(None, 100, &mixed);
+        let reading = Some((200, &mixed[..]));
+        assert_ne!(wait.step(5_000, reading), Step::Continue);
+        assert_ne!(wait.step(20_000 + GRACE - 1, reading), Step::Continue);
+        assert_eq!(wait.step(20_000 + GRACE, reading), Step::Continue);
+        // A refusal during the wait restarts its clock.
+        let mut wait = LimitWait::new(None, 100, &[]);
+        wait.learn(None, 600, &[]);
+        assert_ne!(wait.step(100 + BACKOFF_MIN, None), Step::Continue);
+        assert_eq!(wait.step(600 + BACKOFF_MIN, None), Step::Continue);
+        // Each guess refused at once: the record spaces the next ones out, never shrinking.
+        let refuse = failed("You've hit your usage limit");
+        let mut record = LimitRecord::default();
+        assert!(record.observe(&AgentSource::vendor(Driver::Claude), &refuse));
+        let mut wait = LimitWait::new(None, 0, &[]);
+        wait.back_off(0, record.backoff());
+        let mut gaps = vec![continues_after(&mut wait, 0, &[])];
+        let mut sent = gaps[0];
+        for _ in 0..6 {
+            record.continued();
+            assert!(record.observe(&AgentSource::vendor(Driver::Claude), &refuse));
+            let mut wait = LimitWait::new(None, sent, &[]);
+            wait.back_off(sent, record.backoff());
+            let gap = continues_after(&mut wait, sent, &[]);
+            gaps.push(gap);
+            sent += gap;
+        }
+        assert_eq!(gaps, [900, 900, 1_800, 3_600, 7_200, 14_400, 21_600]);
     }
 
     #[test]
@@ -449,10 +910,11 @@ mod tests {
         // Still only on a reading taken after the limit.
         let mut wait = LimitWait::new(None, 5_000, &at_limit);
         assert_eq!(wait.step(5_000, Some((4_500, &at_limit))), Step::Wait);
-        // A full window with no reset time is never judged stale: only a fresh reading frees it.
+        // A full window with no reset time is not judged stale by any reading; the wait still
+        // ends on its back-off (`a_wait_nothing_can_end_continues_on_the_back_off`).
         let open = [window("Weekly", 1.0, None)];
         let mut wait = LimitWait::new(None, 100, &open);
-        assert_eq!(wait.step(1_000_000, Some((999_000, &open))), Step::Probe);
+        assert_eq!(wait.step(300, Some((200, &open))), Step::Probe);
         // And with no blocking window at the limit, every window must be free the same way.
         let mut wait = LimitWait::new(None, 100, &[]);
         assert_eq!(

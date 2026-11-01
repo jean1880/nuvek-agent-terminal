@@ -48,7 +48,7 @@ use crate::window::sidebar_model::{
 use crate::window::sidebar_model::{
     limit_wait_text, reopen_offer, sessions_added_toast, thread_activity, ThreadActivity,
 };
-use agent_core::limit_wait::{LimitWait, Step, Window as LimitWindow};
+use agent_core::limit_wait::{LimitRecord, LimitWait, Step, Window as LimitWindow};
 
 /// Removes every row of `list`, and only rows: an open thread menu is also the list's child, and
 /// `remove` refuses it, so walking `first_child` would never end.
@@ -70,29 +70,25 @@ fn limit_windows(windows: &[agent_core::event::QuotaWindow]) -> Vec<LimitWindow>
         .collect()
 }
 
+/// Whose usage limit a thread's events on `driver` come from: the agent, on the model server its
+/// running process was launched on ([`ChatSession::launched_server`]), never the server the live
+/// configuration now gives its profile. No session yet: the vendor's.
+fn limit_source(
+    driver: Driver,
+    session: Option<&ChatSession>,
+) -> agent_core::limit_wait::AgentSource {
+    agent_core::limit_wait::AgentSource {
+        driver,
+        server: session.and_then(ChatSession::launched_server),
+    }
+}
+
 /// When the limit a refusal reports resets (epoch seconds), when it says: only a rate limit
 /// names a time.
 fn limit_reset_of(event: &Event) -> Option<i64> {
     match event {
         Event::RateLimited { resets_at, .. } => resets_at.as_deref().and_then(reset_epoch),
         _ => None,
-    }
-}
-
-/// Whether `event` says the agent refused the thread's work over its usage limit: only a turn
-/// that failed for quota. A rate limit alone is not (agy raises one for a tool's own 429, and a
-/// usage reading may name a window the thread does not use); one inside the turn only says when
-/// the limit resets.
-fn limit_refused(event: &Event) -> bool {
-    match event {
-        Event::TurnCompleted {
-            state: agent_core::event::TurnState::Failed,
-            error,
-            ..
-        } => error
-            .as_deref()
-            .is_some_and(agent_core::quota::is_rate_limit_or_quota),
-        _ => false,
     }
 }
 
@@ -759,6 +755,8 @@ pub(super) struct ChatTab {
     /// When a rate limit inside the running turn said the limit resets: the wait its failure
     /// starts uses it.
     limit_reset_seen: Option<i64>,
+    /// Whether the usage limit stopped the thread, waiting or not; outlives each wait.
+    limit: LimitRecord,
     /// Shown when the thread's model is no longer offered by its agent.
     model_banner: adw::Banner,
     /// Shown while the thread's agent is installed but no one is signed in to it.
@@ -920,6 +918,21 @@ pub(super) struct SessionSlot {
 }
 
 impl SessionSlot {
+    /// "Stop and Switch": the running turn is stopped as Stop stops it (sub-agents included), but
+    /// the thread is not marked stopped by the user: its work goes on in the new agent, and its
+    /// limit wait ends only once that agent is up.
+    pub(super) fn stop_for_switch(&self) {
+        self.switch_serial
+            .set(self.switch_serial.get().wrapping_add(1));
+        if let Some((supervisor, thread)) =
+            crate::delegation::supervisor().zip(self.thread.as_deref())
+        {
+            supervisor.root_stop_for_switch(thread);
+        }
+        if let Some(s) = self.get() {
+            s.interrupt_for_switch();
+        }
+    }
     pub(super) fn invalidate_pending_switch(&self) {
         self.switch_serial
             .set(self.switch_serial.get().wrapping_add(1));
@@ -1003,6 +1016,15 @@ impl ChatBackend for SessionSlot {
         }
         if let Some(s) = self.get() {
             s.interrupt();
+        }
+        // A stopped thread does not continue on its own after its usage limit: its wait ends now
+        // (the session refuses the continuation until the user speaks again either way).
+        if let Some((window, thread)) = self
+            .thread
+            .as_deref()
+            .and_then(|thread| Some((thread_owner(thread)?, thread)))
+        {
+            window.imp().cancel_limit_wait(thread);
         }
     }
     fn respond_approval(&self, request: &str, decision: Decision) {
@@ -1775,7 +1797,7 @@ fn decide_live_model(
 /// list it can use.
 fn live_model(
     driver: Driver,
-    source: Option<&agent_core::provider::ModelProvider>,
+    source: Option<&crate::model_catalog::ServerSource>,
     model: Option<String>,
     effort: Option<String>,
 ) -> (Option<String>, Option<String>, Option<RetiredModel>) {
@@ -1792,17 +1814,18 @@ fn live_model(
 pub(super) fn own_source(
     profile: &Profile,
     driver: Driver,
-) -> Option<agent_core::provider::ModelProvider> {
+) -> Option<crate::model_catalog::ServerSource> {
     profile
         .provider
         .clone()
         .filter(|_| agent_core::provider::supports(driver))
+        .map(|provider| crate::model_catalog::ServerSource::new(provider, profile))
 }
 
 /// Why a thread or worker on a model server cannot start: it has no model (the profile names
 /// none and the server listed none yet). Claude or Codex left without one start on their own
 /// setting, which names a vendor model; so nothing starts.
-pub(super) fn no_model_reason(source: &agent_core::provider::ModelProvider) -> String {
+pub(super) fn no_model_reason(source: &crate::model_catalog::ServerSource) -> String {
     format!(
         "Cannot start on {}: it has listed no model yet. Pick a Default Model for this profile, \
          or try again once its models are listed.",
@@ -1815,9 +1838,7 @@ pub(super) fn no_model_reason(source: &agent_core::provider::ModelProvider) -> S
 /// profile's default, else the first chat model the server lists; never the CLI's own setting,
 /// which names a vendor model (`opus`) the server does not have.
 pub(super) fn start_model(profile: &Profile, driver: Driver) -> Option<String> {
-    match crate::config::profile_provider(profile, driver)
-        .filter(|_| agent_core::provider::supports(driver))
-    {
+    match launch_source(profile, driver) {
         None => profile.effective_default_model(None),
         Some(source) => profile.default_model.clone().or_else(|| {
             let listed = ModelCatalog::shared().models_for(driver, Some(&source));
@@ -1838,12 +1859,10 @@ pub(super) fn start_model(profile: &Profile, driver: Driver) -> Option<String> {
 fn other_profile_sources(
     agents: &[(Driver, Profile)],
     all: &[Profile],
-) -> Vec<(Driver, Option<agent_core::provider::ModelProvider>, Profile)> {
-    let source = |driver: Driver, p: &Profile| {
-        crate::config::profile_provider(p, driver)
-            .filter(|_| agent_core::provider::supports(driver))
-    };
-    let mut out: Vec<(Driver, Option<agent_core::provider::ModelProvider>, Profile)> = Vec::new();
+) -> Vec<(Driver, Option<crate::model_catalog::ServerSource>, Profile)> {
+    // Keyed with the profile's environment file: one holding another key is another source.
+    let source = |driver: Driver, p: &Profile| crate::model_catalog::ServerSource::of(p, driver);
+    let mut out: Vec<(Driver, Option<crate::model_catalog::ServerSource>, Profile)> = Vec::new();
     for (driver, own) in agents.iter().filter(|(_, own)| !own.disabled) {
         let own_source = source(*driver, own);
         for profile in all.iter().filter(|p| {
@@ -1864,11 +1883,20 @@ pub(super) fn profile_source(
     config: &crate::config::TerminalConfig,
     profile_id: Option<&str>,
     driver: Driver,
-) -> Option<agent_core::provider::ModelProvider> {
+) -> Option<crate::model_catalog::ServerSource> {
     // The same resolution as the launch's (`agent_launch`), so the picker lists the server the
     // thread runs on.
-    crate::config::profile_provider(&thread_profile_or_new(config, profile_id, driver), driver)
-        .filter(|_| agent_core::provider::supports(driver))
+    launch_source(&thread_profile_or_new(config, profile_id, driver), driver)
+}
+
+/// The model server a process started on `profile` runs `driver` on (`None`: the vendor's own):
+/// what [`profile_launch`] starts it with. A start judges its model by this, on the profile it
+/// launches with, never on the live configuration, which may have changed since.
+pub(super) fn launch_source(
+    profile: &Profile,
+    driver: Driver,
+) -> Option<crate::model_catalog::ServerSource> {
+    crate::model_catalog::ServerSource::of(profile, driver)
 }
 
 /// The model picker's groups for a thread opened with `profile_id` that runs `current` now: for
@@ -1884,10 +1912,7 @@ pub(super) fn picker_specs(
     let mut out = Vec::new();
     for driver in Driver::ALL {
         let info = driver.info();
-        let source = |p: &Profile| {
-            crate::config::profile_provider(p, driver)
-                .filter(|_| agent_core::provider::supports(driver))
-        };
+        let source = |p: &Profile| crate::model_catalog::ServerSource::of(p, driver);
         // The profile a pick in this agent's vendor group would keep, and the one it runs now.
         let own = thread_profile_or_new(config, profile_id, driver);
         let runs = |p: &Profile| driver == current && p.id == own.id;
@@ -2185,7 +2210,7 @@ pub(super) async fn wait_until(
 /// waited for is that one, which a profile on a server with no model of its own starts from.
 async fn wait_for_fresh_catalog(
     driver: Driver,
-    source: Option<agent_core::provider::ModelProvider>,
+    source: Option<crate::model_catalog::ServerSource>,
 ) {
     let catalog = ModelCatalog::shared();
     wait_for_catalog_source(&catalog, driver, source.as_ref(), CATALOG_WAIT).await;
@@ -2212,7 +2237,7 @@ async fn wait_for_catalog(
 async fn wait_for_catalog_source(
     catalog: &ModelCatalog,
     driver: Driver,
-    source: Option<&agent_core::provider::ModelProvider>,
+    source: Option<&crate::model_catalog::ServerSource>,
     limit: std::time::Duration,
 ) -> bool {
     wait_until(limit, std::time::Duration::from_millis(100), || {
@@ -2549,10 +2574,9 @@ pub(super) fn profile_launch(
     env: Vec<(String, String)>,
     clear: &[String],
 ) -> Result<(Vec<String>, AgentEnv), String> {
-    let mut args = profile.args.clone();
     let mut agent = agent_env(env, clear);
     let Some(provider) = &crate::config::profile_provider(profile, driver) else {
-        return Ok((args, agent));
+        return Ok((profile.args.clone(), agent));
     };
     let key = provider
         .key_env()
@@ -2562,7 +2586,9 @@ pub(super) fn profile_launch(
     let launch = provider
         .launch(driver, key.as_deref())
         .map_err(|why| format!("Cannot start on {}: {why}.", provider.kind.label()))?;
-    args.extend(launch.args);
+    // A `--settings` of the profile's own is merged under Claude's overlay, never dropped.
+    let args = agent_core::provider::with_profile_settings(&profile.args, launch.args)
+        .map_err(|why| format!("Cannot start on {}: {why}", provider.kind.label()))?;
     agent.env.retain(|(name, _)| !launch.unset.contains(name));
     for name in launch.unset {
         if !agent.unset.contains(&name) {
@@ -2740,6 +2766,7 @@ fn agent_launch_with(
     };
     Ok(AgentLaunch {
         profile: None,
+        server: launch_source(&profile, driver).map(|source| source.provider),
         adapter,
         program,
         extra_args,
@@ -3295,9 +3322,21 @@ impl AgentTerminalWindow {
         }
     }
 
-    /// `thread`'s agent refused its work over its usage limit ([`limit_refused`]); `reset`: when
-    /// it said the limit resets. Unless Settings turned it off or the thread is a delegated
-    /// worker, the thread waits for the limit to be over and continues
+    /// The usage reading a limit wait of `chat` reads: its vendor's, kept per agent
+    /// ([`AccountStatus`]). `None` when its process was launched with no vendor quota (on a model
+    /// server, the Local agent): another thread's reading of the vendor says nothing of it, so its
+    /// wait ends on its back-off alone. Settings moving the profile since change nothing for that
+    /// process.
+    fn limit_snapshot(&self, chat: &ChatTab) -> Option<crate::account_status::Snapshot> {
+        limit_source(chat.driver, chat.slot.get().as_deref())
+            .has_vendor_quota()
+            .then(|| AccountStatus::shared().snapshot(chat.driver))
+    }
+
+    /// `thread`'s agent refused its work over its usage limit
+    /// ([`agent_core::limit_wait::limit_refused`]); `reset`: when it said the limit resets.
+    /// Unless Settings turned it off or the thread is a delegated worker, the thread waits for
+    /// the limit to be over and continues
     /// ([`Self::continue_after_limits`]). A wait already running learns a later reset time from
     /// another refusal only: a quota reading may name a window the thread does not use.
     fn arm_limit_wait(&self, thread: &str, reset: Option<i64>) {
@@ -3325,17 +3364,29 @@ impl AgentTerminalWindow {
         };
         // What the agent's windows hold now names what stopped the thread, and which stale copies
         // this refusal disproves.
-        let held = limit_windows(&AccountStatus::shared().snapshot(chat.driver).windows);
-        match &mut chat.limit_wait {
-            Some(wait) => wait.learn(reset, now, &held),
+        let held = self
+            .limit_snapshot(chat)
+            .map(|snap| limit_windows(&snap.windows))
+            .unwrap_or_default();
+        // A refused continuation holds the thread longer each time, whatever its windows say:
+        // the record outlives the wait it ended.
+        let gap = chat.limit.backoff();
+        let wait = match chat.limit_wait.take() {
+            Some(mut wait) => {
+                wait.learn(reset, now, &held);
+                wait
+            }
             None => {
                 info!(
-                    "thread {thread} waits for its usage limit to reset (reset time known: {})",
+                    "thread {thread} waits for its usage limit to reset (reset time known: {}, \
+                     back-off: {gap} s)",
                     reset.is_some()
                 );
-                chat.limit_wait = Some(LimitWait::new(reset, now, &held));
+                LimitWait::new(reset, now, &held)
             }
-        }
+        };
+        let wait = chat.limit_wait.insert(wait);
+        wait.back_off(now, gap);
         chat.show_limit_wait(now);
         // Sub-agent news waits too: the limit would refuse the turn it started.
         if let Some(session) = chat.slot.get() {
@@ -3387,15 +3438,26 @@ impl AgentTerminalWindow {
             .filter_map(|t| t.chat.as_mut())
         {
             let driver = chat.driver;
+            if chat.limit_wait.is_none() {
+                continue;
+            }
+            // None for a thread with no vendor quota: never probed, its wait ends on its back-off.
+            let snap = self.limit_snapshot(chat);
+            let windows = snap
+                .as_ref()
+                .map(|s| limit_windows(&s.windows))
+                .unwrap_or_default();
+            // When quota windows last arrived: an account-only update moves `read_at`, not this.
+            let reading = snap
+                .as_ref()
+                .and_then(|s| s.updated_at)
+                .map(|at| (at, windows.as_slice()));
             let Some(wait) = chat.limit_wait.as_mut() else {
                 continue;
             };
-            let snap = status.snapshot(driver);
-            let windows = limit_windows(&snap.windows);
-            // When quota windows last arrived: an account-only update moves `read_at`, not this.
-            match wait.step(now, snap.updated_at.map(|at| (at, windows.as_slice()))) {
+            match wait.step(now, reading) {
                 Step::Wait => {}
-                Step::Probe if !probe.contains(&driver) => probe.push(driver),
+                Step::Probe if snap.is_some() && !probe.contains(&driver) => probe.push(driver),
                 Step::Probe => {}
                 Step::Continue => {
                     if let Some(session) = chat.slot.get() {
@@ -3422,6 +3484,8 @@ impl AgentTerminalWindow {
             match session.continue_after_limit() {
                 ContinueOutcome::Started => {
                     info!("thread {thread} continues: its usage limit has reset");
+                    // A refusal before the agent works again is one of this continuation.
+                    self.with_chat_mut(&thread, |c| c.limit.continued());
                     self.end_limit_wait_of(&thread);
                 }
                 ContinueOutcome::Busy => {}
@@ -4576,7 +4640,7 @@ impl AgentTerminalWindow {
             }
             // The slot again: the page may have closed while the question was open.
             if let Some(slot) = imp.slot_of(&thread) {
-                slot.interrupt();
+                slot.stop_for_switch();
                 delegation::switch(&slot, driver, model, effort, target);
             }
         });
@@ -5401,6 +5465,7 @@ impl AgentTerminalWindow {
                 wait_banner,
                 limit_wait: None,
                 limit_reset_seen: None,
+                limit: LimitRecord::default(),
                 model_banner,
                 sign_in_banner,
                 running: false,
@@ -5895,8 +5960,9 @@ impl AgentTerminalWindow {
             .flatten()
             .or_else(|| profile.default_effort.clone());
         // A model its agent no longer offers (judged on a list fetched in this run) is never
-        // started: the thread resumes on the replacement, and says so.
-        let source = profile_source(&self.config.borrow(), Some(&profile.id), driver);
+        // started: the thread resumes on the replacement, and says so. Judged on the profile the
+        // launch above was built from, so the check and the launch agree on the server.
+        let source = launch_source(profile, driver);
         let (model, effort, ported) = live_model(
             driver,
             source.as_ref(),
@@ -5982,6 +6048,8 @@ impl AgentTerminalWindow {
             session.shutdown(true);
             return;
         }
+        // Whose usage limit it hits: the server of the profile it was launched with.
+        session.set_launched_server(source.map(|source| source.provider));
         let (thread_for, dir_for) = (thread.to_owned(), dir.to_owned());
         session.set_adapter_factory(Rc::new(move |d, profile| {
             agent_launch(d, &thread_for, &dir_for, profile)
@@ -6105,7 +6173,7 @@ impl AgentTerminalWindow {
         // agent must restart on its own profile.
         let mut clear_profile = false;
         let mut commit_profile: Option<String> = None;
-        // The agent refused the turn over its usage limit ([`limit_refused`]): may start a wait,
+        // The agent refused the turn over its usage limit ([`LimitRecord::observe`]): may start a wait,
         // with the reset time a rate limit in that turn gave.
         let refused: Option<Option<i64>>;
         enum After {
@@ -6154,10 +6222,19 @@ impl AgentTerminalWindow {
                 chat.rate_limited = false;
                 chat.rate_banner.set_revealed(false);
             }
-            // The agent is at work again, or the thread runs another agent now: the limit it
-            // waited out is not this one's any more.
-            if chat.limit_wait.is_some() && (switched || limit_over(&env.event)) {
+            // The agent is at work again, or the thread runs another agent now and it is up: the
+            // limit it waited out is not this one's any more. A switch only asked for, or one
+            // whose agent never starts (it rolls back), keeps the wait. Where the agent runs is
+            // the server its process was launched on, never the live Settings (a profile moved
+            // onto or off a server since is not a move of this process): a move to a model server
+            // of the same agent is another source.
+            let source = limit_source(driver, chat.slot.get().as_deref());
+            let moved_on = chat.limit.moved_on(&source, &env.event);
+            if chat.limit_wait.is_some() && (moved_on || limit_over(&env.event)) {
                 chat.end_limit_wait();
+            }
+            if moved_on {
+                chat.limit.forget();
             }
             // Read before the turn's end below closes it.
             if matches!(env.event, Event::TurnStarted { .. }) {
@@ -6168,7 +6245,10 @@ impl AgentTerminalWindow {
                     chat.limit_reset_seen = Some(reset);
                 }
             }
-            refused = limit_refused(&env.event).then(|| chat.limit_reset_seen.take());
+            refused = chat
+                .limit
+                .observe(&source, &env.event)
+                .then(|| chat.limit_reset_seen.take());
             let after = match &env.event {
                 Event::TurnStarted { .. } => {
                     chat.running = true;
@@ -6753,7 +6833,7 @@ impl AgentTerminalWindow {
     /// The banners' "Continue in" button and a bare `/handoff`: hand the thread to the next
     /// usable agent, never silently to an agy that would edit unasked (see
     /// [`safe_handoff_target`]): that one is confirmed first. While the thread is stopped by its
-    /// usage limit (its banner, or a limit wait), the new agent then continues the work with the
+    /// usage limit ([`Self::stopped_by_limit`]), the new agent then continues the work with the
     /// handoff, as a busy switch does; otherwise the handoff waits for the user's next message.
     fn continue_rate_limited(&self, thread: &str) {
         let Some(slot) = self.slot_of(thread) else {
@@ -6776,9 +6856,11 @@ impl AgentTerminalWindow {
         }
     }
 
-    /// Whether `thread` is stopped by its usage limit: its banner is up, or it waits.
+    /// Whether `thread` is stopped by its usage limit: it waits for it, or a turn was refused over
+    /// it and the agent has not worked since ([`LimitRecord::stopped`]). The rate-limit banner
+    /// alone is not: a usage reading or a tool's 429 raises it too.
     fn stopped_by_limit(&self, thread: &str) -> bool {
-        self.with_chat(thread, |c| c.limit_wait.is_some() || c.rate_limited)
+        self.with_chat(thread, |c| c.limit_wait.is_some() || c.limit.stopped())
             .unwrap_or(false)
     }
 
@@ -6816,8 +6898,8 @@ impl AgentTerminalWindow {
         let Some(slot) = self.slot_of(thread) else {
             return;
         };
-        // The work goes on in the other agent: the old one's limit is not waited out.
-        self.cancel_limit_wait(thread);
+        // The old agent's limit wait ends once the new agent is up (`LimitRecord::moved_on`),
+        // never before: a switch that fails rolls back to the agent it waits for.
         if slot.get().is_some() {
             slot.switch(target, model, effort);
             return;
@@ -7960,9 +8042,7 @@ impl AgentTerminalWindow {
                 // launch removes the vendor's variables, which may be the one holding it).
                 // (agy cannot run on one: its launch refuses, so it keeps its own list.)
                 let mut server_lists = true;
-                if let Some(provider) = crate::config::profile_provider(&profile, driver)
-                    .filter(|_| agent_core::provider::supports(driver))
-                {
+                if let Some(provider) = crate::model_catalog::ServerSource::of(&profile, driver) {
                     let key = provider
                         .key_env()
                         .ok()
@@ -8666,15 +8746,43 @@ pub(super) mod tests {
         };
         let (args, env) =
             profile_launch(&on_gateway, Driver::Claude, env_file.clone(), &[]).unwrap();
-        assert_eq!(args, ["--verbose"]);
+        // The profile's own, then the settings overlay that pins the server, without the key.
+        assert_eq!(&args[..2], ["--verbose", "--settings"]);
+        assert!(args[2].contains("http://gw:4000") && !args[2].contains("gateway-key"));
+        // The profile's own `--settings` is merged under the overlay; a file is refused.
+        let own_settings = |value: &str| Profile {
+            args: vec!["--settings".into(), value.into()],
+            ..on_gateway.clone()
+        };
+        let (args, _) = profile_launch(
+            &own_settings(r#"{"theme":"dark"}"#),
+            Driver::Claude,
+            env_file.clone(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(args.len(), 2, "{args:?}");
+        assert!(args[1].contains("\"theme\":\"dark\"") && args[1].contains("http://gw:4000"));
+        let why = profile_launch(
+            &own_settings("/home/u/claude.json"),
+            Driver::Claude,
+            env_file.clone(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(why.starts_with("Cannot start on LiteLLM") && why.contains("inline JSON"));
         assert_eq!(
             env.lookup("ANTHROPIC_BASE_URL").as_deref(),
             Some("http://gw:4000")
         );
         assert_eq!(
-            env.lookup("ANTHROPIC_AUTH_TOKEN").as_deref(),
+            env.lookup(agent_core::provider::CLAUDE_KEY_VAR).as_deref(),
             Some("gateway-key")
         );
+        // Carried to the spawn, which moves it to a key file; the variable it was read from goes,
+        // so nothing Claude starts inherits it.
+        assert!(!env.env.iter().any(|(k, _)| k == "GW_KEY"));
+        assert!(env.unset.iter().any(|u| u == "GW_KEY"));
         // The vendor's key is gone, from the env file and from what is inherited.
         assert!(!env.env.iter().any(|(k, _)| k == "ANTHROPIC_API_KEY"));
         assert!(env.unset.iter().any(|u| u == "ANTHROPIC_API_KEY"));
@@ -8755,6 +8863,37 @@ pub(super) mod tests {
         );
     }
 
+    /// A start judges its model on the server of the profile it launches with: when Settings has
+    /// moved that profile since (or removed it), the live configuration names another source.
+    #[test]
+    fn a_start_judges_its_model_on_the_profile_it_launches_with() {
+        use agent_core::provider::{ModelProvider, ProviderKind};
+        let ollama = ModelProvider::new(ProviderKind::Ollama);
+        let snapshot = Profile {
+            id: "claude-local".into(),
+            provider: Some(ollama.clone()),
+            ..crate::config::new_agent_profile(Driver::Claude)
+        };
+        // The profile has since been taken off the server in Settings.
+        let mut config = crate::config::TerminalConfig::default();
+        config.profiles.push(Profile {
+            provider: None,
+            ..snapshot.clone()
+        });
+        assert_eq!(
+            launch_source(&snapshot, Driver::Claude),
+            Some(ollama.into())
+        );
+        assert_eq!(
+            profile_source(&config, Some("claude-local"), Driver::Claude),
+            None
+        );
+        // So the launch, which runs on the snapshot, is the one a start must follow.
+        let (args, _) = profile_launch(&snapshot, Driver::Claude, Vec::new(), &[]).unwrap();
+        assert!(args.iter().any(|a| a == "--settings"));
+        assert_eq!(launch_source(&snapshot, Driver::Agy), None);
+    }
+
     /// Each source another enabled profile runs an agent on, other than the agent's own, is
     /// listed once with a profile that uses it; disabled profiles, agy's servers and the agent's
     /// own source are not.
@@ -8780,6 +8919,11 @@ pub(super) mod tests {
         all.extend([
             own(Driver::Claude, "claude-local", Some(ollama.clone())),
             own(Driver::Claude, "claude-local-2", Some(ollama.clone())),
+            // The same server and key variable from another environment file: another key.
+            Profile {
+                env_file: Some("/p/work.env".into()),
+                ..own(Driver::Claude, "claude-local-work", Some(ollama.clone()))
+            },
             own(Driver::Claude, "claude-lm", Some(lm.clone())),
             Profile {
                 disabled: true,
@@ -8794,19 +8938,35 @@ pub(super) mod tests {
             own(Driver::Codex, "codex-cloud", None),
             own(Driver::Codex, "codex-same", Some(ollama.clone())),
         ]);
-        let got: Vec<(Driver, Option<ModelProvider>, String)> =
-            other_profile_sources(&agents, &all)
-                .into_iter()
-                .map(|(d, s, p)| (d, s, p.id))
-                .collect();
+        type Got = (Driver, Option<(ModelProvider, Option<String>)>, String);
+        let got: Vec<Got> = other_profile_sources(&agents, &all)
+            .into_iter()
+            .map(|(d, s, p)| (d, s.map(|s| (s.provider, s.env_file)), p.id))
+            .collect();
         assert_eq!(
             got,
             vec![
-                (Driver::Claude, Some(ollama), "claude-local".into()),
-                (Driver::Claude, Some(lm), "claude-lm".into()),
+                (
+                    Driver::Claude,
+                    Some((ollama.clone(), None)),
+                    "claude-local".into()
+                ),
+                (
+                    Driver::Claude,
+                    Some((ollama, Some("/p/work.env".into()))),
+                    "claude-local-work".into()
+                ),
+                (Driver::Claude, Some((lm, None)), "claude-lm".into()),
                 (Driver::Codex, None, "codex-cloud".into()),
             ]
         );
+    }
+
+    /// A thread with no session yet is judged on its vendor; the Local agent never reads one.
+    #[test]
+    fn a_thread_with_no_session_is_judged_on_its_vendor() {
+        assert!(limit_source(Driver::Claude, None).has_vendor_quota());
+        assert!(!limit_source(Driver::Local, None).has_vendor_quota());
     }
 
     /// A cloud profile and a local one of the same agent: each thread's source is its own
@@ -8840,7 +9000,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             profile_source(&config, Some("claude-local"), Driver::Claude),
-            Some(ollama.clone())
+            Some(ollama.clone().into())
         );
         // Switched to Codex, the local Claude thread runs Codex's own profile.
         assert_eq!(
@@ -8869,6 +9029,7 @@ pub(super) mod tests {
     #[test]
     fn only_a_turn_refused_for_quota_starts_a_limit_wait() {
         use agent_core::event::{QuotaWindow, TurnState};
+        use agent_core::limit_wait::limit_refused;
         let limited = Event::RateLimited {
             resets_at: Some("1793047200".into()),
             detail: None,
@@ -8884,6 +9045,9 @@ pub(super) mod tests {
         assert!(limit_refused(&failed("You've hit your session limit")));
         assert!(limit_refused(&failed("You have exhausted your quota")));
         assert!(!limit_refused(&failed("syntax error")));
+        // A turn that failed on a rate limit alone waits for nothing: it passes on its own.
+        assert!(!limit_refused(&failed("429 Too Many Requests")));
+        assert!(!limit_refused(&failed("rate limit exceeded")));
         let error = Event::Error {
             message: "429 Too Many Requests".into(),
         };

@@ -111,6 +111,11 @@ fn main() -> glib::ExitCode {
         .application_id(APP_ID)
         .flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE)
         .build();
+    // `--help` names the build: the log line above reaches stderr only on a terminal.
+    app.set_option_context_summary(Some(&format!(
+        "Agent Terminal v{}",
+        env!("CARGO_PKG_VERSION")
+    )));
     app.add_main_option(
         "resume",
         glib::Char::from(b'r'),
@@ -146,6 +151,7 @@ fn main() -> glib::ExitCode {
         load_css();
         window::watch_config_file(app);
         diff_tool::sweep_stale();
+        agent_proc::sweep_stale_key_files();
 
         // Add "New Window" action
         let new_window_action = gtk4::gio::SimpleAction::new("new-window", None);
@@ -271,6 +277,8 @@ fn main() -> glib::ExitCode {
         delegation::settle_shutdown(std::time::Duration::from_secs(3));
         delegation::final_cleanup();
         agent_proc::terminate_all();
+        // A key file whose removal was queued may still be there: none outlives the app.
+        agent_proc::remove_own_key_files();
         tracing::debug!(
             ms = started.elapsed().as_millis(),
             "shutdown: agents stopped"

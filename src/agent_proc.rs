@@ -53,6 +53,8 @@ pub struct SpawnSpec {
     /// Removed from the inherited environment before `env` is applied (a launching agent
     /// session's own markers, the config's `clear_env`).
     pub unset: Vec<String>,
+    /// A model server's key file the process reads ([`write_key_file`]): kept until it exits.
+    pub key_file: KeyFileHold,
 }
 
 type ExitCallback = Box<dyn FnOnce(Option<i32>)>;
@@ -92,6 +94,8 @@ struct Shared {
     killed: Cell<bool>,
     /// Told of every phase change ([`ExitWatch::connect_phase`]); dropped once it has exited.
     watchers: RefCell<Vec<PhaseCallback>>,
+    /// The model server's key file this process reads: dropped (removed) when it exits.
+    key_file: RefCell<KeyFileHold>,
 }
 
 impl Shared {
@@ -211,6 +215,10 @@ impl AgentProcess {
         let Some(program) = spec.argv.first() else {
             return Err("empty command line".to_owned());
         };
+        // A model server's key helper that was never bound to its key file: refused, never run.
+        if agent_core::provider::needs_key_file(&spec.argv) {
+            return Err("the model server's key was not prepared for this start".to_owned());
+        }
         let name = Path::new(program)
             .file_name()
             .map_or_else(|| program.clone(), |n| n.to_string_lossy().into_owned());
@@ -277,6 +285,7 @@ impl AgentProcess {
             stopping: Cell::new(false),
             killed: Cell::new(false),
             watchers: RefCell::new(Vec::new()),
+            key_file: RefCell::new(spec.key_file.clone()),
         });
         spawn_reader(shared.clone(), stdout, Box::new(on_stdout), "stdout");
         spawn_reader(shared.clone(), stderr, Box::new(on_stderr), "stderr");
@@ -485,6 +494,8 @@ fn spawn_waiter(shared: Rc<Shared>) {
             LIVE.with(|l| l.borrow_mut().retain(|p| *p != pid));
         }
         shared.exited.set(true);
+        // Its key file is read by it alone.
+        drop(shared.key_file.take());
         shared.queue.borrow_mut().clear();
         shared.exit_code.set(Some(code));
         shared.notify();
@@ -584,11 +595,162 @@ impl AgentEnv {
 }
 
 /// The entries of `env` a child is given: a model server's thread-model placeholder that no
-/// spawn bound ([`agent_core::provider::bind_thread_model`]) is never exported as a model name.
+/// spawn bound ([`agent_core::provider::bind_thread_model`]) is never exported as a model name,
+/// and the variable that carries a model server's key to the spawn is never exported at all (the
+/// key goes to its key file: [`agent_core::provider::CLAUDE_KEY_VAR`]).
 fn exported(env: &[(String, String)]) -> impl Iterator<Item = (&String, &String)> {
     env.iter()
-        .filter(|(_, v)| v != agent_core::provider::THREAD_MODEL)
+        .filter(|(k, v)| {
+            v != agent_core::provider::THREAD_MODEL && k != agent_core::provider::CLAUDE_KEY_VAR
+        })
         .map(|(k, v)| (k, v))
+}
+
+/// Takes a model server's key out of `spec`'s environment, where a launch carried it to the
+/// spawn ([`agent_core::provider::CLAUDE_KEY_VAR`]): what [`write_key_file`] writes.
+pub fn take_provider_key(spec: &mut SpawnSpec) -> Option<String> {
+    let key = spec
+        .env
+        .iter()
+        .rev()
+        .find(|(k, _)| k == agent_core::provider::CLAUDE_KEY_VAR)
+        .map(|(_, v)| v.clone());
+    spec.env
+        .retain(|(k, _)| k != agent_core::provider::CLAUDE_KEY_VAR);
+    key
+}
+
+/// Writes `key` to a new key file for one agent process, off the main thread, and binds the
+/// settings overlay in `argv` to read it. `Err` refuses the start: no runtime directory (there is
+/// no `/tmp` fallback), or the file could not be written privately.
+pub async fn write_key_file(argv: &mut [String], key: String) -> Result<KeyFileHold, String> {
+    write_key_file_in(&key_root()?, argv, key).await
+}
+
+/// [`write_key_file`] under `root` (`agent_kit::provider_key::key_root`).
+pub async fn write_key_file_in(
+    root: &std::path::Path,
+    argv: &mut [String],
+    key: String,
+) -> Result<KeyFileHold, String> {
+    let root = root.to_path_buf();
+    let file = gtk4::gio::spawn_blocking(move || {
+        let instance = instance_in(&root)?;
+        agent_kit::provider_key::KeyFile::write_new(&instance, &key)
+    })
+    .await
+    .map_err(|_| "Writing the model server's key panicked".to_owned())?
+    .map_err(|e| format!("Could not keep the model server's key privately: {e}"))?;
+    let Some(path) = file.path().to_str().map(str::to_owned) else {
+        release_key_file(file);
+        return Err("The runtime directory's path is not valid UTF-8".to_owned());
+    };
+    if !agent_core::provider::bind_key_file_args(argv, &path) {
+        release_key_file(file);
+        return Err("The model server's settings had no key helper to bind".to_owned());
+    }
+    Ok(KeyFileHold(Some(std::sync::Arc::new(file))))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Where this test thread's key files go, instead of the real runtime directory: an `Err`
+    /// stands for an unusable one.
+    pub static TEST_KEY_ROOT: RefCell<Option<Result<std::path::PathBuf, String>>> =
+        const { RefCell::new(None) };
+}
+
+/// Where key files go; `Err` without a usable runtime directory: there is no `/tmp` fallback.
+fn key_root() -> Result<std::path::PathBuf, String> {
+    #[cfg(test)]
+    if let Some(root) = TEST_KEY_ROOT.with(|r| r.borrow().clone()) {
+        return root;
+    }
+    agent_kit::provider_key::key_root(std::env::var("XDG_RUNTIME_DIR").ok().as_deref()).ok_or_else(
+        || {
+            "There is no runtime directory ($XDG_RUNTIME_DIR) to keep the model server's key in"
+                .to_owned()
+        },
+    )
+}
+
+/// This app instance's claims on key folders (one, but for tests), each holding its lock.
+static INSTANCES: std::sync::Mutex<
+    Vec<(
+        std::path::PathBuf,
+        std::sync::Arc<agent_kit::provider_key::Instance>,
+    )>,
+> = std::sync::Mutex::new(Vec::new());
+
+/// This instance's claim on `root`, taken the first time it is needed. Blocking: off the main
+/// thread.
+fn instance_in(
+    root: &std::path::Path,
+) -> std::io::Result<std::sync::Arc<agent_kit::provider_key::Instance>> {
+    let mut claims = INSTANCES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, instance)) = claims.iter().find(|(r, _)| r == root) {
+        return Ok(instance.clone());
+    }
+    let instance = std::sync::Arc::new(agent_kit::provider_key::Instance::claim(root)?);
+    claims.push((root.to_path_buf(), instance.clone()));
+    Ok(instance)
+}
+
+/// Start-up housekeeping, off the main thread: this instance takes its lock, then the key files
+/// of instances that are gone (their lock free) go.
+pub fn sweep_stale_key_files() {
+    let Ok(root) = key_root() else {
+        return;
+    };
+    drop(gtk4::gio::spawn_blocking(move || {
+        let mine = instance_in(&root).ok();
+        let n = agent_kit::provider_key::sweep_stale(&root, mine.as_ref().map(|i| i.id()));
+        if n > 0 {
+            info!(removed = n, "removed stale model server key files");
+        }
+    }));
+}
+
+/// Exit housekeeping, once the agents are gone: this instance's key files still there (a removal
+/// queued off the main thread may not have run yet) go now. One unlink each, on the calling
+/// thread: acceptable at exit.
+pub fn remove_own_key_files() {
+    let claims = INSTANCES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (_, instance) in claims.iter() {
+        instance.remove_own_keys();
+    }
+}
+
+/// Removes a key file off the main thread.
+pub fn release_key_file(file: agent_kit::provider_key::KeyFile) {
+    drop(gtk4::gio::spawn_blocking(move || drop(file)));
+}
+
+/// A model server's key file, kept by the one process that reads it ([`SpawnSpec::key_file`])
+/// and removed (off the main thread) when that process exits, or when the last holder goes.
+#[derive(Debug, Clone, Default)]
+pub struct KeyFileHold(Option<std::sync::Arc<agent_kit::provider_key::KeyFile>>);
+
+impl KeyFileHold {
+    /// The file's path, if it holds one.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn path(&self) -> Option<&std::path::Path> {
+        self.0
+            .as_deref()
+            .map(agent_kit::provider_key::KeyFile::path)
+    }
+}
+
+impl Drop for KeyFileHold {
+    fn drop(&mut self) {
+        if let Some(file) = self.0.take().and_then(std::sync::Arc::into_inner) {
+            release_key_file(file);
+        }
+    }
 }
 
 /// Runs a one-shot side process (agy `-p /model --output-format json`, `agy models`) and returns
@@ -746,6 +908,79 @@ mod tests {
         )
         .expect("spawn");
         (proc, out, err, exit)
+    }
+
+    /// A model server's key reaches its process only through a private key file, which the
+    /// settings overlay's helper reads and which goes when the process exits: never through the
+    /// environment every child of the agent inherits.
+    #[test]
+    fn a_model_servers_key_is_a_private_file_gone_with_its_process() {
+        use std::os::unix::fs::PermissionsExt;
+        let runtime = tempfile::tempdir().unwrap();
+        let root = agent_kit::provider_key::key_root(runtime.path().to_str()).unwrap();
+        let launch = agent_core::provider::ModelProvider {
+            kind: agent_core::provider::ProviderKind::LiteLlm,
+            base_url: Some("http://127.0.0.1:9".into()),
+            api_key_env: Some("GW_KEY".into()),
+        }
+        .launch(agent_core::adapter::Driver::Claude, Some("k-secret-1"))
+        .unwrap();
+        // The process prints its environment, then waits for a line.
+        let mut spec = sh("env; read l");
+        spec.argv.extend(launch.args);
+        spec.env = launch.env;
+        spec.unset = launch.unset;
+        // An unbound helper never starts.
+        in_loop(|_| assert!(AgentProcess::spawn(&spec, |_| {}, |_| {}, |_| {}).is_err()));
+        let key = take_provider_key(&mut spec).expect("the launch carries the key");
+        assert_eq!(key, "k-secret-1");
+        assert!(!spec.env.iter().any(|(_, v)| v.contains("k-secret-1")));
+        in_loop(|ctx| {
+            let written = Rc::new(RefCell::new(None));
+            let mut argv = spec.argv.clone();
+            let w = written.clone();
+            let into = root.clone();
+            glib::spawn_future_local(async move {
+                let hold = write_key_file_in(&into, &mut argv, key).await;
+                *w.borrow_mut() = Some((hold, argv));
+            });
+            assert!(pump_until(ctx, 10, || written.borrow().is_some()));
+            let (hold, argv) = written.borrow_mut().take().unwrap();
+            let hold = hold.expect("the key file is written");
+            let path = hold.path().unwrap().to_path_buf();
+            assert!(path.starts_with(&root));
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+            // The overlay's helper prints the key from the file.
+            let at = argv.iter().position(|a| a == "--settings").unwrap();
+            let overlay: serde_json::Value = serde_json::from_str(&argv[at + 1]).unwrap();
+            let helper = overlay["apiKeyHelper"].as_str().unwrap().to_owned();
+            let printed = std::process::Command::new("/bin/sh")
+                .args(["-c", &helper])
+                .output()
+                .unwrap();
+            assert_eq!(String::from_utf8_lossy(&printed.stdout), "k-secret-1");
+            assert!(!argv.iter().any(|a| a.contains("k-secret-1")));
+            spec.argv = argv;
+            spec.key_file = hold;
+            let (proc, out, _err, exit) = start(&spec);
+            drop(std::mem::take(&mut spec.key_file));
+            assert!(pump_until(ctx, 10, || !out.borrow().is_empty()));
+            proc.write_line("done");
+            assert!(pump_until(ctx, 10, || exit.get().is_some()));
+            let env = out.borrow().join("\n");
+            assert!(!env.contains("k-secret-1"), "the key is in the environment");
+            assert!(!env.contains(agent_core::provider::CLAUDE_KEY_VAR));
+            assert!(
+                !env.contains("GW_KEY="),
+                "nor under the variable it was read from"
+            );
+            // Gone once the process is, off the main thread.
+            assert!(
+                pump_until(ctx, 10, || !path.exists()),
+                "the key file outlived it"
+            );
+        });
     }
 
     #[test]

@@ -186,7 +186,9 @@ A server is ready when it lists at least one chat model. Its threads pick from i
 models, and keep the server they were opened on. The agent works in the thread's folder with
 six tools (read a file, list a folder, search, write a file, edit a file, run a command).
 Writes and commands follow the mode: Plan only reads, Ask asks before each, Accept edits
-asks before commands and before writing outside the folder. Reads run unasked inside the
+asks before commands, before writing outside the folder and before writing a sensitive file
+(the same list as for reads, below). A mode picked while the agent works applies to its next
+step. A file is written whole or not at all, keeping its permissions. Reads run unasked inside the
 folder; in every mode, Plan included, the agent asks before reading outside it, reading a
 sensitive file (git, hook, editor and agent configuration, instruction files, a file with a
 second hard link and, when the folder is your home or above it, your home's dotfiles) or
@@ -305,7 +307,11 @@ starts them fresh.
 (`~/.codex/config.toml` by default, read once, never rereading it at launch): **Preview
 import** lists each stdio `mcp_servers` entry with its executable name, exact tools
 (`enabled_tools` less `disabled_tools`) and environment variable names, then **Import
-selected** adds the definitions you tick. An entry without an explicit allowlist arrives
+selected** adds the definitions you tick. An entry with no `cwd` runs in the thread's folder
+(`$WORKSPACE`), as Codex runs it in its session's. Timeouts are read as Codex reads them
+(`startup_timeout_sec` and `tool_timeout_sec` in whole or fractional seconds, or
+`startup_timeout_ms` in milliseconds when `startup_timeout_sec` is absent) and rounded up to
+whole seconds. An entry without an explicit allowlist arrives
 disabled and unreviewed; none arrives read-only or approved. Entries with another transport,
 interpolation, shell or package-runner indirection (`sh -c`, `npx --call`), source files,
 literal credentials or `agent-terminal` itself are reported, not imported; a credential
@@ -332,12 +338,20 @@ name, defined in the profile's environment file or your session. The key itself 
 written to the settings. If the address is invalid, or the key variable is not set, the
 thread refuses to start: it never falls back to the vendor's models.
 
+A terminal tab of such a profile runs on the server too. Its shell reads your shell's startup
+files (`.zshrc`, `.bashrc`) before the CLI starts, so the vendor's variables they export are
+removed again just before the CLI starts, and the server's set. That takes a POSIX shell as
+`$SHELL` (sh, bash, zsh, dash, ksh): with fish or csh the tab refuses to start, and a chat
+thread still runs on the server. Such a tab also refuses to start when the profile's
+environment file cannot be read, rather than start without it.
+
 The model list is the one request the app makes to the server itself (`GET <url>/v1/models`).
 Claude reaches the server's Anthropic-compatible API at the URL's root; Codex reaches its
 OpenAI-compatible Responses API at `<url>/v1`. Antigravity only runs Google's models.
 
 Each profile's threads pick from its own server's list: a cloud profile and a local one of
-the same agent each show their own models, and a model is only ever called retired against
+the same agent each show their own models, and so do two profiles on one server whose
+environment files hold different keys, and a model is only ever called retired against
 the list of the server it runs on. A profile with no **Default Model** starts on the first
 model its server lists that is not an embedding model; it never takes the CLI's own default
 (such as `opus` in `~/.claude/settings.json`), which the server would not have.
@@ -346,7 +360,30 @@ Claude Code also picks models on its own: its `opus`, `sonnet`, `haiku` and `fab
 aliases (background tasks use `haiku`), its subagents and auto mode. On a model server all
 of these name the thread's model (`ANTHROPIC_DEFAULT_*_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL`
 and the rest are set for it, and follow a model change), so nothing is sent for a model the
-server does not have. Values for them in your own environment are replaced. Changing the
+server does not have. Values for them in your own environment are replaced, and so are
+those of an `env` block in Claude's own settings files, which Claude Code applies over its
+environment: it is started with a `--settings` overlay that sets the server's address and
+these models, and blanks every other credential and routing variable Claude Code reads
+(`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_PROFILE`,
+the federation variables, `CLAUDE_CODE_OAUTH_TOKEN` and the token file descriptors, and the
+Bedrock, Vertex, Foundry and gateway switches). The credential Claude sends is always the
+profile's key, or the server's placeholder without one, and an `apiKeyHelper` or token of
+your own settings files is not used on a server. The key is never in Claude's environment,
+which everything Claude starts (its shell commands, hooks, MCP servers) would inherit: each
+agent process, and each terminal tab, gets a key file of its own, readable only by you, in
+`$XDG_RUNTIME_DIR/agent-terminal/provider-keys`, which the overlay's `apiKeyHelper` reads.
+The file is removed when that process exits, and any left by a crash at the next start;
+without a runtime directory (`XDG_RUNTIME_DIR` unset) such a profile does not start. The
+variable you named for the key is not passed on to Claude either. This keeps the key out of
+environment listings and away from other users; Claude's own tools run as you and can still
+read the file. The overlay also blanks
+`BASH_ENV` and `ENV`, so a settings file cannot run code in the shell the helper runs in
+(nor in Claude's own shell commands). Claude Code reads only the last `--settings`, so one in
+the profile's own arguments is merged into the overlay: its keys stay, its `env` variables
+too, and the overlay's win where both set one (its own credential and helper included). It
+must be inline JSON (`--settings '{"theme":"dark"}'`): a file path, or a value that is not a
+JSON object, refuses the start with the reason. A managed settings file still
+sits above the overlay. Changing the
 model of a thread on a server restarts Claude on the new model, resuming the same
 conversation (Claude Code cannot switch to a model id it does not know in place). Ollama
 answers Claude's token-count requests with 404 (it has no `/v1/messages/count_tokens`);

@@ -436,7 +436,20 @@ impl Supervisor {
         if bound.is_empty() {
             return Ok(a.receipt);
         }
-        self.dispatch_check(caller, &r.worker_id, epoch, None)?;
+        // A sibling's close or exit while this was accepted moved the epoch on, and the cancel
+        // with it; only a revocation covering either end fails it, and an accepted cancel that
+        // cannot go out is recorded failed, never left reserved.
+        let checked = match self
+            .settled_delivery_epoch(caller, &r.worker_id, epoch)
+            .await
+        {
+            Ok(epoch) => self.dispatch_check(caller, &r.worker_id, epoch, None),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = checked {
+            self.record_fact(a.operation.clone(), DispatchFact::Failed(e.clone()));
+            return Err(e);
+        }
         let workers = {
             let state = self.state.borrow();
             state
@@ -1640,8 +1653,12 @@ impl Supervisor {
         reserve: bool,
     ) -> Result<(Accepted, Option<Reserved>), ToolError> {
         #[cfg(test)]
-        if matches!(a.request, ToolRequest::Send(_)) {
-            let hold = self.state.borrow().hold_send_accept.clone();
+        {
+            let hold = match a.request {
+                ToolRequest::Send(_) => self.state.borrow().hold_send_accept.clone(),
+                ToolRequest::Cancel(_) => self.state.borrow().hold_cancel_accept.clone(),
+                _ => None,
+            };
             while hold.as_ref().is_some_and(|h| h.get()) {
                 glib::timeout_future(std::time::Duration::from_millis(5)).await;
             }

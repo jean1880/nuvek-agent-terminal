@@ -84,6 +84,9 @@ impl HttpChat {
             // A ceiling on a whole reply; a silent server is noticed sooner (`STALL`).
             .timeout_recv_body(Some(Duration::from_secs(3600)))
             .max_redirects(0)
+            // The key goes only to the configured address: never through a proxy the
+            // environment names.
+            .proxy(None)
             .http_status_as_error(false)
             .user_agent(&self.user_agent)
             .build()
@@ -380,6 +383,8 @@ pub struct Runner<C: ChatClient, W: Write> {
     next_id: u64,
     /// The current model cannot take tools: it goes without them until the model changes.
     no_tools: bool,
+    /// What the model is told of a built-in call a Stop ended while it ran: it did start.
+    stopped_result: Option<String>,
     /// The thread's folder, opened when the session starts: every write and command is
     /// anchored to it.
     workspace: Option<std::sync::Arc<crate::local_tools::Workspace>>,
@@ -422,6 +427,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             generation: new_session_id()[..8].to_owned(),
             next_id: 0,
             no_tools: false,
+            stopped_result: None,
             workspace: None,
         }
     }
@@ -903,14 +909,36 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
     }
 
     fn poll_commands(&mut self, commands: &Receiver<RunnerInput>) -> Option<Stop> {
+        self.poll_commands_narrowing(commands).0
+    }
+
+    /// [`Self::poll_commands`], also saying whether a mode it applied narrowed what may run
+    /// unasked (out of Bypass, or into Plan). A mode change is applied as soon as it arrives,
+    /// never held for the turn's end: the next gate and the next request see it.
+    fn poll_commands_narrowing(
+        &mut self,
+        commands: &Receiver<RunnerInput>,
+    ) -> (Option<Stop>, bool) {
         let stop = poll(commands, &mut self.deferred, &self.context.mcp_servers);
         let waiting = std::mem::take(&mut self.deferred);
+        let mut narrowed = false;
         for command in waiting {
-            if !self.handle_busy_control(&command) {
+            if let Command::SetMode { mode } = command {
+                narrowed |= self.set_mode(mode);
+            } else if !self.handle_busy_control(&command) {
                 self.deferred.push(command);
             }
         }
-        stop
+        (stop, narrowed)
+    }
+
+    /// Applies `mode` and says so; whether it narrowed what may run unasked.
+    fn set_mode(&mut self, mode: Mode) -> bool {
+        let narrowed = self.mode == Mode::Bypass && mode != Mode::Bypass
+            || mode == Mode::Plan && self.mode != Mode::Plan;
+        self.mode = mode;
+        self.emit(Envelope::new(Event::ModeChanged { mode }));
+        narrowed
     }
 
     /// One turn: the prompt, then model requests and tool calls until the model answers.
@@ -1093,7 +1121,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         usage: &mut Usage,
     ) -> Result<StepEnd, StepError> {
         use agent_core::local_context::{
-            bound_result, compose_system, plan_request, reserve_batch, SchemaCandidate,
+            bound_result, compose_system, plan_request, reserve_batch_for_any_mode, SchemaCandidate,
         };
         let mut candidates: Vec<_> = if self.no_tools {
             Vec::new()
@@ -1149,9 +1177,10 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         let complete = ended && reply.finish_reason.as_deref() != Some("length");
         let runnable = stopped.is_none() && complete;
         // What arrived before an interrupt is kept, so the next turn knows it was said; calls
-        // only when they will each get an answer below.
-        if !reply.text.is_empty() || !reply.tool_calls.is_empty() {
-            let calls = runnable && !reply.tool_calls.is_empty();
+        // only when they will each get an answer below. A reply whose calls are dropped and that
+        // said nothing leaves no message.
+        let calls = runnable && !reply.tool_calls.is_empty();
+        if !reply.text.is_empty() || calls {
             self.messages.push(ChatMessage {
                 tool_calls: if calls {
                     reply
@@ -1190,15 +1219,13 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         } else {
             plan.schemas
         };
-        let system = compose_system(
+        // The mode may change while the calls run (it is applied as it arrives): the results
+        // are reserved so the next request carries them whichever mode it is planned in.
+        let reservation = match reserve_batch_for_any_mode(
+            model,
             &self.args.cwd,
-            self.mode,
             &self.turn_instructions,
             !self.no_tools,
-        );
-        let reservation = match reserve_batch(
-            model,
-            &system,
             &schemas,
             &self.messages,
             &self.context.budget,
@@ -1222,6 +1249,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 schema.pointer("/function/name").and_then(Value::as_str)
                     == Some(call.function.name.as_str())
             });
+            self.stopped_result = None;
             match self.call(call, commands, reservation, advertised) {
                 Ok(output) => self.messages.push(ChatMessage::tool_result(
                     &call.id,
@@ -1245,6 +1273,9 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                                 &serde_json::json!({"isError":true,"content":[{"type":"text","text":"MCP call interrupted without a confirmed result; its outcome may be unknown. Do not retry automatically."}]}),
                                 reservation,
                             )
+                        } else if let Some(ran) = self.stopped_result.take().filter(|_| offset == 0)
+                        {
+                            bound_result(&self.safe_text(&ran), reservation)
                         } else {
                             bound_result(reason, reservation)
                         };
@@ -1269,7 +1300,8 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         commands: &Receiver<RunnerInput>,
         usage: &mut Usage,
     ) -> Result<(agent_core::local_agent::Reply, bool, Option<Stop>), StepError> {
-        let mut reader = StreamReader::new();
+        // This turn's MCP aliases, so a server repeating one whole with each fragment is read right.
+        let mut reader = StreamReader::with_known_names(self.registry.keys().cloned());
         let mut shown = Shown::default();
         let mut stopped = None;
         let mut server_error = None;
@@ -1569,50 +1601,67 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         let Some(ws) = self.workspace.clone() else {
             return fail(self, "The thread's folder is not open.".to_owned());
         };
-        let outside = if tool.writes() {
-            tool != Tool::RunCommand
-                && input
-                    .get("file_path")
-                    .and_then(Value::as_str)
-                    .is_none_or(|p| !crate::local_tools::inside(&ws, p))
-        } else {
-            crate::local_tools::read_must_ask(&ws, tool, &input)
-        };
-        match gate(tool, self.mode, outside) {
-            Gate::Refuse(why) => {
-                self.emit(Envelope::item_completed(
-                    &item,
-                    ItemStatus::Declined,
-                    None,
-                    Some(why),
-                ));
-                return Ok(format!("Refused: {why}"));
-            }
-            // Any allow runs this one call: what a session or Always answer keeps is the app's
-            // rule, scoped as its card said, and the app answers the cards it covers itself.
-            Gate::Ask => match self.ask(tool, &title, &input, commands)? {
-                Decision::Allow | Decision::AllowForSession | Decision::AllowAlways => {}
-                Decision::Deny | Decision::Cancel => {
+        // Resolved once: judged, shown on its card and run where it leads now, never anywhere
+        // it leads later.
+        let target = crate::local_tools::target(&ws, tool, &input);
+        let outside = crate::local_tools::must_ask(&ws, tool, target.as_deref());
+        // Gated in the mode as it is now (a change during the turn is applied as it arrives),
+        // and again if it changes while the card is open.
+        loop {
+            match gate(tool, self.mode, outside) {
+                Gate::Refuse(why) => {
                     self.emit(Envelope::item_completed(
                         &item,
                         ItemStatus::Declined,
                         None,
-                        Some("The user declined it."),
+                        Some(why),
                     ));
-                    return Ok(
-                        "The user declined this call. Do not retry it; ask or try another way."
-                            .to_owned(),
-                    );
+                    return Ok(format!("Refused: {why}"));
                 }
-            },
-            Gate::Run => {}
+                // Any allow runs this one call: what a session or Always answer keeps is the
+                // app's rule, scoped as its card said, and the app answers the cards it covers
+                // itself.
+                Gate::Ask => match self.ask(
+                    tool,
+                    &title,
+                    &input,
+                    crate::local_tools::card_note(&ws, tool, &input, target.as_deref()),
+                    commands,
+                )? {
+                    None => continue,
+                    Some(Decision::Allow | Decision::AllowForSession | Decision::AllowAlways) => {}
+                    Some(Decision::Deny | Decision::Cancel) => {
+                        self.emit(Envelope::item_completed(
+                            &item,
+                            ItemStatus::Declined,
+                            None,
+                            Some("The user declined it."),
+                        ));
+                        return Ok(
+                            "The user declined this call. Do not retry it; ask or try another way."
+                                .to_owned(),
+                        );
+                    }
+                },
+                Gate::Run => {}
+            }
+            break;
         }
         // Run on a thread of its own, so a Stop is seen (and ends a command's whole group)
         // while it works.
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker = {
-            let (cancel, input) = (cancel.clone(), input.clone());
-            std::thread::spawn(move || crate::local_tools::run(tool, &input, &ws, outside, &cancel))
+            let (cancel, input, target) = (cancel.clone(), input.clone(), target.clone());
+            std::thread::spawn(move || {
+                crate::local_tools::run_judged(
+                    tool,
+                    &input,
+                    &ws,
+                    outside,
+                    target.as_deref(),
+                    &cancel,
+                )
+            })
         };
         let mut stop = None;
         while !worker.is_finished() {
@@ -1634,6 +1683,15 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 None,
                 None,
             ));
+            // It ran: what it gave back is kept, and a change it was making may be half done.
+            self.stopped_result = Some(match result {
+                Ok(output) => output,
+                Err(why) if tool.writes() => format!(
+                    "Stopped by the user while it ran, so its outcome is unknown: check before \
+                     retrying it. ({why})"
+                ),
+                Err(why) => format!("Error: {why}"),
+            });
             return Err(StepError::Stop(stop));
         }
         match result {
@@ -1667,23 +1725,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
     }
 
     fn poll_mcp(&mut self, commands: &Receiver<RunnerInput>, active: bool) -> Option<Stop> {
-        let stop = self.poll_commands(commands);
-        let mut modes = Vec::new();
-        self.deferred.retain(|command| {
-            if let Command::SetMode { mode } = command {
-                modes.push(*mode);
-                false
-            } else {
-                true
-            }
-        });
-        let mut narrowed = false;
-        for mode in modes {
-            narrowed |= self.mode == Mode::Bypass && mode != Mode::Bypass
-                || mode == Mode::Plan && self.mode != Mode::Plan;
-            self.mode = mode;
-            self.emit(Envelope::new(Event::ModeChanged { mode }));
-        }
+        let (stop, narrowed) = self.poll_commands_narrowing(commands);
         if active && narrowed && stop.is_none() {
             self.emit(Envelope::new(Event::Notice {
                 text:
@@ -1892,13 +1934,9 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             }
             match response.recv_timeout(Duration::from_millis(20)) {
                 Ok(Ok(mut value)) => {
-                    if self.masks.value(&mut value).is_err() {
-                        return failed(
-                            self,
-                            "Sensitive MCP result keys were withheld.",
-                            ItemStatus::Failed,
-                        );
-                    }
+                    // The call ran: a key that must be masked is masked in the record, never
+                    // a reason to report a completed call as failed (the model would retry it).
+                    self.masks.value_lossy(&mut value);
                     let is_error = value
                         .get("isError")
                         .and_then(Value::as_bool)
@@ -2018,28 +2056,30 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         }
     }
 
-    /// Asks the user, and waits for the answer (or an interrupt).
+    /// Asks the user, and waits for the answer (or an interrupt). `None`: the mode changed while
+    /// the card was open, so it expired and the call must be gated again.
     fn ask(
         &mut self,
         tool: Tool,
         title: &str,
         input: &Value,
+        note: Option<String>,
         commands: &Receiver<RunnerInput>,
-    ) -> Result<Decision, StepError> {
+    ) -> Result<Option<Decision>, StepError> {
         let request = self.id("approval");
         if !self.emit_approval(
             Envelope::new(Event::ApprovalRequested {
                 tool: tool.name().to_owned(),
                 title: Some(title.to_owned()),
                 input: input.clone(),
-                reason: None,
+                reason: note,
                 options: APPROVAL_OPTIONS.to_vec(),
                 response: ResponseCapability::Live,
                 remembers: None,
             })
             .request(&request),
         ) {
-            return Ok(Decision::Deny);
+            return Ok(Some(Decision::Deny));
         }
         loop {
             match commands.recv_timeout(Duration::from_secs(3600)) {
@@ -2051,7 +2091,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                     self.emit(
                         Envelope::new(Event::ApprovalResolved { decision }).request(&request),
                     );
-                    return Ok(decision);
+                    return Ok(Some(decision));
                 }
                 Ok(RunnerInput::Invalid(why)) => {
                     self.emit(Envelope::new(Event::ApprovalExpired).request(&request));
@@ -2060,6 +2100,12 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 Ok(RunnerInput::Command(Command::Interrupt)) => {
                     self.emit(Envelope::new(Event::ApprovalExpired).request(&request));
                     return Err(StepError::Stop(Stop::Interrupted));
+                }
+                // The card was asked in another mode: it expires, and the call is gated again.
+                Ok(RunnerInput::Command(Command::SetMode { mode })) => {
+                    self.set_mode(mode);
+                    self.emit(Envelope::new(Event::ApprovalExpired).request(&request));
+                    return Ok(None);
                 }
                 Ok(RunnerInput::Command(other))
                     if restrictive_toggle(&other, &self.context.mcp_servers) =>
@@ -3171,6 +3217,17 @@ mod tests {
             context,
         );
         run.send(prompt("change instructions"));
+        // An instruction file is sensitive: even Accept edits asks before writing it.
+        let request = run.wait_for(|e| match &e.event {
+            Event::ApprovalRequested { .. } => e.request.clone(),
+            _ => None,
+        });
+        run.send(Command::Approve {
+            request,
+            decision: Decision::Allow,
+            updated_input: None,
+            message: None,
+        });
         assert_eq!(run.wait_for(completed).0, TurnState::Completed);
         run.send(prompt("next turn"));
         assert_eq!(run.wait_for(completed).0, TurnState::Completed);
@@ -3446,6 +3503,51 @@ mod tests {
         assert!(answer["content"].as_str().unwrap().starts_with("Edited"));
     }
 
+    /// Writing a git hook runs code as surely as a command: Accept edits asks first, and the
+    /// card says where a path through a link leads.
+    #[test]
+    fn a_write_of_a_sensitive_file_in_accept_edits_asks_first() {
+        let work = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(work.path().join(".git/hooks")).unwrap();
+        std::os::unix::fs::symlink(".git/hooks", work.path().join("hooks")).unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let script = Script::new(vec![
+            Ok(tool_call(
+                "c1",
+                "write_file",
+                json!({"file_path": "hooks/pre-commit", "content": "#!/bin/sh\n"}),
+            )),
+            Ok(text(&["Ok"])),
+        ]);
+        let run = start(
+            args(work.path(), Mode::AcceptEdits),
+            script,
+            state.path().into(),
+        );
+        run.send(prompt("add a hook"));
+        let (request, reason) = run.wait_for(|e| match &e.event {
+            Event::ApprovalRequested { reason, .. } => Some((e.request.clone()?, reason.clone())),
+            _ => None,
+        });
+        let real = work.path().canonicalize().unwrap();
+        assert_eq!(
+            reason,
+            Some(format!(
+                "Leads to {}",
+                real.join(".git/hooks/pre-commit").display()
+            ))
+        );
+        run.send(Command::Approve {
+            request,
+            decision: Decision::Deny,
+            updated_input: None,
+            message: None,
+        });
+        run.wait_for(completed);
+        run.finish();
+        assert!(!work.path().join(".git/hooks/pre-commit").exists());
+    }
+
     #[test]
     fn a_command_in_ask_mode_waits_for_the_user_and_a_denial_is_told_to_the_model() {
         let work = tempfile::tempdir().unwrap();
@@ -3588,6 +3690,51 @@ mod tests {
         );
     }
 
+    /// A call stopped while it runs did start: the model is never told it did not run. A
+    /// command's outcome is unknown, and the call after it certainly did not run.
+    #[test]
+    fn a_call_stopped_while_it_runs_is_never_told_it_did_not_run() {
+        let work = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let two = vec![
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"run_command","arguments":"{\"command\":\"touch made; sleep 30\"}"}},{"index":1,"id":"b","function":{"name":"run_command","arguments":"{\"command\":\"true\"}"}}]},"finish_reason":"tool_calls"}]}"#.to_owned(),
+            "data: [DONE]".to_owned(),
+        ];
+        let script = Script::new(vec![Ok(two), Ok(text(&["Next"]))]);
+        let run = start(
+            args(work.path(), Mode::Bypass),
+            script.clone(),
+            state.path().into(),
+        );
+        run.send(prompt("go"));
+        run.wait_for(|e| matches!(e.event, Event::ItemStarted { .. }).then_some(()));
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while !work.path().join("made").exists() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        run.send(Command::Interrupt);
+        run.wait_for(completed);
+        run.send(prompt("again"));
+        run.wait_for(completed);
+        run.finish();
+        assert!(work.path().join("made").exists());
+        let sent = script.bodies()[1]["messages"].as_array().unwrap().clone();
+        let answer = |id: &str| -> String {
+            sent.iter()
+                .find(|m| m["role"] == "tool" && m["tool_call_id"] == id)
+                .and_then(|m| m["content"].as_str())
+                .unwrap()
+                .to_owned()
+        };
+        assert!(!answer("a").contains("Not run"), "{}", answer("a"));
+        assert!(
+            answer("a").contains("outcome is unknown"),
+            "{}",
+            answer("a")
+        );
+        assert!(answer("b").contains("Not run"), "{}", answer("b"));
+    }
+
     #[test]
     fn a_reply_that_breaks_off_before_its_end_runs_no_call() {
         let work = tempfile::tempdir().unwrap();
@@ -3596,17 +3743,23 @@ mod tests {
         let broken = vec![
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"run_command","arguments":"{\"command\":\"touch made\"}"}}]}}]}"#.to_owned(),
         ];
+        let script = Script::new(vec![Ok(broken), Ok(text(&["Ok"]))]);
         let run = start(
             args(work.path(), Mode::Bypass),
-            Script::new(vec![Ok(broken)]),
+            script.clone(),
             state.path().into(),
         );
         run.send(prompt("go"));
         let (state_, _, error) = run.wait_for(completed);
-        run.finish();
         assert_eq!(state_, TurnState::Failed);
         assert!(error.unwrap().contains("before it ended"));
         assert!(!work.path().join("made").exists());
+        // With its call dropped the reply said nothing: no empty message is kept for it.
+        run.send(prompt("again"));
+        run.wait_for(completed);
+        run.finish();
+        let sent = script.bodies()[1]["messages"].as_array().unwrap().clone();
+        assert!(sent.iter().all(|m| m["role"] != "assistant"), "{sent:?}");
     }
 
     #[test]
@@ -3815,6 +3968,101 @@ mod tests {
             .map(|t| t["function"]["name"].as_str().unwrap().to_owned())
             .collect();
         assert_eq!(offered, ["read_file", "list_dir", "search"]);
+    }
+
+    /// A switch to Plan while a call of the batch runs reaches the next call of the same batch:
+    /// it is refused, never written, and the next request offers only Plan's tools.
+    #[test]
+    fn a_switch_to_plan_in_the_middle_of_a_turn_refuses_the_next_write() {
+        let work = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let two = vec![
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"run_command","arguments":"{\"command\":\"sleep 1\"}"}},{"index":1,"id":"b","function":{"name":"write_file","arguments":"{\"file_path\":\"x.txt\",\"content\":\"y\"}"}}]},"finish_reason":"tool_calls"}]}"#.to_owned(),
+            "data: [DONE]".to_owned(),
+        ];
+        let script = Script::new(vec![Ok(two), Ok(text(&["Ok"]))]);
+        let run = start(
+            args(work.path(), Mode::Bypass),
+            script.clone(),
+            state.path().into(),
+        );
+        run.send(prompt("go"));
+        run.wait_for(|e| matches!(e.event, Event::ItemStarted { .. }).then_some(()));
+        run.send(Command::SetMode { mode: Mode::Plan });
+        let mut changed = false;
+        let mut refused = false;
+        run.wait_for(|e| {
+            match &e.event {
+                Event::ModeChanged { mode: Mode::Plan } => changed = true,
+                Event::ItemCompleted {
+                    status: ItemStatus::Declined,
+                    ..
+                } => refused = true,
+                _ => {}
+            }
+            completed(e)
+        });
+        run.finish();
+        assert!(changed && refused, "{changed} {refused}");
+        assert!(!work.path().join("x.txt").exists());
+        let offered: Vec<_> = script.bodies()[1]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(offered, ["read_file", "list_dir", "search"]);
+    }
+
+    /// A card open when the mode changes is judged again in the new mode: in Plan, the command it
+    /// asked about is refused, and a late answer to the old card runs nothing.
+    #[test]
+    fn a_switch_to_plan_at_an_open_card_expires_it_and_refuses_the_call() {
+        let work = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let script = Script::new(vec![
+            Ok(tool_call(
+                "c1",
+                "run_command",
+                json!({"command": "touch made"}),
+            )),
+            Ok(text(&["Ok"])),
+        ]);
+        let run = start(
+            args(work.path(), Mode::Ask),
+            script.clone(),
+            state.path().into(),
+        );
+        run.send(prompt("make it"));
+        let request = run.wait_for(|e| match &e.event {
+            Event::ApprovalRequested { .. } => e.request.clone(),
+            _ => None,
+        });
+        run.send(Command::SetMode { mode: Mode::Plan });
+        run.wait_for(|e| {
+            (matches!(e.event, Event::ApprovalExpired) && e.request.as_ref() == Some(&request))
+                .then_some(())
+        });
+        run.send(Command::Approve {
+            request,
+            decision: Decision::Allow,
+            updated_input: None,
+            message: None,
+        });
+        let (state_, _, _) = run.wait_for(completed);
+        run.finish();
+        assert_eq!(state_, TurnState::Completed);
+        assert!(!work.path().join("made").exists());
+        let told = script.bodies()[1]["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert!(
+            told["content"].as_str().unwrap().contains("Plan mode"),
+            "{told}"
+        );
     }
 
     /// A plan refuses mutation, not disclosure: a read in the folder runs unasked, a read past it

@@ -257,7 +257,7 @@ impl Supervisor {
             });
         }
     }
-    async fn reserve_run(&self, entry: &Delivery) -> Result<Option<RunId>, ToolError> {
+    pub(super) async fn reserve_run(&self, entry: &Delivery) -> Result<Option<RunId>, ToolError> {
         if !matches!(entry.input.plan, DeliveryPlan::StartTurn) {
             return Ok(None);
         }
@@ -282,15 +282,18 @@ impl Supervisor {
                 s.atomically(|s| {
                     if let Some(run) = s.active_delegation_run(worker.as_str())? {
                         return RunId::parse(&run.id)
+                            .map(Ok)
                             .map_err(|e| agent_kit::store::StoreError::Failed(e.to_string()));
                     }
                     let root = s
                         .delegation_root_of_worker(&worker)?
                         .ok_or(agent_kit::store::StoreError::WriterGone)?;
+                    // The authority moved on: refused as stale, never a storage failure.
                     if root.authority_epoch != epoch.0 as i64 {
-                        return Err(agent_kit::store::StoreError::Failed(
-                            "stale authority while reserving follow-up".into(),
-                        ));
+                        return Ok(Err(error(
+                            ErrorCode::StaleEpoch,
+                            "stale authority while reserving follow-up",
+                        )));
                     }
                     let suffix = s.new_id()?.replace('-', "");
                     let run = RunId::from_suffix(&suffix)
@@ -308,10 +311,10 @@ impl Supervisor {
                         created_at: super::supervisor::now(),
                         updated_at: super::supervisor::now(),
                     })?;
-                    Ok(run)
+                    Ok(Ok(run))
                 })
             })
-            .await?;
+            .await??;
         if let Some(w) = self.state.borrow_mut().workers.get_mut(&entry.worker) {
             w.run = Some(run.clone());
         }
@@ -336,7 +339,7 @@ impl Supervisor {
                     if let Some(w) = self.state.borrow_mut().workers.get_mut(&entry.worker) {
                         w.end_dispatch();
                     }
-                    self.record_fact(entry.input.operation, DispatchFact::Failed(e));
+                    self.fail_undispatched(&entry, e);
                     return;
                 }
             }
@@ -348,10 +351,7 @@ impl Supervisor {
             .get(&entry.worker)
             .map(|w| (w.run.clone(), w.generation))
         else {
-            self.record_fact(
-                entry.input.operation,
-                DispatchFact::Failed(error(ErrorCode::NotFound, "unknown worker")),
-            );
+            self.fail_undispatched(&entry, error(ErrorCode::NotFound, "unknown worker"));
             return;
         };
         // A sibling's close or exit while this waited moved the epoch on, and this with it.
@@ -376,7 +376,7 @@ impl Supervisor {
                 if let Some(w) = self.state.borrow_mut().workers.get_mut(&entry.worker) {
                     w.end_dispatch();
                 }
-                self.record_fact(entry.input.operation, DispatchFact::Failed(e));
+                self.fail_undispatched(&entry, e);
                 return;
             }
         };
@@ -408,7 +408,9 @@ impl Supervisor {
             entry.input.epoch,
             expected,
         ) {
-            self.fail_dispatch(&entry, &used, e);
+            if !self.unwritten_auto_to_next_turn(&entry, e.code) {
+                self.fail_dispatch(&entry, &used, e);
+            }
             return;
         }
         let session = self.child_session(&entry.worker);
@@ -428,7 +430,9 @@ impl Supervisor {
         let turn_started = matches!(outcome, DelegatedOutcome::TurnStarted);
         match outcome {
             DelegatedOutcome::Refused(c) => {
-                self.fail_dispatch(&entry, &used, error(c, "session refused delegated input"));
+                if !self.unwritten_auto_to_next_turn(&entry, c) {
+                    self.fail_dispatch(&entry, &used, error(c, "session refused delegated input"));
+                }
                 return;
             }
             DelegatedOutcome::SteerSent { tag } => {
@@ -523,7 +527,7 @@ impl Supervisor {
                 w.end_dispatch();
             }
             if let Err(e) = ready {
-                sup.record_fact(entry.input.operation, DispatchFact::Failed(e));
+                sup.fail_undispatched(&entry, e);
                 return;
             }
             entry.input.plan = DeliveryPlan::StartTurn;
@@ -601,6 +605,8 @@ impl Supervisor {
             if let Err(e) = requeued {
                 warn!(%worker, %operation, "a refused steer could not be requeued");
                 sup.record_fact(operation, DispatchFact::Failed(e));
+                // What was queued behind it is not left waiting.
+                sup.drain_deferred(&worker);
                 return;
             }
             info!(%worker, %operation, "refused steer requeued for the next turn");
@@ -613,6 +619,38 @@ impl Supervisor {
             // The run that refused it may already be over: nothing else would drain it.
             sup.drain_deferred(&worker);
         });
+    }
+    /// An `auto` steer or live write refused `stale_run` before anything was written (the run
+    /// it was planned for ended while it was accepted or reserved) was never given to the
+    /// agent: it takes a refused steer's way to the next turn ([`Self::steer_refused`]) and is
+    /// never failed. A worker being cancelled or closed is left to that path. Whether it was
+    /// requeued.
+    fn unwritten_auto_to_next_turn(self: &Rc<Self>, entry: &Delivery, code: ErrorCode) -> bool {
+        let live = matches!(
+            entry.input.plan,
+            DeliveryPlan::SteerNow(_) | DeliveryPlan::WriteLive { .. }
+        );
+        if entry.policy != DeliveryPolicy::Auto
+            || code != ErrorCode::StaleRun
+            || !live
+            || !matches!(entry.input.source, InputSource::Message { .. })
+            || self
+                .state
+                .borrow()
+                .workers
+                .get(&entry.worker)
+                .is_none_or(|w| matches!(w.row.state.as_str(), "stopping" | "closed"))
+        {
+            return false;
+        }
+        info!(worker = %entry.worker, operation = %entry.input.operation,
+            "the run ended before its auto delivery was written");
+        self.state
+            .borrow_mut()
+            .dispatching
+            .remove(&entry.input.operation);
+        self.steer_refused(&entry.worker, entry.clone());
+        true
     }
     /// A steer's answer may come after its turn ended (the correlation outlives the turn). One
     /// with no answer within [`STEER_SETTLE`] may yet have been taken: its outcome is recorded
@@ -748,6 +786,22 @@ impl Supervisor {
     /// cancel that landed after the task left `pending` (so `cancel_bound_run` could not end it)
     /// ends the run as interrupted, as a cancel does, and never turns into a worker failure.
     fn fail_dispatch(self: &Rc<Self>, entry: &Delivery, used: &Dispatch, e: ToolError) {
+        self.end_failed_dispatch(entry, used, e);
+        // However it ended, the worker's next queued entry is not left behind it: nothing else
+        // would drain it. A spawn's undelivered task fails the worker instead.
+        if !matches!(entry.input.source, InputSource::Task) {
+            self.drain_deferred(&entry.worker);
+        }
+    }
+    /// A delivery that failed before it reserved a run: its operation fails, and the worker's
+    /// next queued entry is tried, as [`Self::fail_dispatch`] does.
+    fn fail_undispatched(self: &Rc<Self>, entry: &Delivery, e: ToolError) {
+        self.record_fact(entry.input.operation.clone(), DispatchFact::Failed(e));
+        if !matches!(entry.input.source, InputSource::Task) {
+            self.drain_deferred(&entry.worker);
+        }
+    }
+    fn end_failed_dispatch(self: &Rc<Self>, entry: &Delivery, used: &Dispatch, e: ToolError) {
         warn!(
             worker = %entry.worker,
             operation = %entry.input.operation,
@@ -841,9 +895,6 @@ impl Supervisor {
                 })
             });
         self.notify_registry();
-        if !task {
-            self.drain_deferred(&entry.worker);
-        }
     }
     /// A task handed to the agent must open its turn within the deadline, or the worker is
     /// stalled: it fails with that reason (stopping its process and ending its run) rather than

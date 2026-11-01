@@ -20,6 +20,9 @@ pub(super) struct Switches {
     /// An Antigravity review is open: the master switch stays where the user put it until the
     /// review ends, instead of flicking off while the registration is not yet saved.
     reviewing: Cell<bool>,
+    /// Antigravity was turned off while its review was open: the review's outcome is not saved,
+    /// and a registration it applied is offered for removal.
+    withdrawn: Cell<bool>,
 }
 
 impl Switches {
@@ -141,6 +144,12 @@ impl AgentTerminalWindow {
                 window.imp().refresh_master_switch(&switches);
             }
         };
+        if driver == Driver::Agy && !on && switches.reviewing.get() {
+            // The open review decides nothing now: its end settles Antigravity off.
+            switches.withdrawn.set(true);
+            self.refresh_master_switch(switches);
+            return;
+        }
         if driver != Driver::Agy || !on {
             self.edit_agent_profile(driver, |p| p.available_for_delegation = on);
             settle(on);
@@ -155,7 +164,9 @@ impl AgentTerminalWindow {
             return;
         }
         switches.reviewing.set(true);
+        switches.withdrawn.set(false);
         let window = self.obj().downgrade();
+        let review_switches = switches.clone();
         self.review_delegation_registration(
             Action::Configure,
             switches.dialog.clone(),
@@ -164,6 +175,19 @@ impl AgentTerminalWindow {
                 let Some(window) = window.upgrade() else {
                     return;
                 };
+                let switches = review_switches;
+                if switches.withdrawn.replace(false) {
+                    if matches!(review, Review::Ready) {
+                        window.imp().review_delegation_registration(
+                            Action::Remove,
+                            switches.dialog.clone(),
+                            switches.registration_row.clone(),
+                            |_| {},
+                        );
+                    }
+                    settle(false);
+                    return;
+                }
                 let ready = matches!(review, Review::Ready);
                 if let Review::Failed(error) = &review {
                     window
@@ -201,8 +225,10 @@ impl AgentTerminalWindow {
                 let on = row.is_active();
                 let imp = obj.imp();
                 for (driver, disabled, available) in imp.delegation_agents() {
-                    // Turning on skips disabled agents; turning off includes them.
-                    if (on && disabled) || available == on {
+                    // Turning on skips disabled agents; turning off includes them, and an
+                    // Antigravity still in its review (not yet saved on).
+                    let in_review = driver == Driver::Agy && switches.reviewing.get();
+                    if (on && disabled) || (available == on && !(in_review && !on)) {
                         continue;
                     }
                     imp.set_agent_delegation(driver, on, &switches);
@@ -232,6 +258,7 @@ impl AgentTerminalWindow {
             dialog: dialog.downgrade(),
             quiet: Cell::new(false),
             reviewing: Cell::new(false),
+            withdrawn: Cell::new(false),
         });
         group.add(&self.master_delegation_row(&switches));
         let runtime = adw::ActionRow::builder().title("Application binding")

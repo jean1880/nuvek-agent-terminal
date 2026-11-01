@@ -1185,7 +1185,7 @@ fn status_class(s: ToolStatus) -> &'static str {
 const MAX_CARD_LINES: usize = 40;
 
 /// A titled block of tool text (input, output, error) with a Copy button that copies all of it,
-/// and "Show full" when the card shows only the last [`MAX_CARD_LINES`] lines.
+/// and "Show More" when the card shows only the last [`MAX_CARD_LINES`] lines.
 struct Section {
     root: gtk4::Box,
     body: gtk4::Label,
@@ -1202,7 +1202,7 @@ impl Section {
         let name = label(title, &["section-title"]);
         name.set_hexpand(true);
         head.append(&name);
-        let more = gtk4::Button::with_label("Show full");
+        let more = gtk4::Button::with_label("Show More");
         more.add_css_class("flat");
         more.add_css_class("section-more");
         more.set_visible(false);
@@ -1255,7 +1255,7 @@ impl Section {
     fn show(body: &gtk4::Label, more: &gtk4::Button, text: &str, expanded: bool) {
         let capped = text.lines().count() > MAX_CARD_LINES;
         more.set_visible(capped);
-        more.set_label(if expanded { "Show less" } else { "Show full" });
+        more.set_label(if expanded { "Show Less" } else { "Show More" });
         body.set_text(&if expanded {
             text.to_owned()
         } else {
@@ -1432,7 +1432,7 @@ impl ToolCard {
         let open_label = label("", &[]);
         open_row.append(&open_label);
         open.set_child(Some(&open_row));
-        let details = gtk4::ToggleButton::with_label("Raw details");
+        let details = gtk4::ToggleButton::with_label("Raw Details");
         details.add_css_class("flat");
         details.set_visible(false);
         bar.append(&details);
@@ -1670,7 +1670,7 @@ impl ToolCard {
         self.diff
             .details
             .update_property(&[gtk4::accessible::Property::Label(&format!(
-                "Raw details for {files}"
+                "Raw Details for {files}"
             ))]);
         self.details_guard.set(true);
         self.diff.details.set_active(item.expanded);
@@ -1819,7 +1819,7 @@ pub(super) fn row_buttons(flow: &gtk4::FlowBox) -> Vec<gtk4::Widget> {
     out
 }
 
-/// The places a permission request names, as a capped monospace list with "Show all".
+/// The places a permission request names, as a capped monospace list with "Show More".
 struct Places {
     root: gtk4::Box,
     body: gtk4::Label,
@@ -1838,7 +1838,7 @@ impl Places {
         body.update_property(&[gtk4::accessible::Property::Label("Places Codex asks for")]);
         frame.append(&body);
         root.append(&frame);
-        let more = gtk4::Button::with_label("Show all");
+        let more = gtk4::Button::with_label("Show More");
         more.add_css_class("flat");
         more.add_css_class("section-more");
         more.set_halign(gtk4::Align::Start);
@@ -1875,13 +1875,13 @@ impl Places {
             &full,
             APPROVAL_VISIBLE_LINES,
             APPROVAL_LINE_CHARS,
-            "Show all",
+            "Show More",
         );
         self.more.set_visible(cut || self.expanded.get());
         self.more.set_label(if self.expanded.get() {
-            "Show fewer"
+            "Show Less"
         } else {
-            "Show all"
+            "Show More"
         });
         self.body.set_text(&if self.expanded.get() {
             full.clone()
@@ -1930,9 +1930,9 @@ fn decision_outcome(d: Decision) -> &'static str {
     }
 }
 
-/// Lines of an approval's input shown on the card itself; the rest is behind "Show raw".
+/// Lines of an approval's input shown on the card itself; the rest is behind "Show Raw".
 const APPROVAL_VISIBLE_LINES: usize = 12;
-/// Characters of one line shown on the card itself; a longer line is cut, the rest in "Show raw".
+/// Characters of one line shown on the card itself; a longer line is cut, the rest in "Show Raw".
 const APPROVAL_LINE_CHARS: usize = 400;
 
 /// What an approval card shows of a request that is not a file edit or a plan, and whether that
@@ -1981,7 +1981,7 @@ fn approval_input_text(tool: &str, input: &Value) -> (String, bool) {
 /// The first `max` lines of `text`, each cut to `width` characters, with a note of what "Show
 /// raw" holds; true when anything was cut.
 fn head_lines(text: &str, max: usize, width: usize) -> (String, bool) {
-    head_lines_in(text, max, width, "Show raw")
+    head_lines_in(text, max, width, "Show Raw")
 }
 
 /// [`head_lines`], naming the control (`rest_in`) that holds what was cut.
@@ -2052,7 +2052,7 @@ impl ApprovalCard {
         root.append(plan.widget());
         let raw_text = mono("");
         let raw_section = Section::new("Raw request", &raw_text);
-        let raw = gtk4::Expander::new(Some("Show raw"));
+        let raw = gtk4::Expander::new(Some("Show Raw"));
         raw.add_css_class("approval-raw");
         raw.set_child(Some(raw_section.widget()));
         raw.set_visible(false);
@@ -2170,7 +2170,7 @@ impl ApprovalCard {
         self.plan.widget().set_visible(plan.is_some());
         self.input_section.set_visible(!input.is_empty());
         self.input_section.set_text(&input);
-        // No "Show raw" only when the card already shows all of it, uncut (a bare command and its
+        // No "Show Raw" only when the card already shows all of it, uncut (a bare command and its
         // folder): whatever is cut is never approved unseen.
         let shown_whole = permission.is_none()
             && !cut
@@ -2193,7 +2193,7 @@ impl ApprovalCard {
             _ if shown_whole => String::new(),
             v => serde_json::to_string_pretty(v).unwrap_or_default(),
         };
-        // The Raw section caps what it shows (Show full, Copy takes all of it).
+        // The Raw section caps what it shows (Show More, Copy takes all of it).
         self.raw_section.set_text(&raw);
         self.raw.set_visible(!raw.is_empty());
         // What cannot be summarized is shown as sent, open: the user can only refuse it, and
@@ -3218,8 +3218,8 @@ pub(crate) mod tests {
         assert!(card.output_box.more.is_visible(), "offers the rest");
         assert_eq!(card.output_box.full.borrow().lines().count(), 100);
         card.output_box.more.emit_clicked();
-        assert_eq!(shown(&card), 100, "Show full shows everything");
-        assert_eq!(card.output_box.more.label().as_deref(), Some("Show less"));
+        assert_eq!(shown(&card), 100, "Show More shows everything");
+        assert_eq!(card.output_box.more.label().as_deref(), Some("Show Less"));
         card.output_box.more.emit_clicked();
         assert_eq!(shown(&card), MAX_CARD_LINES + 1);
         // Short text offers nothing more.
@@ -3560,7 +3560,7 @@ pub(crate) mod tests {
     }
 
     /// A Codex command card shows the bare command and its folder,
-    /// with the request's JSON behind a capped "Show raw"; a large input shows at most the cap;
+    /// with the request's JSON behind a capped "Show Raw"; a large input shows at most the cap;
     /// Claude's ExitPlanMode shows its plan as markdown, not JSON.
     fn approval_cards_show_the_command_and_cap_the_rest() {
         let w0 = include_str!("../../../tests/fixtures/real/codex/ask-shell-decline.jsonl")
@@ -3592,7 +3592,7 @@ pub(crate) mod tests {
             .input_section
             .body
             .text()
-            .ends_with("more lines in Show raw"));
+            .ends_with("more lines in Show Raw"));
         assert!(card.raw_section.body.text().lines().count() <= MAX_CARD_LINES + 1);
 
         // A command the card cuts (a 30-line heredoc, one 5000-character line) always keeps its
@@ -3617,10 +3617,10 @@ pub(crate) mod tests {
                     .all(|l| l.chars().count() <= APPROVAL_LINE_CHARS + 60),
                 "a single enormous line is cut"
             );
-            assert!(shown.contains("in Show raw"), "{shown}");
+            assert!(shown.contains("in Show Raw"), "{shown}");
             assert!(card.raw.is_visible(), "cut text is never approved unseen");
             let raw: Value = serde_json::from_str(&card.raw_section.full.borrow()).expect("raw");
-            assert_eq!(raw["command"], command, "Show raw holds the whole command");
+            assert_eq!(raw["command"], command, "Show Raw holds the whole command");
         }
         // A short plain command is shown whole: no raw needed.
         let (card, _) = codex_card(
@@ -4109,7 +4109,7 @@ pub(crate) mod tests {
         assert!(card.permission_view().1.contains("home folder"));
     }
 
-    /// Two hundred paths do not make a two-hundred-line card: twelve lines, then Show all.
+    /// Two hundred paths do not make a two-hundred-line card: twelve lines, then Show More.
     fn permission_lists_are_bounded() {
         let many: Vec<Value> = (0..200)
             .map(|i| entry("write", &format!("/w/out/{i:03}")))
@@ -4123,11 +4123,11 @@ pub(crate) mod tests {
         );
         let shown = card.places.body.text().to_string();
         assert!(shown.lines().count() <= APPROVAL_VISIBLE_LINES, "{shown}");
-        assert!(shown.ends_with("more lines in Show all"), "{shown}");
+        assert!(shown.ends_with("more lines in Show More"), "{shown}");
         assert!(card.places.more.is_visible());
         card.places.more.emit_clicked();
         assert_eq!(card.places.body.text().lines().count(), 201);
-        assert_eq!(card.places.more.label().as_deref(), Some("Show fewer"));
+        assert_eq!(card.places.more.label().as_deref(), Some("Show Less"));
         card.places.more.emit_clicked();
         assert!(card.places.body.text().lines().count() <= APPROVAL_VISIBLE_LINES);
     }

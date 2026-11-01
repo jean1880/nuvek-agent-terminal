@@ -670,7 +670,7 @@ button.flat.quick-reply-action:hover { color: @at_fg_soft; text-decoration: unde
     background-color: @at_surface_raised;
     border: 1px solid alpha(@at_warning, 0.45);
     background-image: linear-gradient(180deg, alpha(@at_warning, 0.10), alpha(@at_warning, 0.02) 100%);
-    box-shadow: 0 4px 12px alpha(#000000, 0.35);
+    box-shadow: 0 4px 12px @at_shadow;
 }
 .chat-bottom .small .interruption-shelf button.pill {
     padding: 6px 8px;

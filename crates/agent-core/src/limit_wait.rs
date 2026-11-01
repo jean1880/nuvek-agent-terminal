@@ -113,6 +113,13 @@ impl AgentSource {
             server: None,
         }
     }
+
+    /// Whether the agent here uses its vendor's quota, whose usage windows a wait may read: not
+    /// on a model server, nor the Local agent (its server is the user's own). Without one, a
+    /// wait ends on its back-off alone.
+    pub fn has_vendor_quota(&self) -> bool {
+        self.driver != Driver::Local && self.server.is_none()
+    }
 }
 
 impl LimitRecord {
@@ -555,6 +562,10 @@ mod tests {
             )),
         };
         assert!(record.moved_on(&on_server, &up));
+        // Only the vendor's own has a vendor quota to read.
+        assert!(claude.has_vendor_quota());
+        assert!(!on_server.has_vendor_quota());
+        assert!(!AgentSource::vendor(Driver::Local).has_vendor_quota());
         // And back from the server to the vendor.
         let mut record = LimitRecord::default();
         record.observe(&on_server, &failed("You've hit your usage limit"));

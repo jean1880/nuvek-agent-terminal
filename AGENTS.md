@@ -306,7 +306,8 @@ Architectural mandates, standards, and workflows for this codebase.
   window missing from the readings, or one still full that names no reset time) continues blind
   15 minutes after its last refusal, and only once every time a window still holding it names
   has passed; a refusal of that guess is a refused continuation like any other, so the guesses
-  double up to 6 hours. A thread whose profile runs a model server, and the Local agent, read no
+  double up to 6 hours. A thread whose process was launched on a model server
+  (`ChatSession::launched_server`, never the live Settings), and the Local agent, read no
   vendor windows (another thread's reading of the vendor says nothing of them) and are never
   probed for one: their waits end that way.
   Readings count from when windows last arrived (`updated_at`), never an account-only

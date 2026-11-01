@@ -325,8 +325,9 @@ fn a_switch_that_rolls_back_keeps_the_limit_wait_for_wakes() {
 }
 
 /// Whose limit a process hits is the server it was launched on: Settings moving its profile off
-/// that server later changes nothing for that process, so its next turn is not a move off the
-/// limit. Only a new launch reads the profile again.
+/// that server later changes nothing for that process: its next turn is not a move off the
+/// limit, and its wait does not start reading the vendor's usage windows. Only a new launch reads
+/// the profile again.
 #[test]
 fn the_server_a_process_was_launched_on_outlives_a_settings_change() {
     use agent_core::limit_wait::{AgentSource, LimitRecord};
@@ -381,6 +382,8 @@ fn the_server_a_process_was_launched_on_outlives_a_settings_change() {
         assert!(pump_until(ctx, 10, || t.idle() && t.sent_new().contains("again")));
         assert_eq!(t.session.launched_server(), Some(ollama));
         assert!(!record.moved_on(&source(), &Event::TurnStarted { model: None }));
+        // Nor does that process's wait start reading the vendor's usage windows.
+        assert!(!source().has_vendor_quota());
         t.session.shutdown(false);
     });
 }

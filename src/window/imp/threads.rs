@@ -70,17 +70,6 @@ fn limit_windows(windows: &[agent_core::event::QuotaWindow]) -> Vec<LimitWindow>
         .collect()
 }
 
-/// Whether a thread on `driver`, opened with `profile_id`, uses its vendor's quota, the one
-/// `AccountStatus` reads per agent: not on a model server ([`profile_source`]), nor the Local
-/// agent.
-fn reads_vendor_quota(
-    config: &crate::config::TerminalConfig,
-    profile_id: Option<&str>,
-    driver: Driver,
-) -> bool {
-    driver != Driver::Local && profile_source(config, profile_id, driver).is_none()
-}
-
 /// Whose usage limit a thread's events on `driver` come from: the agent, on the model server its
 /// running process was launched on ([`ChatSession::launched_server`]), never the server the live
 /// configuration now gives its profile. No session yet: the vendor's.
@@ -3334,12 +3323,13 @@ impl AgentTerminalWindow {
     }
 
     /// The usage reading a limit wait of `chat` reads: its vendor's, kept per agent
-    /// ([`AccountStatus`]). `None` when the profile it runs has no vendor quota (a model server,
-    /// the Local agent): another thread's reading of the vendor says nothing of it, so its wait
-    /// ends on its back-off alone.
+    /// ([`AccountStatus`]). `None` when its process was launched with no vendor quota (on a model
+    /// server, the Local agent): another thread's reading of the vendor says nothing of it, so its
+    /// wait ends on its back-off alone. Settings moving the profile since change nothing for that
+    /// process.
     fn limit_snapshot(&self, chat: &ChatTab) -> Option<crate::account_status::Snapshot> {
-        let profile = chat.running_profile_id();
-        reads_vendor_quota(&self.config.borrow(), profile.as_deref(), chat.driver)
+        limit_source(chat.driver, chat.slot.get().as_deref())
+            .has_vendor_quota()
             .then(|| AccountStatus::shared().snapshot(chat.driver))
     }
 
@@ -8968,35 +8958,11 @@ pub(super) mod tests {
         );
     }
 
-    /// A usage-limit wait reads the vendor's windows only for a thread on its vendor: one on a
-    /// model server, or the Local agent, reads none (its wait ends on its back-off).
+    /// A thread with no session yet is judged on its vendor; the Local agent never reads one.
     #[test]
-    fn only_a_thread_on_its_vendor_reads_the_vendors_quota() {
-        use agent_core::provider::{ModelProvider, ProviderKind};
-        let mut config = crate::config::TerminalConfig::default();
-        config.profiles = vec![
-            Profile {
-                id: "claude-cloud".into(),
-                ..crate::config::new_agent_profile(Driver::Claude)
-            },
-            Profile {
-                id: "claude-local".into(),
-                provider: Some(ModelProvider::new(ProviderKind::Ollama)),
-                ..crate::config::new_agent_profile(Driver::Claude)
-            },
-        ];
-        assert!(reads_vendor_quota(
-            &config,
-            Some("claude-cloud"),
-            Driver::Claude
-        ));
-        assert!(reads_vendor_quota(&config, None, Driver::Codex));
-        assert!(!reads_vendor_quota(
-            &config,
-            Some("claude-local"),
-            Driver::Claude
-        ));
-        assert!(!reads_vendor_quota(&config, None, Driver::Local));
+    fn a_thread_with_no_session_is_judged_on_its_vendor() {
+        assert!(limit_source(Driver::Claude, None).has_vendor_quota());
+        assert!(!limit_source(Driver::Local, None).has_vendor_quota());
     }
 
     /// A cloud profile and a local one of the same agent: each thread's source is its own

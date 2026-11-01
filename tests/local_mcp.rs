@@ -51,7 +51,9 @@ for line in sys.stdin:
         if scenario == 'reverse':
             send({'jsonrpc':'2.0','id':'reverse','method':'sampling/createMessage','params':{'secret':os.environ.get('TOKEN','')}})
         if scenario == 'notification-flood':
-            for _ in range(129): send({'jsonrpc':'2.0','method':'notifications/message','params':{}})
+            for _ in range(1000): send({'jsonrpc':'2.0','method':'notifications/message','params':{}})
+        if scenario == 'request-flood':
+            for n in range(129): send({'jsonrpc':'2.0','id':'ask-%d' % n,'method':'roots/list'})
         respond(request, {'resultType':'complete','supportedVersions':['2026-07-28'],'capabilities':{'tools':{}},'ttlMs':0,'cacheScope':'private'})
     elif method == 'initialize':
         respond(request, {'protocolVersion':'2025-11-25','capabilities':{'tools':{}},'serverInfo':{'name':'fixture','version':'1'}})
@@ -101,6 +103,8 @@ for line in sys.stdin:
     elif method == 'tools/call':
         with open(folder + '/executions','a') as f: f.write(json.dumps(request['params']) + '\n')
         if scenario == 'call-stall': time.sleep(60)
+        if scenario == 'notification-flood':
+            for n in range(1000): send({'jsonrpc':'2.0','method':'notifications/progress','params':{'progress':n}})
         if scenario == 'call-exit': sys.exit(0)
         if scenario == 'call-error':
             send({'jsonrpc':'2.0','id':request['id'],'error':{'code':-32000,'message':os.environ.get('TOKEN','error')}}); continue
@@ -326,7 +330,7 @@ fn invalid_frames_wrong_ids_and_discovery_bounds_fail_closed_and_clean_up() {
         "partial",
         "oversize-frame",
         "oversize-id",
-        "notification-flood",
+        "request-flood",
         "cursor-loop",
         "cursor-long",
         "page-bound",
@@ -2009,6 +2013,28 @@ mod runner {
             assert!(calls(folder.path()).is_empty());
             run.finish();
         }
+    }
+
+    #[test]
+    fn chatty_servers_keep_their_connection_through_discovery_and_calls() {
+        let folder = tempfile::tempdir().unwrap();
+        let run = Run::new(
+            vec![config(folder.path(), "notification-flood")],
+            Mode::Ask,
+            BTreeMap::new(),
+            vec![Reply::Calls(vec![(mcp_alias(), json!({}))])],
+            None,
+        );
+        run.send(Command::Prompt {
+            text: "test".into(),
+        });
+        let events = run.turn();
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::ItemCompleted { output: Some(output), .. } if output.contains("hello")
+        )));
+        assert_eq!(calls(folder.path()).len(), 1);
+        run.finish();
     }
 
     #[test]

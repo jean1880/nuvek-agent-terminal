@@ -394,6 +394,8 @@ Architectural mandates, standards, and workflows for this codebase.
   importing. Each runs under a guardian (`--local-mcp-guardian`) in its own process group,
   with a minimal exact environment (`PATH`, `HOME`, locale, `TMPDIR`, `XDG_RUNTIME_DIR`, plus
   the definition's references and literals; never a control variable), bounded frames (1 MiB),
+  server requests (128 between responses, each refused; notifications are never kept, and past
+  128 between responses are counted as dropped, never a reason to end the connection),
   discovery (256 tools a server, 1,024 a session), schemas (64 KiB, compiled with a linear
   regex engine, no external `$ref`), arguments (64 KiB) and stderr tail (64 KiB). A turn's
   registry is frozen at its start: the model sees short aliases (`mcp_<hash>`), routed only
@@ -404,7 +406,11 @@ Architectural mandates, standards, and workflows for this codebase.
   (the server's for its reviewed allowlist, a tool override only narrows it, Deny always
   wins; server annotations grant nothing). A card shows the server, the original tool name
   and exactly the arguments that run, secrets masked in place
-  (`agent_core::redact::structured`); a call whose card cannot be shown faithfully is refused.
+  (`agent_core::redact::structured`; a value under a name sensitive only through `KEY` or
+  `TOKEN`, such as `sort_key` or `max_tokens`, is masked only when it looks like a credential:
+  `redact_keyed_shown`); a call whose card cannot be shown faithfully is refused. Discovered
+  names, descriptions and schemas are masked only for the exact resolved credentials, so the
+  model sees the schema its validator compiled; a tool whose input schema holds one is left out.
   A pending approval is bound to its request id, the runner generation and the connection it
   was raised on: a disconnection or reconnection expires the card, and a late answer never
   authorises a replacement call. A session or saved grant is bound to the server definition's
@@ -414,7 +420,8 @@ Architectural mandates, standards, and workflows for this codebase.
   and `disconnect_expires_pending_cards_and_late_answers_never_authorise_reconnection` prove
   the two). Stop, session end, EOF or a narrowing setting ends every server
   of the session, idle ones included, the guardian killing the group on the runner's death
-  through a private lifetime pipe; the next turn starts a fresh generation. A thread's MCP
+  through a private lifetime pipe (it reaps the leader only after killing its group, so the group
+  id is never one reused by another process); the next turn starts a fresh generation. A thread's MCP
   panel toggle never re-enables a definition Settings has disabled. Resolved credential
   values are masked exactly, whole and by fragment, in arguments, results, errors, stderr,
   events, the transcript and the store, before truncation. `tests/local_mcp.rs` proves these

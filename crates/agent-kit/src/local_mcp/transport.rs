@@ -12,7 +12,11 @@ use std::{
 use tokio::io::{AsyncRead, AsyncWrite};
 
 pub(super) const MAX_FRAME: usize = 1024 * 1024;
-const MAX_UNSOLICITED: usize = 128;
+/// Server requests (each answered with an error) allowed between two responses.
+const MAX_SERVER_REQUESTS: usize = 128;
+/// Notifications read between two responses before the rest count as dropped. None is ever
+/// kept (only `tools/list_changed` marks discovery stale), so a chatty server costs no memory.
+const MAX_NOTIFICATIONS: usize = 128;
 
 pub(super) struct ClientTransport<R, W> {
     reader: FrameReader<R>,
@@ -22,6 +26,8 @@ pub(super) struct ClientTransport<R, W> {
     pub closed: Arc<std::sync::atomic::AtomicBool>,
     pub failure: Arc<Mutex<Option<&'static str>>>,
     pub received_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    /// Notifications past [`MAX_NOTIFICATIONS`] in one wait for a response.
+    dropped: usize,
     ended: bool,
 }
 
@@ -35,6 +41,7 @@ impl<R: AsyncRead, W: AsyncWrite> ClientTransport<R, W> {
             closed: Default::default(),
             failure: Default::default(),
             received_bytes: Default::default(),
+            dropped: 0,
             ended: false,
         }
     }
@@ -79,7 +86,9 @@ where
         if self.ended {
             return None;
         }
-        for _ in 0..MAX_UNSOLICITED {
+        let mut requests = 0usize;
+        let mut notifications = 0usize;
+        loop {
             let line = match self.reader.next_frame().await {
                 Ok(Some(line)) => line,
                 Ok(None) => {
@@ -112,11 +121,24 @@ where
                         self.fail("Invalid MCP request ID.");
                         return None;
                     }
+                    // Each request costs a written answer: a server that keeps asking fails.
+                    requests += 1;
+                    if requests > MAX_SERVER_REQUESTS {
+                        self.fail("MCP server exceeded the server request limit.");
+                        return None;
+                    }
                     if write_value(&self.writer, json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"Client requests are unsupported"}}), MAX_FRAME, Duration::from_secs(5)).await.is_err() { self.fail("MCP reverse response could not be written."); return None; }
                 } else if value.get("method").and_then(Value::as_str)
                     == Some("notifications/tools/list_changed")
                 {
                     self.stale.store(true, std::sync::atomic::Ordering::Release);
+                } else {
+                    // Progress and log messages are never kept; past the limit they are
+                    // counted as dropped, never a reason to end the connection.
+                    notifications += 1;
+                    if notifications > MAX_NOTIFICATIONS {
+                        self.dropped = self.dropped.saturating_add(1);
+                    }
                 }
                 tokio::task::yield_now().await;
                 continue;
@@ -149,8 +171,6 @@ where
                 }
             }
         }
-        self.fail("MCP server exceeded the unsolicited frame limit.");
-        None
     }
     async fn close(&mut self) -> io::Result<()> {
         self.ended = true;
@@ -165,6 +185,13 @@ impl<R, W> Drop for ClientTransport<R, W> {
     fn drop(&mut self) {
         self.closed
             .store(true, std::sync::atomic::Ordering::Release);
+        if self.dropped > 0 {
+            // A count only: notification contents never reach a log.
+            eprintln!(
+                "agent-terminal: an MCP server sent {} notifications past the limit of {MAX_NOTIFICATIONS} between responses; they were dropped.",
+                self.dropped
+            );
+        }
     }
 }
 
@@ -194,6 +221,37 @@ mod tests {
                         .unwrap()
                         .contains("secret-canary"));
                 }
+            });
+    }
+
+    #[test]
+    fn chatty_notifications_are_dropped_and_only_server_requests_are_bounded() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let notification =
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n";
+                let response = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n";
+                let input = format!("{}{response}", notification.repeat(1000));
+                let (writer, _peer) = tokio::io::duplex(4096);
+                let mut transport = ClientTransport::new(input.as_bytes(), writer);
+                let request =
+                    serde_json::from_value(json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
+                        .unwrap();
+                transport.send(request).await.unwrap();
+                assert!(transport.receive().await.is_some());
+                assert_eq!(transport.dropped, 1000 - MAX_NOTIFICATIONS);
+                assert!(transport.failure.lock().unwrap().is_none());
+
+                let ask =
+                    "{\"jsonrpc\":\"2.0\",\"id\":\"r\",\"method\":\"sampling/createMessage\"}\n";
+                let input = format!("{}{response}", ask.repeat(MAX_SERVER_REQUESTS + 1));
+                let (writer, _peer) = tokio::io::duplex(1024 * 1024);
+                let mut transport = ClientTransport::new(input.as_bytes(), writer);
+                assert!(transport.receive().await.is_none());
+                assert!(transport.failure.lock().unwrap().is_some());
             });
     }
 

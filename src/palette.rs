@@ -225,6 +225,13 @@ pub const SYSTEM_COLOURS: [(&str, &str); 27] = [
     ("at_info", "@accent_color"),
 ];
 
+/// The shadow under floating chrome (the interruption shelf). Translucent, so it stays apart
+/// from [`Chrome::named`] (opaque colours, read back by probes): a bundled palette draws a
+/// neutral black, the system theme libadwaita's own shade, so the desktop decides.
+pub const SHADOW_NAME: &str = "at_shadow";
+const PALETTE_SHADOW: &str = "rgba(0, 0, 0, 0.35)";
+const SYSTEM_SHADOW: &str = "@shade_color";
+
 /// The class a probe label takes to be coloured `name`, so its value can be read back.
 fn probe_class(name: &str) -> String {
     format!("at-probe-{}", name.replace('_', "-"))
@@ -237,6 +244,7 @@ fn system_css() -> String {
     for (name, value) in SYSTEM_COLOURS {
         css.push_str(&format!("@define-color {name} {value};\n"));
     }
+    css.push_str(&format!("@define-color {SHADOW_NAME} {SYSTEM_SHADOW};\n"));
     for (name, _) in SYSTEM_COLOURS {
         css.push_str(&format!(
             "label.{} {{ color: @{name}; }}\n",
@@ -443,6 +451,7 @@ impl Chrome {
         for (name, colour) in self.named() {
             css.push_str(&format!("@define-color {name} {};\n", colour.hex()));
         }
+        css.push_str(&format!("@define-color {SHADOW_NAME} {PALETTE_SHADOW};\n"));
         // libadwaita before 1.6 reads these names; 1.6 and later the variables below.
         let legacy = [
             ("accent_color", self.accent),
@@ -652,11 +661,12 @@ mod tests {
     /// whose colour does not resolve, so a typo would silently unstyle it.
     #[test]
     fn the_stylesheets_name_only_defined_colours() {
-        let defined: Vec<&str> = Chrome::agent_terminal()
+        let mut defined: Vec<&str> = Chrome::agent_terminal()
             .named()
             .iter()
             .map(|(name, _)| *name)
             .collect();
+        defined.push(SHADOW_NAME);
         let sheets = [
             ("main.rs", include_str!("main.rs")),
             ("style.css", include_str!("chat/view/style.css")),
@@ -671,6 +681,37 @@ mod tests {
                 assert!(defined.contains(&name.as_str()), "{sheet}: @{name}");
             }
         }
+    }
+
+    /// The stylesheets bring no colour of their own: every colour is a palette name, so the
+    /// system theme never shows a literal.
+    #[test]
+    fn the_stylesheets_hold_no_literal_colour() {
+        for (sheet, text) in [
+            ("style.css", include_str!("chat/view/style.css")),
+            ("loading.css", include_str!("window/loading.css")),
+        ] {
+            for literal in ["#", "rgb(", "rgba("] {
+                let found: Vec<&str> = text
+                    .lines()
+                    .filter(|l| !l.trim_start().starts_with("/*") && l.contains(literal))
+                    .collect();
+                assert!(found.is_empty(), "{sheet}: {literal} in {found:?}");
+            }
+        }
+    }
+
+    /// The shadow is defined by every theme, from the desktop's own shade under the system one.
+    #[test]
+    fn every_theme_defines_the_shadow() {
+        let line = format!("@define-color {SHADOW_NAME} ");
+        for choice in ThemeChoice::ALL {
+            if let Some(chrome) = Chrome::for_choice(choice) {
+                assert!(chrome.css().contains(&line), "{choice}: no shadow");
+            }
+        }
+        assert!(system_css().contains(&format!("{line}{SYSTEM_SHADOW};")));
+        assert!(SYSTEM_SHADOW.starts_with('@') && !SYSTEM_SHADOW.contains('#'));
     }
 
     /// The app's own theme is exactly what the stylesheets were tuned with.

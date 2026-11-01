@@ -3188,7 +3188,7 @@ fn event_summary(env: &Envelope) -> (String, Option<StateRef>) {
     let summary = if one_line {
         first_line(&text, MAX_ACTIVITY_SUMMARY_BYTES)
     } else {
-        truncate_bytes(&text, MAX_EVENT_SUMMARY_BYTES).to_owned()
+        truncate_whole_marker(&text, MAX_EVENT_SUMMARY_BYTES).to_owned()
     };
     (summary, state)
 }

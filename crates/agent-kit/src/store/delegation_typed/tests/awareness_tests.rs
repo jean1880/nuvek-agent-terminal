@@ -122,6 +122,19 @@ fn a_cut_never_lands_inside_a_redaction_marker() {
 }
 
 #[test]
+fn a_whole_summary_cut_never_lands_inside_a_redaction_marker() {
+    for pad in MAX_EVENT_SUMMARY_BYTES - 12..=MAX_EVENT_SUMMARY_BYTES {
+        let text = format!("line\n{}****abcd{}", "x".repeat(pad - 5), "y".repeat(100));
+        let (summary, _) = event_summary(&Envelope::new(Event::Notice { text }));
+        assert!(summary.len() <= MAX_EVENT_SUMMARY_BYTES, "{pad}");
+        if let Some(at) = summary.find("****") {
+            assert_eq!(summary.get(at..at + 8), Some("****abcd"), "pad {pad}");
+        }
+        assert!(!summary.ends_with('*'), "pad {pad}");
+    }
+}
+
+#[test]
 fn a_form_page_names_the_form() {
     let events = page_of(
         Event::FormRequested {

@@ -26,6 +26,9 @@ use gtk4::prelude::*;
 use crate::config::ThemeChoice;
 use crate::theme::Theme;
 
+/// WCAG AA for body text: what every text colour must reach on what it is drawn on.
+pub const MIN_TEXT_CONTRAST: f64 = 4.5;
+
 /// An opaque sRGB colour, components 0..=1.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rgb(pub f64, pub f64, pub f64);
@@ -82,10 +85,20 @@ impl Rgb {
     /// `self`, moved just far enough toward `toward` to reach `min` contrast on `bg` (all the
     /// way, if even `toward` falls short).
     pub fn readable_on(self, bg: Rgb, toward: Rgb, min: f64) -> Rgb {
+        self.readable_on_all(&[bg], toward, min)
+    }
+
+    /// [`Self::readable_on`] against every one of `grounds` at once.
+    pub fn readable_on_all(self, grounds: &[Rgb], toward: Rgb, min: f64) -> Rgb {
         (0..=20)
             .map(|step| self.mix(toward, f64::from(step) / 20.0))
-            .find(|c| c.contrast(bg) >= min)
+            .find(|c| c.reads_on_all(grounds, min))
             .unwrap_or(toward)
+    }
+
+    /// Whether `self` reaches `min` contrast on every one of `grounds`.
+    pub fn reads_on_all(self, grounds: &[Rgb], min: f64) -> bool {
+        grounds.iter().all(|g| self.contrast(*g) >= min)
     }
 
     /// Darker (`f` < 1) or lighter (`f` > 1), clamped.
@@ -178,9 +191,11 @@ pub const SYSTEM_COLOURS: [(&str, &str); 27] = [
     ("at_border_hover", "alpha(@accent_color, 0.6)"),
     ("at_fg_strong", "@window_fg_color"),
     ("at_fg", "@window_fg_color"),
-    ("at_fg_soft", "alpha(@window_fg_color, 0.85)"),
-    ("at_fg_dim", "alpha(@window_fg_color, 0.65)"),
-    ("at_fg_faint", "alpha(@window_fg_color, 0.45)"),
+    // Secondary text stays at 4.5:1 on Adwaita's light window, whose text is itself 80 % opaque
+    // (`a_system_themes_secondary_text_reads_on_adwaita`).
+    ("at_fg_soft", "alpha(@window_fg_color, 0.9)"),
+    ("at_fg_dim", "alpha(@window_fg_color, 0.8)"),
+    ("at_fg_faint", "alpha(@window_fg_color, 0.72)"),
     ("at_accent", "@accent_color"),
     (
         "at_accent_hover",
@@ -278,7 +293,7 @@ impl Chrome {
     pub fn for_choice(choice: ThemeChoice) -> Option<Chrome> {
         match choice {
             ThemeChoice::System => None,
-            ThemeChoice::AgentTerminal => Some(Self::agent_terminal()),
+            ThemeChoice::AgentTerminal => Some(Self::agent_terminal().with_readable_text()),
             other => Theme::chrome_base(other).map(|base| {
                 Self::derived(
                     Rgb::from_rgba(&base.background),
@@ -291,8 +306,28 @@ impl Chrome {
                         Rgb::from_rgba(&base.blue),
                     ],
                 )
+                .with_readable_text()
             }),
         }
+    }
+
+    /// The secondary text colours (soft, dim, faint) lifted to [`MIN_TEXT_CONTRAST`] on every
+    /// surface text is drawn on, each moved toward the body text only as far as it must (toward
+    /// the strong text where even the body text falls short), so their order is kept.
+    fn with_readable_text(mut self) -> Chrome {
+        let grounds = [self.bg, self.surface, self.surface_raised];
+        let lift = |c: Rgb| {
+            let toward_fg = c.readable_on_all(&grounds, self.fg, MIN_TEXT_CONTRAST);
+            if toward_fg.reads_on_all(&grounds, MIN_TEXT_CONTRAST) {
+                toward_fg
+            } else {
+                toward_fg.readable_on_all(&grounds, self.fg_strong, MIN_TEXT_CONTRAST)
+            }
+        };
+        self.fg_soft = lift(self.fg_soft);
+        self.fg_dim = lift(self.fg_dim);
+        self.fg_faint = lift(self.fg_faint);
+        self
     }
 
     /// The app's own palette, as hand-tuned (the values the stylesheets were written with).
@@ -645,6 +680,10 @@ mod tests {
         assert!(css.contains("@define-color at_bg #181425;"));
         assert!(css.contains("@define-color at_accent #b49bff;"));
         assert!(css.contains("@define-color at_fg_dim #918bbd;"));
+        // Applied, its faint text (3.45:1 as tuned) is lifted to AA; what already reads is kept.
+        let applied = Chrome::for_choice(ThemeChoice::AgentTerminal).expect("bundled");
+        assert_ne!(applied.fg_faint, Chrome::agent_terminal().fg_faint);
+        assert_eq!(applied.bg, Chrome::agent_terminal().bg);
     }
 
     /// A derived theme reads as its terminal does: its background, its text, its accent, and a
@@ -658,8 +697,69 @@ mod tests {
         assert_ne!(c.accent, c.bg);
     }
 
+    /// Secondary text (soft, dim, faint) reads at WCAG AA on every surface of every bundled theme.
+    #[test]
+    fn every_bundled_themes_secondary_text_reads() {
+        for choice in ThemeChoice::ALL {
+            let Some(c) = Chrome::for_choice(choice) else {
+                continue;
+            };
+            for (role, text) in [
+                ("soft", c.fg_soft),
+                ("dim", c.fg_dim),
+                ("faint", c.fg_faint),
+            ] {
+                for (ground, bg) in [
+                    ("bg", c.bg),
+                    ("surface", c.surface),
+                    ("raised", c.surface_raised),
+                ] {
+                    let ratio = text.contrast(bg);
+                    assert!(
+                        ratio >= MIN_TEXT_CONTRAST,
+                        "{choice}: fg_{role} on {ground} at {ratio:.2}:1"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The system theme's alphas reach AA on libadwaita's own light and dark windows (its text
+    /// colour is translucent in light: rgba(0, 0, 6, 0.8) on #fafafb).
+    #[test]
+    fn a_system_themes_secondary_text_reads_on_adwaita() {
+        let alpha_of = |name: &str| -> f64 {
+            let (_, value) = SYSTEM_COLOURS
+                .iter()
+                .find(|(n, _)| *n == name)
+                .expect("a system colour");
+            value
+                .trim_start_matches("alpha(@window_fg_color, ")
+                .trim_end_matches(')')
+                .parse()
+                .expect("an alpha")
+        };
+        let windows = [
+            (
+                "light",
+                Rgb::from_hex(0xfafafb),
+                Rgb::from_hex(0x000006),
+                0.8,
+            ),
+            ("dark", Rgb::from_hex(0x222226), Rgb::WHITE, 1.0),
+        ];
+        for (mode, bg, fg, fg_alpha) in windows {
+            for name in ["at_fg_soft", "at_fg_dim", "at_fg_faint"] {
+                let text = bg.mix(fg, fg_alpha * alpha_of(name));
+                let ratio = text.contrast(bg);
+                assert!(ratio >= MIN_TEXT_CONTRAST, "{mode}: {name} at {ratio:.2}:1");
+            }
+        }
+    }
+
     #[test]
     fn colour_maths() {
+        assert!((Rgb::WHITE.contrast(Rgb(0.0, 0.0, 0.0)) - 21.0).abs() < 1e-9);
         let black = Rgb(0.0, 0.0, 0.0);
         assert_eq!(black.mix(Rgb::WHITE, 0.5).hex(), "#808080");
         assert_eq!(Rgb::from_hex(0x336699).hex(), "#336699");

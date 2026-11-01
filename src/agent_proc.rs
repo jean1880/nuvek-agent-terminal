@@ -640,8 +640,20 @@ pub async fn write_key_file_in(
     write_key_at(path, key).await
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Where this test thread's key files go, instead of the real runtime directory: an `Err`
+    /// stands for an unusable one.
+    pub static TEST_KEY_ROOT: RefCell<Option<Result<std::path::PathBuf, String>>> =
+        const { RefCell::new(None) };
+}
+
 /// Where key files go; `Err` without a usable runtime directory: there is no `/tmp` fallback.
 fn key_root() -> Result<std::path::PathBuf, String> {
+    #[cfg(test)]
+    if let Some(root) = TEST_KEY_ROOT.with(|r| r.borrow().clone()) {
+        return root;
+    }
     agent_kit::provider_key::key_root(std::env::var("XDG_RUNTIME_DIR").ok().as_deref()).ok_or_else(
         || {
             "There is no runtime directory ($XDG_RUNTIME_DIR) to keep the model server's key in"

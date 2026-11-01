@@ -830,6 +830,66 @@ fn a_move_to_a_server_that_cannot_start_returns_to_the_threads_own_profile() {
     });
 }
 
+/// A move to a keyed model server whose key file cannot be written (no usable runtime
+/// directory) is a start that got no process: it rolls back to the agent the thread ran, which is
+/// up again, rather than leave the thread on an agent no start can bring up.
+#[test]
+fn a_move_whose_key_file_cannot_be_written_rolls_back_to_the_running_agent() {
+    in_loop(|ctx| {
+        crate::agent_proc::TEST_KEY_ROOT
+            .with(|r| *r.borrow_mut() = Some(Err("no runtime directory in this test".into())));
+        let s = slow(Driver::Codex);
+        let asked: Rc<RefCell<Vec<Option<String>>>> = Rc::default();
+        let (asked_in, factory_log) = (asked.clone(), s.new_log.clone());
+        s.session.set_adapter_factory(Rc::new(move |d, profile| {
+            asked_in.borrow_mut().push(profile.map(str::to_owned));
+            launch_of(FakeAdapter::boxed(d, &factory_log)).map(|mut launch| {
+                if let Some(p) = profile {
+                    launch.profile = Some(p.to_owned());
+                    // What a keyed provider launch carries to its spawn.
+                    launch.env.env.push((
+                        agent_core::provider::CLAUDE_KEY_VAR.into(),
+                        "k-secret".into(),
+                    ));
+                }
+                launch
+            })
+        }));
+        s.session.switch_to(
+            Driver::Claude,
+            crate::chat::session::SwitchTarget {
+                profile: "p-keyed".into(),
+                label: "Claude on Gateway".into(),
+            },
+            Some("qwen3-coder".into()),
+            None,
+        );
+        assert!(
+            pump_until(ctx, 5, || asked.borrow().len() >= 2),
+            "never rolled back: {:?}",
+            asked.borrow()
+        );
+        assert_eq!(*asked.borrow(), [Some("p-keyed".to_owned()), None]);
+        assert!(
+            pump_until(ctx, 5, || s.session.status().driver == Driver::Codex
+                && s.session
+                    .inner
+                    .proc
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|p| p.is_alive())),
+            "the previous agent is not up again"
+        );
+        assert!(has(
+            &s.seen,
+            |e| matches!(e, Event::Notice { text } | Event::Error { message: text }
+            if text.contains("no runtime directory"))
+        ));
+        crate::agent_proc::TEST_KEY_ROOT.with(|r| *r.borrow_mut() = None);
+        s.session.shutdown(false);
+    });
+}
+
 /// Overlapping moves: A → B, then a move to C whose launch is refused. C installs nothing, so the
 /// running process is still B's and still says so: its start binds the thread to B.
 #[test]

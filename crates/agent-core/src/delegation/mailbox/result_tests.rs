@@ -130,6 +130,28 @@ fn a_cap_too_small_for_a_header_and_note_still_bounds_every_part() {
     }
 }
 
+/// The note's room is reserved for the most that can be cut, so the last part always ends with
+/// it, whole, at any cap that fits a header and a note, including where the count gains a digit.
+#[test]
+fn the_omission_note_survives_every_boundary_of_a_cap_that_fits_it() {
+    for cap in 96..=160 {
+        for len in (90..=1100).chain(9_990..=10_010) {
+            for already_cut in [0, 1, 9, 99_999] {
+                let split = result_parts(&"y".repeat(len), cap, already_cut);
+                if split.omitted == 0 {
+                    continue;
+                }
+                let last = split.parts.last().expect("a part");
+                assert!(
+                    last.ends_with(&omission_note(split.omitted)),
+                    "cap {cap} len {len} cut {already_cut}: {last:?}"
+                );
+                assert!(split.parts.iter().all(|p| p.len() <= cap));
+            }
+        }
+    }
+}
+
 #[test]
 fn only_an_overdue_steer_is_confirmed_late() {
     use DeliveryState as D;

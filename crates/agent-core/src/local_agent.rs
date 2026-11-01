@@ -209,7 +209,12 @@ impl Tool {
         match self {
             Tool::ReadFile => format!("Read {}", field("file_path")),
             Tool::ListDir => format!("List {}", field("path")),
-            Tool::Search => format!("Search for {}", field("pattern")),
+            Tool::Search => match input.get("path").and_then(Value::as_str) {
+                Some(path) if !path.trim().is_empty() => {
+                    format!("Search for {} in {path}", field("pattern"))
+                }
+                _ => format!("Search for {}", field("pattern")),
+            },
             Tool::WriteFile => format!("Write {}", field("file_path")),
             Tool::EditFile => format!("Edit {}", field("file_path")),
             Tool::RunCommand => field("command").to_owned(),
@@ -333,13 +338,20 @@ pub enum Gate {
     Refuse(&'static str),
 }
 
-/// The gate for `tool` in `mode`. `outside` says the call writes a path outside the working
-/// folder (or one that cannot be resolved): that always asks unless every request is approved
-/// (Bypass). The runner remembers no answer: "Allow for session" and "Always allow" run the one
-/// call, and the app's own rules (scoped as each card says) answer later cards it covers.
+/// The gate for `tool` in `mode`. `outside` says the call reaches past what may run unasked: a
+/// write of a path outside the working folder (or one that cannot be resolved), or a read
+/// outside it, of a sensitive file, or a search from home or above (`local_tools::read_must_ask`).
+/// That always asks unless every request is approved (Bypass), a read in Plan mode included:
+/// a plan refuses mutation, not disclosure. The runner remembers no answer: "Allow for session"
+/// and "Always allow" run the one call, and the app's own rules (scoped as each card says)
+/// answer later cards it covers.
 pub fn gate(tool: Tool, mode: Mode, outside: bool) -> Gate {
     if !tool.writes() {
-        return Gate::Run;
+        return if outside && mode != Mode::Bypass {
+            Gate::Ask
+        } else {
+            Gate::Run
+        };
     }
     match mode {
         Mode::Plan => Gate::Refuse("Plan mode is read-only: describe the change instead."),
@@ -1153,10 +1165,13 @@ mod tests {
     #[test]
     fn the_gate_follows_the_mode() {
         use Tool::*;
+        // A read inside the folder runs; one past it asks in every mode, Plan included.
         for tool in [ReadFile, ListDir, Search] {
             for mode in [Mode::Ask, Mode::Plan, Mode::AcceptEdits] {
-                assert_eq!(gate(tool, mode, true), Gate::Run);
+                assert_eq!(gate(tool, mode, false), Gate::Run);
+                assert_eq!(gate(tool, mode, true), Gate::Ask, "{tool:?} {mode:?}");
             }
+            assert_eq!(gate(tool, Mode::Bypass, true), Gate::Run);
         }
         assert!(matches!(gate(EditFile, Mode::Plan, false), Gate::Refuse(_)));
         assert_eq!(gate(EditFile, Mode::Ask, false), Gate::Ask);
@@ -1172,6 +1187,18 @@ mod tests {
         assert_eq!(gate(RunCommand, Mode::Bypass, true), Gate::Run);
         assert!(tools_for(Mode::Plan).iter().all(|t| !t.writes()));
         assert_eq!(tools_for(Mode::Ask).len(), Tool::ALL.len());
+    }
+
+    #[test]
+    fn a_search_card_says_where_it_searches() {
+        assert_eq!(
+            Tool::Search.title(&json!({"pattern": "KEY", "path": "/home/u"})),
+            "Search for KEY in /home/u"
+        );
+        assert_eq!(
+            Tool::Search.title(&json!({"pattern": "KEY"})),
+            "Search for KEY"
+        );
     }
 
     #[test]

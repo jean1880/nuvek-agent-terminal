@@ -1569,12 +1569,15 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         let Some(ws) = self.workspace.clone() else {
             return fail(self, "The thread's folder is not open.".to_owned());
         };
-        let outside = tool != Tool::RunCommand
-            && tool.writes()
-            && input
-                .get("file_path")
-                .and_then(Value::as_str)
-                .is_none_or(|p| !crate::local_tools::inside(&ws, p));
+        let outside = if tool.writes() {
+            tool != Tool::RunCommand
+                && input
+                    .get("file_path")
+                    .and_then(Value::as_str)
+                    .is_none_or(|p| !crate::local_tools::inside(&ws, p))
+        } else {
+            crate::local_tools::read_must_ask(&ws, tool, &input)
+        };
         match gate(tool, self.mode, outside) {
             Gate::Refuse(why) => {
                 self.emit(Envelope::item_completed(
@@ -3812,6 +3815,58 @@ mod tests {
             .map(|t| t["function"]["name"].as_str().unwrap().to_owned())
             .collect();
         assert_eq!(offered, ["read_file", "list_dir", "search"]);
+    }
+
+    /// A plan refuses mutation, not disclosure: a read in the folder runs unasked, a read past it
+    /// waits for the user even in Plan mode, and a denial reads nothing.
+    #[test]
+    fn a_read_outside_the_folder_asks_even_in_plan_mode() {
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("in.txt"), "inside text").unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let secret = elsewhere.path().join("key");
+        std::fs::write(&secret, "private text").unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let script = Script::new(vec![
+            Ok(tool_call("c1", "read_file", json!({"file_path": "in.txt"}))),
+            Ok(tool_call(
+                "c2",
+                "read_file",
+                json!({"file_path": secret.to_str().unwrap()}),
+            )),
+            Ok(text(&["Done"])),
+        ]);
+        let run = start(
+            args(work.path(), Mode::Plan),
+            script.clone(),
+            state.path().into(),
+        );
+        run.send(prompt("look around"));
+        let (request, tool) = run.wait_for(|e| match &e.event {
+            Event::ApprovalRequested { tool, .. } => {
+                Some((e.request.clone().unwrap(), tool.clone()))
+            }
+            _ => None,
+        });
+        assert_eq!(tool, "read_file");
+        run.send(Command::Approve {
+            request,
+            decision: Decision::Deny,
+            updated_input: None,
+            message: None,
+        });
+        run.wait_for(completed);
+        run.finish();
+        let bodies = script.bodies();
+        let answer = |i: usize| -> String {
+            bodies[i]["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert!(answer(1).contains("inside text"), "{}", answer(1));
+        assert!(answer(2).contains("declined"), "{}", answer(2));
+        assert!(!answer(2).contains("private text"));
     }
 
     #[test]

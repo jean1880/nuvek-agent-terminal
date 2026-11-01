@@ -2,6 +2,7 @@
 //! restart, a revocation scoped to the subtree it names, one replay precedence, and a result
 //! stored as all of its parts or none.
 use super::*;
+use rusqlite::OptionalExtension;
 
 /// A message's stored delivery state and the run it was delivered into.
 fn delivery(s: &Store, m: &MessageId) -> (String, Option<String>) {
@@ -762,7 +763,16 @@ fn a_targeted_strict_message_is_never_confirmed_without_a_run() {
 }
 
 fn carried(s: &Store, op: &OperationId) -> Option<String> {
-    s.meta(&carried_epoch_key(op.as_str())).expect("meta")
+    s.conn
+        .query_row(
+            "SELECT carried_epoch FROM delegation_operations WHERE id = ?1",
+            [op.as_str()],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .expect("carried epoch")
+        .flatten()
+        .map(|e| e.to_string())
 }
 
 /// Only work that was current is carried to the new epoch, and the carried epoch goes once
@@ -806,7 +816,11 @@ fn a_carried_epoch_is_kept_only_for_current_work_and_dropped_whenever_it_leaves_
         f.s.delegation_operation(revoked.operation.as_str())
             .expect("q")
             .expect("row");
-    f.s.delete_meta(&carried_epoch_key(&stale_row.id))
+    f.s.conn
+        .execute(
+            "UPDATE delegation_operations SET carried_epoch = NULL WHERE id = ?1",
+            [&stale_row.id],
+        )
         .expect("drop");
     let other = spawn(&f.s, &f.root.worker, "k3").worker.expect("w");
     f.s.revoke_delegation(&f.root.worker, &RevocationEvent::Close(other))

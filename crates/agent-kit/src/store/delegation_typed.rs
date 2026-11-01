@@ -155,13 +155,6 @@ fn illegal(what: &str) -> StoreError {
     StoreError::Failed(format!("illegal delegation transition: {what}"))
 }
 
-/// [`Store::meta`] key of the epoch an accepted operation was carried to by a revocation that
-/// did not cover it: its own row's epoch is frozen at acceptance. Removed once it leaves
-/// `accepted`.
-fn carried_epoch_key(op: &str) -> String {
-    format!("delegation_operation_epoch:{op}")
-}
-
 fn rfc3339_ms(ms: i64) -> String {
     agent_core::quota::epoch_to_rfc3339(ms.div_euclid(1000))
 }
@@ -1318,11 +1311,6 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(op.to_string()))?;
         let from: OperationState = parse_name("dispatch state", &row.dispatch_state)?;
         operation_step(from, to).map_err(|_| illegal("operation"))?;
-        // An epoch carried by a revocation applies only while it is accepted: every way out
-        // of `accepted` (reservation, failure, revocation, restart) drops it, in this unit.
-        if from == OperationState::Accepted {
-            self.delete_meta(&carried_epoch_key(&row.id))?;
-        }
         // Every stored error is scrubbed whole (message and every string of its nested details):
         // it is replayed to callers verbatim.
         let error_json = error
@@ -1372,12 +1360,8 @@ impl Store {
     /// The epoch an accepted operation holds now: the one a revocation that did not cover it
     /// carried it to, else the one it was accepted under.
     fn operation_epoch(&self, row: &OperationRow) -> Result<i64> {
-        match self.meta(&carried_epoch_key(&row.id))? {
-            Some(v) => v.parse().map_err(|_| {
-                StoreError::Failed(format!("the stored epoch of {} is unreadable", row.id))
-            }),
-            None => Ok(row.authority_epoch),
-        }
+        self.delegation_operation_epoch(&row.id)?
+            .ok_or_else(|| StoreError::NotFound(row.id.clone()))
     }
 
     fn messages_of_operation(&self, op: &str) -> Result<Vec<String>> {
@@ -1688,10 +1672,7 @@ impl Store {
             s.set_delegation_dispatch_state(&op.id, &name_of(&op_to), None, None, now)?;
             let root = s.root_row(&op.root_id)?;
             if root.authority_epoch != op.authority_epoch {
-                s.set_meta(
-                    &carried_epoch_key(&op.id),
-                    &root.authority_epoch.to_string(),
-                )?;
+                s.set_delegation_carried_epoch(&op.id, root.authority_epoch)?;
             }
             Ok(to)
         })
@@ -1972,13 +1953,10 @@ impl Store {
                 {
                     // Current work for a child the event did not cover moves to the new epoch.
                     // Its row's epoch is frozen at acceptance (a schema trigger): the epoch it now
-                    // holds is kept beside it, and reserving its dispatch checks that one. Work
-                    // already stale stays stale; cancels and closes are reserved at acceptance
-                    // and never wait here.
-                    self.set_meta(
-                        &carried_epoch_key(&row.id),
-                        &i64_of(out.authority_epoch).to_string(),
-                    )?;
+                    // holds is its carried epoch, and reserving its dispatch checks that one.
+                    // Work already stale stays stale; cancels and closes are reserved at
+                    // acceptance and never wait here.
+                    self.set_delegation_carried_epoch(&row.id, i64_of(out.authority_epoch))?;
                 }
             }
             // Queued parent→child deliveries of no operation (continuations) go too, when the
@@ -2997,7 +2975,6 @@ impl Store {
                 }
             }
         }
-        // The operations the cascades take carry their epoch in `meta`, which no key reaches.
         let ops = self.ids_with(
             "SELECT id FROM delegation_operations
              WHERE principal_worker_id IN (SELECT value FROM json_each(?1))
@@ -3006,9 +2983,6 @@ impl Store {
                               WHERE r.worker_id IN (SELECT value FROM json_each(?1)))",
             &[&w_json],
         )?;
-        for op in &ops {
-            self.delete_meta(&carried_epoch_key(op))?;
-        }
         // Messages go first, in one statement, with every reply that chains to them: `reply_to`
         // does not cascade (a long chain would nest past SQLite's limit on foreign-key actions),
         // and a reply left behind would refuse the delete.

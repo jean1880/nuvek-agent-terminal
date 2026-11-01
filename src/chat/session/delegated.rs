@@ -496,6 +496,9 @@ impl Inner {
             return WakeOutcome::Busy;
         }
         info!("waking the agent with its sub-agents' news");
+        // Only the copy this dispatch keeps is taken back, never a user's prompt with the same
+        // text.
+        let kept_before = self.pre_init_prompts.borrow().len();
         if !self.dispatch_in_flight(text, None) {
             return WakeOutcome::Busy;
         }
@@ -506,9 +509,7 @@ impl Inner {
         if !self.wrote_now() && self.starting.borrow().is_none() {
             self.prompt_in_flight.set(false);
             self.state.borrow_mut().running_turn = false;
-            self.pre_init_prompts
-                .borrow_mut()
-                .retain(|kept| kept.text != text);
+            self.pre_init_prompts.borrow_mut().truncate(kept_before);
             return WakeOutcome::Busy;
         }
         self.auto_wakes.set(self.auto_wakes.get().saturating_add(1));

@@ -218,6 +218,66 @@ CREATE INDEX delegation_native_aliases_worker ON delegation_native_aliases(worke
 INSERT INTO schema_version (version) VALUES (4);
 ";
 
+/// The v9 migration step's schema: the epoch an accepted operation was carried to by a
+/// revocation that did not cover it, in a column of its own (its `authority_epoch` is frozen at
+/// acceptance). It means something only while the operation is `accepted`, and the triggers
+/// refuse it anywhere else, so every way out of `accepted` must clear it in the same statement.
+/// The frozen-fields trigger names its columns, so this one stays writable. The rows the store
+/// kept in `meta` before are moved by `migrate_v9_carried_epochs`.
+pub(crate) const SCHEMA_V9: &str = "
+ALTER TABLE delegation_operations ADD COLUMN carried_epoch INTEGER
+    CHECK (carried_epoch IS NULL OR carried_epoch >= 0);
+CREATE TRIGGER delegation_operations_carried_insert BEFORE INSERT ON delegation_operations
+WHEN NEW.carried_epoch IS NOT NULL AND NEW.dispatch_state <> 'accepted'
+BEGIN SELECT RAISE(ABORT, 'only an accepted delegation operation carries an epoch'); END;
+CREATE TRIGGER delegation_operations_carried_update
+BEFORE UPDATE OF carried_epoch, dispatch_state ON delegation_operations
+WHEN NEW.carried_epoch IS NOT NULL AND NEW.dispatch_state <> 'accepted'
+BEGIN SELECT RAISE(ABORT, 'only an accepted delegation operation carries an epoch'); END;
+";
+
+/// The `meta` key prefix under which schemas before v9 kept an accepted operation's carried
+/// epoch, one row per operation.
+const V8_CARRIED_EPOCH_PREFIX: &str = "delegation_operation_epoch:";
+
+/// Moves the carried epochs kept in `meta` before v9 into `delegation_operations.carried_epoch`:
+/// only an accepted operation's (anything else was stale, and is never read), then every such
+/// row goes, orphans included. An accepted operation's value that is not an epoch fails the
+/// migration.
+pub(crate) fn migrate_v9_carried_epochs(conn: &rusqlite::Connection) -> Result<()> {
+    let rows: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT o.id, m.value FROM meta m
+             JOIN delegation_operations o ON o.id = substr(m.key, ?1 + 1)
+             WHERE substr(m.key, 1, ?1) = ?2 AND o.dispatch_state = 'accepted'
+             ORDER BY o.id",
+        )?;
+        let prefix_len = V8_CARRIED_EPOCH_PREFIX.len() as i64;
+        let rows = stmt.query_map(params![prefix_len, V8_CARRIED_EPOCH_PREFIX], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (op, value) in &rows {
+        let epoch: i64 = value.parse().ok().filter(|e| *e >= 0).ok_or_else(|| {
+            StoreError::Upgrade(format!("the stored epoch of {op} is unreadable"))
+        })?;
+        conn.execute(
+            "UPDATE delegation_operations SET carried_epoch = ?2 WHERE id = ?1",
+            params![op, epoch],
+        )?;
+    }
+    conn.execute(
+        "DELETE FROM meta WHERE substr(key, 1, ?1) = ?2",
+        params![
+            V8_CARRIED_EPOCH_PREFIX.len() as i64,
+            V8_CARRIED_EPOCH_PREFIX
+        ],
+    )?;
+    conn.execute("INSERT INTO schema_version (version) VALUES (9)", [])?;
+    Ok(())
+}
+
 /// The v7 migration step: `delegation_workers` allows the 'local' driver, so a root thread can
 /// move to the Local agent (it binds no bridge, but its row follows the thread's driver). SQLite
 /// cannot alter a CHECK constraint, so the table is rebuilt with foreign keys off (create new,
@@ -1001,7 +1061,8 @@ impl Store {
     }
 
     /// Records a dispatch fact. The receipt and request are frozen (trigger); only the dispatch
-    /// state, the error of a `failed` operation and a not-yet-set run may change.
+    /// state, the error of a `failed` operation and a not-yet-set run may change. Any state but
+    /// `accepted` drops a carried epoch in the same statement (the schema refuses one there).
     pub fn set_delegation_dispatch_state(
         &self,
         id: &str,
@@ -1013,11 +1074,36 @@ impl Store {
         let n = self.conn.execute(
             "UPDATE delegation_operations SET dispatch_state = ?2,
                  error_json = COALESCE(?3, error_json), run_id = COALESCE(run_id, ?4),
+                 carried_epoch = CASE WHEN ?2 = 'accepted' THEN carried_epoch END,
                  updated_at = ?5
              WHERE id = ?1",
             params![id, dispatch_state, error_json, run_id, at],
         )?;
         super::require_row(n, id)
+    }
+
+    /// Carries an accepted operation to `epoch`, the one a revocation that did not cover it moved
+    /// its tree to. Refused by the schema unless the operation is `accepted`.
+    pub fn set_delegation_carried_epoch(&self, id: &str, epoch: i64) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE delegation_operations SET carried_epoch = ?2 WHERE id = ?1",
+            params![id, epoch],
+        )?;
+        super::require_row(n, id)
+    }
+
+    /// The epoch an operation holds now: the one it was carried to while accepted, else the one
+    /// it was accepted under. `None` when there is no such operation.
+    pub fn delegation_operation_epoch(&self, id: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT COALESCE(carried_epoch, authority_epoch) FROM delegation_operations
+                 WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     // ---- messages ----

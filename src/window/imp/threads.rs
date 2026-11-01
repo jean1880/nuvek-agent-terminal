@@ -916,6 +916,21 @@ pub(super) struct SessionSlot {
 }
 
 impl SessionSlot {
+    /// "Stop and Switch": the running turn is stopped as Stop stops it (sub-agents included), but
+    /// the thread is not marked stopped by the user: its work goes on in the new agent, and its
+    /// limit wait ends only once that agent is up.
+    pub(super) fn stop_for_switch(&self) {
+        self.switch_serial
+            .set(self.switch_serial.get().wrapping_add(1));
+        if let Some((supervisor, thread)) =
+            crate::delegation::supervisor().zip(self.thread.as_deref())
+        {
+            supervisor.root_stop(thread);
+        }
+        if let Some(s) = self.get() {
+            s.interrupt_for_switch();
+        }
+    }
     pub(super) fn invalidate_pending_switch(&self) {
         self.switch_serial
             .set(self.switch_serial.get().wrapping_add(1));
@@ -4621,7 +4636,7 @@ impl AgentTerminalWindow {
             }
             // The slot again: the page may have closed while the question was open.
             if let Some(slot) = imp.slot_of(&thread) {
-                slot.interrupt();
+                slot.stop_for_switch();
                 delegation::switch(&slot, driver, model, effort, target);
             }
         });
@@ -6203,8 +6218,18 @@ impl AgentTerminalWindow {
             }
             // The agent is at work again, or the thread runs another agent now and it is up: the
             // limit it waited out is not this one's any more. A switch only asked for, or one
-            // whose agent never starts (it rolls back), keeps the wait.
-            let moved_on = chat.limit.moved_on(driver, &env.event);
+            // whose agent never starts (it rolls back), keeps the wait. Where the agent runs is
+            // its own process's profile: a move to a model server of the same agent is another.
+            let source = agent_core::limit_wait::AgentSource {
+                driver,
+                server: profile_source(
+                    &self.config.borrow(),
+                    chat.running_profile_id().as_deref(),
+                    driver,
+                )
+                .map(|source| source.provider),
+            };
+            let moved_on = chat.limit.moved_on(&source, &env.event);
             if chat.limit_wait.is_some() && (moved_on || limit_over(&env.event)) {
                 chat.end_limit_wait();
             }
@@ -6222,7 +6247,7 @@ impl AgentTerminalWindow {
             }
             refused = chat
                 .limit
-                .observe(driver, &env.event)
+                .observe(&source, &env.event)
                 .then(|| chat.limit_reset_seen.take());
             let after = match &env.event {
                 Event::TurnStarted { .. } => {

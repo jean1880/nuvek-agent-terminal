@@ -278,6 +278,50 @@ fn a_switch_to_another_agent_ends_the_limit_wait_for_wakes() {
     });
 }
 
+/// A switch whose new agent cannot start rolls back to the agent the thread waits for: the
+/// session still holds sub-agent news for the limit, as the window still waits.
+#[test]
+fn a_switch_that_rolls_back_keeps_the_limit_wait_for_wakes() {
+    in_loop(|ctx| {
+        let t = Thread::new(ctx);
+        t.session.send_prompt("first");
+        assert!(pump_until(ctx, 10, || t.idle()));
+        t.session.set_limit_wait(true);
+
+        let launch = super::answering_claude(&t.new);
+        let env = minimal_env(&t.new);
+        t.session.set_adapter_factory(Rc::new(move |driver, _| {
+            Ok(AgentLaunch {
+                profile: None,
+                adapter: Box::new(Relabelled {
+                    inner: agent_core::claude::ClaudeAdapter::new(),
+                    driver,
+                }),
+                program: if driver == Driver::Codex {
+                    "/nonexistent/agent-terminal-test-codex".into()
+                } else {
+                    launch.program.clone()
+                },
+                extra_args: launch.extra_args.clone(),
+                default_model: None,
+                default_effort: None,
+                env: env.clone(),
+                approval: Err(None),
+            })
+        }));
+        t.session.switch(Driver::Codex, None, None);
+        assert!(pump_until(ctx, 10, || t.session.status().driver
+            == Driver::Claude
+            && t.idle()
+            && t.session.inner.rollback.borrow().is_none()));
+        assert_eq!(
+            t.session.wake_blocker(),
+            Some("the thread waits for its usage limit")
+        );
+        t.session.shutdown(false);
+    });
+}
+
 /// The turn the limit refused carried a handoff (the thread had just switched agent): the
 /// continuation carries it, through the same path as a user prompt (in flight, then spent once
 /// its turn answers), and is shown as the app's notice, never stored as the user's message.
@@ -358,6 +402,35 @@ fn continue_in_another_agent_starts_a_continuation_there() {
             t.sent_new().matches("Continue the unfinished task").count(),
             1
         );
+        t.session.shutdown(false);
+    });
+}
+
+/// "Stop and Switch" stops the turn without marking the thread stopped by the user: a later limit
+/// wait still continues it. And the switch's continuation, the user's own request for the work to
+/// go on, ends a stop that held the root (a delegation root's supervisor holds it on that stop).
+#[test]
+fn a_stop_for_a_switch_never_holds_the_thread_from_continuing() {
+    in_loop(|ctx| {
+        let t = Thread::new(ctx);
+        t.session.send_prompt("first");
+        assert!(pump_until(ctx, 10, || t.idle()
+            && t.session.inner.has_conversation.get()));
+        t.session.interrupt_for_switch();
+        assert!(!t.session.wakes_held());
+        t.session.set_limit_wait(true);
+        assert_eq!(t.session.continue_after_limit(), ContinueOutcome::Started);
+        assert!(pump_until(ctx, 10, || t.idle()));
+
+        t.session.hold_wakes();
+        assert!(t
+            .session
+            .continue_after_switch_to(Driver::Codex, t.session.work_epoch()));
+        t.session.switch(Driver::Codex, None, None);
+        assert!(pump_until(ctx, 10, || t
+            .sent_new()
+            .contains("Continue the unfinished task")));
+        assert!(!t.session.wakes_held());
         t.session.shutdown(false);
     });
 }

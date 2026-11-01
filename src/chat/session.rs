@@ -548,8 +548,9 @@ struct Inner {
     /// queue. Cleared by every start and every teardown.
     provider_session_up: Cell<Option<u64>>,
     /// The window waits for this thread's usage limit to reset (`continue_after_limit`): sub-agent
-    /// news does not wake it meanwhile; only the continuation starts a turn. Cleared by the window,
-    /// by a turn that completes, and by a switch to another agent.
+    /// news does not wake it meanwhile; only the continuation starts a turn. Cleared by the window
+    /// (which ends its wait once a switch's new agent is up) and by the agent working again
+    /// ([`agent_core::limit_wait::limit_over`]); never by a switch alone, which may roll back.
     limit_waiting: Cell<bool>,
     /// The continuation a busy switch owes its task ([`SwitchContinuation`]).
     switch_continuation: RefCell<Option<SwitchContinuation>>,
@@ -1160,6 +1161,14 @@ impl ChatSession {
         self.inner.continue_armed.set(armed);
         self.inner.continue_on_switch_to.set(Some((driver, armed)));
         true
+    }
+
+    /// Stops the running turn for a switch the user confirmed ("Stop and Switch"): not a Stop of
+    /// the thread, so it is not held from continuing on its own (the switch's own continuation,
+    /// sub-agent news, a later usage-limit continuation), as the user's Stop holds it.
+    pub(crate) fn interrupt_for_switch(&self) {
+        self.inner.end_pending_switch();
+        self.inner.command(Command::Interrupt);
     }
 
     /// Bumped whenever the agent works again on its own: it continued after its usage limit,
@@ -5045,6 +5054,8 @@ impl Inner {
     fn continue_after_switch(self: &Rc<Self>, driver: Driver) {
         let sent = self.adapter.borrow().driver() == driver && self.state.borrow().alive;
         if sent {
+            // The user asked for the work to go on here: a stop the switch made is over.
+            self.wakes_held.set(false);
             self.send_prompt_now(super::SWITCH_CONTINUATION);
         }
         self.settle_carried(sent);
@@ -5387,10 +5398,8 @@ impl Inner {
         launch: AgentLaunch,
         installed: Installed,
     ) -> (Mode, bool, bool) {
-        // The limit the thread waited out was the old agent's.
-        if self.adapter.borrow().driver() != driver {
-            self.limit_waiting.set(false);
-        }
+        // A limit wait is not ended here: the window ends it (`set_limit_wait`) once the new
+        // agent is up, and a switch that rolls back keeps it.
         *self.provider_thread.borrow_mut() = pt;
         *self.launched_profile.borrow_mut() = launch.profile.clone();
         self.pending_local_context.borrow_mut().take();
@@ -6553,8 +6562,7 @@ impl ChatBackend for ChatSession {
         if self.inner.child.is_none() {
             self.inner.wakes_held.set(true);
         }
-        self.inner.end_pending_switch();
-        self.inner.command(Command::Interrupt);
+        self.interrupt_for_switch();
     }
 
     fn respond_approval(&self, request: &str, decision: Decision) {

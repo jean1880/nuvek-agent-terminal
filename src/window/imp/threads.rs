@@ -12545,11 +12545,11 @@ pub(super) mod tests {
         let pages = imp.thread_pages();
         writer.shutdown(WORKER_FLUSH_WAIT);
         undos[1].emit_by_name::<()>("button-clicked", &[]);
-        answer("The Thread Is Not Ready Yet", "OK");
+        answer("The Thread Is Not Ready Yet", "Close");
         assert!(threads_in(&other_dir).is_empty());
         assert_eq!(imp.thread_pages(), pages, "no page for a thread not stored");
         imp.delete_thread_now(&named);
-        answer("Could Not Delete the Thread", "OK");
+        answer("Could Not Delete the Thread", "Close");
         assert!(exists(&named), "still there");
 
         window.destroy();

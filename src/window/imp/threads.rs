@@ -1815,9 +1815,7 @@ pub(super) fn no_model_reason(source: &agent_core::provider::ModelProvider) -> S
 /// profile's default, else the first chat model the server lists; never the CLI's own setting,
 /// which names a vendor model (`opus`) the server does not have.
 pub(super) fn start_model(profile: &Profile, driver: Driver) -> Option<String> {
-    match crate::config::profile_provider(profile, driver)
-        .filter(|_| agent_core::provider::supports(driver))
-    {
+    match launch_source(profile, driver) {
         None => profile.effective_default_model(None),
         Some(source) => profile.default_model.clone().or_else(|| {
             let listed = ModelCatalog::shared().models_for(driver, Some(&source));
@@ -1867,7 +1865,17 @@ pub(super) fn profile_source(
 ) -> Option<agent_core::provider::ModelProvider> {
     // The same resolution as the launch's (`agent_launch`), so the picker lists the server the
     // thread runs on.
-    crate::config::profile_provider(&thread_profile_or_new(config, profile_id, driver), driver)
+    launch_source(&thread_profile_or_new(config, profile_id, driver), driver)
+}
+
+/// The model server a process started on `profile` runs `driver` on (`None`: the vendor's own):
+/// what [`profile_launch`] starts it with. A start judges its model by this, on the profile it
+/// launches with, never on the live configuration, which may have changed since.
+pub(super) fn launch_source(
+    profile: &Profile,
+    driver: Driver,
+) -> Option<agent_core::provider::ModelProvider> {
+    crate::config::profile_provider(profile, driver)
         .filter(|_| agent_core::provider::supports(driver))
 }
 
@@ -5895,8 +5903,9 @@ impl AgentTerminalWindow {
             .flatten()
             .or_else(|| profile.default_effort.clone());
         // A model its agent no longer offers (judged on a list fetched in this run) is never
-        // started: the thread resumes on the replacement, and says so.
-        let source = profile_source(&self.config.borrow(), Some(&profile.id), driver);
+        // started: the thread resumes on the replacement, and says so. Judged on the profile the
+        // launch above was built from, so the check and the launch agree on the server.
+        let source = launch_source(profile, driver);
         let (model, effort, ported) = live_model(
             driver,
             source.as_ref(),
@@ -8755,6 +8764,34 @@ pub(super) mod tests {
             start_model(&vendor, Driver::Claude).as_deref(),
             Some("claude-opus-5-5")
         );
+    }
+
+    /// A start judges its model on the server of the profile it launches with: when Settings has
+    /// moved that profile since (or removed it), the live configuration names another source.
+    #[test]
+    fn a_start_judges_its_model_on_the_profile_it_launches_with() {
+        use agent_core::provider::{ModelProvider, ProviderKind};
+        let ollama = ModelProvider::new(ProviderKind::Ollama);
+        let snapshot = Profile {
+            id: "claude-local".into(),
+            provider: Some(ollama.clone()),
+            ..crate::config::new_agent_profile(Driver::Claude)
+        };
+        // The profile has since been taken off the server in Settings.
+        let mut config = crate::config::TerminalConfig::default();
+        config.profiles.push(Profile {
+            provider: None,
+            ..snapshot.clone()
+        });
+        assert_eq!(launch_source(&snapshot, Driver::Claude), Some(ollama));
+        assert_eq!(
+            profile_source(&config, Some("claude-local"), Driver::Claude),
+            None
+        );
+        // So the launch, which runs on the snapshot, is the one a start must follow.
+        let (args, _) = profile_launch(&snapshot, Driver::Claude, Vec::new(), &[]).unwrap();
+        assert!(args.iter().any(|a| a == "--settings"));
+        assert_eq!(launch_source(&snapshot, Driver::Agy), None);
     }
 
     /// Each source another enabled profile runs an agent on, other than the agent's own, is

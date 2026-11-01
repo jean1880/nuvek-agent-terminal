@@ -857,6 +857,23 @@ pub fn with_provider_args(profile: &Profile, model: Option<&str>) -> Result<Prof
     Ok(profile)
 }
 
+/// What a terminal tab takes from its profile's env file (`read`): its variables, or none when
+/// it cannot be read. A tab on a model server (`on_provider`) refuses to start instead: the file
+/// may hold the server's key or the settings the profile needs there.
+pub fn terminal_env_file(
+    read: Result<Vec<(String, String)>, String>,
+    on_provider: bool,
+) -> Result<Vec<(String, String)>, String> {
+    match read {
+        Ok(vars) => Ok(vars),
+        Err(why) if on_provider => Err(format!("Cannot start on the model server: {why}.")),
+        Err(why) => {
+            warn!("Starting the terminal without its environment file: {why}");
+            Ok(Vec::new())
+        }
+    }
+}
+
 /// The prefix of the private names a terminal tab's provider values reach its shell under.
 const PROVIDER_ENV_PREFIX: &str = "__AT_PROVIDER_";
 
@@ -1072,6 +1089,17 @@ mod tests {
             ..on(ProviderKind::Ollama, None)
         };
         assert_eq!(with_provider_args(&shell, None).unwrap(), shell);
+    }
+
+    #[test]
+    fn a_terminal_tab_on_a_model_server_refuses_an_unreadable_env_file() {
+        let vars = vec![("GW_KEY".to_owned(), "k".to_owned())];
+        assert_eq!(terminal_env_file(Ok(vars.clone()), true), Ok(vars));
+        let failed = || load_env_file_checked("/nonexistent/env.sh");
+        let why = terminal_env_file(failed(), true).unwrap_err();
+        assert!(why.contains("environment file"), "{why}");
+        // Without a server the tab starts as before, without the file's variables.
+        assert_eq!(terminal_env_file(failed(), false), Ok(Vec::new()));
     }
 
     /// A terminal tab's shell runs the user's rc before the command, and an rc may export the

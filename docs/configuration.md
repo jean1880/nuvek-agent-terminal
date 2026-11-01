@@ -336,7 +336,8 @@ A terminal tab of such a profile runs on the server too. Its shell reads your sh
 files (`.zshrc`, `.bashrc`) before the CLI starts, so the vendor's variables they export are
 removed again just before the CLI starts, and the server's set. That takes a POSIX shell as
 `$SHELL` (sh, bash, zsh, dash, ksh): with fish or csh the tab refuses to start, and a chat
-thread still runs on the server.
+thread still runs on the server. Such a tab also refuses to start when the profile's
+environment file cannot be read, rather than start without it.
 
 The model list is the one request the app makes to the server itself (`GET <url>/v1/models`).
 Claude reaches the server's Anthropic-compatible API at the URL's root; Codex reaches its

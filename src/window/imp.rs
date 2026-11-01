@@ -4069,7 +4069,9 @@ impl AgentTerminalWindow {
             }
         };
         let mut command = get_startup_command(on_provider.as_ref(), launch);
-        let env_file = profile.and_then(|p| p.env_file.clone());
+        let env_file = profile
+            .and_then(|p| p.env_file.clone())
+            .filter(|f| !f.trim().is_empty());
         info!(
             "Spawning terminal with shell: {}, command: {:?}",
             shell, command
@@ -4157,11 +4159,18 @@ impl AgentTerminalWindow {
                 if let Some(path) = env_file {
                     // With the patterns: an export of a cleared variable equal to its inherited
                     // value is kept, since the block below no longer has it to fall back on.
-                    let extra = gtk4::gio::spawn_blocking(move || {
-                        crate::utils::load_env_file_for_profile(&path, &clear).unwrap_or_default()
+                    let read = gtk4::gio::spawn_blocking(move || {
+                        crate::utils::load_env_file_for_profile(&path, &clear)
                     })
                     .await
-                    .unwrap_or_default();
+                    .unwrap_or_else(|_| Err("reading the environment file failed".to_owned()));
+                    let extra = match crate::utils::terminal_env_file(read, provider.is_some()) {
+                        Ok(extra) => extra,
+                        Err(why) => {
+                            refuse_terminal(&obj, &stack, &terminal, &why);
+                            return;
+                        }
+                    };
 
                     // Later entries win in the environment block, so appending
                     // lets the profile override an inherited value.

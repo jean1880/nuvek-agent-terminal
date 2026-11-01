@@ -174,9 +174,11 @@ impl std::fmt::Debug for ProviderLaunch {
 }
 
 /// Claude Code variables that would send its requests somewhere other than the provider, or
-/// authenticate it as someone else: removed from a provider launch.
-const CLAUDE_UNSET: [&str; 5] = [
+/// authenticate it as someone else: removed from a provider launch. `ANTHROPIC_CUSTOM_HEADERS`
+/// goes with every request, so it may carry another account's credentials to the server.
+const CLAUDE_UNSET: [&str; 6] = [
     "ANTHROPIC_API_KEY",
+    "ANTHROPIC_CUSTOM_HEADERS",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
@@ -798,6 +800,8 @@ mod tests {
             "ANTHROPIC_API_KEY",
             "CLAUDE_CODE_OAUTH_TOKEN",
             "CLAUDE_CODE_USE_BEDROCK",
+            // Headers sent with every request: they could carry another account's credentials.
+            "ANTHROPIC_CUSTOM_HEADERS",
         ] {
             assert!(launch.unset.iter().any(|u| u == name), "{name}");
         }

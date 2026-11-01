@@ -69,18 +69,14 @@ impl AgentTerminalWindow {
         let selections: Rc<RefCell<Vec<(adw::SwitchRow, adw::EntryRow, adw::ActionRow)>>> =
             Rc::default();
         let weak_dialog = dialog.downgrade();
-        preview_button.connect_clicked(glib::clone!(#[weak]source,#[weak]folder,#[weak]preview_row,#[weak]summary,#[weak]confirm,#[strong]data,#[strong]selections,move |button| {
+        preview_button.connect_clicked(glib::clone!(#[weak]source,#[weak]preview_row,#[weak]summary,#[weak]confirm,#[strong]data,#[strong]selections,move |button| {
             confirm.set_sensitive(false);data.borrow_mut().take();
             for (row,entry,error) in selections.borrow_mut().drain(..){preview_row.remove(&row);preview_row.remove(&entry);preview_row.remove(&error);}
-            let path=std::path::PathBuf::from(source.text().as_str());let cwd=std::path::PathBuf::from(folder.text().as_str());
+            let path=std::path::PathBuf::from(source.text().as_str());
             let button=button.downgrade();let output=summary.downgrade();let preview_row=preview_row.downgrade();let confirm=confirm.downgrade();let data=data.clone();let selections=selections.clone();
             if let Some(button)=button.upgrade(){button.set_sensitive(false);}
             glib::spawn_future_local(async move {
-                let result=off_main("Codex import preview",move || {
-                    let expanded=agent_kit::paths::expand_tilde_with(&cwd.display().to_string(),&std::env::var("HOME").unwrap_or_default());
-                    let cwd=std::fs::canonicalize(expanded).map_err(|_|"Choose an existing fallback folder for imported definitions.".to_owned())?;
-                    read_codex(&path,&cwd).map_err(str::to_owned)
-                }).await;
+                let result=off_main("Codex import preview",move || read_codex(&path).map_err(str::to_owned)).await;
                 if let (Some(output),Some(parent),Some(confirm))=(output.upgrade(),preview_row.upgrade(),confirm.upgrade()) {match result {
                     Ok(preview)=>{
                         output.set_subtitle(&preview.summary());

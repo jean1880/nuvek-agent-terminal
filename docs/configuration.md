@@ -305,7 +305,8 @@ starts them fresh.
 (`~/.codex/config.toml` by default, read once, never rereading it at launch): **Preview
 import** lists each stdio `mcp_servers` entry with its executable name, exact tools
 (`enabled_tools` less `disabled_tools`) and environment variable names, then **Import
-selected** adds the definitions you tick. An entry without an explicit allowlist arrives
+selected** adds the definitions you tick. An entry with no `cwd` runs in the thread's folder
+(`$WORKSPACE`), as Codex runs it in its session's. An entry without an explicit allowlist arrives
 disabled and unreviewed; none arrives read-only or approved. Entries with another transport,
 interpolation, shell or package-runner indirection (`sh -c`, `npx --call`), source files,
 literal credentials or `agent-terminal` itself are reported, not imported; a credential

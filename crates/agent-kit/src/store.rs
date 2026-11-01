@@ -47,7 +47,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Schema version this build writes. Bump it and add a step to [`migrate`]. An existing store is
 /// only ever upgraded by the preflight (`preflight::run`), after a verified backup.
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 /// `PRAGMA synchronous = FULL`: a durable control write's level.
 const SYNC_FULL: i64 = 2;
 /// [`Store::meta`] key of the native sessions whose threads the user deleted (JSON list of
@@ -3986,6 +3986,11 @@ fn migrate_locked_to(conn: &Connection, current: i64, target: i64) -> Result<()>
         conn.execute_batch(delegation::SCHEMA_V9)?;
         delegation::migrate_v9_carried_epochs(conn)?;
     }
+    if current < 10 && target >= 10 {
+        // An operation outlives the worker it targets and the run it started, so its key
+        // still replays; workers are indexed by driver.
+        conn.execute_batch(delegation::SCHEMA_V10)?;
+    }
     let broken: Option<String> = conn
         .query_row(
             "SELECT \"table\" FROM pragma_foreign_key_check LIMIT 1",
@@ -5573,19 +5578,28 @@ mod tests {
     fn v8_cascades_take_exactly_what_a_worker_and_a_root_own() {
         let conn = v7_fixture();
         migrate(&conn).expect("migrate");
-        // The child's subtree: its run, the operation targeting it, both messages (the
-        // instruction to it and its reply), its link and its alias. The root and its thread stay.
+        // The child's subtree: its run, both messages (the instruction to it and its reply), its
+        // link and its alias. The root and its thread stay, and so does the root's operation
+        // that targeted it, its key with it, naming neither the child nor its run any more.
         conn.execute("DELETE FROM delegation_workers WHERE id = 'w_kid'", [])
             .expect("delete the child");
         for table in [
             "delegation_runs",
-            "delegation_operations",
             "delegation_messages",
             "delegation_event_links",
             "delegation_native_aliases",
         ] {
             assert_eq!(count(&conn, table), 0, "{table}");
         }
+        let kept: (String, String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT principal_worker_id, idempotency_key, target_worker_id, run_id
+                 FROM delegation_operations WHERE id = 'op1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("the root's operation stays");
+        assert_eq!(kept, ("w_root".into(), "k1".into(), None, None));
         assert_eq!(count(&conn, "delegation_workers"), 1);
         assert_eq!(count(&conn, "delegation_roots"), 1);
         // Its backing thread was released, so it can go; the root's thread cannot while the
@@ -5595,10 +5609,11 @@ mod tests {
         assert!(conn
             .execute("DELETE FROM threads WHERE id = 't1'", [])
             .is_err());
-        // The root row takes its root worker.
+        // The root row takes its root worker, and the root worker its operations.
         conn.execute("DELETE FROM delegation_roots WHERE id = 'r1'", [])
             .expect("delete the root");
         assert_eq!(count(&conn, "delegation_workers"), 0);
+        assert_eq!(count(&conn, "delegation_operations"), 0);
         // Then the thread takes its provider threads and events.
         conn.execute("DELETE FROM threads WHERE id = 't1'", [])
             .expect("delete the thread");
@@ -5827,6 +5842,85 @@ mod tests {
             )
             .expect("count");
         assert_eq!(left, 0);
+    }
+
+    /// A v9 store (as a 1.1 beta wrote it) is brought to v10 keeping every operation, its rowid
+    /// and its carried epoch; the rebuilt table keeps its checks, and workers gain their driver
+    /// index.
+    #[test]
+    fn a_v9_database_migrates_to_v10_keeping_every_operation() {
+        let conn = v8_fixture();
+        conn.pragma_update(None, "foreign_keys", "OFF")
+            .expect("fk off");
+        migrate_locked_to(&conn, 8, 9).expect("a v9 database");
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .expect("fk on");
+        conn.execute(
+            "UPDATE delegation_operations SET carried_epoch = 2 WHERE id = 'op2'",
+            [],
+        )
+        .expect("a carried epoch");
+        let operations = |conn: &Connection| -> Vec<(i64, String, Option<i64>)> {
+            conn.prepare(
+                "SELECT rowid, id, carried_epoch FROM delegation_operations ORDER BY rowid",
+            )
+            .expect("prepare")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .expect("query")
+            .collect::<std::result::Result<_, _>>()
+            .expect("rows")
+        };
+        let before = operations(&conn);
+        migrate(&conn).expect("migrate");
+        let version: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .expect("version");
+        assert_eq!(version, 10);
+        assert_eq!(operations(&conn), before);
+        let broken: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .expect("fk check");
+        assert_eq!(broken, 0);
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index'
+                 AND name = 'delegation_workers_driver'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("index");
+        assert_eq!(indexed, 1);
+        // The checks came back with the table: frozen fields, carried epochs, the target's root.
+        let refused = |sql: &str| assert!(conn.execute_batch(sql).is_err(), "accepted: {sql}");
+        refused("UPDATE delegation_operations SET target_worker_id = 'w_root' WHERE id = 'op1'");
+        refused("UPDATE delegation_operations SET run_id = 'run_x' WHERE id = 'op1'");
+        refused("UPDATE delegation_operations SET idempotency_key = 'k9' WHERE id = 'op1'");
+        refused("UPDATE delegation_operations SET carried_epoch = 1 WHERE id = 'op1'");
+        conn.execute_batch(
+            "BEGIN;
+             INSERT INTO threads (id, title, cwd, created_at, updated_at)
+                 VALUES ('t3', 'other', '/w', 1, 2);
+             INSERT INTO delegation_roots (id, root_thread_id, root_worker_id, task_state,
+                 policy_json, continuation_budget, created_at, updated_at)
+                 VALUES ('r2', 't3', 'w_other', 'active', '{}', 3, 1, 2);
+             INSERT INTO delegation_workers (id, root_id, parent_id, origin, depth, name, driver,
+                 profile_id, launch_json, state, workspace_json, delegation_status, created_at,
+                 updated_at)
+                 VALUES ('w_other', 'r2', NULL, 'root', 0, 'o', 'claude', 'p', '{}', 'running',
+                         '{}', 'available', 1, 2);
+             COMMIT;",
+        )
+        .expect("a second root");
+        refused(
+            "INSERT INTO delegation_operations (id, root_id, principal_worker_id, kind,
+                 idempotency_key, authority_epoch, canonical_request, resolution_json,
+                 receipt_json, dispatch_state, target_worker_id, created_at, updated_at)
+             VALUES ('op9', 'r1', 'w_root', 'send', 'k9', 0, '{}', '{}', '{}', 'accepted',
+                     'w_other', 1, 2)",
+        );
+        migrate(&conn).expect("a second run is a no-op");
     }
 
     #[test]

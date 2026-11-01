@@ -283,6 +283,84 @@ pub(crate) fn migrate_v9_carried_epochs(conn: &rusqlite::Connection) -> Result<(
     Ok(())
 }
 
+/// The v10 migration step. An operation is owned by its principal (and root) alone: deleting the
+/// worker it targets, or the run it started, clears that reference (`ON DELETE SET NULL`) and
+/// keeps the operation, so the principal's idempotency key still replays its receipt and a retry
+/// never runs twice. Under v8/v9 both cascaded, so deleting a child's subtree took its parent's
+/// spawn with it. A composite key cannot clear one column (it would clear `root_id` too), so the
+/// target is a plain reference and a trigger keeps it a worker of the operation's own root. The
+/// frozen-fields trigger lets either reference go to NULL and nowhere else. SQLite cannot change
+/// a foreign key, so the table is rebuilt (create new, copy keeping rowids, drop, rename, with
+/// foreign keys off) and its indexes and triggers created again. `delegation_workers.driver`
+/// gains an index too.
+pub(crate) const SCHEMA_V10: &str = "
+CREATE TABLE delegation_operations_v10 (
+    id TEXT PRIMARY KEY NOT NULL,
+    root_id TEXT NOT NULL REFERENCES delegation_roots(id) ON DELETE CASCADE,
+    principal_worker_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (length(kind) BETWEEN 1 AND 32),
+    idempotency_key TEXT NOT NULL CHECK (length(idempotency_key) BETWEEN 1 AND 128),
+    authority_epoch INTEGER NOT NULL CHECK (authority_epoch >= 0),
+    canonical_request TEXT NOT NULL,
+    resolution_json TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    dispatch_state TEXT NOT NULL CHECK (dispatch_state IN ('accepted', 'dispatch_reserved',
+        'submitted', 'confirmed', 'failed', 'unknown')),
+    error_json TEXT,
+    target_worker_id TEXT REFERENCES delegation_workers(id) ON DELETE SET NULL,
+    run_id TEXT REFERENCES delegation_runs(id) ON DELETE SET NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    carried_epoch INTEGER CHECK (carried_epoch IS NULL OR carried_epoch >= 0),
+    UNIQUE (principal_worker_id, kind, idempotency_key),
+    CHECK (dispatch_state <> 'failed' OR error_json IS NOT NULL),
+    FOREIGN KEY (root_id, principal_worker_id) REFERENCES delegation_workers(root_id, id)
+        ON DELETE CASCADE
+);
+INSERT INTO delegation_operations_v10 (rowid, id, root_id, principal_worker_id, kind,
+    idempotency_key, authority_epoch, canonical_request, resolution_json, receipt_json,
+    dispatch_state, error_json, target_worker_id, run_id, created_at, updated_at, carried_epoch)
+SELECT rowid, id, root_id, principal_worker_id, kind,
+    idempotency_key, authority_epoch, canonical_request, resolution_json, receipt_json,
+    dispatch_state, error_json, target_worker_id, run_id, created_at, updated_at, carried_epoch
+FROM delegation_operations;
+DROP TABLE delegation_operations;
+ALTER TABLE delegation_operations_v10 RENAME TO delegation_operations;
+
+CREATE INDEX delegation_operations_root ON delegation_operations(root_id, created_at);
+CREATE INDEX delegation_operations_state ON delegation_operations(dispatch_state, root_id);
+CREATE INDEX delegation_operations_target ON delegation_operations(target_worker_id);
+CREATE INDEX delegation_operations_run ON delegation_operations(run_id);
+CREATE INDEX delegation_workers_driver ON delegation_workers(driver);
+
+CREATE TRIGGER delegation_operations_target_owned BEFORE INSERT ON delegation_operations
+WHEN NEW.target_worker_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM delegation_workers
+     WHERE id = NEW.target_worker_id AND root_id = NEW.root_id)
+BEGIN SELECT RAISE(ABORT, 'a delegation operation targets a worker of its own root'); END;
+CREATE TRIGGER delegation_operations_frozen BEFORE UPDATE ON delegation_operations
+WHEN NEW.id IS NOT OLD.id OR NEW.root_id IS NOT OLD.root_id
+  OR NEW.principal_worker_id IS NOT OLD.principal_worker_id OR NEW.kind IS NOT OLD.kind
+  OR NEW.idempotency_key IS NOT OLD.idempotency_key
+  OR NEW.authority_epoch IS NOT OLD.authority_epoch
+  OR NEW.canonical_request IS NOT OLD.canonical_request
+  OR NEW.resolution_json IS NOT OLD.resolution_json
+  OR NEW.receipt_json IS NOT OLD.receipt_json
+  OR (NEW.target_worker_id IS NOT OLD.target_worker_id AND NEW.target_worker_id IS NOT NULL)
+  OR NEW.created_at IS NOT OLD.created_at
+  OR (OLD.run_id IS NOT NULL AND NEW.run_id IS NOT OLD.run_id AND NEW.run_id IS NOT NULL)
+BEGIN SELECT RAISE(ABORT, 'a delegation operation''s request, resolution and receipt are frozen');
+END;
+CREATE TRIGGER delegation_operations_carried_insert BEFORE INSERT ON delegation_operations
+WHEN NEW.carried_epoch IS NOT NULL AND NEW.dispatch_state <> 'accepted'
+BEGIN SELECT RAISE(ABORT, 'only an accepted delegation operation carries an epoch'); END;
+CREATE TRIGGER delegation_operations_carried_update
+BEFORE UPDATE OF carried_epoch, dispatch_state ON delegation_operations
+WHEN NEW.carried_epoch IS NOT NULL AND NEW.dispatch_state <> 'accepted'
+BEGIN SELECT RAISE(ABORT, 'only an accepted delegation operation carries an epoch'); END;
+
+INSERT INTO schema_version (version) VALUES (10);
+";
+
 /// The v7 migration step: `delegation_workers` allows the 'local' driver, so a root thread can
 /// move to the Local agent (it binds no bridge, but its row follows the thread's driver). SQLite
 /// cannot alter a CHECK constraint, so the table is rebuilt with foreign keys off (create new,

@@ -2928,11 +2928,12 @@ impl Store {
     /// Called by `delete_thread` inside its transaction: refuses while any delegated worker the
     /// delete would take is live (not closed, or with an active run), else removes that subtree's
     /// workers (for a root, its root row). Their messages and every reply chained to them go
-    /// first, in one statement; the schema's cascades take the rest they own: runs, operations,
-    /// links and aliases, and the links and aliases of the deleted threads' events and provider
-    /// threads with those. Returns the other hidden backing
-    /// threads that go with it, for the caller to delete too (so none is left to surface in the
-    /// sidebar).
+    /// first, in one statement; the schema's cascades take the rest they own: runs, their own
+    /// operations, links and aliases, and the links and aliases of the deleted threads' events
+    /// and provider threads with those. An operation of a principal outside the subtree (the
+    /// parent's spawn of it) stays, without its target and run, so its key still replays.
+    /// Returns the other hidden backing threads that go with it, for the caller to delete too (so
+    /// none is left to surface in the sidebar).
     pub(crate) fn release_delegation_for_delete(&self, thread: &str) -> Result<Vec<String>> {
         let (workers, root_case, root) =
             if let Some(root) = self.delegation_root_of_thread(thread)? {

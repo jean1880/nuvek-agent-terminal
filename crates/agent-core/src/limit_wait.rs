@@ -47,6 +47,56 @@ pub fn limit_over(event: &Event) -> bool {
     }
 }
 
+/// Whether `event` says the agent refused the thread's work over its usage limit: only a turn
+/// that failed for quota ([`crate::quota::is_quota_exhausted`]). A rate limit alone is not (agy
+/// raises one for a tool's own 429, and a usage reading may name a window the thread does not
+/// use), nor a turn that failed on one (a 429 passes on its own); one inside the turn only says
+/// when the limit resets.
+pub fn limit_refused(event: &Event) -> bool {
+    match event {
+        Event::TurnCompleted {
+            state: TurnState::Failed,
+            error,
+            ..
+        } => error
+            .as_deref()
+            .is_some_and(crate::quota::is_quota_exhausted),
+        _ => false,
+    }
+}
+
+/// What a thread keeps of its usage limit whether or not it waits for it: that the limit stopped
+/// it. Set by a refusal ([`limit_refused`]), and kept until the agent works again
+/// ([`limit_over`]) or the thread runs another agent. A banner's rate limit, a usage reading at
+/// 100 % or a tool's 429 never set it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LimitRecord {
+    refused: bool,
+}
+
+impl LimitRecord {
+    /// Reads one of the thread's events; returns whether it is a refusal.
+    pub fn observe(&mut self, event: &Event) -> bool {
+        if limit_over(event) {
+            *self = Self::default();
+            return false;
+        }
+        let refused = limit_refused(event);
+        self.refused |= refused;
+        refused
+    }
+
+    /// Whether the limit stopped the thread and its agent has not worked since.
+    pub fn stopped(&self) -> bool {
+        self.refused
+    }
+
+    /// The thread runs another agent now: the old one's limit is not its own.
+    pub fn forget(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// Seconds past a reset time before continuing: the provider's clock and ours may differ.
 pub const GRACE: i64 = 60;
 
@@ -265,6 +315,64 @@ mod tests {
             used,
             resets_at,
         }
+    }
+
+    fn failed(error: &str) -> Event {
+        Event::TurnCompleted {
+            state: TurnState::Failed,
+            usage: None,
+            cost_usd: None,
+            error: Some(error.into()),
+        }
+    }
+
+    fn answered() -> Event {
+        Event::ItemStarted {
+            kind: ItemKind::AssistantMessage,
+            title: String::new(),
+            input: None,
+            parent: None,
+        }
+    }
+
+    #[test]
+    fn only_a_refusal_stops_a_thread_by_its_limit_until_the_agent_works() {
+        use crate::event::QuotaWindow;
+        let mut record = LimitRecord::default();
+        // A tool's 429 (agy raises a rate limit for it), a usage reading at 100 %, a quota error
+        // outside a turn and a turn failed on a rate limit alone do not stop the thread.
+        for not_a_refusal in [
+            Event::RateLimited {
+                resets_at: None,
+                detail: None,
+            },
+            Event::QuotaUpdated {
+                account: None,
+                windows: vec![QuotaWindow {
+                    group: None,
+                    label: "5-hour".into(),
+                    used: 1.0,
+                    resets_at: None,
+                }],
+            },
+            Event::Error {
+                message: "You have exhausted your quota".into(),
+            },
+            failed("429 Too Many Requests"),
+        ] {
+            assert!(!record.observe(&not_a_refusal), "{not_a_refusal:?}");
+            assert!(!record.stopped(), "{not_a_refusal:?}");
+        }
+        assert!(record.observe(&failed("You've hit your session limit")));
+        assert!(record.stopped());
+        // A turn starting, or completing with nothing to show, is not the agent working again.
+        record.observe(&Event::TurnStarted { model: None });
+        assert!(record.stopped());
+        record.observe(&answered());
+        assert!(!record.stopped());
+        record.observe(&failed("You've hit your session limit"));
+        record.forget();
+        assert!(!record.stopped());
     }
 
     #[test]

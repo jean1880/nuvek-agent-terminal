@@ -48,7 +48,7 @@ use crate::window::sidebar_model::{
 use crate::window::sidebar_model::{
     limit_wait_text, reopen_offer, sessions_added_toast, thread_activity, ThreadActivity,
 };
-use agent_core::limit_wait::{LimitWait, Step, Window as LimitWindow};
+use agent_core::limit_wait::{LimitRecord, LimitWait, Step, Window as LimitWindow};
 
 /// Removes every row of `list`, and only rows: an open thread menu is also the list's child, and
 /// `remove` refuses it, so walking `first_child` would never end.
@@ -76,24 +76,6 @@ fn limit_reset_of(event: &Event) -> Option<i64> {
     match event {
         Event::RateLimited { resets_at, .. } => resets_at.as_deref().and_then(reset_epoch),
         _ => None,
-    }
-}
-
-/// Whether `event` says the agent refused the thread's work over its usage limit: only a turn
-/// that failed for quota ([`agent_core::quota::is_quota_exhausted`]). A rate limit alone is not
-/// (agy raises one for a tool's own 429, and a usage reading may name a window the thread does
-/// not use), nor a turn that failed on one (a 429 passes on its own); one inside the turn only
-/// says when the limit resets.
-fn limit_refused(event: &Event) -> bool {
-    match event {
-        Event::TurnCompleted {
-            state: agent_core::event::TurnState::Failed,
-            error,
-            ..
-        } => error
-            .as_deref()
-            .is_some_and(agent_core::quota::is_quota_exhausted),
-        _ => false,
     }
 }
 
@@ -760,6 +742,8 @@ pub(super) struct ChatTab {
     /// When a rate limit inside the running turn said the limit resets: the wait its failure
     /// starts uses it.
     limit_reset_seen: Option<i64>,
+    /// Whether the usage limit stopped the thread, waiting or not; outlives each wait.
+    limit: LimitRecord,
     /// Shown when the thread's model is no longer offered by its agent.
     model_banner: adw::Banner,
     /// Shown while the thread's agent is installed but no one is signed in to it.
@@ -3296,7 +3280,7 @@ impl AgentTerminalWindow {
         }
     }
 
-    /// `thread`'s agent refused its work over its usage limit ([`limit_refused`]); `reset`: when
+    /// `thread`'s agent refused its work over its usage limit ([`agent_core::limit_wait::limit_refused`]); `reset`: when
     /// it said the limit resets. Unless Settings turned it off or the thread is a delegated
     /// worker, the thread waits for the limit to be over and continues
     /// ([`Self::continue_after_limits`]). A wait already running learns a later reset time from
@@ -5402,6 +5386,7 @@ impl AgentTerminalWindow {
                 wait_banner,
                 limit_wait: None,
                 limit_reset_seen: None,
+                limit: LimitRecord::default(),
                 model_banner,
                 sign_in_banner,
                 running: false,
@@ -6106,7 +6091,7 @@ impl AgentTerminalWindow {
         // agent must restart on its own profile.
         let mut clear_profile = false;
         let mut commit_profile: Option<String> = None;
-        // The agent refused the turn over its usage limit ([`limit_refused`]): may start a wait,
+        // The agent refused the turn over its usage limit ([`LimitRecord::observe`]): may start a wait,
         // with the reset time a rate limit in that turn gave.
         let refused: Option<Option<i64>>;
         enum After {
@@ -6160,6 +6145,9 @@ impl AgentTerminalWindow {
             if chat.limit_wait.is_some() && (switched || limit_over(&env.event)) {
                 chat.end_limit_wait();
             }
+            if switched {
+                chat.limit.forget();
+            }
             // Read before the turn's end below closes it.
             if matches!(env.event, Event::TurnStarted { .. }) {
                 chat.limit_reset_seen = None;
@@ -6169,7 +6157,10 @@ impl AgentTerminalWindow {
                     chat.limit_reset_seen = Some(reset);
                 }
             }
-            refused = limit_refused(&env.event).then(|| chat.limit_reset_seen.take());
+            refused = chat
+                .limit
+                .observe(&env.event)
+                .then(|| chat.limit_reset_seen.take());
             let after = match &env.event {
                 Event::TurnStarted { .. } => {
                     chat.running = true;
@@ -6754,7 +6745,7 @@ impl AgentTerminalWindow {
     /// The banners' "Continue in" button and a bare `/handoff`: hand the thread to the next
     /// usable agent, never silently to an agy that would edit unasked (see
     /// [`safe_handoff_target`]): that one is confirmed first. While the thread is stopped by its
-    /// usage limit (its banner, or a limit wait), the new agent then continues the work with the
+    /// usage limit ([`Self::stopped_by_limit`]), the new agent then continues the work with the
     /// handoff, as a busy switch does; otherwise the handoff waits for the user's next message.
     fn continue_rate_limited(&self, thread: &str) {
         let Some(slot) = self.slot_of(thread) else {
@@ -6777,9 +6768,11 @@ impl AgentTerminalWindow {
         }
     }
 
-    /// Whether `thread` is stopped by its usage limit: its banner is up, or it waits.
+    /// Whether `thread` is stopped by its usage limit: it waits for it, or a turn was refused over
+    /// it and the agent has not worked since ([`LimitRecord::stopped`]). The rate-limit banner
+    /// alone is not: a usage reading or a tool's 429 raises it too.
     fn stopped_by_limit(&self, thread: &str) -> bool {
-        self.with_chat(thread, |c| c.limit_wait.is_some() || c.rate_limited)
+        self.with_chat(thread, |c| c.limit_wait.is_some() || c.limit.stopped())
             .unwrap_or(false)
     }
 
@@ -8870,6 +8863,7 @@ pub(super) mod tests {
     #[test]
     fn only_a_turn_refused_for_quota_starts_a_limit_wait() {
         use agent_core::event::{QuotaWindow, TurnState};
+        use agent_core::limit_wait::limit_refused;
         let limited = Event::RateLimited {
             resets_at: Some("1793047200".into()),
             detail: None,

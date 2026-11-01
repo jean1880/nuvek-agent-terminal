@@ -301,7 +301,6 @@ pub fn is_quota_exhausted(text: &str) -> bool {
         || lower.contains("session limit")
         || lower.contains("weekly limit")
         || lower.contains("usage limit")
-        || lower.contains("usage_limit")
         || lower.contains("hit your limit")
 }
 
@@ -415,10 +414,11 @@ mod tests {
             "You've hit your session limit · resets 2:10pm (Europe/Paris)",
             "You've hit your usage limit. Try again at 4:00 PM.",
             "You have exhausted your quota",
-            "usage_limit_reached",
             "You're out of credits",
         ] {
             assert!(is_quota_exhausted(spent), "{spent}");
+            // Every spent quota is also what the rate-limit banner shows.
+            assert!(is_rate_limit_or_quota(spent), "{spent}");
         }
         for passing in [
             "429 Too Many Requests",

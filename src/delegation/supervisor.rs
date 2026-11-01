@@ -3072,7 +3072,18 @@ impl Supervisor {
             self.schedule_wake(&id, super::wake::WAKE_COALESCE);
         }
     }
+    /// The user's Stop of a root: its tree is revoked and stopped, and the root is not woken by
+    /// its sub-agents' news until the user speaks again.
     pub(crate) fn root_stop(self: &Rc<Self>, thread: &str) {
+        self.stop_root(thread, true);
+    }
+    /// "Stop and Switch": the tree is revoked and stopped as by [`Self::root_stop`], but the
+    /// thread is not stopped by the user. Its work goes on after the switch, so sub-agent news
+    /// is neither dropped nor held, whether the switch continues it, ends idle or fails.
+    pub(crate) fn root_stop_for_switch(self: &Rc<Self>, thread: &str) {
+        self.stop_root(thread, false);
+    }
+    fn stop_root(self: &Rc<Self>, thread: &str, by_user: bool) {
         {
             let mut state = self.state.borrow_mut();
             let revision = state.preparations.entry(thread.into()).or_default();
@@ -3087,9 +3098,13 @@ impl Supervisor {
                 .get(&root)
                 .and_then(WorkerRt::session);
             // A stopped root is not woken by its sub-agents' news until the user speaks again.
-            self.forget_wakes(&root);
+            if by_user {
+                self.forget_wakes(&root);
+            }
             if let Some(session) = session {
-                session.hold_wakes();
+                if by_user {
+                    session.hold_wakes();
+                }
                 session.interrupt_run();
             }
             self.begin_revoke(&root, RevocationEvent::RootStop);

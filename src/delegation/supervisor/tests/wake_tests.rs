@@ -319,6 +319,30 @@ fn a_stopped_root_is_not_woken() {
     });
 }
 
+/// "Stop and Switch" stops the tree as Stop does, but the thread is not stopped by the user:
+/// the root still hears its sub-agents' news, whatever the switch then does.
+#[test]
+fn a_root_stopped_for_a_switch_is_still_woken() {
+    in_context(async {
+        let (dir, sup, root) = harness();
+        let r = root_session(&sup, dir.path(), &root).await;
+        r.hold(true);
+        r.session.send_prompt("start some work");
+        pump_until(|| r.prompts().contains("start some work")).await;
+        let worker = worker_of(
+            &sup.spawn_worker(&root, spawn_request("wake-switched"))
+                .await
+                .unwrap(),
+        );
+        completed(&sup, &worker).await;
+        sup.root_stop_for_switch(&r.thread);
+        release(&sup, &r).await;
+        pump_until(|| r.wakes() > 0).await;
+        r.session.shutdown(false);
+        stop(&sup).await;
+    });
+}
+
 fn pending(sup: &Rc<Supervisor>, root: &WorkerId) -> usize {
     sup.state
         .borrow()

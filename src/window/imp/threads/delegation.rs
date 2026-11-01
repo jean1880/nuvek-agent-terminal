@@ -542,8 +542,7 @@ impl AgentTerminalWindow {
         let catalog = crate::delegation::services::CatalogServices {
             models: Rc::new(|driver, profile| {
                 let availability = AgentAvailability::shared();
-                let source = crate::config::profile_provider(profile, driver)
-                    .filter(|_| agent_core::provider::supports(driver));
+                let source = crate::model_catalog::ServerSource::of(profile, driver);
                 crate::model_catalog::only_ready(
                     crate::model_catalog::ModelCatalog::shared().models_for(driver, source.as_ref()),
                     |d| availability.is_ready(d),
@@ -601,10 +600,7 @@ impl AgentTerminalWindow {
                         return None;
                     }
                 };
-                let source = profile
-                    .provider
-                    .clone()
-                    .filter(|_| agent_core::provider::supports(driver));
+                let source = own_source(profile, driver);
                 Some(ResolvedChild {
                     program: resolved.program?,
                     extra_args,

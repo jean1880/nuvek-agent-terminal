@@ -1114,7 +1114,7 @@ mod tests {
         ])
         .with_providers(vec![(
             Driver::Codex,
-            ModelProvider::new(ProviderKind::Ollama),
+            ModelProvider::new(ProviderKind::Ollama).into(),
             crate::probe::ProviderKey::default(),
         )]);
         let jobs: Vec<Driver> = AccountStatus::new()

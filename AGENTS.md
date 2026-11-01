@@ -333,7 +333,8 @@ Architectural mandates, standards, and workflows for this codebase.
   model on the command line (`provider::model_args`). A model change on a server is a resumed
   restart (`binds_thread_model`): Claude Code refuses a live `set_model` to an unknown id. The
   catalogue keeps a list per source any enabled profile uses (`ModelCatalog::models_for`,
-  `other_profile_sources`): a thread's retirement judgement and a delegated worker's effort check
+  `other_profile_sources`), a server keyed with the profile's environment file
+  (`model_catalog::ServerSource`), since another file may hold another key: a thread's retirement judgement and a delegated worker's effort check
   use the list of the source its own profile runs (`profile_source`). Its picker shows one group
   per source (`picker_specs`, `ModelCatalog::list_state`): each agent's vendor and every enabled
   profile on a model server (every Local server) under its own name, kind and address, saying

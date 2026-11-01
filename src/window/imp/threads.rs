@@ -1775,7 +1775,7 @@ fn decide_live_model(
 /// list it can use.
 fn live_model(
     driver: Driver,
-    source: Option<&agent_core::provider::ModelProvider>,
+    source: Option<&crate::model_catalog::ServerSource>,
     model: Option<String>,
     effort: Option<String>,
 ) -> (Option<String>, Option<String>, Option<RetiredModel>) {
@@ -1792,17 +1792,18 @@ fn live_model(
 pub(super) fn own_source(
     profile: &Profile,
     driver: Driver,
-) -> Option<agent_core::provider::ModelProvider> {
+) -> Option<crate::model_catalog::ServerSource> {
     profile
         .provider
         .clone()
         .filter(|_| agent_core::provider::supports(driver))
+        .map(|provider| crate::model_catalog::ServerSource::new(provider, profile))
 }
 
 /// Why a thread or worker on a model server cannot start: it has no model (the profile names
 /// none and the server listed none yet). Claude or Codex left without one start on their own
 /// setting, which names a vendor model; so nothing starts.
-pub(super) fn no_model_reason(source: &agent_core::provider::ModelProvider) -> String {
+pub(super) fn no_model_reason(source: &crate::model_catalog::ServerSource) -> String {
     format!(
         "Cannot start on {}: it has listed no model yet. Pick a Default Model for this profile, \
          or try again once its models are listed.",
@@ -1836,12 +1837,10 @@ pub(super) fn start_model(profile: &Profile, driver: Driver) -> Option<String> {
 fn other_profile_sources(
     agents: &[(Driver, Profile)],
     all: &[Profile],
-) -> Vec<(Driver, Option<agent_core::provider::ModelProvider>, Profile)> {
-    let source = |driver: Driver, p: &Profile| {
-        crate::config::profile_provider(p, driver)
-            .filter(|_| agent_core::provider::supports(driver))
-    };
-    let mut out: Vec<(Driver, Option<agent_core::provider::ModelProvider>, Profile)> = Vec::new();
+) -> Vec<(Driver, Option<crate::model_catalog::ServerSource>, Profile)> {
+    // Keyed with the profile's environment file: one holding another key is another source.
+    let source = |driver: Driver, p: &Profile| crate::model_catalog::ServerSource::of(p, driver);
+    let mut out: Vec<(Driver, Option<crate::model_catalog::ServerSource>, Profile)> = Vec::new();
     for (driver, own) in agents.iter().filter(|(_, own)| !own.disabled) {
         let own_source = source(*driver, own);
         for profile in all.iter().filter(|p| {
@@ -1862,7 +1861,7 @@ pub(super) fn profile_source(
     config: &crate::config::TerminalConfig,
     profile_id: Option<&str>,
     driver: Driver,
-) -> Option<agent_core::provider::ModelProvider> {
+) -> Option<crate::model_catalog::ServerSource> {
     // The same resolution as the launch's (`agent_launch`), so the picker lists the server the
     // thread runs on.
     launch_source(&thread_profile_or_new(config, profile_id, driver), driver)
@@ -1874,9 +1873,8 @@ pub(super) fn profile_source(
 pub(super) fn launch_source(
     profile: &Profile,
     driver: Driver,
-) -> Option<agent_core::provider::ModelProvider> {
-    crate::config::profile_provider(profile, driver)
-        .filter(|_| agent_core::provider::supports(driver))
+) -> Option<crate::model_catalog::ServerSource> {
+    crate::model_catalog::ServerSource::of(profile, driver)
 }
 
 /// The model picker's groups for a thread opened with `profile_id` that runs `current` now: for
@@ -1892,10 +1890,7 @@ pub(super) fn picker_specs(
     let mut out = Vec::new();
     for driver in Driver::ALL {
         let info = driver.info();
-        let source = |p: &Profile| {
-            crate::config::profile_provider(p, driver)
-                .filter(|_| agent_core::provider::supports(driver))
-        };
+        let source = |p: &Profile| crate::model_catalog::ServerSource::of(p, driver);
         // The profile a pick in this agent's vendor group would keep, and the one it runs now.
         let own = thread_profile_or_new(config, profile_id, driver);
         let runs = |p: &Profile| driver == current && p.id == own.id;
@@ -2193,7 +2188,7 @@ pub(super) async fn wait_until(
 /// waited for is that one, which a profile on a server with no model of its own starts from.
 async fn wait_for_fresh_catalog(
     driver: Driver,
-    source: Option<agent_core::provider::ModelProvider>,
+    source: Option<crate::model_catalog::ServerSource>,
 ) {
     let catalog = ModelCatalog::shared();
     wait_for_catalog_source(&catalog, driver, source.as_ref(), CATALOG_WAIT).await;
@@ -2220,7 +2215,7 @@ async fn wait_for_catalog(
 async fn wait_for_catalog_source(
     catalog: &ModelCatalog,
     driver: Driver,
-    source: Option<&agent_core::provider::ModelProvider>,
+    source: Option<&crate::model_catalog::ServerSource>,
     limit: std::time::Duration,
 ) -> bool {
     wait_until(limit, std::time::Duration::from_millis(100), || {
@@ -7969,9 +7964,7 @@ impl AgentTerminalWindow {
                 // launch removes the vendor's variables, which may be the one holding it).
                 // (agy cannot run on one: its launch refuses, so it keeps its own list.)
                 let mut server_lists = true;
-                if let Some(provider) = crate::config::profile_provider(&profile, driver)
-                    .filter(|_| agent_core::provider::supports(driver))
-                {
+                if let Some(provider) = crate::model_catalog::ServerSource::of(&profile, driver) {
                     let key = provider
                         .key_env()
                         .ok()
@@ -8783,7 +8776,10 @@ pub(super) mod tests {
             provider: None,
             ..snapshot.clone()
         });
-        assert_eq!(launch_source(&snapshot, Driver::Claude), Some(ollama));
+        assert_eq!(
+            launch_source(&snapshot, Driver::Claude),
+            Some(ollama.into())
+        );
         assert_eq!(
             profile_source(&config, Some("claude-local"), Driver::Claude),
             None
@@ -8819,6 +8815,11 @@ pub(super) mod tests {
         all.extend([
             own(Driver::Claude, "claude-local", Some(ollama.clone())),
             own(Driver::Claude, "claude-local-2", Some(ollama.clone())),
+            // The same server and key variable from another environment file: another key.
+            Profile {
+                env_file: Some("/p/work.env".into()),
+                ..own(Driver::Claude, "claude-local-work", Some(ollama.clone()))
+            },
             own(Driver::Claude, "claude-lm", Some(lm.clone())),
             Profile {
                 disabled: true,
@@ -8833,16 +8834,25 @@ pub(super) mod tests {
             own(Driver::Codex, "codex-cloud", None),
             own(Driver::Codex, "codex-same", Some(ollama.clone())),
         ]);
-        let got: Vec<(Driver, Option<ModelProvider>, String)> =
-            other_profile_sources(&agents, &all)
-                .into_iter()
-                .map(|(d, s, p)| (d, s, p.id))
-                .collect();
+        type Got = (Driver, Option<(ModelProvider, Option<String>)>, String);
+        let got: Vec<Got> = other_profile_sources(&agents, &all)
+            .into_iter()
+            .map(|(d, s, p)| (d, s.map(|s| (s.provider, s.env_file)), p.id))
+            .collect();
         assert_eq!(
             got,
             vec![
-                (Driver::Claude, Some(ollama), "claude-local".into()),
-                (Driver::Claude, Some(lm), "claude-lm".into()),
+                (
+                    Driver::Claude,
+                    Some((ollama.clone(), None)),
+                    "claude-local".into()
+                ),
+                (
+                    Driver::Claude,
+                    Some((ollama, Some("/p/work.env".into()))),
+                    "claude-local-work".into()
+                ),
+                (Driver::Claude, Some((lm, None)), "claude-lm".into()),
                 (Driver::Codex, None, "codex-cloud".into()),
             ]
         );
@@ -8879,7 +8889,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             profile_source(&config, Some("claude-local"), Driver::Claude),
-            Some(ollama.clone())
+            Some(ollama.clone().into())
         );
         // Switched to Codex, the local Claude thread runs Codex's own profile.
         assert_eq!(

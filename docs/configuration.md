@@ -344,7 +344,8 @@ Claude reaches the server's Anthropic-compatible API at the URL's root; Codex re
 OpenAI-compatible Responses API at `<url>/v1`. Antigravity only runs Google's models.
 
 Each profile's threads pick from its own server's list: a cloud profile and a local one of
-the same agent each show their own models, and a model is only ever called retired against
+the same agent each show their own models, and so do two profiles on one server whose
+environment files hold different keys, and a model is only ever called retired against
 the list of the server it runs on. A profile with no **Default Model** starts on the first
 model its server lists that is not an embedding model; it never takes the CLI's own default
 (such as `opus` in `~/.claude/settings.json`), which the server would not have.

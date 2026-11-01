@@ -336,7 +336,7 @@ impl Supervisor {
                     if let Some(w) = self.state.borrow_mut().workers.get_mut(&entry.worker) {
                         w.end_dispatch();
                     }
-                    self.record_fact(entry.input.operation, DispatchFact::Failed(e));
+                    self.fail_undispatched(&entry, e);
                     return;
                 }
             }
@@ -348,10 +348,7 @@ impl Supervisor {
             .get(&entry.worker)
             .map(|w| (w.run.clone(), w.generation))
         else {
-            self.record_fact(
-                entry.input.operation,
-                DispatchFact::Failed(error(ErrorCode::NotFound, "unknown worker")),
-            );
+            self.fail_undispatched(&entry, error(ErrorCode::NotFound, "unknown worker"));
             return;
         };
         // A sibling's close or exit while this waited moved the epoch on, and this with it.
@@ -376,7 +373,7 @@ impl Supervisor {
                 if let Some(w) = self.state.borrow_mut().workers.get_mut(&entry.worker) {
                     w.end_dispatch();
                 }
-                self.record_fact(entry.input.operation, DispatchFact::Failed(e));
+                self.fail_undispatched(&entry, e);
                 return;
             }
         };
@@ -523,7 +520,7 @@ impl Supervisor {
                 w.end_dispatch();
             }
             if let Err(e) = ready {
-                sup.record_fact(entry.input.operation, DispatchFact::Failed(e));
+                sup.fail_undispatched(&entry, e);
                 return;
             }
             entry.input.plan = DeliveryPlan::StartTurn;
@@ -748,6 +745,22 @@ impl Supervisor {
     /// cancel that landed after the task left `pending` (so `cancel_bound_run` could not end it)
     /// ends the run as interrupted, as a cancel does, and never turns into a worker failure.
     fn fail_dispatch(self: &Rc<Self>, entry: &Delivery, used: &Dispatch, e: ToolError) {
+        self.end_failed_dispatch(entry, used, e);
+        // However it ended, the worker's next queued entry is not left behind it: nothing else
+        // would drain it. A spawn's undelivered task fails the worker instead.
+        if !matches!(entry.input.source, InputSource::Task) {
+            self.drain_deferred(&entry.worker);
+        }
+    }
+    /// A delivery that failed before it reserved a run: its operation fails, and the worker's
+    /// next queued entry is tried, as [`Self::fail_dispatch`] does.
+    fn fail_undispatched(self: &Rc<Self>, entry: &Delivery, e: ToolError) {
+        self.record_fact(entry.input.operation.clone(), DispatchFact::Failed(e));
+        if !matches!(entry.input.source, InputSource::Task) {
+            self.drain_deferred(&entry.worker);
+        }
+    }
+    fn end_failed_dispatch(self: &Rc<Self>, entry: &Delivery, used: &Dispatch, e: ToolError) {
         warn!(
             worker = %entry.worker,
             operation = %entry.input.operation,
@@ -841,9 +854,6 @@ impl Supervisor {
                 })
             });
         self.notify_registry();
-        if !task {
-            self.drain_deferred(&entry.worker);
-        }
     }
     /// A task handed to the agent must open its turn within the deadline, or the worker is
     /// stalled: it fails with that reason (stopping its process and ending its run) rather than

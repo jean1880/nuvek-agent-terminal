@@ -12,6 +12,9 @@ set -euo pipefail
 SRC="${SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 OUT="${OUT:-$SRC/dist}"
 WORK="$(mktemp -d /tmp/agent-terminal-build.XXXXXX)"
+# The scratch copy goes with the script, whether it succeeds or not (collect has copied the
+# package out by then).
+trap 'rm -rf "$WORK"' EXIT
 
 # The package version: the [package] version in Cargo.toml (its first `version =` line).
 version() {

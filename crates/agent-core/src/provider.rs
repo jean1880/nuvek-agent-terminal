@@ -6,8 +6,9 @@
 //! (`GET <base>/v1/models`, OpenAI's shape, which all three serve).
 //!
 //! - Claude: `ANTHROPIC_BASE_URL` at the server's root (its Anthropic-compatible
-//!   `/v1/messages`) and `ANTHROPIC_AUTH_TOKEN`. Ollama and LM Studio ignore the token's value
-//!   but Claude Code requires one, so each has its documented placeholder.
+//!   `/v1/messages`), and the key from an `apiKeyHelper` ([`CLAUDE_KEY_VAR`]). Ollama and LM
+//!   Studio ignore the key's value but Claude Code requires one, so each has its documented
+//!   placeholder.
 //! - Codex: a custom provider given with `-c`, since `app-server` takes no `--oss`. The ids
 //!   `openai`, `ollama` and `lmstudio` are reserved by Codex, so the app's has its own.
 //!
@@ -174,16 +175,51 @@ impl std::fmt::Debug for ProviderLaunch {
 }
 
 /// Claude Code variables that would send its requests somewhere other than the provider, or
-/// authenticate it as someone else: removed from a provider launch. `ANTHROPIC_CUSTOM_HEADERS`
-/// goes with every request, so it may carry another account's credentials to the server.
-const CLAUDE_UNSET: [&str; 6] = [
+/// authenticate it as someone else (its keys and tokens, the file descriptors and helpers that
+/// hand it one, an Anthropic profile and the federation variables, the third-party providers):
+/// removed from a provider launch, and blanked in its settings overlay. `ANTHROPIC_CUSTOM_HEADERS`
+/// goes with every request, so it may carry another account's credentials to the server. From
+/// Claude Code 2.1.309.
+const CLAUDE_UNSET: [&str; 28] = [
     "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_PROFILE",
+    "ANTHROPIC_FEDERATION_RULE_ID",
+    "ANTHROPIC_ORGANIZATION_ID",
+    "ANTHROPIC_IDENTITY_TOKEN",
+    "ANTHROPIC_IDENTITY_TOKEN_FILE",
+    "ANTHROPIC_AWS_API_KEY",
+    "ANTHROPIC_FOUNDRY_API_KEY",
+    "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+    "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+    "CLAUDE_CODE_GATEWAY_TOKEN",
+    "CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR",
+    "CLAUDE_CODE_SESSION_ACCESS_TOKEN",
+    "CLAUDE_CODE_HOST_AUTH_ENV_VAR",
+    "CLAUDE_CODE_CUSTOM_OAUTH_URL",
+    "CLAUDE_CODE_FEDERATION_CACHE_DIR",
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
     "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_GATEWAY",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+    "CLAUDE_CODE_USE_MANTLE",
 ];
+
+/// Where a provider launch hands Claude its credential: the profile's key, or the server's
+/// placeholder. Only the app sets it (an inherited one is removed first), and the overlay's
+/// `apiKeyHelper` ([`CLAUDE_KEY_HELPER`]) prints it, so the value never reaches argv. A helper
+/// in the overlay wins over a settings file's `apiKeyHelper` and `env` tokens, and over the
+/// process's (seen live with Claude Code 2.1.309), with the tokens blanked beside it.
+pub const CLAUDE_KEY_VAR: &str = "AGENT_TERMINAL_PROVIDER_KEY";
+
+/// The overlay's `apiKeyHelper`: prints [`CLAUDE_KEY_VAR`]; names the variable, not its value.
+const CLAUDE_KEY_HELPER: &str = "printf %s \"$AGENT_TERMINAL_PROVIDER_KEY\"";
 
 /// Stands for the thread's model in a provider launch's environment until the spawn binds it
 /// ([`bind_thread_model`]); never exported itself (the control character keeps it from passing
@@ -503,8 +539,9 @@ impl ModelProvider {
                 args,
                 env: vec![
                     ("ANTHROPIC_BASE_URL".to_owned(), base),
+                    // The overlay's `apiKeyHelper` prints it: the only credential Claude sends.
                     (
-                        "ANTHROPIC_AUTH_TOKEN".to_owned(),
+                        CLAUDE_KEY_VAR.to_owned(),
                         key.unwrap_or(self.kind.placeholder_token()).to_owned(),
                     ),
                     // A per-request header that defeats a local server's prompt cache.
@@ -516,6 +553,7 @@ impl ModelProvider {
                 unset: CLAUDE_UNSET
                     .iter()
                     .chain(CLAUDE_MODEL_VARS.iter())
+                    .chain([&CLAUDE_KEY_VAR])
                     .map(|n| (*n).to_owned())
                     .collect(),
             },
@@ -545,17 +583,13 @@ impl ModelProvider {
             }
             // Claude Code applies a settings file's `env` over its own environment, so a user's
             // settings could send it to the vendor: a `--settings` overlay, which sits above every
-            // settings file but a managed one, pins what the launch sets. It holds no secret:
-            // with a key configured the token stays in the environment only.
+            // settings file but a managed one, pins what the launch sets. It holds no secret: its
+            // `apiKeyHelper` prints the credential from the environment ([`CLAUDE_KEY_VAR`]),
+            // and every other credential is blanked, so a settings file's own helper or tokens
+            // never reach the server.
             Driver::Claude => {
                 let mut env = serde_json::Map::new();
                 env.insert("ANTHROPIC_BASE_URL".to_owned(), base.into());
-                if key_env.is_none() {
-                    env.insert(
-                        "ANTHROPIC_AUTH_TOKEN".to_owned(),
-                        self.kind.placeholder_token().into(),
-                    );
-                }
                 env.insert("CLAUDE_CODE_ATTRIBUTION_HEADER".to_owned(), "0".into());
                 for name in CLAUDE_UNSET {
                     env.insert(name.to_owned(), "".into());
@@ -565,7 +599,8 @@ impl ModelProvider {
                 }
                 vec![
                     "--settings".to_owned(),
-                    serde_json::json!({ "env": env }).to_string(),
+                    serde_json::json!({ "apiKeyHelper": CLAUDE_KEY_HELPER, "env": env })
+                        .to_string(),
                 ]
             }
             Driver::Local => crate::local_agent::RunnerArgs::server_args(&base, key_env),
@@ -939,7 +974,7 @@ mod tests {
             launch.env[..3],
             [
                 ("ANTHROPIC_BASE_URL".into(), "http://nas:11434".into()),
-                ("ANTHROPIC_AUTH_TOKEN".into(), "ollama".into()),
+                (CLAUDE_KEY_VAR.into(), "ollama".into()),
                 ("CLAUDE_CODE_ATTRIBUTION_HEADER".into(), "0".into()),
             ]
         );
@@ -954,20 +989,30 @@ mod tests {
         }
         for name in [
             "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
             "CLAUDE_CODE_OAUTH_TOKEN",
             "CLAUDE_CODE_USE_BEDROCK",
             // Headers sent with every request: they could carry another account's credentials.
             "ANTHROPIC_CUSTOM_HEADERS",
+            // An Anthropic profile and the federation variables supply a credential of their own.
+            "ANTHROPIC_PROFILE",
+            "ANTHROPIC_FEDERATION_RULE_ID",
+            "ANTHROPIC_IDENTITY_TOKEN_FILE",
+            "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+            "CLAUDE_CODE_USE_GATEWAY",
+            // Only the app sets the variable the helper reads: an inherited one goes first.
+            CLAUDE_KEY_VAR,
         ] {
             assert!(launch.unset.iter().any(|u| u == name), "{name}");
         }
+        assert!(!launch.env.iter().any(|(k, _)| k == "ANTHROPIC_AUTH_TOKEN"));
         let keyed = at(ProviderKind::LiteLlm, "https://gw.example", Some("GW_KEY"));
         let launch = keyed.launch(Driver::Claude, Some("secret-value")).unwrap();
         assert!(launch
             .env
-            .contains(&("ANTHROPIC_AUTH_TOKEN".into(), "secret-value".into())));
+            .contains(&(CLAUDE_KEY_VAR.into(), "secret-value".into())));
         let shown = format!("{launch:?}");
-        assert!(shown.contains("ANTHROPIC_AUTH_TOKEN") && !shown.contains("secret-value"));
+        assert!(shown.contains(CLAUDE_KEY_VAR) && !shown.contains("secret-value"));
     }
 
     /// The `env` of the `--settings` overlay in `args`, if there is one.
@@ -975,6 +1020,13 @@ mod tests {
         let at = args.iter().position(|a| a == "--settings")?;
         let value: serde_json::Value = serde_json::from_str(args.get(at + 1)?).ok()?;
         value.get("env")?.as_object().cloned()
+    }
+
+    /// The `apiKeyHelper` of the `--settings` overlay in `args`, if there is one.
+    fn overlay_helper(args: &[String]) -> Option<String> {
+        let at = args.iter().position(|a| a == "--settings")?;
+        let value: serde_json::Value = serde_json::from_str(args.get(at + 1)?).ok()?;
+        value.get("apiKeyHelper")?.as_str().map(str::to_owned)
     }
 
     #[test]
@@ -986,12 +1038,19 @@ mod tests {
         let env = overlay_env(&launch.args).expect("a settings overlay");
         assert_eq!(env["ANTHROPIC_BASE_URL"], "http://nas:11434");
         assert_eq!(env["CLAUDE_CODE_ATTRIBUTION_HEADER"], "0");
-        // No key configured: the placeholder is no secret, so the overlay pins it too.
-        assert_eq!(env["ANTHROPIC_AUTH_TOKEN"], "ollama");
-        // The vendor's credentials and routing are blanked, whatever a settings file says.
+        // The vendor's credentials and routing are blanked, whatever a settings file says, and
+        // the one credential sent is what the overlay's helper prints from the environment.
         for name in CLAUDE_UNSET {
             assert_eq!(env[name], "", "{name}");
         }
+        assert_eq!(
+            overlay_helper(&launch.args).as_deref(),
+            Some(CLAUDE_KEY_HELPER)
+        );
+        assert!(
+            !env.contains_key(CLAUDE_KEY_VAR),
+            "never blanked: the helper reads it"
+        );
         for name in CLAUDE_MODEL_VARS {
             assert_eq!(env[name], THREAD_MODEL, "{name}");
         }
@@ -1002,8 +1061,12 @@ mod tests {
         let launch = keyed.launch(Driver::Claude, Some("secret-value")).unwrap();
         assert!(!launch.args.iter().any(|a| a.contains("secret-value")));
         let env = overlay_env(&launch.args).unwrap();
-        assert!(!env.contains_key("ANTHROPIC_AUTH_TOKEN"));
+        assert_eq!(env["ANTHROPIC_AUTH_TOKEN"], "");
         assert_eq!(env["ANTHROPIC_BASE_URL"], "https://gw.example");
+        assert_eq!(
+            overlay_helper(&launch.args).as_deref(),
+            Some(CLAUDE_KEY_HELPER)
+        );
 
         // The models are bound at the spawn, in the overlay as in the environment.
         let mut args = vec!["--settings".to_owned(), r#"{"theme":"dark"}"#.to_owned()];
@@ -1056,6 +1119,17 @@ mod tests {
             value["env"]["ANTHROPIC_BASE_URL"], "http://nas:11434",
             "the overlay wins"
         );
+        assert_eq!(value["env"]["ANTHROPIC_API_KEY"], "");
+        // The profile's own credential never survives the merge: the overlay's helper and blanks
+        // replace them.
+        let keyed = with_profile_settings(
+            &own(r#"{"apiKeyHelper":"echo profile-helper","env":{"ANTHROPIC_AUTH_TOKEN":"t","ANTHROPIC_API_KEY":"k"}}"#),
+            launch.args.clone(),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&keyed[keyed.len() - 1]).unwrap();
+        assert_eq!(value["apiKeyHelper"], CLAUDE_KEY_HELPER);
+        assert_eq!(value["env"]["ANTHROPIC_AUTH_TOKEN"], "");
         assert_eq!(value["env"]["ANTHROPIC_API_KEY"], "");
         // `--settings=<json>` is the same flag.
         let eq = with_profile_settings(

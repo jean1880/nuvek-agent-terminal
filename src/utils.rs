@@ -1051,7 +1051,10 @@ mod tests {
         // The values reach the shell under private names, copied into place after its rc ran.
         let private = |name: &str| format!("{PROVIDER_ENV_PREFIX}{name}");
         assert!(env.contains(&format!("{}=http://gw:4000", private("ANTHROPIC_BASE_URL"))));
-        assert!(env.contains(&format!("{}=gateway-key", private("ANTHROPIC_AUTH_TOKEN"))));
+        assert!(env.contains(&format!(
+            "{}=gateway-key",
+            private(agent_core::provider::CLAUDE_KEY_VAR)
+        )));
         // Claude's own model names are the tab's model, the shell's value gone.
         assert!(env.contains(&format!(
             "{}=qwen3-coder",
@@ -1069,8 +1072,8 @@ mod tests {
         assert!(prelude.starts_with("unset "), "{prelude}");
         assert!(
             prelude.contains(&format!(
-                "export ANTHROPIC_AUTH_TOKEN=\"${{{}}}\"; ",
-                private("ANTHROPIC_AUTH_TOKEN")
+                "export AGENT_TERMINAL_PROVIDER_KEY=\"${{{}}}\"; ",
+                private(agent_core::provider::CLAUDE_KEY_VAR)
             )),
             "{prelude}"
         );
@@ -1177,7 +1180,11 @@ mod tests {
             let seen = String::from_utf8_lossy(&out.stdout);
             let has = |line: &str| seen.lines().any(|l| l == line);
             assert!(has("ANTHROPIC_BASE_URL=http://gw:4000"), "{shell}: {seen}");
-            assert!(has("ANTHROPIC_AUTH_TOKEN=gateway-key"), "{shell}: {seen}");
+            assert!(
+                has("AGENT_TERMINAL_PROVIDER_KEY=gateway-key"),
+                "{shell}: {seen}"
+            );
+            assert!(!seen.contains("ANTHROPIC_AUTH_TOKEN="), "{shell}: {seen}");
             assert!(has("ANTHROPIC_MODEL=qwen3-coder"), "{shell}: {seen}");
             assert!(!seen.contains("ANTHROPIC_API_KEY="), "{shell}: {seen}");
             assert!(!seen.contains("vendor"), "{shell}: {seen}");

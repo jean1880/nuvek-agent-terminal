@@ -332,6 +332,12 @@ name, defined in the profile's environment file or your session. The key itself 
 written to the settings. If the address is invalid, or the key variable is not set, the
 thread refuses to start: it never falls back to the vendor's models.
 
+A terminal tab of such a profile runs on the server too. Its shell reads your shell's startup
+files (`.zshrc`, `.bashrc`) before the CLI starts, so the vendor's variables they export are
+removed again just before the CLI starts, and the server's set. That takes a POSIX shell as
+`$SHELL` (sh, bash, zsh, dash, ksh): with fish or csh the tab refuses to start, and a chat
+thread still runs on the server.
+
 The model list is the one request the app makes to the server itself (`GET <url>/v1/models`).
 Claude reaches the server's Anthropic-compatible API at the URL's root; Codex reaches its
 OpenAI-compatible Responses API at `<url>/v1`. Antigravity only runs Google's models.

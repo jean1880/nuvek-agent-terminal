@@ -36,7 +36,12 @@ Architectural mandates, standards, and workflows for this codebase.
   CLI owns the controlling terminal. Never emit banner or `clear` output into the
   TTY beforehand — it disrupts the CLI's initial terminal handshake. Anything
   resembling a startup script must contribute *environment*, merged into the
-  spawn environment, never bytes written to the terminal.
+  spawn environment, never bytes written to the terminal. The one text before `exec` is a
+  terminal tab's model provider (`utils::apply_provider_env`): the user's rc runs after the
+  spawn environment and may export the vendor's variables again, so POSIX `unset`/`export`
+  builtins put the provider's back. It names variables only, never a value: each value, the
+  key among them, comes in the spawn environment under a private `__AT_PROVIDER_` name that
+  is copied and then unset. A shell that is not POSIX (fish, csh) refuses such a tab.
 - **Threads over a hidden tab view**: the window is an `adw::OverlaySplitView`
   whose sidebar lists the store's threads. Its content is an `adw::TabView` with
   no tab bar: one page per open thread or terminal. Each page is tracked in an

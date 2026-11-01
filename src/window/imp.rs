@@ -4068,7 +4068,7 @@ impl AgentTerminalWindow {
                 return;
             }
         };
-        let command = get_startup_command(on_provider.as_ref(), launch);
+        let mut command = get_startup_command(on_provider.as_ref(), launch);
         let env_file = profile.and_then(|p| p.env_file.clone());
         info!(
             "Spawning terminal with shell: {}, command: {:?}",
@@ -4171,14 +4171,20 @@ impl AgentTerminalWindow {
                     }
                 }
                 if let Some((provider, driver)) = &provider {
-                    if let Err(why) = crate::utils::apply_provider_env(
+                    match crate::utils::apply_provider_env(
                         provider,
                         *driver,
                         terminal_model.as_deref(),
+                        &shell,
                         &mut env_strs,
                     ) {
-                        refuse_terminal(&obj, &stack, &terminal, &why);
-                        return;
+                        // Run after the user's rc, which may export the vendor's variables
+                        // again: environment only, nothing written to the terminal.
+                        Ok(prelude) => command[1] = format!("{prelude}{}", command[1]),
+                        Err(why) => {
+                            refuse_terminal(&obj, &stack, &terminal, &why);
+                            return;
+                        }
                     }
                 }
 

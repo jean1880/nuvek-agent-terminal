@@ -5640,6 +5640,111 @@ mod tests {
         assert_eq!(active, vec![None, None]);
     }
 
+    #[test]
+    fn v8_repairs_rows_that_name_another_roots_worker_or_another_workers_run() {
+        let conn = v7_fixture();
+        // Older schemas checked only that a referenced row existed.
+        conn.execute_batch(
+            "BEGIN;
+             INSERT INTO threads (id, title, cwd, created_at, updated_at)
+                 VALUES ('t3', 'other', '/w', 1, 2);
+             INSERT INTO delegation_roots (id, root_thread_id, root_worker_id, task_state,
+                 policy_json, continuation_budget, created_at, updated_at)
+                 VALUES ('r2', 't3', 'w_other', 'active', '{}', 3, 1, 2);
+             INSERT INTO delegation_workers (id, root_id, parent_id, origin, depth, name, driver,
+                 profile_id, launch_json, state, workspace_json, delegation_status, created_at,
+                 updated_at)
+                 VALUES ('w_other', 'r2', NULL, 'root', 0, 'o', 'claude', 'p', '{}', 'running',
+                         '{}', 'available', 1, 2);
+             INSERT INTO delegation_runs (id, worker_id, process_generation, authority_epoch,
+                 state, created_at, updated_at)
+                 VALUES ('run_other', 'w_other', 0, 0, 'completed', 1, 2);
+             -- A spawn by r1's root naming r2's worker as its target, and one whose principal
+             -- is r2's.
+             INSERT INTO delegation_operations (id, root_id, principal_worker_id, kind,
+                 idempotency_key, authority_epoch, canonical_request, resolution_json,
+                 receipt_json, dispatch_state, target_worker_id, run_id, created_at, updated_at)
+                 VALUES ('op_cross', 'r1', 'w_root', 'send', 'kx', 0, '{}', '{}', '{}',
+                         'confirmed', 'w_other', NULL, 1, 2),
+                        ('op_foreign', 'r1', 'w_other', 'send', 'ky', 0, '{}', '{}', '{}',
+                         'confirmed', 'w_kid', NULL, 1, 2);
+             -- A message to another root's worker, one of the foreign operation, and one aimed
+             -- at another worker's run.
+             INSERT INTO delegation_messages (id, root_id, operation_id, sender_worker_id,
+                 recipient_worker_id, kind, reply_to, body, delivery_policy, target_run_id,
+                 delivery_state, recipient_run_id, queued_at, updated_at, event_seq)
+                 VALUES ('m_cross', 'r1', NULL, 'w_root', 'w_other', 'instruction', NULL, 'x',
+                         'next_turn', NULL, 'queued', NULL, 5, 6, NULL),
+                        ('m_op', 'r1', 'op_foreign', 'w_root', 'w_kid', 'instruction', NULL, 'y',
+                         'next_turn', NULL, 'queued', NULL, 5, 6, NULL),
+                        ('m_run', 'r1', NULL, 'w_root', 'w_kid', 'instruction', 'm_cross', 'z',
+                         'this_run', 'run_other', 'provider_confirmed', 'run_other', 5, 6, NULL);
+             -- Links of another root's worker, and naming another worker's run.
+             INSERT INTO delegation_event_links (event_seq, worker_id, root_id, run_id, category,
+                 process_generation)
+                 VALUES (1, 'w_other', 'r1', NULL, 'activity', 0),
+                        (1, 'w_kid', 'r1', 'run_other', 'activity', 0);
+             COMMIT;",
+        )
+        .expect("legacy cross links");
+        migrate(&conn).expect("the store opens");
+        let broken: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .expect("fk check");
+        assert_eq!(broken, 0);
+        let ops: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT id, target_worker_id FROM delegation_operations ORDER BY id")
+            .expect("prepare")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .expect("query")
+            .collect::<std::result::Result<_, _>>()
+            .expect("rows");
+        assert_eq!(
+            ops,
+            vec![
+                ("op1".into(), Some("w_kid".into())),
+                ("op_cross".into(), None)
+            ],
+            "a foreign principal's operation goes; a foreign target is cleared, its key kept"
+        );
+        type Message = (String, Option<String>, Option<String>, Option<String>);
+        let messages: Vec<Message> = conn
+            .prepare(
+                "SELECT id, reply_to, target_run_id, recipient_run_id FROM delegation_messages
+                 ORDER BY id",
+            )
+            .expect("prepare")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .expect("query")
+            .collect::<std::result::Result<_, _>>()
+            .expect("rows");
+        assert_eq!(
+            messages,
+            vec![
+                ("m1".into(), None, Some("run1".into()), Some("run1".into())),
+                ("m2".into(), Some("m1".into()), None, None),
+                ("m_run".into(), None, None, None),
+            ]
+        );
+        let links: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT worker_id, run_id FROM delegation_event_links ORDER BY event_seq")
+            .expect("prepare")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .expect("query")
+            .collect::<std::result::Result<_, _>>()
+            .expect("rows");
+        assert_eq!(
+            links,
+            vec![
+                ("w_kid".into(), None),
+                ("w_kid".into(), Some("run1".into()))
+            ]
+        );
+        migrate(&conn).expect("a second run is a no-op");
+    }
+
     /// [`v7_fixture`] brought to v8, with an accepted operation `op2` beside the confirmed `op1`.
     fn v8_fixture() -> Connection {
         let conn = v7_fixture();

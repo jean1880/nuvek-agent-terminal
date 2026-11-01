@@ -502,8 +502,10 @@ pub fn redact_keyed_shown(key: &str, value: &str) -> String {
 
 /// Plain words or identifiers, never a credential's shape: every blank-separated word, less
 /// surrounding punctuation, is at most 24 letters with no digit, in segments (split on
-/// `_ - . '`) that are all lower case, all upper case, Capitalised or camelCase. Random keys
-/// almost always hold a digit or break that case pattern; anything else is not words.
+/// `_ - . '`) that are all lower case, all upper case, Capitalised or camelCase, and whose
+/// humps are pronounceable (vowels in a plausible share, no long consonant or vowel runs).
+/// Random keys almost always hold a digit, break that case pattern or fail the vowel checks;
+/// anything else is not words.
 fn reads_as_words(value: &str) -> bool {
     fn segment(text: &str) -> bool {
         if !text.chars().all(char::is_alphabetic) {
@@ -531,6 +533,47 @@ fn reads_as_words(value: &str) -> bool {
         }
         run > 0
     }
+    // Whether a segment's humps (`created`, `At`; `CUSTOMER`) read as words: a vowel in every
+    // one of two letters or more (`id`, `asc`), and from four letters on at most 16 letters, at
+    // least one vowel in seven, no run of five consonants or four vowels. Random letters break
+    // these almost always (`qwhxjzkplmnbvcxzasdf`); a short uppercase hump is an acronym (`ID`).
+    fn pronounceable(segment: &str) -> bool {
+        let mut humps = Vec::new();
+        let mut start = 0;
+        let upper = segment.chars().all(char::is_uppercase);
+        for (i, c) in segment.char_indices() {
+            if i > 0 && c.is_uppercase() && !upper {
+                humps.push(&segment[start..i]);
+                start = i;
+            }
+        }
+        humps.push(&segment[start..]);
+        humps.into_iter().all(|hump| {
+            let letters: Vec<char> = hump.chars().flat_map(char::to_lowercase).collect();
+            let vowel = |c: &char| "aeiouyàâäéèêëîïôöùûüÿ".contains(*c);
+            let vowels = letters.iter().filter(|c| vowel(c)).count();
+            if letters.len() < 2 || (upper && letters.len() <= 4) {
+                return true;
+            }
+            if letters.len() < 4 {
+                return vowels > 0;
+            }
+            let (mut consonant_run, mut vowel_run) = (0, 0);
+            for c in &letters {
+                if vowel(c) {
+                    vowel_run += 1;
+                    consonant_run = 0;
+                } else {
+                    consonant_run += 1;
+                    vowel_run = 0;
+                }
+                if consonant_run >= 5 || vowel_run >= 4 {
+                    return false;
+                }
+            }
+            letters.len() <= 16 && vowels * 7 >= letters.len()
+        })
+    }
     let mut words = 0;
     for word in value.split_whitespace() {
         let word = word.trim_matches(|c: char| ".,;:!?()\"'".contains(c));
@@ -540,7 +583,7 @@ fn reads_as_words(value: &str) -> bool {
         if word.chars().count() > 24
             || !word
                 .split(['_', '-', '.', '\''])
-                .all(|part| part.is_empty() || segment(part))
+                .all(|part| part.is_empty() || (segment(part) && pronounceable(part)))
         {
             return false;
         }
@@ -1244,6 +1287,13 @@ mod tests {
     fn shown_values_under_key_or_token_names_stay_readable_unless_they_look_secret() {
         for (key, value) in [
             ("sort_key", "created_at"),
+            ("sort_key", "updated_at"),
+            ("sort_key", "timestamp"),
+            ("sort_key", "relevance"),
+            ("sort_key", "descending"),
+            ("sort_key", "asc"),
+            ("sort_key", "desc"),
+            ("max_tokens", "1000"),
             ("keyword", "searching the archive"),
             ("api_key", "secondary"),
             ("sortKey", "createdAt"),
@@ -1259,6 +1309,12 @@ mod tests {
             ("token", "Bearer 7f3a9c2b1d4e5f60"),
             ("key", "aB3dE5gH7jK9"),
             ("key", "xQzRwPtLkMnB"),
+            // Random letters with no digit: no plausible vowels, long consonant runs.
+            ("api_key", "qwhxjzkplmnbvcxzasdf"),
+            ("api_key", "kdjfhqpwoeirutyz"),
+            ("token", "zxcvbnmlkjhg"),
+            ("token", "QWHXJZKPLMNB"),
+            ("api_key", "plain words qwhxjzkplmnb"),
             // Strong names mask whatever the value looks like.
             ("password", "correct horse battery staple"),
             ("client_secret", "plainwords"),

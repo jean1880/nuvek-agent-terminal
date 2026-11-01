@@ -105,6 +105,8 @@ for line in sys.stdin:
         if scenario == 'call-stall': time.sleep(60)
         if scenario == 'notification-flood':
             for n in range(1000): send({'jsonrpc':'2.0','method':'notifications/progress','params':{'progress':n}})
+        if scenario == 'notification-ceiling':
+            for n in range(10001): send({'jsonrpc':'2.0','method':'notifications/progress','params':{'progress':n}})
         if scenario == 'call-exit': sys.exit(0)
         if scenario == 'call-error':
             send({'jsonrpc':'2.0','id':request['id'],'error':{'code':-32000,'message':os.environ.get('TOKEN','error')}}); continue
@@ -2016,7 +2018,7 @@ mod runner {
     }
 
     #[test]
-    fn chatty_servers_keep_their_connection_through_discovery_and_calls() {
+    fn chatty_servers_keep_their_connection_until_the_notification_ceiling() {
         let folder = tempfile::tempdir().unwrap();
         let run = Run::new(
             vec![config(folder.path(), "notification-flood")],
@@ -2032,6 +2034,32 @@ mod runner {
         assert!(events.iter().any(|event| matches!(
             &event.event,
             Event::ItemCompleted { output: Some(output), .. } if output.contains("hello")
+        )));
+        assert_eq!(calls(folder.path()).len(), 1);
+        run.finish();
+
+        // A stream past the ceiling between two responses ends the connection, unreplayed.
+        let folder = tempfile::tempdir().unwrap();
+        let mut config = config(folder.path(), "notification-ceiling");
+        config.call_timeout_secs = 20;
+        let run = Run::new(
+            vec![config],
+            Mode::Ask,
+            BTreeMap::new(),
+            vec![Reply::Calls(vec![(mcp_alias(), json!({}))])],
+            None,
+        );
+        run.send(Command::Prompt {
+            text: "test".into(),
+        });
+        let events = run.turn();
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::ItemCompleted {
+                status: agent_core::event::ItemStatus::Failed,
+                error: Some(error),
+                ..
+            } if error.contains("notification ceiling") && !error.contains("hello")
         )));
         assert_eq!(calls(folder.path()).len(), 1);
         run.finish();

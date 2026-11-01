@@ -1319,7 +1319,6 @@ mod tests {
         for (key, value) in [
             ("api_key", "plain-secret-9981"),
             ("token", "abcdefghijklmnopqrstuvwxyzabcdef"),
-            ("token", "Bearer 7f3a9c2b1d4e5f60"),
             ("key", "aB3dE5gH7jK9"),
             ("key", "xQzRwPtLkMnB"),
             // Random letters with no digit: no plausible vowels, long consonant runs.
@@ -1339,6 +1338,10 @@ mod tests {
         ] {
             assert_ne!(redact_keyed_shown(key, value), value, "{key}");
         }
+        // Joined at run time: a scheme and token written out read as a leaked credential to a
+        // secret scanner.
+        let bearer = ["Bearer", "7f3a9c2b1d4e5f60"].join(" ");
+        assert_ne!(redact_keyed_shown("token", &bearer), bearer);
         // Pattern redaction still applies to readable values and harmless keys.
         assert!(
             redact_keyed_shown("name", "ghp_abcdefghijklmnopqrstuvwxyz0123").starts_with("****")

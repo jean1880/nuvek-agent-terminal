@@ -2214,8 +2214,8 @@ mod tests {
         let input = json!({"file_path": "f.txt", "content": "new"});
         let judged = target(&pinned, Tool::WriteFile, &input);
         let note = card_note(&pinned, Tool::WriteFile, &input, judged.as_deref()).unwrap();
-        assert!(note.contains("other link keeps the old content"), "{note}");
-        assert!(!note.contains("Leads to"), "{note}");
+        assert!(note.contains("other link keeps the old content"));
+        assert!(!note.contains("Leads to"));
         // A read of it, or a write of a file with one link, adds nothing.
         let read = json!({"file_path": "f.txt"});
         let judged = target(&pinned, Tool::ReadFile, &read);

@@ -605,6 +605,8 @@ impl Supervisor {
             if let Err(e) = requeued {
                 warn!(%worker, %operation, "a refused steer could not be requeued");
                 sup.record_fact(operation, DispatchFact::Failed(e));
+                // What was queued behind it is not left waiting.
+                sup.drain_deferred(&worker);
                 return;
             }
             info!(%worker, %operation, "refused steer requeued for the next turn");

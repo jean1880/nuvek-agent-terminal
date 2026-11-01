@@ -5207,15 +5207,24 @@ impl Inner {
                 // Not yet "went ahead": its start may still fail (a hook proof still out, then
                 // a spawn that fails), so the marks stay until the agent reports it started.
                 inner.switch_installed(driver);
-            } else {
-                // Failed or rolled back: what was written for the new agent is held, never sent
-                // to the agent the thread is on.
-                inner.hold_for_switch(Some(driver), "failed");
-                // A delegation root's rebind left the outgoing agent stopped for the switch
-                // (its start waited for it): it is back as it was.
-                inner.ensure_alive();
+                inner.end_switch(busy, revision);
+                return;
             }
-            inner.end_switch(busy, revision);
+            // Failed or rolled back: what was written for the new agent is held, never sent
+            // to the agent the thread is on.
+            inner.hold_for_switch(Some(driver), "failed");
+            // A delegation root's rebind left the outgoing agent stopped for the switch
+            // (its start waited for it): it is back as it was.
+            inner.ensure_alive();
+            if busy {
+                // The task never moved: its turn (another profile's of the same agent too) is
+                // still the old agent's, so no continuation goes into it, and what the switch
+                // took over is queued again.
+                inner.switch_continuation.borrow_mut().take();
+                inner.settle_carried(false);
+            } else {
+                inner.end_switch(false, revision);
+            }
         });
     }
 

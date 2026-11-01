@@ -24,6 +24,29 @@
 //! only a reading decides. The caller supplies the clock and the readings; nothing here sends or
 //! probes anything.
 
+use crate::event::{Event, ItemKind, TurnState};
+
+/// Whether `event` shows the agent at work again, so the thread no longer waits for (or is
+/// stopped by) its usage limit: an item of its own, or a turn that completed with output. The one
+/// test of it, for the window and the session alike. A turn merely starting is not: Claude starts
+/// one itself to read a finished task, and a retry the limit refuses starts one too; hiding the
+/// banner then took the offer away (2026-10-11). Nor is a turn that completed with nothing to
+/// show. Only a top-level item counts: a sub-agent started before the limit can still stream
+/// under it.
+pub fn limit_over(event: &Event) -> bool {
+    match event {
+        Event::ItemStarted {
+            kind, parent: None, ..
+        } => *kind != ItemKind::UserMessage,
+        Event::TurnCompleted {
+            state: TurnState::Completed,
+            usage: Some(usage),
+            ..
+        } => usage.output_tokens > 0,
+        _ => false,
+    }
+}
+
 /// Seconds past a reset time before continuing: the provider's clock and ours may differ.
 pub const GRACE: i64 = 60;
 

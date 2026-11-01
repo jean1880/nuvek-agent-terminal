@@ -7,7 +7,11 @@
 //! background, and VTE's default colours for the rest.
 
 use crate::config::ThemeChoice;
+use crate::palette::Rgb;
 use gtk4::gdk::RGBA;
+
+/// WCAG AA for body text.
+const MIN_TEXT_CONTRAST: f64 = 4.5;
 #[cfg(feature = "terminal")]
 use vte4::prelude::*;
 #[cfg(feature = "terminal")]
@@ -239,13 +243,30 @@ impl Theme {
                 file: c.accent.to_rgba(),
             };
         };
+        // Bright black names the file in `diff --git`/`index` lines, yet some schemes draw it
+        // at or near their background (Solarized's is the background): lift it toward the
+        // text until it reads.
+        let rgb = |c: &RGBA| {
+            Rgb(
+                f64::from(c.red()),
+                f64::from(c.green()),
+                f64::from(c.blue()),
+            )
+        };
+        let meta = rgb(&theme.palette[8])
+            .readable_on(
+                rgb(&theme.background),
+                rgb(&theme.foreground),
+                MIN_TEXT_CONTRAST,
+            )
+            .to_rgba();
         DiffColours {
             background: theme.background,
             text: theme.foreground,
             added: theme.palette[2],
             removed: theme.palette[1],
             hunk: theme.palette[6],
-            meta: theme.palette[8],
+            meta,
             file: theme.bold,
         }
     }
@@ -257,5 +278,45 @@ impl Theme {
         terminal.set_color_cursor(Some(&self.cursor));
         terminal.set_color_highlight(Some(&self.highlight_bg));
         terminal.set_color_highlight_foreground(Some(&self.highlight_fg));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rgb_of(c: &RGBA) -> Rgb {
+        Rgb(
+            f64::from(c.red()),
+            f64::from(c.green()),
+            f64::from(c.blue()),
+        )
+    }
+
+    #[test]
+    fn every_bundled_theme_draws_diff_meta_lines_readably() {
+        for choice in ThemeChoice::ALL {
+            if choice == ThemeChoice::System {
+                continue;
+            }
+            let diff = Theme::diff_colours(choice);
+            let bg = rgb_of(&diff.background);
+            let ratio = rgb_of(&diff.meta).contrast(bg);
+            assert!(
+                ratio >= MIN_TEXT_CONTRAST,
+                "{choice:?}: meta at {ratio:.2}:1"
+            );
+        }
+    }
+
+    #[test]
+    fn a_meta_colour_that_already_reads_is_left_as_the_scheme_has_it() {
+        // The app's own bright black reads on its background: unchanged.
+        let theme = Theme::agent_terminal();
+        let diff = Theme::diff_colours(ThemeChoice::AgentTerminal);
+        assert_eq!(rgb_of(&diff.meta).hex(), rgb_of(&theme.palette[8]).hex());
+        // Solarized's bright black is its background: lifted.
+        let diff = Theme::diff_colours(ThemeChoice::SolarizedDark);
+        assert_ne!(rgb_of(&diff.meta).hex(), rgb_of(&diff.background).hex());
     }
 }

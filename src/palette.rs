@@ -61,6 +61,33 @@ impl Rgb {
         Rgb(m(self.0, other.0), m(self.1, other.1), m(self.2, other.2))
     }
 
+    /// WCAG 2 relative luminance.
+    pub fn luminance(self) -> f64 {
+        let l = |c: f64| {
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * l(self.0) + 0.7152 * l(self.1) + 0.0722 * l(self.2)
+    }
+
+    /// WCAG 2 contrast ratio with `other` (1..=21).
+    pub fn contrast(self, other: Rgb) -> f64 {
+        let (a, b) = (self.luminance(), other.luminance());
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// `self`, moved just far enough toward `toward` to reach `min` contrast on `bg` (all the
+    /// way, if even `toward` falls short).
+    pub fn readable_on(self, bg: Rgb, toward: Rgb, min: f64) -> Rgb {
+        (0..=20)
+            .map(|step| self.mix(toward, f64::from(step) / 20.0))
+            .find(|c| c.contrast(bg) >= min)
+            .unwrap_or(toward)
+    }
+
     /// Darker (`f` < 1) or lighter (`f` > 1), clamped.
     pub fn shade(self, f: f64) -> Rgb {
         let s = |a: f64| (a * f).clamp(0.0, 1.0);

@@ -131,6 +131,8 @@ impl AgentTerminalWindow {
                     .unwrap_or_default(),
             )
             .build();
+        // How the chat shows an edit's diff, apart from the external tool the group below is about.
+        let display = adw::PreferencesGroup::builder().title("Diffs").build();
         let expand_row = self.config_switch(
             "Expand Diffs",
             "Show a file edit's diff as soon as the edit completes",
@@ -138,7 +140,8 @@ impl AgentTerminalWindow {
             SaveWhen::Owned,
             Self::set_diffs_expanded,
         );
-        group.add(&expand_row);
+        display.add(&expand_row);
+        page.add(&display);
         group.add(&preset_row);
         group.add(&command_row);
         page.add(&group);
@@ -198,15 +201,26 @@ impl AgentTerminalWindow {
                 if syncing.get() {
                     return;
                 }
+                let widget = entry.upcast_ref::<gtk4::Widget>();
                 match tool_from_text(&entry.text()) {
                     Err(why) => {
-                        // Inline, and not saved: the field says what is wrong.
+                        // Inline, and not saved: the field says what is wrong, to assistive
+                        // technology too.
+                        let title = command_error_title(&why);
                         entry.add_css_class("error");
-                        entry.set_title(&command_error_title(&why));
+                        entry.set_title(&title);
+                        widget.update_property(&[gtk4::accessible::Property::Description(&title)]);
+                        widget.update_state(&[gtk4::accessible::State::Invalid(
+                            gtk4::AccessibleInvalidState::True,
+                        )]);
                     }
                     Ok(_) => {
                         entry.remove_css_class("error");
                         entry.set_title("Command");
+                        widget.update_property(&[gtk4::accessible::Property::Description("")]);
+                        widget.update_state(&[gtk4::accessible::State::Invalid(
+                            gtk4::AccessibleInvalidState::False,
+                        )]);
                     }
                 }
             }
@@ -271,8 +285,10 @@ impl AgentTerminalWindow {
                     }
                 }
                 if !missing.is_empty() {
-                    preset_row
-                        .set_subtitle(&format!("Not found on this system: {}", missing.join(", ")));
+                    preset_row.set_subtitle(&format!(
+                        "Choose a preset, or edit the command below. Not found on this system: {}",
+                        missing.join(", ")
+                    ));
                 }
             }
         ));

@@ -3984,7 +3984,9 @@ impl AgentTerminalWindow {
     /// A settings row whose entry names a folder (the starting directory, the worktree folder).
     /// A path that does not exist is refused inline and never saved: one used to be accepted,
     /// saved, and then silently swapped for $HOME at spawn time with only a log line, so the
-    /// user saw a tab in the wrong place and no explanation. A usable one saves on change.
+    /// user saw a tab in the wrong place and no explanation. The path is checked as it is
+    /// typed but saved only when committed (Enter, or focus leaving the entry), so a
+    /// half-typed path that happens to exist is never saved.
     fn directory_row(
         &self,
         title: &str,
@@ -4000,6 +4002,7 @@ impl AgentTerminalWindow {
             .valign(gtk4::Align::Center)
             .placeholder_text(placeholder)
             .build();
+        entry.update_property(&[gtk4::accessible::Property::Label(title)]);
         let row = adw::ActionRow::builder()
             .title(title)
             .subtitle(help)
@@ -4007,18 +4010,23 @@ impl AgentTerminalWindow {
         row.add_suffix(&entry);
         entry.connect_changed(glib::clone!(
             #[weak]
+            row,
+            move |entry| {
+                check_directory_entry(entry, &row, help);
+            }
+        ));
+        let commit = std::rc::Rc::new(glib::clone!(
+            #[weak]
             obj,
             #[weak]
             row,
-            move |entry| {
-                let text = entry.text().to_string();
-                if !directory_is_usable(&text) {
-                    entry.add_css_class("error");
-                    row.set_subtitle("That directory does not exist");
+            #[weak]
+            entry,
+            move || {
+                if !check_directory_entry(&entry, &row, help) {
                     return;
                 }
-                entry.remove_css_class("error");
-                row.set_subtitle(help);
+                let text = entry.text().to_string();
                 let imp = obj.imp();
                 if *get(&imp.config.borrow()) == text {
                     return;
@@ -4027,6 +4035,14 @@ impl AgentTerminalWindow {
                 imp.schedule_config_save();
             }
         ));
+        entry.connect_activate(glib::clone!(
+            #[strong]
+            commit,
+            move |_| commit()
+        ));
+        let focus = gtk4::EventControllerFocus::new();
+        focus.connect_leave(move |_| commit());
+        entry.add_controller(focus);
         row
     }
 
@@ -4339,14 +4355,14 @@ impl AgentTerminalWindow {
         };
 
         let status_page = adw::StatusPage::builder()
-            .title("No AI CLI detected")
+            .title("No AI CLI Detected")
             .description(description)
             .vexpand(true)
             .build();
         crate::icons::set_status_icon(&status_page, "at-utilities-terminal-symbolic");
 
         let refresh_button = Button::builder()
-            .label("Check again")
+            .label("Check Again")
             .halign(Align::Center)
             .margin_top(20)
             .css_classes(["suggested-action"])
@@ -4394,9 +4410,13 @@ impl AgentTerminalWindow {
 
         let scrollback_row = adw::ActionRow::builder()
             .title("Scrollback Lines")
-            .subtitle("How many lines of output a terminal keeps to scroll back through")
+            .subtitle(
+                "How many lines of output a terminal keeps to scroll back through \
+                 (100 to 100,000; default 10,000)",
+            )
             .build();
         scrollback_row.add_suffix(&scroll_spin);
+        scroll_spin.update_property(&[gtk4::accessible::Property::Label("Scrollback Lines")]);
 
         let suspend_spin = gtk4::SpinButton::builder()
             .adjustment(&gtk4::Adjustment::new(
@@ -4413,10 +4433,13 @@ impl AgentTerminalWindow {
             .title("Pause Idle Agents After (Minutes)")
             .subtitle(
                 "A thread out of sight and idle this long stops its agent to free memory; \
-                 it picks up the same conversation when you send. 0 never pauses",
+                 it picks up the same conversation when you send. 0 never pauses; default 15",
             )
             .build();
         suspend_row.add_suffix(&suspend_spin);
+        suspend_spin.update_property(&[gtk4::accessible::Property::Label(
+            "Pause Idle Agents After (Minutes)",
+        )]);
 
         // Built from the configured profiles. Index 0 is auto-detection, so the
         // list is one longer than the profile list and every later index is
@@ -4441,9 +4464,10 @@ impl AgentTerminalWindow {
 
         let font_scale_row = adw::ActionRow::builder()
             .title("Text Scale")
-            .subtitle("Chat and terminal text size (Ctrl+= and Ctrl+- change it)")
+            .subtitle("Chat and terminal text size; default 1.0 (Ctrl+= and Ctrl+- change it)")
             .build();
         font_scale_row.add_suffix(&font_scale_spin);
+        font_scale_spin.update_property(&[gtk4::accessible::Property::Label("Text Scale")]);
         *self.font_scale_spin.borrow_mut() = font_scale_spin.downgrade();
 
         let cli_client_row = adw::ComboRow::builder()
@@ -4455,7 +4479,7 @@ impl AgentTerminalWindow {
 
         let theme_row = self.choice_row(
             "Theme",
-            "Colours of the whole app: threads, terminals and diffs. Use System Theme takes \
+            "Colours of the whole app: threads, terminals and diffs. “Use System Theme” takes \
              them from your desktop and follows it when it changes",
             crate::config::ThemeChoice::ALL
                 .iter()
@@ -4540,7 +4564,7 @@ impl AgentTerminalWindow {
         );
 
         let quick_replies_row = self.config_switch(
-            "Suggest quick replies when a reply ends with a question",
+            "Suggest Quick Replies After a Question",
             "Codex and Antigravity: when a reply ends with a question and a short list of \
              choices, offer the choices under the reply. Choosing one fills the message box; \
              nothing is sent until you press Enter",
@@ -7158,6 +7182,44 @@ fn directory_is_usable(dir: &str) -> bool {
     std::path::Path::new(&crate::utils::expand_tilde_with(trimmed, &home)).is_dir()
 }
 
+/// What a folder row says about `dir` when it cannot be used, or `None` when it can.
+fn directory_problem(dir: &str) -> Option<String> {
+    (!directory_is_usable(dir)).then(|| {
+        format!(
+            "“{}” is not an existing folder. The previous value is still in use.",
+            dir.trim()
+        )
+    })
+}
+
+/// Shows on a folder row whether its entry names a usable folder: the reason in the subtitle
+/// (escaped: the row's help is markup) and the entry's tooltip, and the entry marked invalid
+/// for assistive technology. Returns whether it is usable.
+fn check_directory_entry(entry: &gtk4::Entry, row: &adw::ActionRow, help: &str) -> bool {
+    match directory_problem(&entry.text()) {
+        Some(problem) => {
+            entry.add_css_class("error");
+            row.set_subtitle(&glib::markup_escape_text(&problem));
+            entry.set_tooltip_text(Some(&problem));
+            entry.update_property(&[gtk4::accessible::Property::Description(&problem)]);
+            entry.update_state(&[gtk4::accessible::State::Invalid(
+                gtk4::AccessibleInvalidState::True,
+            )]);
+            false
+        }
+        None => {
+            entry.remove_css_class("error");
+            row.set_subtitle(help);
+            entry.set_tooltip_text(None);
+            entry.update_property(&[gtk4::accessible::Property::Description("")]);
+            entry.update_state(&[gtk4::accessible::State::Invalid(
+                gtk4::AccessibleInvalidState::False,
+            )]);
+            true
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7168,6 +7230,26 @@ mod tests {
             gtk4::pango::parse_markup(text, '\0').unwrap();
         }
         agents_prefs::tests::help_texts_are_valid_markup();
+    }
+
+    #[test]
+    fn a_folder_row_names_a_missing_folder_and_accepts_blank_or_existing_ones() {
+        assert_eq!(directory_problem(""), None);
+        let tmp = tempfile::tempdir().expect("tmp");
+        assert_eq!(directory_problem(&tmp.path().to_string_lossy()), None);
+        let missing = tmp.path().join("pro");
+        let problem = directory_problem(&format!(" {} ", missing.display())).expect("missing");
+        assert!(
+            problem.contains(&format!("“{}”", missing.display())),
+            "{problem}"
+        );
+        assert!(
+            problem.contains("previous value is still in use"),
+            "{problem}"
+        );
+        // The subtitle escapes it: a path with markup characters stays valid markup.
+        let odd = directory_problem("/no/<such>&dir").expect("missing");
+        gtk4::pango::parse_markup(&glib::markup_escape_text(&odd), '\0').unwrap();
     }
 
     #[test]

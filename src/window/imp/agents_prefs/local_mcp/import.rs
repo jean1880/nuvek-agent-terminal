@@ -23,7 +23,7 @@ impl AgentTerminalWindow {
             .text(default)
             .build();
         let choose = gtk4::Button::builder()
-            .label("Choose file")
+            .label("Choose File…")
             .valign(gtk4::Align::Center)
             .build();
         source.add_suffix(&choose);
@@ -34,7 +34,7 @@ impl AgentTerminalWindow {
             source,
             move |_| {
                 let picker = gtk4::FileDialog::builder()
-                    .title("Choose Codex configuration")
+                    .title("Choose Codex Configuration")
                     .build();
                 let obj = obj.downgrade();
                 let source = source.downgrade();
@@ -50,17 +50,17 @@ impl AgentTerminalWindow {
             }
         ));
         let preview_button = gtk4::Button::builder()
-            .label("Preview import")
+            .label("Preview Import")
             .valign(gtk4::Align::Center)
             .build();
         source.add_suffix(&preview_button);
         group.add(&source);
         let preview_row=adw::ExpanderRow::builder().title("Codex Import Preview").subtitle("Stdio only. No approval exemptions or read-only declarations are imported. Opening Settings reads no Codex configuration and starts no MCP server.").build();
         group.add(&preview_row);
-        let summary=adw::ActionRow::builder().title("Import Status").subtitle("Choose a file, then Preview import. Environment names only; credential values are never shown.").subtitle_lines(0).use_markup(false).build();
+        let summary=adw::ActionRow::builder().title("Import Status").subtitle("Choose a file, then Preview Import. Environment names only; credential values are never shown.").subtitle_lines(0).use_markup(false).build();
         preview_row.add_row(&summary);
         let confirm = gtk4::Button::builder()
-            .label("Import selected")
+            .label("Import Selected")
             .sensitive(false)
             .valign(gtk4::Align::Center)
             .build();

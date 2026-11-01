@@ -2790,7 +2790,8 @@ fn enabled_subtitle(
         (Availability::Disabled, _) | (_, None) => state.describe(driver),
         (Availability::Ready(_), Some(Err(_))) => Availability::Missing.describe(driver),
         (Availability::Missing | Availability::Detecting, Some(Ok(found))) => {
-            format!("Ready: {}", found.trim_start_matches("Installed at "))
+            Availability::Ready(found.trim_start_matches("Installed at ").to_owned())
+                .describe(driver)
         }
         _ => state.describe(driver),
     }

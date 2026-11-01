@@ -3720,18 +3720,8 @@ impl AgentTerminalWindow {
             .placeholder_text("Search threads")
             .hexpand(true)
             .build();
-        let new = Button::builder()
-            .icon_name("at-list-add-symbolic")
-            .tooltip_text("New Thread (Ctrl+Shift+T)")
-            .css_classes(["flat"])
-            .build();
-        new.connect_clicked(glib::clone!(
-            #[weak]
-            obj,
-            move |_| obj.imp().new_tab()
-        ));
+        // New Thread is the header's "+", visible whether or not the sidebar is.
         top.append(&search);
-        top.append(&new);
         root.append(&top);
 
         let list = gtk4::ListBox::builder()
@@ -4252,12 +4242,21 @@ impl AgentTerminalWindow {
                     .build(),
             );
         }
+        // The label may be cut and the count is a bare number: the tooltip and the accessible
+        // name say both in full.
+        let shown = crate::utils::tildify(&folder, home);
+        let name = match group.hidden {
+            0 => shown,
+            1 => format!("{shown} · 1 thread hidden"),
+            n => format!("{shown} · {n} threads hidden"),
+        };
         let toggle = Button::builder()
             .child(&inner)
             .hexpand(true)
-            .tooltip_text(&folder)
+            .tooltip_text(&name)
             .css_classes(["flat", "folder-toggle"])
             .build();
+        toggle.update_property(&[gtk4::accessible::Property::Label(&name)]);
         toggle.update_state(&[gtk4::accessible::State::Expanded(Some(group.expanded))]);
         let weak_sidebar = Rc::downgrade(sidebar);
         toggle.connect_clicked(glib::clone!(

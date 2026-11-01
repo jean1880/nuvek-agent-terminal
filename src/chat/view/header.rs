@@ -232,7 +232,7 @@ impl Header {
         let agent = label("", &["chip-agent"]);
         let model = label("", &["chip-model"]);
         model.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
-        model.set_max_width_chars(28);
+        model.set_max_width_chars(40);
         chip_box.append(&brand);
         chip_box.append(&agent);
         chip_box.append(&model);

@@ -7,11 +7,8 @@
 //! background, and VTE's default colours for the rest.
 
 use crate::config::ThemeChoice;
-use crate::palette::Rgb;
+use crate::palette::{Rgb, MIN_TEXT_CONTRAST};
 use gtk4::gdk::RGBA;
-
-/// WCAG AA for body text.
-const MIN_TEXT_CONTRAST: f64 = 4.5;
 #[cfg(feature = "terminal")]
 use vte4::prelude::*;
 #[cfg(feature = "terminal")]

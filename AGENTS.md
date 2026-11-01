@@ -254,7 +254,7 @@ Architectural mandates, standards, and workflows for this codebase.
   "Always allow" keeps one file. `always_allow::tests::session_edit_keeps_its_folder_and_nothing_more`
   proves each of these.
 - **An idle thread out of sight is suspended, never ended**: after `idle_suspend_minutes`
-  (default 15, 0 never; Settings → Behaviour) unseen and unheard from, the window's minute sweep
+  (default 15, 0 never; Settings → General → Threads) unseen and unheard from, the window's minute sweep
   (`suspend_idle_threads`) asks `ChatSession::suspend_if_idle`, which stops the agent process
   only when nothing would be lost (`Inner::suspend_blocker`: no turn, queue, approval, permission
   card, model change, handoff, rebind, Codex session grants, unresumable Codex thread, no
@@ -282,7 +282,7 @@ Architectural mandates, standards, and workflows for this codebase.
   the epoch is unchanged. Silent too: its next instruction resumes the same native session
   through `ensure_child`. `capacity_tests` (supervisor and session) prove these.
 - **A thread stopped by its usage limit continues once it resets, unless told not to**: with
-  `continue_after_limit` on (default; Settings → Behaviour), a root thread whose turn failed for
+  `continue_after_limit` on (default; Settings → General → Threads), a root thread whose turn failed for
   quota (never a rate limit alone, which may be a tool's own 429, nor a usage reading, which may
   name a window the thread does not use) waits (`agent_core::limit_wait`): until the reset time a
   rate limit in that turn gave, plus a minute, or, with none, until a prompt-less usage probe

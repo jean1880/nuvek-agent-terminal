@@ -5205,7 +5205,7 @@ impl AgentTerminalWindow {
         });
     }
 
-    /// Settings → Behaviour → "Show Sessions Started Outside Agent Terminal". Applies at once:
+    /// Settings → General → Threads → "Show Sessions Started Outside Agent Terminal". Applies at once:
     /// on, the scan runs now; off, it never runs (threads already listed stay).
     pub(super) fn set_list_outside_sessions(&self, on: bool) {
         if self.config.borrow().list_outside_sessions == on {

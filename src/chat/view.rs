@@ -4844,7 +4844,7 @@ pub(crate) mod tests {
         assert_eq!(state.1, "No diff is available for this edit.");
         assert_eq!(state.2, "");
 
-        // An Edit approval shows the proposed change as a diff, with the JSON behind "Show raw";
+        // An Edit approval shows the proposed change as a diff, with the JSON behind "Show Raw";
         // a command approval keeps its command line and has neither.
         sink(
             &Envelope::new(Event::ApprovalRequested {

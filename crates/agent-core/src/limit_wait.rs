@@ -36,6 +36,7 @@
 //! refused continuation, so the guesses spread out by the same back-off. The caller supplies the
 //! clock and the readings; nothing here sends or probes anything.
 
+use crate::adapter::Driver;
 use crate::event::{Event, ItemKind, TurnState};
 
 /// Whether `event` shows the agent at work again, so the thread no longer waits for (or is
@@ -90,18 +91,36 @@ pub struct LimitRecord {
     continued: bool,
     /// The back-off the last refused continuation earned, in seconds; 0 before any.
     gap: i64,
+    /// The agent whose limit this is: the one that last refused.
+    agent: Option<Driver>,
 }
 
 impl LimitRecord {
-    /// Reads one of the thread's events; returns whether it is a refusal.
-    pub fn observe(&mut self, event: &Event) -> bool {
+    /// Reads one of the thread's events, from its agent `driver` then; returns whether it is a
+    /// refusal.
+    pub fn observe(&mut self, driver: Driver, event: &Event) -> bool {
         if limit_over(event) {
             *self = Self::default();
             return false;
         }
         let refused = limit_refused(event);
-        self.refused |= refused;
+        if refused {
+            self.refused = true;
+            self.agent = Some(driver);
+        }
         refused
+    }
+
+    /// Whether `event`, from `driver`, shows the thread on another agent than the one whose limit
+    /// this is, and that agent up (its session or a turn started): a switch that has taken, so
+    /// the old agent's limit is not waited out. Not before: a switch whose agent never starts
+    /// rolls back to the old one, still limited.
+    pub fn moved_on(&self, driver: Driver, event: &Event) -> bool {
+        self.agent.is_some_and(|agent| agent != driver)
+            && matches!(
+                event,
+                Event::SessionStarted { .. } | Event::TurnStarted { .. }
+            )
     }
 
     /// Whether the limit stopped the thread and its agent has not worked since.
@@ -460,19 +479,43 @@ mod tests {
             },
             failed("429 Too Many Requests"),
         ] {
-            assert!(!record.observe(&not_a_refusal), "{not_a_refusal:?}");
+            assert!(
+                !record.observe(Driver::Claude, &not_a_refusal),
+                "{not_a_refusal:?}"
+            );
             assert!(!record.stopped(), "{not_a_refusal:?}");
         }
-        assert!(record.observe(&failed("You've hit your session limit")));
+        assert!(record.observe(Driver::Claude, &failed("You've hit your session limit")));
         assert!(record.stopped());
         // A turn starting, or completing with nothing to show, is not the agent working again.
-        record.observe(&Event::TurnStarted { model: None });
+        record.observe(Driver::Claude, &Event::TurnStarted { model: None });
         assert!(record.stopped());
-        record.observe(&answered());
+        record.observe(Driver::Claude, &answered());
         assert!(!record.stopped());
-        record.observe(&failed("You've hit your session limit"));
+        record.observe(Driver::Claude, &failed("You've hit your session limit"));
         record.forget();
         assert!(!record.stopped());
+    }
+
+    #[test]
+    fn only_another_agent_that_is_up_moves_a_thread_off_its_limit() {
+        let mut record = LimitRecord::default();
+        let up = Event::SessionStarted {
+            native_id: "s".into(),
+            model: None,
+            cwd: None,
+        };
+        assert!(!record.moved_on(Driver::Codex, &up), "no limit yet");
+        record.observe(Driver::Claude, &failed("You've hit your session limit"));
+        // The switch's own notice comes from the new agent before it has started: a switch that
+        // never starts rolls back to Claude, which is still limited.
+        let notice = Event::Notice {
+            text: "Switched to Codex".into(),
+        };
+        assert!(!record.moved_on(Driver::Codex, &notice));
+        assert!(!record.moved_on(Driver::Claude, &up), "the same agent");
+        assert!(record.moved_on(Driver::Codex, &up));
+        assert!(record.moved_on(Driver::Codex, &Event::TurnStarted { model: None }));
     }
 
     /// When each wait ends with a continuation: the first tick (each minute from `refusal`) at
@@ -493,7 +536,7 @@ mod tests {
         let free = [window("5-hour", 0.2, Some(10_000_000))];
         let refuse = failed("You've hit your session limit");
         let mut record = LimitRecord::default();
-        assert!(record.observe(&refuse));
+        assert!(record.observe(Driver::Claude, &refuse));
         let mut wait = LimitWait::new(None, 1_000, &free);
         wait.back_off(1_000, record.backoff());
         // The first refusal: a reading taken after it decides at once.
@@ -503,7 +546,7 @@ mod tests {
         for _ in 0..7 {
             record.continued();
             let refusal = sent + 5;
-            assert!(record.observe(&refuse));
+            assert!(record.observe(Driver::Claude, &refuse));
             // Each refusal starts a new wait; the record outlives the one before.
             let mut wait = LimitWait::new(None, refusal, &free);
             wait.back_off(refusal, record.backoff());
@@ -514,20 +557,20 @@ mod tests {
         // At least the minimum, then each at least double the last, up to the cap.
         assert_eq!(gaps, [900, 1_800, 3_600, 7_200, 14_400, 21_600, 21_600]);
         // The user's own retry refused meanwhile (no continuation since) keeps the gap.
-        assert!(record.observe(&refuse));
+        assert!(record.observe(Driver::Claude, &refuse));
         let mut wait = LimitWait::new(None, sent, &free);
         wait.back_off(sent, record.backoff());
         assert_eq!(continues_after(&mut wait, sent, &free), BACKOFF_MAX);
         // Once the agent works again the record starts over.
-        record.observe(&answered());
-        assert!(record.observe(&refuse));
+        record.observe(Driver::Claude, &answered());
+        assert!(record.observe(Driver::Claude, &refuse));
         let mut wait = LimitWait::new(None, sent, &free);
         wait.back_off(sent, record.backoff());
         assert_eq!(continues_after(&mut wait, sent, &free), 60);
         // A refusal during a wait backs it off the same way.
         record.continued();
         let mut wait = LimitWait::new(None, sent, &free);
-        assert!(record.observe(&refuse));
+        assert!(record.observe(Driver::Claude, &refuse));
         wait.learn(None, sent + 30, &free);
         wait.back_off(sent + 30, record.backoff());
         assert_eq!(continues_after(&mut wait, sent + 30, &free), BACKOFF_MIN);
@@ -690,14 +733,14 @@ mod tests {
         // Each guess refused at once: the record spaces the next ones out, never shrinking.
         let refuse = failed("You've hit your usage limit");
         let mut record = LimitRecord::default();
-        assert!(record.observe(&refuse));
+        assert!(record.observe(Driver::Claude, &refuse));
         let mut wait = LimitWait::new(None, 0, &[]);
         wait.back_off(0, record.backoff());
         let mut gaps = vec![continues_after(&mut wait, 0, &[])];
         let mut sent = gaps[0];
         for _ in 0..6 {
             record.continued();
-            assert!(record.observe(&refuse));
+            assert!(record.observe(Driver::Claude, &refuse));
             let mut wait = LimitWait::new(None, sent, &[]);
             wait.back_off(sent, record.backoff());
             let gap = continues_after(&mut wait, sent, &[]);

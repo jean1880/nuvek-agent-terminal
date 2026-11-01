@@ -3311,8 +3311,9 @@ impl AgentTerminalWindow {
     }
 
     /// `thread`'s agent refused its work over its usage limit
-    /// ([`agent_core::limit_wait::limit_refused`]); `reset`: when it said the limit resets. Unless Settings turned it off or the thread is a delegated
-    /// worker, the thread waits for the limit to be over and continues
+    /// ([`agent_core::limit_wait::limit_refused`]); `reset`: when it said the limit resets.
+    /// Unless Settings turned it off or the thread is a delegated worker, the thread waits for
+    /// the limit to be over and continues
     /// ([`Self::continue_after_limits`]). A wait already running learns a later reset time from
     /// another refusal only: a quota reading may name a window the thread does not use.
     fn arm_limit_wait(&self, thread: &str, reset: Option<i64>) {
@@ -6195,12 +6196,14 @@ impl AgentTerminalWindow {
                 chat.rate_limited = false;
                 chat.rate_banner.set_revealed(false);
             }
-            // The agent is at work again, or the thread runs another agent now: the limit it
-            // waited out is not this one's any more.
-            if chat.limit_wait.is_some() && (switched || limit_over(&env.event)) {
+            // The agent is at work again, or the thread runs another agent now and it is up: the
+            // limit it waited out is not this one's any more. A switch only asked for, or one
+            // whose agent never starts (it rolls back), keeps the wait.
+            let moved_on = chat.limit.moved_on(driver, &env.event);
+            if chat.limit_wait.is_some() && (moved_on || limit_over(&env.event)) {
                 chat.end_limit_wait();
             }
-            if switched {
+            if moved_on {
                 chat.limit.forget();
             }
             // Read before the turn's end below closes it.
@@ -6214,7 +6217,7 @@ impl AgentTerminalWindow {
             }
             refused = chat
                 .limit
-                .observe(&env.event)
+                .observe(driver, &env.event)
                 .then(|| chat.limit_reset_seen.take());
             let after = match &env.event {
                 Event::TurnStarted { .. } => {
@@ -6865,8 +6868,8 @@ impl AgentTerminalWindow {
         let Some(slot) = self.slot_of(thread) else {
             return;
         };
-        // The work goes on in the other agent: the old one's limit is not waited out.
-        self.cancel_limit_wait(thread);
+        // The old agent's limit wait ends once the new agent is up (`LimitRecord::moved_on`),
+        // never before: a switch that fails rolls back to the agent it waits for.
         if slot.get().is_some() {
             slot.switch(target, model, effort);
             return;

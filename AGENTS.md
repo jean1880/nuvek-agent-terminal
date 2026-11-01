@@ -313,8 +313,10 @@ Architectural mandates, standards, and workflows for this codebase.
   (`TurnPurpose::LimitContinue`), never for a delegated worker, never for a root the user
   stopped (Stop ends its wait, delegation or not, and the session refuses a continuation until
   the user speaks again). While the thread waits, sub-agent news does not wake it (`TurnPurpose::Wake`); it
-  arrives after the continuation. The wait ends when the agent works again, the thread switches
-  agent (the hand-off included), the user picks "Don't Continue" on its banner, or the setting
+  arrives after the continuation. The wait ends when the agent works again (`limit_over`, the
+  one test for the window and the session), the thread switches agent (the hand-off included;
+  once the new agent is up, `LimitRecord::moved_on`, so a switch that rolls back keeps it), the
+  user stops it, the user picks "Don't Continue" on its banner, or the setting
   goes off. "Continue in …" on the limit's banner (and a bare `/handoff` while the thread is
   stopped by its limit) switches and then continues the work in the new agent with the handoff,
   as a busy switch does. `limit_wait::tests`, the session tests

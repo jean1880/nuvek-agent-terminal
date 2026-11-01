@@ -5800,17 +5800,33 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_carried_epoch_fails_the_v9_step_and_changes_nothing() {
+    fn an_unreadable_carried_epoch_is_left_unset_and_the_store_still_opens() {
         let conn = v8_fixture();
         conn.execute_batch(
             "INSERT INTO meta (key, value) VALUES ('delegation_operation_epoch:op2', 'many');",
         )
         .expect("an unreadable epoch");
-        assert!(matches!(migrate(&conn), Err(StoreError::Upgrade(_))));
+        migrate(&conn).expect("one unreadable row never keeps the store from opening");
         let version: i64 = conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .expect("version");
-        assert_eq!(version, 8, "rolled back");
+        assert_eq!(version, SCHEMA_VERSION);
+        let carried: Option<i64> = conn
+            .query_row(
+                "SELECT carried_epoch FROM delegation_operations WHERE id = 'op2'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("op2");
+        assert_eq!(carried, None, "held to its acceptance epoch");
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM meta WHERE key LIKE 'delegation_operation_epoch:%'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(left, 0);
     }
 
     #[test]

@@ -242,8 +242,9 @@ const V8_CARRIED_EPOCH_PREFIX: &str = "delegation_operation_epoch:";
 
 /// Moves the carried epochs kept in `meta` before v9 into `delegation_operations.carried_epoch`:
 /// only an accepted operation's (anything else was stale, and is never read), then every such
-/// row goes, orphans included. An accepted operation's value that is not an epoch fails the
-/// migration.
+/// row goes, orphans included. An accepted operation whose value is not an epoch is left with
+/// none, and said so in the log: it is then held to its acceptance epoch, so it fails as stale
+/// when it is dispatched, rather than one row keeping the whole store from opening.
 pub(crate) fn migrate_v9_carried_epochs(conn: &rusqlite::Connection) -> Result<()> {
     let rows: Vec<(String, String)> = {
         let mut stmt = conn.prepare(
@@ -259,9 +260,13 @@ pub(crate) fn migrate_v9_carried_epochs(conn: &rusqlite::Connection) -> Result<(
         rows.collect::<rusqlite::Result<_>>()?
     };
     for (op, value) in &rows {
-        let epoch: i64 = value.parse().ok().filter(|e| *e >= 0).ok_or_else(|| {
-            StoreError::Upgrade(format!("the stored epoch of {op} is unreadable"))
-        })?;
+        let Some(epoch) = value.parse::<i64>().ok().filter(|e| *e >= 0) else {
+            tracing::warn!(
+                operation = %op,
+                "an accepted delegation operation's carried epoch was unreadable; left unset"
+            );
+            continue;
+        };
         conn.execute(
             "UPDATE delegation_operations SET carried_epoch = ?2 WHERE id = ?1",
             params![op, epoch],

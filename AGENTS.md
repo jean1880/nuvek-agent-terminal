@@ -296,7 +296,19 @@ Architectural mandates, standards, and workflows for this codebase.
   every failed guess at least doubles the next one (a few failed turns spread ever wider, never
   a loop), and a copy whose usage drops or that names another reset is new. A
   refusal during a wait counts the same way, and readings from before it, or a reset time it
-  came after, no longer count.
+  came after, no longer count. A refused continuation holds the thread whatever its windows say
+  (every one shown free, or none reported): the thread keeps a record from one wait to the next
+  (`LimitRecord`, kept by "Don't Continue" and a new wait, reset only when the agent works
+  again or the thread switches agent), and each continuation refused before the agent works
+  again waits at least 15 minutes, then at least double the last gap, up to 6 hours, before the
+  next (`LimitWait::back_off`); a refusal of the user's own retry keeps the last gap, never
+  shrinking it. A wait no reading can end (no reset time, and no window reported, a blocking
+  window missing from the readings, or one still full that names no reset time) continues blind
+  15 minutes after its last refusal, and only once every time a window still holding it names
+  has passed; a refusal of that guess is a refused continuation like any other, so the guesses
+  double up to 6 hours. A thread whose profile runs a model server, and the Local agent, read no
+  vendor windows (another thread's reading of the vendor says nothing of them) and are never
+  probed for one: their waits end that way.
   Readings count from when windows last arrived (`updated_at`), never an account-only
   update. agy's `/usage` side command never raises `RateLimited`: a reading is not a refusal. The window's minute sweep (`continue_after_limits`)
   then calls `ChatSession::continue_after_limit`, which sends the app's continue prompt as a
@@ -304,9 +316,12 @@ Architectural mandates, standards, and workflows for this codebase.
   waiting for a prompt rides on it and is spent as a user prompt's would be; the prompt is never
   stored as the user's message. Never into a running turn or anything else a wake waits for
   (`TurnPurpose::LimitContinue`), never for a delegated worker, never for a root the user
-  stopped. While the thread waits, sub-agent news does not wake it (`TurnPurpose::Wake`); it
-  arrives after the continuation. The wait ends when the agent works again, the thread switches
-  agent (the hand-off included), the user picks "Don't Continue" on its banner, or the setting
+  stopped (Stop ends its wait, delegation or not, and the session refuses a continuation until
+  the user speaks again). While the thread waits, sub-agent news does not wake it (`TurnPurpose::Wake`); it
+  arrives after the continuation. The wait ends when the agent works again (`limit_over`, the
+  one test for the window and the session), the thread switches agent (the hand-off included;
+  once the new agent is up, `LimitRecord::moved_on`, so a switch that rolls back keeps it), the
+  user stops it, the user picks "Don't Continue" on its banner, or the setting
   goes off. "Continue in …" on the limit's banner (and a bare `/handoff` while the thread is
   stopped by its limit) switches and then continues the work in the new agent with the handoff,
   as a busy switch does. `limit_wait::tests`, the session tests
@@ -362,34 +377,46 @@ Architectural mandates, standards, and workflows for this codebase.
   model (`AgentAvailability::server_ready`). Its tools (`agent_kit::local_tools`) pass
   `local_agent::gate` first: Plan offers and runs no writing tool, Ask asks before every write
   and command, Accept edits asks before commands and before any write outside the thread's
-  folder (`local_tools::inside`, links followed, a dangling one counted outside). Reads follow
-  the agy hook's read policy, except that a link staying inside the folder is judged where it
-  leads: a read outside the folder, of a sensitive file (the shared `agent_core::sensitive`
-  list, a file with a second hard link, and a home's dotfiles when the folder is that home or
-  above it) or a search from a home or above asks in every mode, Plan included
-  (`local_tools::read_must_ask`). Homes are `$HOME` and the account's own; with neither known,
-  every dot-named path and every search asks. An unapproved read is judged again just before it
-  runs and opened from the pinned folder one component at a time without following a link
-  (`open_inside`), so a folder swapped for a link meanwhile fails it. A search walks open
-  folders (read with `fdopendir`, no `/proc` needed; opened only when their turn comes, so the
-  open folders never outnumber the depth), never follows a link, and never reads a sensitive or
+  folder (links followed, a dangling one counted outside), of a sensitive file (the agy hook's
+  Accept edits list: `agent_core::sensitive`, and a home's dotfiles when the folder is that
+  home or above it) or of a file with a second hard link (`local_tools::must_ask`). A mode
+  change is applied as it arrives, in the middle of a turn too: the next gate and the next
+  request use it, and a card open when it comes expires and its call is gated again. Reads
+  follow the agy hook's read policy, except that a link staying inside the folder is judged
+  where it leads: a read outside the folder, of a sensitive file (the same list, a file with a
+  second hard link, and a home's dotfiles when the folder is that home or above it) or a search
+  from a home or above asks in every mode, Plan included (`local_tools::read_must_ask`). Homes
+  are `$HOME` and the account's own; with neither known, every dot-named path and every search
+  asks. A call's path is resolved once (`local_tools::target`): that is what is judged, what its
+  card names (where it leads, when that is not the path itself) and what runs
+  (`local_tools::run_judged`). Resolved again just before it runs, a path that leads anywhere
+  else is refused, an unapproved call that now must ask is refused, and what runs is opened
+  from the pinned folder (from `/` for an approved call outside it) one component at a time
+  without following a link (`open_inside`, `write_target`), so a folder swapped for a link
+  meanwhile fails it, and one judged inside never lands outside. A search walks open folders
+  (read with `fdopendir`, no `/proc` needed; opened only when their turn comes, so the open
+  folders never outnumber the depth), never follows a link, and never reads a sensitive or
   hard-linked file or a home's dotfiles, even approved: inside the folder as reads judge them,
   outside it by the whole resolved path wherever the search started. What it withheld and what
-  it could not open are counted in its result, never silently dropped (generated trees such as
-  `.git` and `target` aside). A command's group is killed before its shell is reaped
-  (never when someone else reaped it), so the group id is never one reused by another process.
-  The runner keeps
-  no approval: the app's own scoped rules answer the cards they cover. A write is bound to what
-  was judged: its folders are opened one at a time without following a link
-  (`local_tools::write_target`), so a folder swapped for a link meanwhile fails it, and one judged
-  inside never lands outside. Files are opened without blocking and read only when regular, at
-  most a fixed size. Commands run in their own process group, killed on Stop or timeout, their
-  output capped and never waited on past a short grace. Stop ends a request's connection
-  (`ChatClient::cancel`). A call from a reply that was cut off or broke off never runs, and every
-  call of an interrupted reply gets an answer. History is sent and kept in whole exchanges.
-  It is never a delegation parent or child (`RouteBlocker::LocalAgentNoBridge`). Its
-  conversation is a `0600` file under `$XDG_STATE_HOME/agent-terminal/local`, which uninstall
-  removes with the state folder.
+  it could not open or read whole (too large) are counted in its result, never silently
+  dropped (generated trees such as `.git` and `target` aside). A command's group is killed
+  before its shell is reaped (never when someone else reaped it), so the group id is never one
+  reused by another process. The runner keeps no approval: the app's own scoped rules answer
+  the cards they cover. A write is whole or nothing: written to a new file beside its target
+  (named `.agent-terminal-write.<name>.<pid>-<n>.tmp`, removed on every failure), which then
+  replaces it (`renameat`), keeping its permissions and, where it may, its owner and group; a
+  link there is never followed nor written through, a pipe never opened, and an unapproved one
+  with a second hard link is refused (an approved one's card says only that name gets the new
+  content). A file with one link that cannot be replaced (its folder not writable, or a mount of
+  its own) is written in place instead, once checked to be the file judged. An edit is made only to UTF-8 text. Files are opened without blocking and read only
+  when regular, at most a fixed size. Commands run in their own process group, killed on Stop
+  or timeout, their output capped and never waited on past a short grace. Stop ends a
+  request's connection (`ChatClient::cancel`). A call from a reply that was cut off or broke
+  off never runs, and every call of an interrupted reply gets an answer: one a Stop ended while
+  it ran keeps what it gave back (a writing one is said to have an unknown outcome), never "not
+  run". History is sent and kept in whole exchanges. It is never a delegation parent or child
+  (`RouteBlocker::LocalAgentNoBridge`). Its conversation is a `0600` file under
+  `$XDG_STATE_HOME/agent-terminal/local`, which uninstall removes with the state folder.
 - **The Local agent's instructions and MCP tools are the user's, configured in the app, never
   found at launch**: the runner takes one validated `LocalLaunchContext` on stdin
   (`Command::ConfigureLocal`, before any prompt; never argv). Instruction files
@@ -402,12 +429,16 @@ Architectural mandates, standards, and workflows for this codebase.
   truncated. The composed system message is redacted, and no instruction can change the gate,
   the approvals or the environment. Every request is planned whole
   (`local_context::plan_request`): policy, instructions, schemas, newest whole exchanges and
-  the response reserve; a call batch runs only when every result's room is reserved first.
+  the response reserve; a call batch runs only when every result's room is reserved first, for
+  whichever mode the next request is planned in (`reserve_batch_for_any_mode`).
   MCP servers (`local_defaults.mcp_servers`, selected per profile) are stdio child processes
   started only at a turn or by Settings → Discover tools, never by opening Settings or
   importing. Each runs under a guardian (`--local-mcp-guardian`) in its own process group,
   with a minimal exact environment (`PATH`, `HOME`, locale, `TMPDIR`, `XDG_RUNTIME_DIR`, plus
   the definition's references and literals; never a control variable), bounded frames (1 MiB),
+  server requests (128 between responses, each refused; notifications are never kept: past
+  128 between responses they are counted as dropped, and only past 10,000 or 16 MiB of them
+  between responses does the connection end, so an endless stream cannot spin its reader),
   discovery (256 tools a server, 1,024 a session), schemas (64 KiB, compiled with a linear
   regex engine, no external `$ref`), arguments (64 KiB) and stderr tail (64 KiB). A turn's
   registry is frozen at its start: the model sees short aliases (`mcp_<hash>`), routed only
@@ -418,7 +449,11 @@ Architectural mandates, standards, and workflows for this codebase.
   (the server's for its reviewed allowlist, a tool override only narrows it, Deny always
   wins; server annotations grant nothing). A card shows the server, the original tool name
   and exactly the arguments that run, secrets masked in place
-  (`agent_core::redact::structured`); a call whose card cannot be shown faithfully is refused.
+  (`agent_core::redact::structured`; a value under a name sensitive only through `KEY` or
+  `TOKEN`, such as `sort_key` or `max_tokens`, is masked only when it looks like a credential:
+  `redact_keyed_shown`); a call whose card cannot be shown faithfully is refused. Discovered
+  names, descriptions and schemas are masked only for the exact resolved credentials, so the
+  model sees the schema its validator compiled; a tool whose input schema holds one is left out.
   A pending approval is bound to its request id, the runner generation and the connection it
   was raised on: a disconnection or reconnection expires the card, and a late answer never
   authorises a replacement call. A session or saved grant is bound to the server definition's
@@ -428,7 +463,8 @@ Architectural mandates, standards, and workflows for this codebase.
   and `disconnect_expires_pending_cards_and_late_answers_never_authorise_reconnection` prove
   the two). Stop, session end, EOF or a narrowing setting ends every server
   of the session, idle ones included, the guardian killing the group on the runner's death
-  through a private lifetime pipe; the next turn starts a fresh generation. A thread's MCP
+  through a private lifetime pipe (it reaps the leader only after killing its group, so the group
+  id is never one reused by another process); the next turn starts a fresh generation. A thread's MCP
   panel toggle never re-enables a definition Settings has disabled. Resolved credential
   values are masked exactly, whole and by fragment, in arguments, results, errors, stderr,
   events, the transcript and the store, before truncation. `tests/local_mcp.rs` proves these

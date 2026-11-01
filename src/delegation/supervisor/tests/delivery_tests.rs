@@ -164,6 +164,132 @@ fn a_refused_strict_steer_still_fails() {
     });
 }
 
+/// An `auto` message whose run ends while it is being accepted is never written to that run:
+/// it goes to the next turn and is delivered there, never failed.
+#[test]
+fn an_auto_send_whose_run_ends_during_its_acceptance_waits_for_the_next_turn() {
+    in_context(async {
+        let (dir, sup, root) = harness();
+        let worker = spawn_holding(&sup, &root, "auto-ended").await;
+        let first = sup.state.borrow().workers[&worker].run.clone().unwrap();
+        let hold = Rc::new(std::cell::Cell::new(true));
+        sup.state.borrow_mut().hold_send_accept = Some(hold.clone());
+        let receipt: Rc<RefCell<Option<Result<Value, ToolError>>>> = Rc::default();
+        {
+            let (sup, worker, root, slot) =
+                (sup.clone(), worker.clone(), root.clone(), receipt.clone());
+            glib::spawn_future_local(async move {
+                let mut request = instruction(&worker, "AUTO_AFTER_END", "auto-ended-send");
+                request.delivery = Delivery::Auto;
+                *slot.borrow_mut() = Some(sup.send_worker(&root, request).await);
+            });
+        }
+        pump_until(|| sup.state.borrow().delivery_holds.contains_key(&worker)).await;
+        // The run ends on its own while the send is accepted.
+        let session = sup.state.borrow().workers[&worker].session().unwrap();
+        assert!(session.interrupt_run());
+        pump_until(|| sup.state.borrow().workers[&worker].run.is_none()).await;
+        hold.set(false);
+        pump_until(|| receipt.borrow().is_some()).await;
+        let receipt = receipt.borrow_mut().take().unwrap().expect("accepted");
+        let op = receipt["operation_id"].as_str().unwrap().to_owned();
+        let id = receipt["message_id"].as_str().unwrap().to_owned();
+        pump_until(|| dispatch(&sup, &op) == "confirmed").await;
+        let row = message(&sup, &id);
+        assert_eq!(row.delivery_state, "provider_confirmed");
+        let reached = row.recipient_run_id.expect("the run it was delivered in");
+        assert_ne!(reached, first.as_str(), "delivered on the next turn");
+        let frames = std::fs::read_to_string(dir.path().join("frames.ndjson")).unwrap();
+        assert_eq!(
+            frames.matches("AUTO_AFTER_END").count(),
+            2,
+            "written once, echoed once"
+        );
+        stop(&sup).await;
+    });
+}
+
+/// A follow-up run reserved under an epoch that moved on is refused as stale, never reported
+/// as a storage failure.
+#[test]
+fn a_follow_up_reserved_under_a_stale_epoch_is_refused_as_stale() {
+    in_context(async {
+        let (_dir, sup, root) = harness();
+        let worker = spawn_idle(&sup, &root, "stale-follow-up").await;
+        let current = sup.epoch(&root).unwrap();
+        let entry = crate::delegation::deferred::Delivery {
+            worker: worker.clone(),
+            input: crate::delegation::seam::DelegatedInput {
+                operation: OperationId::from_suffix(&"5".repeat(32)).unwrap(),
+                epoch: agent_core::delegation::AuthorityEpoch(current.0 + 1),
+                source: crate::delegation::seam::InputSource::Message {
+                    id: MessageId::from_suffix(&"5".repeat(32)).unwrap(),
+                    kind: agent_core::delegation::mailbox::MessageKind::Instruction,
+                },
+                from: root.clone(),
+                from_label: "root".into(),
+                text: "later".into(),
+                plan: agent_core::delegation::mailbox::DeliveryPlan::StartTurn,
+                tag: "stale".into(),
+            },
+            policy: Delivery::NextTurn,
+            reserved: true,
+        };
+        let e = sup.reserve_run(&entry).await.expect_err("stale");
+        assert_eq!(e.code, ErrorCode::StaleEpoch, "{e:?}");
+        assert!(sup.state.borrow().workers[&worker].run.is_none());
+        stop(&sup).await;
+    });
+}
+
+/// A cancel accepted while a sibling's revocation is still being committed waits it out and
+/// goes out under the new epoch, rather than failing on the change.
+#[test]
+fn a_cancel_accepted_during_a_siblings_revocation_still_cancels() {
+    in_context(async {
+        let (_dir, sup, root) = harness();
+        let worker = spawn_holding(&sup, &root, "cancel-revoking").await;
+        let hold = Rc::new(std::cell::Cell::new(true));
+        sup.state.borrow_mut().hold_cancel_accept = Some(hold.clone());
+        let result: Rc<RefCell<Option<Result<Value, ToolError>>>> = Rc::default();
+        {
+            let (sup, worker, root, slot) =
+                (sup.clone(), worker.clone(), root.clone(), result.clone());
+            glib::spawn_future_local(async move {
+                let r = sup
+                    .cancel_worker_call(&root, cancel_request(&worker, "cancel-revoking"))
+                    .await;
+                *slot.borrow_mut() = Some(r);
+            });
+        }
+        glib::timeout_future(Duration::from_millis(30)).await;
+        // A sibling's close is latched, not yet committed, as the acceptance ends.
+        sup.state
+            .borrow_mut()
+            .roots
+            .get_mut(&root)
+            .unwrap()
+            .revoking = true;
+        hold.set(false);
+        glib::timeout_future(Duration::from_millis(100)).await;
+        assert!(result.borrow().is_none(), "it waits for the revocation");
+        sup.state
+            .borrow_mut()
+            .roots
+            .get_mut(&root)
+            .unwrap()
+            .revoking = false;
+        pump_until(|| result.borrow().is_some()).await;
+        let receipt = result.borrow_mut().take().unwrap().expect("cancelled");
+        let op = receipt["operation_id"].as_str().unwrap().to_owned();
+        pump_until(|| {
+            sup.state.borrow().workers[&worker].run.is_none() && dispatch(&sup, &op) == "confirmed"
+        })
+        .await;
+        stop(&sup).await;
+    });
+}
+
 /// A binding staged for `worker` that never launched (a launch about to start).
 fn plant_staged(sup: &Rc<Supervisor>, worker: &WorkerId) {
     let binding = PreparedBinding {

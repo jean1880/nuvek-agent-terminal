@@ -552,6 +552,68 @@ pub fn reserve_batch(
     Ok(per_result)
 }
 
+/// Every mode, for [`reserve_batch_for_any_mode`].
+const EVERY_MODE: [crate::adapter::Mode; 4] = [
+    crate::adapter::Mode::Ask,
+    crate::adapter::Mode::AcceptEdits,
+    crate::adapter::Mode::Plan,
+    crate::adapter::Mode::Bypass,
+];
+
+/// Fails to compile when a mode is added and [`EVERY_MODE`] is not told.
+#[allow(dead_code)]
+fn every_mode_is_listed(mode: crate::adapter::Mode) {
+    use crate::adapter::Mode;
+    match mode {
+        Mode::Ask | Mode::AcceptEdits | Mode::Plan | Mode::Bypass => {}
+    }
+}
+
+/// [`reserve_batch`] that holds whatever mode the next request is planned in: the user may
+/// change the mode while the calls run, and the next request then carries that mode's policy
+/// text and built-in schemas. The least room any mode leaves is reserved, so the results always
+/// fit. `schemas` are those this request advertised; each mode's own built-in schemas take the
+/// place of the built-in ones among them, and the rest (MCP tools) are kept.
+pub fn reserve_batch_for_any_mode(
+    model: &str,
+    cwd: &str,
+    snapshot: &InstructionSnapshot,
+    tools_available: bool,
+    schemas: &[serde_json::Value],
+    history_with_calls: &[crate::local_agent::ChatMessage],
+    budget: &ContextBudget,
+) -> Result<usize, String> {
+    use crate::local_agent::{tools_for, Tool};
+    let builtin = |schema: &serde_json::Value| {
+        schema
+            .pointer("/function/name")
+            .and_then(serde_json::Value::as_str)
+            .and_then(Tool::from_name)
+            .is_some()
+    };
+    let mut least = usize::MAX;
+    for mode in EVERY_MODE {
+        let system = compose_system(cwd, mode, snapshot, tools_available);
+        let mode_schemas: Vec<_> = if tools_available {
+            tools_for(mode)
+                .into_iter()
+                .map(|tool| tool.schema())
+                .chain(schemas.iter().filter(|s| !builtin(s)).cloned())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        least = least.min(reserve_batch(
+            model,
+            &system,
+            &mode_schemas,
+            history_with_calls,
+            budget,
+        )?);
+    }
+    Ok(least)
+}
+
 /// UTF-8-safe, marked truncation whose marker is included in the byte reservation.
 pub fn bound_result(text: &str, max: usize) -> String {
     const MARKER: &str = "\n… (result truncated)";
@@ -797,6 +859,67 @@ mod tests {
         let marked = bound_result(&"é\u{1f9ca}".repeat(100), 129);
         assert!(marked.len() <= 129);
         assert!(marked.contains("truncated"));
+    }
+
+    #[test]
+    fn a_batch_reserved_in_one_mode_still_fits_once_the_mode_changes() {
+        use crate::adapter::Mode;
+        use crate::local_agent::tools_for;
+        let budget = ContextBudget::default();
+        let snapshot = InstructionSnapshot::default();
+        let history = vec![ChatMessage::new("user", "read"), assistant_calls(1, 100, 0)];
+        let schemas_of = |mode| -> Vec<_> { tools_for(mode).iter().map(|t| t.schema()).collect() };
+        // Planned in Plan mode, which offers the fewest tools.
+        let planned = schemas_of(Mode::Plan);
+        let plan_only = reserve_batch(
+            "m",
+            &compose_system("/w", Mode::Plan, &snapshot, true),
+            &planned,
+            &history,
+            &budget,
+        )
+        .unwrap();
+        let cap =
+            reserve_batch_for_any_mode("m", "/w", &snapshot, true, &planned, &history, &budget)
+                .unwrap();
+        assert!(cap < plan_only, "{cap} {plan_only}");
+        // The user widens to Bypass while the call runs: the next request still carries it.
+        let mut with_results = history.clone();
+        with_results.push(ChatMessage::tool_result(
+            &history[1].tool_calls[0].id,
+            "\u{1}".repeat(cap),
+        ));
+        let candidates: Vec<_> = tools_for(Mode::Bypass)
+            .into_iter()
+            .map(|tool| SchemaCandidate {
+                tool: ResolvedTool::builtin(tool, tool.schema()),
+                priority: 0,
+            })
+            .collect();
+        let next = plan_request(
+            "m",
+            &compose_system("/w", Mode::Bypass, &snapshot, true),
+            &candidates,
+            &with_results,
+            &budget,
+        )
+        .unwrap();
+        assert_eq!(next.history_start, 0, "the whole exchange is sent");
+        assert!(next.input_tokens <= next.input_allowance);
+        // Reserved for Plan alone, the same result would not have fitted.
+        with_results.pop();
+        with_results.push(ChatMessage::tool_result(
+            &history[1].tool_calls[0].id,
+            "\u{1}".repeat(plan_only),
+        ));
+        assert!(plan_request(
+            "m",
+            &compose_system("/w", Mode::Bypass, &snapshot, true),
+            &candidates,
+            &with_results,
+            &budget,
+        )
+        .is_err());
     }
 
     #[test]

@@ -87,7 +87,7 @@ trademarks of their owners; used only to identify the agent the user connects to
 
 Drawn for agent-terminal: `agent-thinking`, `agent-mcp`, `agent-subagent`, `agent-handoff`,
 `agent-compact`, `agent-usage`, `agent-worktree`, `agent-checkpoint`, `agent-external`,
-`agent-pull-request`, `agent-pop-out`, `agent-git` (in `scalable/actions/`), the Codex monogram `agent-codex` and the symbolic app icon
+`agent-pull-request`, `agent-pop-out`, `agent-git` (in `scalable/actions/`), the Codex monogram `agent-codex`, the Local agent monogram `agent-local` and the symbolic app icon
 `ca.nuvek.AgentTerminal-symbolic` (in `scalable/apps/`). The Codex monogram is not
 OpenAI's logo; a user may place their own mark at `$XDG_DATA_HOME/agent-terminal/brand/codex.svg`
 and it is used instead (never committed).

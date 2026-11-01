@@ -913,3 +913,64 @@ fn a_childs_report_is_done_at_acceptance_and_survives_its_exit() {
     let replayed = new_op_or_replay(send(&f.s, &child, "parent", "report", "done", "r1"));
     assert_eq!(replayed["replayed"], json!(true));
 }
+
+/// Deleting a child's thread keeps its parent's spawn of it: a retry of that spawn is replayed,
+/// never run again.
+#[test]
+fn a_spawn_outlives_the_child_it_started_and_its_retry_is_replayed() {
+    let f = fx();
+    let child = spawn(&f.s, &f.root.worker, "k1");
+    let worker = child.worker.expect("w");
+    f.s.set_delegation_worker_state(worker.as_str(), "closed", None, 9)
+        .expect("close");
+    if let Some(run) = f.s.active_delegation_run(worker.as_str()).expect("run") {
+        f.s.end_delegation_run_if_open(&run.id, "interrupted", None, 9)
+            .expect("end");
+    }
+    let thread =
+        f.s.delegation_worker(worker.as_str())
+            .expect("q")
+            .expect("row")
+            .backing_thread_id
+            .expect("thread");
+    f.s.delete_thread(&thread)
+        .expect("delete the child's thread");
+    assert!(f.s.delegation_worker(worker.as_str()).expect("q").is_none());
+    let kept =
+        f.s.delegation_operation(child.operation.as_str())
+            .expect("q")
+            .expect("the spawn stays");
+    assert_eq!(kept.target_worker_id, None);
+    assert_eq!(kept.run_id, None);
+    match accept(
+        &f.s,
+        &f.root.worker,
+        spawn_req("k1", "review the parser"),
+        Resolution::default(),
+        AcceptPlan::Spawn(spawn_plan()),
+    ) {
+        Ok(Accepted::Replay(_)) => {}
+        other => panic!("the retry ran again: {other:?}"),
+    }
+}
+
+/// A worker whose run cannot be read is never taken for one with no run: the delete is refused.
+#[test]
+fn an_unreadable_run_refuses_the_delete() {
+    let f = fx();
+    let child = spawn(&f.s, &f.root.worker, "k1");
+    let worker = child.worker.expect("w");
+    let run = child.run.expect("run");
+    f.s.set_delegation_worker_state(worker.as_str(), "closed", None, 9)
+        .expect("close");
+    // Still active, and unreadable: its last update is no time.
+    f.s.conn
+        .execute(
+            "UPDATE delegation_runs SET updated_at = 'x' WHERE id = ?1",
+            [run.as_str()],
+        )
+        .expect("corrupt");
+    assert!(f.s.active_delegation_run(worker.as_str()).is_err());
+    assert!(f.s.delete_thread(&f.root_thread).is_err());
+    assert!(f.s.delegation_worker(worker.as_str()).expect("q").is_some());
+}

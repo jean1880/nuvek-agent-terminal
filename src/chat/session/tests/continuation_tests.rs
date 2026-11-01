@@ -74,6 +74,11 @@ impl Thread {
     /// A root thread on an answering Claude, whose switches start another answering Claude
     /// under the asked agent's name, settled after its prompt-less first turn.
     fn new(ctx: &glib::MainContext) -> Self {
+        Self::on(ctx, super::answering_claude)
+    }
+
+    /// [`Self::new`] whose first agent is `first` (run in the thread's folder).
+    fn on(ctx: &glib::MainContext, first: fn(&Path) -> OpenSession) -> Self {
         let dir = tempfile::tempdir().expect("dir");
         let old = dir.path().join("old");
         let new = dir.path().join("new");
@@ -84,7 +89,7 @@ impl Thread {
         let (sink, seen) = make_sink();
         let session = ChatSession::with_options(
             Box::new(agent_core::claude::ClaudeAdapter::new()),
-            super::answering_claude(&old),
+            first(&old),
             SessionStore::from(store.clone()),
             thread.clone(),
             sink,
@@ -191,6 +196,58 @@ fn a_limit_wait_holds_wakes_but_never_the_continuation() {
         // The continuation's turn completed: the session no longer waits, whatever the window does.
         assert_eq!(t.session.wake_with("news"), WakeOutcome::Started);
         assert!(pump_until(ctx, 10, || t.sent_old().contains("news")));
+        t.session.shutdown(false);
+    });
+}
+
+/// Stop ends the wait of a root no delegation supervisor knows: it never continues on its own
+/// until the user speaks to it again.
+#[test]
+fn a_root_the_user_stopped_never_continues_after_its_limit() {
+    in_loop(|ctx| {
+        let t = Thread::new(ctx);
+        t.session.send_prompt("first");
+        assert!(pump_until(ctx, 10, || t.idle()
+            && t.session.inner.has_conversation.get()));
+        t.session.set_limit_wait(true);
+
+        t.session.interrupt();
+        assert_eq!(t.session.continue_after_limit(), ContinueOutcome::Refused);
+        assert!(!t.sent_old().contains("Your usage limit has reset"));
+
+        // The user wrote again: a later limit continues the thread as before.
+        t.session.send_prompt("again");
+        assert!(pump_until(ctx, 10, || t.idle() && t.sent_old().contains("again")));
+        t.session.set_limit_wait(true);
+        assert_eq!(t.session.continue_after_limit(), ContinueOutcome::Started);
+        t.session.shutdown(false);
+    });
+}
+
+/// The session and its window agree on when the agent works again
+/// ([`agent_core::limit_wait::limit_over`]): a turn that completes with nothing to show does not
+/// end the wait for sub-agent news while the window still waits; an answer does.
+#[test]
+fn a_turn_with_no_output_does_not_end_the_limit_wait_for_wakes() {
+    in_loop(|ctx| {
+        let t = Thread::on(ctx, super::idle_claude);
+        t.session.send_prompt("first");
+        assert!(pump_until(ctx, 10, || t.idle() && t.sent_old().contains("first")));
+
+        t.session.set_limit_wait(true);
+        t.session.send_prompt("retry");
+        assert!(pump_until(ctx, 10, || t.idle()
+            && t.sent_old().contains("retry")
+            && t.seen
+                .borrow()
+                .iter()
+                .filter(|e| matches!(e.event, Event::TurnCompleted { .. }))
+                .count()
+                >= 3));
+        assert_eq!(
+            t.session.wake_blocker(),
+            Some("the thread waits for its usage limit")
+        );
         t.session.shutdown(false);
     });
 }

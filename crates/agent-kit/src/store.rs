@@ -47,7 +47,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Schema version this build writes. Bump it and add a step to [`migrate`]. An existing store is
 /// only ever upgraded by the preflight (`preflight::run`), after a verified backup.
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 /// `PRAGMA synchronous = FULL`: a durable control write's level.
 const SYNC_FULL: i64 = 2;
 /// [`Store::meta`] key of the native sessions whose threads the user deleted (JSON list of
@@ -3986,6 +3986,11 @@ fn migrate_locked_to(conn: &Connection, current: i64, target: i64) -> Result<()>
         conn.execute_batch(delegation::SCHEMA_V9)?;
         delegation::migrate_v9_carried_epochs(conn)?;
     }
+    if current < 10 && target >= 10 {
+        // An operation outlives the worker it targets and the run it started, so its key
+        // still replays; workers are indexed by driver.
+        conn.execute_batch(delegation::SCHEMA_V10)?;
+    }
     let broken: Option<String> = conn
         .query_row(
             "SELECT \"table\" FROM pragma_foreign_key_check LIMIT 1",
@@ -5573,19 +5578,28 @@ mod tests {
     fn v8_cascades_take_exactly_what_a_worker_and_a_root_own() {
         let conn = v7_fixture();
         migrate(&conn).expect("migrate");
-        // The child's subtree: its run, the operation targeting it, both messages (the
-        // instruction to it and its reply), its link and its alias. The root and its thread stay.
+        // The child's subtree: its run, both messages (the instruction to it and its reply), its
+        // link and its alias. The root and its thread stay, and so does the root's operation
+        // that targeted it, its key with it, naming neither the child nor its run any more.
         conn.execute("DELETE FROM delegation_workers WHERE id = 'w_kid'", [])
             .expect("delete the child");
         for table in [
             "delegation_runs",
-            "delegation_operations",
             "delegation_messages",
             "delegation_event_links",
             "delegation_native_aliases",
         ] {
             assert_eq!(count(&conn, table), 0, "{table}");
         }
+        let kept: (String, String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT principal_worker_id, idempotency_key, target_worker_id, run_id
+                 FROM delegation_operations WHERE id = 'op1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("the root's operation stays");
+        assert_eq!(kept, ("w_root".into(), "k1".into(), None, None));
         assert_eq!(count(&conn, "delegation_workers"), 1);
         assert_eq!(count(&conn, "delegation_roots"), 1);
         // Its backing thread was released, so it can go; the root's thread cannot while the
@@ -5595,10 +5609,11 @@ mod tests {
         assert!(conn
             .execute("DELETE FROM threads WHERE id = 't1'", [])
             .is_err());
-        // The root row takes its root worker.
+        // The root row takes its root worker, and the root worker its operations.
         conn.execute("DELETE FROM delegation_roots WHERE id = 'r1'", [])
             .expect("delete the root");
         assert_eq!(count(&conn, "delegation_workers"), 0);
+        assert_eq!(count(&conn, "delegation_operations"), 0);
         // Then the thread takes its provider threads and events.
         conn.execute("DELETE FROM threads WHERE id = 't1'", [])
             .expect("delete the thread");
@@ -5638,6 +5653,111 @@ mod tests {
             .collect::<std::result::Result<_, _>>()
             .expect("rows");
         assert_eq!(active, vec![None, None]);
+    }
+
+    #[test]
+    fn v8_repairs_rows_that_name_another_roots_worker_or_another_workers_run() {
+        let conn = v7_fixture();
+        // Older schemas checked only that a referenced row existed.
+        conn.execute_batch(
+            "BEGIN;
+             INSERT INTO threads (id, title, cwd, created_at, updated_at)
+                 VALUES ('t3', 'other', '/w', 1, 2);
+             INSERT INTO delegation_roots (id, root_thread_id, root_worker_id, task_state,
+                 policy_json, continuation_budget, created_at, updated_at)
+                 VALUES ('r2', 't3', 'w_other', 'active', '{}', 3, 1, 2);
+             INSERT INTO delegation_workers (id, root_id, parent_id, origin, depth, name, driver,
+                 profile_id, launch_json, state, workspace_json, delegation_status, created_at,
+                 updated_at)
+                 VALUES ('w_other', 'r2', NULL, 'root', 0, 'o', 'claude', 'p', '{}', 'running',
+                         '{}', 'available', 1, 2);
+             INSERT INTO delegation_runs (id, worker_id, process_generation, authority_epoch,
+                 state, created_at, updated_at)
+                 VALUES ('run_other', 'w_other', 0, 0, 'completed', 1, 2);
+             -- A spawn by r1's root naming r2's worker as its target, and one whose principal
+             -- is r2's.
+             INSERT INTO delegation_operations (id, root_id, principal_worker_id, kind,
+                 idempotency_key, authority_epoch, canonical_request, resolution_json,
+                 receipt_json, dispatch_state, target_worker_id, run_id, created_at, updated_at)
+                 VALUES ('op_cross', 'r1', 'w_root', 'send', 'kx', 0, '{}', '{}', '{}',
+                         'confirmed', 'w_other', NULL, 1, 2),
+                        ('op_foreign', 'r1', 'w_other', 'send', 'ky', 0, '{}', '{}', '{}',
+                         'confirmed', 'w_kid', NULL, 1, 2);
+             -- A message to another root's worker, one of the foreign operation, and one aimed
+             -- at another worker's run.
+             INSERT INTO delegation_messages (id, root_id, operation_id, sender_worker_id,
+                 recipient_worker_id, kind, reply_to, body, delivery_policy, target_run_id,
+                 delivery_state, recipient_run_id, queued_at, updated_at, event_seq)
+                 VALUES ('m_cross', 'r1', NULL, 'w_root', 'w_other', 'instruction', NULL, 'x',
+                         'next_turn', NULL, 'queued', NULL, 5, 6, NULL),
+                        ('m_op', 'r1', 'op_foreign', 'w_root', 'w_kid', 'instruction', NULL, 'y',
+                         'next_turn', NULL, 'queued', NULL, 5, 6, NULL),
+                        ('m_run', 'r1', NULL, 'w_root', 'w_kid', 'instruction', 'm_cross', 'z',
+                         'this_run', 'run_other', 'provider_confirmed', 'run_other', 5, 6, NULL);
+             -- Links of another root's worker, and naming another worker's run.
+             INSERT INTO delegation_event_links (event_seq, worker_id, root_id, run_id, category,
+                 process_generation)
+                 VALUES (1, 'w_other', 'r1', NULL, 'activity', 0),
+                        (1, 'w_kid', 'r1', 'run_other', 'activity', 0);
+             COMMIT;",
+        )
+        .expect("legacy cross links");
+        migrate(&conn).expect("the store opens");
+        let broken: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .expect("fk check");
+        assert_eq!(broken, 0);
+        let ops: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT id, target_worker_id FROM delegation_operations ORDER BY id")
+            .expect("prepare")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .expect("query")
+            .collect::<std::result::Result<_, _>>()
+            .expect("rows");
+        assert_eq!(
+            ops,
+            vec![
+                ("op1".into(), Some("w_kid".into())),
+                ("op_cross".into(), None)
+            ],
+            "a foreign principal's operation goes; a foreign target is cleared, its key kept"
+        );
+        type Message = (String, Option<String>, Option<String>, Option<String>);
+        let messages: Vec<Message> = conn
+            .prepare(
+                "SELECT id, reply_to, target_run_id, recipient_run_id FROM delegation_messages
+                 ORDER BY id",
+            )
+            .expect("prepare")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .expect("query")
+            .collect::<std::result::Result<_, _>>()
+            .expect("rows");
+        assert_eq!(
+            messages,
+            vec![
+                ("m1".into(), None, Some("run1".into()), Some("run1".into())),
+                ("m2".into(), Some("m1".into()), None, None),
+                ("m_run".into(), None, None, None),
+            ]
+        );
+        let links: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT worker_id, run_id FROM delegation_event_links ORDER BY event_seq")
+            .expect("prepare")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .expect("query")
+            .collect::<std::result::Result<_, _>>()
+            .expect("rows");
+        assert_eq!(
+            links,
+            vec![
+                ("w_kid".into(), None),
+                ("w_kid".into(), Some("run1".into()))
+            ]
+        );
+        migrate(&conn).expect("a second run is a no-op");
     }
 
     /// [`v7_fixture`] brought to v8, with an accepted operation `op2` beside the confirmed `op1`.
@@ -5695,17 +5815,112 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_carried_epoch_fails_the_v9_step_and_changes_nothing() {
+    fn an_unreadable_carried_epoch_is_left_unset_and_the_store_still_opens() {
         let conn = v8_fixture();
         conn.execute_batch(
             "INSERT INTO meta (key, value) VALUES ('delegation_operation_epoch:op2', 'many');",
         )
         .expect("an unreadable epoch");
-        assert!(matches!(migrate(&conn), Err(StoreError::Upgrade(_))));
+        migrate(&conn).expect("one unreadable row never keeps the store from opening");
         let version: i64 = conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .expect("version");
-        assert_eq!(version, 8, "rolled back");
+        assert_eq!(version, SCHEMA_VERSION);
+        let carried: Option<i64> = conn
+            .query_row(
+                "SELECT carried_epoch FROM delegation_operations WHERE id = 'op2'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("op2");
+        assert_eq!(carried, None, "held to its acceptance epoch");
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM meta WHERE key LIKE 'delegation_operation_epoch:%'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(left, 0);
+    }
+
+    /// A v9 store (as a 1.1 beta wrote it) is brought to v10 keeping every operation, its rowid
+    /// and its carried epoch; the rebuilt table keeps its checks, and workers gain their driver
+    /// index.
+    #[test]
+    fn a_v9_database_migrates_to_v10_keeping_every_operation() {
+        let conn = v8_fixture();
+        conn.pragma_update(None, "foreign_keys", "OFF")
+            .expect("fk off");
+        migrate_locked_to(&conn, 8, 9).expect("a v9 database");
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .expect("fk on");
+        conn.execute(
+            "UPDATE delegation_operations SET carried_epoch = 2 WHERE id = 'op2'",
+            [],
+        )
+        .expect("a carried epoch");
+        let operations = |conn: &Connection| -> Vec<(i64, String, Option<i64>)> {
+            conn.prepare(
+                "SELECT rowid, id, carried_epoch FROM delegation_operations ORDER BY rowid",
+            )
+            .expect("prepare")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .expect("query")
+            .collect::<std::result::Result<_, _>>()
+            .expect("rows")
+        };
+        let before = operations(&conn);
+        migrate(&conn).expect("migrate");
+        let version: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .expect("version");
+        assert_eq!(version, 10);
+        assert_eq!(operations(&conn), before);
+        let broken: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .expect("fk check");
+        assert_eq!(broken, 0);
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index'
+                 AND name = 'delegation_workers_driver'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("index");
+        assert_eq!(indexed, 1);
+        // The checks came back with the table: frozen fields, carried epochs, the target's root.
+        let refused = |sql: &str| assert!(conn.execute_batch(sql).is_err(), "accepted: {sql}");
+        refused("UPDATE delegation_operations SET target_worker_id = 'w_root' WHERE id = 'op1'");
+        refused("UPDATE delegation_operations SET run_id = 'run_x' WHERE id = 'op1'");
+        refused("UPDATE delegation_operations SET idempotency_key = 'k9' WHERE id = 'op1'");
+        refused("UPDATE delegation_operations SET carried_epoch = 1 WHERE id = 'op1'");
+        conn.execute_batch(
+            "BEGIN;
+             INSERT INTO threads (id, title, cwd, created_at, updated_at)
+                 VALUES ('t3', 'other', '/w', 1, 2);
+             INSERT INTO delegation_roots (id, root_thread_id, root_worker_id, task_state,
+                 policy_json, continuation_budget, created_at, updated_at)
+                 VALUES ('r2', 't3', 'w_other', 'active', '{}', 3, 1, 2);
+             INSERT INTO delegation_workers (id, root_id, parent_id, origin, depth, name, driver,
+                 profile_id, launch_json, state, workspace_json, delegation_status, created_at,
+                 updated_at)
+                 VALUES ('w_other', 'r2', NULL, 'root', 0, 'o', 'claude', 'p', '{}', 'running',
+                         '{}', 'available', 1, 2);
+             COMMIT;",
+        )
+        .expect("a second root");
+        refused(
+            "INSERT INTO delegation_operations (id, root_id, principal_worker_id, kind,
+                 idempotency_key, authority_epoch, canonical_request, resolution_json,
+                 receipt_json, dispatch_state, target_worker_id, created_at, updated_at)
+             VALUES ('op9', 'r1', 'w_root', 'send', 'k9', 0, '{}', '{}', '{}', 'accepted',
+                     'w_other', 1, 2)",
+        );
+        migrate(&conn).expect("a second run is a no-op");
     }
 
     #[test]

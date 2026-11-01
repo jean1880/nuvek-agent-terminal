@@ -126,6 +126,21 @@ fn matching_args<'a>(
     })
 }
 
+/// The one text every argument in `args` named one of `names` (in [`matching_args`]' sense)
+/// carries: `None` when there is none, when one is not text or is blank, or when two disagree,
+/// since agy would act on whichever came last.
+pub(crate) fn sole_str<'a>(args: &'a Value, names: &'a [&'a str]) -> Option<&'a str> {
+    let mut found = None;
+    for v in matching_args(args, names) {
+        let s = v.as_str().filter(|s| !s.trim().is_empty())?;
+        match found {
+            Some(prev) if prev != s => return None,
+            _ => found = Some(s),
+        }
+    }
+    found
+}
+
 /// Whether a `manage_task` call only asks for the state of a task: the arguments are an object
 /// with exactly one name that reads as `action`, spelt `Action`, whose value is exactly
 /// `status`, and no name but `TaskId` and `tool_name` besides. Anything else is a command.

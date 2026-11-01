@@ -111,6 +111,11 @@ fn main() -> glib::ExitCode {
         .application_id(APP_ID)
         .flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE)
         .build();
+    // `--help` names the build: the log line above reaches stderr only on a terminal.
+    app.set_option_context_summary(Some(&format!(
+        "Agent Terminal v{}",
+        env!("CARGO_PKG_VERSION")
+    )));
     app.add_main_option(
         "resume",
         glib::Char::from(b'r'),

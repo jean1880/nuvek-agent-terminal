@@ -18,6 +18,13 @@
 //!   thread's provider thread; such a link is wrong by definition, so the step clears it (the
 //!   thread then shows its latest provider thread, and the event names none) rather than refuse
 //!   the upgrade and leave the store unopenable.
+//! - Older schemas checked only that a referenced row existed, not that it was of the same root
+//!   or worker. Rows the new keys would refuse are dealt with the same way, before the check:
+//!   what they only refer to is cleared (an operation's target or run, a message's runs, reply
+//!   or event, a link's run), and a row whose owner is wrong or gone goes, as the cascade would
+//!   take it (a run of no worker, an operation whose principal is not of its root, a message
+//!   whose sender or recipient is not, or whose operation went, a link of another root's worker
+//!   or of no event, an alias of no worker or provider thread).
 //! - Every foreign-key child column is indexed (a parent delete or `SET NULL` otherwise scans the
 //!   child table), with indexes for the lookups and orderings the queries use.
 //! - Text primary keys are `NOT NULL` (a rowid table's `TEXT PRIMARY KEY` otherwise allows NULL).
@@ -327,6 +334,53 @@ UPDATE events SET provider_thread_id = NULL
 WHERE seq IN (SELECT e.seq FROM provider_threads p
               JOIN events e INDEXED BY events_provider_thread ON e.provider_thread_id = p.id
               WHERE e.thread_id IS NOT p.thread_id);
+
+DELETE FROM delegation_runs WHERE worker_id NOT IN (SELECT id FROM delegation_workers);
+UPDATE delegation_runs SET provider_thread_id = NULL
+WHERE provider_thread_id IS NOT NULL
+  AND provider_thread_id NOT IN (SELECT id FROM provider_threads);
+DELETE FROM delegation_operations WHERE NOT EXISTS (SELECT 1 FROM delegation_workers w
+      WHERE w.root_id = delegation_operations.root_id
+        AND w.id = delegation_operations.principal_worker_id);
+UPDATE delegation_operations SET target_worker_id = NULL
+WHERE target_worker_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM delegation_workers w
+      WHERE w.root_id = delegation_operations.root_id
+        AND w.id = delegation_operations.target_worker_id);
+UPDATE delegation_operations SET run_id = NULL
+WHERE run_id IS NOT NULL AND run_id NOT IN (SELECT id FROM delegation_runs);
+DELETE FROM delegation_messages
+WHERE NOT EXISTS (SELECT 1 FROM delegation_workers w
+          WHERE w.root_id = delegation_messages.root_id
+            AND w.id = delegation_messages.sender_worker_id)
+   OR NOT EXISTS (SELECT 1 FROM delegation_workers w
+          WHERE w.root_id = delegation_messages.root_id
+            AND w.id = delegation_messages.recipient_worker_id)
+   OR (operation_id IS NOT NULL
+       AND operation_id NOT IN (SELECT id FROM delegation_operations));
+UPDATE delegation_messages SET reply_to = NULL
+WHERE reply_to IS NOT NULL AND reply_to NOT IN (SELECT id FROM delegation_messages);
+UPDATE delegation_messages SET target_run_id = NULL
+WHERE target_run_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM delegation_runs r
+      WHERE r.worker_id = delegation_messages.recipient_worker_id
+        AND r.id = delegation_messages.target_run_id);
+UPDATE delegation_messages SET recipient_run_id = NULL
+WHERE recipient_run_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM delegation_runs r
+      WHERE r.worker_id = delegation_messages.recipient_worker_id
+        AND r.id = delegation_messages.recipient_run_id);
+UPDATE delegation_messages SET event_seq = NULL
+WHERE event_seq IS NOT NULL AND event_seq NOT IN (SELECT seq FROM events);
+DELETE FROM delegation_event_links
+WHERE event_seq NOT IN (SELECT seq FROM events)
+   OR NOT EXISTS (SELECT 1 FROM delegation_workers w
+          WHERE w.root_id = delegation_event_links.root_id
+            AND w.id = delegation_event_links.worker_id);
+UPDATE delegation_event_links SET run_id = NULL
+WHERE run_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM delegation_runs r
+      WHERE r.worker_id = delegation_event_links.worker_id
+        AND r.id = delegation_event_links.run_id);
+DELETE FROM delegation_native_aliases
+WHERE worker_id NOT IN (SELECT id FROM delegation_workers)
+   OR provider_thread_id NOT IN (SELECT id FROM provider_threads);
 
 CREATE TRIGGER threads_active_provider_owned_insert BEFORE INSERT ON threads
 WHEN NEW.active_provider_thread IS NOT NULL AND NOT EXISTS (SELECT 1 FROM provider_threads

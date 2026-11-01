@@ -186,7 +186,9 @@ A server is ready when it lists at least one chat model. Its threads pick from i
 models, and keep the server they were opened on. The agent works in the thread's folder with
 six tools (read a file, list a folder, search, write a file, edit a file, run a command).
 Writes and commands follow the mode: Plan only reads, Ask asks before each, Accept edits
-asks before commands and before writing outside the folder. Reads run unasked inside the
+asks before commands, before writing outside the folder and before writing a sensitive file
+(the same list as for reads, below). A mode picked while the agent works applies to its next
+step. A file is written whole or not at all, keeping its permissions. Reads run unasked inside the
 folder; in every mode, Plan included, the agent asks before reading outside it, reading a
 sensitive file (git, hook, editor and agent configuration, instruction files, a file with a
 second hard link and, when the folder is your home or above it, your home's dotfiles) or
@@ -305,7 +307,11 @@ starts them fresh.
 (`~/.codex/config.toml` by default, read once, never rereading it at launch): **Preview
 import** lists each stdio `mcp_servers` entry with its executable name, exact tools
 (`enabled_tools` less `disabled_tools`) and environment variable names, then **Import
-selected** adds the definitions you tick. An entry without an explicit allowlist arrives
+selected** adds the definitions you tick. An entry with no `cwd` runs in the thread's folder
+(`$WORKSPACE`), as Codex runs it in its session's. Timeouts are read as Codex reads them
+(`startup_timeout_sec` and `tool_timeout_sec` in whole or fractional seconds, or
+`startup_timeout_ms` in milliseconds when `startup_timeout_sec` is absent) and rounded up to
+whole seconds. An entry without an explicit allowlist arrives
 disabled and unreviewed; none arrives read-only or approved. Entries with another transport,
 interpolation, shell or package-runner indirection (`sh -c`, `npx --call`), source files,
 literal credentials or `agent-terminal` itself are reported, not imported; a credential

@@ -51,7 +51,9 @@ for line in sys.stdin:
         if scenario == 'reverse':
             send({'jsonrpc':'2.0','id':'reverse','method':'sampling/createMessage','params':{'secret':os.environ.get('TOKEN','')}})
         if scenario == 'notification-flood':
-            for _ in range(129): send({'jsonrpc':'2.0','method':'notifications/message','params':{}})
+            for _ in range(1000): send({'jsonrpc':'2.0','method':'notifications/message','params':{}})
+        if scenario == 'request-flood':
+            for n in range(129): send({'jsonrpc':'2.0','id':'ask-%d' % n,'method':'roots/list'})
         respond(request, {'resultType':'complete','supportedVersions':['2026-07-28'],'capabilities':{'tools':{}},'ttlMs':0,'cacheScope':'private'})
     elif method == 'initialize':
         respond(request, {'protocolVersion':'2025-11-25','capabilities':{'tools':{}},'serverInfo':{'name':'fixture','version':'1'}})
@@ -77,6 +79,11 @@ for line in sys.stdin:
             with open(folder + '/tool.json') as f: result['tools'] = [json.load(f)]
         if scenario == 'strict-schema':
             result['tools'][0]['inputSchema'] = {'type':'object','properties':{'value':{'type':'string','minLength':3}},'required':['value'],'additionalProperties':False}
+        if scenario == 'keyed-schema':
+            result['tools'][0]['description'] = 'Choose api_key: primary or secondary; max_tokens: an upper bound'
+            result['tools'][0]['inputSchema'] = {'type':'object','properties':{'api_key':{'type':'string','enum':['primary','secondary']},'max_tokens':{'type':'integer','description':'Upper bound on produced tokens'},'sort_key':{'type':'string','pattern':'^[a-z_]+$'}},'required':['api_key'],'additionalProperties':False}
+        if scenario == 'credential-schema':
+            result['tools'] += [dict(tool('leaky'),inputSchema={'type':'object','properties':{'value':{'enum':[os.environ['TOKEN']]}}})]
         if scenario == 'invalid-schema':
             result['tools'][0]['inputSchema'] = {'type':'unknown-private-canary'}
         if scenario == 'external-schema':
@@ -96,12 +103,19 @@ for line in sys.stdin:
     elif method == 'tools/call':
         with open(folder + '/executions','a') as f: f.write(json.dumps(request['params']) + '\n')
         if scenario == 'call-stall': time.sleep(60)
+        if scenario == 'notification-flood':
+            for n in range(1000): send({'jsonrpc':'2.0','method':'notifications/progress','params':{'progress':n}})
+        if scenario == 'notification-ceiling':
+            for n in range(10001): send({'jsonrpc':'2.0','method':'notifications/progress','params':{'progress':n}})
         if scenario == 'call-exit': sys.exit(0)
         if scenario == 'call-error':
             send({'jsonrpc':'2.0','id':request['id'],'error':{'code':-32000,'message':os.environ.get('TOKEN','error')}}); continue
         if scenario == 'nested-secrets':
             payload = {'tokens':['array-private-1111',['nested-private-2222'],{'ordinary':['object-private-3333']}]}
             respond(request, {'resultType':'complete','content':[{'type':'text','text':json.dumps(payload)}], 'structuredContent':payload}); continue
+        if scenario == 'secret-key-result':
+            respond(request, {'resultType':'complete','content':[{'type':'text','text':'wrote marker'}],
+                'structuredContent':{os.environ['TOKEN']:'kept'}}); continue
         if scenario == 'structured-result':
             respond(request, {'resultType':'complete','isError':True,
                 'content':[{'type':'text','text':'雪'*20000},{'type':'image','data':'BINARY-CANARY'},{'type':'resource_link','uri':'https://example.com/no-fetch'}],
@@ -318,7 +332,7 @@ fn invalid_frames_wrong_ids_and_discovery_bounds_fail_closed_and_clean_up() {
         "partial",
         "oversize-frame",
         "oversize-id",
-        "notification-flood",
+        "request-flood",
         "cursor-loop",
         "cursor-long",
         "page-bound",
@@ -348,6 +362,71 @@ fn oversized_schemas_are_unavailable_without_losing_other_tools() {
     assert_eq!(report.servers[0].tools.len(), 1);
     assert_eq!(report.servers[0].notices.len(), 1);
     assert!(!report.servers[0].required_failed);
+    session.shutdown();
+}
+
+#[test]
+fn discovered_schemas_reach_the_model_as_the_validator_compiled_them() {
+    let folder = tempfile::tempdir().unwrap();
+    let mut session = session(vec![config(folder.path(), "keyed-schema")], BTreeMap::new());
+    let report = discover(&session);
+    let server = &report.servers[0];
+    let tool = &server.registry[0];
+    let schema = &tool.resolved.schema["function"];
+    assert_eq!(
+        serde_json::Value::Object((*server.tools[0].input_schema).clone()),
+        schema["parameters"]
+    );
+    assert_eq!(
+        schema["parameters"]["properties"]["api_key"]["enum"],
+        serde_json::json!(["primary", "secondary"])
+    );
+    assert_eq!(
+        schema["parameters"]["properties"]["max_tokens"]["description"],
+        "Upper bound on produced tokens"
+    );
+    assert!(schema["description"]
+        .as_str()
+        .unwrap()
+        .ends_with("Choose api_key: primary or secondary; max_tokens: an upper bound"));
+    assert!(tool
+        .validator
+        .validate(&serde_json::json!({"api_key":"secondary","sort_key":"created_at"}))
+        .is_ok());
+    session.shutdown();
+
+    // A schema holding a configured credential is left out rather than shown changed.
+    let mut config = config(folder.path(), "credential-schema");
+    config.tools.push(McpToolPolicy {
+        name: "leaky".into(),
+        read_only: true,
+        approval: ApprovalPolicy::Inherit,
+    });
+    config.env.insert(
+        "TOKEN".into(),
+        EnvironmentValue::Reference {
+            from_env: "SOURCE".into(),
+        },
+    );
+    let mut session = crate::session(
+        vec![config],
+        BTreeMap::from([("SOURCE".into(), "opaque-private-value-one".into())]),
+    );
+    let report = discover(&session);
+    let server = &report.servers[0];
+    assert_eq!(
+        server
+            .registry
+            .iter()
+            .map(|t| t.resolved.alias.clone())
+            .collect::<Vec<_>>(),
+        vec![agent_core::local_mcp::alias("fixture", "read").unwrap()]
+    );
+    assert!(server
+        .notices
+        .iter()
+        .any(|n| n.contains("leaky") && n.contains("credential")));
+    assert!(!format!("{:?}", server.notices).contains("opaque-private"));
     session.shutdown();
 }
 
@@ -1936,6 +2015,156 @@ mod runner {
             assert!(calls(folder.path()).is_empty());
             run.finish();
         }
+    }
+
+    #[test]
+    fn chatty_servers_keep_their_connection_until_the_notification_ceiling() {
+        let folder = tempfile::tempdir().unwrap();
+        let run = Run::new(
+            vec![config(folder.path(), "notification-flood")],
+            Mode::Ask,
+            BTreeMap::new(),
+            vec![Reply::Calls(vec![(mcp_alias(), json!({}))])],
+            None,
+        );
+        run.send(Command::Prompt {
+            text: "test".into(),
+        });
+        let events = run.turn();
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::ItemCompleted { output: Some(output), .. } if output.contains("hello")
+        )));
+        assert_eq!(calls(folder.path()).len(), 1);
+        run.finish();
+
+        // A stream past the ceiling between two responses ends the connection, unreplayed.
+        let folder = tempfile::tempdir().unwrap();
+        let mut config = config(folder.path(), "notification-ceiling");
+        config.call_timeout_secs = 20;
+        let run = Run::new(
+            vec![config],
+            Mode::Ask,
+            BTreeMap::new(),
+            vec![Reply::Calls(vec![(mcp_alias(), json!({}))])],
+            None,
+        );
+        run.send(Command::Prompt {
+            text: "test".into(),
+        });
+        let events = run.turn();
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::ItemCompleted {
+                status: agent_core::event::ItemStatus::Failed,
+                error: Some(error),
+                ..
+            } if error.contains("notification ceiling") && !error.contains("hello")
+        )));
+        assert_eq!(calls(folder.path()).len(), 1);
+        run.finish();
+    }
+
+    #[test]
+    fn a_completed_call_keeps_its_result_when_a_result_key_must_be_masked() {
+        let secret = "opaque-private-value-one";
+        let folder = tempfile::tempdir().unwrap();
+        let mut config = config(folder.path(), "secret-key-result");
+        config.env.insert(
+            "TOKEN".into(),
+            EnvironmentValue::Reference {
+                from_env: "SOURCE".into(),
+            },
+        );
+        let run = Run::new(
+            vec![config],
+            Mode::Ask,
+            BTreeMap::from([("SOURCE".into(), secret.into())]),
+            vec![Reply::Calls(vec![(mcp_alias(), json!({}))])],
+            None,
+        );
+        run.send(Command::Prompt {
+            text: "test".into(),
+        });
+        let events = run.turn();
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::ItemCompleted {
+                status: agent_core::event::ItemStatus::Completed,
+                output: Some(output),
+                ..
+            } if output.contains("wrote marker")
+        )));
+        let (bodies, transcript) = run.finish();
+        assert_eq!(calls(folder.path()).len(), 1);
+        let answered = serde_json::to_string(&bodies[1]).unwrap();
+        assert!(answered.contains("wrote marker"));
+        assert!(!answered.contains("withheld"));
+        for safe in [
+            answered,
+            serde_json::to_string(&events).unwrap(),
+            transcript,
+        ] {
+            assert!(!safe.contains(secret));
+        }
+    }
+
+    #[test]
+    fn cards_show_plain_values_under_key_names_and_mask_what_looks_secret() {
+        let folder = tempfile::tempdir().unwrap();
+        let argument = json!({"api_key":"secondary","sort_key":"created_at","max_tokens":5});
+        let run = Run::new(
+            vec![config(folder.path(), "keyed-schema")],
+            Mode::Ask,
+            BTreeMap::new(),
+            vec![Reply::Calls(vec![(mcp_alias(), argument.clone())])],
+            None,
+        );
+        run.send(Command::Prompt {
+            text: "test".into(),
+        });
+        let events = run.turn();
+        let card = events.iter().find_map(|event| match &event.event {
+            Event::ApprovalRequested { input, .. } => Some(input["arguments"].clone()),
+            _ => None,
+        });
+        assert_eq!(card, Some(argument.clone()));
+        assert_eq!(calls(folder.path())[0]["arguments"], argument);
+        let (bodies, _) = run.finish();
+        let offered = &bodies[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["function"]["name"] == mcp_alias())
+            .unwrap()["function"]["parameters"];
+        assert_eq!(
+            offered["properties"]["api_key"]["enum"],
+            json!(["primary", "secondary"])
+        );
+
+        let folder = tempfile::tempdir().unwrap();
+        let argument = json!({"sort_key":"created_at","api_key":"plain-secret-9981"});
+        let run = Run::new(
+            vec![config(folder.path(), "modern")],
+            Mode::Ask,
+            BTreeMap::new(),
+            vec![Reply::Calls(vec![(mcp_alias(), argument.clone())])],
+            None,
+        );
+        run.send(Command::Prompt {
+            text: "test".into(),
+        });
+        let events = run.turn();
+        let card = events.iter().find_map(|event| match &event.event {
+            Event::ApprovalRequested { input, .. } => Some(input["arguments"].clone()),
+            _ => None,
+        });
+        assert_eq!(
+            card,
+            Some(json!({"sort_key":"created_at","api_key":"****9981"}))
+        );
+        assert_eq!(calls(folder.path())[0]["arguments"], argument);
+        run.finish();
     }
 
     #[test]

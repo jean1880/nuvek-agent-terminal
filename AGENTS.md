@@ -404,7 +404,11 @@ Architectural mandates, standards, and workflows for this codebase.
   (the server's for its reviewed allowlist, a tool override only narrows it, Deny always
   wins; server annotations grant nothing). A card shows the server, the original tool name
   and exactly the arguments that run, secrets masked in place
-  (`agent_core::redact::structured`); a call whose card cannot be shown faithfully is refused.
+  (`agent_core::redact::structured`; a value under a name sensitive only through `KEY` or
+  `TOKEN`, such as `sort_key` or `max_tokens`, is masked only when it looks like a credential:
+  `redact_keyed_shown`); a call whose card cannot be shown faithfully is refused. Discovered
+  names, descriptions and schemas are masked only for the exact resolved credentials, so the
+  model sees the schema its validator compiled; a tool whose input schema holds one is left out.
   A pending approval is bound to its request id, the runner generation and the connection it
   was raised on: a disconnection or reconnection expires the card, and a late answer never
   authorises a replacement call. A session or saved grant is bound to the server definition's

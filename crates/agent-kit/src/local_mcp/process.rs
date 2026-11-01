@@ -14,6 +14,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const TAIL_BYTES: usize = 64 * 1024;
 const STDERR_LINE_BYTES: usize = 128 * 1024;
 
+/// How a string is masked beyond the exact resolved credentials.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rule {
+    /// Patterns, and a sensitive enclosing name masks its value whole (`redact_keyed`).
+    Keyed,
+    /// Patterns, and a sensitive name masks only what looks secret (`redact_keyed_shown`).
+    Shown,
+    /// Only the exact resolved credentials.
+    Exact,
+}
+
 // No Debug implementations for resolved credentials or raw process data.
 #[derive(Clone, Default)]
 pub struct Scrubber(Vec<String>);
@@ -44,8 +55,20 @@ impl Scrubber {
         Self(values)
     }
     /// Strict hand-off: changed object keys cannot preserve call identity or schema meaning.
+    /// What it masks is shown for review (an approval card shows exactly what runs), so a
+    /// value under a name sensitive only through `KEY`/`TOKEN` stays readable unless it looks
+    /// like a credential (`redact_keyed_shown`). Resolved credentials are always masked.
     pub fn value(&self, value: &mut serde_json::Value) -> Result<(), &'static str> {
-        if self.walk_value(None, value) {
+        self.strict(value, Rule::Shown)
+    }
+    /// Discovery metadata (tool names, descriptions, schemas): only the exact resolved
+    /// credential values are masked. Field names never mask a schema, or the model would see
+    /// enums and patterns the validator does not.
+    pub fn metadata(&self, value: &mut serde_json::Value) -> Result<(), &'static str> {
+        self.strict(value, Rule::Exact)
+    }
+    fn strict(&self, value: &mut serde_json::Value, rule: Rule) -> Result<(), &'static str> {
+        if self.walk_value(None, value, rule) {
             Err("Arguments cannot be shown faithfully after secret masking: JSON keys, structure or escape spelling would change.")
         } else {
             Ok(())
@@ -53,10 +76,20 @@ impl Scrubber {
     }
     /// Persistence must retain the surrounding record even when a key needs masking.
     pub fn value_lossy(&self, value: &mut serde_json::Value) {
-        self.walk_value(None, value);
+        self.walk_value(None, value, Rule::Keyed);
     }
-    fn walk_value(&self, parent: Option<&str>, value: &mut serde_json::Value) -> bool {
-        self.walk_value_at(parent, value, 0, &mut (32 * 1024 * 1024))
+    fn walk_value(&self, parent: Option<&str>, value: &mut serde_json::Value, rule: Rule) -> bool {
+        self.walk_value_at(parent, value, 0, &mut (32 * 1024 * 1024), rule)
+    }
+    fn leaf(&self, parent: Option<&str>, text: &str, rule: Rule) -> String {
+        match (rule, parent) {
+            (Rule::Exact, _) => self.scrub_exact(text),
+            (_, None) => self.scrub(text),
+            (Rule::Keyed, Some(key)) => agent_core::redact::redact_keyed(key, &self.scrub(text)),
+            (Rule::Shown, Some(key)) => {
+                agent_core::redact::redact_keyed_shown(key, &self.scrub(text))
+            }
+        }
     }
     fn walk_value_at(
         &self,
@@ -64,7 +97,15 @@ impl Scrubber {
         value: &mut serde_json::Value,
         depth: usize,
         remaining: &mut usize,
+        rule: Rule,
     ) -> bool {
+        let key_mask = |key: &str| {
+            if rule == Rule::Exact {
+                self.scrub_exact(key)
+            } else {
+                self.scrub(key)
+            }
+        };
         let cost = value.as_str().map_or(1, str::len);
         if depth > 128 || cost > *remaining {
             *value = serde_json::Value::String("[JSON masking limit exceeded.]".into());
@@ -79,10 +120,11 @@ impl Scrubber {
                     parent,
                     |key, decoded, is_key| {
                         if is_key {
-                            return self.scrub(decoded);
+                            return key_mask(decoded);
                         }
                         let mut value = serde_json::Value::String(decoded.into());
-                        nested_changed |= self.walk_value_at(key, &mut value, depth + 1, remaining);
+                        nested_changed |=
+                            self.walk_value_at(key, &mut value, depth + 1, remaining, rule);
                         value
                             .as_str()
                             .unwrap_or("[Sensitive text withheld.]")
@@ -103,10 +145,7 @@ impl Scrubber {
                         masked.keys_changed || masked.spelling_changed || nested_changed || residual
                     }
                     Ok(None) => {
-                        *text = parent.map_or_else(
-                            || self.scrub(text),
-                            |key| agent_core::redact::redact_keyed(key, &self.scrub(text)),
-                        );
+                        *text = self.leaf(parent, text, rule);
                         false
                     }
                     Err(_) => {
@@ -118,21 +157,21 @@ impl Scrubber {
             serde_json::Value::Array(values) => {
                 let mut changed = false;
                 for value in values {
-                    changed |= self.walk_value_at(parent, value, depth + 1, remaining);
+                    changed |= self.walk_value_at(parent, value, depth + 1, remaining, rule);
                 }
                 changed
             }
             serde_json::Value::Object(values) => {
                 let mut changed = false;
                 for (key, mut value) in std::mem::take(values) {
-                    let mut safe_key = self.scrub(&key);
+                    let mut safe_key = key_mask(&key);
                     changed |= safe_key != key;
                     // A sensitive ancestor remains authoritative through arrays and objects.
                     let enclosing = parent
                         .filter(|key| agent_core::redact::is_sensitive_name(key))
                         .unwrap_or(&key);
                     changed |=
-                        self.walk_value_at(Some(enclosing), &mut value, depth + 1, remaining);
+                        self.walk_value_at(Some(enclosing), &mut value, depth + 1, remaining, rule);
                     while values.contains_key(&safe_key) {
                         safe_key.push('_');
                     }
@@ -220,7 +259,8 @@ impl Scrubber {
     pub fn scrub(&self, text: &str) -> String {
         agent_core::redact::redact(&self.scrub_exact(text))
     }
-    fn scrub_exact(&self, text: &str) -> String {
+    /// Only the exact resolved credentials, whole and by line: for discovery metadata.
+    pub fn scrub_exact(&self, text: &str) -> String {
         let mut safe = String::new();
         let mut at = 0;
         while at < text.len() {

@@ -482,6 +482,73 @@ pub fn redact_keyed(key: &str, value: &str) -> String {
     }
 }
 
+/// [`redact_keyed`] for a value shown for review before it runs (an approval card), where
+/// hiding a plain value misstates what runs. A name sensitive only through `KEY` or `TOKEN`
+/// (`sort_key`, `keyword`, `max_tokens`) masks its value only when it does not read as words
+/// ([`reads_as_words`]); a value that could be a credential stays masked, and every other
+/// sensitive name (`password`, `client_secret`, `private_key`) masks as [`redact_keyed`] does.
+pub fn redact_keyed_shown(key: &str, value: &str) -> String {
+    let upper = key.to_ascii_uppercase();
+    let strong = SENSITIVE_NAME_PARTS
+        .iter()
+        .filter(|part| !matches!(**part, "KEY" | "TOKEN"))
+        .any(|part| upper.contains(part));
+    if is_sensitive_name(key) && !strong && reads_as_words(value) {
+        redact(value)
+    } else {
+        redact_keyed(key, value)
+    }
+}
+
+/// Plain words or identifiers, never a credential's shape: every blank-separated word, less
+/// surrounding punctuation, is at most 24 letters with no digit, in segments (split on
+/// `_ - . '`) that are all lower case, all upper case, Capitalised or camelCase. Random keys
+/// almost always hold a digit or break that case pattern; anything else is not words.
+fn reads_as_words(value: &str) -> bool {
+    fn segment(text: &str) -> bool {
+        if !text.chars().all(char::is_alphabetic) {
+            return false;
+        }
+        if text.chars().all(char::is_uppercase) {
+            return true;
+        }
+        // An optional leading capital, then humps: a capital starts a new hump only after at
+        // least two lower-case letters, and the last hump holds at least one (`createdAt`).
+        let mut chars = text.chars().peekable();
+        if chars.peek().is_some_and(|c| c.is_uppercase()) {
+            chars.next();
+        }
+        let mut run = 0;
+        for c in chars {
+            if c.is_uppercase() {
+                if run < 2 {
+                    return false;
+                }
+                run = 0;
+            } else {
+                run += 1;
+            }
+        }
+        run > 0
+    }
+    let mut words = 0;
+    for word in value.split_whitespace() {
+        let word = word.trim_matches(|c: char| ".,;:!?()\"'".contains(c));
+        if word.is_empty() {
+            continue;
+        }
+        if word.chars().count() > 24
+            || !word
+                .split(['_', '-', '.', '\''])
+                .all(|part| part.is_empty() || segment(part))
+        {
+            return false;
+        }
+        words += 1;
+    }
+    words > 0
+}
+
 /// Opens a PEM block.
 pub(crate) const PEM_BEGIN: &str = "-----BEGIN ";
 /// Starts the line that closes a PEM block.
@@ -1171,6 +1238,38 @@ mod tests {
         assert_eq!(redact_keyed("api_key", "****9981"), "****9981");
         // A harmless key still gets pattern redaction.
         assert!(redact_keyed("note", "ghp_abcdefghijklmnopqrstuvwxyz0123").starts_with("****"));
+    }
+
+    #[test]
+    fn shown_values_under_key_or_token_names_stay_readable_unless_they_look_secret() {
+        for (key, value) in [
+            ("sort_key", "created_at"),
+            ("keyword", "searching the archive"),
+            ("api_key", "secondary"),
+            ("sortKey", "createdAt"),
+            ("token_type", "Bearer"),
+            ("max_tokens", "Upper bound on produced tokens."),
+            ("primary_key", "CUSTOMER_ID"),
+        ] {
+            assert_eq!(redact_keyed_shown(key, value), value, "{key}");
+        }
+        for (key, value) in [
+            ("api_key", "plain-secret-9981"),
+            ("token", "abcdefghijklmnopqrstuvwxyzabcdef"),
+            ("token", "Bearer 7f3a9c2b1d4e5f60"),
+            ("key", "aB3dE5gH7jK9"),
+            ("key", "xQzRwPtLkMnB"),
+            // Strong names mask whatever the value looks like.
+            ("password", "correct horse battery staple"),
+            ("client_secret", "plainwords"),
+            ("private_key", "secondary"),
+        ] {
+            assert_ne!(redact_keyed_shown(key, value), value, "{key}");
+        }
+        // Pattern redaction still applies to readable values and harmless keys.
+        assert!(
+            redact_keyed_shown("name", "ghp_abcdefghijklmnopqrstuvwxyz0123").starts_with("****")
+        );
     }
 
     /// Blanks around the separator never hide a secret: each of these leaked whole before.

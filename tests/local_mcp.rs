@@ -77,6 +77,11 @@ for line in sys.stdin:
             with open(folder + '/tool.json') as f: result['tools'] = [json.load(f)]
         if scenario == 'strict-schema':
             result['tools'][0]['inputSchema'] = {'type':'object','properties':{'value':{'type':'string','minLength':3}},'required':['value'],'additionalProperties':False}
+        if scenario == 'keyed-schema':
+            result['tools'][0]['description'] = 'Choose api_key: primary or secondary; max_tokens: an upper bound'
+            result['tools'][0]['inputSchema'] = {'type':'object','properties':{'api_key':{'type':'string','enum':['primary','secondary']},'max_tokens':{'type':'integer','description':'Upper bound on produced tokens'},'sort_key':{'type':'string','pattern':'^[a-z_]+$'}},'required':['api_key'],'additionalProperties':False}
+        if scenario == 'credential-schema':
+            result['tools'] += [dict(tool('leaky'),inputSchema={'type':'object','properties':{'value':{'enum':[os.environ['TOKEN']]}}})]
         if scenario == 'invalid-schema':
             result['tools'][0]['inputSchema'] = {'type':'unknown-private-canary'}
         if scenario == 'external-schema':
@@ -348,6 +353,71 @@ fn oversized_schemas_are_unavailable_without_losing_other_tools() {
     assert_eq!(report.servers[0].tools.len(), 1);
     assert_eq!(report.servers[0].notices.len(), 1);
     assert!(!report.servers[0].required_failed);
+    session.shutdown();
+}
+
+#[test]
+fn discovered_schemas_reach_the_model_as_the_validator_compiled_them() {
+    let folder = tempfile::tempdir().unwrap();
+    let mut session = session(vec![config(folder.path(), "keyed-schema")], BTreeMap::new());
+    let report = discover(&session);
+    let server = &report.servers[0];
+    let tool = &server.registry[0];
+    let schema = &tool.resolved.schema["function"];
+    assert_eq!(
+        serde_json::Value::Object((*server.tools[0].input_schema).clone()),
+        schema["parameters"]
+    );
+    assert_eq!(
+        schema["parameters"]["properties"]["api_key"]["enum"],
+        serde_json::json!(["primary", "secondary"])
+    );
+    assert_eq!(
+        schema["parameters"]["properties"]["max_tokens"]["description"],
+        "Upper bound on produced tokens"
+    );
+    assert!(schema["description"]
+        .as_str()
+        .unwrap()
+        .ends_with("Choose api_key: primary or secondary; max_tokens: an upper bound"));
+    assert!(tool
+        .validator
+        .validate(&serde_json::json!({"api_key":"secondary","sort_key":"created_at"}))
+        .is_ok());
+    session.shutdown();
+
+    // A schema holding a configured credential is left out rather than shown changed.
+    let mut config = config(folder.path(), "credential-schema");
+    config.tools.push(McpToolPolicy {
+        name: "leaky".into(),
+        read_only: true,
+        approval: ApprovalPolicy::Inherit,
+    });
+    config.env.insert(
+        "TOKEN".into(),
+        EnvironmentValue::Reference {
+            from_env: "SOURCE".into(),
+        },
+    );
+    let mut session = crate::session(
+        vec![config],
+        BTreeMap::from([("SOURCE".into(), "opaque-private-value-one".into())]),
+    );
+    let report = discover(&session);
+    let server = &report.servers[0];
+    assert_eq!(
+        server
+            .registry
+            .iter()
+            .map(|t| t.resolved.alias.clone())
+            .collect::<Vec<_>>(),
+        vec![agent_core::local_mcp::alias("fixture", "read").unwrap()]
+    );
+    assert!(server
+        .notices
+        .iter()
+        .any(|n| n.contains("leaky") && n.contains("credential")));
+    assert!(!format!("{:?}", server.notices).contains("opaque-private"));
     session.shutdown();
 }
 
@@ -1936,6 +2006,64 @@ mod runner {
             assert!(calls(folder.path()).is_empty());
             run.finish();
         }
+    }
+
+    #[test]
+    fn cards_show_plain_values_under_key_names_and_mask_what_looks_secret() {
+        let folder = tempfile::tempdir().unwrap();
+        let argument = json!({"api_key":"secondary","sort_key":"created_at","max_tokens":5});
+        let run = Run::new(
+            vec![config(folder.path(), "keyed-schema")],
+            Mode::Ask,
+            BTreeMap::new(),
+            vec![Reply::Calls(vec![(mcp_alias(), argument.clone())])],
+            None,
+        );
+        run.send(Command::Prompt {
+            text: "test".into(),
+        });
+        let events = run.turn();
+        let card = events.iter().find_map(|event| match &event.event {
+            Event::ApprovalRequested { input, .. } => Some(input["arguments"].clone()),
+            _ => None,
+        });
+        assert_eq!(card, Some(argument.clone()));
+        assert_eq!(calls(folder.path())[0]["arguments"], argument);
+        let (bodies, _) = run.finish();
+        let offered = &bodies[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["function"]["name"] == mcp_alias())
+            .unwrap()["function"]["parameters"];
+        assert_eq!(
+            offered["properties"]["api_key"]["enum"],
+            json!(["primary", "secondary"])
+        );
+
+        let folder = tempfile::tempdir().unwrap();
+        let argument = json!({"sort_key":"created_at","api_key":"plain-secret-9981"});
+        let run = Run::new(
+            vec![config(folder.path(), "modern")],
+            Mode::Ask,
+            BTreeMap::new(),
+            vec![Reply::Calls(vec![(mcp_alias(), argument.clone())])],
+            None,
+        );
+        run.send(Command::Prompt {
+            text: "test".into(),
+        });
+        let events = run.turn();
+        let card = events.iter().find_map(|event| match &event.event {
+            Event::ApprovalRequested { input, .. } => Some(input["arguments"].clone()),
+            _ => None,
+        });
+        assert_eq!(
+            card,
+            Some(json!({"sort_key":"created_at","api_key":"****9981"}))
+        );
+        assert_eq!(calls(folder.path())[0]["arguments"], argument);
+        run.finish();
     }
 
     #[test]

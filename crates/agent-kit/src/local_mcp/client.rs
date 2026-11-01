@@ -173,9 +173,20 @@ impl Server {
                     };
                     let mut safe =
                         serde_json::to_value(&tool).map_err(|_| "Invalid MCP schema encoding.")?;
-                    self.process.scrubber.value(&mut safe)?;
-                    if self.process.scrubber.scrub(&tool.name) != tool.name {
+                    // Exact credentials only: a field name (`api_key`, `max_tokens`) never
+                    // masks a schema, so the model sees what the validator compiled.
+                    self.process.scrubber.metadata(&mut safe)?;
+                    if self.process.scrubber.scrub_exact(&tool.name) != tool.name {
                         return Err("MCP tool identity contains sensitive text.".into());
+                    }
+                    if safe.get("inputSchema")
+                        != Some(&serde_json::Value::Object((*tool.input_schema).clone()))
+                    {
+                        notices.push(format!(
+                            "MCP tool {} was excluded because its input schema contains a configured credential.",
+                            tool.name
+                        ));
+                        continue;
                     }
                     if serde_json::to_vec(&safe)
                         .map_err(|_| "Invalid scrubbed MCP schema encoding.")?
@@ -244,7 +255,7 @@ impl Server {
             let schema_revision = self.revisions.get(tool.name.as_ref())?.clone();
             let schema = serde_json::json!({"type":"function","function":{
                 "name":alias,
-                "description":self.process.scrubber.scrub(&format!("{} ({}) / {}\n{}", self.config.label,self.config.id,tool.name,tool.description.as_deref().unwrap_or(""))),
+                "description":format!("{} {}",self.process.scrubber.scrub(&self.config.label),self.process.scrubber.scrub_exact(&format!("({}) / {}\n{}",self.config.id,tool.name,tool.description.as_deref().unwrap_or("")))),
                 "parameters":tool.input_schema
             }});
             Some(RegistryTool { resolved: ResolvedTool {

@@ -1892,13 +1892,9 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             }
             match response.recv_timeout(Duration::from_millis(20)) {
                 Ok(Ok(mut value)) => {
-                    if self.masks.value(&mut value).is_err() {
-                        return failed(
-                            self,
-                            "Sensitive MCP result keys were withheld.",
-                            ItemStatus::Failed,
-                        );
-                    }
+                    // The call ran: a key that must be masked is masked in the record, never
+                    // a reason to report a completed call as failed (the model would retry it).
+                    self.masks.value_lossy(&mut value);
                     let is_error = value
                         .get("isError")
                         .and_then(Value::as_bool)

@@ -716,12 +716,12 @@ async fn worker(
                         }
                     };
                     match response {
-                        Ok(mut value) => server
-                            .process
-                            .scrubber
-                            .value(&mut value)
-                            .map(|()| value)
-                            .map_err(str::to_owned),
+                        // The call ran: keep its result even when a key must be masked, or
+                        // the model would read a completed call as failed and run it again.
+                        Ok(mut value) => {
+                            server.process.scrubber.value_lossy(&mut value);
+                            Ok(value)
+                        }
                         Err(reason) => {
                             server.close().await;
                             servers[index] = None;

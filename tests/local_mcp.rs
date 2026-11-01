@@ -107,6 +107,9 @@ for line in sys.stdin:
         if scenario == 'nested-secrets':
             payload = {'tokens':['array-private-1111',['nested-private-2222'],{'ordinary':['object-private-3333']}]}
             respond(request, {'resultType':'complete','content':[{'type':'text','text':json.dumps(payload)}], 'structuredContent':payload}); continue
+        if scenario == 'secret-key-result':
+            respond(request, {'resultType':'complete','content':[{'type':'text','text':'wrote marker'}],
+                'structuredContent':{os.environ['TOKEN']:'kept'}}); continue
         if scenario == 'structured-result':
             respond(request, {'resultType':'complete','isError':True,
                 'content':[{'type':'text','text':'雪'*20000},{'type':'image','data':'BINARY-CANARY'},{'type':'resource_link','uri':'https://example.com/no-fetch'}],
@@ -2005,6 +2008,50 @@ mod runner {
                 .any(|e| matches!(e.event, Event::ApprovalRequested { .. })));
             assert!(calls(folder.path()).is_empty());
             run.finish();
+        }
+    }
+
+    #[test]
+    fn a_completed_call_keeps_its_result_when_a_result_key_must_be_masked() {
+        let secret = "opaque-private-value-one";
+        let folder = tempfile::tempdir().unwrap();
+        let mut config = config(folder.path(), "secret-key-result");
+        config.env.insert(
+            "TOKEN".into(),
+            EnvironmentValue::Reference {
+                from_env: "SOURCE".into(),
+            },
+        );
+        let run = Run::new(
+            vec![config],
+            Mode::Ask,
+            BTreeMap::from([("SOURCE".into(), secret.into())]),
+            vec![Reply::Calls(vec![(mcp_alias(), json!({}))])],
+            None,
+        );
+        run.send(Command::Prompt {
+            text: "test".into(),
+        });
+        let events = run.turn();
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::ItemCompleted {
+                status: agent_core::event::ItemStatus::Completed,
+                output: Some(output),
+                ..
+            } if output.contains("wrote marker")
+        )));
+        let (bodies, transcript) = run.finish();
+        assert_eq!(calls(folder.path()).len(), 1);
+        let answered = serde_json::to_string(&bodies[1]).unwrap();
+        assert!(answered.contains("wrote marker"));
+        assert!(!answered.contains("withheld"));
+        for safe in [
+            answered,
+            serde_json::to_string(&events).unwrap(),
+            transcript,
+        ] {
+            assert!(!safe.contains(secret));
         }
     }
 

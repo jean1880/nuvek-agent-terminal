@@ -5227,12 +5227,13 @@ impl Inner {
             if busy {
                 // The task never moved: its turn (another profile's of the same agent too) is
                 // still the old agent's, so no continuation goes into it, and what the switch
-                // took over is queued again.
-                inner.switch_continuation.borrow_mut().take();
+                // took over from the old agent's unspawned start is queued again, for it.
                 inner.settle_carried(false);
-            } else {
-                inner.end_switch(false, revision);
             }
+            // Ended as an idle switch: the owed continuation goes, and the queue goes on to the
+            // old agent once nothing runs. What was written for the new agent stays held, said
+            // so by `hold_for_switch`, until the user writes again or takes it back.
+            inner.end_switch(false, revision);
         });
     }
 

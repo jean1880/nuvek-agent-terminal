@@ -46,7 +46,8 @@ use crate::window::sidebar_model::{
     OpenState, Redraw, ResumeAs, RowKey, SidebarModel, SidebarRow,
 };
 use crate::window::sidebar_model::{
-    limit_wait_text, reopen_offer, sessions_added_toast, thread_activity, ThreadActivity,
+    empty_sidebar_text, limit_wait_text, reopen_offer, sessions_added_toast, thread_activity,
+    ThreadActivity,
 };
 use agent_core::limit_wait::{LimitRecord, LimitWait, Step, Window as LimitWindow};
 
@@ -3088,6 +3089,10 @@ pub(super) struct Sidebar {
     loading: std::cell::Cell<bool>,
     /// Those skeleton rows.
     placeholder: gtk4::Widget,
+    /// The list's placeholder once loaded: what an empty list or a search with no match says.
+    empty: gtk4::Box,
+    empty_title: Label,
+    empty_hint: Label,
     /// Held for the sidebar's lifetime: the footer's usage indicator.
     _usage: Rc<UsageIndicator>,
 }
@@ -3743,7 +3748,7 @@ impl AgentTerminalWindow {
             .css_classes(["sidebar-footer"])
             .build();
         let archived = gtk4::ToggleButton::builder()
-            .label("Show archived")
+            .label("Show Archived")
             .tooltip_text("Also list archived threads")
             .css_classes(["flat", "caption"])
             .halign(Align::Start)
@@ -3765,6 +3770,25 @@ impl AgentTerminalWindow {
         footer.append(usage.widget());
         root.append(&footer);
 
+        let empty_title = Label::builder()
+            .wrap(true)
+            .justify(gtk4::Justification::Center)
+            .css_classes(["heading"])
+            .build();
+        let empty_hint = Label::builder()
+            .wrap(true)
+            .justify(gtk4::Justification::Center)
+            .css_classes(["dim-label", "caption"])
+            .build();
+        let empty = Box::builder()
+            .orientation(Orientation::Vertical)
+            .spacing(4)
+            .margin_top(24)
+            .margin_start(12)
+            .margin_end(12)
+            .build();
+        empty.append(&empty_title);
+        empty.append(&empty_hint);
         let sidebar = Rc::new(Sidebar {
             root,
             list: list.clone(),
@@ -3776,6 +3800,9 @@ impl AgentTerminalWindow {
             drawn_rows: RefCell::new(Vec::new()),
             loading: std::cell::Cell::new(true),
             placeholder,
+            empty,
+            empty_title,
+            empty_hint,
             _usage: usage,
         });
         search.connect_search_changed(glib::clone!(
@@ -4040,13 +4067,16 @@ impl AgentTerminalWindow {
             return;
         }
         if sidebar.loading.replace(false) {
-            sidebar.list.set_placeholder(None::<&gtk4::Widget>);
+            sidebar.list.set_placeholder(Some(&sidebar.empty));
             loading::reveal(&sidebar.list);
         }
         let rows = self.sidebar_rows();
         let selected = self.selected_row_key();
         let focused = self.obj().is_active();
         let query = sidebar.search.text().to_string();
+        let (title, hint) = empty_sidebar_text(&query);
+        sidebar.empty_title.set_text(title);
+        sidebar.empty_hint.set_text(hint);
         let (active, groups) = sidebar_sections(rows, &query, self.show_archived.get());
         let groups = fold_groups(
             groups,
@@ -4447,7 +4477,7 @@ impl AgentTerminalWindow {
         if let (RowKey::Thread(thread_id), OpenState::Closed) = (&row.key, row.open) {
             let delete = Button::builder()
                 .icon_name("at-user-trash-symbolic")
-                .tooltip_text("Delete thread…")
+                .tooltip_text("Delete Thread…")
                 .css_classes(["flat", "circular", "thread-delete"])
                 .valign(Align::Center)
                 .build();
@@ -4462,7 +4492,7 @@ impl AgentTerminalWindow {
         if row.open == OpenState::Here {
             let close = Button::builder()
                 .icon_name("at-window-close-symbolic")
-                .tooltip_text("Close (the thread stays in the list; a running turn is stopped)")
+                .tooltip_text("Close Thread (it stays in the list; a running turn is stopped)")
                 .css_classes(["flat", "circular", "thread-close"])
                 .valign(Align::Center)
                 .build();

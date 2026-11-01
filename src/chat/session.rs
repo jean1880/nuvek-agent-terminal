@@ -537,7 +537,8 @@ struct Inner {
     /// Turns started by sub-agent news since the user last spoke (see
     /// [`agent_core::delegation::wake::MAX_CONSECUTIVE_WAKES`]).
     auto_wakes: Cell<u32>,
-    /// The user stopped this root: no sub-agent news wakes it until the user speaks again.
+    /// The user stopped this root (Stop, with or without a delegation supervisor): no sub-agent
+    /// news wakes it, and no usage-limit continuation starts, until the user speaks again.
     wakes_held: Cell<bool>,
     /// Sub-agent news the supervisor holds for the user while this root is in dangerous
     /// permissive mode ([`delegated::HeldNews`]).
@@ -6536,6 +6537,11 @@ impl ChatBackend for ChatSession {
     }
 
     fn interrupt(&self) {
+        // The user stopped this root, delegation or not: nothing continues it on its own (a
+        // usage-limit continuation, sub-agent news) until the user speaks again.
+        if self.inner.child.is_none() {
+            self.inner.wakes_held.set(true);
+        }
         self.inner.end_pending_switch();
         self.inner.command(Command::Interrupt);
     }

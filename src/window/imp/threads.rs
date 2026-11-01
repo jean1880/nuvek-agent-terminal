@@ -1000,6 +1000,15 @@ impl ChatBackend for SessionSlot {
         if let Some(s) = self.get() {
             s.interrupt();
         }
+        // A stopped thread does not continue on its own after its usage limit: its wait ends now
+        // (the session refuses the continuation until the user speaks again either way).
+        if let Some((window, thread)) = self
+            .thread
+            .as_deref()
+            .and_then(|thread| Some((thread_owner(thread)?, thread)))
+        {
+            window.imp().cancel_limit_wait(thread);
+        }
     }
     fn respond_approval(&self, request: &str, decision: Decision) {
         if let Some(s) = self.get() {

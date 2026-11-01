@@ -311,7 +311,8 @@ Architectural mandates, standards, and workflows for this codebase.
   waiting for a prompt rides on it and is spent as a user prompt's would be; the prompt is never
   stored as the user's message. Never into a running turn or anything else a wake waits for
   (`TurnPurpose::LimitContinue`), never for a delegated worker, never for a root the user
-  stopped. While the thread waits, sub-agent news does not wake it (`TurnPurpose::Wake`); it
+  stopped (Stop ends its wait, delegation or not, and the session refuses a continuation until
+  the user speaks again). While the thread waits, sub-agent news does not wake it (`TurnPurpose::Wake`); it
   arrives after the continuation. The wait ends when the agent works again, the thread switches
   agent (the hand-off included), the user picks "Don't Continue" on its banner, or the setting
   goes off. "Continue in …" on the limit's banner (and a bare `/handoff` while the thread is

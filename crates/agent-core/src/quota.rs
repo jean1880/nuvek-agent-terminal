@@ -287,6 +287,24 @@ pub fn is_rate_limit_or_quota(text: &str) -> bool {
         || lower.contains("hit your limit")
 }
 
+/// Whether an error says the account's usage quota is spent: a quota, a session, weekly or usage
+/// limit, tokens or credits run out. Unlike [`is_rate_limit_or_quota`], a rate limit alone (a
+/// 429, "too many requests", a server at capacity) is not: it passes on its own, and may be a
+/// tool's own.
+pub fn is_quota_exhausted(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("quota")
+        || lower.contains("tokens exhausted")
+        || lower.contains("out of tokens")
+        || lower.contains("insufficient tokens")
+        || lower.contains("out of credits")
+        || lower.contains("session limit")
+        || lower.contains("weekly limit")
+        || lower.contains("usage limit")
+        || lower.contains("usage_limit")
+        || lower.contains("hit your limit")
+}
+
 // ---------------------------------------------------------------------------------------------
 // Time helpers (no chrono: the UI needs only epoch seconds and an "in 3 h 47 min" phrase)
 // ---------------------------------------------------------------------------------------------
@@ -390,6 +408,29 @@ mod tests {
     use super::*;
     use crate::test_support::{records, Malformed};
     use serde_json::json;
+
+    #[test]
+    fn a_rate_limit_alone_is_not_a_spent_quota() {
+        for spent in [
+            "You've hit your session limit · resets 2:10pm (Europe/Paris)",
+            "You've hit your usage limit. Try again at 4:00 PM.",
+            "You have exhausted your quota",
+            "usage_limit_reached",
+            "You're out of credits",
+        ] {
+            assert!(is_quota_exhausted(spent), "{spent}");
+        }
+        for passing in [
+            "429 Too Many Requests",
+            "rate limit exceeded, retry in 2s",
+            "rate_limit_error",
+            "capacity exceeded",
+            "RESOURCE_EXHAUSTED",
+        ] {
+            assert!(!is_quota_exhausted(passing), "{passing}");
+            assert!(is_rate_limit_or_quota(passing), "{passing}");
+        }
+    }
 
     #[test]
     fn codex_account_reads_chatgpt_and_api_key_and_signed_out() {

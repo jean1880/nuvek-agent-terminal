@@ -80,9 +80,10 @@ fn limit_reset_of(event: &Event) -> Option<i64> {
 }
 
 /// Whether `event` says the agent refused the thread's work over its usage limit: only a turn
-/// that failed for quota. A rate limit alone is not (agy raises one for a tool's own 429, and a
-/// usage reading may name a window the thread does not use); one inside the turn only says when
-/// the limit resets.
+/// that failed for quota ([`agent_core::quota::is_quota_exhausted`]). A rate limit alone is not
+/// (agy raises one for a tool's own 429, and a usage reading may name a window the thread does
+/// not use), nor a turn that failed on one (a 429 passes on its own); one inside the turn only
+/// says when the limit resets.
 fn limit_refused(event: &Event) -> bool {
     match event {
         Event::TurnCompleted {
@@ -91,7 +92,7 @@ fn limit_refused(event: &Event) -> bool {
             ..
         } => error
             .as_deref()
-            .is_some_and(agent_core::quota::is_rate_limit_or_quota),
+            .is_some_and(agent_core::quota::is_quota_exhausted),
         _ => false,
     }
 }
@@ -8884,6 +8885,9 @@ pub(super) mod tests {
         assert!(limit_refused(&failed("You've hit your session limit")));
         assert!(limit_refused(&failed("You have exhausted your quota")));
         assert!(!limit_refused(&failed("syntax error")));
+        // A turn that failed on a rate limit alone waits for nothing: it passes on its own.
+        assert!(!limit_refused(&failed("429 Too Many Requests")));
+        assert!(!limit_refused(&failed("rate limit exceeded")));
         let error = Event::Error {
             message: "429 Too Many Requests".into(),
         };

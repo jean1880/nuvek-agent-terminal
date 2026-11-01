@@ -405,7 +405,9 @@ impl Supervisor {
             entry.input.epoch,
             expected,
         ) {
-            self.fail_dispatch(&entry, &used, e);
+            if !self.unwritten_auto_to_next_turn(&entry, e.code) {
+                self.fail_dispatch(&entry, &used, e);
+            }
             return;
         }
         let session = self.child_session(&entry.worker);
@@ -425,7 +427,9 @@ impl Supervisor {
         let turn_started = matches!(outcome, DelegatedOutcome::TurnStarted);
         match outcome {
             DelegatedOutcome::Refused(c) => {
-                self.fail_dispatch(&entry, &used, error(c, "session refused delegated input"));
+                if !self.unwritten_auto_to_next_turn(&entry, c) {
+                    self.fail_dispatch(&entry, &used, error(c, "session refused delegated input"));
+                }
                 return;
             }
             DelegatedOutcome::SteerSent { tag } => {
@@ -610,6 +614,38 @@ impl Supervisor {
             // The run that refused it may already be over: nothing else would drain it.
             sup.drain_deferred(&worker);
         });
+    }
+    /// An `auto` steer or live write refused `stale_run` before anything was written (the run
+    /// it was planned for ended while it was accepted or reserved) was never given to the
+    /// agent: it takes a refused steer's way to the next turn ([`Self::steer_refused`]) and is
+    /// never failed. A worker being cancelled or closed is left to that path. Whether it was
+    /// requeued.
+    fn unwritten_auto_to_next_turn(self: &Rc<Self>, entry: &Delivery, code: ErrorCode) -> bool {
+        let live = matches!(
+            entry.input.plan,
+            DeliveryPlan::SteerNow(_) | DeliveryPlan::WriteLive { .. }
+        );
+        if entry.policy != DeliveryPolicy::Auto
+            || code != ErrorCode::StaleRun
+            || !live
+            || !matches!(entry.input.source, InputSource::Message { .. })
+            || self
+                .state
+                .borrow()
+                .workers
+                .get(&entry.worker)
+                .is_none_or(|w| matches!(w.row.state.as_str(), "stopping" | "closed"))
+        {
+            return false;
+        }
+        info!(worker = %entry.worker, operation = %entry.input.operation,
+            "the run ended before its auto delivery was written");
+        self.state
+            .borrow_mut()
+            .dispatching
+            .remove(&entry.input.operation);
+        self.steer_refused(&entry.worker, entry.clone());
+        true
     }
     /// A steer's answer may come after its turn ended (the correlation outlives the turn). One
     /// with no answer within [`STEER_SETTLE`] may yet have been taken: its outcome is recorded

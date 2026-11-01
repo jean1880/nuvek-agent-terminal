@@ -1638,11 +1638,13 @@ impl Store {
     }
 
     /// An `auto` parent→child message whose steer the recipient's run refused after it was
-    /// written (`submitted`) waits for the recipient's next turn again (`queued_next_turn`), and
-    /// its operation is `accepted` again, in the same transaction: from here it is any accepted
-    /// send, so its next dispatch is reserved with every check (the epoch, a closed target), and a
-    /// revocation or a restart fails it like any other. Its epoch is the root's current one (it was
-    /// current, being in flight). The only way back from `submitted`, for either
+    /// written (`submitted`), or that was reserved for a run that ended before it could be
+    /// written (`dispatch_reserved`), waits for the recipient's next turn again
+    /// (`queued_next_turn`), and its operation is `accepted` again, in the same transaction: from
+    /// here it is any accepted send, so its next dispatch is reserved with every check (the
+    /// epoch, a closed target), and a revocation or a restart fails it like any other. Its epoch
+    /// is the root's current one (it was current, being in flight). The only way back from
+    /// `submitted` or `dispatch_reserved`, for either
     /// (`mailbox::requeue_refused_steer`, `operation::requeue_refused_steer`); any other message,
     /// or one in any other state, is refused and nothing changes. The run it was aimed at stays
     /// recorded as accepted (a frozen fact), and a confirmation in a later run is its delivery

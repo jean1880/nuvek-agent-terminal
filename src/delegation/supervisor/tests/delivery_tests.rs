@@ -164,6 +164,51 @@ fn a_refused_strict_steer_still_fails() {
     });
 }
 
+/// An `auto` message whose run ends while it is being accepted is never written to that run:
+/// it goes to the next turn and is delivered there, never failed.
+#[test]
+fn an_auto_send_whose_run_ends_during_its_acceptance_waits_for_the_next_turn() {
+    in_context(async {
+        let (dir, sup, root) = harness();
+        let worker = spawn_holding(&sup, &root, "auto-ended").await;
+        let first = sup.state.borrow().workers[&worker].run.clone().unwrap();
+        let hold = Rc::new(std::cell::Cell::new(true));
+        sup.state.borrow_mut().hold_send_accept = Some(hold.clone());
+        let receipt: Rc<RefCell<Option<Result<Value, ToolError>>>> = Rc::default();
+        {
+            let (sup, worker, root, slot) =
+                (sup.clone(), worker.clone(), root.clone(), receipt.clone());
+            glib::spawn_future_local(async move {
+                let mut request = instruction(&worker, "AUTO_AFTER_END", "auto-ended-send");
+                request.delivery = Delivery::Auto;
+                *slot.borrow_mut() = Some(sup.send_worker(&root, request).await);
+            });
+        }
+        pump_until(|| sup.state.borrow().delivery_holds.contains_key(&worker)).await;
+        // The run ends on its own while the send is accepted.
+        let session = sup.state.borrow().workers[&worker].session().unwrap();
+        assert!(session.interrupt_run());
+        pump_until(|| sup.state.borrow().workers[&worker].run.is_none()).await;
+        hold.set(false);
+        pump_until(|| receipt.borrow().is_some()).await;
+        let receipt = receipt.borrow_mut().take().unwrap().expect("accepted");
+        let op = receipt["operation_id"].as_str().unwrap().to_owned();
+        let id = receipt["message_id"].as_str().unwrap().to_owned();
+        pump_until(|| dispatch(&sup, &op) == "confirmed").await;
+        let row = message(&sup, &id);
+        assert_eq!(row.delivery_state, "provider_confirmed");
+        let reached = row.recipient_run_id.expect("the run it was delivered in");
+        assert_ne!(reached, first.as_str(), "delivered on the next turn");
+        let frames = std::fs::read_to_string(dir.path().join("frames.ndjson")).unwrap();
+        assert_eq!(
+            frames.matches("AUTO_AFTER_END").count(),
+            2,
+            "written once, echoed once"
+        );
+        stop(&sup).await;
+    });
+}
+
 /// A binding staged for `worker` that never launched (a launch about to start).
 fn plant_staged(sup: &Rc<Supervisor>, worker: &WorkerId) {
     let binding = PreparedBinding {

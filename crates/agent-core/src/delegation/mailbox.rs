@@ -222,17 +222,19 @@ pub fn on_steer_refused(d: Delivery) -> Result<DeliveryState, ErrorCode> {
 }
 
 /// The one step back a delivery may take: an `auto` message written to a run that refused it
-/// (`submitted`) goes back to wait for the next turn. It is not a [`delivery_step`] (an echo, a
-/// confirmation or an unknown outcome never takes it): only the refused steer's own path does,
-/// and only for `auto`, since a `this_run` message has no next turn to fall back to.
+/// (`submitted`), or reserved for a run that ended before it was written
+/// (`dispatch_reserved`), goes back to wait for the next turn. It is not a [`delivery_step`]
+/// (an echo, a confirmation or an unknown outcome never takes it): only the refused steer's own
+/// path does, and only for `auto`, since a `this_run` message has no next turn to fall back to.
 pub fn requeue_refused_steer(
     from: DeliveryState,
     policy: Delivery,
 ) -> Result<DeliveryState, LifecycleError> {
     match (from, on_steer_refused(policy)) {
-        (DeliveryState::Submitted | DeliveryState::Unknown, Ok(to)) if policy == Delivery::Auto => {
-            Ok(to)
-        }
+        (
+            DeliveryState::Submitted | DeliveryState::Unknown | DeliveryState::DispatchReserved,
+            Ok(to),
+        ) if policy == Delivery::Auto => Ok(to),
         _ => Err(LifecycleError::Illegal {
             from: WorkerState::Unknown,
             input: "requeue_refused_steer",

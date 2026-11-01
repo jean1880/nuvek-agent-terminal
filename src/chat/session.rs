@@ -1932,6 +1932,9 @@ impl Inner {
     /// switch does not happen.
     fn hold_for_switch(&self, to: Option<Driver>, what: &str) {
         self.switch_to.set(None);
+        // No new agent is waiting to report its start: nothing may release the hold but the
+        // user, whatever an earlier switch left.
+        self.switch_confirming.set(None);
         let queued = self.switch_marked();
         if queued == 0 {
             return;
@@ -2392,6 +2395,16 @@ impl Inner {
         self.state.borrow_mut().running_turn = false;
         for queued in prompts.into_iter().rev() {
             self.hold_queued_prompt(queued);
+        }
+        // Behind messages written for a switch's new agent, the queue is held, not sent when the
+        // agent next starts: the user is told that instead (once), and how to send them.
+        if self.switch_marked() > 0 && self.switch_confirming.get().is_none() {
+            if self.switch_failed.get().is_some() {
+                self.announce_failed_switch();
+            } else if !self.switch_held.get() {
+                self.hold_for_switch(None, "did not go ahead");
+            }
+            return;
         }
         self.deliver(&Envelope::new(Event::Notice {
             text: if kept == 1 {
@@ -4793,6 +4806,9 @@ impl Inner {
         // The latest choice wins over a switch still reading the thread, and over the
         // continuation an earlier switch still owes.
         self.end_pending_switch();
+        // And over an earlier switch's new agent still to report its start: what is written
+        // from now on is this switch's, and only its own new agent may release it.
+        self.switch_confirming.set(None);
         let revision = self.switch_revision.get().wrapping_add(1);
         self.switch_revision.set(revision);
         // What an overtaken switch still owed (its turn was stopped and nothing continued it)
@@ -5241,9 +5257,10 @@ impl Inner {
                 // took over from the old agent's unspawned start is queued again, for it.
                 inner.settle_carried(false);
             }
-            // Ended as an idle switch: the owed continuation goes, and the queue goes on to the
-            // old agent once nothing runs. What was written for the new agent stays held, said
-            // so by `hold_for_switch`, until the user writes again or takes it back.
+            // Ended as an idle switch: the owed continuation is dropped, and the queue goes on to
+            // the old agent once nothing runs, unless something in it was written for the new
+            // agent: then all of it stays held, said so by `hold_for_switch`, until the user
+            // writes again or takes it back.
             inner.end_switch(false, revision);
         });
     }
@@ -6563,7 +6580,15 @@ impl ChatBackend for ChatSession {
         if self.inner.child.is_none() {
             self.inner.wakes_held.set(true);
         }
+        // The Stop wins over a switch's continuation still armed (one a rebind holds, say):
+        // nothing carries the task on, and what that switch took over is queued again, as
+        // when a switch fails.
+        let owed = self.inner.switch_continuation.borrow_mut().take().is_some();
+        self.inner.switch_interrupted.set(false);
         self.interrupt_for_switch();
+        if owed {
+            self.inner.settle_carried(false);
+        }
     }
 
     fn respond_approval(&self, request: &str, decision: Decision) {

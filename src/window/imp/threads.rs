@@ -925,7 +925,7 @@ impl SessionSlot {
         if let Some((supervisor, thread)) =
             crate::delegation::supervisor().zip(self.thread.as_deref())
         {
-            supervisor.root_stop(thread);
+            supervisor.root_stop_for_switch(thread);
         }
         if let Some(s) = self.get() {
             s.interrupt_for_switch();

@@ -211,6 +211,34 @@ fn a_busy_switch_whose_turn_ended_meanwhile_sends_no_continuation() {
     }
 }
 
+/// The user's Stop wins over a switch continuation still armed (here one a delegation rebind
+/// holds until its restart): the rebind's end sends nothing, and the thread stays stopped.
+#[test]
+fn a_stop_drops_a_switch_continuation_still_armed() {
+    in_loop(|ctx| {
+        let s = slow(Driver::Claude);
+        s.session.send_prompt("the task");
+        assert!(s.session.status().running_turn);
+        s.session.inner.rebinding.set(true);
+        s.session.inner.arm_switch_continuation(7, Driver::Claude);
+        s.session.inner.handoff_prepared(7);
+        s.session.inner.rebinding.set(false);
+        assert!(s.session.inner.switch_continuation.borrow().is_some());
+        ChatBackend::interrupt(&*s.session);
+        end_turn(&s.session);
+        assert!(s.session.inner.switch_continuation.borrow().is_none());
+        s.session.inner.rebind_ready();
+        pump_until(ctx, 1, || false);
+        assert!(
+            !s.sent_anywhere("Continue the unfinished task"),
+            "{:?}",
+            prompts(&s.log)
+        );
+        assert!(s.session.inner.wakes_held.get(), "still stopped");
+        s.session.shutdown(false);
+    });
+}
+
 fn failed_notice(s: &Slow) -> bool {
     has(&s.seen, |e| {
         matches!(e, Event::Notice { text }
@@ -263,6 +291,66 @@ fn a_failed_switch_never_sends_the_messages_written_for_its_new_agent_to_the_old
             s.session.shutdown(false);
         });
     }
+}
+
+/// An earlier switch's new agent still waiting to report its start never lets a later, failed
+/// switch's messages reach the old agent: the hold is the failed switch's, whatever came before.
+#[test]
+fn a_stale_confirmation_never_releases_a_failed_switchs_messages() {
+    in_loop(|ctx| {
+        let s = slow(Driver::Agy);
+        s.session.send_prompt("the task");
+        assert!(s.session.status().running_turn);
+        // Left by an earlier switch whose new agent never reported its start.
+        s.session.inner.switch_confirming.set(Some(Driver::Codex));
+        s.session
+            .set_adapter_factory(Rc::new(|_, _| Err("Claude is not ready".into())));
+        s.hold_writer(300);
+        s.session.switch(Driver::Claude, Some("opus".into()), None);
+        s.session.queue_prompt("for Claude");
+        assert!(pump_until(ctx, 5, || failed_notice(&s)), "not told");
+        end_turn(&s.session);
+        assert!(
+            !pump_until(ctx, 1, || s.sent_anywhere("for Claude")),
+            "a message for Claude went to agy"
+        );
+        assert!(s.session.inner.switch_confirming.get().is_none());
+        assert!(!has(&s.seen, |e| matches!(e, Event::Notice { text }
+            if text.contains("goes first when the agent next starts"))));
+        s.session.shutdown(false);
+    });
+}
+
+/// Messages given back behind one written for a switch's new agent are held with it, so the user
+/// is told that, and how to send them, never that they go when the agent next starts.
+#[test]
+fn messages_given_back_behind_a_held_one_are_said_to_be_held() {
+    in_loop(|_| {
+        let s = slow(Driver::Agy);
+        let prompt = |text: &str, for_switch: bool| QueuedPrompt {
+            item_id: format!("item-{text}"),
+            text: text.into(),
+            stored: true,
+            for_switch,
+        };
+        s.session
+            .inner
+            .queued_prompts
+            .borrow_mut()
+            .push_back(prompt("for the new agent", true));
+        s.session
+            .inner
+            .keep_unsent_prompts(vec![prompt("given back", false)]);
+        assert!(!has(&s.seen, |e| matches!(e, Event::Notice { text }
+            if text.contains("next starts"))));
+        assert!(notice_starting(
+            &s.seen,
+            "The switch to the new agent did not go ahead, so 1 message written for it was not \
+             sent."
+        ));
+        assert!(s.session.inner.switch_held.get());
+        s.session.shutdown(false);
+    });
 }
 
 /// A busy switch on the same agent whose read fails: the task was not carried, so what the user

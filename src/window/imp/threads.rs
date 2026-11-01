@@ -916,6 +916,21 @@ pub(super) struct SessionSlot {
 }
 
 impl SessionSlot {
+    /// "Stop and Switch": the running turn is stopped as Stop stops it (sub-agents included), but
+    /// the thread is not marked stopped by the user: its work goes on in the new agent, and its
+    /// limit wait ends only once that agent is up.
+    pub(super) fn stop_for_switch(&self) {
+        self.switch_serial
+            .set(self.switch_serial.get().wrapping_add(1));
+        if let Some((supervisor, thread)) =
+            crate::delegation::supervisor().zip(self.thread.as_deref())
+        {
+            supervisor.root_stop(thread);
+        }
+        if let Some(s) = self.get() {
+            s.interrupt_for_switch();
+        }
+    }
     pub(super) fn invalidate_pending_switch(&self) {
         self.switch_serial
             .set(self.switch_serial.get().wrapping_add(1));
@@ -4621,7 +4636,7 @@ impl AgentTerminalWindow {
             }
             // The slot again: the page may have closed while the question was open.
             if let Some(slot) = imp.slot_of(&thread) {
-                slot.interrupt();
+                slot.stop_for_switch();
                 delegation::switch(&slot, driver, model, effort, target);
             }
         });

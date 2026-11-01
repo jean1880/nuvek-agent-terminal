@@ -1163,6 +1163,14 @@ impl ChatSession {
         true
     }
 
+    /// Stops the running turn for a switch the user confirmed ("Stop and Switch"): not a Stop of
+    /// the thread, so it is not held from continuing on its own (the switch's own continuation,
+    /// sub-agent news, a later usage-limit continuation), as the user's Stop holds it.
+    pub(crate) fn interrupt_for_switch(&self) {
+        self.inner.end_pending_switch();
+        self.inner.command(Command::Interrupt);
+    }
+
     /// Bumped whenever the agent works again on its own: it continued after its usage limit,
     /// or completed a turn after a prompt. What a "Continue in" asked at one value is for.
     pub(crate) fn work_epoch(&self) -> u64 {
@@ -5046,6 +5054,8 @@ impl Inner {
     fn continue_after_switch(self: &Rc<Self>, driver: Driver) {
         let sent = self.adapter.borrow().driver() == driver && self.state.borrow().alive;
         if sent {
+            // The user asked for the work to go on here: a stop the switch made is over.
+            self.wakes_held.set(false);
             self.send_prompt_now(super::SWITCH_CONTINUATION);
         }
         self.settle_carried(sent);
@@ -6552,8 +6562,7 @@ impl ChatBackend for ChatSession {
         if self.inner.child.is_none() {
             self.inner.wakes_held.set(true);
         }
-        self.inner.end_pending_switch();
-        self.inner.command(Command::Interrupt);
+        self.interrupt_for_switch();
     }
 
     fn respond_approval(&self, request: &str, decision: Decision) {

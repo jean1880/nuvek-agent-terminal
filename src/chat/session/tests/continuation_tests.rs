@@ -406,6 +406,35 @@ fn continue_in_another_agent_starts_a_continuation_there() {
     });
 }
 
+/// "Stop and Switch" stops the turn without marking the thread stopped by the user: a later limit
+/// wait still continues it. And the switch's continuation, the user's own request for the work to
+/// go on, ends a stop that held the root (a delegation root's supervisor holds it on that stop).
+#[test]
+fn a_stop_for_a_switch_never_holds_the_thread_from_continuing() {
+    in_loop(|ctx| {
+        let t = Thread::new(ctx);
+        t.session.send_prompt("first");
+        assert!(pump_until(ctx, 10, || t.idle()
+            && t.session.inner.has_conversation.get()));
+        t.session.interrupt_for_switch();
+        assert!(!t.session.wakes_held());
+        t.session.set_limit_wait(true);
+        assert_eq!(t.session.continue_after_limit(), ContinueOutcome::Started);
+        assert!(pump_until(ctx, 10, || t.idle()));
+
+        t.session.hold_wakes();
+        assert!(t
+            .session
+            .continue_after_switch_to(Driver::Codex, t.session.work_epoch()));
+        t.session.switch(Driver::Codex, None, None);
+        assert!(pump_until(ctx, 10, || t
+            .sent_new()
+            .contains("Continue the unfinished task")));
+        assert!(!t.session.wakes_held());
+        t.session.shutdown(false);
+    });
+}
+
 /// A "Continue in" that was not taken never continues a later switch: its question was
 /// cancelled, or the thread's own agent continued after its limit and completed, or the user
 /// wrote first (a message sent, queued or steered); and taking one back never takes a later one.

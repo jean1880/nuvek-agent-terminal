@@ -317,7 +317,8 @@ Architectural mandates, standards, and workflows for this codebase.
   stored as the user's message. Never into a running turn or anything else a wake waits for
   (`TurnPurpose::LimitContinue`), never for a delegated worker, never for a root the user
   stopped (Stop ends its wait, delegation or not, and the session refuses a continuation until
-  the user speaks again). While the thread waits, sub-agent news does not wake it (`TurnPurpose::Wake`); it
+  the user speaks again; the stop inside "Stop and Switch" is not one, and a switch's
+  continuation ends a stop that held the root). While the thread waits, sub-agent news does not wake it (`TurnPurpose::Wake`); it
   arrives after the continuation. The wait ends when the agent works again (`limit_over`, the
   one test for the window and the session), the thread switches agent (the hand-off included;
   once the new agent is up, `LimitRecord::moved_on`, so a switch that rolls back keeps it), the

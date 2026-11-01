@@ -3311,16 +3311,25 @@ impl AgentTerminalWindow {
         // What the agent's windows hold now names what stopped the thread, and which stale copies
         // this refusal disproves.
         let held = limit_windows(&AccountStatus::shared().snapshot(chat.driver).windows);
-        match &mut chat.limit_wait {
-            Some(wait) => wait.learn(reset, now, &held),
+        // A refused continuation holds the thread longer each time, whatever its windows say:
+        // the record outlives the wait it ended.
+        let gap = chat.limit.backoff();
+        let wait = match chat.limit_wait.take() {
+            Some(mut wait) => {
+                wait.learn(reset, now, &held);
+                wait
+            }
             None => {
                 info!(
-                    "thread {thread} waits for its usage limit to reset (reset time known: {})",
+                    "thread {thread} waits for its usage limit to reset (reset time known: {}, \
+                     back-off: {gap} s)",
                     reset.is_some()
                 );
-                chat.limit_wait = Some(LimitWait::new(reset, now, &held));
+                LimitWait::new(reset, now, &held)
             }
-        }
+        };
+        let wait = chat.limit_wait.insert(wait);
+        wait.back_off(now, gap);
         chat.show_limit_wait(now);
         // Sub-agent news waits too: the limit would refuse the turn it started.
         if let Some(session) = chat.slot.get() {
@@ -3407,6 +3416,8 @@ impl AgentTerminalWindow {
             match session.continue_after_limit() {
                 ContinueOutcome::Started => {
                     info!("thread {thread} continues: its usage limit has reset");
+                    // A refusal before the agent works again is one of this continuation.
+                    self.with_chat_mut(&thread, |c| c.limit.continued());
                     self.end_limit_wait_of(&thread);
                 }
                 ContinueOutcome::Busy => {}

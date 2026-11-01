@@ -291,7 +291,13 @@ Architectural mandates, standards, and workflows for this codebase.
   every failed guess at least doubles the next one (a few failed turns spread ever wider, never
   a loop), and a copy whose usage drops or that names another reset is new. A
   refusal during a wait counts the same way, and readings from before it, or a reset time it
-  came after, no longer count.
+  came after, no longer count. A refused continuation holds the thread whatever its windows say
+  (every one shown free, or none reported): the thread keeps a record from one wait to the next
+  (`LimitRecord`, kept by "Don't Continue" and a new wait, reset only when the agent works
+  again or the thread switches agent), and each continuation refused before the agent works
+  again waits at least 15 minutes, then at least double the last gap, up to 6 hours, before the
+  next (`LimitWait::back_off`); a refusal of the user's own retry keeps the last gap, never
+  shrinking it.
   Readings count from when windows last arrived (`updated_at`), never an account-only
   update. agy's `/usage` side command never raises `RateLimited`: a reading is not a refusal. The window's minute sweep (`continue_after_limits`)
   then calls `ChatSession::continue_after_limit`, which sends the app's continue prompt as a

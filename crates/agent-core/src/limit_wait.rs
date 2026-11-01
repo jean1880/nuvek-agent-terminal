@@ -21,8 +21,14 @@
 //! refusal also restarts the clock: only readings taken after it count, and a reset time it came
 //! after is dropped. When every window still holding the thread names a reset time ahead, the
 //! next reading is taken just after the latest, which the thread shows as when it continues;
-//! only a reading decides. The caller supplies the clock and the readings; nothing here sends or
-//! probes anything.
+//! only a reading decides.
+//!
+//! A refusal no window explains (every window shown free, or none reported) would loop just the
+//! same, each new wait continuing on its first reading. So the thread keeps a [`LimitRecord`]
+//! from one wait to the next, until the agent works again: each continuation refused meanwhile
+//! holds the next wait off ([`LimitWait::back_off`]) for at least [`BACKOFF_MIN`], then at least
+//! double the last gap, up to [`BACKOFF_MAX`]. The caller supplies the clock and the readings;
+//! nothing here sends or probes anything.
 
 use crate::event::{Event, ItemKind, TurnState};
 
@@ -65,13 +71,19 @@ pub fn limit_refused(event: &Event) -> bool {
     }
 }
 
-/// What a thread keeps of its usage limit whether or not it waits for it: that the limit stopped
-/// it. Set by a refusal ([`limit_refused`]), and kept until the agent works again
-/// ([`limit_over`]) or the thread runs another agent. A banner's rate limit, a usage reading at
-/// 100 % or a tool's 429 never set it.
+/// What a thread keeps of its usage limit whether or not it waits for it, from one wait to the
+/// next: that the limit stopped it (set by a refusal, [`limit_refused`]; a banner's rate limit, a
+/// usage reading at 100 % or a tool's 429 never set it), and the back-off its refused
+/// continuations built up ([`Self::backoff`]). Kept until the agent works again
+/// ([`limit_over`]) or the thread runs another agent; ending a wait ("Don't Continue", a
+/// continuation sent) keeps it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LimitRecord {
     refused: bool,
+    /// A continuation went out since the agent last worked (or since the last refusal counted).
+    continued: bool,
+    /// The back-off the last refused continuation earned, in seconds; 0 before any.
+    gap: i64,
 }
 
 impl LimitRecord {
@@ -95,6 +107,24 @@ impl LimitRecord {
     pub fn forget(&mut self) {
         *self = Self::default();
     }
+
+    /// The thread was sent its continuation: a refusal before the agent works again is one of it.
+    pub fn continued(&mut self) {
+        self.continued = true;
+    }
+
+    /// The least a refusal just observed holds the thread ([`LimitWait::back_off`]). The first
+    /// since the agent last worked holds it for nothing more (its reset time or windows decide);
+    /// each one of a continuation at least [`BACKOFF_MIN`] and at least double the last, up to
+    /// [`BACKOFF_MAX`]; any other (the user's own retry) as long as the last. So refusals no
+    /// window explains (every window shown free, or none reported) never loop, and the gaps
+    /// never shrink.
+    pub fn backoff(&mut self) -> i64 {
+        if std::mem::take(&mut self.continued) {
+            self.gap = self.gap.saturating_mul(2).clamp(BACKOFF_MIN, BACKOFF_MAX);
+        }
+        self.gap
+    }
 }
 
 /// Seconds past a reset time before continuing: the provider's clock and ours may differ.
@@ -103,8 +133,13 @@ pub const GRACE: i64 = 60;
 /// Seconds between quota readings while no reset time is known: 2, 5, 10, then every 15 min.
 const POLL: [i64; 4] = [2 * 60, 5 * 60, 10 * 60, 15 * 60];
 
-/// The shortest wait before a copy a refusal came after is taken as stale again.
+/// The shortest wait before a copy a refusal came after is taken as stale again, and the first
+/// back-off a refused continuation earns ([`LimitRecord::backoff`]).
 pub const BACKOFF_MIN: i64 = 15 * 60;
+
+/// The longest back-off refused continuations earn: a limit that has reset is never waited out
+/// for days.
+pub const BACKOFF_MAX: i64 = 6 * 60 * 60;
 
 /// One quota window as the wait reads it.
 #[derive(Debug, Clone, PartialEq)]
@@ -157,6 +192,9 @@ pub struct LimitWait {
     blocking: Vec<String>,
     /// Copies a refusal came after (see [`BackedOff`]): not taken as stale until their gap ends.
     backed_off: Vec<BackedOff>,
+    /// Never continued before this, whatever a reset time or a reading says: the back-off the
+    /// thread's refused continuations earned ([`Self::back_off`]).
+    not_before: i64,
 }
 
 /// A copy (key and reset time) that was already past its reset when the agent refused work.
@@ -202,7 +240,14 @@ impl LimitWait {
                 .map(|w| w.key.clone())
                 .collect(),
             backed_off: backed_off_by(held, now),
+            not_before: now,
         }
+    }
+
+    /// A refusal at `now` earned the thread `gap` seconds ([`LimitRecord::backoff`]): it does not
+    /// continue before then. Only ever later.
+    pub fn back_off(&mut self, now: i64, gap: i64) {
+        self.not_before = self.not_before.max(now.saturating_add(gap));
     }
 
     /// Free at `now`: not exhausted, or past its own reset (a stale copy) once any back-off a
@@ -251,13 +296,24 @@ impl LimitWait {
         }
     }
 
-    /// When the limit resets, if known: what the thread says it waits for.
+    /// When the limit resets, if known: what the thread says it waits for (no earlier than its
+    /// back-off ends).
     pub fn reset(&self) -> Option<i64> {
-        self.reset.or(self.expected)
+        self.reset
+            .or(self.expected)
+            .map(|at| at.max(self.not_before))
     }
 
     /// What to do at `now`. `reading`: the agent's latest quota windows and when they arrived.
+    /// Never [`Step::Continue`] before the back-off ends.
     pub fn step(&mut self, now: i64, reading: Option<(i64, &[Window])>) -> Step {
+        match self.judge(now, reading) {
+            Step::Continue if now < self.not_before => Step::Wait,
+            step => step,
+        }
+    }
+
+    fn judge(&mut self, now: i64, reading: Option<(i64, &[Window])>) -> Step {
         if let Some(reset) = self.reset {
             return if now >= reset.saturating_add(GRACE) {
                 Step::Continue
@@ -373,6 +429,64 @@ mod tests {
         record.observe(&failed("You've hit your session limit"));
         record.forget();
         assert!(!record.stopped());
+    }
+
+    /// When each wait ends with a continuation: the first tick (each minute from `refusal`) at
+    /// which `wait` continues on `reading`.
+    fn continues_after(wait: &mut LimitWait, refusal: i64, reading: &[Window]) -> i64 {
+        let mut t = refusal + 60;
+        while wait.step(t, Some((refusal + 1, reading))) != Step::Continue {
+            t += 60;
+            assert!(t < refusal + 10 * BACKOFF_MAX, "never continues");
+        }
+        t - refusal
+    }
+
+    #[test]
+    fn refused_continuations_no_window_explains_back_off_ever_wider() {
+        // Every window shows usage left, yet the agent refuses each continuation at once: no
+        // window explains it, so only the record of refusals keeps it from looping.
+        let free = [window("5-hour", 0.2, Some(10_000_000))];
+        let refuse = failed("You've hit your session limit");
+        let mut record = LimitRecord::default();
+        assert!(record.observe(&refuse));
+        let mut wait = LimitWait::new(None, 1_000, &free);
+        wait.back_off(1_000, record.backoff());
+        // The first refusal: a reading taken after it decides at once.
+        assert_eq!(continues_after(&mut wait, 1_000, &free), 60);
+        let mut sent = 1_060;
+        let mut gaps = Vec::new();
+        for _ in 0..7 {
+            record.continued();
+            let refusal = sent + 5;
+            assert!(record.observe(&refuse));
+            // Each refusal starts a new wait; the record outlives the one before.
+            let mut wait = LimitWait::new(None, refusal, &free);
+            wait.back_off(refusal, record.backoff());
+            let gap = continues_after(&mut wait, refusal, &free);
+            gaps.push(gap);
+            sent = refusal + gap;
+        }
+        // At least the minimum, then each at least double the last, up to the cap.
+        assert_eq!(gaps, [900, 1_800, 3_600, 7_200, 14_400, 21_600, 21_600]);
+        // The user's own retry refused meanwhile (no continuation since) keeps the gap.
+        assert!(record.observe(&refuse));
+        let mut wait = LimitWait::new(None, sent, &free);
+        wait.back_off(sent, record.backoff());
+        assert_eq!(continues_after(&mut wait, sent, &free), BACKOFF_MAX);
+        // Once the agent works again the record starts over.
+        record.observe(&answered());
+        assert!(record.observe(&refuse));
+        let mut wait = LimitWait::new(None, sent, &free);
+        wait.back_off(sent, record.backoff());
+        assert_eq!(continues_after(&mut wait, sent, &free), 60);
+        // A refusal during a wait backs it off the same way.
+        record.continued();
+        let mut wait = LimitWait::new(None, sent, &free);
+        assert!(record.observe(&refuse));
+        wait.learn(None, sent + 30, &free);
+        wait.back_off(sent + 30, record.backoff());
+        assert_eq!(continues_after(&mut wait, sent + 30, &free), BACKOFF_MIN);
     }
 
     #[test]

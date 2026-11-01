@@ -428,7 +428,8 @@ Architectural mandates, standards, and workflows for this codebase.
   (`check_updates_on_startup`), and when the user picks "Check for Updates…". Tests never reach
   it. And a model server's model list (`agent_kit::provider_models`): one GET of
   `<base>/v1/models` at the address the user configured for a profile's model provider, off the
-  main thread, with a timeout, redirects not followed, made only while a profile has a provider
+  main thread, with a timeout, redirects not followed, never through a proxy (an
+  `HTTP(S)_PROXY` in the environment is ignored), made only while a profile has a provider
   (when the models are listed, as the vendor's list is otherwise; for each enabled Local server
   at every agent scan and on Scan Now). For a Local server of a kind that says what each model
   can do, the catalogue and Scan Now also ask it (`provider_models::fetch_info`): Ollama's
@@ -436,7 +437,8 @@ Architectural mandates, standards, and workflows for this codebase.
   a failure leaves a model to its name. Its tests use a loopback listener of their own. And the
   Local agent's chat requests (`agent_kit::local_agent::HttpChat`): streamed POSTs of
   `<base>/v1/chat/completions` to the address the user configured for that server, only while
-  one of its threads runs a turn, redirects not followed, the key sent only as a bearer token
+  one of its threads runs a turn, redirects not followed, never through a proxy, the key sent
+  only as a bearer token
   read from the variable the profile names. Never add any other request. Two user actions reach GitHub without the app making a
   request: the diff panel's "Open a PR" hands GitHub's compare URL (built from the remote,
   credentials dropped: `agent_kit::github`) to the browser, and "Push & Open PR" runs one

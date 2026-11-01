@@ -84,6 +84,9 @@ impl HttpChat {
             // A ceiling on a whole reply; a silent server is noticed sooner (`STALL`).
             .timeout_recv_body(Some(Duration::from_secs(3600)))
             .max_redirects(0)
+            // The key goes only to the configured address: never through a proxy the
+            // environment names.
+            .proxy(None)
             .http_status_as_error(false)
             .user_agent(&self.user_agent)
             .build()

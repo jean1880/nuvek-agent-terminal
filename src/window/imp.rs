@@ -4770,6 +4770,7 @@ impl AgentTerminalWindow {
             .build();
         let look = adw::PreferencesGroup::builder().title("Appearance").build();
         look.add(&theme_row);
+        look.add(&font_scale_row);
         general.add(&look);
         let startup = adw::PreferencesGroup::builder().title("Startup").build();
         startup.add(&starting_directory_row);
@@ -4779,6 +4780,34 @@ impl AgentTerminalWindow {
         startup.add(&update_check_row);
         startup.add(&setup_row);
         general.add(&startup);
+        // How threads and their agents behave, whatever page they are on.
+        let threads = adw::PreferencesGroup::builder().title("Threads").build();
+        threads.add(&suspend_row);
+        let continue_row = self.config_switch(
+            "Continue When Usage Limits Reset",
+            "A thread whose agent ran out of usage waits for its limit to reset, then restarts \
+             the agent if needed and asks it to carry on. A thread's Don't Continue cancels its \
+             wait",
+            |c| c.continue_after_limit,
+            SaveWhen::Debounced(|c, on| c.continue_after_limit = on),
+            |imp, on| {
+                if !on {
+                    imp.for_each_window(Self::cancel_limit_waits);
+                }
+            },
+        );
+        threads.add(&continue_row);
+        let outside_row = self.config_switch(
+            "Show Sessions Started Outside Agent Terminal",
+            "List the agents' own recent sessions (started in a terminal or another tool) as \
+             threads in the sidebar. Off: their session files are not scanned; threads \
+             already listed stay",
+            |c| c.list_outside_sessions,
+            SaveWhen::Owned,
+            Self::set_list_outside_sessions,
+        );
+        threads.add(&outside_row);
+        general.add(&threads);
         let notifications = adw::PreferencesGroup::builder()
             .title("Notifications")
             .build();
@@ -4822,38 +4851,12 @@ impl AgentTerminalWindow {
             .build();
         let appearance = adw::PreferencesGroup::builder().title("Appearance").build();
         appearance.add(&font_row);
-        appearance.add(&font_scale_row);
         appearance.add(&cursor_row);
         appearance.add(&blink_row);
         terminal.add(&appearance);
         let behaviour = adw::PreferencesGroup::builder().title("Behaviour").build();
         behaviour.add(&cli_client_row);
         behaviour.add(&scrollback_row);
-        behaviour.add(&suspend_row);
-        let continue_row = self.config_switch(
-            "Continue When Usage Limits Reset",
-            "A thread whose agent ran out of usage waits for its limit to reset, then restarts \
-             the agent if needed and asks it to carry on. A thread's Don't Continue cancels its \
-             wait",
-            |c| c.continue_after_limit,
-            SaveWhen::Debounced(|c, on| c.continue_after_limit = on),
-            |imp, on| {
-                if !on {
-                    imp.for_each_window(Self::cancel_limit_waits);
-                }
-            },
-        );
-        behaviour.add(&continue_row);
-        let outside_row = self.config_switch(
-            "Show Sessions Started Outside Agent Terminal",
-            "List the agents' own recent sessions (started in a terminal or another tool) as \
-             threads in the sidebar. Off: their session files are not scanned; threads \
-             already listed stay",
-            |c| c.list_outside_sessions,
-            SaveWhen::Owned,
-            Self::set_list_outside_sessions,
-        );
-        behaviour.add(&outside_row);
         terminal.add(&behaviour);
         dialog.add(&terminal);
 

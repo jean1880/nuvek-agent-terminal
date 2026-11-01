@@ -894,7 +894,7 @@ impl Store {
             "UPDATE delegation_workers SET delegation_status = ?2, delegation_reason = ?3,
                  delegation_paths = ?4, updated_at = ?5
              WHERE id = ?1",
-            params![id, status, masked(reason), paths, at],
+            params![id, status, masked(reason), scrubbed_json(paths)?, at],
         )?;
         super::require_row(n, id)
     }
@@ -918,7 +918,7 @@ impl Store {
                 run.authority_epoch,
                 run.state,
                 masked(run.terminal_reason.as_deref()),
-                run.usage_json,
+                run.usage_json.as_deref().map(scrubbed_json).transpose()?,
                 run.created_at,
                 run.updated_at
             ],
@@ -973,7 +973,7 @@ impl Store {
                 state,
                 native_turn_id,
                 masked(terminal_reason),
-                usage_json,
+                usage_json.map(scrubbed_json).transpose()?,
                 at
             ],
         )?;
@@ -1417,6 +1417,42 @@ mod tests {
         ] {
             assert!(!json.contains(&canary));
             let _: serde_json::Value = serde_json::from_str(json).unwrap();
+        }
+    }
+
+    #[test]
+    fn worker_status_paths_and_run_usage_are_scrubbed_at_the_write_boundary() {
+        let tree = tree();
+        let canary = format!("{}{}", "ghp_", "z".repeat(36));
+        let paths = serde_json::json!([format!("src/{canary}")]).to_string();
+        tree.s
+            .set_delegation_worker_status("w_child", "restricted", None, &paths, 2)
+            .unwrap();
+        let stored = tree.s.delegation_worker("w_child").unwrap().unwrap();
+        assert!(!stored.delegation_paths.contains(&canary));
+        let usage = serde_json::json!({"note": canary}).to_string();
+        let mut row = run("r_usage", "w_child", "running");
+        row.usage_json = Some(usage.clone());
+        tree.s.insert_delegation_run(&row).unwrap();
+        tree.s
+            .set_delegation_run_state("r_usage", "completed", None, None, Some(&usage), 3)
+            .unwrap();
+        let mut second = run("r_usage2", "w_child", "running");
+        second.usage_json = None;
+        tree.s.insert_delegation_run(&second).unwrap();
+        tree.s
+            .set_delegation_run_state("r_usage2", "completed", None, None, Some(&usage), 3)
+            .unwrap();
+        for id in ["r_usage", "r_usage2"] {
+            let json = tree
+                .s
+                .delegation_run(id)
+                .unwrap()
+                .unwrap()
+                .usage_json
+                .unwrap();
+            assert!(!json.contains(&canary), "{id}");
+            let _: serde_json::Value = serde_json::from_str(&json).unwrap();
         }
     }
 

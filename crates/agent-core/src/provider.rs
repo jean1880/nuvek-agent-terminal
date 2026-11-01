@@ -220,6 +220,97 @@ pub fn bind_thread_model(env: &mut Vec<(String, String)>, model: Option<&str>) {
     }
 }
 
+/// Where a `--settings` flag is in `args`: the index of the flag and its value (`--settings
+/// <value>` or `--settings=<value>`). A flag with no value is `Err`.
+fn settings_flags(args: &[String]) -> Result<Vec<(usize, usize, String)>, String> {
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if let Some(value) = args[i].strip_prefix("--settings=") {
+            found.push((i, i, value.to_owned()));
+        } else if args[i] == "--settings" {
+            let value = args
+                .get(i + 1)
+                .ok_or_else(|| "The profile's --settings has no value".to_owned())?;
+            found.push((i, i + 1, value.clone()));
+            i += 1;
+        }
+        i += 1;
+    }
+    Ok(found)
+}
+
+/// A profile's own arguments (`profile_args`) followed by what its provider launch adds
+/// (`launch_args`). Claude Code reads only the last `--settings`, so when the launch carries its
+/// overlay ([`ModelProvider::args`]) a `--settings` of the profile's own is not passed beside it
+/// but merged under it: the profile's object, with the overlay's keys on top (its `env` merged
+/// variable by variable, the overlay's winning). Only inline JSON can be merged here, without
+/// reading a file: a file path, or a value that is not a JSON object, refuses the launch with
+/// the reason, rather than be dropped. With no overlay the arguments go through as they are.
+pub fn with_profile_settings(
+    profile_args: &[String],
+    launch_args: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let overlay_at = settings_flags(&launch_args)?;
+    let own = settings_flags(profile_args)?;
+    let mut out: Vec<String> = Vec::with_capacity(profile_args.len() + launch_args.len());
+    let (Some((_, overlay_value_at, overlay)), Some((_, _, user))) =
+        (overlay_at.last(), own.last())
+    else {
+        out.extend(profile_args.iter().cloned());
+        out.extend(launch_args);
+        return Ok(out);
+    };
+    if !user.trim_start().starts_with('{') {
+        return Err(format!(
+            "The profile passes --settings {user}, a file, which cannot be merged with the model \
+             server's settings: give it as inline JSON instead, or move its keys to Claude's \
+             settings.json."
+        ));
+    }
+    let not_object = || "The profile's --settings is not a JSON object".to_owned();
+    let mut merged: serde_json::Map<String, serde_json::Value> = serde_json::from_str(user)
+        .ok()
+        .and_then(|v: serde_json::Value| v.as_object().cloned())
+        .ok_or_else(not_object)?;
+    let overlay: serde_json::Map<String, serde_json::Value> = serde_json::from_str(overlay)
+        .ok()
+        .and_then(|v: serde_json::Value| v.as_object().cloned())
+        .ok_or_else(|| "The model server's settings are not a JSON object".to_owned())?;
+    for (key, value) in overlay {
+        match (merged.get_mut(&key), value) {
+            (Some(serde_json::Value::Object(mine)), serde_json::Value::Object(theirs)) => {
+                mine.extend(theirs);
+            }
+            (Some(_), serde_json::Value::Object(_)) => {
+                return Err(format!(
+                    "The profile's --settings has a \"{key}\" that is not an object"
+                ));
+            }
+            (_, value) => {
+                merged.insert(key, value);
+            }
+        }
+    }
+    let skip: Vec<usize> = own.iter().flat_map(|(a, b, _)| *a..=*b).collect();
+    out.extend(
+        profile_args
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !skip.contains(i))
+            .map(|(_, a)| a.clone()),
+    );
+    let overlay_value_at = *overlay_value_at;
+    out.extend(launch_args.into_iter().enumerate().map(|(i, a)| {
+        if i == overlay_value_at {
+            serde_json::Value::Object(merged.clone()).to_string()
+        } else {
+            a
+        }
+    }));
+    Ok(out)
+}
+
 /// [`bind_thread_model`] for the `--settings` overlay a provider launch gave Claude
 /// ([`ModelProvider::args`]): its [`THREAD_MODEL`] values name `model`, or go with none known. Any
 /// other `--settings` (a profile's own) is left as it is.
@@ -936,6 +1027,65 @@ mod tests {
         // Only a launch on a server has one.
         let codex = keyed.launch(Driver::Codex, Some("secret-value")).unwrap();
         assert!(overlay_env(&codex.args).is_none());
+    }
+
+    #[test]
+    fn a_profiles_own_settings_are_merged_under_the_overlay_never_dropped() {
+        let launch = at(ProviderKind::Ollama, "http://nas:11434", None)
+            .launch(Driver::Claude, None)
+            .unwrap();
+        let own = |settings: &str| {
+            vec![
+                "--verbose".to_owned(),
+                "--settings".to_owned(),
+                settings.to_owned(),
+            ]
+        };
+        let merged = with_profile_settings(
+            &own(r#"{"theme":"dark","env":{"MY_VAR":"1","ANTHROPIC_BASE_URL":"https://vendor"}}"#),
+            launch.args.clone(),
+        )
+        .unwrap();
+        // One `--settings`, the merged one: Claude Code reads only the last.
+        assert_eq!(merged.iter().filter(|a| *a == "--settings").count(), 1);
+        assert_eq!(merged[0], "--verbose");
+        let value: serde_json::Value = serde_json::from_str(&merged[merged.len() - 1]).unwrap();
+        assert_eq!(value["theme"], "dark", "the profile's own keys stay");
+        assert_eq!(value["env"]["MY_VAR"], "1", "and its own variables");
+        assert_eq!(
+            value["env"]["ANTHROPIC_BASE_URL"], "http://nas:11434",
+            "the overlay wins"
+        );
+        assert_eq!(value["env"]["ANTHROPIC_API_KEY"], "");
+        // `--settings=<json>` is the same flag.
+        let eq = with_profile_settings(
+            &["--settings={\"theme\":\"light\"}".to_owned()],
+            launch.args.clone(),
+        )
+        .unwrap();
+        assert_eq!(eq.len(), 2);
+        assert!(eq[1].contains("\"theme\":\"light\""));
+
+        // What cannot be merged refuses the launch, saying why; it is never dropped.
+        for bad in ["not json {", "[1,2]", "{\"env\": 3}"] {
+            let why = with_profile_settings(&own(bad), launch.args.clone()).unwrap_err();
+            assert!(why.contains("--settings"), "{bad}: {why}");
+        }
+        let why =
+            with_profile_settings(&own("/home/u/claude.json"), launch.args.clone()).unwrap_err();
+        assert!(why.contains("inline JSON"), "{why}");
+        assert!(with_profile_settings(&["--settings".to_owned()], launch.args.clone()).is_err());
+
+        // No overlay (a vendor launch, Codex): the profile's arguments go through as they are.
+        let codex = at(ProviderKind::Ollama, "http://nas:11434", None)
+            .launch(Driver::Codex, None)
+            .unwrap();
+        let mut want = own("/home/u/claude.json");
+        want.extend(codex.args.clone());
+        assert_eq!(
+            with_profile_settings(&own("/home/u/claude.json"), codex.args).unwrap(),
+            want
+        );
     }
 
     #[test]

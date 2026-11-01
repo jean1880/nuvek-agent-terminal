@@ -2552,10 +2552,9 @@ pub(super) fn profile_launch(
     env: Vec<(String, String)>,
     clear: &[String],
 ) -> Result<(Vec<String>, AgentEnv), String> {
-    let mut args = profile.args.clone();
     let mut agent = agent_env(env, clear);
     let Some(provider) = &crate::config::profile_provider(profile, driver) else {
-        return Ok((args, agent));
+        return Ok((profile.args.clone(), agent));
     };
     let key = provider
         .key_env()
@@ -2565,7 +2564,9 @@ pub(super) fn profile_launch(
     let launch = provider
         .launch(driver, key.as_deref())
         .map_err(|why| format!("Cannot start on {}: {why}.", provider.kind.label()))?;
-    args.extend(launch.args);
+    // A `--settings` of the profile's own is merged under Claude's overlay, never dropped.
+    let args = agent_core::provider::with_profile_settings(&profile.args, launch.args)
+        .map_err(|why| format!("Cannot start on {}: {why}", provider.kind.label()))?;
     agent.env.retain(|(name, _)| !launch.unset.contains(name));
     for name in launch.unset {
         if !agent.unset.contains(&name) {
@@ -8671,6 +8672,28 @@ pub(super) mod tests {
         // The profile's own, then the settings overlay that pins the server, without the key.
         assert_eq!(&args[..2], ["--verbose", "--settings"]);
         assert!(args[2].contains("http://gw:4000") && !args[2].contains("gateway-key"));
+        // The profile's own `--settings` is merged under the overlay; a file is refused.
+        let own_settings = |value: &str| Profile {
+            args: vec!["--settings".into(), value.into()],
+            ..on_gateway.clone()
+        };
+        let (args, _) = profile_launch(
+            &own_settings(r#"{"theme":"dark"}"#),
+            Driver::Claude,
+            env_file.clone(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(args.len(), 2, "{args:?}");
+        assert!(args[1].contains("\"theme\":\"dark\"") && args[1].contains("http://gw:4000"));
+        let why = profile_launch(
+            &own_settings("/home/u/claude.json"),
+            Driver::Claude,
+            env_file.clone(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(why.starts_with("Cannot start on LiteLLM") && why.contains("inline JSON"));
         assert_eq!(
             env.lookup("ANTHROPIC_BASE_URL").as_deref(),
             Some("http://gw:4000")

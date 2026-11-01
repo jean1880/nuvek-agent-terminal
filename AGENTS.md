@@ -318,7 +318,9 @@ Architectural mandates, standards, and workflows for this codebase.
   → Agents → Model Provider, Claude and Codex only) starts the agent on that server
   (`agent_core::provider`: Claude through `ANTHROPIC_BASE_URL`, with the vendor's own credential
   variables removed, all pinned again by a `--settings` overlay, since a settings file's `env`
-  wins over the process environment; the overlay never holds the key. Codex through a `-c`
+  wins over the process environment; the overlay never holds the key, and a profile's own
+  `--settings` is merged under it (`provider::with_profile_settings`: inline JSON only, a file
+  refuses the start, never dropped). Codex through a `-c`
   provider of the app's own id). Every chat launch path
   goes through `profile_launch` (threads, switches, forks, delegated workers), and a terminal tab
   through `utils::with_provider_args` and `apply_provider_env`: a provider that cannot be used (a

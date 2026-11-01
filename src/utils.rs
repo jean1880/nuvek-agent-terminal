@@ -849,7 +849,9 @@ pub fn with_provider_args(profile: &Profile, model: Option<&str>) -> Result<Prof
             )
         })?;
         agent_core::provider::bind_thread_model_args(&mut args, Some(model));
-        profile.args.extend(args);
+        // A `--settings` of the profile's own is merged under Claude's overlay, never dropped.
+        profile.args = agent_core::provider::with_profile_settings(&profile.args, args)
+            .map_err(|why| format!("Cannot start on {label}: {why}"))?;
         profile
             .args
             .extend(agent_core::provider::model_args(driver, model));
@@ -1014,6 +1016,21 @@ mod tests {
             "{overlay}"
         );
         assert!(!overlay.contains(agent_core::provider::THREAD_MODEL));
+        // A `--settings` of the profile's own is merged into it, or refuses the tab.
+        let own = |value: &str| Profile {
+            command: "claude".into(),
+            driver: None,
+            args: vec!["--settings".into(), value.into()],
+            ..on(ProviderKind::Ollama, None)
+        };
+        let merged = with_provider_args(&own(r#"{"theme":"dark"}"#), Some("qwen3-coder")).unwrap();
+        assert_eq!(merged.args.iter().filter(|a| *a == "--settings").count(), 1);
+        assert!(
+            merged.args[1].contains("\"theme\":\"dark\""),
+            "{:?}",
+            merged.args
+        );
+        assert!(with_provider_args(&own("/home/u/claude.json"), Some("qwen3-coder")).is_err());
 
         let (provider, driver) = terminal_provider(&Profile {
             command: "claude".into(),

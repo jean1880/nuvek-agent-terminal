@@ -361,8 +361,11 @@ these models, and blanks the vendor's credential and routing variables (`ANTHROP
 `ANTHROPIC_CUSTOM_HEADERS`, `CLAUDE_CODE_OAUTH_TOKEN` and the Bedrock, Vertex and Foundry
 switches). The overlay holds no key, so with an **API Key Variable** set, an
 `ANTHROPIC_AUTH_TOKEN` in a settings file's `env` still replaces the key: leave it out there.
-It also takes the place of a `--settings` in the profile's own arguments (Claude Code reads
-only the last one), and a managed settings file still sits above it. Changing the
+Claude Code reads only the last `--settings`, so one in the profile's own arguments is merged
+into the overlay: its keys stay, its `env` variables too, and the overlay's win where both
+set one. It must be inline JSON (`--settings '{"theme":"dark"}'`): a file path, or a value
+that is not a JSON object, refuses the start with the reason. A managed settings file still
+sits above the overlay. Changing the
 model of a thread on a server restarts Claude on the new model, resuming the same
 conversation (Claude Code cannot switch to a model id it does not know in place). Ollama
 answers Claude's token-count requests with 404 (it has no `/v1/messages/count_tokens`);

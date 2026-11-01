@@ -188,20 +188,12 @@ impl AgentTerminalWindow {
             }
         ));
 
-        // The field says at once whether it is valid, but saves only once the edit is over (the
-        // next idle turn), from what it then holds. Replacing the text (select all, paste) passes
-        // through an empty field, which is valid ("no tool"): saved at once, it cleared the
-        // tool even when the pasted command was then refused.
-        let save_pending = Rc::new(Cell::new(false));
+        // The field says at once whether it is valid, but saves only when committed (Enter, its
+        // apply button, or focus leaving it), from what it then holds: never a half-typed
+        // command, and never the empty field a replacement (select all, paste) passes through.
         command_row.connect_changed(glib::clone!(
-            #[weak]
-            obj,
-            #[weak]
-            preset_row,
             #[strong]
             syncing,
-            #[strong]
-            save_pending,
             move |entry| {
                 if syncing.get() {
                     return;
@@ -217,38 +209,44 @@ impl AgentTerminalWindow {
                         entry.set_title("Command");
                     }
                 }
-                if save_pending.replace(true) {
-                    return;
-                }
-                let (entry, save_pending, syncing) =
-                    (entry.clone(), save_pending.clone(), syncing.clone());
-                glib::idle_add_local_once(glib::clone!(
-                    #[weak]
-                    obj,
-                    #[weak]
-                    preset_row,
-                    move || {
-                        save_pending.set(false);
-                        // Still invalid when the edit is over: nothing is saved.
-                        let Ok(tool) = tool_from_text(&entry.text()) else {
-                            return;
-                        };
-                        // A typed argv that is a preset's selects it; otherwise it is Custom.
-                        let want = if tool.is_none() {
-                            NONE_INDEX
-                        } else {
-                            row_of(tool.as_ref())
-                        };
-                        if preset_row.selected() != want {
-                            syncing.set(true);
-                            preset_row.set_selected(want);
-                            syncing.set(false);
-                        }
-                        obj.imp().set_diff_tool(tool);
-                    }
-                ));
             }
         ));
+        let commit = Rc::new(glib::clone!(
+            #[weak]
+            obj,
+            #[weak]
+            preset_row,
+            #[weak]
+            command_row,
+            #[strong]
+            syncing,
+            move || {
+                // Still invalid when committed: nothing is saved.
+                let Ok(tool) = tool_from_text(&command_row.text()) else {
+                    return;
+                };
+                // A typed argv that is a preset's selects it; otherwise it is Custom.
+                let want = if tool.is_none() {
+                    NONE_INDEX
+                } else {
+                    row_of(tool.as_ref())
+                };
+                if preset_row.selected() != want {
+                    syncing.set(true);
+                    preset_row.set_selected(want);
+                    syncing.set(false);
+                }
+                obj.imp().set_diff_tool(tool);
+            }
+        ));
+        command_row.set_show_apply_button(true);
+        let on_apply = commit.clone();
+        command_row.connect_apply(move |_| on_apply());
+        let on_enter = commit.clone();
+        command_row.connect_entry_activated(move |_| on_enter());
+        let focus = gtk4::EventControllerFocus::new();
+        focus.connect_leave(move |_| commit());
+        command_row.add_controller(focus);
 
         // Mark presets whose program is not installed, once the (off-thread) probe answers.
         glib::MainContext::default().spawn_local(glib::clone!(
@@ -327,13 +325,18 @@ pub(super) mod tests {
             .downcast::<adw::SwitchRow>()
             .expect("switch");
         let saved = || imp.config.borrow().diff_tool.clone();
-        // A typed edit is saved once it is over (the next idle turn).
+        // A typed edit is saved once it is committed (here, its apply button).
         let ctx = glib::MainContext::default();
         let type_in = |text: &str| {
             entry.set_text(text);
+            entry.emit_by_name::<()>("apply", &[]);
             crate::testutil::settle(&ctx);
         };
 
+        // Typing alone saves nothing, even a valid prefix of a command.
+        entry.set_text("m");
+        crate::testutil::settle(&ctx);
+        assert_eq!(saved(), None, "a half-typed command is never saved");
         // A preset typed out selects it and is saved.
         type_in("meld {old} {new}");
         assert_eq!(combo.selected(), 1);

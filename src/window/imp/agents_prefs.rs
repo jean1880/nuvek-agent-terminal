@@ -1123,9 +1123,10 @@ impl AgentTerminalWindow {
         // Initial sync state check
         sync_cb();
 
-        // Applied once valid, ~400 ms after typing stops (the file checks run off the main
-        // thread) or at once when focus leaves. An invalid draft stays in the entry with its
-        // error shown inline, and the previously saved list stays in use; nothing reverts.
+        // Checked ~400 ms after typing stops (the file checks run off the main thread), and
+        // applied only when committed: Enter, the apply button or focus leaving, never a
+        // half-typed path. An invalid draft stays in the entry with its error shown inline, and
+        // the previously saved list stays in use; nothing reverts.
         let on_sources = sync_cb.clone();
         let typing = Rc::new(crate::window::Generation::new());
         let validate = Rc::new(glib::clone!(
@@ -1137,7 +1138,7 @@ impl AgentTerminalWindow {
             sources_error,
             #[strong]
             typing,
-            move |wait: bool| {
+            move |wait: bool, commit: bool| {
                 let current = typing.next();
                 let text = sources_row.text().to_string();
                 let typing = typing.clone();
@@ -1173,7 +1174,7 @@ impl AgentTerminalWindow {
                                     None,
                                 );
                                 let imp = obj.imp();
-                                if imp.config.borrow().permission_sources != parsed {
+                                if commit && imp.config.borrow().permission_sources != parsed {
                                     imp.config.borrow_mut().permission_sources = parsed;
                                     imp.schedule_config_save();
                                     on_sources();
@@ -1191,9 +1192,14 @@ impl AgentTerminalWindow {
             }
         ));
         let on_change = validate.clone();
-        sources_row.connect_changed(move |_| on_change(true));
+        sources_row.connect_changed(move |_| on_change(true, false));
+        sources_row.set_show_apply_button(true);
+        let on_apply = validate.clone();
+        sources_row.connect_apply(move |_| on_apply(false, true));
+        let on_enter = validate.clone();
+        sources_row.connect_entry_activated(move |_| on_enter(false, true));
         let focus = gtk4::EventControllerFocus::new();
-        focus.connect_leave(move |_| validate(false));
+        focus.connect_leave(move |_| validate(false, true));
         sources_row.add_controller(focus);
 
         let on_sync_for_diff = sync_cb.clone();

@@ -4845,7 +4845,7 @@ impl AgentTerminalWindow {
             .title("Terminal")
             .icon_name("at-utilities-terminal-symbolic")
             .description(
-                "Terminal tabs and the terminal drawer (Ctrl+`). Their colours follow the theme \
+                "Terminal tabs and the terminal drawer (Ctrl+J). Their colours follow the theme \
                  (General).",
             )
             .build();

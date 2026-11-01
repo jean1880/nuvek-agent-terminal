@@ -1008,7 +1008,7 @@ fn native_quick_reply_chips_fill_the_composer_and_send_nothing() {
     assert!(actions.borrow().is_empty(), "Dismiss changes no setting");
 
     offer("reply:a2");
-    action("Don\u{2019}t suggest these").emit_clicked();
+    action("Don\u{2019}t Suggest These").emit_clicked();
     crate::testutil::settle(&ctx);
     assert!(chips().is_empty());
     assert_eq!(&*actions.borrow(), &["StopQuickReplies".to_owned()]);

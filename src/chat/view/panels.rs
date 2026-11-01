@@ -947,12 +947,19 @@ fn load_mcp(ctx: &PanelCtx, stack: &gtk4::Stack) {
                         "●",
                         &["mcp-dot", &format!("mcp-{}", mcp_status_class(&s.status))],
                     );
+                    // The subtitle says the status in words; the dot is only its colour.
+                    dot.update_state(&[gtk4::accessible::State::Hidden(true)]);
                     row.add_prefix(&dot);
 
                     let reconnect = gtk4::Button::from_icon_name("at-view-refresh-symbolic");
                     reconnect.add_css_class("flat");
                     reconnect.set_valign(gtk4::Align::Center);
                     reconnect.set_tooltip_text(Some("Reconnect"));
+                    // Every row has one: the name says which server.
+                    reconnect.update_property(&[gtk4::accessible::Property::Label(&format!(
+                        "Reconnect {}",
+                        s.name
+                    ))]);
                     reconnect.set_sensitive(s.enabled);
                     let ctx3 = ctx2.clone();
                     let name = s.name.clone();
@@ -998,6 +1005,10 @@ fn load_mcp(ctx: &PanelCtx, stack: &gtk4::Stack) {
                     toggle.set_active(s.enabled);
                     toggle.set_valign(gtk4::Align::Center);
                     toggle.set_tooltip_text(Some("Enabled for this session"));
+                    toggle.update_property(&[gtk4::accessible::Property::Label(&format!(
+                        "{} enabled for this session",
+                        s.name
+                    ))]);
                     let ctx3 = ctx2.clone();
                     let name = s.name.clone();
                     toggle.connect_state_set(glib::clone!(

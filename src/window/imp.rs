@@ -111,7 +111,7 @@ const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
             <child>
               <object class="GtkShortcutsShortcut">
                 <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;T</property>
-                <property name="title">New Thread / Tab</property>
+                <property name="title">New Thread</property>
               </object>
             </child>
             <child>
@@ -129,13 +129,19 @@ const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
             <child>
               <object class="GtkShortcutsShortcut">
                 <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;W</property>
-                <property name="title">Close Tab</property>
+                <property name="title">Close Thread or Tab</property>
               </object>
             </child>
             <child>
               <object class="GtkShortcutsShortcut">
                 <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;S</property>
-                <property name="title">Checkpoint Workspace</property>
+                <property name="title">Checkpoint Now</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;R</property>
+                <property name="title">Restart Agent</property>
               </object>
             </child>
             <child>
@@ -151,20 +157,20 @@ const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
             <property name="title">Panels &amp; Views</property>
             <child>
               <object class="GtkShortcutsShortcut">
-                <property name="accelerator">F9</property>
-                <property name="title">Toggle Sidebar</property>
+                <property name="accelerator">F9 &lt;Primary&gt;&lt;Shift&gt;B</property>
+                <property name="title">Show or Hide Threads</property>
               </object>
             </child>
             <child>
               <object class="GtkShortcutsShortcut">
-                <property name="accelerator">&lt;Primary&gt;J</property>
-                <property name="title">Toggle Terminal Drawer</property>
+                <property name="accelerator">&lt;Primary&gt;J &lt;Primary&gt;grave</property>
+                <property name="title">Show or Hide Terminal Drawer</property>
               </object>
             </child>
             <child>
               <object class="GtkShortcutsShortcut">
                 <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;D</property>
-                <property name="title">Toggle Diff View</property>
+                <property name="title">Show or Hide Changes</property>
               </object>
             </child>
             <child>
@@ -221,13 +227,13 @@ const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
             <property name="title">Navigation &amp; Tabs</property>
             <child>
               <object class="GtkShortcutsShortcut">
-                <property name="accelerator">&lt;Primary&gt;Tab</property>
+                <property name="accelerator">&lt;Primary&gt;Tab &lt;Primary&gt;Page_Down</property>
                 <property name="title">Next Tab</property>
               </object>
             </child>
             <child>
               <object class="GtkShortcutsShortcut">
-                <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;Tab</property>
+                <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;Tab &lt;Primary&gt;Page_Up</property>
                 <property name="title">Previous Tab</property>
               </object>
             </child>
@@ -235,6 +241,35 @@ const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
               <object class="GtkShortcutsShortcut">
                 <property name="accelerator">&lt;Alt&gt;1...9</property>
                 <property name="title">Select Tab by Number</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;&lt;Alt&gt;1...9</property>
+                <property name="title">New Tab as Profile by Number</property>
+              </object>
+            </child>
+          </object>
+        </child>
+        <child>
+          <object class="GtkShortcutsGroup">
+            <property name="title">Terminal</property>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;C</property>
+                <property name="title">Copy</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;V</property>
+                <property name="title">Paste</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Shift&gt;F10 Menu</property>
+                <property name="title">Open the Context Menu</property>
               </object>
             </child>
           </object>
@@ -1132,9 +1167,9 @@ fn thread_subtitle(
 /// [`present_message`] over whichever window `parent` is in (a popped-out diff panel's, say).
 fn present_message_over(parent: &impl IsA<gtk4::Widget>, heading: &str, body: &str) {
     let dialog = adw::AlertDialog::new(Some(heading), Some(body));
-    dialog.add_response("ok", "OK");
-    dialog.set_default_response(Some("ok"));
-    dialog.set_close_response("ok");
+    dialog.add_response("close", "Close");
+    dialog.set_default_response(Some("close"));
+    dialog.set_close_response("close");
     dialog.present(Some(parent));
 }
 
@@ -1326,7 +1361,7 @@ pub struct AgentTerminalWindow {
     test_toasts: RefCell<Vec<adw::Toast>>,
     /// A change arrived while a reload was running: load again when it ends.
     summaries_stale: std::cell::Cell<bool>,
-    /// The sidebar's "Show archived" toggle.
+    /// The sidebar's "Show Archived" toggle.
     show_archived: std::cell::Cell<bool>,
     /// A new thread asked for while agents were still being detected: what to create once the
     /// default agent is known.
@@ -2018,6 +2053,10 @@ impl AgentTerminalWindow {
             debug!("Action: Keyboard Shortcuts");
             imp.show_shortcuts();
         });
+        self.add_win_action("about", |imp| {
+            debug!("Action: About");
+            imp.show_about();
+        });
 
         self.add_win_action("support", |imp| {
             debug!("Action: Support Agent Terminal");
@@ -2285,7 +2324,7 @@ impl AgentTerminalWindow {
 
         let settings_btn = gtk4::Button::builder()
             .icon_name("at-emblem-system-symbolic")
-            .tooltip_text("Settings")
+            .tooltip_text("Settings (Ctrl+,)")
             .build();
         settings_btn.connect_clicked(glib::clone!(
             #[weak]
@@ -2531,6 +2570,7 @@ impl AgentTerminalWindow {
                 .can_target(false)
                 .visible(false)
                 .css_classes(["update-dot"])
+                .accessible_role(gtk4::AccessibleRole::Presentation)
                 .build();
             let menu_overlay = gtk4::Overlay::builder().child(&menu_btn).build();
             menu_overlay.add_overlay(&dot);
@@ -2552,7 +2592,7 @@ impl AgentTerminalWindow {
 
             let drawer_btn = Button::builder()
                 .icon_name("at-utilities-terminal-symbolic")
-                .tooltip_text("Terminal Drawer (Ctrl+`)")
+                .tooltip_text("Show or Hide Terminal Drawer (Ctrl+J)")
                 .action_name("win.toggle-drawer")
                 .build();
             let diff_btn = Button::builder()
@@ -2881,9 +2921,33 @@ impl AgentTerminalWindow {
         menu.append_section(None, &support);
         let app = gtk4::gio::Menu::new();
         app.append(Some(&update_menu_label()), Some("win.check-updates"));
+        app.append(Some("Settings"), Some("win.preferences"));
+        app.append(Some("Keyboard Shortcuts"), Some("win.shortcuts"));
+        app.append(Some("About Agent Terminal"), Some("win.about"));
         *self.update_menu.borrow_mut() = Some(app.clone());
         menu.append_section(None, &app);
         menu
+    }
+
+    /// "About Agent Terminal": name, version, licence and where to report a problem, all from
+    /// the package metadata.
+    fn show_about(&self) {
+        let developer = env!("CARGO_PKG_AUTHORS")
+            .split(['<', ':'])
+            .next()
+            .unwrap_or_default()
+            .trim();
+        let about = adw::AboutDialog::builder()
+            .application_name("Agent Terminal")
+            .application_icon(crate::icons::APP_ICON_COLOUR)
+            .version(env!("CARGO_PKG_VERSION"))
+            .developer_name(developer)
+            .comments(env!("CARGO_PKG_DESCRIPTION"))
+            .license_type(gtk4::License::MitX11)
+            .website(env!("CARGO_PKG_HOMEPAGE"))
+            .issue_url(concat!(env!("CARGO_PKG_REPOSITORY"), "/issues"))
+            .build();
+        about.present(Some(&*self.obj()));
     }
 
     /// "Support Agent Terminal…": one link opens straight in the browser; several are offered in
@@ -2925,13 +2989,29 @@ impl AgentTerminalWindow {
         let found = known_update().is_some();
         if let Some(dot) = self.update_dot.borrow().as_ref() {
             dot.set_visible(found);
-            dot.set_tooltip_text(found.then_some("An update is available"));
+            // The dot cannot be hovered or read: the menu button it sits on says it.
+            if let Some(button) = dot
+                .parent()
+                .and_downcast::<gtk4::Overlay>()
+                .and_then(|overlay| overlay.child())
+            {
+                button.set_tooltip_text(Some(if found {
+                    "Menu (update available)"
+                } else {
+                    "Menu"
+                }));
+                button.update_property(&[gtk4::accessible::Property::Description(if found {
+                    "An update is available"
+                } else {
+                    ""
+                })]);
+            }
         }
         if let Some(menu) = self.update_menu.borrow().as_ref() {
             if menu.n_items() > 0 {
                 menu.remove(0);
             }
-            menu.append(Some(&update_menu_label()), Some("win.check-updates"));
+            menu.insert(0, Some(&update_menu_label()), Some("win.check-updates"));
         }
     }
 
@@ -3768,13 +3848,13 @@ impl AgentTerminalWindow {
     fn wire_input_controllers(&self, terminal: &Terminal) {
         // Context Menu (Right Click)
         let menu = gtk4::gio::Menu::new();
-        menu.append(Some("New Tab"), Some("win.new-tab"));
+        menu.append(Some("New Thread"), Some("win.new-tab"));
         menu.append_submenu(
             Some("New Tab As"),
             &self.build_profile_menu("win.new-tab-profile", |_| true),
         );
         menu.append(
-            Some("New Tab in Existing Folder…"),
+            Some("New Thread in Existing Folder…"),
             Some("win.new-tab-folder"),
         );
         menu.append_submenu(
@@ -3782,7 +3862,7 @@ impl AgentTerminalWindow {
             &self.build_profile_menu("win.new-tab-folder-profile", |_| true),
         );
         menu.append(
-            Some("New Tab in Isolated Git Worktree…"),
+            Some("New Thread in Isolated Git Worktree…"),
             Some("win.new-tab-worktree"),
         );
         menu.append_submenu(
@@ -3790,7 +3870,7 @@ impl AgentTerminalWindow {
             &self.build_profile_menu("win.new-tab-worktree-profile", |_| true),
         );
         menu.append(Some("New Window"), Some("app.new-window"));
-        menu.append(Some("Restart Session"), Some("win.restart-tab"));
+        menu.append(Some("Restart Agent"), Some("win.restart-tab"));
         menu.append(Some("Checkpoint Now"), Some("win.checkpoint-now"));
         menu.append(Some("Show or Hide Changes"), Some("win.toggle-diff"));
         menu.append_section(None, &self.build_session_section());
@@ -3826,6 +3906,41 @@ impl AgentTerminalWindow {
             }
         ));
         terminal.add_controller(click_gesture);
+
+        // The same menu by keyboard (the Menu key, Shift+F10) and by a long press on a touch
+        // screen, as the sidebar's thread menu opens. Captured, so the terminal never sees it.
+        let menu_keys = gtk4::EventControllerKey::new();
+        menu_keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        menu_keys.connect_key_pressed(glib::clone!(
+            #[weak]
+            popover,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_, key, _, state| {
+                let shift_f10 = key == gtk4::gdk::Key::F10
+                    && state.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
+                if key != gtk4::gdk::Key::Menu && !shift_f10 {
+                    return glib::Propagation::Proceed;
+                }
+                popover.set_pointing_to(None);
+                popover.popup();
+                glib::Propagation::Stop
+            }
+        ));
+        terminal.add_controller(menu_keys);
+        let long_press = gtk4::GestureLongPress::new();
+        long_press.set_touch_only(true);
+        long_press.connect_pressed(glib::clone!(
+            #[weak]
+            popover,
+            move |gesture, x, y| {
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
+                let rect = gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+                popover.set_pointing_to(Some(&rect));
+                popover.popup();
+            }
+        ));
+        terminal.add_controller(long_press);
 
         // Hyperlink Click Handler (Ctrl + Left Click)
         let link_click_gesture = gtk4::GestureClick::new();
@@ -3984,7 +4099,9 @@ impl AgentTerminalWindow {
     /// A settings row whose entry names a folder (the starting directory, the worktree folder).
     /// A path that does not exist is refused inline and never saved: one used to be accepted,
     /// saved, and then silently swapped for $HOME at spawn time with only a log line, so the
-    /// user saw a tab in the wrong place and no explanation. A usable one saves on change.
+    /// user saw a tab in the wrong place and no explanation. The path is checked as it is
+    /// typed but saved only when committed (Enter, or focus leaving the entry), so a
+    /// half-typed path that happens to exist is never saved.
     fn directory_row(
         &self,
         title: &str,
@@ -4000,6 +4117,7 @@ impl AgentTerminalWindow {
             .valign(gtk4::Align::Center)
             .placeholder_text(placeholder)
             .build();
+        entry.update_property(&[gtk4::accessible::Property::Label(title)]);
         let row = adw::ActionRow::builder()
             .title(title)
             .subtitle(help)
@@ -4007,18 +4125,23 @@ impl AgentTerminalWindow {
         row.add_suffix(&entry);
         entry.connect_changed(glib::clone!(
             #[weak]
+            row,
+            move |entry| {
+                check_directory_entry(entry, &row, help);
+            }
+        ));
+        let commit = std::rc::Rc::new(glib::clone!(
+            #[weak]
             obj,
             #[weak]
             row,
-            move |entry| {
-                let text = entry.text().to_string();
-                if !directory_is_usable(&text) {
-                    entry.add_css_class("error");
-                    row.set_subtitle("That directory does not exist");
+            #[weak]
+            entry,
+            move || {
+                if !check_directory_entry(&entry, &row, help) {
                     return;
                 }
-                entry.remove_css_class("error");
-                row.set_subtitle(help);
+                let text = entry.text().to_string();
                 let imp = obj.imp();
                 if *get(&imp.config.borrow()) == text {
                     return;
@@ -4027,6 +4150,14 @@ impl AgentTerminalWindow {
                 imp.schedule_config_save();
             }
         ));
+        entry.connect_activate(glib::clone!(
+            #[strong]
+            commit,
+            move |_| commit()
+        ));
+        let focus = gtk4::EventControllerFocus::new();
+        focus.connect_leave(move |_| commit());
+        entry.add_controller(focus);
         row
     }
 
@@ -4339,14 +4470,14 @@ impl AgentTerminalWindow {
         };
 
         let status_page = adw::StatusPage::builder()
-            .title("No AI CLI detected")
+            .title("No AI CLI Detected")
             .description(description)
             .vexpand(true)
             .build();
         crate::icons::set_status_icon(&status_page, "at-utilities-terminal-symbolic");
 
         let refresh_button = Button::builder()
-            .label("Check again")
+            .label("Check Again")
             .halign(Align::Center)
             .margin_top(20)
             .css_classes(["suggested-action"])
@@ -4394,9 +4525,13 @@ impl AgentTerminalWindow {
 
         let scrollback_row = adw::ActionRow::builder()
             .title("Scrollback Lines")
-            .subtitle("How many lines of output a terminal keeps to scroll back through")
+            .subtitle(
+                "How many lines of output a terminal keeps to scroll back through \
+                 (100 to 100,000; default 10,000)",
+            )
             .build();
         scrollback_row.add_suffix(&scroll_spin);
+        scroll_spin.update_property(&[gtk4::accessible::Property::Label("Scrollback Lines")]);
 
         let suspend_spin = gtk4::SpinButton::builder()
             .adjustment(&gtk4::Adjustment::new(
@@ -4413,10 +4548,13 @@ impl AgentTerminalWindow {
             .title("Pause Idle Agents After (Minutes)")
             .subtitle(
                 "A thread out of sight and idle this long stops its agent to free memory; \
-                 it picks up the same conversation when you send. 0 never pauses",
+                 it picks up the same conversation when you send. 0 never pauses; default 15",
             )
             .build();
         suspend_row.add_suffix(&suspend_spin);
+        suspend_spin.update_property(&[gtk4::accessible::Property::Label(
+            "Pause Idle Agents After (Minutes)",
+        )]);
 
         // Built from the configured profiles. Index 0 is auto-detection, so the
         // list is one longer than the profile list and every later index is
@@ -4441,9 +4579,10 @@ impl AgentTerminalWindow {
 
         let font_scale_row = adw::ActionRow::builder()
             .title("Text Scale")
-            .subtitle("Chat and terminal text size (Ctrl+= and Ctrl+- change it)")
+            .subtitle("Chat and terminal text size; default 1.0 (Ctrl+= and Ctrl+- change it)")
             .build();
         font_scale_row.add_suffix(&font_scale_spin);
+        font_scale_spin.update_property(&[gtk4::accessible::Property::Label("Text Scale")]);
         *self.font_scale_spin.borrow_mut() = font_scale_spin.downgrade();
 
         let cli_client_row = adw::ComboRow::builder()
@@ -4455,7 +4594,7 @@ impl AgentTerminalWindow {
 
         let theme_row = self.choice_row(
             "Theme",
-            "Colours of the whole app: threads, terminals and diffs. Use System Theme takes \
+            "Colours of the whole app: threads, terminals and diffs. “Use System Theme” takes \
              them from your desktop and follows it when it changes",
             crate::config::ThemeChoice::ALL
                 .iter()
@@ -4540,7 +4679,7 @@ impl AgentTerminalWindow {
         );
 
         let quick_replies_row = self.config_switch(
-            "Suggest quick replies when a reply ends with a question",
+            "Suggest Quick Replies After a Question",
             "Codex and Antigravity: when a reply ends with a question and a short list of \
              choices, offer the choices under the reply. Choosing one fills the message box; \
              nothing is sent until you press Enter",
@@ -7158,6 +7297,44 @@ fn directory_is_usable(dir: &str) -> bool {
     std::path::Path::new(&crate::utils::expand_tilde_with(trimmed, &home)).is_dir()
 }
 
+/// What a folder row says about `dir` when it cannot be used, or `None` when it can.
+fn directory_problem(dir: &str) -> Option<String> {
+    (!directory_is_usable(dir)).then(|| {
+        format!(
+            "“{}” is not an existing folder. The previous value is still in use.",
+            dir.trim()
+        )
+    })
+}
+
+/// Shows on a folder row whether its entry names a usable folder: the reason in the subtitle
+/// (escaped: the row's help is markup) and the entry's tooltip, and the entry marked invalid
+/// for assistive technology. Returns whether it is usable.
+fn check_directory_entry(entry: &gtk4::Entry, row: &adw::ActionRow, help: &str) -> bool {
+    match directory_problem(&entry.text()) {
+        Some(problem) => {
+            entry.add_css_class("error");
+            row.set_subtitle(&glib::markup_escape_text(&problem));
+            entry.set_tooltip_text(Some(&problem));
+            entry.update_property(&[gtk4::accessible::Property::Description(&problem)]);
+            entry.update_state(&[gtk4::accessible::State::Invalid(
+                gtk4::AccessibleInvalidState::True,
+            )]);
+            false
+        }
+        None => {
+            entry.remove_css_class("error");
+            row.set_subtitle(help);
+            entry.set_tooltip_text(None);
+            entry.update_property(&[gtk4::accessible::Property::Description("")]);
+            entry.update_state(&[gtk4::accessible::State::Invalid(
+                gtk4::AccessibleInvalidState::False,
+            )]);
+            true
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7168,6 +7345,26 @@ mod tests {
             gtk4::pango::parse_markup(text, '\0').unwrap();
         }
         agents_prefs::tests::help_texts_are_valid_markup();
+    }
+
+    #[test]
+    fn a_folder_row_names_a_missing_folder_and_accepts_blank_or_existing_ones() {
+        assert_eq!(directory_problem(""), None);
+        let tmp = tempfile::tempdir().expect("tmp");
+        assert_eq!(directory_problem(&tmp.path().to_string_lossy()), None);
+        let missing = tmp.path().join("pro");
+        let problem = directory_problem(&format!(" {} ", missing.display())).expect("missing");
+        assert!(
+            problem.contains(&format!("“{}”", missing.display())),
+            "{problem}"
+        );
+        assert!(
+            problem.contains("previous value is still in use"),
+            "{problem}"
+        );
+        // The subtitle escapes it: a path with markup characters stays valid markup.
+        let odd = directory_problem("/no/<such>&dir").expect("missing");
+        gtk4::pango::parse_markup(&glib::markup_escape_text(&odd), '\0').unwrap();
     }
 
     #[test]
@@ -7585,6 +7782,28 @@ mod tests {
             5,
             "menu has threads, sessions, recovery, support and app sections, no terminal section"
         );
+        let app_section = menu
+            .item_link(4, gtk4::gio::MENU_LINK_SECTION)
+            .expect("app section");
+        let app_actions: Vec<Option<String>> = (0..app_section.n_items())
+            .map(|i| {
+                app_section
+                    .item_attribute_value(i, "action", None)
+                    .and_then(|v| v.get::<String>())
+            })
+            .collect();
+        assert_eq!(
+            app_actions,
+            [
+                "win.check-updates",
+                "win.preferences",
+                "win.shortcuts",
+                "win.about"
+            ]
+            .map(|a| Some(a.to_owned())),
+            "the app section offers updates, Settings, Keyboard Shortcuts and About"
+        );
+        assert!(window.lookup_action("about").is_some());
         let action_of = |section: i32| {
             menu.item_link(section, gtk4::gio::MENU_LINK_SECTION)
                 .expect("section")

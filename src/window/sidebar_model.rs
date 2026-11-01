@@ -230,6 +230,22 @@ pub fn reopen_offer(n: usize) -> Option<String> {
     }
 }
 
+/// What the sidebar says when it lists nothing: the title and hint for an empty list, or for a
+/// search that matched nothing.
+pub fn empty_sidebar_text(query: &str) -> (&'static str, &'static str) {
+    if query.trim().is_empty() {
+        (
+            "No Threads Yet",
+            "Start one with Ctrl+Shift+T or the + button.",
+        )
+    } else {
+        (
+            "No Matching Threads",
+            "Try other words, or show archived threads.",
+        )
+    }
+}
+
 /// The toast after the agents' own recent sessions were listed as threads: how many, and from
 /// which agents (each named once, in the order first met). `None` when none were added.
 pub fn sessions_added_toast(drivers: &[Driver]) -> Option<String> {
@@ -360,7 +376,7 @@ pub struct SidebarRow {
     pub background: Vec<String>,
     /// Where the thread's page is open, if anywhere.
     pub open: OpenState,
-    /// Archived threads are hidden unless the sidebar's "Show archived" toggle is on.
+    /// Archived threads are hidden unless the sidebar's "Show Archived" toggle is on.
     pub archived: bool,
 }
 
@@ -970,6 +986,13 @@ pub fn parse_driver(name: &str) -> Option<Driver> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_sidebar_says_why_by_whether_a_search_is_on() {
+        assert_eq!(empty_sidebar_text("").0, "No Threads Yet");
+        assert_eq!(empty_sidebar_text("   ").0, "No Threads Yet");
+        assert_eq!(empty_sidebar_text("deploy").0, "No Matching Threads");
+    }
 
     #[test]
     fn switches_ask_for_every_busy_reason() {

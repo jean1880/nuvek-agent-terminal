@@ -47,7 +47,10 @@ impl Availability {
             Self::Detecting => "Detecting…".to_owned(),
             // Its program is this app: what matters is that its server answered.
             Self::Ready(_) if driver.is_built_in() => "Ready: its server lists models".to_owned(),
-            Self::Ready(path) => format!("Ready: {path}"),
+            Self::Ready(path) => format!(
+                "Ready: {}",
+                crate::utils::tildify(path, &gtk4::glib::home_dir().to_string_lossy())
+            ),
             Self::Missing if driver.is_built_in() => format!(
                 "Its server did not answer or lists no chat model. {}",
                 driver.info().install_hint

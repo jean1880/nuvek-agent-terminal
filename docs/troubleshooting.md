@@ -8,10 +8,10 @@ journalctl --user -t agent-terminal -b
 RUST_LOG=debug agent-terminal
 ```
 
-**"No AI CLI detected."** None of the configured commands was found on `PATH`, in the
+**"No AI CLI Detected."** None of the configured commands was found on `PATH`, in the
 usual install folders, or through your login shell. Install one (see
 [The agents themselves](install.md#the-agents-themselves)), or set its full path in Settings →
-Agents, then press **Check again**.
+Agents, then press **Check Again**.
 
 **Setup never appeared, or keeps coming back.** Setup opens when there is no settings file
 at launch (`~/.config/agent-terminal/config.json`). Closing it writes that file. If it comes back

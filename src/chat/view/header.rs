@@ -232,7 +232,7 @@ impl Header {
         let agent = label("", &["chip-agent"]);
         let model = label("", &["chip-model"]);
         model.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
-        model.set_max_width_chars(28);
+        model.set_max_width_chars(40);
         chip_box.append(&brand);
         chip_box.append(&agent);
         chip_box.append(&model);
@@ -527,7 +527,10 @@ impl Header {
             self.mode.remove_css_class("mode-danger");
         }
         self.mode
-            .update_property(&[gtk4::accessible::Property::Label(mode.label())]);
+            .update_property(&[gtk4::accessible::Property::Label(&format!(
+                "Interaction mode: {}",
+                mode.label()
+            ))]);
     }
 
     pub fn set_text_scale(&self, scale: f64) {
@@ -581,11 +584,11 @@ impl Header {
         self.access.set_visible(!grants.is_empty());
         let tip = format!("Allowed for this Codex session:\n{list}");
         self.access.set_tooltip_text(Some(&tip));
-        self.access
-            .update_property(&[gtk4::accessible::Property::Label(&format!(
-                "Extra access for this Codex session: {}",
-                grants.join(", ")
-            ))]);
+        // A short name, and the list (which may be long) as its description.
+        self.access.update_property(&[
+            gtk4::accessible::Property::Label("Extra access for this Codex session"),
+            gtk4::accessible::Property::Description(&grants.join(", ")),
+        ]);
         self.fit_height();
     }
 

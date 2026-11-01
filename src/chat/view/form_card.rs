@@ -516,7 +516,10 @@ impl Inner {
             }
             FormState::Expired => {
                 self.root.add_css_class("expired");
-                Some("Expired: the agent that asked has exited".to_owned())
+                Some(
+                    "Expired: the agent that asked has exited; ask it again if you still need this"
+                        .to_owned(),
+                )
             }
             FormState::Unanswerable => {
                 self.root.add_css_class("expired");
@@ -1572,7 +1575,7 @@ pub(crate) mod tests {
             (FormState::Resolved(FormAction::Cancel), "Dismissed"),
             (
                 FormState::Expired,
-                "Expired: the agent that asked has exited",
+                "Expired: the agent that asked has exited; ask it again if you still need this",
             ),
         ] {
             card.update(&with(state, &form));

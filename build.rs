@@ -24,6 +24,11 @@ fn main() {
     for rel in &files {
         let _ = writeln!(xml, "    <file>{rel}</file>");
     }
+    // The full-colour app icon by name too (`APP_ICON_COLOUR`), for the About dialog, which
+    // takes an icon name and would otherwise upscale the 16 px symbolic glyph.
+    xml.push_str(
+        "    <file alias=\"scalable/apps/ca.nuvek.AgentTerminal.svg\">ca.nuvek.AgentTerminal.svg</file>\n",
+    );
     xml.push_str("  </gresource>\n");
     // The full-colour app icon, for hero use (`APP_ART` in src/icons.rs).
     xml.push_str("  <gresource prefix=\"/ca/nuvek/AgentTerminal/art\">\n");

@@ -3177,7 +3177,7 @@ impl Inner {
         // Codex Accept edits runs on `untrusted`: the app accepts edits whose every path is
         // in the workspace and not sensitive; anything else, and every shell command, asks.
         // A child's Accept edits auto also needs every target to be one its rules may cover.
-        let accept_edit = driver == Driver::Codex
+        let codex_accept_edit = driver == Driver::Codex
             && tool == "file_change"
             && self.state.borrow().mode == Mode::AcceptEdits
             && !forced
@@ -3191,6 +3191,18 @@ impl Inner {
                         self.rule_may_apply(&edit, cwd.as_deref())
                     })
                 }));
+        // A Claude child runs `--permission-mode default`, so its CLI never accepts an edit
+        // itself and the gate sees every call. Its Accept edits is answered here: an edit whose
+        // target its rules may cover (inside its lease, not sensitive, within the ceiling).
+        let claude_child_accept_edit = driver == Driver::Claude
+            && self.child.is_some()
+            && self.state.borrow().mode == Mode::AcceptEdits
+            && !forced
+            && matches!(action, Some(crate::always_allow::Action::Edit { .. }))
+            && action
+                .as_ref()
+                .is_some_and(|a| self.rule_may_apply(a, cwd.as_deref()));
+        let accept_edit = codex_accept_edit || claude_child_accept_edit;
         // Dangerous permissive mode: the agent's own bypass should leave nothing to ask, and
         // whatever still arrives (escalations included) is approved, as the user agreed to. A
         // supervised child never runs it.

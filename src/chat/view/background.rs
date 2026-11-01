@@ -174,6 +174,8 @@ impl TaskOutputPanel {
         let title = wrapped_text(&task_name(task), &["subagent-panel-title"]);
         title.set_selectable(true);
         let status = label("Reading output…", &["dim-label"]);
+        // It may hold a read error worth copying.
+        status.set_selectable(true);
         body.append(&title);
         body.append(&status);
         let buffer = gtk4::TextBuffer::new(None);

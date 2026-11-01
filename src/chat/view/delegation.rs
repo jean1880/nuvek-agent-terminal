@@ -462,9 +462,7 @@ impl Subscriber {
         drop(state);
         inner.queue_worker_flush();
         if inner.delegation.borrow_mut().take_overflow_notice() {
-            inner.worker_notice(
-                "Some worker activity could not be displayed because its registry was unavailable.",
-            );
+            inner.worker_notice("Some worker activity could not be shown here.");
         }
     }
 }
@@ -520,8 +518,20 @@ impl Inspector {
         entry.set_placeholder_text(Some("Send this worker a message"));
         entry.set_hexpand(true);
         let send = gtk4::Button::with_label("Send");
-        let cancel = gtk4::Button::with_label("Interrupt run");
-        let close = gtk4::Button::with_label("Close worker");
+        // Enter sends, as it does in the composer.
+        let send_weak = send.downgrade();
+        entry.connect_activate(move |_| {
+            if let Some(send) = send_weak.upgrade() {
+                send.emit_clicked();
+            }
+        });
+        let cancel = gtk4::Button::with_label("Stop Run");
+        cancel.set_tooltip_text(Some("Stop what this worker is doing now; it stays open"));
+        let close = gtk4::Button::with_label("Close Worker");
+        close.set_tooltip_text(Some(
+            "End this worker and everything it started; its queued work is dropped",
+        ));
+        close.add_css_class("destructive-action");
         let actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
         actions.append(&entry);
         actions.append(&send);
@@ -575,7 +585,7 @@ impl Inspector {
             button.connect_clicked(move |_| {
                 let (Some(inner),Some(inspector)) = (weak.upgrade(), own.upgrade()) else { return };
                 let scope = inspector.action_scope.borrow().clone();
-                let Some(scope) = scope else { inner.worker_notice("This worker has no live process scope."); return };
+                let Some(scope) = scope else { inner.worker_notice("This worker is not running, so there is nothing to act on."); return };
                 let action = match kind {
                     0 => {
                         let text = inspector.entry.text().trim().to_owned();
@@ -586,7 +596,7 @@ impl Inspector {
                     _ => WorkerAction::Close { scope },
                 };
                 if inner.backend.worker_action(action) { if kind == 0 { inspector.entry.set_text(""); } }
-                else { inner.worker_notice("The worker changed or this action is unavailable. Refresh its current run."); }
+                else { inner.worker_notice("The worker has moved on, or this action is not available now. Pick its latest run in the history list and try again."); }
             });
         }
         inspector

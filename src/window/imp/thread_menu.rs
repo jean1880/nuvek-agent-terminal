@@ -468,7 +468,7 @@ impl AgentTerminalWindow {
     // ---- archive / delete ----
 
     /// Hides (or brings back) a thread. Archiving closes its page; the thread stays in the store
-    /// and behind the sidebar's "Show archived" toggle.
+    /// and behind the sidebar's "Show Archived" toggle.
     pub(super) fn set_thread_archived(&self, thread: &str, archived: bool) {
         if let Some(owner) = super::threads::thread_owner(thread).filter(|w| w != &*self.obj()) {
             owner.imp().set_thread_archived(thread, archived);

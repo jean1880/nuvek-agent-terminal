@@ -7,7 +7,7 @@ pkgrel=1
 # Epoch 1 keeps every release newer than the 3.x packages that were installed before the
 # version numbering restarted at 1.0.0. Keep it in step with the deb and rpm epochs.
 epoch=1
-pkgdesc="A native GTK4 chat front end for Claude, Antigravity and Codex"
+pkgdesc="A native GTK4 chat front end for Claude, Antigravity, Codex and local models"
 arch=('x86_64')
 url="https://github.com/jean1880/nuvek-agent-terminal"
 license=('MIT')

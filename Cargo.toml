@@ -7,7 +7,7 @@ edition = "2021"
 # approval rules store, needs only 1.89).
 rust-version = "1.92"
 authors = ["Jean-Luc Desroches <jean1880@users.noreply.github.com>"]
-description = "A native GTK4 chat front end for Claude, Antigravity and Codex"
+description = "A native GTK4 chat front end for Claude, Antigravity, Codex and local models"
 license = "MIT"
 repository = "https://github.com/jean1880/nuvek-agent-terminal"
 homepage = "https://github.com/jean1880/nuvek-agent-terminal"
@@ -110,7 +110,8 @@ depends = "$auto"
 # document — markdown, code fences and all — lands in the control file.
 extended-description = """
 A native GTK4/libadwaita front end for AI coding agents. Chat threads drive
-Claude, Antigravity (agy) and Codex headless: one model picker across agents,
+Claude, Antigravity (agy) and Codex headless, and the Local agent runs models
+on the user's own server (Ollama, LM Studio, LiteLLM): one model picker across agents,
 switching model or agent mid-thread with a redacted handoff, approval cards
 with the proposed diff, per-turn file diffs, slash-command typeahead, usage
 and account indicators, and checkpoints with undo. A VTE terminal drawer and
@@ -129,7 +130,7 @@ assets = [
 # Fedora/RPM, built with cargo-generate-rpm (the release workflow's rpm job). The same files as
 # the .deb; runtime requirements are derived from the built binary (auto-req), like $auto above.
 [package.metadata.generate-rpm]
-summary = "A native GTK4 chat front end for Claude, Antigravity and Codex"
+summary = "A native GTK4 chat front end for Claude, Antigravity, Codex and local models"
 license = "MIT"
 # Epoch 1 keeps every release newer than the 3.x packages installed before the version numbering
 # restarted at 1.0.0. Keep it in step with the deb version (packaging/build-deb.sh) and the PKGBUILD.

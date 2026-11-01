@@ -1149,9 +1149,10 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         let complete = ended && reply.finish_reason.as_deref() != Some("length");
         let runnable = stopped.is_none() && complete;
         // What arrived before an interrupt is kept, so the next turn knows it was said; calls
-        // only when they will each get an answer below.
-        if !reply.text.is_empty() || !reply.tool_calls.is_empty() {
-            let calls = runnable && !reply.tool_calls.is_empty();
+        // only when they will each get an answer below. A reply whose calls are dropped and that
+        // said nothing leaves no message.
+        let calls = runnable && !reply.tool_calls.is_empty();
+        if !reply.text.is_empty() || calls {
             self.messages.push(ChatMessage {
                 tool_calls: if calls {
                     reply
@@ -3596,17 +3597,23 @@ mod tests {
         let broken = vec![
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"run_command","arguments":"{\"command\":\"touch made\"}"}}]}}]}"#.to_owned(),
         ];
+        let script = Script::new(vec![Ok(broken), Ok(text(&["Ok"]))]);
         let run = start(
             args(work.path(), Mode::Bypass),
-            Script::new(vec![Ok(broken)]),
+            script.clone(),
             state.path().into(),
         );
         run.send(prompt("go"));
         let (state_, _, error) = run.wait_for(completed);
-        run.finish();
         assert_eq!(state_, TurnState::Failed);
         assert!(error.unwrap().contains("before it ended"));
         assert!(!work.path().join("made").exists());
+        // With its call dropped the reply said nothing: no empty message is kept for it.
+        run.send(prompt("again"));
+        run.wait_for(completed);
+        run.finish();
+        let sent = script.bodies()[1]["messages"].as_array().unwrap().clone();
+        assert!(sent.iter().all(|m| m["role"] != "assistant"), "{sent:?}");
     }
 
     #[test]

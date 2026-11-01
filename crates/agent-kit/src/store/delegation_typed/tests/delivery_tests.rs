@@ -954,6 +954,50 @@ fn a_spawn_outlives_the_child_it_started_and_its_retry_is_replayed() {
     }
 }
 
+/// An accepted operation whose target was deleted is never reserved: it fails as closed.
+#[test]
+fn an_operation_whose_target_was_deleted_fails_as_closed() {
+    let f = fx();
+    let child = spawn(&f.s, &f.root.worker, "k1");
+    let worker = child.worker.expect("w");
+    let queued = new_op(send(
+        &f.s,
+        &f.root.worker,
+        worker.as_str(),
+        "instruction",
+        "later",
+        "s1",
+    ));
+    f.s.set_delegation_worker_state(worker.as_str(), "closed", None, 9)
+        .expect("close");
+    if let Some(run) = f.s.active_delegation_run(worker.as_str()).expect("run") {
+        f.s.end_delegation_run_if_open(&run.id, "interrupted", None, 9)
+            .expect("end");
+    }
+    let thread =
+        f.s.delegation_worker(worker.as_str())
+            .expect("q")
+            .expect("row")
+            .backing_thread_id
+            .expect("thread");
+    f.s.delete_thread(&thread)
+        .expect("delete the child's thread");
+    let row =
+        f.s.delegation_operation(queued.operation.as_str())
+            .expect("q")
+            .expect("the send stays");
+    assert_eq!(
+        (row.target_worker_id, row.dispatch_state.as_str()),
+        (None, "accepted")
+    );
+    let e =
+        f.s.reserve_delegation_dispatch(&queued.operation)
+            .expect("store")
+            .expect_err("no target to dispatch to");
+    assert_eq!(e.code, ErrorCode::WorkerClosed);
+    assert_eq!(op_state(&f.s, &queued.operation), "failed");
+}
+
 /// A worker whose run cannot be read is never taken for one with no run: the delete is refused.
 #[test]
 fn an_unreadable_run_refuses_the_delete() {

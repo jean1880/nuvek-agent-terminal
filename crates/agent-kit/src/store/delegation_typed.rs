@@ -1468,7 +1468,10 @@ impl Store {
                 .is_some_and(|w| w.state == name_of(&WorkerState::Closed)),
             None => false,
         };
-        if target_closed && stored.kind != OperationKind::Close {
+        // Every kind but an acknowledgement names its target at acceptance: one with none now
+        // lost it to the worker's deletion (`ON DELETE SET NULL`), and is never dispatched.
+        let target_gone = row.target_worker_id.is_none() && stored.kind != OperationKind::Ack;
+        if target_gone || (target_closed && stored.kind != OperationKind::Close) {
             let e = ToolError::new(ErrorCode::WorkerClosed, "the worker is closed");
             self.invalidate_operation(&row, &e, now)?;
             return Ok(Err(e.with_detail("operation_id", op.as_str())));

@@ -1015,6 +1015,48 @@ fn a_refusal_after_the_turn_ended_still_requeues_the_steer() {
     });
 }
 
+/// A refused steer that cannot be requeued fails, and what was queued behind it still goes.
+#[test]
+fn a_steer_that_cannot_be_requeued_lets_the_next_entry_through() {
+    in_context(async {
+        let (dir, sup, root) = harness();
+        let (worker, run, op, id) =
+            steer_in_flight(&sup, &root, Delivery::Auto, "requeue-fails").await;
+        sup.cancel_bound_run(&worker, &run, "Delegated run cancelled");
+        pump_until(|| sup.state.borrow().workers[&worker].run.is_none()).await;
+        // An instruction queued behind it that nothing else drains.
+        sup.state.borrow_mut().workers.get_mut(&worker).unwrap().run =
+            Some(RunId::parse("r_heldBehind1").unwrap());
+        let behind = sup
+            .send_worker(&root, instruction(&worker, "QUEUED_BEHIND", "behind"))
+            .await
+            .unwrap();
+        sup.state.borrow_mut().workers.get_mut(&worker).unwrap().run = None;
+        assert_eq!(sup.state.borrow().deferred[&worker].len(), 1);
+        // Its message settled meanwhile, so the steer can no longer go back to the queue.
+        sup.services
+            .handle
+            .reader()
+            .record_delegation_delivery(
+                &MessageId::parse(&id).unwrap(),
+                agent_core::delegation::mailbox::DeliveryState::ProviderConfirmed,
+                None,
+            )
+            .unwrap();
+        sup.delivery_control(&worker, &refusal("requeue-fails-tag"));
+        pump_until(|| dispatch(&sup, &op) == "failed").await;
+        let behind = behind["operation_id"].as_str().unwrap().to_owned();
+        pump_until(|| {
+            dispatch(&sup, &behind) == "confirmed"
+                && std::fs::read_to_string(dir.path().join("frames.ndjson"))
+                    .unwrap()
+                    .contains("QUEUED_BEHIND")
+        })
+        .await;
+        stop(&sup).await;
+    });
+}
+
 /// How many times the fake child was handed the steered text.
 fn steered(dir: &std::path::Path) -> usize {
     std::fs::read_to_string(dir.join("frames.ndjson"))

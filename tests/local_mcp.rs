@@ -51,7 +51,7 @@ for line in sys.stdin:
         if scenario == 'reverse':
             send({'jsonrpc':'2.0','id':'reverse','method':'sampling/createMessage','params':{'secret':os.environ.get('TOKEN','')}})
         if scenario == 'notification-flood':
-            for _ in range(1000): send({'jsonrpc':'2.0','method':'notifications/message','params':{}})
+            for _ in range(800): send({'jsonrpc':'2.0','method':'notifications/message','params':{}})
         if scenario == 'request-flood':
             for n in range(129): send({'jsonrpc':'2.0','id':'ask-%d' % n,'method':'roots/list'})
         respond(request, {'resultType':'complete','supportedVersions':['2026-07-28'],'capabilities':{'tools':{}},'ttlMs':0,'cacheScope':'private'})
@@ -104,8 +104,8 @@ for line in sys.stdin:
         with open(folder + '/executions','a') as f: f.write(json.dumps(request['params']) + '\n')
         if scenario == 'call-stall': time.sleep(60)
         if scenario == 'notification-flood':
-            for n in range(1000): send({'jsonrpc':'2.0','method':'notifications/progress','params':{'progress':n}})
-        if scenario == 'notification-ceiling':
+            for n in range(800): send({'jsonrpc':'2.0','method':'notifications/progress','params':{'progress':n}})
+        if scenario == 'notification-burst':
             for n in range(10001): send({'jsonrpc':'2.0','method':'notifications/progress','params':{'progress':n}})
         if scenario == 'call-exit': sys.exit(0)
         if scenario == 'call-error':
@@ -2018,7 +2018,7 @@ mod runner {
     }
 
     #[test]
-    fn chatty_servers_keep_their_connection_until_the_notification_ceiling() {
+    fn chatty_servers_keep_their_connection_until_they_stream_too_fast() {
         let folder = tempfile::tempdir().unwrap();
         let run = Run::new(
             vec![config(folder.path(), "notification-flood")],
@@ -2038,9 +2038,9 @@ mod runner {
         assert_eq!(calls(folder.path()).len(), 1);
         run.finish();
 
-        // A stream past the ceiling between two responses ends the connection, unreplayed.
+        // A burst past the notification rate ends the connection, unreplayed.
         let folder = tempfile::tempdir().unwrap();
-        let mut config = config(folder.path(), "notification-ceiling");
+        let mut config = config(folder.path(), "notification-burst");
         config.call_timeout_secs = 20;
         let run = Run::new(
             vec![config],
@@ -2059,7 +2059,7 @@ mod runner {
                 status: agent_core::event::ItemStatus::Failed,
                 error: Some(error),
                 ..
-            } if error.contains("notification ceiling") && !error.contains("hello")
+            } if error.contains("notification rate") && !error.contains("hello")
         )));
         assert_eq!(calls(folder.path()).len(), 1);
         run.finish();

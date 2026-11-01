@@ -186,7 +186,9 @@ A server is ready when it lists at least one chat model. Its threads pick from i
 models, and keep the server they were opened on. The agent works in the thread's folder with
 six tools (read a file, list a folder, search, write a file, edit a file, run a command).
 Writes and commands follow the mode: Plan only reads, Ask asks before each, Accept edits
-asks before commands and before writing outside the folder. Reads run unasked inside the
+asks before commands, before writing outside the folder and before writing a sensitive file
+(the same list as for reads, below). A mode picked while the agent works applies to its next
+step. A file is written whole or not at all, keeping its permissions. Reads run unasked inside the
 folder; in every mode, Plan included, the agent asks before reading outside it, reading a
 sensitive file (git, hook, editor and agent configuration, instruction files, a file with a
 second hard link and, when the folder is your home or above it, your home's dotfiles) or

@@ -348,34 +348,43 @@ Architectural mandates, standards, and workflows for this codebase.
   model (`AgentAvailability::server_ready`). Its tools (`agent_kit::local_tools`) pass
   `local_agent::gate` first: Plan offers and runs no writing tool, Ask asks before every write
   and command, Accept edits asks before commands and before any write outside the thread's
-  folder (`local_tools::inside`, links followed, a dangling one counted outside). Reads follow
-  the agy hook's read policy, except that a link staying inside the folder is judged where it
-  leads: a read outside the folder, of a sensitive file (the shared `agent_core::sensitive`
-  list, a file with a second hard link, and a home's dotfiles when the folder is that home or
-  above it) or a search from a home or above asks in every mode, Plan included
-  (`local_tools::read_must_ask`). Homes are `$HOME` and the account's own; with neither known,
-  every dot-named path and every search asks. An unapproved read is judged again just before it
-  runs and opened from the pinned folder one component at a time without following a link
-  (`open_inside`), so a folder swapped for a link meanwhile fails it. A search walks open
-  folders (read with `fdopendir`, no `/proc` needed; opened only when their turn comes, so the
-  open folders never outnumber the depth), never follows a link, and never reads a sensitive or
+  folder (links followed, a dangling one counted outside), of a sensitive file (the agy hook's
+  Accept edits list: `agent_core::sensitive`, and a home's dotfiles when the folder is that
+  home or above it) or of a file with a second hard link (`local_tools::must_ask`). A mode
+  change is applied as it arrives, in the middle of a turn too: the next gate and the next
+  request use it, and a card open when it comes expires and its call is gated again. Reads
+  follow the agy hook's read policy, except that a link staying inside the folder is judged
+  where it leads: a read outside the folder, of a sensitive file (the same list, a file with a
+  second hard link, and a home's dotfiles when the folder is that home or above it) or a search
+  from a home or above asks in every mode, Plan included (`local_tools::read_must_ask`). Homes
+  are `$HOME` and the account's own; with neither known, every dot-named path and every search
+  asks. A call's path is resolved once (`local_tools::target`): that is what is judged, what its
+  card names (where it leads, when that is not the path itself) and what runs
+  (`local_tools::run_judged`). Resolved again just before it runs, a path that leads anywhere
+  else is refused, an unapproved call that now must ask is refused, and what runs is opened
+  from the pinned folder (from `/` for an approved call outside it) one component at a time
+  without following a link (`open_inside`, `write_target`), so a folder swapped for a link
+  meanwhile fails it, and one judged inside never lands outside. A search walks open folders
+  (read with `fdopendir`, no `/proc` needed; opened only when their turn comes, so the open
+  folders never outnumber the depth), never follows a link, and never reads a sensitive or
   hard-linked file or a home's dotfiles, even approved: inside the folder as reads judge them,
   outside it by the whole resolved path wherever the search started. What it withheld and what
-  it could not open are counted in its result, never silently dropped (generated trees such as
-  `.git` and `target` aside). A command's group is killed before its shell is reaped
-  (never when someone else reaped it), so the group id is never one reused by another process.
-  The runner keeps
-  no approval: the app's own scoped rules answer the cards they cover. A write is bound to what
-  was judged: its folders are opened one at a time without following a link
-  (`local_tools::write_target`), so a folder swapped for a link meanwhile fails it, and one judged
-  inside never lands outside. Files are opened without blocking and read only when regular, at
-  most a fixed size. Commands run in their own process group, killed on Stop or timeout, their
-  output capped and never waited on past a short grace. Stop ends a request's connection
-  (`ChatClient::cancel`). A call from a reply that was cut off or broke off never runs, and every
-  call of an interrupted reply gets an answer. History is sent and kept in whole exchanges.
-  It is never a delegation parent or child (`RouteBlocker::LocalAgentNoBridge`). Its
-  conversation is a `0600` file under `$XDG_STATE_HOME/agent-terminal/local`, which uninstall
-  removes with the state folder.
+  it could not open or read whole (too large) are counted in its result, never silently
+  dropped (generated trees such as `.git` and `target` aside). A command's group is killed
+  before its shell is reaped (never when someone else reaped it), so the group id is never one
+  reused by another process. The runner keeps no approval: the app's own scoped rules answer
+  the cards they cover. A write is whole or nothing: written to a new file beside its target,
+  which then replaces it (`renameat`), keeping its permissions; a link there is never followed
+  nor written through, a pipe never opened, and an unapproved one with a second hard link is
+  refused. An edit is made only to UTF-8 text. Files are opened without blocking and read only
+  when regular, at most a fixed size. Commands run in their own process group, killed on Stop
+  or timeout, their output capped and never waited on past a short grace. Stop ends a
+  request's connection (`ChatClient::cancel`). A call from a reply that was cut off or broke
+  off never runs, and every call of an interrupted reply gets an answer: one a Stop ended while
+  it ran keeps what it gave back (a writing one is said to have an unknown outcome), never "not
+  run". History is sent and kept in whole exchanges. It is never a delegation parent or child
+  (`RouteBlocker::LocalAgentNoBridge`). Its conversation is a `0600` file under
+  `$XDG_STATE_HOME/agent-terminal/local`, which uninstall removes with the state folder.
 - **The Local agent's instructions and MCP tools are the user's, configured in the app, never
   found at launch**: the runner takes one validated `LocalLaunchContext` on stdin
   (`Command::ConfigureLocal`, before any prompt; never argv). Instruction files
@@ -388,7 +397,8 @@ Architectural mandates, standards, and workflows for this codebase.
   truncated. The composed system message is redacted, and no instruction can change the gate,
   the approvals or the environment. Every request is planned whole
   (`local_context::plan_request`): policy, instructions, schemas, newest whole exchanges and
-  the response reserve; a call batch runs only when every result's room is reserved first.
+  the response reserve; a call batch runs only when every result's room is reserved first, for
+  whichever mode the next request is planned in (`reserve_batch_for_any_mode`).
   MCP servers (`local_defaults.mcp_servers`, selected per profile) are stdio child processes
   started only at a turn or by Settings → Discover tools, never by opening Settings or
   importing. Each runs under a guardian (`--local-mcp-guardian`) in its own process group,

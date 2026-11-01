@@ -346,8 +346,15 @@ Architectural mandates, standards, and workflows for this codebase.
   `/tmp`: without a runtime directory the start is refused), written off the main thread right
   before the spawn (`agent_proc::write_key_file`; `provider::CLAUDE_KEY_VAR` only carries the key
   there and is never exported, and the variable the key was read from is unset) and removed
-  when that process exits (`SpawnSpec::key_file`; a tab's on `child-exited`); start-up sweeps
-  those of dead processes. The overlay's `apiKeyHelper` is `cat` of that file (no key: a
+  when that process exits (`SpawnSpec::key_file`; a tab's on `child-exited`), and at quit, once
+  the agents are gone, whatever of this instance's is left (`remove_own_key_files`). Files are
+  named for a random instance id (`<instance>-<n>.key`, a taken name skipped), and each instance
+  holds an exclusive `flock` on its `<instance>.lock` while it runs (`provider_key::Instance`):
+  start-up sweeps only the files of instances whose lock can be taken, and their locks, so no pid
+  namespace or reused pid makes a live instance's file look stale. **Residual risk:** the agent's
+  own tools run as the same user, and the file's path is in Claude's argv, so the agent can read
+  its own key: the file keeps the key out of environment dumps and away from other users, not
+  away from the agent. The overlay's `apiKeyHelper` is `cat` of that file (no key: a
   constant printing the placeholder), it blanks every other credential (`CLAUDE_UNSET`) and
   `BASH_ENV`/`ENV` (so a settings file runs no code in the helper's shell), and a settings
   file's helper or tokens are never used (seen live with Claude Code 2.1.309: the helper of the

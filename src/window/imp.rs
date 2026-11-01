@@ -26,7 +26,7 @@ use crate::config::{Profile, SessionFormat};
 use crate::dialogs::confirm_dialog;
 use crate::handoff::QuotaState;
 use crate::theme::Theme;
-use crate::utils::{get_startup_command, resolve_profile, resolve_working_directory, Launch};
+use crate::utils::{resolve_profile, resolve_working_directory, Launch};
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk4::glib;
@@ -4058,17 +4058,8 @@ impl AgentTerminalWindow {
             Some(driver) => threads::start_model(p, driver),
             None => p.effective_default_model(None),
         });
-        // Where the tab's key file goes, named now (no I/O) so the command line can point
-        // Claude's key helper at it; written off the main thread before the spawn.
-        let key_path = crate::agent_proc::prepare_key_path();
         let on_provider = match profile
-            .map(|p| {
-                crate::utils::with_provider_args(
-                    p,
-                    terminal_model.as_deref(),
-                    key_path.as_deref().map_err(String::as_str),
-                )
-            })
+            .map(|p| crate::utils::with_provider_args(p, terminal_model.as_deref()))
             .transpose()
         {
             Ok(p) => p,
@@ -4077,14 +4068,13 @@ impl AgentTerminalWindow {
                 return;
             }
         };
-        let mut command = get_startup_command(on_provider.as_ref(), launch);
+        // Made a shell command only once Claude's key helper is bound to the tab's key file,
+        // written off the main thread below.
+        let mut argv = crate::utils::startup_argv(on_provider.as_ref(), launch);
         let env_file = profile
             .and_then(|p| p.env_file.clone())
             .filter(|f| !f.trim().is_empty());
-        info!(
-            "Spawning terminal with shell: {}, command: {:?}",
-            shell, command
-        );
+        info!("Spawning terminal with shell: {}, argv: {:?}", shell, argv);
 
         // Switch off the loading screen as soon as the command prints anything,
         // then disconnect: this signal fires on every screen update for the life
@@ -4189,6 +4179,7 @@ impl AgentTerminalWindow {
                     }
                 }
                 let mut key_file = crate::agent_proc::KeyFileHold::default();
+                let mut prelude = String::new();
                 if let Some((provider, driver)) = &provider {
                     let key = match crate::utils::apply_provider_env(
                         provider,
@@ -4199,8 +4190,8 @@ impl AgentTerminalWindow {
                     ) {
                         // Run after the user's rc, which may export the vendor's variables
                         // again: environment only, nothing written to the terminal.
-                        Ok((prelude, key)) => {
-                            command[1] = format!("{prelude}{}", command[1]);
+                        Ok((text, key)) => {
+                            prelude = text;
                             key
                         }
                         Err(why) => {
@@ -4209,12 +4200,8 @@ impl AgentTerminalWindow {
                         }
                     };
                     // The key goes to the file the command line's key helper reads.
-                    if let Some(key) = key {
-                        let written = match key_path {
-                            Ok(path) => crate::agent_proc::write_key_at(path, key).await,
-                            Err(why) => Err(why),
-                        };
-                        match written {
+                    if let (Some(key), Some(argv)) = (key, argv.as_mut()) {
+                        match crate::agent_proc::write_key_file(argv, key).await {
                             Ok(file) => key_file = file,
                             Err(why) => {
                                 refuse_terminal(&obj, &stack, &terminal, &why);
@@ -4223,6 +4210,21 @@ impl AgentTerminalWindow {
                         }
                     }
                 }
+                // A key helper never bound to a key file never starts.
+                if argv
+                    .as_deref()
+                    .is_some_and(agent_core::provider::needs_key_file)
+                {
+                    refuse_terminal(
+                        &obj,
+                        &stack,
+                        &terminal,
+                        "Cannot start: the model server's key was not prepared for this tab.",
+                    );
+                    return;
+                }
+                let mut command = crate::utils::exec_command(argv.as_deref());
+                command[1] = format!("{prelude}{}", command[1]);
                 // Kept until the tab's process exits (or the tab goes), then removed.
                 let key_file = std::rc::Rc::new(RefCell::new(Some(key_file)));
                 let exited: std::rc::Rc<RefCell<Option<glib::SignalHandlerId>>> =

@@ -151,6 +151,7 @@ fn main() -> glib::ExitCode {
         load_css();
         window::watch_config_file(app);
         diff_tool::sweep_stale();
+        agent_proc::sweep_stale_key_files();
 
         // Add "New Window" action
         let new_window_action = gtk4::gio::SimpleAction::new("new-window", None);

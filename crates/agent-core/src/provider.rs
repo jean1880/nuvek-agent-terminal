@@ -6,7 +6,7 @@
 //! (`GET <base>/v1/models`, OpenAI's shape, which all three serve).
 //!
 //! - Claude: `ANTHROPIC_BASE_URL` at the server's root (its Anthropic-compatible
-//!   `/v1/messages`), and the key from an `apiKeyHelper` ([`CLAUDE_KEY_VAR`]). Ollama and LM
+//!   `/v1/messages`), and the key from an `apiKeyHelper` ([`KEY_FILE_HELPER`]). Ollama and LM
 //!   Studio ignore the key's value but Claude Code requires one, so each has its documented
 //!   placeholder.
 //! - Codex: a custom provider given with `-c`, since `app-server` takes no `--oss`. The ids
@@ -211,15 +211,59 @@ const CLAUDE_UNSET: [&str; 28] = [
     "CLAUDE_CODE_USE_MANTLE",
 ];
 
-/// Where a provider launch hands Claude its credential: the profile's key, or the server's
-/// placeholder. Only the app sets it (an inherited one is removed first), and the overlay's
-/// `apiKeyHelper` ([`CLAUDE_KEY_HELPER`]) prints it, so the value never reaches argv. A helper
-/// in the overlay wins over a settings file's `apiKeyHelper` and `env` tokens, and over the
-/// process's (seen live with Claude Code 2.1.309), with the tokens blanked beside it.
+/// Carries a provider launch's key from the launch to its spawn, and is never exported: the spawn
+/// takes it out of the environment, writes it to a private key file for that one process
+/// (`agent_kit::provider_key`) and binds the overlay's `apiKeyHelper` to read that file
+/// ([`bind_key_file_args`]). Every child Claude starts inherits its environment, so a key there
+/// would be one `env` away from the model. An inherited one is removed first. A helper in the
+/// overlay wins over a settings file's `apiKeyHelper` and `env` tokens, and over the process's
+/// (seen live with Claude Code 2.1.309), with the tokens blanked beside it.
 pub const CLAUDE_KEY_VAR: &str = "AGENT_TERMINAL_PROVIDER_KEY";
 
-/// The overlay's `apiKeyHelper`: prints [`CLAUDE_KEY_VAR`]; names the variable, not its value.
-const CLAUDE_KEY_HELPER: &str = "printf %s \"$AGENT_TERMINAL_PROVIDER_KEY\"";
+/// Stands for the overlay's `apiKeyHelper` until the spawn binds it to the key file it wrote
+/// ([`bind_key_file_args`]); a command line still holding it is never started.
+pub const KEY_FILE_HELPER: &str = "\u{1}agent-terminal:key-file";
+
+/// The overlay's `apiKeyHelper` without a key configured: the server's placeholder, no secret.
+fn placeholder_helper(token: &str) -> String {
+    format!("printf %s '{token}'")
+}
+
+/// The overlay's `apiKeyHelper` for the key file at `path`: `cat` of it, the path quoted.
+pub fn key_file_helper(path: &str) -> String {
+    format!("cat -- '{}'", path.replace('\'', r"'\''"))
+}
+
+/// Binds the [`KEY_FILE_HELPER`] of a `--settings` overlay in `args` to read the key file at
+/// `path`. Whether one was there: a launch with a key needs its file written first.
+pub fn bind_key_file_args(args: &mut [String], path: &str) -> bool {
+    let mut bound = false;
+    for arg in args.iter_mut() {
+        if !arg.contains("agent-terminal:key-file") {
+            continue;
+        }
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(arg) else {
+            continue;
+        };
+        let Some(helper) = value.get_mut("apiKeyHelper") else {
+            continue;
+        };
+        if helper.as_str() != Some(KEY_FILE_HELPER) {
+            continue;
+        }
+        *helper = key_file_helper(path).into();
+        *arg = value.to_string();
+        bound = true;
+    }
+    bound
+}
+
+/// Whether `args` still holds an unbound [`KEY_FILE_HELPER`]: never started that way.
+pub fn needs_key_file(args: &[String]) -> bool {
+    let marker = serde_json::Value::from(KEY_FILE_HELPER).to_string();
+    let marker = marker.trim_matches('"');
+    args.iter().any(|a| a.contains(marker))
+}
 
 /// Stands for the thread's model in a provider launch's environment until the spawn binds it
 /// ([`bind_thread_model`]); never exported itself (the control character keeps it from passing
@@ -537,24 +581,25 @@ impl ModelProvider {
         Ok(match driver {
             Driver::Claude => ProviderLaunch {
                 args,
-                env: vec![
+                env: [
                     ("ANTHROPIC_BASE_URL".to_owned(), base),
-                    // The overlay's `apiKeyHelper` prints it: the only credential Claude sends.
-                    (
-                        CLAUDE_KEY_VAR.to_owned(),
-                        key.unwrap_or(self.kind.placeholder_token()).to_owned(),
-                    ),
                     // A per-request header that defeats a local server's prompt cache.
                     ("CLAUDE_CODE_ATTRIBUTION_HEADER".to_owned(), "0".to_owned()),
                 ]
                 .into_iter()
+                // The key goes to the spawn, which writes its key file: never exported.
+                .chain(key.map(|k| (CLAUDE_KEY_VAR.to_owned(), k.to_owned())))
                 .chain(CLAUDE_MODEL_VARS.map(|name| (name.to_owned(), THREAD_MODEL.to_owned())))
                 .collect(),
+                // The variable the key was read from goes too: Claude reads its key file, and
+                // what it starts would inherit the key under that name.
                 unset: CLAUDE_UNSET
                     .iter()
                     .chain(CLAUDE_MODEL_VARS.iter())
                     .chain([&CLAUDE_KEY_VAR])
-                    .map(|n| (*n).to_owned())
+                    .copied()
+                    .chain(key_env)
+                    .map(str::to_owned)
                     .collect(),
             },
             // agy never gets here: `args` refused it. The Local runner reads the key from the
@@ -584,23 +629,28 @@ impl ModelProvider {
             // Claude Code applies a settings file's `env` over its own environment, so a user's
             // settings could send it to the vendor: a `--settings` overlay, which sits above every
             // settings file but a managed one, pins what the launch sets. It holds no secret: its
-            // `apiKeyHelper` prints the credential from the environment ([`CLAUDE_KEY_VAR`]),
-            // and every other credential is blanked, so a settings file's own helper or tokens
-            // never reach the server.
+            // `apiKeyHelper` reads the key file the spawn writes ([`KEY_FILE_HELPER`], bound by
+            // [`bind_key_file_args`]), or prints the placeholder with no key configured, and every
+            // other credential is blanked, so a settings file's own helper or tokens never reach
+            // the server. `BASH_ENV` and `ENV` are blanked too: a settings file must not run code
+            // in the shell the helper runs in.
             Driver::Claude => {
                 let mut env = serde_json::Map::new();
                 env.insert("ANTHROPIC_BASE_URL".to_owned(), base.into());
                 env.insert("CLAUDE_CODE_ATTRIBUTION_HEADER".to_owned(), "0".into());
-                for name in CLAUDE_UNSET {
-                    env.insert(name.to_owned(), "".into());
+                for name in CLAUDE_UNSET.iter().chain(&["BASH_ENV", "ENV"]) {
+                    env.insert((*name).to_owned(), "".into());
                 }
                 for name in CLAUDE_MODEL_VARS {
                     env.insert(name.to_owned(), THREAD_MODEL.into());
                 }
+                let helper = match key_env {
+                    Some(_) => KEY_FILE_HELPER.to_owned(),
+                    None => placeholder_helper(self.kind.placeholder_token()),
+                };
                 vec![
                     "--settings".to_owned(),
-                    serde_json::json!({ "apiKeyHelper": CLAUDE_KEY_HELPER, "env": env })
-                        .to_string(),
+                    serde_json::json!({ "apiKeyHelper": helper, "env": env }).to_string(),
                 ]
             }
             Driver::Local => crate::local_agent::RunnerArgs::server_args(&base, key_env),
@@ -971,13 +1021,14 @@ mod tests {
         let launch = p.launch(Driver::Claude, None).unwrap();
         assert_eq!(launch.args.len(), 2, "only the settings overlay");
         assert_eq!(
-            launch.env[..3],
+            launch.env[..2],
             [
                 ("ANTHROPIC_BASE_URL".into(), "http://nas:11434".into()),
-                (CLAUDE_KEY_VAR.into(), "ollama".into()),
                 ("CLAUDE_CODE_ATTRIBUTION_HEADER".into(), "0".into()),
             ]
         );
+        // No key configured: nothing to carry, the placeholder is the helper's own.
+        assert!(!launch.env.iter().any(|(k, _)| k == CLAUDE_KEY_VAR));
         // Every model Claude Code would pick on its own is the thread's, bound at the spawn.
         for name in CLAUDE_MODEL_VARS {
             assert!(
@@ -1000,7 +1051,7 @@ mod tests {
             "ANTHROPIC_IDENTITY_TOKEN_FILE",
             "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
             "CLAUDE_CODE_USE_GATEWAY",
-            // Only the app sets the variable the helper reads: an inherited one goes first.
+            // Only the app sets the variable that carries the key: an inherited one goes first.
             CLAUDE_KEY_VAR,
         ] {
             assert!(launch.unset.iter().any(|u| u == name), "{name}");
@@ -1039,34 +1090,47 @@ mod tests {
         assert_eq!(env["ANTHROPIC_BASE_URL"], "http://nas:11434");
         assert_eq!(env["CLAUDE_CODE_ATTRIBUTION_HEADER"], "0");
         // The vendor's credentials and routing are blanked, whatever a settings file says, and
-        // the one credential sent is what the overlay's helper prints from the environment.
-        for name in CLAUDE_UNSET {
-            assert_eq!(env[name], "", "{name}");
+        // so is what a settings file could run code in the helper's shell with.
+        for name in CLAUDE_UNSET.iter().chain(&["BASH_ENV", "ENV"]) {
+            assert_eq!(env[*name], "", "{name}");
         }
+        // No key configured: the one credential sent is the placeholder, with no file.
         assert_eq!(
             overlay_helper(&launch.args).as_deref(),
-            Some(CLAUDE_KEY_HELPER)
+            Some("printf %s 'ollama'")
         );
-        assert!(
-            !env.contains_key(CLAUDE_KEY_VAR),
-            "never blanked: the helper reads it"
-        );
+        assert!(!needs_key_file(&launch.args));
         for name in CLAUDE_MODEL_VARS {
             assert_eq!(env[name], THREAD_MODEL, "{name}");
         }
         assert_eq!(p.args(Driver::Claude).unwrap(), launch.args);
 
-        // With a key, the key stays in the environment only: never on the command line.
+        // With a key, the key goes to the spawn, never the command line: the helper reads the
+        // key file the spawn writes, and a command line that is not bound to one never starts.
         let keyed = at(ProviderKind::LiteLlm, "https://gw.example", Some("GW_KEY"));
         let launch = keyed.launch(Driver::Claude, Some("secret-value")).unwrap();
         assert!(!launch.args.iter().any(|a| a.contains("secret-value")));
         let env = overlay_env(&launch.args).unwrap();
         assert_eq!(env["ANTHROPIC_AUTH_TOKEN"], "");
         assert_eq!(env["ANTHROPIC_BASE_URL"], "https://gw.example");
+        assert!(!env.contains_key(CLAUDE_KEY_VAR));
         assert_eq!(
             overlay_helper(&launch.args).as_deref(),
-            Some(CLAUDE_KEY_HELPER)
+            Some(KEY_FILE_HELPER)
         );
+        assert!(needs_key_file(&launch.args));
+        let mut bound = launch.args.clone();
+        assert!(bind_key_file_args(
+            &mut bound,
+            "/run/u/agent-terminal/k's.key"
+        ));
+        assert!(!needs_key_file(&bound));
+        assert_eq!(
+            overlay_helper(&bound).as_deref(),
+            Some(r"cat -- '/run/u/agent-terminal/k'\''s.key'")
+        );
+        // Nothing to bind in a command line without one.
+        assert!(!bind_key_file_args(&mut bound, "/x"));
 
         // The models are bound at the spawn, in the overlay as in the environment.
         let mut args = vec!["--settings".to_owned(), r#"{"theme":"dark"}"#.to_owned()];
@@ -1128,7 +1192,7 @@ mod tests {
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_str(&keyed[keyed.len() - 1]).unwrap();
-        assert_eq!(value["apiKeyHelper"], CLAUDE_KEY_HELPER);
+        assert_eq!(value["apiKeyHelper"], "printf %s 'ollama'");
         assert_eq!(value["env"]["ANTHROPIC_AUTH_TOKEN"], "");
         assert_eq!(value["env"]["ANTHROPIC_API_KEY"], "");
         // `--settings=<json>` is the same flag.

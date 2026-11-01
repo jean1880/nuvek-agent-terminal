@@ -8779,6 +8779,10 @@ pub(super) mod tests {
             env.lookup(agent_core::provider::CLAUDE_KEY_VAR).as_deref(),
             Some("gateway-key")
         );
+        // Carried to the spawn, which moves it to a key file; the variable it was read from goes,
+        // so nothing Claude starts inherits it.
+        assert!(!env.env.iter().any(|(k, _)| k == "GW_KEY"));
+        assert!(env.unset.iter().any(|u| u == "GW_KEY"));
         // The vendor's key is gone, from the env file and from what is inherited.
         assert!(!env.env.iter().any(|(k, _)| k == "ANTHROPIC_API_KEY"));
         assert!(env.unset.iter().any(|u| u == "ANTHROPIC_API_KEY"));

@@ -1249,11 +1249,18 @@ fn a_codex_ask_child_requests_workspace_write_and_reads_it_back() {
         let start = &child.sent("thread/start")[0];
         assert_eq!(start["params"]["approvalPolicy"], "untrusted");
         assert_eq!(start["params"]["sandbox"], "workspace-write");
-        let result = child
-            .frames()
-            .into_iter()
-            .find(|f| f["dir"] == "out" && f["frame"]["id"] == start["id"])
-            .expect("thread/start result");
+        // The fake server answers on its own time: wait for the reply rather than race it.
+        let reply = || {
+            child
+                .frames()
+                .into_iter()
+                .find(|f| f["dir"] == "out" && f["frame"]["id"] == start["id"])
+        };
+        assert!(
+            pump_until(ctx, 10, || reply().is_some()),
+            "no thread/start result"
+        );
+        let result = reply().expect("thread/start result");
         assert_eq!(
             result["frame"]["result"]["sandbox"]["type"],
             "workspaceWrite"

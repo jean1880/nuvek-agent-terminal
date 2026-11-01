@@ -348,7 +348,9 @@ Architectural mandates, standards, and workflows for this codebase.
   model (`AgentAvailability::server_ready`). Its tools (`agent_kit::local_tools`) pass
   `local_agent::gate` first: Plan offers and runs no writing tool, Ask asks before every write
   and command, Accept edits asks before commands and before any write outside the thread's
-  folder (`local_tools::inside`, links followed, a dangling one counted outside). Reads follow
+  folder (`local_tools::inside`, links followed, a dangling one counted outside). A mode change
+  is applied as it arrives, in the middle of a turn too: the next gate and the next request use
+  it, and a card open when it comes expires and its call is gated again. Reads follow
   the agy hook's read policy, except that a link staying inside the folder is judged where it
   leads: a read outside the folder, of a sensitive file (the shared `agent_core::sensitive`
   list, a file with a second hard link, and a home's dotfiles when the folder is that home or
@@ -388,7 +390,8 @@ Architectural mandates, standards, and workflows for this codebase.
   truncated. The composed system message is redacted, and no instruction can change the gate,
   the approvals or the environment. Every request is planned whole
   (`local_context::plan_request`): policy, instructions, schemas, newest whole exchanges and
-  the response reserve; a call batch runs only when every result's room is reserved first.
+  the response reserve; a call batch runs only when every result's room is reserved first, for
+  whichever mode the next request is planned in (`reserve_batch_for_any_mode`).
   MCP servers (`local_defaults.mcp_servers`, selected per profile) are stdio child processes
   started only at a turn or by Settings → Discover tools, never by opening Settings or
   importing. Each runs under a guardian (`--local-mcp-guardian`) in its own process group,

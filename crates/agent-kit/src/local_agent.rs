@@ -903,14 +903,36 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
     }
 
     fn poll_commands(&mut self, commands: &Receiver<RunnerInput>) -> Option<Stop> {
+        self.poll_commands_narrowing(commands).0
+    }
+
+    /// [`Self::poll_commands`], also saying whether a mode it applied narrowed what may run
+    /// unasked (out of Bypass, or into Plan). A mode change is applied as soon as it arrives,
+    /// never held for the turn's end: the next gate and the next request see it.
+    fn poll_commands_narrowing(
+        &mut self,
+        commands: &Receiver<RunnerInput>,
+    ) -> (Option<Stop>, bool) {
         let stop = poll(commands, &mut self.deferred, &self.context.mcp_servers);
         let waiting = std::mem::take(&mut self.deferred);
+        let mut narrowed = false;
         for command in waiting {
-            if !self.handle_busy_control(&command) {
+            if let Command::SetMode { mode } = command {
+                narrowed |= self.set_mode(mode);
+            } else if !self.handle_busy_control(&command) {
                 self.deferred.push(command);
             }
         }
-        stop
+        (stop, narrowed)
+    }
+
+    /// Applies `mode` and says so; whether it narrowed what may run unasked.
+    fn set_mode(&mut self, mode: Mode) -> bool {
+        let narrowed = self.mode == Mode::Bypass && mode != Mode::Bypass
+            || mode == Mode::Plan && self.mode != Mode::Plan;
+        self.mode = mode;
+        self.emit(Envelope::new(Event::ModeChanged { mode }));
+        narrowed
     }
 
     /// One turn: the prompt, then model requests and tool calls until the model answers.
@@ -1093,7 +1115,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         usage: &mut Usage,
     ) -> Result<StepEnd, StepError> {
         use agent_core::local_context::{
-            bound_result, compose_system, plan_request, reserve_batch, SchemaCandidate,
+            bound_result, compose_system, plan_request, reserve_batch_for_any_mode, SchemaCandidate,
         };
         let mut candidates: Vec<_> = if self.no_tools {
             Vec::new()
@@ -1191,15 +1213,13 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         } else {
             plan.schemas
         };
-        let system = compose_system(
+        // The mode may change while the calls run (it is applied as it arrives): the results
+        // are reserved so the next request carries them whichever mode it is planned in.
+        let reservation = match reserve_batch_for_any_mode(
+            model,
             &self.args.cwd,
-            self.mode,
             &self.turn_instructions,
             !self.no_tools,
-        );
-        let reservation = match reserve_batch(
-            model,
-            &system,
             &schemas,
             &self.messages,
             &self.context.budget,
@@ -1579,34 +1599,41 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         } else {
             crate::local_tools::read_must_ask(&ws, tool, &input)
         };
-        match gate(tool, self.mode, outside) {
-            Gate::Refuse(why) => {
-                self.emit(Envelope::item_completed(
-                    &item,
-                    ItemStatus::Declined,
-                    None,
-                    Some(why),
-                ));
-                return Ok(format!("Refused: {why}"));
-            }
-            // Any allow runs this one call: what a session or Always answer keeps is the app's
-            // rule, scoped as its card said, and the app answers the cards it covers itself.
-            Gate::Ask => match self.ask(tool, &title, &input, commands)? {
-                Decision::Allow | Decision::AllowForSession | Decision::AllowAlways => {}
-                Decision::Deny | Decision::Cancel => {
+        // Gated in the mode as it is now (a change during the turn is applied as it arrives),
+        // and again if it changes while the card is open.
+        loop {
+            match gate(tool, self.mode, outside) {
+                Gate::Refuse(why) => {
                     self.emit(Envelope::item_completed(
                         &item,
                         ItemStatus::Declined,
                         None,
-                        Some("The user declined it."),
+                        Some(why),
                     ));
-                    return Ok(
-                        "The user declined this call. Do not retry it; ask or try another way."
-                            .to_owned(),
-                    );
+                    return Ok(format!("Refused: {why}"));
                 }
-            },
-            Gate::Run => {}
+                // Any allow runs this one call: what a session or Always answer keeps is the
+                // app's rule, scoped as its card said, and the app answers the cards it covers
+                // itself.
+                Gate::Ask => match self.ask(tool, &title, &input, commands)? {
+                    None => continue,
+                    Some(Decision::Allow | Decision::AllowForSession | Decision::AllowAlways) => {}
+                    Some(Decision::Deny | Decision::Cancel) => {
+                        self.emit(Envelope::item_completed(
+                            &item,
+                            ItemStatus::Declined,
+                            None,
+                            Some("The user declined it."),
+                        ));
+                        return Ok(
+                            "The user declined this call. Do not retry it; ask or try another way."
+                                .to_owned(),
+                        );
+                    }
+                },
+                Gate::Run => {}
+            }
+            break;
         }
         // Run on a thread of its own, so a Stop is seen (and ends a command's whole group)
         // while it works.
@@ -1668,23 +1695,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
     }
 
     fn poll_mcp(&mut self, commands: &Receiver<RunnerInput>, active: bool) -> Option<Stop> {
-        let stop = self.poll_commands(commands);
-        let mut modes = Vec::new();
-        self.deferred.retain(|command| {
-            if let Command::SetMode { mode } = command {
-                modes.push(*mode);
-                false
-            } else {
-                true
-            }
-        });
-        let mut narrowed = false;
-        for mode in modes {
-            narrowed |= self.mode == Mode::Bypass && mode != Mode::Bypass
-                || mode == Mode::Plan && self.mode != Mode::Plan;
-            self.mode = mode;
-            self.emit(Envelope::new(Event::ModeChanged { mode }));
-        }
+        let (stop, narrowed) = self.poll_commands_narrowing(commands);
         if active && narrowed && stop.is_none() {
             self.emit(Envelope::new(Event::Notice {
                 text:
@@ -2019,14 +2030,15 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         }
     }
 
-    /// Asks the user, and waits for the answer (or an interrupt).
+    /// Asks the user, and waits for the answer (or an interrupt). `None`: the mode changed while
+    /// the card was open, so it expired and the call must be gated again.
     fn ask(
         &mut self,
         tool: Tool,
         title: &str,
         input: &Value,
         commands: &Receiver<RunnerInput>,
-    ) -> Result<Decision, StepError> {
+    ) -> Result<Option<Decision>, StepError> {
         let request = self.id("approval");
         if !self.emit_approval(
             Envelope::new(Event::ApprovalRequested {
@@ -2040,7 +2052,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             })
             .request(&request),
         ) {
-            return Ok(Decision::Deny);
+            return Ok(Some(Decision::Deny));
         }
         loop {
             match commands.recv_timeout(Duration::from_secs(3600)) {
@@ -2052,7 +2064,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                     self.emit(
                         Envelope::new(Event::ApprovalResolved { decision }).request(&request),
                     );
-                    return Ok(decision);
+                    return Ok(Some(decision));
                 }
                 Ok(RunnerInput::Invalid(why)) => {
                     self.emit(Envelope::new(Event::ApprovalExpired).request(&request));
@@ -2061,6 +2073,12 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 Ok(RunnerInput::Command(Command::Interrupt)) => {
                     self.emit(Envelope::new(Event::ApprovalExpired).request(&request));
                     return Err(StepError::Stop(Stop::Interrupted));
+                }
+                // The card was asked in another mode: it expires, and the call is gated again.
+                Ok(RunnerInput::Command(Command::SetMode { mode })) => {
+                    self.set_mode(mode);
+                    self.emit(Envelope::new(Event::ApprovalExpired).request(&request));
+                    return Ok(None);
                 }
                 Ok(RunnerInput::Command(other))
                     if restrictive_toggle(&other, &self.context.mcp_servers) =>
@@ -3822,6 +3840,101 @@ mod tests {
             .map(|t| t["function"]["name"].as_str().unwrap().to_owned())
             .collect();
         assert_eq!(offered, ["read_file", "list_dir", "search"]);
+    }
+
+    /// A switch to Plan while a call of the batch runs reaches the next call of the same batch:
+    /// it is refused, never written, and the next request offers only Plan's tools.
+    #[test]
+    fn a_switch_to_plan_in_the_middle_of_a_turn_refuses_the_next_write() {
+        let work = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let two = vec![
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"run_command","arguments":"{\"command\":\"sleep 1\"}"}},{"index":1,"id":"b","function":{"name":"write_file","arguments":"{\"file_path\":\"x.txt\",\"content\":\"y\"}"}}]},"finish_reason":"tool_calls"}]}"#.to_owned(),
+            "data: [DONE]".to_owned(),
+        ];
+        let script = Script::new(vec![Ok(two), Ok(text(&["Ok"]))]);
+        let run = start(
+            args(work.path(), Mode::Bypass),
+            script.clone(),
+            state.path().into(),
+        );
+        run.send(prompt("go"));
+        run.wait_for(|e| matches!(e.event, Event::ItemStarted { .. }).then_some(()));
+        run.send(Command::SetMode { mode: Mode::Plan });
+        let mut changed = false;
+        let mut refused = false;
+        run.wait_for(|e| {
+            match &e.event {
+                Event::ModeChanged { mode: Mode::Plan } => changed = true,
+                Event::ItemCompleted {
+                    status: ItemStatus::Declined,
+                    ..
+                } => refused = true,
+                _ => {}
+            }
+            completed(e)
+        });
+        run.finish();
+        assert!(changed && refused, "{changed} {refused}");
+        assert!(!work.path().join("x.txt").exists());
+        let offered: Vec<_> = script.bodies()[1]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(offered, ["read_file", "list_dir", "search"]);
+    }
+
+    /// A card open when the mode changes is judged again in the new mode: in Plan, the command it
+    /// asked about is refused, and a late answer to the old card runs nothing.
+    #[test]
+    fn a_switch_to_plan_at_an_open_card_expires_it_and_refuses_the_call() {
+        let work = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let script = Script::new(vec![
+            Ok(tool_call(
+                "c1",
+                "run_command",
+                json!({"command": "touch made"}),
+            )),
+            Ok(text(&["Ok"])),
+        ]);
+        let run = start(
+            args(work.path(), Mode::Ask),
+            script.clone(),
+            state.path().into(),
+        );
+        run.send(prompt("make it"));
+        let request = run.wait_for(|e| match &e.event {
+            Event::ApprovalRequested { .. } => e.request.clone(),
+            _ => None,
+        });
+        run.send(Command::SetMode { mode: Mode::Plan });
+        run.wait_for(|e| {
+            (matches!(e.event, Event::ApprovalExpired) && e.request.as_ref() == Some(&request))
+                .then_some(())
+        });
+        run.send(Command::Approve {
+            request,
+            decision: Decision::Allow,
+            updated_input: None,
+            message: None,
+        });
+        let (state_, _, _) = run.wait_for(completed);
+        run.finish();
+        assert_eq!(state_, TurnState::Completed);
+        assert!(!work.path().join("made").exists());
+        let told = script.bodies()[1]["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert!(
+            told["content"].as_str().unwrap().contains("Plan mode"),
+            "{told}"
+        );
     }
 
     /// A plan refuses mutation, not disclosure: a read in the folder runs unasked, a read past it

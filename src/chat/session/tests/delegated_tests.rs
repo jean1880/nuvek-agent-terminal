@@ -634,6 +634,44 @@ fn an_ask_only_card_offers_no_grant_and_is_never_auto_allowed() {
     });
 }
 
+/// A Claude child runs `--permission-mode default`, so the app answers its Accept edits: an edit
+/// its rules may cover is allowed at once; one they may not, an edit in Ask and a command in
+/// Accept edits still ask.
+#[test]
+fn a_claude_child_in_accept_edits_is_allowed_its_contained_edits_only() {
+    fn edit(id: &str, path: &str) -> String {
+        serde_json::json!({"type": "control_request", "request_id": id, "request": {
+            "subtype": "can_use_tool", "tool_name": "Edit", "tool_use_id": format!("tu-{id}"),
+            "input": {"file_path": path, "old_string": "a", "new_string": "b"}}})
+        .to_string()
+    }
+    in_loop(|ctx| {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let file = tmp.path().join("a.rs").to_string_lossy().into_owned();
+        let (session, seen) =
+            claude_child(ctx, tmp.path(), Mode::AcceptEdits, TestGate::defer(true));
+        feed(&session, &edit("inside", &file));
+        assert!(pump_until(ctx, 10, || resolution(&seen, "inside").is_some()));
+        assert_eq!(resolution(&seen, "inside"), Some(Decision::Allow));
+        feed(&session, &can_use_tool("cmd", "touch b.tmp"));
+        assert!(!pump_until(ctx, 1, || resolution(&seen, "cmd").is_some()));
+        session.shutdown(false);
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (session, seen) =
+            claude_child(ctx, tmp.path(), Mode::AcceptEdits, TestGate::defer(false));
+        feed(&session, &edit("outside", &file));
+        assert!(!pump_until(ctx, 1, || resolution(&seen, "outside").is_some()));
+        session.shutdown(false);
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (session, seen) = claude_child(ctx, tmp.path(), Mode::Ask, TestGate::defer(true));
+        feed(&session, &edit("ask", &file));
+        assert!(!pump_until(ctx, 1, || resolution(&seen, "ask").is_some()));
+        session.shutdown(false);
+    });
+}
+
 /// A rule the card offered is checked again when the answer comes; if the gate
 /// no longer allows it, the call is allowed once and nothing is kept, with a notice.
 #[test]

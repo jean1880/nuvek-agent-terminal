@@ -26,6 +26,8 @@ pub fn fetch(
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(TIMEOUT))
         .max_redirects(0)
+        // The key goes only to the configured address: never through a proxy the environment names.
+        .proxy(None)
         .user_agent(user_agent)
         .build()
         .into();
@@ -75,6 +77,8 @@ pub fn fetch_info(
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(DETAIL_TIMEOUT))
         .max_redirects(0)
+        // The key goes only to the configured address: never through a proxy the environment names.
+        .proxy(None)
         .user_agent(user_agent)
         .build()
         .into();

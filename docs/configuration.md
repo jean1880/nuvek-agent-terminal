@@ -338,12 +338,20 @@ name, defined in the profile's environment file or your session. The key itself 
 written to the settings. If the address is invalid, or the key variable is not set, the
 thread refuses to start: it never falls back to the vendor's models.
 
+A terminal tab of such a profile runs on the server too. Its shell reads your shell's startup
+files (`.zshrc`, `.bashrc`) before the CLI starts, so the vendor's variables they export are
+removed again just before the CLI starts, and the server's set. That takes a POSIX shell as
+`$SHELL` (sh, bash, zsh, dash, ksh): with fish or csh the tab refuses to start, and a chat
+thread still runs on the server. Such a tab also refuses to start when the profile's
+environment file cannot be read, rather than start without it.
+
 The model list is the one request the app makes to the server itself (`GET <url>/v1/models`).
 Claude reaches the server's Anthropic-compatible API at the URL's root; Codex reaches its
 OpenAI-compatible Responses API at `<url>/v1`. Antigravity only runs Google's models.
 
 Each profile's threads pick from its own server's list: a cloud profile and a local one of
-the same agent each show their own models, and a model is only ever called retired against
+the same agent each show their own models, and so do two profiles on one server whose
+environment files hold different keys, and a model is only ever called retired against
 the list of the server it runs on. A profile with no **Default Model** starts on the first
 model its server lists that is not an embedding model; it never takes the CLI's own default
 (such as `opus` in `~/.claude/settings.json`), which the server would not have.
@@ -352,7 +360,18 @@ Claude Code also picks models on its own: its `opus`, `sonnet`, `haiku` and `fab
 aliases (background tasks use `haiku`), its subagents and auto mode. On a model server all
 of these name the thread's model (`ANTHROPIC_DEFAULT_*_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL`
 and the rest are set for it, and follow a model change), so nothing is sent for a model the
-server does not have. Values for them in your own environment are replaced. Changing the
+server does not have. Values for them in your own environment are replaced, and so are
+those of an `env` block in Claude's own settings files, which Claude Code applies over its
+environment: it is started with a `--settings` overlay that sets the server's address and
+these models, and blanks the vendor's credential and routing variables (`ANTHROPIC_API_KEY`,
+`ANTHROPIC_CUSTOM_HEADERS`, `CLAUDE_CODE_OAUTH_TOKEN` and the Bedrock, Vertex and Foundry
+switches). The overlay holds no key, so with an **API Key Variable** set, an
+`ANTHROPIC_AUTH_TOKEN` in a settings file's `env` still replaces the key: leave it out there.
+Claude Code reads only the last `--settings`, so one in the profile's own arguments is merged
+into the overlay: its keys stay, its `env` variables too, and the overlay's win where both
+set one. It must be inline JSON (`--settings '{"theme":"dark"}'`): a file path, or a value
+that is not a JSON object, refuses the start with the reason. A managed settings file still
+sits above the overlay. Changing the
 model of a thread on a server restarts Claude on the new model, resuming the same
 conversation (Claude Code cannot switch to a model id it does not know in place). Ollama
 answers Claude's token-count requests with 404 (it has no `/v1/messages/count_tokens`);

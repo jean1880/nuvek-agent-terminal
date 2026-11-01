@@ -36,7 +36,12 @@ Architectural mandates, standards, and workflows for this codebase.
   CLI owns the controlling terminal. Never emit banner or `clear` output into the
   TTY beforehand — it disrupts the CLI's initial terminal handshake. Anything
   resembling a startup script must contribute *environment*, merged into the
-  spawn environment, never bytes written to the terminal.
+  spawn environment, never bytes written to the terminal. The one text before `exec` is a
+  terminal tab's model provider (`utils::apply_provider_env`): the user's rc runs after the
+  spawn environment and may export the vendor's variables again, so POSIX `unset`/`export`
+  builtins put the provider's back. It names variables only, never a value: each value, the
+  key among them, comes in the spawn environment under a private `__AT_PROVIDER_` name that
+  is copied and then unset. A shell that is not POSIX (fish, csh) refuses such a tab.
 - **Threads over a hidden tab view**: the window is an `adw::OverlaySplitView`
   whose sidebar lists the store's threads. Its content is an `adw::TabView` with
   no tab bar: one page per open thread or terminal. Each page is tracked in an
@@ -327,21 +332,26 @@ Architectural mandates, standards, and workflows for this codebase.
 - **A profile on a model server never falls back to its vendor**: a profile's `provider` (Settings
   → Agents → Model Provider, Claude and Codex only) starts the agent on that server
   (`agent_core::provider`: Claude through `ANTHROPIC_BASE_URL`, with the vendor's own credential
-  variables removed; Codex through a `-c` provider of the app's own id). Every chat launch path
+  variables removed, all pinned again by a `--settings` overlay, since a settings file's `env`
+  wins over the process environment; the overlay never holds the key, and a profile's own
+  `--settings` is merged under it (`provider::with_profile_settings`: inline JSON only, a file
+  refuses the start, never dropped). Codex through a `-c`
+  provider of the app's own id). Every chat launch path
   goes through `profile_launch` (threads, switches, forks, delegated workers), and a terminal tab
   through `utils::with_provider_args` and `apply_provider_env`: a provider that cannot be used (a
   bad address, a key variable that is unset) refuses the start. Such an agent lists the server's
   models or none (never its vendor's), and its vendor's account is never probed. Claude's own
   model names (`ANTHROPIC_MODEL`, the `ANTHROPIC_DEFAULT_*_MODEL` aliases, the subagent and
   auto-mode models: `provider::CLAUDE_MODEL_VARS`) are unset, then bound to the process's model
-  at every spawn (`bind_thread_model`), so background tasks and subagents stay on the server; an
+  at every spawn (`bind_thread_model`, and in the overlay `bind_thread_model_args`), so background tasks and subagents stay on the server; an
   unbound one is never exported. A model is chosen by `start_model`: the profile's own, else the
   server's first chat model (never the CLI's own setting, which names a vendor model); with none
   known, nothing starts (thread, switch, worker or terminal tab), and a terminal tab is given its
   model on the command line (`provider::model_args`). A model change on a server is a resumed
   restart (`binds_thread_model`): Claude Code refuses a live `set_model` to an unknown id. The
   catalogue keeps a list per source any enabled profile uses (`ModelCatalog::models_for`,
-  `other_profile_sources`): a thread's retirement judgement and a delegated worker's effort check
+  `other_profile_sources`), a server keyed with the profile's environment file
+  (`model_catalog::ServerSource`), since another file may hold another key: a thread's retirement judgement and a delegated worker's effort check
   use the list of the source its own profile runs (`profile_source`). Its picker shows one group
   per source (`picker_specs`, `ModelCatalog::list_state`): each agent's vendor and every enabled
   profile on a model server (every Local server) under its own name, kind and address, saying
@@ -460,7 +470,8 @@ Architectural mandates, standards, and workflows for this codebase.
   (`check_updates_on_startup`), and when the user picks "Check for Updates…". Tests never reach
   it. And a model server's model list (`agent_kit::provider_models`): one GET of
   `<base>/v1/models` at the address the user configured for a profile's model provider, off the
-  main thread, with a timeout, redirects not followed, made only while a profile has a provider
+  main thread, with a timeout, redirects not followed, never through a proxy (an
+  `HTTP(S)_PROXY` in the environment is ignored), made only while a profile has a provider
   (when the models are listed, as the vendor's list is otherwise; for each enabled Local server
   at every agent scan and on Scan Now). For a Local server of a kind that says what each model
   can do, the catalogue and Scan Now also ask it (`provider_models::fetch_info`): Ollama's
@@ -468,8 +479,8 @@ Architectural mandates, standards, and workflows for this codebase.
   a failure leaves a model to its name. Its tests use a loopback listener of their own. And the
   Local agent's chat requests (`agent_kit::local_agent::HttpChat`): streamed POSTs of
   `<base>/v1/chat/completions` to the address the user configured for that server, only while
-  one of its threads runs a turn, redirects not followed, the key sent only as a bearer token
-  read from the variable the profile names. Never add any other request. Two user actions reach GitHub without the app making a
+  one of its threads runs a turn, redirects not followed, never through a proxy, the key sent
+  only as a bearer token read from the variable the profile names. Never add any other request. Two user actions reach GitHub without the app making a
   request: the diff panel's "Open a PR" hands GitHub's compare URL (built from the remote,
   credentials dropped: `agent_kit::github`) to the browser, and "Push & Open PR" runs one
   `git push` (never forced, after a confirmation that shows the command) through the user's own

@@ -2006,6 +2006,8 @@ impl Inner {
         self.open.borrow_mut().delegation = binding.as_ref().and_then(|b| b.open.clone());
         let open = self.open.borrow();
         let mut argv = self.adapter.borrow().argv(&open);
+        // A model server's Claude names this process's model in its settings overlay too.
+        agent_core::provider::bind_thread_model_args(&mut argv, open.model.as_deref());
         // Claude shares its thinking only with this hidden flag, so it goes only to a
         // version known to take it (`claude_probe`), and never after the one retry without it.
         let thinking = self.adapter.borrow().driver() == Driver::Claude

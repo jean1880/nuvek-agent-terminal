@@ -805,7 +805,9 @@ fn search(input: &Value, ws: &Workspace, cancel: &AtomicBool) -> Result<String, 
                 continue;
             }
             let path = root.join(&rel);
+            // Too large, or no longer a regular file: not searched, and said so.
             let Ok(content) = read_open(fd, &path, MAX_SEARCH_FILE) else {
+                unread += 1;
                 continue;
             };
             if content.bytes().take(8192).any(|b| b == 0) {
@@ -838,7 +840,9 @@ fn search(input: &Value, ws: &Workspace, cancel: &AtomicBool) -> Result<String, 
     }
     if unread > 0 {
         out.push_str(&format!(
-            "\n… {unread} folders or files could not be opened, so the search is incomplete"
+            "\n… {unread} folders or files could not be opened or read whole (over {} MB), so \
+             the search is incomplete",
+            MAX_SEARCH_FILE / (1024 * 1024)
         ));
     }
     if withheld > 0 {
@@ -1815,6 +1819,18 @@ mod tests {
         assert_eq!(out, "src/a.rs:1: fn needle() {}");
         let none = go(Tool::Search, &json!({"pattern": "absent"}), d.path()).unwrap();
         assert!(none.starts_with("No line contains"));
+    }
+
+    #[test]
+    fn a_file_too_large_to_search_is_counted_never_skipped_silently() {
+        let d = dir();
+        std::fs::write(d.path().join("a.rs"), "needle\n").unwrap();
+        let mut big = "needle\n".to_owned();
+        big.push_str(&"x".repeat(MAX_SEARCH_FILE as usize));
+        std::fs::write(d.path().join("big.log"), big).unwrap();
+        let out = go(Tool::Search, &json!({"pattern": "needle"}), d.path()).unwrap();
+        assert!(out.starts_with("a.rs:1: needle"), "{out}");
+        assert!(out.contains("1 folders or files could not be"), "{out}");
     }
 
     #[test]

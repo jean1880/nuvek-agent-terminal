@@ -361,7 +361,7 @@ Architectural mandates, standards, and workflows for this codebase.
   open folders never outnumber the depth), never follows a link, and never reads a sensitive or
   hard-linked file or a home's dotfiles, even approved: inside the folder as reads judge them,
   outside it by the whole resolved path wherever the search started. What it withheld and what
-  it could not open are counted in its result, never silently dropped (generated trees such as
+  it could not open or read whole (too large) are counted in its result, never silently dropped (generated trees such as
   `.git` and `target` aside). A command's group is killed before its shell is reaped
   (never when someone else reaped it), so the group id is never one reused by another process.
   The runner keeps

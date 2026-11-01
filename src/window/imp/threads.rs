@@ -70,6 +70,17 @@ fn limit_windows(windows: &[agent_core::event::QuotaWindow]) -> Vec<LimitWindow>
         .collect()
 }
 
+/// Whether a thread on `driver`, opened with `profile_id`, uses its vendor's quota, the one
+/// `AccountStatus` reads per agent: not on a model server ([`profile_source`]), nor the Local
+/// agent.
+fn reads_vendor_quota(
+    config: &crate::config::TerminalConfig,
+    profile_id: Option<&str>,
+    driver: Driver,
+) -> bool {
+    driver != Driver::Local && profile_source(config, profile_id, driver).is_none()
+}
+
 /// When the limit a refusal reports resets (epoch seconds), when it says: only a rate limit
 /// names a time.
 fn limit_reset_of(event: &Event) -> Option<i64> {
@@ -3280,8 +3291,18 @@ impl AgentTerminalWindow {
         }
     }
 
-    /// `thread`'s agent refused its work over its usage limit ([`agent_core::limit_wait::limit_refused`]); `reset`: when
-    /// it said the limit resets. Unless Settings turned it off or the thread is a delegated
+    /// The usage reading a limit wait of `chat` reads: its vendor's, kept per agent
+    /// ([`AccountStatus`]). `None` when the profile it runs has no vendor quota (a model server,
+    /// the Local agent): another thread's reading of the vendor says nothing of it, so its wait
+    /// ends on its back-off alone.
+    fn limit_snapshot(&self, chat: &ChatTab) -> Option<crate::account_status::Snapshot> {
+        let profile = chat.running_profile_id();
+        reads_vendor_quota(&self.config.borrow(), profile.as_deref(), chat.driver)
+            .then(|| AccountStatus::shared().snapshot(chat.driver))
+    }
+
+    /// `thread`'s agent refused its work over its usage limit
+    /// ([`agent_core::limit_wait::limit_refused`]); `reset`: when it said the limit resets. Unless Settings turned it off or the thread is a delegated
     /// worker, the thread waits for the limit to be over and continues
     /// ([`Self::continue_after_limits`]). A wait already running learns a later reset time from
     /// another refusal only: a quota reading may name a window the thread does not use.
@@ -3310,7 +3331,10 @@ impl AgentTerminalWindow {
         };
         // What the agent's windows hold now names what stopped the thread, and which stale copies
         // this refusal disproves.
-        let held = limit_windows(&AccountStatus::shared().snapshot(chat.driver).windows);
+        let held = self
+            .limit_snapshot(chat)
+            .map(|snap| limit_windows(&snap.windows))
+            .unwrap_or_default();
         // A refused continuation holds the thread longer each time, whatever its windows say:
         // the record outlives the wait it ended.
         let gap = chat.limit.backoff();
@@ -3381,15 +3405,26 @@ impl AgentTerminalWindow {
             .filter_map(|t| t.chat.as_mut())
         {
             let driver = chat.driver;
+            if chat.limit_wait.is_none() {
+                continue;
+            }
+            // None for a thread with no vendor quota: never probed, its wait ends on its back-off.
+            let snap = self.limit_snapshot(chat);
+            let windows = snap
+                .as_ref()
+                .map(|s| limit_windows(&s.windows))
+                .unwrap_or_default();
+            // When quota windows last arrived: an account-only update moves `read_at`, not this.
+            let reading = snap
+                .as_ref()
+                .and_then(|s| s.updated_at)
+                .map(|at| (at, windows.as_slice()));
             let Some(wait) = chat.limit_wait.as_mut() else {
                 continue;
             };
-            let snap = status.snapshot(driver);
-            let windows = limit_windows(&snap.windows);
-            // When quota windows last arrived: an account-only update moves `read_at`, not this.
-            match wait.step(now, snap.updated_at.map(|at| (at, windows.as_slice()))) {
+            match wait.step(now, reading) {
                 Step::Wait => {}
-                Step::Probe if !probe.contains(&driver) => probe.push(driver),
+                Step::Probe if snap.is_some() && !probe.contains(&driver) => probe.push(driver),
                 Step::Probe => {}
                 Step::Continue => {
                     if let Some(session) = chat.slot.get() {
@@ -8812,6 +8847,37 @@ pub(super) mod tests {
                 (Driver::Codex, None, "codex-cloud".into()),
             ]
         );
+    }
+
+    /// A usage-limit wait reads the vendor's windows only for a thread on its vendor: one on a
+    /// model server, or the Local agent, reads none (its wait ends on its back-off).
+    #[test]
+    fn only_a_thread_on_its_vendor_reads_the_vendors_quota() {
+        use agent_core::provider::{ModelProvider, ProviderKind};
+        let mut config = crate::config::TerminalConfig::default();
+        config.profiles = vec![
+            Profile {
+                id: "claude-cloud".into(),
+                ..crate::config::new_agent_profile(Driver::Claude)
+            },
+            Profile {
+                id: "claude-local".into(),
+                provider: Some(ModelProvider::new(ProviderKind::Ollama)),
+                ..crate::config::new_agent_profile(Driver::Claude)
+            },
+        ];
+        assert!(reads_vendor_quota(
+            &config,
+            Some("claude-cloud"),
+            Driver::Claude
+        ));
+        assert!(reads_vendor_quota(&config, None, Driver::Codex));
+        assert!(!reads_vendor_quota(
+            &config,
+            Some("claude-local"),
+            Driver::Claude
+        ));
+        assert!(!reads_vendor_quota(&config, None, Driver::Local));
     }
 
     /// A cloud profile and a local one of the same agent: each thread's source is its own

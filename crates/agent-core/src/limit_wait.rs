@@ -27,8 +27,14 @@
 //! same, each new wait continuing on its first reading. So the thread keeps a [`LimitRecord`]
 //! from one wait to the next, until the agent works again: each continuation refused meanwhile
 //! holds the next wait off ([`LimitWait::back_off`]) for at least [`BACKOFF_MIN`], then at least
-//! double the last gap, up to [`BACKOFF_MAX`]. The caller supplies the clock and the readings;
-//! nothing here sends or probes anything.
+//! double the last gap, up to [`BACKOFF_MAX`].
+//!
+//! Some waits no reading can end: no reset time, and no window reported (an API key, a model
+//! server, the Local agent), a blocking window missing from the readings, or one still full that
+//! names no reset time. Such a wait continues blind [`BACKOFF_MIN`] after its last refusal (and
+//! once every time a window still holding it names has passed); a refusal of that guess is a
+//! refused continuation, so the guesses spread out by the same back-off. The caller supplies the
+//! clock and the readings; nothing here sends or probes anything.
 
 use crate::event::{Event, ItemKind, TurnState};
 
@@ -195,6 +201,16 @@ pub struct LimitWait {
     /// Never continued before this, whatever a reset time or a reading says: the back-off the
     /// thread's refused continuations earned ([`Self::back_off`]).
     not_before: i64,
+    /// When the thread is tried again though nothing said the limit is over: no reset time is
+    /// known and no window still holding it names one (an agent that reports no windows, or a
+    /// full window with no reset time). [`BACKOFF_MIN`] after the last refusal.
+    blind_at: i64,
+    /// The latest time a window still holding the thread names (its reset, or the end of a
+    /// back-off), in the last reading that counted: a blind try waits for it too.
+    named: Option<i64>,
+    /// No reading has counted yet, or a window still holding the thread in the last one names
+    /// no time: only then is it tried blind.
+    unnamed: bool,
 }
 
 /// A copy (key and reset time) that was already past its reset when the agent refused work.
@@ -241,6 +257,9 @@ impl LimitWait {
                 .collect(),
             backed_off: backed_off_by(held, now),
             not_before: now,
+            blind_at: now.saturating_add(BACKOFF_MIN),
+            named: None,
+            unnamed: true,
         }
     }
 
@@ -265,12 +284,15 @@ impl LimitWait {
     /// Until when a window that is not free holds the thread, if known: its reset still ahead,
     /// else the end of the back-off a refusal put on that copy.
     fn holds_until(&self, w: &Window, now: i64) -> Option<i64> {
-        w.resets_at.filter(|r| *r > now).or_else(|| {
-            self.backed_off
-                .iter()
-                .find(|b| b.key == w.key && Some(b.reset) == w.resets_at && now < b.until)
-                .map(|b| b.until)
-        })
+        // A reset within the grace still holds it (`past_reset`).
+        w.resets_at
+            .filter(|r| r.saturating_add(GRACE) > now)
+            .or_else(|| {
+                self.backed_off
+                    .iter()
+                    .find(|b| b.key == w.key && Some(b.reset) == w.resets_at && now < b.until)
+                    .map(|b| b.until)
+            })
     }
 
     /// The agent refused work again at `now` (a retry during the wait), with `reset` if known and
@@ -280,6 +302,9 @@ impl LimitWait {
     /// reset are backed off, and a later reset time than the one waited for replaces it.
     pub fn learn(&mut self, reset: Option<i64>, now: i64, held: &[Window]) {
         self.since = self.since.max(now);
+        self.blind_at = self.blind_at.max(now.saturating_add(BACKOFF_MIN));
+        self.named = None;
+        self.unnamed = true;
         if self.reset.is_some_and(|known| now >= known) {
             self.reset = None;
         }
@@ -307,10 +332,25 @@ impl LimitWait {
     /// What to do at `now`. `reading`: the agent's latest quota windows and when they arrived.
     /// Never [`Step::Continue`] before the back-off ends.
     pub fn step(&mut self, now: i64, reading: Option<(i64, &[Window])>) -> Step {
-        match self.judge(now, reading) {
-            Step::Continue if now < self.not_before => Step::Wait,
-            step => step,
+        let judged = self.judge(now, reading);
+        if (judged == Step::Continue || self.blind_due(now)) && now >= self.not_before {
+            Step::Continue
+        } else if judged == Step::Continue {
+            Step::Wait
+        } else {
+            judged
         }
+    }
+
+    /// Nothing will say the limit is over (no reset time, and no window reported or one still
+    /// holding the thread that names no time): it is tried again once `blind_at` has
+    /// passed, and every time a window still holding it names too. A refusal of that try backs
+    /// the next one off further ([`LimitRecord::backoff`]).
+    fn blind_due(&self, now: i64) -> bool {
+        self.reset.is_none()
+            && self.unnamed
+            && now >= self.blind_at
+            && self.named.is_none_or(|at| now >= at.saturating_add(GRACE))
     }
 
     fn judge(&mut self, now: i64, reading: Option<(i64, &[Window])>) -> Step {
@@ -337,17 +377,21 @@ impl LimitWait {
             // When every window still holding the thread says when it stops (its reset ahead, or
             // the end of a back-off), the next reading waits for the latest of them; one that
             // does not keeps the backoff.
-            let latest = windows
+            let holding: Vec<Option<i64>> = windows
                 .iter()
                 .filter(|w| !self.free(w, now))
                 .filter(|w| self.blocking.is_empty() || self.blocking.contains(&w.key))
                 .map(|w| self.holds_until(w, now))
-                .collect::<Option<Vec<i64>>>()
-                .and_then(|resets| resets.into_iter().max());
-            if let Some(latest) = latest {
-                if self.expected != Some(latest) {
-                    self.expected = Some(latest);
-                    self.next_check = latest.saturating_add(GRACE);
+                .collect();
+            self.named = holding.iter().flatten().max().copied();
+            // None holding it, yet not freed: a blocking window is missing from the reading.
+            self.unnamed = holding.is_empty() || holding.iter().any(Option::is_none);
+            if !self.unnamed {
+                if let Some(latest) = self.named {
+                    if self.expected != Some(latest) {
+                        self.expected = Some(latest);
+                        self.next_check = latest.saturating_add(GRACE);
+                    }
                 }
             }
         }
@@ -599,6 +643,8 @@ mod tests {
         // A reset already past is no reset.
         let mut wait = LimitWait::new(Some(50), 100, &[]);
         assert_eq!(wait.reset(), None);
+        // Held off past the end of this schedule: no blind continuation meanwhile.
+        wait.back_off(100, 10_000);
         assert_eq!(wait.step(100, None), Step::Wait);
         assert_eq!(wait.step(100 + 119, None), Step::Wait);
         assert_eq!(wait.step(100 + 120, None), Step::Probe);
@@ -608,6 +654,57 @@ mod tests {
         assert_eq!(wait.step(520 + 600, None), Step::Probe);
         assert_eq!(wait.step(1_120 + 900, None), Step::Probe);
         assert_eq!(wait.step(2_020 + 900, None), Step::Probe);
+    }
+
+    #[test]
+    fn a_wait_nothing_can_end_continues_on_the_back_off() {
+        // No reset time and no usage windows (an API key, a model server, the Local agent): no
+        // reading will ever free the thread, so it is tried again once the back-off has passed.
+        for reading in [None, Some((200, &[][..]))] {
+            let mut wait = LimitWait::new(None, 100, &[]);
+            assert_ne!(wait.step(100 + BACKOFF_MIN - 1, reading), Step::Continue);
+            assert_eq!(wait.step(100 + BACKOFF_MIN, reading), Step::Continue);
+        }
+        // A full window with no reset time (one the agent stopped reporting keeps its copy): the
+        // same, whatever the readings say.
+        let open = [window("Weekly", 1.0, None)];
+        let mut wait = LimitWait::new(None, 100, &open);
+        let reading = Some((200, &open[..]));
+        assert_ne!(wait.step(100 + BACKOFF_MIN - 1, reading), Step::Continue);
+        assert_eq!(wait.step(100 + BACKOFF_MIN, reading), Step::Continue);
+        // Beside a full window that names its reset, it waits for that one.
+        let mixed = [
+            window("5-hour", 1.0, Some(20_000)),
+            window("Weekly", 1.0, None),
+        ];
+        let mut wait = LimitWait::new(None, 100, &mixed);
+        let reading = Some((200, &mixed[..]));
+        assert_ne!(wait.step(5_000, reading), Step::Continue);
+        assert_ne!(wait.step(20_000 + GRACE - 1, reading), Step::Continue);
+        assert_eq!(wait.step(20_000 + GRACE, reading), Step::Continue);
+        // A refusal during the wait restarts its clock.
+        let mut wait = LimitWait::new(None, 100, &[]);
+        wait.learn(None, 600, &[]);
+        assert_ne!(wait.step(100 + BACKOFF_MIN, None), Step::Continue);
+        assert_eq!(wait.step(600 + BACKOFF_MIN, None), Step::Continue);
+        // Each guess refused at once: the record spaces the next ones out, never shrinking.
+        let refuse = failed("You've hit your usage limit");
+        let mut record = LimitRecord::default();
+        assert!(record.observe(&refuse));
+        let mut wait = LimitWait::new(None, 0, &[]);
+        wait.back_off(0, record.backoff());
+        let mut gaps = vec![continues_after(&mut wait, 0, &[])];
+        let mut sent = gaps[0];
+        for _ in 0..6 {
+            record.continued();
+            assert!(record.observe(&refuse));
+            let mut wait = LimitWait::new(None, sent, &[]);
+            wait.back_off(sent, record.backoff());
+            let gap = continues_after(&mut wait, sent, &[]);
+            gaps.push(gap);
+            sent += gap;
+        }
+        assert_eq!(gaps, [900, 900, 1_800, 3_600, 7_200, 14_400, 21_600]);
     }
 
     #[test]
@@ -715,10 +812,11 @@ mod tests {
         // Still only on a reading taken after the limit.
         let mut wait = LimitWait::new(None, 5_000, &at_limit);
         assert_eq!(wait.step(5_000, Some((4_500, &at_limit))), Step::Wait);
-        // A full window with no reset time is never judged stale: only a fresh reading frees it.
+        // A full window with no reset time is not judged stale by any reading; the wait still
+        // ends on its back-off (`a_wait_nothing_can_end_continues_on_the_back_off`).
         let open = [window("Weekly", 1.0, None)];
         let mut wait = LimitWait::new(None, 100, &open);
-        assert_eq!(wait.step(1_000_000, Some((999_000, &open))), Step::Probe);
+        assert_eq!(wait.step(300, Some((200, &open))), Step::Probe);
         // And with no blocking window at the limit, every window must be free the same way.
         let mut wait = LimitWait::new(None, 100, &[]);
         assert_eq!(

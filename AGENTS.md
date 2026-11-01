@@ -297,7 +297,13 @@ Architectural mandates, standards, and workflows for this codebase.
   again or the thread switches agent), and each continuation refused before the agent works
   again waits at least 15 minutes, then at least double the last gap, up to 6 hours, before the
   next (`LimitWait::back_off`); a refusal of the user's own retry keeps the last gap, never
-  shrinking it.
+  shrinking it. A wait no reading can end (no reset time, and no window reported, a blocking
+  window missing from the readings, or one still full that names no reset time) continues blind
+  15 minutes after its last refusal, and only once every time a window still holding it names
+  has passed; a refusal of that guess is a refused continuation like any other, so the guesses
+  double up to 6 hours. A thread whose profile runs a model server, and the Local agent, read no
+  vendor windows (another thread's reading of the vendor says nothing of them) and are never
+  probed for one: their waits end that way.
   Readings count from when windows last arrived (`updated_at`), never an account-only
   update. agy's `/usage` side command never raises `RateLimited`: a reading is not a refusal. The window's minute sweep (`continue_after_limits`)
   then calls `ChatSession::continue_after_limit`, which sends the app's continue prompt as a

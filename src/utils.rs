@@ -790,9 +790,23 @@ fn launch_argv(profile: &Profile, launch: Launch<'_>) -> Vec<String> {
 /// A profile that cannot do what `launch` asks — resume, or take a prompt —
 /// starts a plain session with a warning. Callers are expected to pick a
 /// capable profile first; this is only the safety net.
+#[cfg(test)]
 pub fn get_startup_command(profile: Option<&Profile>, launch: Launch<'_>) -> Vec<String> {
-    match profile {
-        Some(profile) => {
+    exec_command(startup_argv(profile, launch).as_deref())
+}
+
+/// The argv a terminal tab of `profile` runs for `launch`, before it is made a shell command
+/// ([`exec_command`]); `None` without a profile (the user's own shell). Kept apart so a tab can
+/// bind its key file into it first.
+pub fn startup_argv(profile: Option<&Profile>, launch: Launch<'_>) -> Option<Vec<String>> {
+    profile.map(|profile| launch_argv(profile, launch))
+}
+
+/// The `$SHELL` arguments that `exec` `argv` (from [`startup_argv`]), each element shell-quoted;
+/// with none, the user's own shell.
+pub fn exec_command(argv: Option<&[String]>) -> Vec<String> {
+    match argv {
+        Some(argv) => {
             // `exec` is critical: it replaces the wrapping interactive shell with the
             // CLI so the CLI directly owns the controlling terminal (session leader).
             // Without it, `zsh -ic "claude"` runs claude as a *child job* of the shell,
@@ -803,10 +817,7 @@ pub fn get_startup_command(profile: Option<&Profile>, launch: Launch<'_>) -> Vec
             // the TTY at this point disrupts the CLI's initial terminal handshake.
             // A profile's env_file contributes environment instead, merged into the
             // spawn environment rather than sourced into the terminal.
-            let argv: Vec<String> = launch_argv(profile, launch)
-                .iter()
-                .map(|a| shell_quote(a))
-                .collect();
+            let argv: Vec<String> = argv.iter().map(|a| shell_quote(a)).collect();
             vec!["-ic".to_string(), format!("exec {}", argv.join(" "))]
         }
         None => vec!["-ic".to_string(), "exec $SHELL".to_string()],
@@ -830,13 +841,9 @@ pub fn terminal_provider(
 /// `profile` with its model provider's arguments after its own, for a terminal tab's command
 /// line. An `Err` refuses the tab: it never starts on the vendor's models.
 ///
-/// `key_file` is where the tab's key file will be written (`agent_proc::prepare_key_path`, or
-/// why there is none): Claude's key helper reads it, so a profile with a key variable needs one.
-pub fn with_provider_args(
-    profile: &Profile,
-    model: Option<&str>,
-    key_file: Result<&str, &str>,
-) -> Result<Profile, String> {
+/// With a key variable, Claude's key helper is left for the spawn to bind to the tab's key file
+/// (`agent_proc::write_key_file`): a command line still holding it never starts.
+pub fn with_provider_args(profile: &Profile, model: Option<&str>) -> Result<Profile, String> {
     let mut profile = profile.clone();
     if crate::config::profile_driver(&profile).is_some_and(agent_core::adapter::Driver::is_built_in)
     {
@@ -856,11 +863,6 @@ pub fn with_provider_args(
             )
         })?;
         agent_core::provider::bind_thread_model_args(&mut args, Some(model));
-        // The key helper reads the tab's own key file, written before the spawn.
-        if agent_core::provider::needs_key_file(&args) {
-            let path = key_file.map_err(|why| format!("Cannot start on {label}: {why}."))?;
-            agent_core::provider::bind_key_file_args(&mut args, path);
-        }
         // A `--settings` of the profile's own is merged under Claude's overlay, never dropped.
         profile.args = agent_core::provider::with_profile_settings(&profile.args, args)
             .map_err(|why| format!("Cannot start on {label}: {why}"))?;
@@ -990,9 +992,6 @@ pub fn apply_provider_env(
 mod tests {
     use super::*;
 
-    /// A tab that cannot keep a key file: what a profile without a key never needs.
-    const NO_KEY_FILE: Result<&str, &str> = Err("no key file in this test");
-
     #[test]
     fn a_terminal_tab_on_a_model_server_runs_on_it_or_not_at_all() {
         use agent_core::provider::{ModelProvider, ProviderKind};
@@ -1007,7 +1006,6 @@ mod tests {
         let codex = with_provider_args(
             &on(ProviderKind::LiteLlm, Some("GW_KEY")),
             Some("qwen3-coder"),
-            NO_KEY_FILE,
         )
         .unwrap();
         assert!(codex
@@ -1023,7 +1021,7 @@ mod tests {
         let resumed = get_startup_command(Some(&codex), Launch::Resume("abc"));
         assert!(resumed[1].contains("'-m' 'qwen3-coder'"), "{resumed:?}");
         // No model known: refused, never left to the CLI's own (vendor) setting.
-        assert!(with_provider_args(&on(ProviderKind::Ollama, None), None, NO_KEY_FILE).is_err());
+        assert!(with_provider_args(&on(ProviderKind::Ollama, None), None).is_err());
         // Claude's settings overlay names the tab's model.
         let claude = with_provider_args(
             &Profile {
@@ -1032,7 +1030,6 @@ mod tests {
                 ..on(ProviderKind::Ollama, None)
             },
             Some("qwen3-coder"),
-            NO_KEY_FILE,
         )
         .unwrap();
         let at = claude.args.iter().position(|a| a == "--settings").unwrap();
@@ -1042,24 +1039,26 @@ mod tests {
             "{overlay}"
         );
         assert!(!overlay.contains(agent_core::provider::THREAD_MODEL));
-        // With a key, its helper reads the tab's key file; with nowhere to keep one, refused.
+        // With a key, its helper is left for the spawn to bind to the tab's key file: the
+        // command line names no key, and is not started until it is bound.
         let keyed = Profile {
             command: "claude".into(),
             driver: None,
             ..on(ProviderKind::LiteLlm, Some("GW_KEY"))
         };
-        let why = with_provider_args(&keyed, Some("m"), Err("no runtime directory")).unwrap_err();
-        assert!(why.contains("no runtime directory"), "{why}");
-        let bound = with_provider_args(&keyed, Some("m"), Ok("/run/u/k.key")).unwrap();
-        assert!(!agent_core::provider::needs_key_file(&bound.args));
-        assert!(
-            bound
-                .args
-                .iter()
-                .any(|a| a.contains("cat -- '/run/u/k.key'")),
-            "{:?}",
-            bound.args
-        );
+        let mut argv = startup_argv(
+            Some(&with_provider_args(&keyed, Some("m")).unwrap()),
+            Launch::Fresh,
+        )
+        .unwrap();
+        assert!(agent_core::provider::needs_key_file(&argv));
+        assert!(agent_core::provider::bind_key_file_args(
+            &mut argv,
+            "/run/u/k.key"
+        ));
+        assert!(!agent_core::provider::needs_key_file(&argv));
+        let command = exec_command(Some(&argv));
+        assert!(command[1].contains("cat -- "), "{command:?}");
         // A `--settings` of the profile's own is merged into it, or refuses the tab.
         let own = |value: &str| Profile {
             command: "claude".into(),
@@ -1067,24 +1066,14 @@ mod tests {
             args: vec!["--settings".into(), value.into()],
             ..on(ProviderKind::Ollama, None)
         };
-        let merged = with_provider_args(
-            &own(r#"{"theme":"dark"}"#),
-            Some("qwen3-coder"),
-            NO_KEY_FILE,
-        )
-        .unwrap();
+        let merged = with_provider_args(&own(r#"{"theme":"dark"}"#), Some("qwen3-coder")).unwrap();
         assert_eq!(merged.args.iter().filter(|a| *a == "--settings").count(), 1);
         assert!(
             merged.args[1].contains("\"theme\":\"dark\""),
             "{:?}",
             merged.args
         );
-        assert!(with_provider_args(
-            &own("/home/u/claude.json"),
-            Some("qwen3-coder"),
-            NO_KEY_FILE
-        )
-        .is_err());
+        assert!(with_provider_args(&own("/home/u/claude.json"), Some("qwen3-coder")).is_err());
 
         let (provider, driver) = terminal_provider(&Profile {
             command: "claude".into(),
@@ -1149,8 +1138,7 @@ mod tests {
                 }),
                 ..crate::config::new_agent_profile(agent_core::adapter::Driver::Claude)
             },
-            Some("m"),
-            NO_KEY_FILE,
+            Some("m")
         )
         .is_err());
         // A profile without a chat agent has nothing to run on a server.
@@ -1159,10 +1147,7 @@ mod tests {
             driver: None,
             ..on(ProviderKind::Ollama, None)
         };
-        assert_eq!(
-            with_provider_args(&shell, None, NO_KEY_FILE).unwrap(),
-            shell
-        );
+        assert_eq!(with_provider_args(&shell, None).unwrap(), shell);
     }
 
     #[test]

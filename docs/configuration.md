@@ -374,7 +374,9 @@ agent process, and each terminal tab, gets a key file of its own, readable only 
 `$XDG_RUNTIME_DIR/agent-terminal/provider-keys`, which the overlay's `apiKeyHelper` reads.
 The file is removed when that process exits, and any left by a crash at the next start;
 without a runtime directory (`XDG_RUNTIME_DIR` unset) such a profile does not start. The
-variable you named for the key is not passed on to Claude either. The overlay also blanks
+variable you named for the key is not passed on to Claude either. This keeps the key out of
+environment listings and away from other users; Claude's own tools run as you and can still
+read the file. The overlay also blanks
 `BASH_ENV` and `ENV`, so a settings file cannot run code in the shell the helper runs in
 (nor in Claude's own shell commands). Claude Code reads only the last `--settings`, so one in
 the profile's own arguments is merged into the overlay: its keys stay, its `env` variables

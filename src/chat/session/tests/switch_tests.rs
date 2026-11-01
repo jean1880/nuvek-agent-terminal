@@ -239,6 +239,49 @@ fn a_stop_drops_a_switch_continuation_still_armed() {
     });
 }
 
+/// The messages a busy switch took over (`carried_unsent`) are queued again when the user's Stop
+/// drops its continuation, but the Stop sends nothing: the end of the interrupted turn leaves
+/// them held, and says so, until the user writes again.
+#[test]
+fn a_stop_that_drops_a_switch_continuation_never_sends_what_it_carried() {
+    in_loop(|ctx| {
+        let s = slow(Driver::Claude);
+        s.session.send_prompt("the task");
+        assert!(s.session.status().running_turn);
+        s.session
+            .inner
+            .carried_unsent
+            .borrow_mut()
+            .push(crate::chat::session::QueuedPrompt {
+                item_id: "carried-1".into(),
+                text: "the carried message".into(),
+                stored: true,
+                for_switch: false,
+            });
+        s.session.inner.rebinding.set(true);
+        s.session.inner.arm_switch_continuation(7, Driver::Claude);
+        s.session.inner.handoff_prepared(7);
+        s.session.inner.rebinding.set(false);
+        ChatBackend::interrupt(&*s.session);
+        end_turn(&s.session);
+        pump_until(ctx, 1, || false);
+        assert!(
+            !s.sent_anywhere("the carried message"),
+            "sent unasked after a Stop: {:?}",
+            prompts(&s.log)
+        );
+        assert_eq!(s.session.inner.queued_prompts.borrow().len(), 1, "kept");
+        assert!(
+            has(
+                &s.seen,
+                |e| matches!(e, Event::Notice { text } if text.contains("not sent"))
+            ),
+            "the hold is not said"
+        );
+        s.session.shutdown(false);
+    });
+}
+
 fn failed_notice(s: &Slow) -> bool {
     has(&s.seen, |e| {
         matches!(e, Event::Notice { text }
@@ -826,6 +869,66 @@ fn a_move_to_a_server_that_cannot_start_returns_to_the_threads_own_profile() {
             None,
             "back on the thread's own: nothing the window could commit"
         );
+        s.session.shutdown(false);
+    });
+}
+
+/// A move to a keyed model server whose key file cannot be written (no usable runtime
+/// directory) is a start that got no process: it rolls back to the agent the thread ran, which is
+/// up again, rather than leave the thread on an agent no start can bring up.
+#[test]
+fn a_move_whose_key_file_cannot_be_written_rolls_back_to_the_running_agent() {
+    in_loop(|ctx| {
+        crate::agent_proc::TEST_KEY_ROOT
+            .with(|r| *r.borrow_mut() = Some(Err("no runtime directory in this test".into())));
+        let s = slow(Driver::Codex);
+        let asked: Rc<RefCell<Vec<Option<String>>>> = Rc::default();
+        let (asked_in, factory_log) = (asked.clone(), s.new_log.clone());
+        s.session.set_adapter_factory(Rc::new(move |d, profile| {
+            asked_in.borrow_mut().push(profile.map(str::to_owned));
+            launch_of(FakeAdapter::boxed(d, &factory_log)).map(|mut launch| {
+                if let Some(p) = profile {
+                    launch.profile = Some(p.to_owned());
+                    // What a keyed provider launch carries to its spawn.
+                    launch.env.env.push((
+                        agent_core::provider::CLAUDE_KEY_VAR.into(),
+                        "k-secret".into(),
+                    ));
+                }
+                launch
+            })
+        }));
+        s.session.switch_to(
+            Driver::Claude,
+            crate::chat::session::SwitchTarget {
+                profile: "p-keyed".into(),
+                label: "Claude on Gateway".into(),
+            },
+            Some("qwen3-coder".into()),
+            None,
+        );
+        assert!(
+            pump_until(ctx, 5, || asked.borrow().len() >= 2),
+            "never rolled back: {:?}",
+            asked.borrow()
+        );
+        assert_eq!(*asked.borrow(), [Some("p-keyed".to_owned()), None]);
+        assert!(
+            pump_until(ctx, 5, || s.session.status().driver == Driver::Codex
+                && s.session
+                    .inner
+                    .proc
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|p| p.is_alive())),
+            "the previous agent is not up again"
+        );
+        assert!(has(
+            &s.seen,
+            |e| matches!(e, Event::Notice { text } | Event::Error { message: text }
+            if text.contains("no runtime directory"))
+        ));
+        crate::agent_proc::TEST_KEY_ROOT.with(|r| *r.borrow_mut() = None);
         s.session.shutdown(false);
     });
 }

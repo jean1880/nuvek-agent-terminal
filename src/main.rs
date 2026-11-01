@@ -277,6 +277,8 @@ fn main() -> glib::ExitCode {
         delegation::settle_shutdown(std::time::Duration::from_secs(3));
         delegation::final_cleanup();
         agent_proc::terminate_all();
+        // A key file whose removal was queued may still be there: none outlives the app.
+        agent_proc::remove_own_key_files();
         tracing::debug!(
             ms = started.elapsed().as_millis(),
             "shutdown: agents stopped"

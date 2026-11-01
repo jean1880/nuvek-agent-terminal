@@ -633,15 +633,39 @@ pub async fn write_key_file_in(
     argv: &mut [String],
     key: String,
 ) -> Result<KeyFileHold, String> {
-    let path = key_path_in(root)?;
+    let root = root.to_path_buf();
+    let file = gtk4::gio::spawn_blocking(move || {
+        let instance = instance_in(&root)?;
+        agent_kit::provider_key::KeyFile::write_new(&instance, &key)
+    })
+    .await
+    .map_err(|_| "Writing the model server's key panicked".to_owned())?
+    .map_err(|e| format!("Could not keep the model server's key privately: {e}"))?;
+    let Some(path) = file.path().to_str().map(str::to_owned) else {
+        release_key_file(file);
+        return Err("The runtime directory's path is not valid UTF-8".to_owned());
+    };
     if !agent_core::provider::bind_key_file_args(argv, &path) {
+        release_key_file(file);
         return Err("The model server's settings had no key helper to bind".to_owned());
     }
-    write_key_at(path, key).await
+    Ok(KeyFileHold(Some(std::sync::Arc::new(file))))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Where this test thread's key files go, instead of the real runtime directory: an `Err`
+    /// stands for an unusable one.
+    pub static TEST_KEY_ROOT: RefCell<Option<Result<std::path::PathBuf, String>>> =
+        const { RefCell::new(None) };
 }
 
 /// Where key files go; `Err` without a usable runtime directory: there is no `/tmp` fallback.
 fn key_root() -> Result<std::path::PathBuf, String> {
+    #[cfg(test)]
+    if let Some(root) = TEST_KEY_ROOT.with(|r| r.borrow().clone()) {
+        return root;
+    }
     agent_kit::provider_key::key_root(std::env::var("XDG_RUNTIME_DIR").ok().as_deref()).ok_or_else(
         || {
             "There is no runtime directory ($XDG_RUNTIME_DIR) to keep the model server's key in"
@@ -650,44 +674,55 @@ fn key_root() -> Result<std::path::PathBuf, String> {
     )
 }
 
-fn key_path_in(root: &std::path::Path) -> Result<String, String> {
-    agent_kit::provider_key::next_path(root)
-        .to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| "The runtime directory's path is not valid UTF-8".to_owned())
-}
+/// This app instance's claims on key folders (one, but for tests), each holding its lock.
+static INSTANCES: std::sync::Mutex<
+    Vec<(
+        std::path::PathBuf,
+        std::sync::Arc<agent_kit::provider_key::Instance>,
+    )>,
+> = std::sync::Mutex::new(Vec::new());
 
-/// The path a new key file will have, chosen without any I/O (so a command line can name it
-/// first). `Err` without a usable runtime directory: there is no `/tmp` fallback.
-pub fn prepare_key_path() -> Result<String, String> {
-    key_path_in(&key_root()?)
-}
-
-/// Writes `key` to the key file at `path` ([`prepare_key_path`]), off the main thread.
-pub async fn write_key_at(path: String, key: String) -> Result<KeyFileHold, String> {
-    let file = gtk4::gio::spawn_blocking(move || {
-        agent_kit::provider_key::KeyFile::write(std::path::Path::new(&path), &key)
-    })
-    .await
-    .map_err(|_| "Writing the model server's key panicked".to_owned())?
-    .map_err(|e| format!("Could not keep the model server's key privately: {e}"))?;
-    Ok(KeyFileHold(Some(std::sync::Arc::new(file))))
-}
-
-/// Start-up housekeeping: key files a crashed run left (their process is gone) go, off the main
+/// This instance's claim on `root`, taken the first time it is needed. Blocking: off the main
 /// thread.
+fn instance_in(
+    root: &std::path::Path,
+) -> std::io::Result<std::sync::Arc<agent_kit::provider_key::Instance>> {
+    let mut claims = INSTANCES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, instance)) = claims.iter().find(|(r, _)| r == root) {
+        return Ok(instance.clone());
+    }
+    let instance = std::sync::Arc::new(agent_kit::provider_key::Instance::claim(root)?);
+    claims.push((root.to_path_buf(), instance.clone()));
+    Ok(instance)
+}
+
+/// Start-up housekeeping, off the main thread: this instance takes its lock, then the key files
+/// of instances that are gone (their lock free) go.
 pub fn sweep_stale_key_files() {
-    let Some(root) =
-        agent_kit::provider_key::key_root(std::env::var("XDG_RUNTIME_DIR").ok().as_deref())
-    else {
+    let Ok(root) = key_root() else {
         return;
     };
     drop(gtk4::gio::spawn_blocking(move || {
-        let n = agent_kit::provider_key::sweep_stale(&root);
+        let mine = instance_in(&root).ok();
+        let n = agent_kit::provider_key::sweep_stale(&root, mine.as_ref().map(|i| i.id()));
         if n > 0 {
             info!(removed = n, "removed stale model server key files");
         }
     }));
+}
+
+/// Exit housekeeping, once the agents are gone: this instance's key files still there (a removal
+/// queued off the main thread may not have run yet) go now. One unlink each, on the calling
+/// thread: acceptable at exit.
+pub fn remove_own_key_files() {
+    let claims = INSTANCES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (_, instance) in claims.iter() {
+        instance.remove_own_keys();
+    }
 }
 
 /// Removes a key file off the main thread.

@@ -2361,18 +2361,26 @@ impl Inner {
             else {
                 return;
             };
-            if let Err(reason) = verdict {
-                inner.error(format!(
+            let refused = match verdict {
+                Err(reason) => Some(format!(
                     "The agent's final delegation launch was refused: {reason}"
-                ));
-                if inner.generation.get() == generation {
-                    inner.finish_process(Some(1), false);
+                )),
+                Ok(()) if delegation_redirect_names(&spec) != facts.config_redirect_vars => Some(
+                    "The agent's configuration redirect environment changed during its launch \
+                     check; it was not started."
+                        .to_owned(),
+                ),
+                Ok(()) => None,
+            };
+            if let Some(message) = refused {
+                // A switch's new agent refused here goes back to the old one, as one that could
+                // not be spawned does.
+                if inner.generation.get() == generation && inner.rollback.borrow().is_some() {
+                    inner.not_spawned(message);
                     inner.keep_unsent_prompts(pending.prompts);
+                    return;
                 }
-                return;
-            }
-            if delegation_redirect_names(&spec) != facts.config_redirect_vars {
-                inner.error("The agent's configuration redirect environment changed during its launch check; it was not started.");
+                inner.error(message);
                 if inner.generation.get() == generation {
                     inner.finish_process(Some(1), false);
                     inner.keep_unsent_prompts(pending.prompts);
@@ -2423,12 +2431,11 @@ impl Inner {
                     inner.spawn_spec_now(generation, spec, None);
                     inner.flush_or_keep(generation, pending.writes, pending.prompts, pending.news);
                 }
+                // As a spawn that failed: a switch's new agent goes back to the old one, and the
+                // start's messages are kept for the agent that runs next.
                 Err(reason) => {
-                    inner.error(format!("The agent was not started: {reason}."));
-                    if inner.generation.get() == generation {
-                        inner.finish_process(Some(1), false);
-                        inner.keep_unsent_prompts(pending.prompts);
-                    }
+                    inner.not_spawned(format!("The agent was not started: {reason}."));
+                    inner.flush_or_keep(generation, pending.writes, pending.prompts, pending.news);
                 }
             }
         });
@@ -2571,39 +2578,54 @@ impl Inner {
                     hooks.process_started(ProcessGeneration(process_generation), pid, watch);
                 }
             }
-            Err(e) => {
-                {
-                    // No process, so no turn: a prompt written into the start opened none.
-                    let mut state = self.state.borrow_mut();
-                    state.alive = false;
-                    state.running_turn = false;
-                }
-                self.abandon_unspawned_binding();
-                // Nothing will complete a turn: a pending handoff goes out with the next prompt.
-                self.handoff_in_flight.set(false);
-                // A switch's new agent that cannot even be spawned: back to the old one. Taken
-                // first: roll_back starts a process, whose own failure lands back here.
-                let previous = self.rollback.borrow_mut().take();
-                if let Some(previous) = previous {
-                    self.reject_model_change();
-                    self.roll_back(previous, &e.to_string());
-                    return;
-                }
-                let pending = self
-                    .pending_model
-                    .borrow()
-                    .as_ref()
-                    .map(|p| p.model.clone());
-                if let Some(model) = pending {
-                    self.emit(Envelope::new(Event::ModelChangeFailed {
-                        model,
-                        message: e,
-                    }));
-                } else {
-                    self.error(e);
-                }
-            }
+            Err(e) => self.not_spawned(e),
         }
+    }
+
+    /// A start that got no process (the spawn failed, or what it needed first could not be
+    /// made): no turn, and a switch's new agent goes back to the old one.
+    fn not_spawned(self: &Rc<Self>, e: String) {
+        {
+            // No process, so no turn: a prompt written into the start opened none.
+            let mut state = self.state.borrow_mut();
+            state.alive = false;
+            state.running_turn = false;
+        }
+        self.abandon_unspawned_binding();
+        // Nothing will complete a turn: a pending handoff goes out with the next prompt.
+        self.handoff_in_flight.set(false);
+        // A switch's new agent that cannot even be spawned: back to the old one.
+        if self.rollback.borrow().is_some() {
+            self.reject_model_change();
+        }
+        if self.roll_back_unstarted(&e) {
+            return;
+        }
+        let pending = self
+            .pending_model
+            .borrow()
+            .as_ref()
+            .map(|p| p.model.clone());
+        if let Some(model) = pending {
+            self.emit(Envelope::new(Event::ModelChangeFailed {
+                model,
+                message: e,
+            }));
+        } else {
+            self.error(e);
+        }
+    }
+
+    /// A switch's new agent that never started (not spawned, refused, or gone before it
+    /// started): back to the old one, saying `reason`. Whether there was a switch to undo. The
+    /// switch is taken first: `roll_back` starts a process, whose own failure lands back here.
+    fn roll_back_unstarted(self: &Rc<Self>, reason: &str) -> bool {
+        let previous = self.rollback.borrow_mut().take();
+        let Some(previous) = previous else {
+            return false;
+        };
+        self.roll_back(previous, reason);
+        true
     }
 
     fn approval(&self) -> Option<ApprovalHandle> {
@@ -3375,16 +3397,12 @@ impl Inner {
             return;
         }
         self.finish_process(code, false);
-        // A switch's new agent that died before it ever started: back to the old one. Taken
-        // first, as in start_process.
-        let previous = self.rollback.borrow_mut().take();
-        if let Some(previous) = previous {
-            let reason = match code {
-                Some(code) => format!("it exited (code {code}) before starting"),
-                None => "it stopped before starting".to_owned(),
-            };
-            self.roll_back(previous, &reason);
-        }
+        // A switch's new agent that died before it ever started: back to the old one.
+        let reason = match code {
+            Some(code) => format!("it exited (code {code}) before starting"),
+            None => "it stopped before starting".to_owned(),
+        };
+        self.roll_back_unstarted(&reason);
     }
 
     /// Claude exited refusing `--thinking-display`. Restarts it ONCE without the flag (the
@@ -5280,6 +5298,21 @@ impl Inner {
         }
     }
 
+    /// The user's Stop dropped the continuation of a switch to `to`: what it carried is queued
+    /// again, ahead of anything newer, and held with the notice ([`Self::hold_for_switch`]), so
+    /// the end of the stopped turn never sends it. The user's next message releases it.
+    fn hold_carried_after_stop(&self, to: Driver) {
+        let carried = self.carried_unsent.take();
+        if carried.is_empty() {
+            return;
+        }
+        for mut queued in carried.into_iter().rev() {
+            queued.for_switch = true;
+            self.hold_queued_prompt(queued);
+        }
+        self.hold_for_switch(Some(to), "was stopped");
+    }
+
     /// The replacement started: the task it carried, held messages included, is its own now.
     fn confirm_carried(&self) {
         self.carried_unsent.borrow_mut().clear();
@@ -6659,13 +6692,18 @@ impl ChatBackend for ChatSession {
             self.inner.wakes_held.set(true);
         }
         // The Stop wins over a switch's continuation still armed (one a rebind holds, say):
-        // nothing carries the task on, and what that switch took over is queued again, as
-        // when a switch fails.
-        let owed = self.inner.switch_continuation.borrow_mut().take().is_some();
+        // nothing carries the task on, and what that switch took over is queued again, held as
+        // when a switch fails: the end of the stopped turn never sends it unasked.
+        let owed = self
+            .inner
+            .switch_continuation
+            .borrow_mut()
+            .take()
+            .map(|c| c.driver);
         self.inner.switch_interrupted.set(false);
         self.interrupt_for_switch();
-        if owed {
-            self.inner.settle_carried(false);
+        if let Some(to) = owed {
+            self.inner.hold_carried_after_stop(to);
         }
     }
 

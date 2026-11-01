@@ -2,16 +2,19 @@
 //! folder. Blocking; each is bounded (file sizes, result counts, a command's time).
 //!
 //! What may run without asking is decided before a tool runs (`agent_core::local_agent::gate`),
-//! and [`inside`] tells it whether a write stays in the folder: the path is resolved through any
-//! symbolic link, so a link pointing out of the folder counts as outside, and a link that cannot
-//! be resolved (a dangling one) does too.
+//! and [`must_ask`] tells it whether a call reaches past that: its path is resolved once through
+//! any symbolic link ([`target`]), so a link pointing out of the folder counts as outside, and a
+//! link that cannot be resolved (a dangling one) does too; a write of a sensitive or hard-linked
+//! file asks as a write outside does.
 //!
-//! A write is then bound to what was judged, however long its approval took: its folders are
-//! opened one at a time from the thread's folder (or `/` for an approved write outside it)
-//! without following any link (`O_NOFOLLOW`), and the file is opened in the last of them the
-//! same way. A folder swapped for a link meanwhile fails the write instead of redirecting it, and
-//! a write judged inside never lands outside. Files are opened without blocking and read only
-//! when they are regular files, at most a fixed size: a pipe or a device is refused.
+//! A call is then bound to what was judged, however long its approval took ([`run_judged`]): a
+//! path that leads elsewhere by then is refused, and its folders are opened one at a time from
+//! the thread's folder (or `/` for an approved call outside it) without following any link
+//! (`O_NOFOLLOW`), and the file is opened in the last of them the same way. A folder swapped for
+//! a link meanwhile fails the call instead of redirecting it, and a write judged inside never
+//! lands outside. A write replaces the file whole (a new file beside it, then `renameat`). Files
+//! are opened without blocking and read only when they are regular files, at most a fixed size:
+//! a pipe or a device is refused.
 
 use std::ffi::{CString, OsStr};
 use std::io::Read;
@@ -256,16 +259,67 @@ fn hard_linked(meta: &std::fs::Metadata) -> bool {
 /// ([`Workspace::sensitive`]) or a file with a second hard link, or, for a search, is a home or
 /// above one (any search, when no home is known). Anything it cannot tell asks.
 pub fn read_must_ask(ws: &Workspace, tool: Tool, input: &Value) -> bool {
-    let Some(target) = read_path(tool, input).and_then(|p| resolved(&absolute(&ws.cwd, p))) else {
+    must_ask(ws, tool, target(ws, tool, input).as_deref())
+}
+
+/// The path a file `tool` call names, as written: `file_path` for a write or an edit,
+/// [`read_path`] for a read. `None` for a command.
+fn named_path(tool: Tool, input: &Value) -> Option<&str> {
+    match tool {
+        Tool::RunCommand => None,
+        Tool::WriteFile | Tool::EditFile => input.get("file_path").and_then(Value::as_str),
+        Tool::ReadFile | Tool::ListDir | Tool::Search => read_path(tool, input),
+    }
+}
+
+/// Where the path a file `tool` call names leads now, links followed: what the call is judged
+/// on ([`must_ask`]), shown with on its card, and then bound to when it runs ([`run_judged`]).
+/// `None` for a command, or for a path it cannot be told where it leads (a link to nothing).
+pub fn target(ws: &Workspace, tool: Tool, input: &Value) -> Option<PathBuf> {
+    named_path(tool, input).and_then(|p| resolved(&absolute(&ws.cwd, p)))
+}
+
+/// What a card for a file `tool` call adds to the path it names: where it leads (`target`), when
+/// that is not the path itself, so the card shows what was judged and is what runs.
+pub fn card_note(
+    ws: &Workspace,
+    tool: Tool,
+    input: &Value,
+    target: Option<&Path>,
+) -> Option<String> {
+    let named = absolute(&ws.cwd, named_path(tool, input)?);
+    // The folder's own path, given through a link, is not worth a note.
+    let named = match named.strip_prefix(&ws.cwd) {
+        Ok(rel) => ws.root.join(rel),
+        Err(_) => named,
+    };
+    match target {
+        Some(target) if target == named => None,
+        Some(target) => Some(format!("Leads to {}", target.display())),
+        None => Some("Leads through a link that names nothing".to_owned()),
+    }
+}
+
+/// Whether a file `tool` call, judged at `target` (what [`target`] gave), reaches past what may
+/// run unasked. A write: outside the folder, a sensitive file ([`Workspace::sensitive`], the
+/// same list the agy hook's Accept edits asks about, a home's dotfiles included when the folder
+/// is that home or above it), or a file with a second hard link, which may name it from
+/// elsewhere. A read: as [`read_must_ask`] says. A command never: the gate decides it. Anything
+/// it cannot tell (no target) asks.
+pub fn must_ask(ws: &Workspace, tool: Tool, target: Option<&Path>) -> bool {
+    if tool == Tool::RunCommand {
+        return false;
+    }
+    let Some(target) = target else {
         return true;
     };
-    if !target.starts_with(&ws.root) || ws.sensitive(&target) {
+    if !target.starts_with(&ws.root) || ws.sensitive(target) {
         return true;
     }
-    if std::fs::symlink_metadata(&target).is_ok_and(|m| hard_linked(&m)) {
+    if std::fs::symlink_metadata(target).is_ok_and(|m| hard_linked(&m)) {
         return true;
     }
-    tool == Tool::Search && (ws.homes.is_empty() || ws.homes_under(&target).next().is_some())
+    tool == Tool::Search && (ws.homes.is_empty() || ws.homes_under(target).next().is_some())
 }
 
 /// Opens `target` (resolved) inside the pinned folder, one component at a time from the folder
@@ -278,52 +332,66 @@ fn open_inside(
     leaf: libc::c_int,
 ) -> Option<std::io::Result<OwnedFd>> {
     let rel = target.strip_prefix(&ws.root).ok()?;
-    let names: Vec<_> = rel.components().map(|c| c.as_os_str().to_owned()).collect();
-    let open = || -> std::io::Result<OwnedFd> {
-        let Some((last, folders)) = names.split_last() else {
-            return ws.folder.try_clone();
-        };
-        let mut dir = ws.folder.try_clone()?;
-        let invalid = |_| std::io::Error::from(std::io::ErrorKind::InvalidInput);
-        for name in folders {
-            let name = CString::new(name.as_bytes()).map_err(invalid)?;
-            dir = open_at(
-                Some(&dir),
-                &name,
-                libc::O_DIRECTORY | libc::O_RDONLY | libc::O_NOFOLLOW,
-                0,
-            )?;
-        }
-        let name = CString::new(last.as_bytes()).map_err(invalid)?;
-        open_at(Some(&dir), &name, leaf | libc::O_NOFOLLOW, 0)
-    };
-    Some(open())
+    Some(
+        ws.folder
+            .try_clone()
+            .and_then(|base| open_below(base, rel, leaf)),
+    )
 }
 
-/// Opens what a read names: inside the folder, bound to the folder ([`open_inside`]); outside
-/// it (an approved read), where the path leads now.
-fn open_for_read(ws: &Workspace, shown: &Path, leaf: libc::c_int) -> Result<OwnedFd, String> {
-    let fail = |e: std::io::Error| format!("Cannot read {}: {e}", shown.display());
-    let target = resolved(shown).ok_or_else(|| {
-        format!(
-            "{} leads through a link that names nothing; nothing was read",
-            shown.display()
-        )
-    })?;
-    match open_inside(ws, &target, leaf) {
-        Some(opened) => opened.map_err(|e| {
-            if e.raw_os_error() == Some(libc::ELOOP) || e.raw_os_error() == Some(libc::ENOTDIR) {
-                format!(
-                    "{} is not as it was judged (a part of its path is not a folder, or is a \
-                     link now), so nothing was read",
-                    shown.display()
-                )
-            } else {
-                fail(e)
-            }
-        }),
-        None => open_at(None, &cstring(target.as_os_str())?, leaf, 0).map_err(fail),
+/// Opens `rel` below the open folder `base`, one component at a time and never through a link
+/// (`O_NOFOLLOW`); its folders are only passed through (`O_PATH`), and its last component is
+/// opened with `leaf`. `rel` empty opens `base` itself.
+fn open_below(base: OwnedFd, rel: &Path, leaf: libc::c_int) -> std::io::Result<OwnedFd> {
+    let names: Vec<_> = rel.components().map(|c| c.as_os_str().to_owned()).collect();
+    let Some((last, folders)) = names.split_last() else {
+        return Ok(base);
+    };
+    let invalid = |_| std::io::Error::from(std::io::ErrorKind::InvalidInput);
+    let mut dir = base;
+    for name in folders {
+        let name = CString::new(name.as_bytes()).map_err(invalid)?;
+        dir = open_at(
+            Some(&dir),
+            &name,
+            libc::O_DIRECTORY | libc::O_PATH | libc::O_NOFOLLOW,
+            0,
+        )?;
     }
+    let name = CString::new(last.as_bytes()).map_err(invalid)?;
+    open_at(Some(&dir), &name, leaf | libc::O_NOFOLLOW, 0)
+}
+
+/// Opens what a read was judged to reach, `target` (resolved): inside the folder, bound to the
+/// folder ([`open_inside`]); outside it (an approved read), from `/` the same way, so a link
+/// that appeared on the way since fails it instead of leading somewhere else.
+fn open_for_read(
+    ws: &Workspace,
+    shown: &Path,
+    target: &Path,
+    leaf: libc::c_int,
+) -> Result<OwnedFd, String> {
+    let opened = match open_inside(ws, target, leaf) {
+        Some(opened) => opened,
+        None => open_at(
+            None,
+            &cstring(OsStr::new("/"))?,
+            libc::O_DIRECTORY | libc::O_PATH,
+            0,
+        )
+        .and_then(|root| open_below(root, target.strip_prefix("/").unwrap_or(target), leaf)),
+    };
+    opened.map_err(|e| {
+        if e.raw_os_error() == Some(libc::ELOOP) || e.raw_os_error() == Some(libc::ENOTDIR) {
+            format!(
+                "{} is not as it was judged (a part of its path is not a folder, or is a link \
+                 now), so nothing was read",
+                shown.display()
+            )
+        } else {
+            format!("Cannot read {}: {e}", shown.display())
+        }
+    })
 }
 
 /// What an entry of a folder is, never following a link.
@@ -413,13 +481,7 @@ fn text<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("{key} is required"))
 }
 
-/// Runs `tool` with `input` in the thread's folder: what the model is told, or why it failed.
-/// `may_leave` says a call past the folder was approved (or every request is: Bypass): a write
-/// outside it, or a read [`read_must_ask`] asks for. Without it a write that now leads outside
-/// is refused, and a read is judged again just before it runs (refused if it now must ask) and
-/// then opened bound to the folder ([`open_inside`]), a file with a second hard link refused. A
-/// search never reads a sensitive file, approved or not. `cancel` stops a running command (its
-/// whole process group) or a search, when it is set.
+/// [`run_judged`], judged where the call's path leads now.
 pub fn run(
     tool: Tool,
     input: &Value,
@@ -427,19 +489,59 @@ pub fn run(
     may_leave: bool,
     cancel: &AtomicBool,
 ) -> Result<String, String> {
+    let judged = target(ws, tool, input);
+    run_judged(tool, input, ws, may_leave, judged.as_deref(), cancel)
+}
+
+/// Runs `tool` with `input` in the thread's folder: what the model is told, or why it failed.
+/// `judged` is where its path led when it was judged and shown ([`target`]): resolved once more
+/// now, a path that leads anywhere else is refused, and what runs is opened at `judged`, one
+/// component at a time without following a link. `may_leave` says a call [`must_ask`] asks for
+/// was approved (or every request is: Bypass): a write outside the folder or of a sensitive or
+/// hard-linked file, or such a read. Without it such a call is refused, and a write or read is
+/// opened bound to the folder ([`open_inside`]), a file with a second hard link refused. A
+/// search never reads a sensitive file, approved or not. `cancel` stops a running command (its
+/// whole process group) or a search, when it is set.
+pub fn run_judged(
+    tool: Tool,
+    input: &Value,
+    ws: &Workspace,
+    may_leave: bool,
+    judged: Option<&Path>,
+    cancel: &AtomicBool,
+) -> Result<String, String> {
     tool.validate_arguments(input).map_err(str::to_owned)?;
-    if !tool.writes() && !may_leave && read_must_ask(ws, tool, input) {
+    let Some(named) = named_path(tool, input) else {
+        return run_command(input, ws, cancel);
+    };
+    let shown = absolute(&ws.cwd, named);
+    let done = if tool.writes() { "written" } else { "read" };
+    let Some(now) = target(ws, tool, input) else {
         return Err(format!(
-            "{} now leads outside the folder or to a sensitive file; nothing was read",
-            read_path(tool, input).unwrap_or_default()
+            "{} leads through a link that names nothing; nothing was {done}",
+            shown.display()
+        ));
+    };
+    if judged != Some(now.as_path()) {
+        return Err(format!(
+            "{} leads somewhere else than when it was judged (a link or a folder on its way \
+             changed); nothing was {done}",
+            shown.display()
+        ));
+    }
+    if !may_leave && must_ask(ws, tool, Some(&now)) {
+        return Err(format!(
+            "{} now leads outside the folder, to a sensitive file or to one with another hard link; \
+             nothing was {done}",
+            shown.display()
         ));
     }
     match tool {
-        Tool::ReadFile => read_file(input, ws, may_leave),
-        Tool::ListDir => list_dir(input, ws),
-        Tool::Search => search(input, ws, cancel),
-        Tool::WriteFile => write_file(input, ws, may_leave),
-        Tool::EditFile => edit_file(input, ws, may_leave),
+        Tool::ReadFile => read_file(input, ws, may_leave, &shown, &now),
+        Tool::ListDir => list_dir(ws, &shown, &now),
+        Tool::Search => search(input, ws, &shown, &now, cancel),
+        Tool::WriteFile => write_file(input, ws, may_leave, &shown, &now),
+        Tool::EditFile => edit_file(input, ws, may_leave, &shown, &now),
         Tool::RunCommand => run_command(input, ws, cancel),
     }
 }
@@ -501,24 +603,18 @@ fn read_open_bytes(fd: OwnedFd, shown: &Path, max: u64) -> Result<Vec<u8>, Strin
     Ok(bytes)
 }
 
-/// The folder a write of `path` lands in, and the file's name in it. The path is resolved as
-/// [`inside`] judges it; then each folder from the pinned thread folder (or from `/`, only when
-/// `may_leave`) is opened in turn without following a link, made when `create` and missing. A
-/// folder that became a link, or a path that now leads outside when it may not (the thread's
-/// folder itself replaced included), fails it.
+/// The folder a write of `shown` lands in, and the file's name in it, for the `target` it was
+/// judged to reach ([`target`]): each folder from the pinned thread folder (or from `/`, only
+/// when `may_leave`) is opened in turn without following a link, made when `create` and
+/// missing. A folder that became a link, or a path that leads outside when it may not (the
+/// thread's folder itself replaced included), fails it.
 fn write_target(
     ws: &Workspace,
-    path: &str,
+    shown: &Path,
+    target: &Path,
     may_leave: bool,
     create: bool,
-) -> Result<(OwnedFd, CString, PathBuf), String> {
-    let shown = absolute(&ws.cwd, path);
-    let target = resolved(&shown).ok_or_else(|| {
-        format!(
-            "{} leads through a link that names nothing; nothing was written",
-            shown.display()
-        )
-    })?;
+) -> Result<(OwnedFd, CString), String> {
     let changed = |e: std::io::Error| {
         format!(
             "A folder on the way to {} changed (it is a link now, or gone), so nothing was \
@@ -537,7 +633,7 @@ fn write_target(
                 0,
             )
             .map_err(changed)?,
-            target.strip_prefix("/").unwrap_or(&target).to_path_buf(),
+            target.strip_prefix("/").unwrap_or(target).to_path_buf(),
         ),
         Err(_) => {
             return Err(format!(
@@ -573,42 +669,115 @@ fn write_target(
         };
         dir = next;
     }
-    Ok((dir, cstring(last)?, shown))
+    Ok((dir, cstring(last)?))
 }
 
-/// Writes `content` as the file `name` in the open folder `dir`, never through a link and only
-/// to a regular file: it is opened without blocking (a pipe with no reader is refused at once,
-/// never waited on) and without truncating, checked, and only then emptied and written.
-fn write_at(dir: &OwnedFd, name: &CString, shown: &Path, content: &str) -> Result<(), String> {
+/// `fstatat(2)` of `name` in `dir`, never following a link.
+fn stat_at(dir: &OwnedFd, name: &CString) -> std::io::Result<libc::stat> {
+    // SAFETY: `st` is written by fstatat only; `dir` is an open folder and `name` a valid
+    // NUL-terminated string.
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        ) != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(st)
+    }
+}
+
+/// A name for a file being written beside its target, unique in this process and short
+/// whatever the target's name.
+fn temp_name() -> CString {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let name = format!(".agent-terminal-{}-{n}.tmp", std::process::id());
+    CString::new(name).unwrap_or_default()
+}
+
+/// Writes `content` as the file `name` in the open folder `dir`, whole or not at all: it is
+/// written to a new file beside it, which then replaces it (`renameat`), so no reader ever sees
+/// a part and a failed write leaves the old file as it was. What is there must be a regular file
+/// (a link is never followed nor replaced, a pipe is never opened) and, unless `approved`, have
+/// no second hard link. The new file keeps the old one's permissions.
+fn write_at(
+    dir: &OwnedFd,
+    name: &CString,
+    shown: &Path,
+    content: &str,
+    approved: bool,
+) -> Result<(), String> {
     use std::io::Write;
+    let fail = |e: std::io::Error| format!("Cannot write {}: {e}", shown.display());
+    let mode = match stat_at(dir, name) {
+        Ok(st) if st.st_mode & libc::S_IFMT != libc::S_IFREG => {
+            return Err(format!(
+                "{} is not a regular file; nothing was written",
+                shown.display()
+            ))
+        }
+        Ok(st) if st.st_nlink > 1 && !approved => {
+            return Err(format!(
+                "{} has another hard link now; nothing was written",
+                shown.display()
+            ))
+        }
+        Ok(st) => Some(st.st_mode & 0o777),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(fail(e)),
+    };
+    let temp = temp_name();
     let fd = open_at(
         Some(dir),
-        name,
-        libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-        0o666,
+        &temp,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+        mode.map_or(0o666, |_| 0o600),
     )
-    .map_err(|e| format!("Cannot write {}: {e}", shown.display()))?;
+    .map_err(fail)?;
     let file = std::fs::File::from(fd);
-    let meta = file
-        .metadata()
-        .map_err(|e| format!("Cannot write {}: {e}", shown.display()))?;
-    if !meta.is_file() {
-        return Err(format!(
-            "{} is not a regular file; nothing was written",
-            shown.display()
-        ));
+    let written = (|| {
+        (&file).write_all(content.as_bytes())?;
+        if let Some(mode) = mode {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
+        file.sync_all()?;
+        // SAFETY: `dir` is an open folder; `temp` and `name` are valid NUL-terminated strings.
+        if unsafe {
+            libc::renameat(
+                dir.as_raw_fd(),
+                temp.as_ptr(),
+                dir.as_raw_fd(),
+                name.as_ptr(),
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    })();
+    if let Err(e) = written {
+        // SAFETY: as above; removes only the file made here.
+        unsafe { libc::unlinkat(dir.as_raw_fd(), temp.as_ptr(), 0) };
+        return Err(fail(e));
     }
-    file.set_len(0)
-        .map_err(|e| format!("Cannot write {}: {e}", shown.display()))?;
-    (&file)
-        .write_all(content.as_bytes())
-        .map_err(|e| format!("Cannot write {}: {e}", shown.display()))
+    Ok(())
 }
 
 /// `approved`: the read was allowed past the folder, so a second hard link does not refuse it.
-fn read_file(input: &Value, ws: &Workspace, approved: bool) -> Result<String, String> {
-    let path = absolute(&ws.cwd, text(input, "file_path")?);
-    let fd = open_for_read(ws, &path, libc::O_RDONLY | libc::O_NONBLOCK)?;
+fn read_file(
+    input: &Value,
+    ws: &Workspace,
+    approved: bool,
+    path: &Path,
+    target: &Path,
+) -> Result<String, String> {
+    let fd = open_for_read(ws, path, target, libc::O_RDONLY | libc::O_NONBLOCK)?;
     if !approved {
         let file = std::fs::File::from(fd.try_clone().map_err(|e| e.to_string())?);
         if file.metadata().is_ok_and(|m| hard_linked(&m)) {
@@ -618,7 +787,7 @@ fn read_file(input: &Value, ws: &Workspace, approved: bool) -> Result<String, St
             ));
         }
     }
-    let content = read_open(fd, &path, MAX_READ_BYTES)?;
+    let content = read_open(fd, path, MAX_READ_BYTES)?;
     let offset = input
         .get("offset")
         .and_then(Value::as_u64)
@@ -651,12 +820,8 @@ fn read_file(input: &Value, ws: &Workspace, approved: bool) -> Result<String, St
     Ok(out)
 }
 
-fn list_dir(input: &Value, ws: &Workspace) -> Result<String, String> {
-    let path = absolute(
-        &ws.cwd,
-        input.get("path").and_then(Value::as_str).unwrap_or("."),
-    );
-    let dir = open_for_read(ws, &path, libc::O_DIRECTORY | libc::O_RDONLY)?;
+fn list_dir(ws: &Workspace, path: &Path, target: &Path) -> Result<String, String> {
+    let dir = open_for_read(ws, path, target, libc::O_DIRECTORY | libc::O_RDONLY)?;
     let entries = entries_of(&dir).map_err(|e| format!("Cannot list {}: {e}", path.display()))?;
     let mut names: Vec<String> = entries
         .into_iter()
@@ -691,24 +856,24 @@ fn list_dir(input: &Value, ws: &Workspace) -> Result<String, String> {
 /// outside it, by the whole resolved path, wherever the search started. A read by name, which
 /// asks, is the way to see one. A folder is opened only when its turn comes, so the open
 /// folders never outnumber the depth; what could not be opened or read is counted and said.
-fn search(input: &Value, ws: &Workspace, cancel: &AtomicBool) -> Result<String, String> {
+fn search(
+    input: &Value,
+    ws: &Workspace,
+    root: &Path,
+    real_root: &Path,
+    cancel: &AtomicBool,
+) -> Result<String, String> {
     use std::rc::Rc;
     let pattern = text(input, "pattern")?;
     if pattern.is_empty() {
         return Err("pattern is empty".to_owned());
     }
-    let root = absolute(
-        &ws.cwd,
-        input.get("path").and_then(Value::as_str).unwrap_or("."),
-    );
-    let real_root = resolved(&root)
-        .ok_or_else(|| format!("{} leads through a link that names nothing", root.display()))?;
     let skipped = |rel: &Path| {
         let real = real_root.join(rel);
         if real.starts_with(&ws.root) {
             return agent_core::sensitive::names_sensitive(&lowered(rel))
                 || ws.sensitive(&real)
-                || ws.home_dotfile(&real_root, &real);
+                || ws.home_dotfile(real_root, &real);
         }
         agent_core::sensitive::names_sensitive(&lowered(&real))
             || if ws.homes.is_empty() {
@@ -731,7 +896,8 @@ fn search(input: &Value, ws: &Workspace, cancel: &AtomicBool) -> Result<String, 
     };
     let top = Rc::new(open_for_read(
         ws,
-        &root,
+        root,
+        real_root,
         libc::O_DIRECTORY | libc::O_RDONLY,
     )?);
     // Its own folder unreadable is an error, never an empty result.
@@ -859,10 +1025,16 @@ fn search(input: &Value, ws: &Workspace, cancel: &AtomicBool) -> Result<String, 
     Ok(out)
 }
 
-fn write_file(input: &Value, ws: &Workspace, may_leave: bool) -> Result<String, String> {
+fn write_file(
+    input: &Value,
+    ws: &Workspace,
+    may_leave: bool,
+    path: &Path,
+    target: &Path,
+) -> Result<String, String> {
     let content = text(input, "content")?;
-    let (dir, name, path) = write_target(ws, text(input, "file_path")?, may_leave, true)?;
-    write_at(&dir, &name, &path, content)?;
+    let (dir, name) = write_target(ws, path, target, may_leave, true)?;
+    write_at(&dir, &name, path, content, may_leave)?;
     Ok(format!(
         "Wrote {} bytes to {}",
         content.len(),
@@ -870,7 +1042,13 @@ fn write_file(input: &Value, ws: &Workspace, may_leave: bool) -> Result<String, 
     ))
 }
 
-fn edit_file(input: &Value, ws: &Workspace, may_leave: bool) -> Result<String, String> {
+fn edit_file(
+    input: &Value,
+    ws: &Workspace,
+    may_leave: bool,
+    path: &Path,
+    target: &Path,
+) -> Result<String, String> {
     let old = text(input, "old_string")?;
     let new = text(input, "new_string")?;
     if old.is_empty() {
@@ -880,7 +1058,7 @@ fn edit_file(input: &Value, ws: &Workspace, may_leave: bool) -> Result<String, S
         return Err("old_string and new_string are the same".to_owned());
     }
     // Read and written through the same folder, opened without following links.
-    let (dir, name, path) = write_target(ws, text(input, "file_path")?, may_leave, false)?;
+    let (dir, name) = write_target(ws, path, target, may_leave, false)?;
     let fd = open_at(
         Some(&dir),
         &name,
@@ -889,7 +1067,7 @@ fn edit_file(input: &Value, ws: &Workspace, may_leave: bool) -> Result<String, S
     )
     .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
     // Edited as text only when it is text: a lossy reading would rewrite every other byte.
-    let content = String::from_utf8(read_open_bytes(fd, &path, MAX_READ_BYTES)?).map_err(|_| {
+    let content = String::from_utf8(read_open_bytes(fd, path, MAX_READ_BYTES)?).map_err(|_| {
         format!(
             "{} is not UTF-8 text, so it cannot be edited; nothing was changed",
             path.display()
@@ -915,7 +1093,7 @@ fn edit_file(input: &Value, ws: &Workspace, may_leave: bool) -> Result<String, S
     } else {
         content.replacen(old, new, 1)
     };
-    write_at(&dir, &name, &path, &edited)?;
+    write_at(&dir, &name, path, &edited, may_leave)?;
     let replaced = if all { count } else { 1 };
     Ok(format!(
         "Edited {} ({replaced} replacement{})",
@@ -1577,6 +1755,222 @@ mod tests {
             &AtomicBool::new(false),
         );
         assert!(approved.unwrap().contains("private"));
+    }
+
+    /// Whether a write of `path` must ask, as the runner judges it.
+    fn write_asks(ws: &Workspace, path: &str) -> bool {
+        let input = json!({"file_path": path, "content": ""});
+        must_ask(
+            ws,
+            Tool::WriteFile,
+            target(ws, Tool::WriteFile, &input).as_deref(),
+        )
+    }
+
+    #[test]
+    fn a_write_of_a_sensitive_file_or_a_home_dotfile_asks() {
+        let root = dir();
+        let home = root.path().join("home");
+        let project = home.join("projects/x");
+        std::fs::create_dir_all(project.join(".git/hooks")).unwrap();
+        let pinned = Workspace::open_with_home(&project, Some(&home)).unwrap();
+        for path in [
+            ".git/hooks/pre-commit",
+            ".envrc",
+            ".vscode/tasks.json",
+            "AGENTS.md",
+            "sub/CLAUDE.md",
+            ".github/workflows/ci.yml",
+        ] {
+            assert!(write_asks(&pinned, path), "{path}");
+        }
+        for path in ["src/main.rs", ".gitignore", "README.md"] {
+            assert!(!write_asks(&pinned, path), "{path}");
+        }
+        // The folder is the home, or above it: the home's dotfiles ask, the rest does not.
+        for cwd in [home.clone(), root.path().to_owned()] {
+            let pinned = Workspace::open_with_home(&cwd, Some(&home)).unwrap();
+            let at = |rel: &str| home.join(rel).to_string_lossy().into_owned();
+            assert!(write_asks(&pinned, &at(".bashrc")), "{cwd:?}");
+            assert!(write_asks(&pinned, &at(".config/autostart/x")), "{cwd:?}");
+            assert!(!write_asks(&pinned, &at("projects/x/a.rs")), "{cwd:?}");
+        }
+        // Unasked, a write to one is refused, whatever the gate said.
+        let err = go(
+            Tool::WriteFile,
+            &json!({"file_path": ".git/hooks/pre-commit", "content": "x"}),
+            &project,
+        )
+        .unwrap_err();
+        assert!(err.contains("nothing was written"), "{err}");
+        assert!(!project.join(".git/hooks/pre-commit").exists());
+    }
+
+    #[test]
+    fn a_write_of_a_hard_linked_file_asks_and_an_unapproved_one_is_refused() {
+        let d = dir();
+        let other = dir();
+        let shared = other.path().join("shared");
+        std::fs::write(&shared, "old").unwrap();
+        if std::fs::hard_link(&shared, d.path().join("f.txt")).is_err() {
+            return;
+        }
+        let pinned = ws(d.path());
+        assert!(write_asks(&pinned, "f.txt"));
+        let input = json!({"file_path": "f.txt", "content": "new"});
+        let err = run(
+            Tool::WriteFile,
+            &input,
+            &pinned,
+            false,
+            &AtomicBool::new(false),
+        );
+        assert!(err.unwrap_err().contains("nothing was written"));
+        // Judged before the second link was made: still refused when it runs.
+        std::fs::write(d.path().join("g.txt"), "old").unwrap();
+        let input = json!({"file_path": "g.txt", "content": "new"});
+        let judged = target(&pinned, Tool::WriteFile, &input);
+        assert!(!must_ask(&pinned, Tool::WriteFile, judged.as_deref()));
+        std::fs::hard_link(d.path().join("g.txt"), other.path().join("g2")).unwrap();
+        let err = run_judged(
+            Tool::WriteFile,
+            &input,
+            &pinned,
+            false,
+            judged.as_deref(),
+            &AtomicBool::new(false),
+        );
+        assert!(err.unwrap_err().contains("hard link"));
+        assert_eq!(
+            std::fs::read_to_string(other.path().join("g2")).unwrap(),
+            "old"
+        );
+        // Approved, it is written.
+        run(
+            Tool::WriteFile,
+            &input,
+            &pinned,
+            true,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("g.txt")).unwrap(),
+            "new"
+        );
+        assert_eq!(std::fs::read_to_string(&shared).unwrap(), "old");
+    }
+
+    #[test]
+    fn a_path_that_leads_elsewhere_than_when_it_was_judged_is_refused() {
+        let d = dir();
+        let cwd = d.path();
+        let first = dir();
+        let second = dir();
+        std::os::unix::fs::symlink(first.path(), cwd.join("l")).unwrap();
+        let pinned = ws(cwd);
+        // An approved write outside, shown leading to the first folder.
+        let input = json!({"file_path": "l/x.txt", "content": "x"});
+        let judged = target(&pinned, Tool::WriteFile, &input);
+        assert_eq!(
+            judged.as_deref(),
+            Some(first.path().canonicalize().unwrap().join("x.txt").as_path())
+        );
+        std::fs::remove_file(cwd.join("l")).unwrap();
+        std::os::unix::fs::symlink(second.path(), cwd.join("l")).unwrap();
+        let err = run_judged(
+            Tool::WriteFile,
+            &input,
+            &pinned,
+            true,
+            judged.as_deref(),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(err.contains("nothing was written"), "{err}");
+        assert!(!second.path().join("x.txt").exists());
+        assert!(!first.path().join("x.txt").exists());
+        // An unapproved read judged at a plain file, then pointed at a sensitive one.
+        std::fs::create_dir(cwd.join(".git")).unwrap();
+        std::fs::write(cwd.join(".git/config"), "secret\n").unwrap();
+        std::fs::write(cwd.join("plain.txt"), "plain\n").unwrap();
+        std::os::unix::fs::symlink("plain.txt", cwd.join("a")).unwrap();
+        let input = json!({"file_path": "a"});
+        let judged = target(&pinned, Tool::ReadFile, &input);
+        assert!(!must_ask(&pinned, Tool::ReadFile, judged.as_deref()));
+        std::fs::remove_file(cwd.join("a")).unwrap();
+        std::os::unix::fs::symlink(".git/config", cwd.join("a")).unwrap();
+        let err = run_judged(
+            Tool::ReadFile,
+            &input,
+            &pinned,
+            false,
+            judged.as_deref(),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(err.contains("nothing was read"), "{err}");
+        // An approved read outside is opened where it was judged to lead, never through a link.
+        std::fs::write(first.path().join("r.txt"), "first\n").unwrap();
+        std::fs::write(second.path().join("r.txt"), "second\n").unwrap();
+        let input = json!({"file_path": "l/r.txt"});
+        let judged = target(&pinned, Tool::ReadFile, &input);
+        let read = run_judged(
+            Tool::ReadFile,
+            &input,
+            &pinned,
+            true,
+            judged.as_deref(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(read.contains("second"), "{read}");
+    }
+
+    #[test]
+    fn a_write_replaces_the_file_whole_and_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = dir();
+        let file = d.path().join("f.sh");
+        std::fs::write(&file, "old").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o750)).unwrap();
+        // A reader that opened the file before keeps the whole old one: never a part.
+        let mut before = std::fs::File::open(&file).unwrap();
+        go(
+            Tool::WriteFile,
+            &json!({"file_path": "f.sh", "content": "new content"}),
+            d.path(),
+        )
+        .unwrap();
+        let mut old = String::new();
+        before.read_to_string(&mut old).unwrap();
+        assert_eq!(old, "old");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new content");
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o750);
+        go(
+            Tool::EditFile,
+            &json!({"file_path": "f.sh", "old_string": "new", "new_string": "edited"}),
+            d.path(),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "edited content");
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o750);
+        // No temporary file is left beside it, after a write or a refused one.
+        std::fs::create_dir(d.path().join("folder")).unwrap();
+        assert!(go(
+            Tool::WriteFile,
+            &json!({"file_path": "folder", "content": "x"}),
+            d.path(),
+        )
+        .is_err());
+        let mut names: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["f.sh", "folder"]);
     }
 
     #[test]

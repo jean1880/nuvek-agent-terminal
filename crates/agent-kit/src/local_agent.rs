@@ -1597,15 +1597,10 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         let Some(ws) = self.workspace.clone() else {
             return fail(self, "The thread's folder is not open.".to_owned());
         };
-        let outside = if tool.writes() {
-            tool != Tool::RunCommand
-                && input
-                    .get("file_path")
-                    .and_then(Value::as_str)
-                    .is_none_or(|p| !crate::local_tools::inside(&ws, p))
-        } else {
-            crate::local_tools::read_must_ask(&ws, tool, &input)
-        };
+        // Resolved once: judged, shown on its card and run where it leads now, never anywhere
+        // it leads later.
+        let target = crate::local_tools::target(&ws, tool, &input);
+        let outside = crate::local_tools::must_ask(&ws, tool, target.as_deref());
         // Gated in the mode as it is now (a change during the turn is applied as it arrives),
         // and again if it changes while the card is open.
         loop {
@@ -1622,7 +1617,13 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 // Any allow runs this one call: what a session or Always answer keeps is the
                 // app's rule, scoped as its card said, and the app answers the cards it covers
                 // itself.
-                Gate::Ask => match self.ask(tool, &title, &input, commands)? {
+                Gate::Ask => match self.ask(
+                    tool,
+                    &title,
+                    &input,
+                    crate::local_tools::card_note(&ws, tool, &input, target.as_deref()),
+                    commands,
+                )? {
                     None => continue,
                     Some(Decision::Allow | Decision::AllowForSession | Decision::AllowAlways) => {}
                     Some(Decision::Deny | Decision::Cancel) => {
@@ -1646,8 +1647,17 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         // while it works.
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker = {
-            let (cancel, input) = (cancel.clone(), input.clone());
-            std::thread::spawn(move || crate::local_tools::run(tool, &input, &ws, outside, &cancel))
+            let (cancel, input, target) = (cancel.clone(), input.clone(), target.clone());
+            std::thread::spawn(move || {
+                crate::local_tools::run_judged(
+                    tool,
+                    &input,
+                    &ws,
+                    outside,
+                    target.as_deref(),
+                    &cancel,
+                )
+            })
         };
         let mut stop = None;
         while !worker.is_finished() {
@@ -2053,6 +2063,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         tool: Tool,
         title: &str,
         input: &Value,
+        note: Option<String>,
         commands: &Receiver<RunnerInput>,
     ) -> Result<Option<Decision>, StepError> {
         let request = self.id("approval");
@@ -2061,7 +2072,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 tool: tool.name().to_owned(),
                 title: Some(title.to_owned()),
                 input: input.clone(),
-                reason: None,
+                reason: note,
                 options: APPROVAL_OPTIONS.to_vec(),
                 response: ResponseCapability::Live,
                 remembers: None,
@@ -3206,6 +3217,17 @@ mod tests {
             context,
         );
         run.send(prompt("change instructions"));
+        // An instruction file is sensitive: even Accept edits asks before writing it.
+        let request = run.wait_for(|e| match &e.event {
+            Event::ApprovalRequested { .. } => e.request.clone(),
+            _ => None,
+        });
+        run.send(Command::Approve {
+            request,
+            decision: Decision::Allow,
+            updated_input: None,
+            message: None,
+        });
         assert_eq!(run.wait_for(completed).0, TurnState::Completed);
         run.send(prompt("next turn"));
         assert_eq!(run.wait_for(completed).0, TurnState::Completed);
@@ -3479,6 +3501,51 @@ mod tests {
         assert_eq!(answer["role"], "tool");
         assert_eq!(answer["tool_call_id"], "c1");
         assert!(answer["content"].as_str().unwrap().starts_with("Edited"));
+    }
+
+    /// Writing a git hook runs code as surely as a command: Accept edits asks first, and the
+    /// card says where a path through a link leads.
+    #[test]
+    fn a_write_of_a_sensitive_file_in_accept_edits_asks_first() {
+        let work = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(work.path().join(".git/hooks")).unwrap();
+        std::os::unix::fs::symlink(".git/hooks", work.path().join("hooks")).unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let script = Script::new(vec![
+            Ok(tool_call(
+                "c1",
+                "write_file",
+                json!({"file_path": "hooks/pre-commit", "content": "#!/bin/sh\n"}),
+            )),
+            Ok(text(&["Ok"])),
+        ]);
+        let run = start(
+            args(work.path(), Mode::AcceptEdits),
+            script,
+            state.path().into(),
+        );
+        run.send(prompt("add a hook"));
+        let (request, reason) = run.wait_for(|e| match &e.event {
+            Event::ApprovalRequested { reason, .. } => Some((e.request.clone()?, reason.clone())),
+            _ => None,
+        });
+        let real = work.path().canonicalize().unwrap();
+        assert_eq!(
+            reason,
+            Some(format!(
+                "Leads to {}",
+                real.join(".git/hooks/pre-commit").display()
+            ))
+        );
+        run.send(Command::Approve {
+            request,
+            decision: Decision::Deny,
+            updated_input: None,
+            message: None,
+        });
+        run.wait_for(completed);
+        run.finish();
+        assert!(!work.path().join(".git/hooks/pre-commit").exists());
     }
 
     #[test]

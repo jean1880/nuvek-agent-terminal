@@ -338,9 +338,10 @@ pub enum Gate {
     Refuse(&'static str),
 }
 
-/// The gate for `tool` in `mode`. `outside` says the call reaches past what may run unasked: a
-/// write of a path outside the working folder (or one that cannot be resolved), or a read
-/// outside it, of a sensitive file, or a search from home or above (`local_tools::read_must_ask`).
+/// The gate for `tool` in `mode`. `outside` says the call reaches past what may run unasked
+/// (`local_tools::must_ask`): a write of a path outside the working folder (or one that cannot
+/// be resolved), of a sensitive file or of a file with a second hard link, or a read outside
+/// it, of a sensitive file, or a search from home or above (`local_tools::read_must_ask`).
 /// That always asks unless every request is approved (Bypass), a read in Plan mode included:
 /// a plan refuses mutation, not disclosure. The runner remembers no answer: "Allow for session"
 /// and "Always allow" run the one call, and the app's own rules (scoped as each card says)

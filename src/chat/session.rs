@@ -5298,6 +5298,21 @@ impl Inner {
         }
     }
 
+    /// The user's Stop dropped the continuation of a switch to `to`: what it carried is queued
+    /// again, ahead of anything newer, and held with the notice ([`Self::hold_for_switch`]), so
+    /// the end of the stopped turn never sends it. The user's next message releases it.
+    fn hold_carried_after_stop(&self, to: Driver) {
+        let carried = self.carried_unsent.take();
+        if carried.is_empty() {
+            return;
+        }
+        for mut queued in carried.into_iter().rev() {
+            queued.for_switch = true;
+            self.hold_queued_prompt(queued);
+        }
+        self.hold_for_switch(Some(to), "was stopped");
+    }
+
     /// The replacement started: the task it carried, held messages included, is its own now.
     fn confirm_carried(&self) {
         self.carried_unsent.borrow_mut().clear();
@@ -6677,13 +6692,18 @@ impl ChatBackend for ChatSession {
             self.inner.wakes_held.set(true);
         }
         // The Stop wins over a switch's continuation still armed (one a rebind holds, say):
-        // nothing carries the task on, and what that switch took over is queued again, as
-        // when a switch fails.
-        let owed = self.inner.switch_continuation.borrow_mut().take().is_some();
+        // nothing carries the task on, and what that switch took over is queued again, held as
+        // when a switch fails: the end of the stopped turn never sends it unasked.
+        let owed = self
+            .inner
+            .switch_continuation
+            .borrow_mut()
+            .take()
+            .map(|c| c.driver);
         self.inner.switch_interrupted.set(false);
         self.interrupt_for_switch();
-        if owed {
-            self.inner.settle_carried(false);
+        if let Some(to) = owed {
+            self.inner.hold_carried_after_stop(to);
         }
     }
 

@@ -239,6 +239,49 @@ fn a_stop_drops_a_switch_continuation_still_armed() {
     });
 }
 
+/// The messages a busy switch took over (`carried_unsent`) are queued again when the user's Stop
+/// drops its continuation, but the Stop sends nothing: the end of the interrupted turn leaves
+/// them held, and says so, until the user writes again.
+#[test]
+fn a_stop_that_drops_a_switch_continuation_never_sends_what_it_carried() {
+    in_loop(|ctx| {
+        let s = slow(Driver::Claude);
+        s.session.send_prompt("the task");
+        assert!(s.session.status().running_turn);
+        s.session
+            .inner
+            .carried_unsent
+            .borrow_mut()
+            .push(crate::chat::session::QueuedPrompt {
+                item_id: "carried-1".into(),
+                text: "the carried message".into(),
+                stored: true,
+                for_switch: false,
+            });
+        s.session.inner.rebinding.set(true);
+        s.session.inner.arm_switch_continuation(7, Driver::Claude);
+        s.session.inner.handoff_prepared(7);
+        s.session.inner.rebinding.set(false);
+        ChatBackend::interrupt(&*s.session);
+        end_turn(&s.session);
+        pump_until(ctx, 1, || false);
+        assert!(
+            !s.sent_anywhere("the carried message"),
+            "sent unasked after a Stop: {:?}",
+            prompts(&s.log)
+        );
+        assert_eq!(s.session.inner.queued_prompts.borrow().len(), 1, "kept");
+        assert!(
+            has(
+                &s.seen,
+                |e| matches!(e, Event::Notice { text } if text.contains("not sent"))
+            ),
+            "the hold is not said"
+        );
+        s.session.shutdown(false);
+    });
+}
+
 fn failed_notice(s: &Slow) -> bool {
     has(&s.seen, |e| {
         matches!(e, Event::Notice { text }

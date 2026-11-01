@@ -56,6 +56,8 @@ pub const THINKING_ICON: &str = "agent-thinking-symbolic";
 pub const MCP_ICON: &str = "agent-mcp-symbolic";
 pub const SUBAGENT_ICON: &str = "agent-subagent-symbolic";
 pub const APP_ICON: &str = "ca.nuvek.AgentTerminal-symbolic";
+/// [`APP_ART`] by icon name, for widgets that take a name at a large size (About).
+pub const APP_ICON_COLOUR: &str = "ca.nuvek.AgentTerminal";
 // Original glyphs for features whose buttons and rows are still being wired.
 pub const HANDOFF_ICON: &str = "agent-handoff-symbolic";
 pub const COMPACT_ICON: &str = "agent-compact-symbolic";

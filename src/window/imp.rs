@@ -2939,7 +2939,7 @@ impl AgentTerminalWindow {
             .trim();
         let about = adw::AboutDialog::builder()
             .application_name("Agent Terminal")
-            .application_icon(crate::icons::APP_ICON)
+            .application_icon(crate::icons::APP_ICON_COLOUR)
             .version(env!("CARGO_PKG_VERSION"))
             .developer_name(developer)
             .comments(env!("CARGO_PKG_DESCRIPTION"))

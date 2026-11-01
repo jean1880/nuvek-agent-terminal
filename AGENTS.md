@@ -312,14 +312,16 @@ Architectural mandates, standards, and workflows for this codebase.
 - **A profile on a model server never falls back to its vendor**: a profile's `provider` (Settings
   → Agents → Model Provider, Claude and Codex only) starts the agent on that server
   (`agent_core::provider`: Claude through `ANTHROPIC_BASE_URL`, with the vendor's own credential
-  variables removed; Codex through a `-c` provider of the app's own id). Every chat launch path
+  variables removed, all pinned again by a `--settings` overlay, since a settings file's `env`
+  wins over the process environment; the overlay never holds the key. Codex through a `-c`
+  provider of the app's own id). Every chat launch path
   goes through `profile_launch` (threads, switches, forks, delegated workers), and a terminal tab
   through `utils::with_provider_args` and `apply_provider_env`: a provider that cannot be used (a
   bad address, a key variable that is unset) refuses the start. Such an agent lists the server's
   models or none (never its vendor's), and its vendor's account is never probed. Claude's own
   model names (`ANTHROPIC_MODEL`, the `ANTHROPIC_DEFAULT_*_MODEL` aliases, the subagent and
   auto-mode models: `provider::CLAUDE_MODEL_VARS`) are unset, then bound to the process's model
-  at every spawn (`bind_thread_model`), so background tasks and subagents stay on the server; an
+  at every spawn (`bind_thread_model`, and in the overlay `bind_thread_model_args`), so background tasks and subagents stay on the server; an
   unbound one is never exported. A model is chosen by `start_model`: the profile's own, else the
   server's first chat model (never the CLI's own setting, which names a vendor model); with none
   known, nothing starts (thread, switch, worker or terminal tab), and a terminal tab is given its

@@ -346,7 +346,15 @@ Claude Code also picks models on its own: its `opus`, `sonnet`, `haiku` and `fab
 aliases (background tasks use `haiku`), its subagents and auto mode. On a model server all
 of these name the thread's model (`ANTHROPIC_DEFAULT_*_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL`
 and the rest are set for it, and follow a model change), so nothing is sent for a model the
-server does not have. Values for them in your own environment are replaced. Changing the
+server does not have. Values for them in your own environment are replaced, and so are
+those of an `env` block in Claude's own settings files, which Claude Code applies over its
+environment: it is started with a `--settings` overlay that sets the server's address and
+these models, and blanks the vendor's credential and routing variables (`ANTHROPIC_API_KEY`,
+`ANTHROPIC_CUSTOM_HEADERS`, `CLAUDE_CODE_OAUTH_TOKEN` and the Bedrock, Vertex and Foundry
+switches). The overlay holds no key, so with an **API Key Variable** set, an
+`ANTHROPIC_AUTH_TOKEN` in a settings file's `env` still replaces the key: leave it out there.
+It also takes the place of a `--settings` in the profile's own arguments (Claude Code reads
+only the last one), and a managed settings file still sits above it. Changing the
 model of a thread on a server restarts Claude on the new model, resuming the same
 conversation (Claude Code cannot switch to a model id it does not know in place). Ollama
 answers Claude's token-count requests with 404 (it has no `/v1/messages/count_tokens`);

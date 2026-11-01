@@ -8666,7 +8666,9 @@ pub(super) mod tests {
         };
         let (args, env) =
             profile_launch(&on_gateway, Driver::Claude, env_file.clone(), &[]).unwrap();
-        assert_eq!(args, ["--verbose"]);
+        // The profile's own, then the settings overlay that pins the server, without the key.
+        assert_eq!(&args[..2], ["--verbose", "--settings"]);
+        assert!(args[2].contains("http://gw:4000") && !args[2].contains("gateway-key"));
         assert_eq!(
             env.lookup("ANTHROPIC_BASE_URL").as_deref(),
             Some("http://gw:4000")

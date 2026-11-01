@@ -837,7 +837,7 @@ pub fn with_provider_args(profile: &Profile, model: Option<&str>) -> Result<Prof
     }
     if let Some((provider, driver)) = terminal_provider(&profile) {
         let label = provider.kind.label();
-        let args = provider
+        let mut args = provider
             .args(driver)
             .map_err(|why| format!("Cannot start on {label}: {why}."))?;
         // The CLI is told its model: left to itself it starts on its own setting, which names
@@ -848,6 +848,7 @@ pub fn with_provider_args(profile: &Profile, model: Option<&str>) -> Result<Prof
                  this profile, or try again once its models are listed."
             )
         })?;
+        agent_core::provider::bind_thread_model_args(&mut args, Some(model));
         profile.args.extend(args);
         profile
             .args
@@ -925,6 +926,23 @@ mod tests {
         assert!(resumed[1].contains("'-m' 'qwen3-coder'"), "{resumed:?}");
         // No model known: refused, never left to the CLI's own (vendor) setting.
         assert!(with_provider_args(&on(ProviderKind::Ollama, None), None).is_err());
+        // Claude's settings overlay names the tab's model.
+        let claude = with_provider_args(
+            &Profile {
+                command: "claude".into(),
+                driver: None,
+                ..on(ProviderKind::Ollama, None)
+            },
+            Some("qwen3-coder"),
+        )
+        .unwrap();
+        let at = claude.args.iter().position(|a| a == "--settings").unwrap();
+        let overlay = &claude.args[at + 1];
+        assert!(
+            overlay.contains("\"ANTHROPIC_MODEL\":\"qwen3-coder\""),
+            "{overlay}"
+        );
+        assert!(!overlay.contains(agent_core::provider::THREAD_MODEL));
 
         let (provider, driver) = terminal_provider(&Profile {
             command: "claude".into(),

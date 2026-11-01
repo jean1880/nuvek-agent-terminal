@@ -220,6 +220,47 @@ pub fn bind_thread_model(env: &mut Vec<(String, String)>, model: Option<&str>) {
     }
 }
 
+/// [`bind_thread_model`] for the `--settings` overlay a provider launch gave Claude
+/// ([`ModelProvider::args`]): its [`THREAD_MODEL`] values name `model`, or go with none known. Any
+/// other `--settings` (a profile's own) is left as it is.
+pub fn bind_thread_model_args(args: &mut [String], model: Option<&str>) {
+    let model = model.filter(|m| !m.trim().is_empty());
+    let mut settings_next = false;
+    for arg in args.iter_mut() {
+        if !std::mem::replace(&mut settings_next, arg == "--settings") {
+            continue;
+        }
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(arg) else {
+            continue;
+        };
+        let Some(env) = value
+            .get_mut("env")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        let marked: Vec<String> = env
+            .iter()
+            .filter(|(_, v)| v.as_str() == Some(THREAD_MODEL))
+            .map(|(k, _)| k.clone())
+            .collect();
+        if marked.is_empty() {
+            continue;
+        }
+        for name in marked {
+            match model {
+                Some(model) => {
+                    env.insert(name, model.into());
+                }
+                None => {
+                    env.remove(&name);
+                }
+            }
+        }
+        *arg = value.to_string();
+    }
+}
+
 /// Whether a launch's arguments and environment run its agent on a model server: what
 /// [`ModelProvider::launch`] gave it (Claude's thread-model placeholder, Codex's provider).
 pub fn launch_on_server(args: &[String], env: &[(String, String)]) -> bool {
@@ -411,7 +452,31 @@ impl ModelProvider {
                     self.kind.label()
                 ))
             }
-            Driver::Claude => Vec::new(),
+            // Claude Code applies a settings file's `env` over its own environment, so a user's
+            // settings could send it to the vendor: a `--settings` overlay, which sits above every
+            // settings file but a managed one, pins what the launch sets. It holds no secret:
+            // with a key configured the token stays in the environment only.
+            Driver::Claude => {
+                let mut env = serde_json::Map::new();
+                env.insert("ANTHROPIC_BASE_URL".to_owned(), base.into());
+                if key_env.is_none() {
+                    env.insert(
+                        "ANTHROPIC_AUTH_TOKEN".to_owned(),
+                        self.kind.placeholder_token().into(),
+                    );
+                }
+                env.insert("CLAUDE_CODE_ATTRIBUTION_HEADER".to_owned(), "0".into());
+                for name in CLAUDE_UNSET {
+                    env.insert(name.to_owned(), "".into());
+                }
+                for name in CLAUDE_MODEL_VARS {
+                    env.insert(name.to_owned(), THREAD_MODEL.into());
+                }
+                vec![
+                    "--settings".to_owned(),
+                    serde_json::json!({ "env": env }).to_string(),
+                ]
+            }
             Driver::Local => crate::local_agent::RunnerArgs::server_args(&base, key_env),
             Driver::Codex => {
                 let id = CODEX_PROVIDER_ID;
@@ -778,7 +843,7 @@ mod tests {
     fn claude_is_pointed_at_the_servers_root_with_a_token() {
         let p = at(ProviderKind::Ollama, "http://nas:11434/v1", None);
         let launch = p.launch(Driver::Claude, None).unwrap();
-        assert!(launch.args.is_empty());
+        assert_eq!(launch.args.len(), 2, "only the settings overlay");
         assert_eq!(
             launch.env[..3],
             [
@@ -814,6 +879,65 @@ mod tests {
         assert!(shown.contains("ANTHROPIC_AUTH_TOKEN") && !shown.contains("secret-value"));
     }
 
+    /// The `env` of the `--settings` overlay in `args`, if there is one.
+    fn overlay_env(args: &[String]) -> Option<serde_json::Map<String, serde_json::Value>> {
+        let at = args.iter().position(|a| a == "--settings")?;
+        let value: serde_json::Value = serde_json::from_str(args.get(at + 1)?).ok()?;
+        value.get("env")?.as_object().cloned()
+    }
+
+    #[test]
+    fn claudes_own_settings_cannot_move_it_off_the_server() {
+        // Claude Code applies a settings file's `env` over its process environment, and a
+        // `--settings` overlay over every settings file: the overlay pins what the launch sets.
+        let p = at(ProviderKind::Ollama, "http://nas:11434", None);
+        let launch = p.launch(Driver::Claude, None).unwrap();
+        let env = overlay_env(&launch.args).expect("a settings overlay");
+        assert_eq!(env["ANTHROPIC_BASE_URL"], "http://nas:11434");
+        assert_eq!(env["CLAUDE_CODE_ATTRIBUTION_HEADER"], "0");
+        // No key configured: the placeholder is no secret, so the overlay pins it too.
+        assert_eq!(env["ANTHROPIC_AUTH_TOKEN"], "ollama");
+        // The vendor's credentials and routing are blanked, whatever a settings file says.
+        for name in CLAUDE_UNSET {
+            assert_eq!(env[name], "", "{name}");
+        }
+        for name in CLAUDE_MODEL_VARS {
+            assert_eq!(env[name], THREAD_MODEL, "{name}");
+        }
+        assert_eq!(p.args(Driver::Claude).unwrap(), launch.args);
+
+        // With a key, the key stays in the environment only: never on the command line.
+        let keyed = at(ProviderKind::LiteLlm, "https://gw.example", Some("GW_KEY"));
+        let launch = keyed.launch(Driver::Claude, Some("secret-value")).unwrap();
+        assert!(!launch.args.iter().any(|a| a.contains("secret-value")));
+        let env = overlay_env(&launch.args).unwrap();
+        assert!(!env.contains_key("ANTHROPIC_AUTH_TOKEN"));
+        assert_eq!(env["ANTHROPIC_BASE_URL"], "https://gw.example");
+
+        // The models are bound at the spawn, in the overlay as in the environment.
+        let mut args = vec!["--settings".to_owned(), r#"{"theme":"dark"}"#.to_owned()];
+        args.extend(launch.args.clone());
+        bind_thread_model_args(&mut args, Some("qwen3-coder"));
+        assert_eq!(
+            args[1], r#"{"theme":"dark"}"#,
+            "a profile's own is left alone"
+        );
+        let env = overlay_env(&args[2..]).unwrap();
+        for name in CLAUDE_MODEL_VARS {
+            assert_eq!(env[name], "qwen3-coder", "{name}");
+        }
+        let mut unbound = launch.args.clone();
+        bind_thread_model_args(&mut unbound, None);
+        let env = overlay_env(&unbound).unwrap();
+        assert!(CLAUDE_MODEL_VARS.iter().all(|n| !env.contains_key(*n)));
+        assert_eq!(env["ANTHROPIC_BASE_URL"], "https://gw.example");
+        assert!(!unbound.iter().any(|a| a.contains(THREAD_MODEL)));
+
+        // Only a launch on a server has one.
+        let codex = keyed.launch(Driver::Codex, Some("secret-value")).unwrap();
+        assert!(overlay_env(&codex.args).is_none());
+    }
+
     #[test]
     fn codex_gets_its_own_provider_and_only_the_key_variables_name() {
         let p = at(ProviderKind::LiteLlm, "https://gw.example/", Some("GW_KEY"));
@@ -837,7 +961,11 @@ mod tests {
         assert!(!launch.args.iter().any(|a| a.contains("secret-value")));
         // The same arguments before the key is known; only `launch` checks that it is set.
         assert_eq!(p.args(Driver::Codex).unwrap(), launch.args);
-        assert!(p.args(Driver::Claude).unwrap().is_empty());
+        assert!(!p
+            .args(Driver::Claude)
+            .unwrap()
+            .iter()
+            .any(|a| a.contains("secret-value")));
         assert!(p.args(Driver::Agy).is_err());
         assert!(!["openai", "ollama", "lmstudio"].contains(&CODEX_PROVIDER_ID));
     }

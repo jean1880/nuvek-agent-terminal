@@ -306,7 +306,10 @@ starts them fresh.
 import** lists each stdio `mcp_servers` entry with its executable name, exact tools
 (`enabled_tools` less `disabled_tools`) and environment variable names, then **Import
 selected** adds the definitions you tick. An entry with no `cwd` runs in the thread's folder
-(`$WORKSPACE`), as Codex runs it in its session's. An entry without an explicit allowlist arrives
+(`$WORKSPACE`), as Codex runs it in its session's. Timeouts are read as Codex reads them
+(`startup_timeout_sec` and `tool_timeout_sec` in whole or fractional seconds, or
+`startup_timeout_ms` in milliseconds when `startup_timeout_sec` is absent) and rounded up to
+whole seconds. An entry without an explicit allowlist arrives
 disabled and unreviewed; none arrives read-only or approved. Entries with another transport,
 interpolation, shell or package-runner indirection (`sh -c`, `npx --call`), source files,
 literal credentials or `agent-terminal` itself are reported, not imported; a credential

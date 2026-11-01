@@ -346,6 +346,7 @@ fn parse_server(
             | "enabled_tools"
             | "disabled_tools"
             | "startup_timeout_sec"
+            | "startup_timeout_ms"
             | "tool_timeout_sec"
             | "transport"
             | "type" => {}
@@ -626,9 +627,20 @@ fn parse_server(
             })
             .collect(),
         approval: ApprovalPolicy::Ask,
-        startup_timeout_secs: seconds(fields, "startup_timeout_sec", 15, 300)
-            .map_err(|_| (INVALID, vec!["startup_timeout_sec".into()]))?,
-        call_timeout_secs: seconds(fields, "tool_timeout_sec", 60, 600)
+        startup_timeout_secs: seconds(
+            fields,
+            "startup_timeout_sec",
+            Some("startup_timeout_ms"),
+            15,
+            300,
+        )
+        .map_err(|_| {
+            (
+                INVALID,
+                vec!["startup_timeout_sec".into(), "startup_timeout_ms".into()],
+            )
+        })?,
+        call_timeout_secs: seconds(fields, "tool_timeout_sec", None, 60, 600)
             .map_err(|_| (INVALID, vec!["tool_timeout_sec".into()]))?,
     };
     candidate.validate().map_err(|_| (INVALID, Vec::new()))?;
@@ -682,10 +694,36 @@ fn boolean(fields: &toml::Table, key: &str, default: bool) -> Result<bool, ()> {
         .map_or(Ok(default), |v| v.as_bool().ok_or(()))
 }
 
-fn seconds(fields: &toml::Table, key: &str, default: u64, max: u64) -> Result<u64, ()> {
-    let value = fields.get(key).map_or(Ok(default), |v| {
-        v.as_integer().and_then(|v| u64::try_from(v).ok()).ok_or(())
-    })?;
+/// A Codex timeout in whole seconds, rounded up. As Codex reads them: `<key>_sec` is an integer
+/// or a float of seconds, and `<key>_ms` (startup only) an integer of milliseconds that counts
+/// only when `<key>_sec` is absent.
+fn seconds(
+    fields: &toml::Table,
+    key: &str,
+    millis: Option<&str>,
+    default: u64,
+    max: u64,
+) -> Result<u64, ()> {
+    let millis = millis.and_then(|m| fields.get(m));
+    // Codex refuses its whole file for a `_ms` that is not a whole number, even beside `_sec`.
+    if millis.is_some_and(|v| v.as_integer().is_none_or(|v| v < 0)) {
+        return Err(());
+    }
+    let value = match (fields.get(key), millis) {
+        (Some(toml::Value::Integer(v)), _) => u64::try_from(*v).map_err(|_| ())?,
+        (Some(toml::Value::Float(v)), _) if v.is_finite() && *v >= 0.0 => {
+            // Bounded before the cast, so it never saturates into range.
+            if v.ceil() > max as f64 {
+                return Err(());
+            }
+            v.ceil() as u64
+        }
+        (Some(_), _) => return Err(()),
+        (None, Some(ms)) => u64::try_from(ms.as_integer().ok_or(())?)
+            .map_err(|_| ())?
+            .div_ceil(1000),
+        (None, None) => default,
+    };
     if (1..=max).contains(&value) {
         Ok(value)
     } else {
@@ -861,6 +899,55 @@ tool_timeout_sec = 90
             (config.startup_timeout_secs, config.call_timeout_secs),
             (30, 90)
         );
+    }
+    #[test]
+    fn codex_timeouts_in_float_seconds_or_milliseconds_round_up_to_whole_seconds() {
+        for (fields, expected) in [
+            (
+                "startup_timeout_sec = 2.5\ntool_timeout_sec = 90.25",
+                (3, 91),
+            ),
+            ("startup_timeout_sec = 0.2", (1, 60)),
+            ("startup_timeout_ms = 2500", (3, 60)),
+            ("startup_timeout_ms = 1000", (1, 60)),
+            // `_sec` wins over `_ms`, as in Codex.
+            (
+                "startup_timeout_sec = 30\nstartup_timeout_ms = 2500",
+                (30, 60),
+            ),
+            (
+                "startup_timeout_sec = 300.0\ntool_timeout_sec = 600",
+                (300, 600),
+            ),
+        ] {
+            let config = only(&format!(
+                "[mcp_servers.docs]\ncommand='docs-server'\n{fields}"
+            ))
+            .candidate;
+            assert_eq!(
+                (config.startup_timeout_secs, config.call_timeout_secs),
+                expected,
+                "{fields}"
+            );
+        }
+        for fields in [
+            "startup_timeout_sec = 300.5",
+            "startup_timeout_sec = 0.0",
+            "startup_timeout_sec = -1.5",
+            "startup_timeout_sec = nan",
+            "startup_timeout_sec = inf",
+            "startup_timeout_ms = 0",
+            "startup_timeout_ms = 2500.5",
+            "startup_timeout_ms = 300001",
+            "startup_timeout_sec = 3\nstartup_timeout_ms = 'soon'",
+            "tool_timeout_sec = 600.01",
+            "tool_timeout_sec = '60'",
+        ] {
+            let preview = parse(&format!(
+                "[mcp_servers.docs]\ncommand='docs-server'\n{fields}"
+            ));
+            assert!(preview.servers.is_empty(), "{fields}");
+        }
     }
     #[test]
     fn absent_empty_or_fully_excluded_allowlist_never_enables() {

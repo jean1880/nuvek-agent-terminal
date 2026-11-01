@@ -336,7 +336,11 @@ Architectural mandates, standards, and workflows for this codebase.
   → Agents → Model Provider, Claude and Codex only) starts the agent on that server
   (`agent_core::provider`: Claude through `ANTHROPIC_BASE_URL`, with the vendor's own credential
   variables removed, all pinned again by a `--settings` overlay, since a settings file's `env`
-  wins over the process environment; the overlay never holds the key, and a profile's own
+  wins over the process environment; the overlay never holds the key. The credential sent is
+  always the profile's key or the placeholder: the overlay's `apiKeyHelper` prints
+  `provider::CLAUDE_KEY_VAR`, set only by the app, and blanks every other credential
+  (`CLAUDE_UNSET`), so a settings file's helper or tokens are never used (seen live with Claude
+  Code 2.1.309: the helper of the overlay beats theirs and the process's token). A profile's own
   `--settings` is merged under it (`provider::with_profile_settings`: inline JSON only, a file
   refuses the start, never dropped). Codex through a `-c`
   provider of the app's own id). Every chat launch path

@@ -8776,7 +8776,7 @@ pub(super) mod tests {
             Some("http://gw:4000")
         );
         assert_eq!(
-            env.lookup("ANTHROPIC_AUTH_TOKEN").as_deref(),
+            env.lookup(agent_core::provider::CLAUDE_KEY_VAR).as_deref(),
             Some("gateway-key")
         );
         // The vendor's key is gone, from the env file and from what is inherited.

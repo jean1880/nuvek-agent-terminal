@@ -170,7 +170,8 @@ fn decode_cache(text: &str) -> CacheFile {
                 Driver::Local => file.local.clear(),
             }
         }
-        file.others.clear();
+        // Another profile's vendor list (no source) stands too.
+        file.others.retain(|o| o.source.is_none());
     }
     file
 }
@@ -1496,11 +1497,21 @@ mod tests {
                 "source": { "kind": "litellm", "api_key_env": "GW_KEY" },
                 "models": [model(Driver::Codex, "qwen3-coder")],
                 "read_at": 1_700_000_200,
+            }, {
+                // Claude's own is on a server: a vendor profile's list of its vendor.
+                "driver": "claude",
+                "source": null,
+                "models": [model(Driver::Claude, "opus")],
+                "read_at": 1_700_000_300,
             }],
         });
         let file = decode_cache(&old.to_string());
         assert!(file.claude.is_empty() && file.read_at.claude.is_none());
-        assert!(file.sources.is_empty() && file.others.is_empty());
+        assert!(file.sources.is_empty());
+        assert_eq!(file.others.len(), 1, "only the vendor's other list stays");
+        assert_eq!(file.others[0].driver, Driver::Claude);
+        assert_eq!(file.others[0].source, None);
+        assert_eq!(file.others[0].models, vec![model(Driver::Claude, "opus")]);
         assert_eq!(file.codex, vec![model(Driver::Codex, "gpt-5-codex")]);
         assert_eq!(file.read_at.codex, Some(1_700_000_100));
     }

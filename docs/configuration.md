@@ -363,13 +363,16 @@ and the rest are set for it, and follow a model change), so nothing is sent for 
 server does not have. Values for them in your own environment are replaced, and so are
 those of an `env` block in Claude's own settings files, which Claude Code applies over its
 environment: it is started with a `--settings` overlay that sets the server's address and
-these models, and blanks the vendor's credential and routing variables (`ANTHROPIC_API_KEY`,
-`ANTHROPIC_CUSTOM_HEADERS`, `CLAUDE_CODE_OAUTH_TOKEN` and the Bedrock, Vertex and Foundry
-switches). The overlay holds no key, so with an **API Key Variable** set, an
-`ANTHROPIC_AUTH_TOKEN` in a settings file's `env` still replaces the key: leave it out there.
-Claude Code reads only the last `--settings`, so one in the profile's own arguments is merged
-into the overlay: its keys stay, its `env` variables too, and the overlay's win where both
-set one. It must be inline JSON (`--settings '{"theme":"dark"}'`): a file path, or a value
+these models, and blanks every other credential and routing variable Claude Code reads
+(`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_PROFILE`,
+the federation variables, `CLAUDE_CODE_OAUTH_TOKEN` and the token file descriptors, and the
+Bedrock, Vertex, Foundry and gateway switches). The credential Claude sends is always the
+profile's key, or the server's placeholder without one: the overlay's `apiKeyHelper` prints
+it from a variable only the app sets (`AGENT_TERMINAL_PROVIDER_KEY`), so the key never
+appears on a command line, and an `apiKeyHelper` or token of your own settings files is not
+used on a server. Claude Code reads only the last `--settings`, so one in the profile's own
+arguments is merged into the overlay: its keys stay, its `env` variables too, and the
+overlay's win where both set one (its own credential and helper included). It must be inline JSON (`--settings '{"theme":"dark"}'`): a file path, or a value
 that is not a JSON object, refuses the start with the reason. A managed settings file still
 sits above the overlay. Changing the
 model of a thread on a server restarts Claude on the new model, resuming the same

@@ -157,12 +157,16 @@ impl LimitWait {
 
     /// The agent refused work again at `now` (a retry during the wait), with `reset` if known and
     /// `held` its windows then. The refusal is evidence as at the start of a wait: readings from
-    /// before it no longer count, a reset time it came after is disproved, the copies past their
+    /// before it no longer count, a reset time it came after (the agent's, or the one the windows
+    /// named) is disproved, the copies past their
     /// reset are backed off, and a later reset time than the one waited for replaces it.
     pub fn learn(&mut self, reset: Option<i64>, now: i64, held: &[Window]) {
         self.since = self.since.max(now);
         if self.reset.is_some_and(|known| now >= known) {
             self.reset = None;
+        }
+        if self.expected.is_some_and(|named| now >= named) {
+            self.expected = None;
         }
         for copy in backed_off_by(held, now) {
             self.backed_off
@@ -279,6 +283,23 @@ mod tests {
         wait.learn(None, 4_100, &copy);
         let freed = [window("Weekly", 0.2, Some(600_000))];
         assert_eq!(wait.step(4_400, Some((4_350, &freed))), Step::Continue);
+    }
+
+    #[test]
+    fn a_refusal_after_the_time_the_windows_named_disproves_it() {
+        // "Weekly" says it resets at 9 000: shown as when the thread continues. A refusal at
+        // 9 100 came after it, so that time is no longer shown.
+        let at_limit = [window("Weekly", 1.0, Some(9_000))];
+        let mut wait = LimitWait::new(None, 100, &at_limit);
+        assert_eq!(wait.step(300, Some((200, &at_limit))), Step::Wait);
+        assert_eq!(wait.reset(), Some(9_000));
+        wait.learn(None, 9_100, &at_limit);
+        assert_eq!(wait.reset(), None);
+        // One still ahead stays.
+        let mut wait = LimitWait::new(None, 100, &at_limit);
+        assert_eq!(wait.step(300, Some((200, &at_limit))), Step::Wait);
+        wait.learn(None, 500, &at_limit);
+        assert_eq!(wait.reset(), Some(9_000));
     }
 
     #[test]

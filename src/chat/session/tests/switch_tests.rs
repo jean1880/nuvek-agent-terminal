@@ -211,6 +211,34 @@ fn a_busy_switch_whose_turn_ended_meanwhile_sends_no_continuation() {
     }
 }
 
+/// The user's Stop wins over a switch continuation still armed (here one a delegation rebind
+/// holds until its restart): the rebind's end sends nothing, and the thread stays stopped.
+#[test]
+fn a_stop_drops_a_switch_continuation_still_armed() {
+    in_loop(|ctx| {
+        let s = slow(Driver::Claude);
+        s.session.send_prompt("the task");
+        assert!(s.session.status().running_turn);
+        s.session.inner.rebinding.set(true);
+        s.session.inner.arm_switch_continuation(7, Driver::Claude);
+        s.session.inner.handoff_prepared(7);
+        s.session.inner.rebinding.set(false);
+        assert!(s.session.inner.switch_continuation.borrow().is_some());
+        ChatBackend::interrupt(&*s.session);
+        end_turn(&s.session);
+        assert!(s.session.inner.switch_continuation.borrow().is_none());
+        s.session.inner.rebind_ready();
+        pump_until(ctx, 1, || false);
+        assert!(
+            !s.sent_anywhere("Continue the unfinished task"),
+            "{:?}",
+            prompts(&s.log)
+        );
+        assert!(s.session.inner.wakes_held.get(), "still stopped");
+        s.session.shutdown(false);
+    });
+}
+
 fn failed_notice(s: &Slow) -> bool {
     has(&s.seen, |e| {
         matches!(e, Event::Notice { text }

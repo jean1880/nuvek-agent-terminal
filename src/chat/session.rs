@@ -6563,7 +6563,15 @@ impl ChatBackend for ChatSession {
         if self.inner.child.is_none() {
             self.inner.wakes_held.set(true);
         }
+        // The Stop wins over a switch's continuation still armed (one a rebind holds, say):
+        // nothing carries the task on, and what that switch took over is queued again, as
+        // when a switch fails.
+        let owed = self.inner.switch_continuation.borrow_mut().take().is_some();
+        self.inner.switch_interrupted.set(false);
         self.interrupt_for_switch();
+        if owed {
+            self.inner.settle_carried(false);
+        }
     }
 
     fn respond_approval(&self, request: &str, decision: Decision) {

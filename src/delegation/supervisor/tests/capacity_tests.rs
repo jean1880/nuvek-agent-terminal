@@ -803,3 +803,75 @@ fn a_resume_waits_out_a_siblings_revocation_instead_of_failing() {
         stop(&sup).await;
     });
 }
+
+/// A queued delivery that fails to start (every slot held, none pausable) never strands the
+/// entries queued behind it: each is tried in turn and settled, and once a slot frees the
+/// worker's next instruction goes out.
+#[test]
+fn a_queued_delivery_refused_for_room_lets_the_next_one_through() {
+    in_context(async {
+        let (dir, sup, root) = harness();
+        let workers = full_table(&sup, &root, "stranded").await;
+        let target = workers[0].clone();
+        let session = sup.state.borrow().workers[&target].session().unwrap();
+        assert!(session.suspend_child_if_idle());
+        pump_until(|| !live(&sup, &target)).await;
+        let filler = idle_worker(&sup, &root, "stranded-fill").await;
+        // Every live worker busy preparing: none can be paused to make room.
+        for w in workers.iter().skip(1).chain([&filler]) {
+            sup.state.borrow_mut().workers.get_mut(w).unwrap().preparing = true;
+        }
+        // Two instructions queued while a run holds the queue.
+        sup.state.borrow_mut().workers.get_mut(&target).unwrap().run =
+            Some(agent_core::delegation::RunId::parse("r_strandedRun1").unwrap());
+        let mut ops = Vec::new();
+        for (text, key) in [("FIRST_QUEUED", "queued-1"), ("SECOND_QUEUED", "queued-2")] {
+            let receipt = sup
+                .send_worker(&root, instruction(&target, text, key))
+                .await
+                .expect("send");
+            ops.push(receipt["operation_id"].as_str().unwrap().to_owned());
+        }
+        assert_eq!(sup.state.borrow().deferred[&target].len(), 2);
+        sup.state.borrow_mut().workers.get_mut(&target).unwrap().run = None;
+        sup.drain_deferred(&target);
+        let state_of = |op: &str| {
+            sup.services
+                .handle
+                .reader()
+                .delegation_operation(op)
+                .unwrap()
+                .unwrap()
+                .dispatch_state
+        };
+        pump_until(|| {
+            ops.iter().all(|op| state_of(op) == "failed")
+                && sup
+                    .state
+                    .borrow()
+                    .deferred
+                    .get(&target)
+                    .is_none_or(|q| q.is_empty())
+        })
+        .await;
+
+        // A slot frees: the next instruction resumes the worker and is delivered.
+        sup.state
+            .borrow_mut()
+            .workers
+            .get_mut(&filler)
+            .unwrap()
+            .preparing = false;
+        sup.send_worker(&root, instruction(&target, "AFTER_ROOM", "queued-3"))
+            .await
+            .expect("send");
+        within_cap(&sup, || {
+            live(&sup, &target) && frames(&dir).contains("AFTER_ROOM")
+        })
+        .await;
+        for w in workers.iter().skip(1) {
+            sup.state.borrow_mut().workers.get_mut(w).unwrap().preparing = false;
+        }
+        stop(&sup).await;
+    });
+}

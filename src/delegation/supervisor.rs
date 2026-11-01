@@ -2327,6 +2327,9 @@ pub(super) struct Runtime {
     /// Test barriers: a held send's acceptance, a held launch's preparation.
     #[cfg(test)]
     pub hold_send_accept: Option<Rc<std::cell::Cell<bool>>>,
+    /// Test barrier: a held cancel's acceptance.
+    #[cfg(test)]
+    pub hold_cancel_accept: Option<Rc<std::cell::Cell<bool>>>,
     #[cfg(test)]
     pub hold_launch: Option<Rc<std::cell::Cell<bool>>>,
     /// Test barrier: a spawn between its slot naming the worker and the worker's registration.

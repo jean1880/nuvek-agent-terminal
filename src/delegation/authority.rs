@@ -16,11 +16,12 @@ use super::seam::{ApprovalGate, AuthorityParams, Effect, GateVerdict, LiveAuthor
 use crate::always_allow::Action;
 use crate::approval_server::{
     canonical_target, classify, classify_call, edit_targets, path_auto_matchable,
-    read_auto_matchable, ToolClass,
+    read_auto_matchable, sole_str, ToolClass,
 };
 
-/// Argument names agy's `call_mcp_tool` names its server by (as `always_allow::Action::of`).
-const AGY_SERVER_KEYS: [&str; 4] = ["ServerName", "server_name", "server", "Server"];
+/// Argument names agy's MCP tools name their server by (as `always_allow::Action::of`), each
+/// matched without regard to case.
+pub(crate) const AGY_SERVER_KEYS: [&str; 3] = ["ServerName", "server_name", "server"];
 
 /// `mcp__<server>__<tool>` as an MCP effect; `None` for any other shape.
 fn mcp_prefixed(tool: &str) -> Option<Effect> {
@@ -30,16 +31,12 @@ fn mcp_prefixed(tool: &str) -> Option<Effect> {
     })
 }
 
-/// agy's `call_mcp_tool`: ours only when every server key it carries names `agent_terminal` and
-/// there is at least one.
+/// agy's `call_mcp_tool`, `list_resources` and `read_resource`: ours only when every server
+/// argument it carries, matched as agy matches names (without regard to case), names
+/// `agent_terminal` and there is at least one.
 fn agy_mcp(input: &Value) -> Effect {
-    let named: Vec<&str> = AGY_SERVER_KEYS
-        .iter()
-        .filter_map(|k| input.get(*k))
-        .map(|v| v.as_str().unwrap_or(""))
-        .collect();
     Effect::Mcp {
-        own: !named.is_empty() && named.iter().all(|s| *s == SERVER_NAME),
+        own: sole_str(input, &AGY_SERVER_KEYS) == Some(SERVER_NAME),
     }
 }
 
@@ -68,7 +65,8 @@ pub(crate) fn effect(driver: Driver, tool: &str, input: &Value) -> Effect {
             | "send_message" | "browser_subagent" => Effect::Delegate,
             "notebook_execution" | "delete_knowledge" | "generate_image" | "run_workflow"
             | "manage_inbox" => Effect::Exec,
-            "call_mcp_tool" => agy_mcp(input),
+            // Resources are an MCP server's too: before `classify`, which files these as reads.
+            "call_mcp_tool" | "list_resources" | "read_resource" => agy_mcp(input),
             "manage_task" => match classify_call(tool, input) {
                 ToolClass::Status => Effect::Read,
                 _ => Effect::Exec,
@@ -448,8 +446,9 @@ mod tests {
             ("find_by_name", Effect::Read),
             ("codebase_search", Effect::Read),
             ("view_code_item", Effect::Read),
-            ("read_resource", Effect::Read),
-            ("list_resources", Effect::Read),
+            // No server named: not ours.
+            ("read_resource", Effect::Mcp { own: false }),
+            ("list_resources", Effect::Mcp { own: false }),
             ("replace_file_content", Effect::Edit),
             ("multi_replace_file_content", Effect::Edit),
             ("write_to_file", Effect::Edit),
@@ -479,11 +478,24 @@ mod tests {
             json!({}),
             json!({"ServerName": "agent_terminal", "server": "github"}),
             json!({"ServerName": 7}),
+            // agy matches names without regard to case and the last one wins.
+            json!({"ServerName": "agent_terminal", "serverName": "github"}),
+            json!({"servername": "github"}),
+            json!({"SERVER_NAME": "github", "ServerName": "agent_terminal"}),
         ] {
+            for tool in ["call_mcp_tool", "list_resources", "read_resource"] {
+                assert_eq!(
+                    effect(Driver::Agy, tool, &foreign),
+                    Effect::Mcp { own: false },
+                    "{tool} {foreign}"
+                );
+            }
+        }
+        for tool in ["list_resources", "read_resource"] {
             assert_eq!(
-                effect(Driver::Agy, "call_mcp_tool", &foreign),
-                Effect::Mcp { own: false },
-                "{foreign}"
+                effect(Driver::Agy, tool, &json!({"ServerName": "agent_terminal"})),
+                Effect::Mcp { own: true },
+                "{tool}"
             );
         }
     }
@@ -908,6 +920,19 @@ mod tests {
                 &json!({"ServerName": "github"}),
                 None
             )));
+            assert!(is_deny(&agy.judge(
+                "call_mcp_tool",
+                &json!({"ServerName": "agent_terminal", "serverName": "github"}),
+                None
+            )));
+            for tool in ["list_resources", "read_resource"] {
+                assert!(is_deny(&agy.judge(tool, &json!({}), None)), "{tool}");
+                assert!(is_deny(&agy.judge(
+                    tool,
+                    &json!({"ServerName": "github", "Uri": "file:///etc/passwd"}),
+                    None
+                )));
+            }
             let codex = f.gate(Driver::Codex, mode);
             assert!(is_deny(&codex.judge(
                 "mcp__codex_apps__x",

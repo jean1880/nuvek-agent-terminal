@@ -104,8 +104,10 @@ fn only_a_refused_auto_steer_goes_back_to_wait_for_the_next_turn() {
     use DeliveryState as D;
     for from in D::ALL {
         for policy in [Delivery::Auto, Delivery::NextTurn, Delivery::ThisRun] {
-            // Written (`submitted`), or overdue (`unknown`) and then refused.
-            let ok = matches!(from, D::Submitted | D::Unknown) && policy == Delivery::Auto;
+            // Written (`submitted`), or overdue (`unknown`) and then refused, or reserved for a
+            // run that ended before it was written.
+            let ok = matches!(from, D::Submitted | D::Unknown | D::DispatchReserved)
+                && policy == Delivery::Auto;
             assert_eq!(
                 requeue_refused_steer(from, policy).ok(),
                 ok.then_some(D::QueuedNextTurn),

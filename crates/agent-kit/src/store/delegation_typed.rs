@@ -1638,11 +1638,13 @@ impl Store {
     }
 
     /// An `auto` parent→child message whose steer the recipient's run refused after it was
-    /// written (`submitted`) waits for the recipient's next turn again (`queued_next_turn`), and
-    /// its operation is `accepted` again, in the same transaction: from here it is any accepted
-    /// send, so its next dispatch is reserved with every check (the epoch, a closed target), and a
-    /// revocation or a restart fails it like any other. Its epoch is the root's current one (it was
-    /// current, being in flight). The only way back from `submitted`, for either
+    /// written (`submitted`), or that was reserved for a run that ended before it could be
+    /// written (`dispatch_reserved`), waits for the recipient's next turn again
+    /// (`queued_next_turn`), and its operation is `accepted` again, in the same transaction: from
+    /// here it is any accepted send, so its next dispatch is reserved with every check (the
+    /// epoch, a closed target), and a revocation or a restart fails it like any other. Its epoch
+    /// is the root's current one (it was current, being in flight). The only way back from
+    /// `submitted` or `dispatch_reserved`, for either
     /// (`mailbox::requeue_refused_steer`, `operation::requeue_refused_steer`); any other message,
     /// or one in any other state, is refused and nothing changes. The run it was aimed at stays
     /// recorded as accepted (a frozen fact), and a confirmation in a later run is its delivery
@@ -2926,11 +2928,12 @@ impl Store {
     /// Called by `delete_thread` inside its transaction: refuses while any delegated worker the
     /// delete would take is live (not closed, or with an active run), else removes that subtree's
     /// workers (for a root, its root row). Their messages and every reply chained to them go
-    /// first, in one statement; the schema's cascades take the rest they own: runs, operations,
-    /// links and aliases, and the links and aliases of the deleted threads' events and provider
-    /// threads with those. Returns the other hidden backing
-    /// threads that go with it, for the caller to delete too (so none is left to surface in the
-    /// sidebar).
+    /// first, in one statement; the schema's cascades take the rest they own: runs, their own
+    /// operations, links and aliases, and the links and aliases of the deleted threads' events
+    /// and provider threads with those. An operation of a principal outside the subtree (the
+    /// parent's spawn of it) stays, without its target and run, so its key still replays.
+    /// Returns the other hidden backing threads that go with it, for the caller to delete too (so
+    /// none is left to surface in the sidebar).
     pub(crate) fn release_delegation_for_delete(&self, thread: &str) -> Result<Vec<String>> {
         let (workers, root_case, root) =
             if let Some(root) = self.delegation_root_of_thread(thread)? {
@@ -2942,20 +2945,19 @@ impl Store {
             } else {
                 return Ok(Vec::new());
             };
-        let live: Vec<&WorkerId> = workers
+        // A lookup that fails refuses the delete: it never counts a worker as closed.
+        let mut live: Vec<&WorkerId> = Vec::new();
+        for w in workers
             .iter()
             .filter(|w| !root_case || w.as_str() != root.root_worker_id)
-            .filter(|w| {
-                let row = self.delegation_worker(w.as_str()).ok().flatten();
-                let open = row.is_none_or(|r| r.state != "closed");
-                let running = self
-                    .active_delegation_run(w.as_str())
-                    .ok()
-                    .flatten()
-                    .is_some();
-                open || running
-            })
-            .collect();
+        {
+            let open = self
+                .delegation_worker(w.as_str())?
+                .is_none_or(|r| r.state != "closed");
+            if open || self.active_delegation_run(w.as_str())?.is_some() {
+                live.push(w);
+            }
+        }
         if !live.is_empty() {
             return Err(StoreError::Failed(format!(
                 "the thread has {} live delegated worker(s); close and revoke them first",
@@ -3186,7 +3188,7 @@ fn event_summary(env: &Envelope) -> (String, Option<StateRef>) {
     let summary = if one_line {
         first_line(&text, MAX_ACTIVITY_SUMMARY_BYTES)
     } else {
-        truncate_bytes(&text, MAX_EVENT_SUMMARY_BYTES).to_owned()
+        truncate_whole_marker(&text, MAX_EVENT_SUMMARY_BYTES).to_owned()
     };
     (summary, state)
 }

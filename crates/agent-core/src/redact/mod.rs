@@ -503,7 +503,9 @@ pub fn redact_keyed_shown(key: &str, value: &str) -> String {
 /// Plain words or identifiers, never a credential's shape: every blank-separated word, less
 /// surrounding punctuation, is at most 24 letters with no digit, in segments (split on
 /// `_ - . '`) that are all lower case, all upper case, Capitalised or camelCase, and whose
-/// humps are pronounceable (vowels in a plausible share, no long consonant or vowel runs).
+/// humps are pronounceable (vowels in a plausible share, no long consonant or vowel runs);
+/// and either two word parts or more (joined by `_ - . '`, a blank or a camelCase capital),
+/// or a single part of at most 10 letters.
 /// Random keys almost always hold a digit, break that case pattern or fail the vowel checks;
 /// anything else is not words.
 fn reads_as_words(value: &str) -> bool {
@@ -574,22 +576,33 @@ fn reads_as_words(value: &str) -> bool {
             letters.len() <= 16 && vowels * 7 >= letters.len()
         })
     }
-    let mut words = 0;
+    // Word parts (`created`, `at`; `created`, `At`), and the letters of the last one.
+    let mut parts = 0;
+    let mut last = 0;
     for word in value.split_whitespace() {
         let word = word.trim_matches(|c: char| ".,;:!?()\"'".contains(c));
         if word.is_empty() {
             continue;
         }
-        if word.chars().count() > 24
-            || !word
-                .split(['_', '-', '.', '\''])
-                .all(|part| part.is_empty() || (segment(part) && pronounceable(part)))
-        {
+        if word.chars().count() > 24 {
             return false;
         }
-        words += 1;
+        for part in word.split(['_', '-', '.', '\'']).filter(|p| !p.is_empty()) {
+            if !segment(part) || !pronounceable(part) {
+                return false;
+            }
+            let humps = if part.chars().all(char::is_uppercase) {
+                1
+            } else {
+                1 + part.chars().skip(1).filter(|c| c.is_uppercase()).count()
+            };
+            parts += humps;
+            last = part.chars().count();
+        }
     }
-    words > 0
+    // A lone part is words only when short: a long pronounceable run of letters
+    // (`tobamelikurasi`) is as likely a generated key as a word.
+    parts >= 2 || (parts == 1 && last <= 10)
 }
 
 /// Opens a PEM block.
@@ -1312,6 +1325,10 @@ mod tests {
             // Random letters with no digit: no plausible vowels, long consonant runs.
             ("api_key", "qwhxjzkplmnbvcxzasdf"),
             ("api_key", "kdjfhqpwoeirutyz"),
+            // Pronounceable, but one long part: as likely generated as a word.
+            ("api_key", "tobamelikurasi"),
+            ("token", "Tobamelikurasi"),
+            ("sort_key", "lumoravetikan"),
             ("token", "zxcvbnmlkjhg"),
             ("token", "QWHXJZKPLMNB"),
             ("api_key", "plain words qwhxjzkplmnb"),

@@ -380,6 +380,8 @@ pub struct Runner<C: ChatClient, W: Write> {
     next_id: u64,
     /// The current model cannot take tools: it goes without them until the model changes.
     no_tools: bool,
+    /// What the model is told of a built-in call a Stop ended while it ran: it did start.
+    stopped_result: Option<String>,
     /// The thread's folder, opened when the session starts: every write and command is
     /// anchored to it.
     workspace: Option<std::sync::Arc<crate::local_tools::Workspace>>,
@@ -422,6 +424,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             generation: new_session_id()[..8].to_owned(),
             next_id: 0,
             no_tools: false,
+            stopped_result: None,
             workspace: None,
         }
     }
@@ -1243,6 +1246,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 schema.pointer("/function/name").and_then(Value::as_str)
                     == Some(call.function.name.as_str())
             });
+            self.stopped_result = None;
             match self.call(call, commands, reservation, advertised) {
                 Ok(output) => self.messages.push(ChatMessage::tool_result(
                     &call.id,
@@ -1266,6 +1270,9 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                                 &serde_json::json!({"isError":true,"content":[{"type":"text","text":"MCP call interrupted without a confirmed result; its outcome may be unknown. Do not retry automatically."}]}),
                                 reservation,
                             )
+                        } else if let Some(ran) = self.stopped_result.take().filter(|_| offset == 0)
+                        {
+                            bound_result(&self.safe_text(&ran), reservation)
                         } else {
                             bound_result(reason, reservation)
                         };
@@ -1662,6 +1669,15 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 None,
                 None,
             ));
+            // It ran: what it gave back is kept, and a change it was making may be half done.
+            self.stopped_result = Some(match result {
+                Ok(output) => output,
+                Err(why) if tool.writes() => format!(
+                    "Stopped by the user while it ran, so its outcome is unknown: check before \
+                     retrying it. ({why})"
+                ),
+                Err(why) => format!("Error: {why}"),
+            });
             return Err(StepError::Stop(stop));
         }
         match result {
@@ -3605,6 +3621,51 @@ mod tests {
             ["a", "b"],
             "every call of the reply has its answer"
         );
+    }
+
+    /// A call stopped while it runs did start: the model is never told it did not run. A
+    /// command's outcome is unknown, and the call after it certainly did not run.
+    #[test]
+    fn a_call_stopped_while_it_runs_is_never_told_it_did_not_run() {
+        let work = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let two = vec![
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"run_command","arguments":"{\"command\":\"touch made; sleep 30\"}"}},{"index":1,"id":"b","function":{"name":"run_command","arguments":"{\"command\":\"true\"}"}}]},"finish_reason":"tool_calls"}]}"#.to_owned(),
+            "data: [DONE]".to_owned(),
+        ];
+        let script = Script::new(vec![Ok(two), Ok(text(&["Next"]))]);
+        let run = start(
+            args(work.path(), Mode::Bypass),
+            script.clone(),
+            state.path().into(),
+        );
+        run.send(prompt("go"));
+        run.wait_for(|e| matches!(e.event, Event::ItemStarted { .. }).then_some(()));
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while !work.path().join("made").exists() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        run.send(Command::Interrupt);
+        run.wait_for(completed);
+        run.send(prompt("again"));
+        run.wait_for(completed);
+        run.finish();
+        assert!(work.path().join("made").exists());
+        let sent = script.bodies()[1]["messages"].as_array().unwrap().clone();
+        let answer = |id: &str| -> String {
+            sent.iter()
+                .find(|m| m["role"] == "tool" && m["tool_call_id"] == id)
+                .and_then(|m| m["content"].as_str())
+                .unwrap()
+                .to_owned()
+        };
+        assert!(!answer("a").contains("Not run"), "{}", answer("a"));
+        assert!(
+            answer("a").contains("outcome is unknown"),
+            "{}",
+            answer("a")
+        );
+        assert!(answer("b").contains("Not run"), "{}", answer("b"));
     }
 
     #[test]

@@ -374,7 +374,9 @@ Architectural mandates, standards, and workflows for this codebase.
   most a fixed size. Commands run in their own process group, killed on Stop or timeout, their
   output capped and never waited on past a short grace. Stop ends a request's connection
   (`ChatClient::cancel`). A call from a reply that was cut off or broke off never runs, and every
-  call of an interrupted reply gets an answer. History is sent and kept in whole exchanges.
+  call of an interrupted reply gets an answer: one a Stop ended while it ran keeps what it gave
+  back (a writing one is said to have an unknown outcome), never "not run". History is sent and
+  kept in whole exchanges.
   It is never a delegation parent or child (`RouteBlocker::LocalAgentNoBridge`). Its
   conversation is a `0600` file under `$XDG_STATE_HOME/agent-terminal/local`, which uninstall
   removes with the state folder.

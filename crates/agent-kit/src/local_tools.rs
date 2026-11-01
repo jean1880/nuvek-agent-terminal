@@ -280,7 +280,8 @@ pub fn target(ws: &Workspace, tool: Tool, input: &Value) -> Option<PathBuf> {
 }
 
 /// What a card for a file `tool` call adds to the path it names: where it leads (`target`), when
-/// that is not the path itself, so the card shows what was judged and is what runs.
+/// that is not the path itself, so the card shows what was judged and is what runs; and, for a
+/// write of a file with a second hard link, that only this name gets the new content.
 pub fn card_note(
     ws: &Workspace,
     tool: Tool,
@@ -293,11 +294,21 @@ pub fn card_note(
         Ok(rel) => ws.root.join(rel),
         Err(_) => named,
     };
-    match target {
-        Some(target) if target == named => None,
-        Some(target) => Some(format!("Leads to {}", target.display())),
-        None => Some("Leads through a link that names nothing".to_owned()),
+    let Some(target) = target else {
+        return Some("Leads through a link that names nothing".to_owned());
+    };
+    let mut notes = Vec::new();
+    if target != named {
+        notes.push(format!("Leads to {}", target.display()));
     }
+    if tool.writes() && std::fs::symlink_metadata(target).is_ok_and(|m| hard_linked(&m)) {
+        notes.push(
+            "This file has another hard link: the write replaces this name only, and the other \
+             link keeps the old content"
+                .to_owned(),
+        );
+    }
+    (!notes.is_empty()).then(|| notes.join(". "))
 }
 
 /// Whether a file `tool` call, judged at `target` (what [`target`] gave), reaches past what may
@@ -691,20 +702,78 @@ fn stat_at(dir: &OwnedFd, name: &CString) -> std::io::Result<libc::stat> {
     }
 }
 
-/// A name for a file being written beside its target, unique in this process and short
-/// whatever the target's name.
-fn temp_name() -> CString {
+/// What a file being written beside its target is named: a dot file that says it is the app's,
+/// the start of the target's name (at most [`TEMP_NAME_KEPT`] bytes, so the name stays short),
+/// this process and a counter. A stale one left by a crash reads as what it is.
+const TEMP_MARK: &str = ".agent-terminal-write";
+const TEMP_NAME_KEPT: usize = 64;
+
+fn temp_name(target: &CString) -> CString {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let name = format!(".agent-terminal-{}-{n}.tmp", std::process::id());
+    let bytes = target.as_bytes();
+    let mut kept = bytes[..bytes.len().min(TEMP_NAME_KEPT)].to_vec();
+    kept.retain(|b| *b != b'/');
+    let mut name = format!("{TEMP_MARK}.").into_bytes();
+    name.extend_from_slice(&kept);
+    name.extend_from_slice(format!(".{}-{n}.tmp", std::process::id()).as_bytes());
     CString::new(name).unwrap_or_default()
+}
+
+/// Whether a failed replace of a file is one an in-place write can do instead: its folder may
+/// not be written (`EACCES`, `EPERM`), or it is a mount point of its own (`EBUSY`, `EXDEV`).
+fn replace_refused(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EACCES | libc::EPERM | libc::EBUSY | libc::EXDEV)
+    )
+}
+
+/// Writes `content` over the file `name` in `dir` in place: the old way, for a file that cannot
+/// be replaced. It is opened without following a link or blocking, and written only if it is
+/// still the regular file `was` describes with one link.
+fn write_in_place(
+    dir: &OwnedFd,
+    name: &CString,
+    was: &libc::stat,
+    content: &str,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let fd = open_at(
+        Some(dir),
+        name,
+        libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        0,
+    )?;
+    // SAFETY: `now` is written by fstat only; `fd` is an open file descriptor owned here.
+    let now = unsafe {
+        let mut now: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd.as_raw_fd(), &mut now) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        now
+    };
+    let file = std::fs::File::from(fd);
+    if now.st_mode & libc::S_IFMT != libc::S_IFREG
+        || now.st_dev != was.st_dev
+        || now.st_ino != was.st_ino
+        || now.st_nlink != 1
+    {
+        return Err(std::io::Error::other("it changed since it was checked"));
+    }
+    file.set_len(0)?;
+    (&file).write_all(content.as_bytes())?;
+    file.sync_all()
 }
 
 /// Writes `content` as the file `name` in the open folder `dir`, whole or not at all: it is
 /// written to a new file beside it, which then replaces it (`renameat`), so no reader ever sees
 /// a part and a failed write leaves the old file as it was. What is there must be a regular file
 /// (a link is never followed nor replaced, a pipe is never opened) and, unless `approved`, have
-/// no second hard link. The new file keeps the old one's permissions.
+/// no second hard link (with one, only this name gets the new content). The new file keeps the
+/// old one's permissions and, where it may, its owner and group. A file with one link that
+/// cannot be replaced (its folder read-only to us, or a mount of its own) is written in place
+/// instead, as before. The new file is removed on every failure.
 fn write_at(
     dir: &OwnedFd,
     name: &CString,
@@ -714,7 +783,7 @@ fn write_at(
 ) -> Result<(), String> {
     use std::io::Write;
     let fail = |e: std::io::Error| format!("Cannot write {}: {e}", shown.display());
-    let mode = match stat_at(dir, name) {
+    let existing = match stat_at(dir, name) {
         Ok(st) if st.st_mode & libc::S_IFMT != libc::S_IFREG => {
             return Err(format!(
                 "{} is not a regular file; nothing was written",
@@ -727,44 +796,64 @@ fn write_at(
                 shown.display()
             ))
         }
-        Ok(st) => Some(st.st_mode & 0o777),
+        Ok(st) => Some(st),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(fail(e)),
     };
-    let temp = temp_name();
-    let fd = open_at(
+    // In place only for a file with one link: with two, the card said the other keeps its content.
+    let in_place = |e: std::io::Error| match &existing {
+        Some(st) if st.st_nlink == 1 && replace_refused(&e) => {
+            write_in_place(dir, name, st, content).map_err(fail)
+        }
+        _ => Err(fail(e)),
+    };
+    let temp = temp_name(name);
+    let fd = match open_at(
         Some(dir),
         &temp,
         libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
-        mode.map_or(0o666, |_| 0o600),
-    )
-    .map_err(fail)?;
+        existing.map_or(0o666, |_| 0o600),
+    ) {
+        Ok(fd) => fd,
+        // Nothing was made: a folder we may not write in.
+        Err(e) => return in_place(e),
+    };
     let file = std::fs::File::from(fd);
     let written = (|| {
         (&file).write_all(content.as_bytes())?;
-        if let Some(mode) = mode {
+        if let Some(st) = &existing {
             use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+            // Best effort: only the owner's group may be kept by an ordinary user.
+            // SAFETY: `file` is an open file descriptor owned here.
+            unsafe { libc::fchown(file.as_raw_fd(), st.st_uid, st.st_gid) };
+            file.set_permissions(std::fs::Permissions::from_mode(st.st_mode & 0o777))?;
         }
-        file.sync_all()?;
-        // SAFETY: `dir` is an open folder; `temp` and `name` are valid NUL-terminated strings.
-        if unsafe {
-            libc::renameat(
-                dir.as_raw_fd(),
-                temp.as_ptr(),
-                dir.as_raw_fd(),
-                name.as_ptr(),
-            )
-        } != 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
+        file.sync_all()
     })();
-    if let Err(e) = written {
-        // SAFETY: as above; removes only the file made here.
+    drop(file);
+    let remove_temp = || {
+        // SAFETY: `dir` is an open folder and `temp` a valid NUL-terminated string; removes
+        // only the file made here.
         unsafe { libc::unlinkat(dir.as_raw_fd(), temp.as_ptr(), 0) };
+    };
+    if let Err(e) = written {
+        remove_temp();
         return Err(fail(e));
+    }
+    // SAFETY: `dir` is an open folder; `temp` and `name` are valid NUL-terminated strings.
+    let renamed = unsafe {
+        libc::renameat(
+            dir.as_raw_fd(),
+            temp.as_ptr(),
+            dir.as_raw_fd(),
+            name.as_ptr(),
+        )
+    };
+    if renamed != 0 {
+        let e = std::io::Error::last_os_error();
+        remove_temp();
+        // Only a refused replace may fall back to writing in place.
+        return in_place(e);
     }
     Ok(())
 }
@@ -1925,6 +2014,87 @@ mod tests {
         )
         .unwrap();
         assert!(read.contains("second"), "{read}");
+    }
+
+    #[test]
+    fn a_file_in_a_folder_that_cannot_be_written_is_written_in_place() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = dir();
+        let locked = d.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let file = locked.join("f.txt");
+        std::fs::write(&file, "old").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = run(
+            Tool::WriteFile,
+            &json!({"file_path": "locked/f.txt", "content": "new"}),
+            &ws(d.path()),
+            true,
+            &AtomicBool::new(false),
+        );
+        let names: Vec<_> = std::fs::read_dir(&locked)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        result.unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
+        assert_eq!(names, ["f.txt"], "no temporary file is left");
+    }
+
+    #[test]
+    fn a_temporary_file_says_whose_it_is_and_stays_short() {
+        let short = temp_name(&CString::new("notes.md").unwrap());
+        let short = short.to_str().unwrap();
+        assert!(
+            short.starts_with(".agent-terminal-write.notes.md."),
+            "{short}"
+        );
+        assert!(short.ends_with(".tmp"), "{short}");
+        assert_ne!(
+            short,
+            temp_name(&CString::new("notes.md").unwrap())
+                .to_str()
+                .unwrap()
+        );
+        let long = temp_name(&CString::new("x".repeat(255)).unwrap());
+        assert!(long.as_bytes().len() < 255, "{}", long.as_bytes().len());
+    }
+
+    #[test]
+    fn a_card_for_a_write_of_a_hard_linked_file_says_the_other_link_keeps_its_content() {
+        let d = dir();
+        let other = dir();
+        std::fs::write(d.path().join("f.txt"), "old").unwrap();
+        if std::fs::hard_link(d.path().join("f.txt"), other.path().join("g")).is_err() {
+            return;
+        }
+        let pinned = ws(d.path());
+        let input = json!({"file_path": "f.txt", "content": "new"});
+        let judged = target(&pinned, Tool::WriteFile, &input);
+        let note = card_note(&pinned, Tool::WriteFile, &input, judged.as_deref()).unwrap();
+        assert!(note.contains("other link keeps the old content"), "{note}");
+        assert!(!note.contains("Leads to"), "{note}");
+        // A read of it, or a write of a file with one link, adds nothing.
+        let read = json!({"file_path": "f.txt"});
+        let judged = target(&pinned, Tool::ReadFile, &read);
+        assert_eq!(
+            card_note(&pinned, Tool::ReadFile, &read, judged.as_deref()),
+            None
+        );
+        // Approved, only this name gets the new content, as the card said.
+        run(
+            Tool::WriteFile,
+            &input,
+            &pinned,
+            true,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(other.path().join("g")).unwrap(),
+            "old"
+        );
     }
 
     #[test]

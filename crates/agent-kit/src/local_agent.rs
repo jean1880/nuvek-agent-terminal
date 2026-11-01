@@ -1300,7 +1300,8 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         commands: &Receiver<RunnerInput>,
         usage: &mut Usage,
     ) -> Result<(agent_core::local_agent::Reply, bool, Option<Stop>), StepError> {
-        let mut reader = StreamReader::new();
+        // This turn's MCP aliases, so a server repeating one whole with each fragment is read right.
+        let mut reader = StreamReader::with_known_names(self.registry.keys().cloned());
         let mut shown = Shown::default();
         let mut stopped = None;
         let mut server_error = None;

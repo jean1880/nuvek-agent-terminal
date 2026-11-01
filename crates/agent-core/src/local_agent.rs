@@ -505,6 +505,9 @@ pub struct StreamReader {
     calls: Vec<PartialCall>,
     think: ThinkSplitter,
     done: bool,
+    /// Tool names offered besides the built-ins (this turn's MCP aliases): a fragment that
+    /// repeats one whole is a repeat, not more of the name.
+    known_names: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -517,6 +520,19 @@ struct PartialCall {
 impl StreamReader {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// [`Self::new`], knowing the tool names offered besides the built-ins.
+    pub fn with_known_names<S: Into<String>>(names: impl IntoIterator<Item = S>) -> Self {
+        Self {
+            known_names: names.into_iter().map(Into::into).collect(),
+            ..Self::default()
+        }
+    }
+
+    /// Whether `name` is a whole tool name that was offered: a built-in or a known alias.
+    fn known(&self, name: &str) -> bool {
+        Tool::from_name(name).is_some() || self.known_names.iter().any(|n| n == name)
     }
 
     /// Whether the server said the reply is over (`data: [DONE]`).
@@ -596,14 +612,25 @@ impl StreamReader {
         while self.calls.len() <= index {
             self.calls.push(PartialCall::default());
         }
-        let slot = &mut self.calls[index];
-        if let Some(id) = call["id"].as_str().filter(|s| !s.is_empty()) {
-            slot.id = id.to_owned();
-        }
+        let id = call["id"].as_str().filter(|s| !s.is_empty());
         let function = &call["function"];
-        // Some servers send the whole name again with every fragment: a repeat is not added.
-        if let Some(name) = function["name"].as_str().filter(|n| *n != slot.name) {
-            slot.name.push_str(name);
+        // Some servers send the whole name again with every fragment. A fragment is that repeat
+        // only when the chunk carries the call's whole name: it equals the name so far and that
+        // is a whole offered name, or the chunk names the call's id again. Otherwise it is more
+        // of the name ("ab" then "ab" is "abab").
+        let repeat = |slot: &PartialCall, name: &str| {
+            !slot.name.is_empty()
+                && name == slot.name
+                && (self.known(name) || id.is_some_and(|id| id == slot.id))
+        };
+        if let Some(name) = function["name"].as_str() {
+            if !repeat(&self.calls[index], name) {
+                self.calls[index].name.push_str(name);
+            }
+        }
+        let slot = &mut self.calls[index];
+        if let Some(id) = id {
+            slot.id = id.to_owned();
         }
         match &function["arguments"] {
             Value::String(fragment) => slot.arguments.push_str(fragment),
@@ -1308,6 +1335,32 @@ data: [DONE]"#;
         );
         // A name that is split, not repeated, is still put together.
         assert_eq!(reply.tool_calls[1].function.name, "list_dir");
+    }
+
+    #[test]
+    fn a_fragment_is_a_repeat_only_when_it_carries_a_whole_known_name_or_the_id_again() {
+        let mut reader = StreamReader::with_known_names(["mcp_ab12"]);
+        for line in [
+            // Split in two equal halves: not a known name, so it is put together.
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"ab"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"ab","arguments":"{}"}}]}}]}"#,
+            // A registry alias of this turn, sent again whole.
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"b","function":{"name":"mcp_ab12"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"name":"mcp_ab12","arguments":"{}"}}]}}]}"#,
+            // An unknown name sent again with the call's id: a repeat too.
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":2,"id":"c","function":{"name":"other"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":2,"id":"c","function":{"name":"other","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ] {
+            reader.feed(line);
+        }
+        let (reply, _) = reader.finish();
+        let names: Vec<_> = reply
+            .tool_calls
+            .iter()
+            .map(|c| c.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["abab", "mcp_ab12", "other"]);
     }
 
     #[test]

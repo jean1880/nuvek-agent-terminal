@@ -398,10 +398,13 @@ Architectural mandates, standards, and workflows for this codebase.
   dropped (generated trees such as `.git` and `target` aside). A command's group is killed
   before its shell is reaped (never when someone else reaped it), so the group id is never one
   reused by another process. The runner keeps no approval: the app's own scoped rules answer
-  the cards they cover. A write is whole or nothing: written to a new file beside its target,
-  which then replaces it (`renameat`), keeping its permissions; a link there is never followed
-  nor written through, a pipe never opened, and an unapproved one with a second hard link is
-  refused. An edit is made only to UTF-8 text. Files are opened without blocking and read only
+  the cards they cover. A write is whole or nothing: written to a new file beside its target
+  (named `.agent-terminal-write.<name>.<pid>-<n>.tmp`, removed on every failure), which then
+  replaces it (`renameat`), keeping its permissions and, where it may, its owner and group; a
+  link there is never followed nor written through, a pipe never opened, and an unapproved one
+  with a second hard link is refused (an approved one's card says only that name gets the new
+  content). A file with one link that cannot be replaced (its folder not writable, or a mount of
+  its own) is written in place instead, once checked to be the file judged. An edit is made only to UTF-8 text. Files are opened without blocking and read only
   when regular, at most a fixed size. Commands run in their own process group, killed on Stop
   or timeout, their output capped and never waited on past a short grace. Stop ends a
   request's connection (`ChatClient::cancel`). A call from a reply that was cut off or broke

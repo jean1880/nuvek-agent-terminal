@@ -63,11 +63,14 @@ impl InterruptionShelf {
         let actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
         actions.set_valign(gtk4::Align::Center);
 
-        // Deny and Cancel share one width, so the label switching never moves Allow.
+        // Deny and Stop turn share one width, so the label switching never moves Allow. Stop
+        // turn is the card's name for ending the whole turn: never a bare "Cancel", which
+        // reads as closing the shelf.
         let deny_text = gtk4::Stack::new();
         deny_text.set_hhomogeneous(true);
+        let stop = decision_label(Decision::Cancel);
         deny_text.add_named(&gtk4::Label::new(Some("Deny")), Some("Deny"));
-        deny_text.add_named(&gtk4::Label::new(Some("Cancel")), Some("Cancel"));
+        deny_text.add_named(&gtk4::Label::new(Some(stop)), Some(stop));
         let deny_btn = gtk4::Button::new();
         deny_btn.set_child(Some(&deny_text));
         deny_btn.update_property(&[gtk4::accessible::Property::Label("Deny")]);
@@ -252,7 +255,7 @@ impl InterruptionShelf {
                 let deny = if options.contains(&Decision::Deny) {
                     "Deny"
                 } else {
-                    "Cancel"
+                    decision_label(Decision::Cancel)
                 };
                 if let Some(text) = self.deny_btn.child().and_downcast::<gtk4::Stack>() {
                     text.set_visible_child_name(deny);
@@ -511,7 +514,7 @@ fn approval_preview(tool: &str, input: &serde_json::Value) -> String {
         return if request.renderable {
             request.one_line()
         } else {
-            "Part of this request could not be summarised. Review it before answering.".to_owned()
+            "Part of this request could not be summarized. Review it before answering.".to_owned()
         };
     }
     let called = payload::tool_title(ItemKind::Tool, tool, Some(input), "");
@@ -690,7 +693,7 @@ pub(crate) mod tests {
 
     /// The shelf never grants a permission request unseen, and points at the form it cannot fill.
     #[test]
-    fn a_permission_request_is_summarised_in_one_line() {
+    fn a_permission_request_is_summarized_in_one_line() {
         let input = serde_json::json!({
             "cwd": "/w", "reason": null, "renderable": true,
             "entries": [
@@ -705,7 +708,7 @@ pub(crate) mod tests {
         );
         assert!(
             approval_preview(permission::TOOL, &serde_json::json!({"renderable": false}))
-                .contains("could not be summarised")
+                .contains("could not be summarized")
         );
     }
 

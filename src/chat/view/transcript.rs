@@ -238,14 +238,13 @@ impl TranscriptView {
         empty.add_css_class("transcript-empty");
         empty.set_valign(gtk4::Align::Center);
         empty.set_halign(gtk4::Align::Center);
-        let title = gtk4::Label::new(Some("Start a conversation"));
+        // Not selectable: the box takes no pointer, so a selectable label would only be a tab
+        // stop. `$ skills` is left to the composer's hint, which shows it only for an agent
+        // that has skills.
+        let title = gtk4::Label::new(Some("Start a Conversation"));
         title.add_css_class("empty-title");
-        title.set_selectable(true);
-        let hint = gtk4::Label::new(Some(
-            "Type a message below. / for commands, @ for files, $ for skills.",
-        ));
+        let hint = gtk4::Label::new(Some("Type a message below. / for commands, @ for files."));
         hint.add_css_class("empty-hint");
-        hint.set_selectable(true);
         let empty_dots = crate::brand::dots();
         empty_dots.set_halign(gtk4::Align::Center);
         empty.append(&empty_dots);

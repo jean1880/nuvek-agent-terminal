@@ -42,7 +42,7 @@ pub(super) fn row(options: &[String], sink: &RowSink) -> gtk4::Box {
             (|| RowEvent::DismissQuickReplies) as fn() -> RowEvent,
         ),
         (
-            "Don\u{2019}t suggest these",
+            "Don\u{2019}t Suggest These",
             "Stop offering quick replies under replies that end with a question",
             || RowEvent::StopQuickReplies,
         ),

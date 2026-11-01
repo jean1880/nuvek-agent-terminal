@@ -1608,11 +1608,9 @@ impl ComposerHost for Inner {
     fn placeholder(&self) -> String {
         // The question or form is above the composer, and typing is not the way to answer it.
         let waiting = match self.model.borrow().pending_interruption() {
-            Some(model::PendingInterruption::Approval { .. }) => Some("Awaiting approval above..."),
+            Some(model::PendingInterruption::Approval { .. }) => Some("Awaiting approval above…"),
             Some(model::PendingInterruption::Question { .. })
-            | Some(model::PendingInterruption::Form { .. }) => {
-                Some("Awaiting your answer above...")
-            }
+            | Some(model::PendingInterruption::Form { .. }) => Some("Awaiting your answer above…"),
             None => None,
         };
         if let Some(waiting) = waiting {

@@ -293,8 +293,11 @@ impl UsageIndicator {
         self.root
             .set_visible(compact_visible(shown, self.filter.get()));
         let label = match self.filter.get() {
-            Some(driver) => format!("Usage for {}; show all agents", driver.info().label),
-            None => "Agent usage; show all agents".to_owned(),
+            Some(driver) => format!(
+                "Plan usage for {}; opens every agent's usage",
+                driver.info().label
+            ),
+            None => "Plan usage; opens every agent's usage".to_owned(),
         };
         self.root
             .update_property(&[gtk4::accessible::Property::Label(&label)]);
@@ -417,7 +420,7 @@ fn compact_form(driver: Driver, snap: &Snapshot, now: i64) -> gtk4::Box {
     }
     b.append(&brand_image(driver));
     if snap.signed_out {
-        b.append(&label("signed out", &["usage-text", "usage-crit"]));
+        b.append(&label("not signed in", &["usage-text", "usage-crit"]));
         b.set_tooltip_text(Some(&format!(
             "{} is not signed in. {}",
             driver.info().label,

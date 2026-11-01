@@ -2196,7 +2196,7 @@ impl ApprovalCard {
         // The Raw section caps what it shows (Show full, Copy takes all of it).
         self.raw_section.set_text(&raw);
         self.raw.set_visible(!raw.is_empty());
-        // What cannot be summarised is shown as sent, open: the user can only refuse it, and
+        // What cannot be summarized is shown as sent, open: the user can only refuse it, and
         // refuses (or stops) knowing what it said.
         if pending
             && permission.as_ref().is_some_and(|p| !p.renderable)
@@ -2364,7 +2364,8 @@ impl ApprovalCard {
             ),
             ApprovalState::Expired => (
                 "expired",
-                "Expired: the agent that asked has exited".to_owned(),
+                "Expired: the agent that asked has exited; ask it again if you still need this"
+                    .to_owned(),
                 false,
                 false,
             ),
@@ -2401,7 +2402,7 @@ impl ApprovalCard {
         let warning = if request.renderable {
             request.warnings().join("\n")
         } else {
-            "Some of this request could not be summarised, so it can only be denied. It is \
+            "Some of this request could not be summarized, so it can only be denied. It is \
              shown below exactly as Codex sent it."
                 .to_owned()
         };
@@ -2628,7 +2629,10 @@ impl QuestionCardWidget {
             QuestionState::Sent => ("Sending…", false),
             QuestionState::Answered => ("Answered", false),
             QuestionState::Withdrawn => ("Withdrawn by the agent", false),
-            QuestionState::Expired => ("Expired: the agent that asked has exited", false),
+            QuestionState::Expired => (
+                "Expired: the agent that asked has exited; ask it again if you still need this",
+                false,
+            ),
         };
         self.status.set_text(text);
         self.submit.set_visible(open);

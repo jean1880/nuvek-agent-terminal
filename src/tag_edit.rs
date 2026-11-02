@@ -71,12 +71,44 @@ pub fn set(
         let current = user_tags::find(doc, target.id, target.scope())
             .or(seed)
             .unwrap_or_default();
-        let entry = current.with(edit);
         let mut vocabulary = tags.vocabulary.clone();
         vocabulary.extend(user_tags::defined_vocabulary(doc));
+        // Tags inherited from a lower layer are carried through as they are, even when the
+        // vocabulary does not name them: an edit of the tier must not fail on a tag the user did
+        // not touch. Tags the edit names are checked.
+        if edit.tags.is_none() {
+            vocabulary.extend(current.tags.iter().map(|t| (t.clone(), String::new())));
+        }
+        let entry = current.with(edit);
         user_tags::check_entry(&entry, &vocabulary)?;
         user_tags::upsert(doc, target.id, target.scope(), &entry)?;
         Ok(entry)
+    })
+}
+
+/// Moves the user's entry of `from` to `to` (another profile scope of the same model) in one
+/// write under the file's lock: nothing is changed unless both halves succeed. Whether there was
+/// an entry to move.
+pub fn rescope(
+    path: &Path,
+    tags: &ModelTags,
+    from: Target<'_>,
+    to: Target<'_>,
+) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    agent_kit::user_tags_file::update(path, |doc| {
+        let Some(entry) = user_tags::find(doc, from.id, from.scope()) else {
+            return Ok(false);
+        };
+        let mut vocabulary = tags.vocabulary.clone();
+        vocabulary.extend(user_tags::defined_vocabulary(doc));
+        vocabulary.extend(entry.tags.iter().map(|t| (t.clone(), String::new())));
+        user_tags::check_entry(&entry, &vocabulary)?;
+        user_tags::upsert(doc, to.id, to.scope(), &entry)?;
+        user_tags::remove(doc, from.id, from.scope());
+        Ok(true)
     })
 }
 
@@ -153,6 +185,68 @@ mod tests {
             effective(&after, haiku).expect("back").source,
             TagSource::BuiltIn
         );
+    }
+
+    /// A tag inherited from a lower layer that the vocabulary does not name is carried through a
+    /// tier edit; naming it in an edit is checked.
+    #[test]
+    fn a_tier_edit_never_fails_on_an_inherited_unknown_tag() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("t.json");
+        let shared = parse(
+            r#"{"version": 1, "models": [{"match": "m", "driver": "local", "tier": "deep",
+                "tags": ["code", "from-elsewhere"]}]}"#,
+        )
+        .expect("v1")
+        .tagged(TagSource::File)
+        .over(tags());
+        let tier = Edit {
+            tier: Some("fast".into()),
+            ..Edit::default()
+        };
+        let written = set(&path, &shared, local("m", None), &tier).expect("tier only");
+        assert_eq!(written.tags, ["code", "from-elsewhere"]);
+        let named = Edit {
+            tags: Some(vec!["from-elsewhere".into()]),
+            ..Edit::default()
+        };
+        assert!(set(&path, &shared, local("m", None), &named).is_err());
+    }
+
+    #[test]
+    fn a_rescope_is_one_write_that_moves_the_entry_or_changes_nothing() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("t.json");
+        assert_eq!(
+            rescope(&path, &tags(), local("m", Some("p-a")), local("m", None)),
+            Ok(false)
+        );
+        let edit = Edit {
+            tier: Some("fast".into()),
+            tags: Some(vec!["code".into()]),
+            ..Edit::default()
+        };
+        set(&path, &tags(), local("m", Some("p-a")), &edit).expect("scoped");
+        assert_eq!(
+            rescope(&path, &tags(), local("m", Some("p-a")), local("m", None)),
+            Ok(true)
+        );
+        let doc = agent_kit::user_tags_file::load(&path).expect("load");
+        assert!(user_tags::find(&doc, "m", Some(Driver::Local)).is_some());
+        assert!(user_tags::find(
+            &doc,
+            "m",
+            Scope {
+                driver: Some(Driver::Local),
+                profile: Some("p-a")
+            }
+        )
+        .is_none());
+        // A refused move (a bad profile id) leaves the entry where it was.
+        let long = "p".repeat(65);
+        assert!(rescope(&path, &tags(), local("m", None), local("m", Some(&long))).is_err());
+        let doc = agent_kit::user_tags_file::load(&path).expect("load");
+        assert!(user_tags::find(&doc, "m", Some(Driver::Local)).is_some());
     }
 
     #[test]

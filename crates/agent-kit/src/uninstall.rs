@@ -727,7 +727,9 @@ pub fn apply(plan: &Plan, uid: u32, home: &Path) -> Report {
             }
             Item::UserTags { file } => {
                 let result = if crate::user_tags_file::is_ours(file) {
+                    // Its lock file goes with it.
                     remove_file(file)
+                        .and_then(|()| remove_file(&crate::user_tags_file::lock_path(file)))
                 } else {
                     Err("not made by Agent Terminal; left alone".into())
                 };
@@ -938,7 +940,7 @@ mod tests {
         let moved = home.join("elsewhere/tags.json");
         let hand = home.join("elsewhere/hand.json");
         for file in [&inside, &moved] {
-            crate::user_tags_file::save(file, &agent_core::user_tags::new_document()).unwrap();
+            crate::user_tags_file::update(file, |_| Ok(())).unwrap();
         }
         fs::write(&hand, r#"{"version": 1, "models": []}"#).unwrap();
         let mut i = inputs(home);
@@ -960,6 +962,10 @@ mod tests {
         let report = apply(&plan, uid(), home);
         assert!(report.failed.is_empty(), "{:?}", report.failed);
         assert!(!moved.exists() && !inside.exists());
+        assert!(
+            !crate::user_tags_file::lock_path(&moved).exists(),
+            "its lock file goes with it"
+        );
         assert!(hand.exists(), "a file the app did not write stays");
     }
 

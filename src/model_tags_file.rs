@@ -10,15 +10,13 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use agent_core::delegation::error::truncate_bytes;
 use agent_core::delegation::wire::MAX_TAGS_STATUS_BYTES;
 use agent_core::model_tags::{built_in, parse, ModelTags, TagSource};
+use agent_kit::fsutil::{self, FileStamp as Stamp, ReadError};
+use agent_kit::user_tags_file::{read_problem, MAX_FILE_BYTES};
 use gtk4::gio;
-
-/// A larger file is refused unread.
-pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
 /// What the capabilities call gets: the tags, or why there are none.
 #[derive(Debug, Clone, Default)]
@@ -27,13 +25,6 @@ pub struct TagsState {
     /// Why a tag file is not in `tags` (the layers below it apply alone); `None` when each one
     /// is, or there is none.
     pub status: Option<String>,
-}
-
-/// What identifies one version of a file on disk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Stamp {
-    modified: Option<SystemTime>,
-    len: u64,
 }
 
 /// One tag file as read: its tags (none when it is missing or refused) and why it was refused.
@@ -63,32 +54,15 @@ pub enum Reading {
 /// Blocking: stats `path` and, unless its stamp is `known`, reads and parses it. `what` names the
 /// file in a refusal ("model tag file", "user tag file").
 pub fn read(path: &Path, known: Option<Stamp>, what: &str) -> Reading {
-    let meta = match std::fs::metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Reading::Loaded(None, Layer::default());
-        }
-        Err(e) => {
-            return Reading::Loaded(
-                None,
-                Layer::refused(what, &format!("unreadable: {}", e.kind())),
-            )
-        }
-    };
-    let stamp = Stamp {
-        modified: meta.modified().ok(),
-        len: meta.len(),
+    let (file, stamp) = match fsutil::open_regular(path) {
+        Ok(opened) => opened,
+        Err(ReadError::NotFound) => return Reading::Loaded(None, Layer::default()),
+        Err(e) => return Reading::Loaded(None, Layer::refused(what, &read_problem(e))),
     };
     if known == Some(stamp) {
         return Reading::Unchanged;
     }
-    if !meta.is_file() {
-        return Reading::Loaded(Some(stamp), Layer::refused(what, "is not a regular file"));
-    }
-    if meta.len() > MAX_FILE_BYTES {
-        return Reading::Loaded(Some(stamp), Layer::refused(what, "is too large"));
-    }
-    let layer = match std::fs::read_to_string(path) {
+    let layer = match fsutil::read_limited(file, MAX_FILE_BYTES) {
         Ok(text) => match parse(&text) {
             Ok(tags) => Layer {
                 tags: Some(tags),
@@ -96,7 +70,7 @@ pub fn read(path: &Path, known: Option<Stamp>, what: &str) -> Reading {
             },
             Err(why) => Layer::refused(what, &format!("refused: {why}")),
         },
-        Err(e) => Layer::refused(what, &format!("unreadable: {}", e.kind())),
+        Err(e) => Layer::refused(what, &read_problem(e)),
     };
     Reading::Loaded(Some(stamp), layer)
 }

@@ -7,34 +7,28 @@
 //! with [`MARKER`], which is how the uninstall knows the file is the app's when the user moved it
 //! outside the app's folder.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use agent_core::user_tags::{check_document, new_document};
 use serde_json::Value;
+
+use crate::fsutil::ReadError;
 
 /// The key and value the app puts in every file it writes.
 pub const MARKER_KEY: &str = "generator";
 pub const MARKER: &str = "agent-terminal";
 
-/// A larger file is refused unread.
+/// A larger file is refused, here and in the app's cache: the one bound for a tag file.
 pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
 /// The file as a JSON document: an empty v1 one when there is no file; `Err` says why a file
 /// that is there cannot be edited.
 pub fn load(path: &Path) -> Result<Value, String> {
-    let meta = match std::fs::metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(new_document()),
-        Err(e) => return Err(format!("{} is unreadable: {}", path.display(), e.kind())),
+    let text = match crate::fsutil::read_bounded(path, MAX_FILE_BYTES) {
+        Ok((_, text)) => text,
+        Err(ReadError::NotFound) => return Ok(new_document()),
+        Err(e) => return Err(format!("{} {}", path.display(), read_problem(e))),
     };
-    if !meta.is_file() {
-        return Err(format!("{} is not a regular file", path.display()));
-    }
-    if meta.len() > MAX_FILE_BYTES {
-        return Err(format!("{} is too large", path.display()));
-    }
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("{} is unreadable: {}", path.display(), e.kind()))?;
     let doc: Value = serde_json::from_str(&text)
         .map_err(|e| format!("{} is not valid JSON: {e}", path.display()))?;
     check_document(&doc).map_err(|why| format!("{}: {why}", path.display()))?;
@@ -54,11 +48,33 @@ pub fn save(path: &Path, doc: &Value) -> Result<(), String> {
         .map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
-/// Loads the file, applies `edit`, and writes the result only when `edit` succeeds.
+/// Why a file could not be read, to follow its path in a message.
+pub fn read_problem(e: ReadError) -> String {
+    match e {
+        ReadError::NotFound => "is not there".to_owned(),
+        ReadError::NotRegular => "is not a regular file".to_owned(),
+        ReadError::TooLarge => "is too large".to_owned(),
+        ReadError::Io(kind) => format!("is unreadable: {kind}"),
+    }
+}
+
+/// The lock file beside `path`: an `update` holds it, so two writers (the app and the command, or
+/// two quick edits) never lose each other's change.
+pub fn lock_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    path.with_file_name(name)
+}
+
+/// Loads the file, applies `edit`, and writes the result only when `edit` succeeds, all under
+/// the file's lock.
 pub fn update<T>(
     path: &Path,
     edit: impl FnOnce(&mut Value) -> Result<T, String>,
 ) -> Result<T, String> {
+    let lock = lock_path(path);
+    let _guard = crate::fsutil::FileLock::take(&lock)
+        .map_err(|e| format!("cannot lock {}: {e}", lock.display()))?;
     let mut doc = load(path)?;
     let out = edit(&mut doc)?;
     save(path, &doc)?;
@@ -102,7 +118,13 @@ mod tests {
             .expect("dir")
             .map(|e| e.expect("entry").file_name())
             .collect();
-        assert_eq!(names, ["model-tags.user.json"], "no temp file left");
+        let mut names = names;
+        names.sort();
+        assert_eq!(
+            names,
+            ["model-tags.user.json", "model-tags.user.json.lock"],
+            "the file and its lock, no temp file left"
+        );
         assert!(is_ours(&path));
         let doc = load(&path).expect("read back");
         assert_eq!(doc[MARKER_KEY], MARKER);

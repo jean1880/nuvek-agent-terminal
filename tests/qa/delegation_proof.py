@@ -804,7 +804,7 @@ def agy_proof(base, output, app, auth_file=None):
 LOCAL_KEYS = {"at", "event", "scenario", "bridge", "child", "mcp_servers", "tools", "cap_present",
               "cap_is_frame_token", "peer_is_runner", "hello_pid_is_runner", "tool", "key",
               "same_arguments", "within_window", "before_session_started", "echo", "decision",
-              "written", "exit_code", "session_started", "count", "clean"}
+              "written", "exit_code", "session_started", "count", "clean", "refused"}
 
 
 def local_token():
@@ -1001,9 +1001,17 @@ def local_proof(base, output, app):
                 started = process.wait(lambda f: f.get("event", {}).get("type") == "item_started"
                                        and f["event"].get("kind") == "command", timeout=30)
                 assert started, "the root's command never started"
-                for name in ("environ", "cmdline"):
-                    clean = canary.encode() not in Path(f"/proc/{process.process.pid}/{name}").read_bytes()
-                    note(event="proc_scan", scenario="root", tool=name, clean=clean)
+                for name in ("environ", "cmdline", "mem"):
+                    # The runner is not dumpable: another process of this user is refused its
+                    # environ and mem outright, which is as clean as it gets.
+                    try:
+                        with open(f"/proc/{process.process.pid}/{name}", "rb") as stream:
+                            clean, refused = canary.encode() not in stream.read(1 << 20), False
+                    except PermissionError:
+                        clean, refused = True, True
+                    except OSError:
+                        clean, refused = False, False  # anything but a refusal proves nothing
+                    note(event="proc_scan", scenario="root", tool=name, clean=clean, refused=refused)
                     results["G-L1"] &= clean
                 assert turn(process), "the root's turn never ended"
             finally:

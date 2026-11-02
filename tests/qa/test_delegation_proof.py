@@ -80,7 +80,10 @@ class DelegationProofTests(unittest.TestCase):
             self.assertTrue(found, (event, match))
             return found[0]
         # G-L1: never in the runner's environment or argv, nor any file or line.
-        self.assertTrue(all(f["clean"] for f in frames if f.get("event")=="proc_scan"))
+        scans = {f["tool"]: f for f in frames if f.get("event")=="proc_scan"}
+        self.assertTrue(all(f["clean"] for f in scans.values()))
+        # Not dumpable: its environment and memory are refused to other processes outright.
+        self.assertTrue(scans["environ"]["refused"] and scans["mem"]["refused"])
         self.assertEqual(one("leaks")["count"], 0)
         # G-L2: its own process, with its frame's capability.
         hello = one("hello")

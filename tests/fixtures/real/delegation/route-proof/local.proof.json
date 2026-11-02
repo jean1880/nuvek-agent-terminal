@@ -3,7 +3,7 @@
   "fixture_version": 1,
   "frames": [
     {
-      "at": 0.001866,
+      "at": 0.001035,
       "bridge": true,
       "child": null,
       "event": "configure",
@@ -11,21 +11,31 @@
       "scenario": "root"
     },
     {
-      "at": 0.051317,
+      "at": 0.04585,
       "clean": true,
       "event": "proc_scan",
+      "refused": true,
       "scenario": "root",
       "tool": "environ"
     },
     {
-      "at": 0.051812,
+      "at": 0.046406,
       "clean": true,
       "event": "proc_scan",
+      "refused": false,
       "scenario": "root",
       "tool": "cmdline"
     },
     {
-      "at": 1.161571,
+      "at": 0.04642,
+      "clean": true,
+      "event": "proc_scan",
+      "refused": true,
+      "scenario": "root",
+      "tool": "mem"
+    },
+    {
+      "at": 1.157216,
       "event": "offered",
       "scenario": "root",
       "tools": [
@@ -46,7 +56,7 @@
       ]
     },
     {
-      "at": 1.161592,
+      "at": 1.157256,
       "event": "offered",
       "scenario": "root",
       "tools": [
@@ -67,7 +77,7 @@
       ]
     },
     {
-      "at": 1.161601,
+      "at": 1.157267,
       "event": "offered",
       "scenario": "root",
       "tools": [
@@ -88,7 +98,7 @@
       ]
     },
     {
-      "at": 1.161607,
+      "at": 1.157274,
       "cap_is_frame_token": true,
       "cap_present": true,
       "event": "hello",
@@ -97,14 +107,14 @@
       "scenario": "root"
     },
     {
-      "at": 1.161619,
+      "at": 1.157288,
       "event": "item",
       "key": "proof-key-1",
       "scenario": "root",
       "tool": "cross_agent_list"
     },
     {
-      "at": 1.161624,
+      "at": 1.157294,
       "event": "call",
       "key": "proof-key-1",
       "same_arguments": true,
@@ -113,7 +123,7 @@
       "within_window": true
     },
     {
-      "at": 1.161948,
+      "at": 1.15772,
       "bridge": true,
       "child": {
         "task_mode": "accept_edits"
@@ -123,7 +133,7 @@
       "scenario": "child-accept-edits"
     },
     {
-      "at": 1.177875,
+      "at": 1.169697,
       "before_session_started": true,
       "echo": {
         "bridge": "ready",
@@ -144,25 +154,25 @@
       "scenario": "child-accept-edits"
     },
     {
-      "at": 1.183747,
+      "at": 1.175816,
       "event": "approval",
       "scenario": "child-accept-edits",
       "tool": "write_file"
     },
     {
-      "at": 1.183794,
+      "at": 1.17586,
       "decision": "deny",
       "event": "decision",
       "scenario": "child-accept-edits"
     },
     {
-      "at": 1.188797,
+      "at": 1.180922,
       "event": "file",
       "scenario": "child-accept-edits",
       "written": false
     },
     {
-      "at": 1.189068,
+      "at": 1.181235,
       "bridge": true,
       "child": {
         "task_mode": "plan"
@@ -172,7 +182,7 @@
       "scenario": "child-plan"
     },
     {
-      "at": 1.207675,
+      "at": 1.195162,
       "event": "offered",
       "scenario": "child-plan",
       "tools": [
@@ -190,7 +200,7 @@
       ]
     },
     {
-      "at": 1.207942,
+      "at": 1.195457,
       "bridge": true,
       "child": {
         "task_mode": "plan"
@@ -200,14 +210,14 @@
       "scenario": "child-mcp"
     },
     {
-      "at": 1.223264,
+      "at": 1.210763,
       "event": "refused_startup",
       "exit_code": 1,
       "scenario": "child-mcp",
       "session_started": false
     },
     {
-      "at": 1.800946,
+      "at": 1.793548,
       "count": 0,
       "event": "leaks"
     }

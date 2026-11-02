@@ -34,7 +34,8 @@ impl OperationKind {
             ToolRequest::Read(_)
             | ToolRequest::Capabilities(_)
             | ToolRequest::Wait(_)
-            | ToolRequest::List(_) => None,
+            | ToolRequest::List(_)
+            | ToolRequest::ShowImage(_) => None,
         }
     }
 }

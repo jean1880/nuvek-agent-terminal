@@ -319,8 +319,9 @@ fn rmcp_lifecycle_and_degraded_tool_errors_are_structured() {
         assert_eq!(initialised["result"]["serverInfo"]["name"], "agent-terminal");
         writer.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n").await.expect("list");
         let listed = read_json(&mut reader).await;
-        assert_eq!(listed["result"]["tools"].as_array().expect("tools").len(), 1);
+        assert_eq!(listed["result"]["tools"].as_array().expect("tools").len(), 2);
         assert_eq!(listed["result"]["tools"][0]["name"], "cross_agent_capabilities");
+        assert_eq!(listed["result"]["tools"][1]["name"], "show_image");
         writer.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"cross_agent_capabilities\",\"arguments\":{}}}\n").await.expect("call");
         let failed = read_json(&mut reader).await;
         assert_eq!(failed["result"]["isError"], true);

@@ -249,6 +249,22 @@ Architectural mandates, standards, and workflows for this codebase.
   approve it. With nothing declared the task mode decides, and the user's shell and edit rules
   reach a writing child within it (`rule_may_apply`); a plan child has no network unless declared.
   `authority::tests::a_declared_limit_is_refused_and_no_rule_reaches_past_it` proves these.
+- **`show_image` shows the user an image file, and reads only what a read may without
+  asking**: the bridge's ninth tool (`ToolName::ShowImage`, 1 to 5 paths, a caption each) needs
+  no delegation (it is in `DEGRADED_TOOLS`) and is a read for `ChildAuthority::judge`, so a plan
+  child, or one declared nothing, may call it. Each path is resolved once against the caller's
+  working folder and judged as the Local agent's reads are (`local_tools::read_unasked`): a path
+  that leads outside the folder, or to a sensitive or hard-linked file, would ask, and since a
+  bridge call has no way to ask the user it is refused with that reason, never read. The rest is
+  opened from the pinned folder without following a link and without blocking, read only when
+  regular (a pipe or a device is refused), at most 20 MB, then decoded under the attachment
+  bounds and stored off the main thread (`delegation/show_image.rs`). The images go on the
+  call's own tool item as `Event::Attachments` with `Origin::AgentShown` (shown below its card;
+  the caption, redacted, as the image's name): the item the call's invocation key names, else the
+  thread's newest open `show_image` call (`correlation::show_image_item`), counted toward the
+  turn's cap. The model is told one line per image (`Shown to the user: chart.png (1280×720)`, or
+  why not), never the bytes. The agy registration adds its allow rule, but delegation never
+  requires it (`agy_guard::IMAGE_ALLOW_RULE`), so an earlier registration still delegates.
 - **A folder grant is session-only and never wider than its card**: "Allow for session" on an
   edit keeps the file's folder (`always_allow::session_folder`): inside the workspace, or at
   least two levels inside home outside it; never `/`, home or above, and nothing when home is

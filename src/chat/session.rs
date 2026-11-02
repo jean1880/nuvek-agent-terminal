@@ -268,6 +268,9 @@ fn consume_for_step(approval: &ApprovalHandle, exact: Option<&str>, tools: &[&st
 /// Room assumed for the user's next prompt when budgeting a handoff, in budget units.
 const HANDOFF_PROMPT_ALLOWANCE: usize = 2_048;
 
+/// The most open `show_image` calls a session remembers (an agent may run a few at once).
+const SHOW_IMAGE_CALLS_KEPT: usize = 16;
+
 struct State {
     model: Option<String>,
     /// Reasoning effort of the running session (Claude `--effort`); `None` is the agent's own.
@@ -437,6 +440,9 @@ struct Inner {
     pre_init_prompts: RefCell<Vec<Sent>>,
     /// Tool images shown in the running turn ([`agent_core::attachment::MAX_PER_TURN`]).
     turn_images: Cell<usize>,
+    /// The open calls to our own `show_image`, by item id, oldest first: where the images such
+    /// a call shows go ([`ChatSession::show_agent_images`]).
+    show_image_calls: RefCell<std::collections::VecDeque<String>>,
     /// Open Codex permission requests, by request id: what the answer may be (see
     /// [`Inner::gate_codex_permissions`]). Never a rule.
     codex_permissions: RefCell<HashMap<String, PermissionCard>>,
@@ -811,6 +817,33 @@ impl From<Rc<Store>> for SessionStore {
 }
 
 impl ChatSession {
+    /// Shows images an agent's `show_image` call read (already stored) on that call's own tool
+    /// item, persisted as [`Event::Attachments`]: the item `exact` names (from the call's
+    /// invocation key) when it is an open `show_image` call, else the newest open one
+    /// ([`agent_core::delegation::correlation::show_image_item`]). They count toward the turn's
+    /// [`agent_core::attachment::MAX_PER_TURN`]; returns how many (the first ones) were shown, or
+    /// why none could be when there is no call to show them on.
+    pub fn show_agent_images(
+        &self,
+        exact: Option<String>,
+        refs: Vec<agent_core::attachment::AttachmentRef>,
+    ) -> Result<usize, String> {
+        use agent_core::attachment::{MAX_PER_ITEM, MAX_PER_TURN};
+        let inner = &self.inner;
+        let open: Vec<String> = inner.show_image_calls.borrow().iter().cloned().collect();
+        let item = agent_core::delegation::correlation::show_image_item(exact, &open)
+            .ok_or_else(|| "the tool call to show it on was not found".to_owned())?;
+        let used = inner.turn_images.get();
+        let room = MAX_PER_TURN.saturating_sub(used).min(MAX_PER_ITEM);
+        let shown: Vec<_> = refs.into_iter().take(room).collect();
+        let n = shown.len();
+        if n > 0 {
+            inner.turn_images.set(used + n);
+            inner.emit(Envelope::new(Event::Attachments { refs: shown }).item(item));
+        }
+        Ok(n)
+    }
+
     /// Starts the agent process and returns the live session.
     ///
     /// - `open` describes the process; its `approval_hook` field is overwritten from `approval`
@@ -998,6 +1031,7 @@ impl ChatSession {
             thinking: ThinkingFlag::default(),
             pre_init_prompts: RefCell::new(Vec::new()),
             turn_images: Cell::new(0),
+            show_image_calls: RefCell::new(std::collections::VecDeque::new()),
             codex_permissions: RefCell::new(HashMap::new()),
             codex_grants: RefCell::new(Vec::new()),
             held_permissions: RefCell::new(HashSet::new()),
@@ -1437,6 +1471,7 @@ impl Inner {
         if matches!(env.event, Event::TurnStarted { .. }) {
             self.turn_images.set(0);
         }
+        self.track_show_image_calls(&env);
         let delivery = ScopedFlag::set(&self.delivering);
         // A prompted turn ran on this native session: there is a conversation to resume.
         if self.prompted.get() && matches!(env.event, Event::TurnCompleted { .. }) {
@@ -6545,6 +6580,39 @@ fn handoff_turn_end(
 /// The stored `HandoffSeeded` for `handoff`: spent only by its acknowledgement
 /// ([`handoff_spent`]).
 impl Inner {
+    /// Keeps [`Inner::show_image_calls`]: a `show_image` call's item while it is open (at most
+    /// [`SHOW_IMAGE_CALLS_KEPT`], newest kept), none past its turn.
+    fn track_show_image_calls(&self, env: &Envelope) {
+        match (&env.event, env.item.as_ref()) {
+            (
+                Event::ItemStarted {
+                    kind, title, input, ..
+                },
+                Some(id),
+            ) if agent_core::delegation::correlation::is_show_image_item(
+                *kind,
+                title,
+                input.as_ref(),
+            ) =>
+            {
+                let mut open = self.show_image_calls.borrow_mut();
+                if !open.contains(id) {
+                    if open.len() >= SHOW_IMAGE_CALLS_KEPT {
+                        open.pop_front();
+                    }
+                    open.push_back(id.clone());
+                }
+            }
+            (Event::ItemCompleted { .. }, Some(id)) => {
+                self.show_image_calls.borrow_mut().retain(|o| o != id);
+            }
+            (Event::TurnCompleted { .. } | Event::SessionExited { .. }, _) => {
+                self.show_image_calls.borrow_mut().clear();
+            }
+            _ => {}
+        }
+    }
+
     /// An image a tool handed the agent ([`Event::ToolImage`]): stored off the main thread (a
     /// bounded decode, re-encoded, never its raw bytes), then shown on its item as
     /// [`Event::Attachments`], the form that is persisted. Past
@@ -12002,6 +12070,109 @@ mod tests {
             ));
             let all = serde_json::to_string(&*seen.borrow()).expect("json");
             assert!(!all.contains(secret), "a secret reached the sink: {all}");
+        });
+    }
+
+    /// `show_image`'s images go on the call's own tool item, as the agent's: the item its key
+    /// names when that is an open `show_image` call, else the newest open one (agy's id may carry
+    /// another prefix); a completed call or an ended turn takes none, and the turn's cap holds.
+    #[test]
+    fn show_image_attaches_to_its_own_tool_item() {
+        use agent_core::attachment::{AttachmentRef, Origin, MAX_PER_TURN};
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (session, seen) = recording(
+                ctx,
+                tmp.path(),
+                Box::new(agent_core::claude::ClaudeAdapter::new()),
+            );
+            let started = |id: &str, title: &str| {
+                Envelope::new(Event::ItemStarted {
+                    kind: ItemKind::McpTool,
+                    title: title.into(),
+                    input: Some(serde_json::json!({"images": [{"path": "a.png"}]})),
+                    parent: None,
+                })
+                .item(id)
+            };
+            let image = |n: u8| AttachmentRef {
+                id: format!("{n:064x}"),
+                kind: Default::default(),
+                mime: "image/png".into(),
+                width: 4,
+                height: 2,
+                bytes: 10,
+                name: Some("a.png".into()),
+                origin: Origin::AgentShown,
+            };
+            let on = |id: &str| -> Vec<String> {
+                seen.borrow()
+                    .iter()
+                    .filter(|e| e.item.as_deref() == Some(id))
+                    .filter_map(|e| match &e.event {
+                        Event::Attachments { refs } => Some(refs.clone()),
+                        _ => None,
+                    })
+                    .flatten()
+                    .inspect(|r| assert_eq!(r.origin, Origin::AgentShown))
+                    .map(|r| r.id)
+                    .collect()
+            };
+            // Nothing open yet: nowhere to show it.
+            assert!(session.show_agent_images(None, vec![image(9)]).is_err());
+            session
+                .inner
+                .emit(started("toolu_a", "mcp__agent_terminal__show_image"));
+            session
+                .inner
+                .emit(started("toolu_b", "mcp__agent_terminal__show_image"));
+            session
+                .inner
+                .emit(started("toolu_c", "mcp__agent_terminal__cross_agent_list"));
+
+            assert_eq!(
+                session.show_agent_images(Some("toolu_a".into()), vec![image(1)]),
+                Ok(1)
+            );
+            assert_eq!(on("toolu_a"), vec![image(1).id]);
+            // A key naming no open call: the newest open call.
+            assert_eq!(
+                session.show_agent_images(Some("00000000:step-7".into()), vec![image(2)]),
+                Ok(1)
+            );
+            assert_eq!(on("toolu_b"), vec![image(2).id]);
+            assert!(on("toolu_c").is_empty());
+
+            session.inner.emit(
+                Envelope::new(Event::ItemCompleted {
+                    status: ItemStatus::Completed,
+                    output: None,
+                    error: None,
+                })
+                .item("toolu_b"),
+            );
+            assert_eq!(session.show_agent_images(None, vec![image(3)]), Ok(1));
+            assert_eq!(on("toolu_a"), vec![image(1).id, image(3).id]);
+
+            // Past the turn's cap, only what fits is shown.
+            session.inner.turn_images.set(MAX_PER_TURN - 1);
+            assert_eq!(
+                session.show_agent_images(Some("toolu_a".into()), vec![image(4), image(5)]),
+                Ok(1)
+            );
+            assert_eq!(
+                session.show_agent_images(Some("toolu_a".into()), vec![image(6)]),
+                Ok(0)
+            );
+
+            // An ended turn leaves no call open.
+            session.inner.emit(Envelope::new(Event::TurnCompleted {
+                state: TurnState::Completed,
+                usage: None,
+                cost_usd: None,
+                error: None,
+            }));
+            assert!(session.show_agent_images(None, vec![image(7)]).is_err());
         });
     }
 

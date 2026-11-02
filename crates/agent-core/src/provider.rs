@@ -77,6 +77,23 @@ impl ProviderKind {
         ProviderKind::OpenAiCompatible,
     ];
 
+    /// Whether a model on this kind of server costs nothing per token unless the user says
+    /// otherwise. A gateway (LiteLLM) and a server of unknown kind may proxy a paid cloud
+    /// model, so they are metered until the profile says it is free.
+    pub fn free_by_default(self) -> bool {
+        match self {
+            ProviderKind::Ollama
+            | ProviderKind::LmStudio
+            | ProviderKind::Vllm
+            | ProviderKind::LlamaCpp
+            | ProviderKind::SgLang
+            | ProviderKind::LocalAi
+            | ProviderKind::Jan
+            | ProviderKind::TextGenWebUi => true,
+            ProviderKind::LiteLlm | ProviderKind::OpenAiCompatible => false,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             ProviderKind::Ollama => "Ollama",
@@ -828,6 +845,14 @@ mod tests {
                 ProviderKind::LiteLlm
             ]
         );
+    }
+
+    #[test]
+    fn a_gateway_or_unknown_server_is_metered_until_said_otherwise() {
+        assert!(ProviderKind::Ollama.free_by_default());
+        assert!(ProviderKind::LmStudio.free_by_default());
+        assert!(!ProviderKind::LiteLlm.free_by_default());
+        assert!(!ProviderKind::OpenAiCompatible.free_by_default());
     }
 
     #[test]

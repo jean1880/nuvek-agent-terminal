@@ -3423,6 +3423,41 @@ impl Store {
         )?)
     }
 
+    /// Every attachment id any stored event refers to, in every thread: what the blob store's
+    /// sweep must keep. Refs are read from a user message's `ItemStarted.input.attachments` and
+    /// from `Event::Attachments`; only content addresses count ([`AttachmentRef::valid_id`]). The
+    /// `LIKE` only skips rows cheaply; each candidate is read as plain JSON, not as an
+    /// [`Envelope`], so a row this build cannot decode still keeps its images, and only the `id`
+    /// of a ref is needed.
+    ///
+    /// [`AttachmentRef::valid_id`]: agent_core::attachment::AttachmentRef::valid_id
+    pub fn attachment_ids(&self) -> Result<HashSet<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT envelope_json FROM events WHERE envelope_json LIKE '%\"attachments\"%'",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = HashSet::new();
+        for row in rows {
+            let Ok(value) = serde_json::from_str::<Value>(&row?) else {
+                continue;
+            };
+            let event = &value["event"];
+            let refs = match event["type"].as_str() {
+                Some("attachments") => &event["refs"],
+                Some("item_started") => &event["input"]["attachments"],
+                _ => continue,
+            };
+            let ids = refs
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r["id"].as_str())
+                .filter(|id| agent_core::attachment::AttachmentRef::valid_id(id));
+            out.extend(ids.map(str::to_owned));
+        }
+        Ok(out)
+    }
+
     /// Rebuilds the thread's items with their final text: a snapshot replaces
     /// the deltas accumulated so far, later deltas append to it. Items appear
     /// in the order they first occur. `Reasoning` items are left out: a
@@ -4093,6 +4128,60 @@ mod tests {
             Some("recover me")
         );
         assert!(!s.has_messages(&t).unwrap());
+    }
+
+    #[test]
+    fn attachment_ids_are_found_in_both_shapes_and_only_when_valid() {
+        use agent_core::attachment::{user_message_input, AttachmentKind, AttachmentRef, Origin};
+        let r = |id: &str| AttachmentRef {
+            id: id.to_owned(),
+            kind: AttachmentKind::Image,
+            mime: "image/png".into(),
+            width: 1,
+            height: 1,
+            bytes: 1,
+            name: None,
+            origin: Origin::User,
+        };
+        // Real digests: the store's scrubbing must leave a content address as it is.
+        let [a, b, c] = [b"one".as_slice(), b"two", b"three"].map(crate::attachments::hex_sha256);
+        let s = store();
+        let t = s.create_thread("/w", None).unwrap();
+        let other = s.create_thread("/w", None).unwrap();
+        assert!(s.attachment_ids().unwrap().is_empty());
+        s.append_event(
+            &t,
+            None,
+            &Envelope::new(Event::ItemStarted {
+                kind: ItemKind::UserMessage,
+                title: String::new(),
+                input: user_message_input(false, &[r(&a), r("../../etc/passwd")]),
+                parent: None,
+            }),
+        )
+        .unwrap();
+        s.append_event(
+            &other,
+            None,
+            &Envelope::new(Event::Attachments {
+                refs: vec![r(&b), r(&a.to_uppercase())],
+            }),
+        )
+        .unwrap();
+        // A tool's input that merely names the key is not a ref.
+        s.append_event(
+            &t,
+            None,
+            &Envelope::new(Event::ItemStarted {
+                kind: ItemKind::Command,
+                title: "attachments".into(),
+                input: Some(serde_json::json!({"note": "\"attachments\"", "id": c})),
+                parent: None,
+            }),
+        )
+        .unwrap();
+        let ids = s.attachment_ids().unwrap();
+        assert_eq!(ids, HashSet::from([a, b]));
     }
 
     #[test]

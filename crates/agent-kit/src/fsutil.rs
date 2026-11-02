@@ -65,11 +65,211 @@ pub fn write_private_atomic_checked(
     result
 }
 
+/// What identifies one version of a file: its modification time and size, and the inode and
+/// change time, so a same-length edit within one mtime tick, or a file renamed into place, is
+/// still seen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileStamp {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+    ino: u64,
+    ctime: (i64, i64),
+}
+
+impl FileStamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            modified: meta.modified().ok(),
+            len: meta.len(),
+            ino: meta.ino(),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        }
+    }
+
+    /// The file's size in bytes.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// Why [`open_regular`] or [`read_limited`] gave nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadError {
+    NotFound,
+    NotRegular,
+    TooLarge,
+    Io(std::io::ErrorKind),
+}
+
+impl From<std::io::Error> for ReadError {
+    fn from(e: std::io::Error) -> Self {
+        match e.kind() {
+            std::io::ErrorKind::NotFound => ReadError::NotFound,
+            kind => ReadError::Io(kind),
+        }
+    }
+}
+
+/// Opens `path` without blocking (a FIFO or device would otherwise hang the open) and checks,
+/// on the open file itself, that it is a regular file: the stamp is of what will be read.
+pub fn open_regular(path: &Path) -> Result<(std::fs::File, FileStamp), ReadError> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(ReadError::NotRegular);
+    }
+    Ok((file, FileStamp::of(&meta)))
+}
+
+/// All of `file` as UTF-8 text, at most `max` bytes: read through `take(max + 1)`, so a file
+/// that grows after it was checked is still bounded.
+pub fn read_limited(file: std::fs::File, max: u64) -> Result<String, ReadError> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    file.take(max.saturating_add(1)).read_to_end(&mut buf)?;
+    if buf.len() as u64 > max {
+        return Err(ReadError::TooLarge);
+    }
+    String::from_utf8(buf).map_err(|_| ReadError::Io(std::io::ErrorKind::InvalidData))
+}
+
+/// [`open_regular`] then [`read_limited`]: the one bounded reader of a small settings file.
+pub fn read_bounded(path: &Path, max: u64) -> Result<(FileStamp, String), ReadError> {
+    let (file, stamp) = open_regular(path)?;
+    if stamp.len() > max {
+        return Err(ReadError::TooLarge);
+    }
+    Ok((stamp, read_limited(file, max)?))
+}
+
+/// An exclusive advisory lock on `path` (created `0600` if missing), held until the guard is
+/// dropped. Blocks: callers run off the main thread.
+pub struct FileLock {
+    _file: std::fs::File,
+}
+
+impl FileLock {
+    pub fn take(path: &Path) -> std::io::Result<FileLock> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)?;
+        use std::os::fd::AsRawFd;
+        // SAFETY: flock on a descriptor this struct owns.
+        let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if status != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(FileLock { _file: file })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    #[test]
+    fn the_bounded_reader_refuses_what_is_not_a_small_regular_text_file() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("f.json");
+        assert_eq!(read_bounded(&path, 8).unwrap_err(), ReadError::NotFound);
+        std::fs::write(&path, "12345678").expect("write");
+        let (stamp, text) = read_bounded(&path, 8).expect("fits");
+        assert_eq!((text.as_str(), stamp.len()), ("12345678", 8));
+        std::fs::write(&path, "123456789").expect("write");
+        assert_eq!(read_bounded(&path, 8).unwrap_err(), ReadError::TooLarge);
+        // Grown after the check: the read itself is bounded.
+        let (file, _) = open_regular(&path).expect("open");
+        assert_eq!(read_limited(file, 4).unwrap_err(), ReadError::TooLarge);
+        assert_eq!(
+            read_bounded(dir.path(), 8).unwrap_err(),
+            ReadError::NotRegular
+        );
+        std::fs::write(&path, [0xff, 0xfe]).expect("write");
+        assert!(matches!(
+            read_bounded(&path, 8).unwrap_err(),
+            ReadError::Io(_)
+        ));
+        // A FIFO is refused without opening it for a peer.
+        let fifo = dir.path().join("pipe");
+        let c = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).expect("cstr");
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert_eq!(read_bounded(&fifo, 8).unwrap_err(), ReadError::NotRegular);
+    }
+
+    #[test]
+    fn a_stamp_sees_a_same_length_edit_and_a_replaced_file() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("f.json");
+        std::fs::write(&path, "aaaa").expect("write");
+        let (_, first) = open_regular(&path).expect("open");
+        // Same length, same second: the change time and inode still move.
+        let other = dir.path().join("g.json");
+        std::fs::write(&other, "bbbb").expect("write");
+        std::fs::rename(&other, &path).expect("rename");
+        let (_, second) = open_regular(&path).expect("open");
+        assert_ne!(
+            first, second,
+            "a replaced file of the same size is a new version"
+        );
+        let (_, again) = open_regular(&path).expect("open");
+        assert_eq!(second, again);
+    }
+
+    #[test]
+    fn a_lock_file_that_is_a_link_is_refused_not_followed() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let (target, lock) = (dir.path().join("elsewhere"), dir.path().join("n.lock"));
+        std::fs::write(&target, "keep").expect("write");
+        std::os::unix::fs::symlink(&target, &lock).expect("link");
+        assert!(FileLock::take(&lock).is_err());
+        assert_eq!(std::fs::read_to_string(&target).expect("read"), "keep");
+    }
+
+    #[test]
+    fn a_lock_serialises_read_modify_write_across_threads() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let (path, lock) = (dir.path().join("n"), dir.path().join("n.lock"));
+        std::fs::write(&path, "0").expect("write");
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (path, lock) = (path.clone(), lock.clone());
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        let _guard = FileLock::take(&lock).expect("lock");
+                        let n: u32 = std::fs::read_to_string(&path)
+                            .expect("read")
+                            .parse()
+                            .expect("n");
+                        std::fs::write(&path, (n + 1).to_string()).expect("write");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("join");
+        }
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "160");
+        let mode = std::fs::metadata(&lock).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
 
     #[test]
     fn the_write_is_private_replaces_and_leaves_no_temp() {

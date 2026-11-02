@@ -1134,8 +1134,11 @@ impl Supervisor {
                 // Each profile's own source: three servers of one agent list three lists.
                 let models = (self.services.catalog.models)(driver, &p)
                     .iter()
-                    .filter_map(|m| super::catalog_info::model_info(m, tags.tags.as_deref()))
+                    .filter_map(|m| {
+                        super::catalog_info::model_info(m, tags.tags.as_deref(), Some(&p.id))
+                    })
                     .collect();
+                let cost = super::catalog_info::profile_cost(&p, driver);
                 Some(ProfileCapabilities {
                     profile_id: id,
                     name: p.name,
@@ -1168,9 +1171,13 @@ impl Supervisor {
                             }
                         })
                         .collect(),
+                    cost,
                     models,
-                    usage: (self.services.catalog.usage)(driver)
-                        .map(|s| super::catalog_info::usage_info(&s, now)),
+                    usage: super::catalog_info::profile_usage(
+                        cost,
+                        (self.services.catalog.usage)(driver),
+                        now,
+                    ),
                     workspaces: vec![
                         WorkspaceKind::SharedReadOnly,
                         WorkspaceKind::IsolatedWorktree,

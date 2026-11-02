@@ -1038,6 +1038,20 @@ pub struct ModelInfo {
     /// `effort_policy` ([`crate::model_tags::effort_for`]); null when there is no policy.
     #[serde(default)]
     pub effort_for: Option<crate::model_tags::EffortFor>,
+    /// Which layer `tags`, `tier` and `best_for` came from; null when the model has no entry.
+    #[serde(default)]
+    pub tags_source: Option<crate::model_tags::TagSource>,
+}
+
+/// What running a profile's models costs: `capabilities.profiles[].cost`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Cost {
+    /// Nothing per token and no quota to burn (a model on the user's own server).
+    Free,
+    /// Quota or money per token.
+    #[default]
+    Metered,
 }
 
 /// Quota windows reported per profile, at most this many.
@@ -1097,6 +1111,21 @@ pub struct UsageInfo {
     pub signed_out: bool,
 }
 
+impl UsageInfo {
+    /// The usage of a [`Cost::Free`] profile: no quota to burn, so `ok` with no load and no
+    /// window, whatever any reading of its agent's vendor says.
+    pub fn free() -> UsageInfo {
+        UsageInfo {
+            headroom: crate::model_tags::Headroom::Ok,
+            load: Some(0.0),
+            windows: Vec::new(),
+            age_s: None,
+            refresh_failed: false,
+            signed_out: false,
+        }
+    }
+}
+
 /// `capabilities.profiles[].delivery`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeliverySupport {
@@ -1120,6 +1149,10 @@ pub struct ProfileCapabilities {
     pub driver: Driver,
     pub available: bool,
     pub reason: Option<String>,
+    /// `free` for a profile on a model server the user runs (unless the profile says otherwise),
+    /// `metered` for a vendor's.
+    #[serde(default)]
+    pub cost: Cost,
     pub modes: Vec<ModeAdmission>,
     pub models: Vec<ModelInfo>,
     pub workspaces: Vec<WorkspaceKind>,
@@ -1793,6 +1826,7 @@ pub(crate) mod fixtures {
                     standard: Some(text(c, MAX_EFFORT_NAME_BYTES)),
                     deep: Some(text(c, MAX_EFFORT_NAME_BYTES)),
                 }),
+                tags_source: Some(crate::model_tags::TagSource::BuiltIn),
             })
             .collect();
         let effort_policy = EffortPolicy {
@@ -1844,6 +1878,7 @@ pub(crate) mod fixtures {
                     driver: Driver::Codex,
                     available: true,
                     reason: Some(text(c, MAX_STATUS_REASON_BYTES)),
+                    cost: Cost::Metered,
                     modes: modes.clone(),
                     models: models.clone(),
                     workspaces: vec![

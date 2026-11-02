@@ -20,6 +20,7 @@ mod delegation;
 mod local_context;
 mod local_mcp;
 mod local_servers;
+mod model_tags;
 
 /// The default-mode dropdown, by index both ways.
 const MODES: [Mode; 3] = [Mode::Ask, Mode::AcceptEdits, Mode::Plan];
@@ -793,12 +794,13 @@ impl AgentTerminalWindow {
         for driver in Driver::ALL {
             // The Local agent is a list of servers, each its own profile.
             if driver.is_built_in() {
-                page.add(&self.local_servers_group(dialog));
+                page.add(&self.local_servers_group(dialog, &switches));
                 page.add(&self.local_context_group(dialog));
                 continue;
             }
             page.add(&self.agent_group(driver, dialog, &switches));
         }
+        page.add(&self.model_tags_group(dialog));
         dialog.add(&page);
     }
 

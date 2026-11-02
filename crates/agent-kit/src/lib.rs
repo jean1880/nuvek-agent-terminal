@@ -32,4 +32,5 @@ pub mod store_writer;
 pub mod test_support;
 pub mod uninstall;
 pub mod update;
+pub mod user_tags_file;
 pub mod worktree;

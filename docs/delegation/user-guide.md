@@ -34,9 +34,22 @@ only for an identical operation; a receipt means acceptance, and subsequent read
 report delivery and completion separately.
 
 Capabilities also helps a parent choose. Each model can carry tags (what it is good
-for), a tier and an effort per task tier, read from a model tag file you write
-(`model_tags_path` in the config; by default `model-tags.json` beside it). Without
-that file, models are still listed, untagged. Each profile reports its plan usage: the
+for), a tier and an effort per task tier, from your own tag file, a shared one and the
+built-in tags, in that order (see Model tags in the configuration guide). Each model
+reports `tags_source`: `user`, `file`, `built_in`, or null when it has none. Edit your tags
+in Settings → Agents → Model Tags or with `agent-terminal tags`. No agent tool changes
+tags (the delegation tools only read them), but the file is yours: any process with your
+shell access can still run that command or edit the file.
+
+Each profile reports its `cost`: `free` for a model server you run and marked **Free to
+Run** (Ollama and LM Studio by default), `metered` for a vendor's agent or a gateway. A
+free profile spends no quota, so it reports headroom `ok`, load 0 and no windows, and a
+parent should pick it first whenever one of its models' tags and tier fit the task; tags
+and tier still come before cost. A Local server joins delegation with its own **Available to
+Other Agents** switch; until the Local agent's routes are admitted, a server switched on
+here is still refused as a target.
+
+Each profile reports its plan usage: the
 fullest window's share (`load`) and a headroom of ok, low, exhausted or unknown, so a
 parent can spread work across agents with room rather than default to its own. Pass
 `refresh: true` to read usage again first; each agent is read at most once a minute,

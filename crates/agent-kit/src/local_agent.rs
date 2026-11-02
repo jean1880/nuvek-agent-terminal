@@ -244,6 +244,16 @@ pub fn sessions_dir(xdg_state: Option<&str>, home: Option<&str>) -> Option<PathB
 /// `agent-terminal --local-agent …`: parses the arguments, reads the key from its variable, and
 /// runs until stdin closes. The exit code is the process's.
 pub fn main(args: &[String], user_agent: &str) -> i32 {
+    // First of all: this process will hold the model server's key and the delegation
+    // capability. Not dumpable, its `/proc/<pid>/environ` and `mem` are closed to every other
+    // process of this user (the commands it runs included), as are ptrace and core dumps.
+    // Removing a variable later edits only libc's copy, never the kernel's. A process that
+    // cannot be made so does not start.
+    // SAFETY: prctl(PR_SET_DUMPABLE) takes plain integer arguments and touches no memory.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        eprintln!("agent-terminal --local-agent: cannot protect this process's memory");
+        return 2;
+    }
     let args = match RunnerArgs::parse(args) {
         Ok(args) => args,
         Err(why) => {
@@ -262,7 +272,8 @@ pub fn main(args: &[String], user_agent: &str) -> i32 {
         None => None,
     };
     // The key is held from here on: a command the agent runs (inheriting this environment)
-    // never gets it. Removed while this process has no other thread yet.
+    // never gets it. Removed while this process has no other thread yet. (The kernel's copy of
+    // the starting environment stays, unreadable to others: see the top of this function.)
     if let Some(name) = &args.key_env {
         std::env::remove_var(name);
     }

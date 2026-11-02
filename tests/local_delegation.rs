@@ -38,6 +38,107 @@ fn tree_text(dir: &Path) -> String {
     out
 }
 
+/// The runner is not dumpable: a command it runs cannot read its environment (where the model
+/// server's key was given) nor its memory, and neither can any other process of this user.
+#[test]
+fn a_command_cannot_read_the_runners_environment_or_memory() {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("running as root, which reads any process's files; skipping");
+        return;
+    }
+    let key = format!("proof-server-key-{}", std::process::id());
+    let model = ScriptedModel::start(vec![
+        ScriptedModel::calls(&[(
+            "run_command",
+            json!({"command": "cat /proc/$PPID/environ; echo; head -c 16 /proc/$PPID/mem; echo end"}),
+        )]),
+        ScriptedModel::text("done"),
+    ]);
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-terminal"));
+    command
+        .args([
+            "--local-agent",
+            "--server",
+            &model.base,
+            "--key-env",
+            "PROOF_SERVER_KEY",
+            "--cwd",
+            work.path().to_str().unwrap(),
+            "--mode",
+            "bypass",
+            "--model",
+            "fixture",
+        ])
+        .env_clear()
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", home.path().join("state"))
+        .env("PROOF_SERVER_KEY", &key);
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("PATH", path);
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let (tx, events) = std::sync::mpsc::channel::<Envelope>();
+    let reader = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(output).lines() {
+            let Ok(line) = line else { break };
+            if let Ok(envelope) = serde_json::from_str(&line) {
+                if tx.send(envelope).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    for command in [
+        AgentCommand::configure_local(Default::default()),
+        AgentCommand::Prompt {
+            text: "read your parent".into(),
+        },
+    ] {
+        writeln!(input, "{}", serde_json::to_string(&command).unwrap()).unwrap();
+        input.flush().unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut refused_here = None;
+    loop {
+        let envelope = events
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("the runner went quiet");
+        if refused_here.is_none() && matches!(envelope.event, Event::SessionStarted { .. }) {
+            // This process (the same user) is refused too.
+            refused_here = Some(
+                std::fs::read(format!("/proc/{pid}/environ"))
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied),
+            );
+        }
+        if matches!(envelope.event, Event::TurnCompleted { .. }) {
+            break;
+        }
+    }
+    drop(input);
+    let _ = child.wait();
+    let _ = reader.join();
+    assert_eq!(refused_here, Some(true), "the runner's environ is readable");
+    let bodies = model.bodies();
+    let output = bodies[1]["messages"].as_array().unwrap().last().unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(output.contains("end"), "the command ran: {output}");
+    assert!(output.contains("Permission denied"), "{output}");
+    assert!(!output.contains(&key), "the key leaked: {output}");
+}
+
 #[test]
 fn the_runner_binds_delegation_only_through_its_startup_frame() {
     let sock = tempfile::tempdir().unwrap();
@@ -47,7 +148,7 @@ fn the_runner_binds_delegation_only_through_its_startup_frame() {
     );
     let model = ScriptedModel::start(vec![
         ScriptedModel::calls(&[("cross_agent_list", json!({}))]),
-        ScriptedModel::calls(&[("run_command", json!({"command": "env; sleep 1"}))]),
+        ScriptedModel::calls(&[("run_command", json!({"command": "env"}))]),
         ScriptedModel::text("listed"),
     ]);
     let home = tempfile::tempdir().unwrap();
@@ -112,7 +213,7 @@ fn the_runner_binds_delegation_only_through_its_startup_frame() {
     });
     let mut seen = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(20);
-    // While the command runs (it sleeps), its runner is up: read its /proc files then.
+    // The runner stays up for the whole turn: its /proc files are read while it works.
     let mut scanned = None;
     loop {
         let (at, envelope) = events

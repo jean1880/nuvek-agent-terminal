@@ -435,6 +435,8 @@ struct Inner {
     thinking: ThinkingFlag,
     /// User input written before Claude's init, retained only for the thinking-flag retry.
     pre_init_prompts: RefCell<Vec<Sent>>,
+    /// Tool images shown in the running turn ([`agent_core::attachment::MAX_PER_TURN`]).
+    turn_images: Cell<usize>,
     /// Open Codex permission requests, by request id: what the answer may be (see
     /// [`Inner::gate_codex_permissions`]). Never a rule.
     codex_permissions: RefCell<HashMap<String, PermissionCard>>,
@@ -995,6 +997,7 @@ impl ChatSession {
             approval_deadline: Cell::new(crate::approval_server::DEFAULT_DEADLINE),
             thinking: ThinkingFlag::default(),
             pre_init_prompts: RefCell::new(Vec::new()),
+            turn_images: Cell::new(0),
             codex_permissions: RefCell::new(HashMap::new()),
             codex_grants: RefCell::new(Vec::new()),
             held_permissions: RefCell::new(HashSet::new()),
@@ -1427,6 +1430,13 @@ impl Inner {
 
     /// Persists (under the current provider thread), updates the status, then delivers.
     fn emit(&self, env: Envelope) {
+        if let Event::ToolImage { image } = env.event {
+            self.store_tool_image(env.item, image);
+            return;
+        }
+        if matches!(env.event, Event::TurnStarted { .. }) {
+            self.turn_images.set(0);
+        }
         let delivery = ScopedFlag::set(&self.delivering);
         // A prompted turn ran on this native session: there is a conversation to resume.
         if self.prompted.get() && matches!(env.event, Event::TurnCompleted { .. }) {
@@ -6534,6 +6544,58 @@ fn handoff_turn_end(
 
 /// The stored `HandoffSeeded` for `handoff`: spent only by its acknowledgement
 /// ([`handoff_spent`]).
+impl Inner {
+    /// An image a tool handed the agent ([`Event::ToolImage`]): stored off the main thread (a
+    /// bounded decode, re-encoded, never its raw bytes), then shown on its item as
+    /// [`Event::Attachments`], the form that is persisted. Past
+    /// [`agent_core::attachment::MAX_PER_TURN`] in a turn, the rest are counted in one notice.
+    fn store_tool_image(
+        &self,
+        item: Option<String>,
+        image: agent_core::attachment::ToolImageSource,
+    ) {
+        let Some(item) = item else {
+            return;
+        };
+        let n = self.turn_images.get() + 1;
+        self.turn_images.set(n);
+        if n > agent_core::attachment::MAX_PER_TURN {
+            if n == agent_core::attachment::MAX_PER_TURN + 1 {
+                self.emit(Envelope::new(Event::Notice {
+                    text: format!(
+                        "This turn showed more than {} images; the rest are not shown.",
+                        agent_core::attachment::MAX_PER_TURN
+                    ),
+                }));
+            }
+            return;
+        }
+        let weak = self.weak_self.borrow().clone();
+        glib::spawn_future_local(async move {
+            let stored = gtk4::gio::spawn_blocking(move || {
+                crate::attachments::ingest_tool_image(
+                    image,
+                    agent_core::attachment::Origin::ToolResult,
+                )
+            })
+            .await
+            .unwrap_or_else(|_| Err("the image could not be read".to_owned()));
+            let Some(inner) = weak.and_then(|w| w.upgrade()) else {
+                return;
+            };
+            match stored {
+                Ok(r) => inner.emit(Envelope::new(Event::Attachments { refs: vec![r] }).item(item)),
+                Err(why) => {
+                    warn!(error = %why, "a tool's image could not be stored");
+                    inner.emit(Envelope::new(Event::Notice {
+                        text: format!("An image a tool returned couldn't be shown: {why}"),
+                    }));
+                }
+            }
+        });
+    }
+}
+
 /// A user message's `ItemStarted`, queued or not, with the refs of the images sent with it: the
 /// one shape the live path, the queue and the store all use, so the view has the images the
 /// first time it sees the item.

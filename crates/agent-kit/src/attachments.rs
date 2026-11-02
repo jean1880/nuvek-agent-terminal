@@ -489,6 +489,92 @@ impl BlobStore {
     }
 }
 
+/// `bytes` as standard base64 (what Claude's image blocks and a `data:` URL carry).
+pub fn to_base64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Standard base64 back to bytes, refusing anything that would decode past
+/// [`MAX_INPUT_BYTES`] before decoding it.
+pub fn from_base64(text: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    let text = text.trim();
+    if (text.len() as u64) / 4 * 3 > MAX_INPUT_BYTES {
+        return Err("over 20 MB".to_owned());
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .map_err(|e| e.to_string())
+}
+
+/// Writes a copy of `r`'s checked `bytes` as `dir/<name>` for another app to open (`0700` folder,
+/// `0600` file, never through a link), so it can never change the stored blob. The name is the
+/// image's own (reduced to a file name) or its id, with the stored extension. Returns the path.
+pub fn write_private_copy(dir: &Path, r: &AttachmentRef, bytes: &[u8]) -> io::Result<PathBuf> {
+    if hex_sha256(bytes) != r.id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the bytes are not this image's",
+        ));
+    }
+    let store = BlobStore::new(dir);
+    store.ensure_dir()?;
+    let ext = AttachmentRef::extension_for(&r.mime).unwrap_or("png");
+    let stem = r
+        .name
+        .as_deref()
+        .and_then(display_name)
+        .and_then(|n| {
+            Path::new(&n)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+        })
+        .filter(|s| !s.is_empty() && !s.starts_with('.'))
+        .unwrap_or_else(|| r.id.chars().take(12).collect());
+    let path = dir.join(format!("{stem}.{ext}"));
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_file() => std::fs::remove_file(&path)?,
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} is not a file", path.display()),
+            ))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(path)
+}
+
+/// Removes the regular files [`write_private_copy`] left in `dir`, then `dir` if it is empty.
+/// Never follows a link, never recurses.
+pub fn remove_private_copies(dir: &Path) {
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return;
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() || meta.uid() != effective_uid() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_file()) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
 /// Reads `path` whole when it is a regular file of at most [`MAX_INPUT_BYTES`], opened without
 /// blocking (a FIFO never stalls the read) and with `flags` added. Over the cap is
 /// `ErrorKind::FileTooLarge`.

@@ -46,6 +46,24 @@ fn reset_preedit(active: &Cell<bool>) {
     active.set(false);
 }
 
+/// Whether a pasted or dropped file is one the composer attaches, by its extension (its content
+/// is checked when it is taken in).
+pub fn looks_like_image(path: &std::path::Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        matches!(
+            e.to_ascii_lowercase().as_str(),
+            "png" | "jpg" | "jpeg" | "webp" | "gif"
+        )
+    })
+}
+
+/// A file's name as a toast names it.
+pub fn file_label(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "The image".to_owned())
+}
+
 /// Per-thread prompt recall. The draft is held while browsing, so Down restores exactly what
 /// the user had typed before they pressed Up.
 #[derive(Debug, Default)]
@@ -149,10 +167,34 @@ pub trait ComposerHost {
     fn pop_queued_prompt(&self) -> Option<String> {
         None
     }
+    /// Enter with images staged (or none): `false` keeps the text and images in the composer
+    /// (the agent cannot take them, or the message is a command). A host that takes no images
+    /// sends text alone and refuses the rest.
+    fn submit_input(&self, input: crate::chat::PromptInput) -> bool {
+        if input.images.is_empty() {
+            self.submit(&input.text);
+            true
+        } else {
+            false
+        }
+    }
+    /// [`Self::pop_queued_prompt`] with the images it carried.
+    fn pop_queued_input(&self) -> Option<crate::chat::PromptInput> {
+        self.pop_queued_prompt().map(crate::chat::PromptInput::text)
+    }
+    /// The tray's fit warning for the current agent ("Antigravity can't take images."), if any.
+    fn image_note(&self) -> Option<String> {
+        None
+    }
+    /// A sentence for the user about the composer's images (a toast).
+    fn notify(&self, _text: &str) {}
 }
 
 pub struct Composer {
     root: gtk4::Box,
+    /// The images staged with the next message.
+    tray: Rc<super::tray::Tray>,
+    attach: gtk4::Button,
     view: sourceview5::View,
     buffer: sourceview5::Buffer,
     send: gtk4::Button,
@@ -174,8 +216,21 @@ pub struct Composer {
 
 impl Composer {
     pub fn new() -> Rc<Self> {
-        let root = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        // The tray (hidden while empty) over the row: attach, the field, Send.
+        let root = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
         root.add_css_class("composer");
+        let tray = super::tray::Tray::new();
+        root.append(tray.widget());
+        let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        root.append(&row);
+        let attach = gtk4::Button::from_icon_name("at-mail-attachment-symbolic");
+        attach.add_css_class("flat");
+        attach.add_css_class("circular");
+        attach.add_css_class("attach-button");
+        attach.set_valign(gtk4::Align::End);
+        attach.set_tooltip_text(Some("Attach Images…"));
+        attach.update_property(&[gtk4::accessible::Property::Label("Attach images")]);
+        row.append(&attach);
 
         let buffer = sourceview5::Buffer::new(None);
         buffer.set_highlight_matching_brackets(false);
@@ -220,7 +275,7 @@ impl Composer {
         overlay.set_child(Some(&scroller));
         overlay.add_overlay(&placeholder);
         overlay.set_hexpand(true);
-        root.append(&overlay);
+        row.append(&overlay);
 
         let send = gtk4::Button::from_icon_name("at-go-up-symbolic");
         send.add_css_class("circular");
@@ -228,7 +283,7 @@ impl Composer {
         send.set_valign(gtk4::Align::End);
         send.set_tooltip_text(Some("Send (Enter)"));
         send.update_property(&[gtk4::accessible::Property::Label("Send message")]);
-        root.append(&send);
+        row.append(&send);
 
         let list = gtk4::ListBox::new();
         list.set_selection_mode(gtk4::SelectionMode::Single);
@@ -258,6 +313,8 @@ impl Composer {
 
         let composer = Rc::new(Self {
             root,
+            tray,
+            attach,
             view,
             buffer,
             send,
@@ -377,10 +434,15 @@ impl Composer {
     pub fn refresh_placeholder(&self) {
         if let Some(host) = self.host() {
             // Only on a change: this runs after every batch of events.
-            let text = host.placeholder();
+            let text = if self.tray.is_empty() {
+                host.placeholder()
+            } else {
+                "Add a message, or press Enter to send".to_owned()
+            };
             if self.placeholder.text() != text {
                 self.placeholder.set_text(&text);
             }
+            self.tray.set_note(host.image_note().as_deref());
         }
         self.placeholder.set_visible(self.buffer.char_count() == 0);
         self.refresh_accessibility();
@@ -459,6 +521,31 @@ impl Composer {
         });
 
         let weak = Rc::downgrade(self);
+        self.attach.connect_clicked(move |_| {
+            if let Some(c) = weak.upgrade() {
+                c.choose_images();
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.view.connect_paste_clipboard(move |view| {
+            if weak.upgrade().is_some_and(|c| c.paste_images()) {
+                view.stop_signal_emission_by_name("paste-clipboard");
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.tray.connect_changed(move || {
+            if let Some(c) = weak.upgrade() {
+                c.refresh_placeholder();
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.tray.connect_notify(move |text| {
+            if let Some(host) = weak.upgrade().and_then(|c| c.host()) {
+                host.notify(text);
+            }
+        });
+
+        let weak = Rc::downgrade(self);
         self.send.connect_clicked(move |_| {
             let Some(c) = weak.upgrade() else {
                 return;
@@ -522,6 +609,15 @@ impl Composer {
             || state.contains(gdk::ModifierType::SUPER_MASK)
             || state.contains(gdk::ModifierType::ALT_MASK);
         let modified = shift || ctrl || meta;
+        // BackSpace with nothing before the caret steps into the tray: the next BackSpace
+        // removes the image focused there, so nothing goes by surprise.
+        if !modified
+            && keyval == gdk::Key::BackSpace
+            && self.buffer.char_count() == 0
+            && self.tray.focus_last()
+        {
+            return glib::Propagation::Stop;
+        }
         if !modified {
             let token = self.current_token();
             let outcome = self.popup.borrow_mut().key(key, &token);
@@ -546,10 +642,13 @@ impl Composer {
                 let current = self.text();
                 let recalled = match key {
                     Key::Up => {
-                        if current.trim().is_empty() {
+                        if current.trim().is_empty() && self.tray.is_empty() {
                             if let Some(host) = self.host() {
-                                if let Some(queued) = host.pop_queued_prompt() {
-                                    self.set_text(&queued);
+                                if let Some(queued) = host.pop_queued_input() {
+                                    self.set_text(&queued.text);
+                                    if !queued.images.is_empty() {
+                                        self.tray.set_images(queued.images);
+                                    }
                                     return glib::Propagation::Stop;
                                 }
                             }
@@ -586,16 +685,164 @@ impl Composer {
     fn submit(&self) {
         let text = self.text();
         let trimmed = text.trim();
-        if trimmed.is_empty() {
-            return;
-        }
         let Some(host) = self.host() else {
             return;
         };
+        if self.tray.preparing() {
+            host.notify("An image is still being prepared");
+            return;
+        }
+        let images = self.tray.images();
+        if trimmed.is_empty() && images.is_empty() {
+            return;
+        }
+        if !images.is_empty() && trimmed.starts_with('/') {
+            host.notify("A command can't carry images");
+            return;
+        }
         let owned = trimmed.to_owned();
-        self.history.borrow_mut().record(&owned);
-        self.clear();
-        host.submit(&owned);
+        if !owned.is_empty() {
+            self.history.borrow_mut().record(&owned);
+        }
+        let input = crate::chat::PromptInput {
+            text: owned,
+            images,
+        };
+        if input.images.is_empty() {
+            self.clear();
+            host.submit_input(input);
+            return;
+        }
+        // With images, the composer empties only once the host took them: refused, the text and
+        // images stay to be edited or sent elsewhere.
+        if host.submit_input(input) {
+            self.clear();
+            self.tray.clear();
+        }
+    }
+
+    /// Takes an image in for the next message (a drop on the thread, a paste).
+    pub fn add_image(&self, source: crate::attachments::Source, what: String) {
+        self.tray.add(source, what);
+    }
+
+    /// Tells the user something about the composer's images (a toast, through the host).
+    pub fn notify_host(&self, text: &str) {
+        if let Some(host) = self.host() {
+            host.notify(text);
+        }
+    }
+
+    /// Shows the "Drop images to attach" hint while something is dragged over the thread.
+    pub fn set_drop_hint(&self, on: bool) {
+        self.tray.set_drop_hint(on);
+        if on {
+            self.root.add_css_class("dropping");
+        } else {
+            self.root.remove_css_class("dropping");
+        }
+    }
+
+    /// Opens the file chooser for images.
+    fn choose_images(self: &Rc<Self>) {
+        let filter = gtk4::FileFilter::new();
+        filter.set_name(Some("Images"));
+        for mime in ["image/png", "image/jpeg", "image/webp", "image/gif"] {
+            filter.add_mime_type(mime);
+        }
+        let filters = gtk4::gio::ListStore::new::<gtk4::FileFilter>();
+        filters.append(&filter);
+        let dialog = gtk4::FileDialog::new();
+        dialog.set_title("Attach Images");
+        dialog.set_modal(true);
+        dialog.set_filters(Some(&filters));
+        dialog.set_default_filter(Some(&filter));
+        let window = self.root.root().and_downcast::<gtk4::Window>();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let Ok(files) = dialog.open_multiple_future(window.as_ref()).await else {
+                return; // Cancelled.
+            };
+            let Some(composer) = weak.upgrade() else {
+                return;
+            };
+            for file in files.iter::<gtk4::gio::File>().flatten() {
+                if let Some(path) = file.path() {
+                    composer.add_image(
+                        crate::attachments::Source::File(path.clone()),
+                        file_label(&path),
+                    );
+                }
+            }
+            composer.view.grab_focus();
+        });
+    }
+
+    /// Ctrl+V: a text paste stays a text paste, as it always was. A list of image files (copied
+    /// in a file manager) attaches them, and a bare image (a screenshot tool, "Copy Image")
+    /// attaches it. True when the paste was taken as images.
+    fn paste_images(self: &Rc<Self>) -> bool {
+        let clipboard = self.view.clipboard();
+        let formats = clipboard.formats();
+        if formats.contains_type(gdk::FileList::static_type()) {
+            let weak = Rc::downgrade(self);
+            let clipboard = clipboard.clone();
+            glib::spawn_future_local(async move {
+                let Ok(Some(value)) = clipboard
+                    .read_value_future(gdk::FileList::static_type(), glib::Priority::DEFAULT)
+                    .await
+                    .map(|v| v.get::<gdk::FileList>().ok())
+                else {
+                    return;
+                };
+                let Some(composer) = weak.upgrade() else {
+                    return;
+                };
+                let paths: Vec<_> = value.files().iter().filter_map(|f| f.path()).collect();
+                if !paths.is_empty() && paths.iter().all(|p| looks_like_image(p)) {
+                    for path in paths {
+                        let what = file_label(&path);
+                        composer.add_image(crate::attachments::Source::File(path), what);
+                    }
+                } else {
+                    // Not all images: paste what a text paste would have.
+                    let text: Vec<String> = paths
+                        .iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect();
+                    composer.buffer.insert_at_cursor(&text.join(" "));
+                }
+            });
+            return true;
+        }
+        let has_text = formats.contains_type(glib::GString::static_type())
+            || formats.contain_mime_type("text/plain")
+            || formats.contain_mime_type("text/plain;charset=utf-8");
+        if has_text || !formats.contains_type(gdk::Texture::static_type()) {
+            return false;
+        }
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let texture = clipboard.read_texture_future().await;
+            let Some(composer) = weak.upgrade() else {
+                return;
+            };
+            match texture {
+                Ok(Some(texture)) => {
+                    let bytes = texture.save_to_png_bytes().to_vec();
+                    composer.add_image(
+                        crate::attachments::Source::Bytes { bytes, name: None },
+                        "Pasted image".to_owned(),
+                    );
+                }
+                _ => {
+                    if let Some(host) = composer.host() {
+                        host.notify("The clipboard's image couldn't be read");
+                    }
+                }
+            }
+        });
+        true
     }
 
     fn cursor_offset(&self) -> (String, usize) {

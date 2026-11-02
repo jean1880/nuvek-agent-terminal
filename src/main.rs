@@ -17,6 +17,7 @@ mod agent_proc;
 mod always_allow;
 mod approval_hook;
 mod approval_server;
+mod attachments;
 mod availability;
 mod brand;
 mod chat;
@@ -273,6 +274,8 @@ fn main() -> glib::ExitCode {
     app.connect_shutdown(|_| {
         let started = std::time::Instant::now();
         diff_tool::remove_own();
+        // The copies "Open in Image Viewer" handed to another app.
+        attachments::remove_private_copies();
         let _ = delegation::shutdown_all();
         delegation::settle_shutdown(std::time::Duration::from_secs(3));
         delegation::final_cleanup();

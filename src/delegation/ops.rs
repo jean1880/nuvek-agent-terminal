@@ -275,9 +275,10 @@ impl CallDispatcher for Supervisor {
     }
     fn closed(&self, conn: ConnId) {
         // A connection its own credential still held: the bridge went away (a rotation or a
-        // revocation takes the token first, so neither lands here). Claude's bridge may
-        // reconnect with the same token; the others cannot, so the worker needs a rebind, and
-        // says why, durably, where `list` and the worker dock can see it.
+        // revocation takes the token first, so neither lands here). Claude's bridge and the
+        // Local runner's client may connect again with the same token; the others cannot, so
+        // the worker needs a rebind, and says why, durably, where `list` and the worker dock can
+        // see it.
         let lost = {
             let mut state = self.state.borrow_mut();
             state.waits.retain(|(c, _), _| *c != conn);
@@ -292,8 +293,10 @@ impl CallDispatcher for Supervisor {
         let Some((worker, driver)) = lost else {
             return;
         };
-        // Claude's bridge, and the Local runner's own client (pinned to its process), may
-        // reconnect once with the same token.
+        // Claude's bridge, and the Local runner's own client, may connect again with the same
+        // token. This side does not count reconnects: the clients try once
+        // (`agent_kit::delegation_client`), one live connection per token is allowed, and a
+        // Local one is accepted only from its runner's own process (`local_peer_ok`).
         if matches!(driver, Driver::Claude | Driver::Local) {
             info!(%worker, ?driver, "delegation bridge disconnected; it may reconnect");
             return;

@@ -142,21 +142,30 @@ impl Client {
             self.commands.try_send(Command::Call(call, reply)).map_err(|_| {
                 ToolError::new(ErrorCode::CapacityReached, "the delegation bridge is busy")
             })?;
-            let _cancel = CancelOnDrop { id, commands: self.commands.clone() };
-            result.await.map_err(|_| lost())?
+            let mut cancel = CancelOnDrop { id, commands: self.commands.clone(), armed: true };
+            let outcome = result.await.map_err(|_| lost());
+            // Answered: there is nothing left to cancel.
+            cancel.armed = false;
+            outcome?
         }).await.map_err(|_| {
             ToolError::new(ErrorCode::DeadlineExceeded, "the delegation call deadline expired; retry mutations with the same idempotency key")
         })?
     }
 }
 
+/// Cancels its call at the supervisor when the wait for it is dropped before the answer came
+/// (a deadline, the caller giving up); disarmed once answered.
 struct CancelOnDrop {
     id: u64,
     commands: mpsc::Sender<Command>,
+    armed: bool,
 }
 
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         // At most four calls are admitted; the bounded 16-entry queue has room for their
         // cancellation notices even while a frame write is in progress.
         let _ = self.commands.try_send(Command::Cancel(self.id));
@@ -286,6 +295,8 @@ async fn actor(
             )));
             return;
         }
+        // One reconnect, counted here only: the supervisor does not count them (it allows one
+        // live connection per token, and a Local one only from its runner's own process).
         if reconnect_used {
             state.send_replace(State::Degraded(unavailable(
                 "the delegation connection was lost after its one reconnect",
@@ -383,16 +394,17 @@ impl Blocking {
         self.client.status()
     }
 
-    /// Waits until the connection is ready or has failed, at most `limit`.
+    /// Waits until the connection is ready or has failed, at most `limit`, on the client's own
+    /// state channel.
     pub fn wait_ready(&self, limit: Duration) -> Status {
-        let until = Instant::now() + limit;
-        loop {
-            let status = self.status();
-            if status != Status::Connecting || Instant::now() >= until {
-                return status;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let client = self.client.clone();
+        self.handle.spawn(async move {
+            let _ = client.ready().await;
+            let _ = tx.send(());
+        });
+        let _ = rx.recv_timeout(limit);
+        self.status()
     }
 
     pub fn next_id(&self) -> u64 {

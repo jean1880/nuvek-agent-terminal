@@ -2018,12 +2018,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 .unwrap_or_else(|| "delegation is unavailable".to_owned());
             return finish(self, ToolError::new(ErrorCode::RuntimeUnavailable, &reason));
         };
-        let timeout_ms = match &parsed {
-            agent_core::delegation::ToolRequest::Wait(wait) => {
-                wait.timeout_ms.unwrap_or(10_000).saturating_add(2_000)
-            }
-            _ => 30_000,
-        };
+        let timeout_ms = agent_core::delegation::call_timeout_ms(&parsed);
         let request = Call {
             id: bridge.next_id(),
             tool,
@@ -3256,19 +3251,29 @@ mod tests {
                 fake.cancels().contains(&call.id),
                 "cancelled at the supervisor"
             );
-            fake.revoke();
-            std::thread::sleep(Duration::from_millis(100));
-            run.send(prompt("again"));
-            run.wait_for(completed);
-            run.finish();
-            let bodies = script.bodies();
-            let last = offered(bodies.last().unwrap());
-            assert_eq!(
-                last.iter()
+            assert!(fake.revoke(), "the live connection was revoked and shut");
+            // The client sees the revocation on its own reader: each next turn's request says
+            // what it is offered, until only the capabilities tool is.
+            let delegation = |body: &Value| {
+                offered(body)
+                    .into_iter()
                     .filter(|t| t.starts_with("cross_agent_"))
-                    .collect::<Vec<_>>(),
-                ["cross_agent_capabilities"]
-            );
+                    .collect::<Vec<_>>()
+            };
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                run.send(prompt("again"));
+                run.wait_for(completed);
+                let last = script.bodies().last().map(delegation).unwrap_or_default();
+                if last == ["cross_agent_capabilities"] {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "never degraded: {last:?}"
+                );
+            }
+            run.finish();
         }
 
         /// A supervised child asks the app before every write (Accept edits included), is

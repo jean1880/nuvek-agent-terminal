@@ -205,6 +205,8 @@ pub struct FakeDelegation {
     pub calls: Arc<Mutex<Vec<agent_core::delegation::ipc::Call>>>,
     pub cancels: Arc<Mutex<Vec<u64>>>,
     revoke: Arc<AtomicBool>,
+    /// Set once a revoked connection is shut.
+    revoked: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -266,14 +268,16 @@ impl FakeDelegation {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let cancels = Arc::new(Mutex::new(Vec::new()));
         let revoke = Arc::new(AtomicBool::new(false));
+        let revoked = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let answer = Arc::new(answer);
-        let (h, c, x, r, s) = (
+        let (h, c, x, r, s, done) = (
             hellos.clone(),
             calls.clone(),
             cancels.clone(),
             revoke.clone(),
             stop.clone(),
+            revoked.clone(),
         );
         let thread = std::thread::spawn(move || {
             let mut handlers = Vec::new();
@@ -283,12 +287,13 @@ impl FakeDelegation {
                     continue;
                 };
                 let _ = stream.set_nonblocking(false);
-                let (h, c, x, r, s, answer) = (
+                let (h, c, x, r, s, done, answer) = (
                     h.clone(),
                     c.clone(),
                     x.clone(),
                     r.clone(),
                     s.clone(),
+                    done.clone(),
                     answer.clone(),
                 );
                 handlers.push(std::thread::spawn(move || {
@@ -342,6 +347,7 @@ impl FakeDelegation {
                             let error = ToolError::new(ErrorCode::AuthenticationFailed, "revoked");
                             write_frame(&mut stream, &Frame::Revoked { error });
                             let _ = stream.shutdown(std::net::Shutdown::Both);
+                            done.store(true, Ordering::SeqCst);
                             return;
                         }
                         match rx.recv_timeout(Duration::from_millis(10)) {
@@ -394,14 +400,24 @@ impl FakeDelegation {
             calls,
             cancels,
             revoke,
+            revoked,
             stop,
             thread: Some(thread),
         }
     }
 
-    /// Revokes the live connection: its next turn of the loop sends `Revoked` and closes.
-    pub fn revoke(&self) {
+    /// Revokes the live connection, returning once `Revoked` was sent and the socket shut (or
+    /// after five seconds, if no connection is live): whether it was.
+    pub fn revoke(&self) -> bool {
         self.revoke.store(true, Ordering::SeqCst);
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while !self.revoked.load(Ordering::SeqCst) {
+            if std::time::Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        true
     }
 
     pub fn calls(&self) -> Vec<agent_core::delegation::ipc::Call> {

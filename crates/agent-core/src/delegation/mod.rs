@@ -43,4 +43,4 @@ pub use limits::Limits;
 pub use route::{admit_route, DelegationCaps, RouteStatus};
 pub use token::{CapabilityToken, InstanceNonce};
 pub use tools::ToolName;
-pub use wire::{parse_request, ToolRequest};
+pub use wire::{call_timeout_ms, parse_request, ToolRequest};

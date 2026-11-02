@@ -445,6 +445,8 @@ struct Inner {
     show_image_calls: RefCell<std::collections::VecDeque<String>>,
     /// Each top-level reply's text while it is open, for the local images it names.
     reply_texts: RefCell<std::collections::HashMap<String, String>>,
+    /// Queued messages with images the user was told this agent cannot take, so it is said once.
+    image_waits_told: RefCell<std::collections::HashSet<String>>,
     /// Open Codex permission requests, by request id: what the answer may be (see
     /// [`Inner::gate_codex_permissions`]). Never a rule.
     codex_permissions: RefCell<HashMap<String, PermissionCard>>,
@@ -1035,6 +1037,7 @@ impl ChatSession {
             turn_images: Cell::new(0),
             show_image_calls: RefCell::new(std::collections::VecDeque::new()),
             reply_texts: RefCell::default(),
+            image_waits_told: RefCell::default(),
             codex_permissions: RefCell::new(HashMap::new()),
             codex_grants: RefCell::new(Vec::new()),
             held_permissions: RefCell::new(HashSet::new()),
@@ -4484,8 +4487,9 @@ impl Inner {
                 }
                 continue;
             }
-            let queued = self.queued_prompts.borrow_mut().pop_front();
-            let Some(queued) = queued else { return };
+            let Some(queued) = self.next_sendable_queued() else {
+                return;
+            };
             if !self.apply_retired() {
                 self.queued_prompts.borrow_mut().push_front(queued);
                 return;
@@ -4549,6 +4553,50 @@ impl Inner {
                 return;
             }
         }
+    }
+
+    /// The first queued message the agent can take, out of the queue. One with images waits while
+    /// the agent cannot take them (it may have been written for another agent before a switch):
+    /// sending its words alone would lose them, and refusing it at every dispatch would hold up
+    /// every message behind it. The user is told once; Up takes it back, and a switch to an
+    /// agent that takes images sends it.
+    fn next_sendable_queued(&self) -> Option<QueuedPrompt> {
+        let takes_images = self.adapter.borrow().capabilities().image_input;
+        let at = {
+            let queue = self.queued_prompts.borrow();
+            let at = queue
+                .iter()
+                .position(|q| takes_images || q.images.is_empty());
+            let waiting: Vec<String> = queue
+                .iter()
+                .filter(|q| !takes_images && !q.images.is_empty())
+                .map(|q| q.item_id.clone())
+                .collect();
+            drop(queue);
+            let fresh: Vec<String> = waiting
+                .into_iter()
+                .filter(|id| self.image_waits_told.borrow_mut().insert(id.clone()))
+                .collect();
+            if !fresh.is_empty() {
+                let agent = self.adapter.borrow().driver().info().label;
+                self.emit(Envelope::new(Event::Notice {
+                    text: format!(
+                        "{agent} can't take images, so {} waiting with images {} not sent. \
+                         Press Up in the composer to edit {}, or switch to an agent that takes \
+                         images.",
+                        if fresh.len() == 1 {
+                            "a message"
+                        } else {
+                            "messages"
+                        },
+                        if fresh.len() == 1 { "was" } else { "were" },
+                        if fresh.len() == 1 { "it" } else { "them" },
+                    ),
+                }));
+            }
+            at
+        }?;
+        self.queued_prompts.borrow_mut().remove(at)
     }
 
     fn pop_queued_prompt(&self) -> Option<(String, String)> {
@@ -6731,11 +6779,13 @@ impl Inner {
             return;
         }
         let weak = self.weak_self.borrow().clone();
+        let cwd = self.open.borrow().cwd.clone();
         glib::spawn_future_local(async move {
             let stored = gtk4::gio::spawn_blocking(move || {
                 crate::attachments::ingest_tool_image(
                     image,
                     agent_core::attachment::Origin::ToolResult,
+                    &cwd,
                 )
             })
             .await
@@ -10708,6 +10758,42 @@ mod tests {
             assert_eq!(session.inner.generation.get(), generation);
             assert!(session.status().running_turn);
             assert_eq!(session.inner.deferred_mode.get(), None);
+        });
+    }
+
+    /// A message queued with images for an agent that takes none (agy, after a switch, say)
+    /// waits without holding up the messages behind it: they go, the user is told once, and Up
+    /// takes it back whole.
+    #[test]
+    fn a_queued_image_message_never_holds_up_the_queue_of_an_agent_without_images() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (session, seen) = recording(ctx, tmp.path(), Box::new(AgyAdapter::new("agy")));
+            session.send_prompt("first");
+            session.queue_input(&PromptInput {
+                text: "with an image".into(),
+                images: vec![staged('a')],
+            });
+            session.queue_prompt("plain after");
+            for _ in 0..2 {
+                session.inner.emit(Envelope::new(Event::TurnCompleted {
+                    state: TurnState::Completed,
+                    error: None,
+                    usage: None,
+                    cost_usd: None,
+                }));
+            }
+            assert!(pump_until(ctx, 5, || stdin_log(tmp.path()).contains("plain after")));
+            assert!(!stdin_log(tmp.path()).contains("with an image"));
+            let told = seen
+                .borrow()
+                .iter()
+                .filter(|e| matches!(&e.event, Event::Notice { text } if text.contains("can't take images")))
+                .count();
+            assert_eq!(told, 1, "told once");
+            let (_, back) = session.pop_queued_input().expect("still queued");
+            assert_eq!(back.text, "with an image");
+            assert_eq!(back.images.len(), 1);
         });
     }
 

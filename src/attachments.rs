@@ -43,11 +43,8 @@ impl Staged {
 pub enum Source {
     /// A file they picked or dropped.
     File(PathBuf),
-    /// A pasted or dropped image (no file behind it).
-    Bytes {
-        bytes: Vec<u8>,
-        name: Option<String>,
-    },
+    /// A pasted or dropped image, encoded on the worker (never on the main thread).
+    Texture(gdk::Texture),
 }
 
 /// Takes `source` in on a worker: normalised (bounded decode, resized, metadata dropped), stored,
@@ -63,7 +60,9 @@ fn stage_blocking(source: Source) -> Result<Staged, String> {
         blob_store().ok_or_else(|| "There is no data folder to keep images in.".to_owned())?;
     let normalised = match source {
         Source::File(path) => store.ingest_path(&path, Origin::User),
-        Source::Bytes { bytes, name } => store.ingest_bytes(&bytes, name.as_deref(), Origin::User),
+        Source::Texture(texture) => {
+            store.ingest_bytes(&texture.save_to_png_bytes(), None, Origin::User)
+        }
     }
     .map_err(|e| e.to_string())?;
     let path = store
@@ -77,10 +76,16 @@ fn stage_blocking(source: Source) -> Result<Staged, String> {
 }
 
 /// Stores an image an agent's tool handed back ([`agent_core::event::Event::ToolImage`]) and
-/// returns its ref. Blocking: call it on a worker. A file (Codex `imageView`) is read only when
-/// it is a regular file under the size cap; its bytes are decoded under the same bounds as the
-/// user's.
-pub fn ingest_tool_image(image: ToolImageSource, origin: Origin) -> Result<AttachmentRef, String> {
+/// returns its ref. Blocking: call it on a worker. A file (Codex `imageView`) is a path an agent
+/// named, so it is read only as the read policy lets a read run without asking in the thread's
+/// folder `cwd` ([`agent_kit::local_tools::read_unasked`]: inside it, not sensitive, links judged
+/// where they lead, a regular file under the size cap); its bytes, like any, are decoded under
+/// the same bounds as the user's.
+pub fn ingest_tool_image(
+    image: ToolImageSource,
+    origin: Origin,
+    cwd: &str,
+) -> Result<AttachmentRef, String> {
     let store = blob_store().ok_or_else(|| "no data folder for images".to_owned())?;
     let normalised = match image {
         ToolImageSource::Inline { data_base64, .. } => {
@@ -88,7 +93,22 @@ pub fn ingest_tool_image(image: ToolImageSource, origin: Origin) -> Result<Attac
                 .map_err(|e| format!("the image was not valid base64: {e}"))?;
             store.ingest_bytes(&bytes, None, origin)
         }
-        ToolImageSource::File { path } => store.ingest_path(std::path::Path::new(&path), origin),
+        ToolImageSource::File { path } => {
+            use agent_kit::local_tools::{read_unasked, UnaskedRead, Workspace};
+            if cwd.is_empty() {
+                return Err("the thread has no folder to read it in".to_owned());
+            }
+            let ws = Workspace::open(std::path::Path::new(cwd))?;
+            let (target, bytes) = read_unasked(&ws, &path, agent_kit::attachments::MAX_INPUT_BYTES)
+                .map_err(|e| match e {
+                    UnaskedRead::MustAsk { .. } => {
+                        format!("{path} is not one the app reads without asking")
+                    }
+                    UnaskedRead::Failed(why) => why,
+                })?;
+            let name = target.file_name().map(|n| n.to_string_lossy().into_owned());
+            store.ingest_bytes(&bytes, name.as_deref(), origin)
+        }
     }
     .map_err(|e| e.to_string())?;
     Ok(normalised.meta)
@@ -177,4 +197,52 @@ pub fn private_copy(r: &AttachmentRef) -> Result<PathBuf, String> {
 pub fn remove_private_copies() {
     let dir = glib::user_runtime_dir().join("agent-terminal").join("open");
     agent_kit::attachments::remove_private_copies(&dir);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file an agent's tool names (Codex `imageView`) is read only as a read may run without
+    /// asking in the thread's folder: one inside is stored as a tool's image; one outside, or a
+    /// link inside leading out, is not, and says why; inline bytes need no folder.
+    #[test]
+    fn a_viewed_file_is_read_only_inside_the_folder() {
+        use std::os::unix::fs::symlink;
+        let png = agent_kit::attachments::from_base64(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+        )
+        .expect("png");
+        let root = tempfile::tempdir().expect("dir");
+        let work = root.path().join("work");
+        std::fs::create_dir_all(&work).expect("work");
+        std::fs::write(work.join("chart.png"), &png).expect("chart");
+        std::fs::write(root.path().join("away.png"), &png).expect("away");
+        symlink(root.path().join("away.png"), work.join("link.png")).expect("link");
+        let cwd = work.to_string_lossy().into_owned();
+        let file = |path: &str| ToolImageSource::File {
+            path: path.to_owned(),
+        };
+        let inside = ingest_tool_image(
+            file(&work.join("chart.png").to_string_lossy()),
+            Origin::ToolResult,
+            &cwd,
+        )
+        .expect("inside");
+        assert_eq!(inside.origin, Origin::ToolResult);
+        assert_eq!(inside.name.as_deref(), Some("chart.png"));
+        for outside in [
+            root.path().join("away.png").to_string_lossy().into_owned(),
+            "link.png".to_owned(),
+        ] {
+            let refused = ingest_tool_image(file(&outside), Origin::ToolResult, &cwd);
+            assert!(refused.is_err(), "{outside}: {refused:?}");
+        }
+        assert!(ingest_tool_image(file("chart.png"), Origin::ToolResult, "").is_err());
+        let inline = ToolImageSource::Inline {
+            mime: "image/png".into(),
+            data_base64: agent_kit::attachments::to_base64(&png),
+        };
+        assert!(ingest_tool_image(inline, Origin::ToolResult, "").is_ok());
+    }
 }

@@ -303,11 +303,30 @@ fn context_menu(
     popover.set_child(Some(&list));
     popover.set_parent(from);
     popover.set_pointing_to(Some(&gdk::Rectangle::new(at.0 as i32, at.1 as i32, 1, 1)));
-    popover.connect_closed(|p| {
-        // Unparented once closed: a popover must not outlive its menu.
-        let p = p.clone();
-        glib::idle_add_local_once(move || p.unparent());
-    });
+    // The tile can go while its menu is open (its card rebuilt as more images arrive): the
+    // menu closes with it rather than outlive it.
+    let unmapped = from.connect_unmap(glib::clone!(
+        #[weak]
+        popover,
+        move |_| popover.popdown()
+    ));
+    let handler = RefCell::new(Some(unmapped));
+    popover.connect_closed(glib::clone!(
+        #[weak]
+        from,
+        move |p| {
+            if let Some(id) = handler.borrow_mut().take() {
+                from.disconnect(id);
+            }
+            // Unparented once closed: a popover must not outlive its menu.
+            let p = p.clone();
+            glib::idle_add_local_once(move || {
+                if p.parent().is_some() {
+                    p.unparent();
+                }
+            });
+        }
+    ));
     open.connect_clicked(glib::clone!(
         #[weak]
         popover,
@@ -513,14 +532,25 @@ pub fn open_viewer(
     let show = {
         let (refs, agent, current, shown) =
             (refs.clone(), agent.clone(), current.clone(), shown.clone());
+        // Weak: the buttons hold `step`, which holds this; strong widgets here would be a cycle
+        // that keeps every viewer (and its texture) alive after it closes.
         let (title, picture, prev, next, counter) = (
-            title.clone(),
-            picture.clone(),
-            prev.clone(),
-            next.clone(),
-            counter.clone(),
+            title.downgrade(),
+            picture.downgrade(),
+            prev.downgrade(),
+            next.downgrade(),
+            counter.downgrade(),
         );
         Rc::new(move || {
+            let (Some(title), Some(picture), Some(prev), Some(next), Some(counter)) = (
+                title.upgrade(),
+                picture.upgrade(),
+                prev.upgrade(),
+                next.upgrade(),
+                counter.upgrade(),
+            ) else {
+                return;
+            };
             let i = current.get();
             let r = refs[i].clone();
             let heading = r.name.clone().unwrap_or_else(|| "Image".to_owned());
@@ -542,10 +572,13 @@ pub fn open_viewer(
             picture.set_paintable(None::<&gdk::Paintable>);
             picture.update_property(&[gtk4::accessible::Property::Label(&r.accessible_label())]);
             *shown.borrow_mut() = None;
-            let (picture, shown, current) = (picture.clone(), shown.clone(), current.clone());
+            let (picture, shown, current) = (picture.downgrade(), shown.clone(), current.clone());
             glib::spawn_future_local(async move {
                 let loaded = crate::attachments::texture(&r).await;
-                // A later image may have been chosen meanwhile.
+                // A later image may have been chosen meanwhile, or the viewer closed.
+                let Some(picture) = picture.upgrade() else {
+                    return;
+                };
                 if current.get() != i {
                     return;
                 }

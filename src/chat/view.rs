@@ -1470,10 +1470,7 @@ fn image_drop_target(composer: &Rc<Composer>) -> gtk4::DropTarget {
         }
         if let Ok(texture) = value.get::<gdk::Texture>() {
             c.add_image(
-                crate::attachments::Source::Bytes {
-                    bytes: texture.save_to_png_bytes().to_vec(),
-                    name: None,
-                },
+                crate::attachments::Source::Texture(texture),
                 "Dropped image".to_owned(),
             );
             return true;

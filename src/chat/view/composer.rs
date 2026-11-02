@@ -828,13 +828,10 @@ impl Composer {
                 return;
             };
             match texture {
-                Ok(Some(texture)) => {
-                    let bytes = texture.save_to_png_bytes().to_vec();
-                    composer.add_image(
-                        crate::attachments::Source::Bytes { bytes, name: None },
-                        "Pasted image".to_owned(),
-                    );
-                }
+                Ok(Some(texture)) => composer.add_image(
+                    crate::attachments::Source::Texture(texture),
+                    "Pasted image".to_owned(),
+                ),
                 _ => {
                     if let Some(host) = composer.host() {
                         host.notify("The clipboard's image couldn't be read");

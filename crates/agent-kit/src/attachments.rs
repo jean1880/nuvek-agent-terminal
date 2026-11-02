@@ -99,6 +99,44 @@ pub struct Normalised {
     pub bytes: Vec<u8>,
 }
 
+/// How many images may be decoded at once, process-wide. Each decode may hold up to
+/// [`MAX_DECODE_ALLOC`] while it runs; a burst (a turn's tool images, a drop of five files)
+/// waits its turn rather than holding many of those at once.
+const MAX_CONCURRENT_DECODES: usize = 2;
+
+static DECODES: (std::sync::Mutex<usize>, std::sync::Condvar) =
+    (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
+/// One of the [`MAX_CONCURRENT_DECODES`] decode slots, given back when dropped.
+struct DecodeSlot;
+
+impl DecodeSlot {
+    fn take() -> Self {
+        let (count, freed) = &DECODES;
+        let mut n = count
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *n >= MAX_CONCURRENT_DECODES {
+            n = freed
+                .wait(n)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *n += 1;
+        DecodeSlot
+    }
+}
+
+impl Drop for DecodeSlot {
+    fn drop(&mut self) {
+        let (count, freed) = &DECODES;
+        let mut n = count
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *n = n.saturating_sub(1);
+        freed.notify_one();
+    }
+}
+
 /// Reads `input` as an image, scales it to fit [`MAX_EDGE`] and encodes it again (PNG, or JPEG
 /// when the PNG is over [`MAX_PNG_BYTES`]). `name` is the original file name, kept redacted and
 /// reduced to its last component; `origin` says who put the image in the thread.
@@ -117,10 +155,13 @@ pub fn normalise(
     ) {
         return Err(AttachError::NotAnImage);
     }
-    let image = decode(input, format)?;
-    let image = fit(image);
-    let (width, height) = (image.width(), image.height());
-    let (bytes, mime) = encode(image)?;
+    let ((width, height), bytes, mime) = {
+        let _slot = DecodeSlot::take();
+        let image = fit(decode(input, format)?);
+        let size = (image.width(), image.height());
+        let (bytes, mime) = encode(image)?;
+        (size, bytes, mime)
+    };
     let id = hex_sha256(&bytes);
     Ok(Normalised {
         meta: AttachmentRef {
@@ -366,6 +407,14 @@ impl BlobStore {
             drop(file);
             match std::fs::symlink_metadata(&target) {
                 Ok(m) if m.file_type().is_file() && m.len() == n.bytes.len() as u64 => {
+                    // Already stored: used again now, so the sweep's grace starts over (it
+                    // judges a blob by when it was last written, and a message holding it may
+                    // not be stored yet).
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NOFOLLOW)
+                        .open(&target)?
+                        .set_modified(SystemTime::now())?;
                     std::fs::remove_file(&tmp)
                 }
                 // Missing, damaged or not a file: the rename replaces the entry itself, never
@@ -852,7 +901,24 @@ mod tests {
             .expect("ingest");
         let path = store.path_of(&n.meta).expect("path");
         assert_eq!(path, store.dir().join(format!("{}.png", n.meta.id)));
+        // Stored again (attached again), the blob counts as just used: the sweep's grace starts
+        // over, so an old image attached anew is never swept while its message is queued.
+        let old = SystemTime::now() - Duration::from_secs(3 * 24 * 60 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open")
+            .set_modified(old)
+            .expect("age");
         assert_eq!(store.put(&n).expect("again"), path);
+        let touched = std::fs::metadata(&path)
+            .expect("meta")
+            .modified()
+            .expect("mtime");
+        assert!(
+            touched > old + Duration::from_secs(60),
+            "reuse refreshed the time"
+        );
         assert_eq!(names(store.dir()), [format!("{}.png", n.meta.id)]);
         let mode = |p: &Path| std::fs::metadata(p).expect("meta").permissions().mode() & 0o777;
         assert_eq!(mode(&path), 0o600);

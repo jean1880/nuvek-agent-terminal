@@ -439,9 +439,43 @@ Architectural mandates, standards, and workflows for this codebase.
   request's connection (`ChatClient::cancel`). A call from a reply that was cut off or broke
   off never runs, and every call of an interrupted reply gets an answer: one a Stop ended while
   it ran keeps what it gave back (a writing one is said to have an unknown outcome), never "not
-  run". History is sent and kept in whole exchanges. It is never a delegation parent or child
-  (`RouteBlocker::LocalAgentNoBridge`). Its conversation is a `0600` file under
-  `$XDG_STATE_HOME/agent-terminal/local`, which uninstall removes with the state folder.
+  run". History is sent and kept in whole exchanges. Its conversation is a `0600` file under
+  `$XDG_STATE_HOME/agent-terminal/local`, which uninstall removes with the state folder. The
+  server key variable is removed from the runner's own environment once read, so no command
+  inherits it.
+- **The Local agent delegates through its own client, never a bridge process**: its binding is
+  the open binding (`launch::prepare_with`), which `LocalAdapter` takes through
+  `Adapter::bind_launch` into exactly one startup frame (`Command::ConfigureLocal`'s `bridge`;
+  never argv, never an environment, a start nobody staged carries none). The runner connects
+  `agent_kit::delegation_client` with it, so the capability lives only in its memory: no
+  command it runs, nor any MCP server, ever holds it (a user definition can neither run the
+  bridge nor be named as it). The supervisor accepts a Local hello only from that generation's
+  own process: the kernel's peer pid and the hello's must both be the runner's
+  (`ops::local_peer_ok`). The `cross_agent_*` tools are the app's own (never MCP aliases),
+  offered only while the client is connected (`cross_agent_capabilities` alone while degraded),
+  with no card in any mode, a plan included: the supervisor judges each call, as for every
+  other agent. Each call is shown first under a key the runner mints
+  (`InvocationKey::Local`), with exactly the arguments sent, and the supervisor denies one not
+  observed so (as for agy); arguments holding a credential the runner holds are never sent. A
+  delegated child's frame also carries its policy (`LocalChildPolicy`): the runner asks the app
+  before every write and command in every mode (`local_agent::child_gate`), so
+  `ChildAuthority::judge` sees each one (its Accept edits is answered by the app inside the
+  lease, `local_child_accept_edit`), is offered only what its mode and declared capabilities
+  allow, never widens its mode, refuses a frame with a user MCP server or without its binding,
+  fails a turn whose model cannot call tools, and reports the policy it applied before its
+  session starts; the child takes its task only once that is read back (`Readback`). A spawn
+  on a model its server does not list, or says cannot call tools, is refused; a requested
+  effort is ignored with a warning. Route admission waits on the four Local gates
+  (`LocalBridgeBinding`, `LocalPeerPin`, `LocalAttestation`, `LocalChildSupervision`), proven
+  by `local.proof.json`. A delegation root's new Local settings never restart it under live
+  sub-agents (`DelegationHooks::holds_restart`): they wait, then apply as a planned rotation.
+  `tests/local_delegation.rs` and `supervisor::tests::local_tests` prove these on the real
+  runner. **Residual risk (not closed):** the capability is in the runner's memory, readable by
+  a same-user process allowed to trace it (Yama `ptrace_scope` 0, or a debugger); the peer pin
+  makes it useless from any other process. Local attestation is the runner vouching for
+  itself: it proves consistency, not independence. The model server is outside supervision: it
+  receives the task, file contents and results, and a proxy may forward them to a cloud model
+  or run tools of its own that no gate sees.
 - **The Local agent's instructions and MCP tools are the user's, configured in the app, never
   found at launch**: the runner takes one validated `LocalLaunchContext` on stdin
   (`Command::ConfigureLocal`, before any prompt; never argv). Instruction files

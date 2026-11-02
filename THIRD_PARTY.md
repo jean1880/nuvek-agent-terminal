@@ -20,6 +20,17 @@ server-supplied schema cannot make validation backtrack. The Codex importer read
 `config.toml` with `toml` 1.1.8 (<https://github.com/toml-rs/toml>, MIT or Apache-2.0).
 Both are compiled into the executable and covered by the cargo-deny policy.
 
+## Image attachment crates
+
+Attached images (`agent_kit::attachments`) are decoded, scaled and encoded again with
+`image` 0.25.10 (<https://github.com/image-rs/image>, MIT or Apache-2.0), built without its
+default features and with only its PNG, JPEG, WebP and GIF codecs, all pure Rust (`png`,
+`zune-jpeg`, `image-webp`, `gif`). Stored images are named by their SHA-256 with `sha2`
+0.10.9 (<https://github.com/RustCrypto/hashes>, MIT or Apache-2.0) and sent inline as
+base64 with `base64` 0.23.1 (<https://github.com/marshallpierce/rust-base64>, MIT or
+Apache-2.0). They are compiled into the executable, link no system library, and are covered
+by the cargo-deny policy.
+
 ## T3 Code
 
 Parts of `crates/agent-core` port logic from T3 Code (<https://github.com/pingdotgg/t3code>):
@@ -64,10 +75,10 @@ system theme's name; the shapes are unchanged. Adapted files remain under CC BY-
 `scalable/actions/` (each as `at-<name>-symbolic.svg`):
 action-unavailable, applications-engineering, chat-message-new, dialog-error, dialog-information,
 dialog-question, dialog-warning, document-edit, document-open-recent, document-properties,
-edit-copy, edit-undo, emblem-system, folder, format-text-italic, go-bottom, go-down, go-next, go-up, list-add,
-media-playback-stop, network-server, object-select, pan-down, pan-end, pan-up, security-high,
+document-save, edit-copy, edit-undo, emblem-system, folder, format-text-italic, go-bottom, go-down,
+go-next, go-previous, go-up, image-missing, list-add, mail-attachment, media-playback-stop, network-server, object-select, pan-down, pan-end, pan-up, security-high,
 security-medium, sidebar-show, system-search, system-users, utilities-terminal,
-view-list-bullet, view-refresh, window-close, x-office-document.
+view-list-bullet, view-refresh, window-close, x-office-document, zoom-original.
 
 ### GNOME Icon Development Kit (CC0 1.0)
 

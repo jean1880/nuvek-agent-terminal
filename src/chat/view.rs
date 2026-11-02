@@ -25,6 +25,7 @@ mod form_card;
 mod form_draft;
 mod git_card;
 mod header;
+mod images;
 mod interruption;
 pub(crate) mod markdown;
 pub mod model;
@@ -37,6 +38,7 @@ mod subagent_shelf;
 mod subagents;
 mod thinking;
 mod transcript;
+mod tray;
 mod typeahead;
 pub mod usage;
 
@@ -347,6 +349,7 @@ impl ChatView {
         view.append(&bottom);
 
         inner.transcript.connect_load_older(inner.model.clone());
+        view.add_controller(image_drop_target(&inner.composer));
         let host: Rc<dyn ComposerHost> = inner.clone();
         inner.composer.set_host(Rc::downgrade(&host));
         inner.connect_header();
@@ -1426,6 +1429,66 @@ fn polls_context(driver: Driver) -> bool {
     !matches!(driver, Driver::Codex)
 }
 
+/// Images dropped anywhere on the thread (its transcript or its composer) are attached to the
+/// next message; the composer shows "Drop images to attach" while they are over it. Files that
+/// are not images are refused with a toast.
+fn image_drop_target(composer: &Rc<Composer>) -> gtk4::DropTarget {
+    let target = gtk4::DropTarget::new(glib::Type::INVALID, gdk::DragAction::COPY);
+    target.set_types(&[gdk::FileList::static_type(), gdk::Texture::static_type()]);
+    let weak = Rc::downgrade(composer);
+    target.connect_enter(move |_, _, _| {
+        if let Some(c) = weak.upgrade() {
+            c.set_drop_hint(true);
+        }
+        gdk::DragAction::COPY
+    });
+    let weak = Rc::downgrade(composer);
+    target.connect_leave(move |_| {
+        if let Some(c) = weak.upgrade() {
+            c.set_drop_hint(false);
+        }
+    });
+    let weak = Rc::downgrade(composer);
+    target.connect_drop(move |_, value, _, _| {
+        let Some(c) = weak.upgrade() else {
+            return false;
+        };
+        c.set_drop_hint(false);
+        if let Ok(files) = value.get::<gdk::FileList>() {
+            let paths: Vec<_> = files.files().iter().filter_map(|f| f.path()).collect();
+            let (images, others): (Vec<_>, Vec<_>) = paths
+                .into_iter()
+                .partition(|p| composer::looks_like_image(p));
+            if !others.is_empty() {
+                c.notify_host("Only images can be attached");
+            }
+            for path in images {
+                let what = composer::file_label(&path);
+                c.add_image(crate::attachments::Source::File(path), what);
+            }
+            return true;
+        }
+        if let Ok(texture) = value.get::<gdk::Texture>() {
+            c.add_image(
+                crate::attachments::Source::Texture(texture),
+                "Dropped image".to_owned(),
+            );
+            return true;
+        }
+        false
+    });
+    target
+}
+
+/// Why the thread's agent cannot take images, in its own words ("Antigravity can't take images
+/// (its input is text only)."), or `None` when it can.
+fn image_refusal(status: &SessionStatus) -> Option<String> {
+    status.capabilities.unsupported_note(
+        agent_core::caps::Feature::ImageInput,
+        status.driver.info().label,
+    )
+}
+
 /// The notice for a whole prompt that is a built-in this agent cannot back (`/mcp` on Codex):
 /// what it lacks, as the greyed-control tooltip would say. `None` for anything else, including
 /// a command the agent lists itself (that one is the agent's to run).
@@ -1479,13 +1542,41 @@ fn help_text(caps: &agent_core::caps::Capabilities, agent: &str) -> String {
 
 impl ComposerHost for Inner {
     fn submit(&self, text: &str) {
+        self.submit_input(crate::chat::PromptInput::text(text));
+    }
+
+    fn submit_input(&self, input: crate::chat::PromptInput) -> bool {
         let status = self.backend.status();
+        if !input.images.is_empty() {
+            // Refused before anything is sent: the message and its images stay in the composer.
+            if let Some(why) = image_refusal(&status) {
+                self.notify(&why);
+                return false;
+            }
+            self.transcript.scroll_to_end();
+            if !status.running_turn {
+                self.subagent_shelf.clear_finished();
+                self.refresh_subagents(&[]);
+            }
+            if status.running_turn && status.capabilities.live_input {
+                self.backend.steer_input(&input);
+            } else if status.running_turn {
+                self.backend.queue_input(&input);
+            } else {
+                self.backend.send_input(&input);
+            }
+            if let Some(me) = self.view().and_then(|v| v.inner()) {
+                me.refresh_status();
+            }
+            return true;
+        }
+        let text = input.text.as_str();
         if let Some(cl) = typeahead::parse_command_line(text, &status.capabilities) {
             // Built-ins never reach the agent.
             if let Some(me) = self.view().and_then(|v| v.inner()) {
                 me.run_action(cl.builtin.action, &cl.args);
             }
-            return;
+            return true;
         }
         if let Some(note) = unavailable_builtin_note(text, &status) {
             // A built-in this agent cannot back: say so rather than send it as a prompt.
@@ -1493,7 +1584,7 @@ impl ComposerHost for Inner {
                 let changes = me.model.borrow_mut().push_notice(note, Tone::Info);
                 me.handle(changes);
             }
-            return;
+            return true;
         }
         // What you just sent, and the reply to it, are where the view goes.
         self.transcript.scroll_to_end();
@@ -1515,6 +1606,7 @@ impl ComposerHost for Inner {
         if let Some(me) = self.view().and_then(|v| v.inner()) {
             me.refresh_status();
         }
+        true
     }
 
     fn interrupt(&self) {
@@ -1535,12 +1627,26 @@ impl ComposerHost for Inner {
     }
 
     fn pop_queued_prompt(&self) -> Option<String> {
-        let (id, text) = self.backend.pop_queued_prompt()?;
+        self.pop_queued_input().map(|input| input.text)
+    }
+
+    fn pop_queued_input(&self) -> Option<crate::chat::PromptInput> {
+        let (id, input) = self.backend.pop_queued_input()?;
         let changes = self.model.borrow_mut().remove_item(&id);
         if let Some(me) = self.view().and_then(|v| v.inner()) {
             me.handle(changes);
         }
-        Some(text)
+        Some(input)
+    }
+
+    fn image_note(&self) -> Option<String> {
+        image_refusal(&self.backend.status())
+    }
+
+    fn notify(&self, text: &str) {
+        if let Some(overlay) = self.view().and_then(|v| v.toast_overlay()) {
+            overlay.add_toast(adw::Toast::new(text));
+        }
     }
 
     fn command_items(&self, trigger: &Trigger) -> Vec<agent_core::commands::CompletionItem> {

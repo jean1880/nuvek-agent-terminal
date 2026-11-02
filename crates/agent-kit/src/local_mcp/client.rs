@@ -719,7 +719,11 @@ async fn worker(
                         // The call ran: keep its result even when a key must be masked, or
                         // the model would read a completed call as failed and run it again.
                         Ok(mut value) => {
-                            server.process.scrubber.value_lossy(&mut value);
+                            // Image data is held aside: masking would corrupt it, and it only
+                            // ever reaches the user (`scrub_outside_image_data`).
+                            agent_core::local_mcp::scrub_outside_image_data(&mut value, |v| {
+                                server.process.scrubber.value_lossy(v)
+                            });
                             Ok(value)
                         }
                         Err(reason) => {

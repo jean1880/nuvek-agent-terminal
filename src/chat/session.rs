@@ -44,7 +44,7 @@ mod reply_questions;
 pub(crate) use delegated::{HeldNews, TakenNews, WakeOutcome};
 pub(crate) use limit::ContinueOutcome;
 
-use super::{ChatBackend, EnvelopeSink, SessionStatus};
+use super::{ChatBackend, EnvelopeSink, PromptImage, PromptInput, SessionStatus};
 use crate::agent_proc::{
     run_side, AgentEnv, AgentProcess, ExitWatch, SpawnSpec, StopPhase, AGY_TIMEOUT,
 };
@@ -268,6 +268,9 @@ fn consume_for_step(approval: &ApprovalHandle, exact: Option<&str>, tools: &[&st
 /// Room assumed for the user's next prompt when budgeting a handoff, in budget units.
 const HANDOFF_PROMPT_ALLOWANCE: usize = 2_048;
 
+/// The most open `show_image` calls a session remembers (an agent may run a few at once).
+const SHOW_IMAGE_CALLS_KEPT: usize = 16;
+
 struct State {
     model: Option<String>,
     /// Reasoning effort of the running session (Claude `--effort`); `None` is the agent's own.
@@ -437,6 +440,15 @@ struct Inner {
     thinking: ThinkingFlag,
     /// User input written before Claude's init, retained only for the thinking-flag retry.
     pre_init_prompts: RefCell<Vec<Sent>>,
+    /// Tool images shown in the running turn ([`agent_core::attachment::MAX_PER_TURN`]).
+    turn_images: Cell<usize>,
+    /// The open calls to our own `show_image`, by item id, oldest first: where the images such
+    /// a call shows go ([`ChatSession::show_agent_images`]).
+    show_image_calls: RefCell<std::collections::VecDeque<String>>,
+    /// Each top-level reply's text while it is open, for the local images it names.
+    reply_texts: RefCell<std::collections::HashMap<String, String>>,
+    /// Queued messages with images the user was told this agent cannot take, so it is said once.
+    image_waits_told: RefCell<std::collections::HashSet<String>>,
     /// Open Codex permission requests, by request id: what the answer may be (see
     /// [`Inner::gate_codex_permissions`]). Never a rule.
     codex_permissions: RefCell<HashMap<String, PermissionCard>>,
@@ -634,6 +646,8 @@ struct ThinkingFlag {
 struct QueuedPrompt {
     item_id: String,
     text: String,
+    /// The images sent with it; they wait with it, and go back to the composer with it.
+    images: Vec<PromptImage>,
     stored: bool,
     /// Written while a switch waited to read the thread: meant for its new agent, so held if
     /// the switch does not go ahead ([`Inner::hold_for_switch`]).
@@ -643,6 +657,7 @@ struct QueuedPrompt {
 struct Sent {
     text: String,
     handoff: Option<Handoff>,
+    images: Vec<PromptImage>,
 }
 
 /// The session's machinery at work ([`Inner::work_in_flight`]), with the words each check
@@ -808,6 +823,33 @@ impl From<Rc<Store>> for SessionStore {
 }
 
 impl ChatSession {
+    /// Shows images an agent's `show_image` call read (already stored) on that call's own tool
+    /// item, persisted as [`Event::Attachments`]: the item `exact` names (from the call's
+    /// invocation key) when it is an open `show_image` call, else the newest open one
+    /// ([`agent_core::delegation::correlation::show_image_item`]). They count toward the turn's
+    /// [`agent_core::attachment::MAX_PER_TURN`]; returns how many (the first ones) were shown, or
+    /// why none could be when there is no call to show them on.
+    pub fn show_agent_images(
+        &self,
+        exact: Option<String>,
+        refs: Vec<agent_core::attachment::AttachmentRef>,
+    ) -> Result<usize, String> {
+        use agent_core::attachment::{MAX_PER_ITEM, MAX_PER_TURN};
+        let inner = &self.inner;
+        let open: Vec<String> = inner.show_image_calls.borrow().iter().cloned().collect();
+        let item = agent_core::delegation::correlation::show_image_item(exact, &open)
+            .ok_or_else(|| "the tool call to show it on was not found".to_owned())?;
+        let used = inner.turn_images.get();
+        let room = MAX_PER_TURN.saturating_sub(used).min(MAX_PER_ITEM);
+        let shown: Vec<_> = refs.into_iter().take(room).collect();
+        let n = shown.len();
+        if n > 0 {
+            inner.turn_images.set(used + n);
+            inner.emit(Envelope::new(Event::Attachments { refs: shown }).item(item));
+        }
+        Ok(n)
+    }
+
     /// Starts the agent process and returns the live session.
     ///
     /// - `open` describes the process; its `approval_hook` field is overwritten from `approval`
@@ -995,6 +1037,10 @@ impl ChatSession {
             approval_deadline: Cell::new(crate::approval_server::DEFAULT_DEADLINE),
             thinking: ThinkingFlag::default(),
             pre_init_prompts: RefCell::new(Vec::new()),
+            turn_images: Cell::new(0),
+            show_image_calls: RefCell::new(std::collections::VecDeque::new()),
+            reply_texts: RefCell::default(),
+            image_waits_told: RefCell::default(),
             codex_permissions: RefCell::new(HashMap::new()),
             codex_grants: RefCell::new(Vec::new()),
             held_permissions: RefCell::new(HashSet::new()),
@@ -1437,6 +1483,15 @@ impl Inner {
 
     /// Persists (under the current provider thread), updates the status, then delivers.
     fn emit(&self, env: Envelope) {
+        if let Event::ToolImage { image } = env.event {
+            self.store_tool_image(env.item, image);
+            return;
+        }
+        if matches!(env.event, Event::TurnStarted { .. }) {
+            self.turn_images.set(0);
+        }
+        self.track_show_image_calls(&env);
+        self.track_reply_images(&env);
         let delivery = ScopedFlag::set(&self.delivering);
         // A prompted turn ran on this native session: there is a conversation to resume.
         if self.prompted.get() && matches!(env.event, Event::TurnCompleted { .. }) {
@@ -3511,7 +3566,7 @@ impl Inner {
         }
         self.start_process();
         for sent in prompts {
-            if !self.dispatch_in_flight(&sent.text, sent.handoff.clone()) {
+            if !self.dispatch_in_flight(&sent.text, sent.handoff.clone(), &sent.images) {
                 self.held_retries.borrow_mut().push_back(sent);
             }
         }
@@ -4064,29 +4119,26 @@ impl Inner {
     }
 
     fn queue_prompt(self: &Rc<Self>, text: &str) {
+        self.queue_input(&PromptInput::text(text));
+    }
+
+    fn queue_input(self: &Rc<Self>, input: &PromptInput) {
         // A message written first is what goes on, not a "Continue in" still waiting.
         self.continue_on_switch_to.set(None);
         let item = glib::uuid_string_random().to_string();
 
-        self.deliver(
-            &Envelope::new(Event::ItemStarted {
-                kind: ItemKind::UserMessage,
-                title: "queued".to_string(),
-                input: Some(serde_json::json!({"queued": true})),
-                parent: None,
-            })
-            .item(item.clone()),
-        );
+        self.deliver(&user_message_started(&item, true, &input.images));
         self.deliver(
             &Envelope::new(Event::ContentSnapshot {
                 stream: StreamKind::Assistant,
-                text: agent_core::redact::redact(text),
+                text: agent_core::redact::redact(&input.text),
             })
             .item(item.clone()),
         );
         self.queued_prompts.borrow_mut().push_back(QueuedPrompt {
             item_id: item,
-            text: text.to_owned(),
+            text: input.text.clone(),
+            images: input.images.clone(),
             stored: false,
             for_switch: self.switch_reading.get(),
         });
@@ -4100,44 +4152,45 @@ impl Inner {
     /// ride on a real prompt. A write the adapter refuses turns the shown message into a queued
     /// one, so it is never lost.
     fn steer_prompt(self: &Rc<Self>, text: &str) {
+        self.steer_input(&PromptInput::text(text));
+    }
+
+    fn steer_input(self: &Rc<Self>, input: &PromptInput) {
+        let text = input.text.as_str();
         self.continue_on_switch_to.set(None);
         // A switch waiting to read the thread: the message is for its new agent, never a live
         // write into the outgoing one. It queues (and is held if the switch does not happen).
         if self.switch_reading.get() {
-            return self.queue_prompt(text);
+            return self.queue_input(input);
         }
         // The user writes again after a dropped switch's notice: what it held goes as usual.
         self.release_switch_hold();
         if !self.root_prompt_allowed() {
-            return self.queue_prompt(text);
+            return self.queue_input(input);
         }
         if !self.state.borrow().running_turn {
-            return self.send_prompt(text);
+            return self.send_input(input);
         }
         let live = self.adapter.borrow().capabilities().live_input;
         let handoff_waiting =
             self.pending_handoff.borrow().is_some() && !self.handoff_in_flight.get();
         if !live || Self::is_slash_command(text) || handoff_waiting {
-            return self.queue_prompt(text);
+            return self.queue_input(input);
         }
         let pt = self.provider_thread.borrow().clone();
         let provider = (!pt.is_empty()).then_some(pt.as_str());
-        let (item, stored) = match self.store.append_user_message(&self.thread, provider, text) {
-            Ok(item) => (item, true),
-            Err(e) => {
-                warn!(error = %e, "could not persist the user message");
-                (glib::uuid_string_random().to_string(), false)
-            }
-        };
-        self.deliver(
-            &Envelope::new(Event::ItemStarted {
-                kind: ItemKind::UserMessage,
-                title: String::new(),
-                input: None,
-                parent: None,
-            })
-            .item(item.clone()),
-        );
+        let (item, stored) =
+            match self
+                .store
+                .append_user_input(&self.thread, provider, text, &input.refs())
+            {
+                Ok(item) => (item, true),
+                Err(e) => {
+                    warn!(error = %e, "could not persist the user message");
+                    (glib::uuid_string_random().to_string(), false)
+                }
+            };
+        self.deliver(&user_message_started(&item, false, &input.images));
         self.deliver(
             &Envelope::new(Event::ContentSnapshot {
                 stream: StreamKind::Assistant,
@@ -4152,10 +4205,13 @@ impl Inner {
                 || text.to_owned(),
                 |news| agent_core::delegation::wake::with_user_prompt(news.text(), text),
             );
-            let accepted = self.command(Command::Steer { text: sent.clone() });
+            let accepted = self.command(Command::Steer {
+                attachments: input.wire(),
+                text: sent.clone(),
+            });
             // Kept before settling, so news given back is taken out of the replayed copy too.
             if accepted {
-                self.remember_pre_init_prompt(&sent, None);
+                self.remember_pre_init_prompt(&sent, None, &input.images);
             }
             self.settle_news(news, accepted, &sent, text);
             if accepted {
@@ -4163,30 +4219,27 @@ impl Inner {
             }
         }
         // Refused: it waits for the turn to end, as a message sent mid-turn always did.
-        self.deliver(
-            &Envelope::new(Event::ItemStarted {
-                kind: ItemKind::UserMessage,
-                title: "queued".to_string(),
-                input: Some(serde_json::json!({"queued": true})),
-                parent: None,
-            })
-            .item(item.clone()),
-        );
+        self.deliver(&user_message_started(&item, true, &input.images));
         self.queued_prompts.borrow_mut().push_back(QueuedPrompt {
             item_id: item,
             text: text.to_owned(),
+            images: input.images.clone(),
             stored,
             for_switch: self.switch_reading.get(),
         });
     }
 
     fn send_prompt(self: &Rc<Self>, text: &str) {
+        self.send_input(&PromptInput::text(text));
+    }
+
+    fn send_input(self: &Rc<Self>, input: &PromptInput) {
         // The user wrote before a "Continue in" switch was made: that message is what goes on.
         self.continue_on_switch_to.set(None);
         if self.rebinding.get() || self.switch_reading.get() {
             // Nothing runs until the rebind starts the next generation, or the switch its new
             // process, which then sends the queue.
-            self.queue_prompt(text);
+            self.queue_input(input);
             return;
         }
         self.release_switch_hold();
@@ -4198,32 +4251,41 @@ impl Inner {
             || self.delivering.get()
             || !self.state.borrow().running_turn && waiting
         {
-            self.queue_prompt(text);
+            self.queue_input(input);
             self.dispatch_queued_prompt();
             return;
         }
-        self.send_prompt_now(text);
+        self.send_input_now(input);
     }
 
     /// A confirmed switch's continuation opens its own turn before queued user input.
     fn send_prompt_now(self: &Rc<Self>, text: &str) {
+        self.send_input_now(&PromptInput::text(text));
+    }
+
+    fn send_input_now(self: &Rc<Self>, input: &PromptInput) {
+        let text = input.text.as_str();
         if !self.root_prompt_allowed() {
-            self.queue_prompt(text);
+            self.queue_input(input);
             return;
         }
         if !self.state.borrow().running_turn && !self.apply_retired() {
-            self.queue_prompt(text);
+            self.queue_input(input);
             return;
         }
         let pt = self.provider_thread.borrow().clone();
         let provider = (!pt.is_empty()).then_some(pt.as_str());
-        let (item, stored) = match self.store.append_user_message(&self.thread, provider, text) {
-            Ok(item) => (item, true),
-            Err(e) => {
-                warn!(error = %e, "could not persist the user message");
-                (glib::uuid_string_random().to_string(), false)
-            }
-        };
+        let (item, stored) =
+            match self
+                .store
+                .append_user_input(&self.thread, provider, text, &input.refs())
+            {
+                Ok(item) => (item, true),
+                Err(e) => {
+                    warn!(error = %e, "could not persist the user message");
+                    (glib::uuid_string_random().to_string(), false)
+                }
+            };
 
         // The handoff rides on the next real prompt: never on a slash command (it would stop
         // being one), nor twice while the turn that carries it runs. It is spent only when that
@@ -4235,15 +4297,7 @@ impl Inner {
             self.pending_handoff.borrow().clone()
         };
 
-        self.deliver(
-            &Envelope::new(Event::ItemStarted {
-                kind: ItemKind::UserMessage,
-                title: String::new(),
-                input: None,
-                parent: None,
-            })
-            .item(item.clone()),
-        );
+        self.deliver(&user_message_started(&item, false, &input.images));
         self.deliver(
             &Envelope::new(Event::ContentSnapshot {
                 stream: StreamKind::Assistant,
@@ -4261,10 +4315,11 @@ impl Inner {
         let queued = QueuedPrompt {
             item_id: item,
             text: text.to_owned(),
+            images: input.images.clone(),
             stored,
             for_switch: false,
         };
-        let accepted = self.dispatch_in_flight(&sent, handoff);
+        let accepted = self.dispatch_in_flight(&sent, handoff, &input.images);
         self.settle_news(news, accepted, &sent, text);
         if accepted {
             self.note_unspawned_prompt(queued);
@@ -4293,25 +4348,22 @@ impl Inner {
     }
 
     fn hold_queued_prompt(&self, queued: QueuedPrompt) {
-        let item = queued.item_id.clone();
+        let started = user_message_started(&queued.item_id, true, &queued.images);
         self.queued_prompts.borrow_mut().push_front(queued);
         self.prompt_in_flight.set(false);
-        self.deliver(
-            &Envelope::new(Event::ItemStarted {
-                kind: ItemKind::UserMessage,
-                title: "queued".to_owned(),
-                input: Some(serde_json::json!({"queued": true})),
-                parent: None,
-            })
-            .item(item),
-        );
+        self.deliver(&started);
     }
 
     /// [`Self::dispatch_sent_prompt`], with a prompt counted in flight while it goes and no
     /// longer once the adapter refused it.
-    fn dispatch_in_flight(self: &Rc<Self>, sent: &str, handoff: Option<Handoff>) -> bool {
+    fn dispatch_in_flight(
+        self: &Rc<Self>,
+        sent: &str,
+        handoff: Option<Handoff>,
+        images: &[PromptImage],
+    ) -> bool {
         self.prompt_in_flight.set(true);
-        let accepted = self.dispatch_sent_prompt(sent, handoff);
+        let accepted = self.dispatch_sent_prompt(sent, handoff, images);
         if !accepted {
             self.prompt_in_flight.set(false);
         }
@@ -4371,7 +4423,12 @@ impl Inner {
     }
 
     /// Sends `sent` as a prompt; true when the adapter took it.
-    fn dispatch_sent_prompt(self: &Rc<Self>, sent: &str, handoff: Option<Handoff>) -> bool {
+    fn dispatch_sent_prompt(
+        self: &Rc<Self>,
+        sent: &str,
+        handoff: Option<Handoff>,
+        images: &[PromptImage],
+    ) -> bool {
         // New Local settings first: their restart is a planned rotation for a delegation root,
         // which the rebind gate below then binds again before the prompt goes.
         if !self.prepare_local_context() {
@@ -4393,11 +4450,16 @@ impl Inner {
             self.state.borrow_mut().running_turn = true;
         }
         let accepted = self.command(Command::Prompt {
+            attachments: PromptInput {
+                text: String::new(),
+                images: images.to_vec(),
+            }
+            .wire(),
             text: sent.to_owned(),
         });
         if accepted {
             self.prompted.set(true);
-            self.remember_pre_init_prompt(sent, handoff.clone());
+            self.remember_pre_init_prompt(sent, handoff.clone(), images);
         }
         if !accepted && starts_turn {
             self.state.borrow_mut().running_turn = was_running;
@@ -4413,11 +4475,17 @@ impl Inner {
         accepted
     }
 
-    fn remember_pre_init_prompt(&self, text: &str, handoff: Option<Handoff>) {
+    fn remember_pre_init_prompt(
+        &self,
+        text: &str,
+        handoff: Option<Handoff>,
+        images: &[PromptImage],
+    ) {
         if self.adapter.borrow().driver() == Driver::Claude && !self.thinking.init_seen.get() {
             self.pre_init_prompts.borrow_mut().push(Sent {
                 text: text.to_owned(),
                 handoff,
+                images: images.to_vec(),
             });
         }
     }
@@ -4469,7 +4537,7 @@ impl Inner {
             }
             let retry = self.held_retries.borrow_mut().pop_front();
             if let Some(retry) = retry {
-                if !self.dispatch_in_flight(&retry.text, retry.handoff.clone()) {
+                if !self.dispatch_in_flight(&retry.text, retry.handoff.clone(), &retry.images) {
                     self.held_retries.borrow_mut().push_front(retry);
                     return;
                 }
@@ -4479,45 +4547,39 @@ impl Inner {
                 }
                 continue;
             }
-            let queued = self.queued_prompts.borrow_mut().pop_front();
-            let Some(queued) = queued else { return };
+            let Some(queued) = self.next_sendable_queued() else {
+                return;
+            };
             if !self.apply_retired() {
                 self.queued_prompts.borrow_mut().push_front(queued);
                 return;
             }
             let generation = self.generation.get();
-            self.deliver(
-                &Envelope::new(Event::ItemStarted {
-                    kind: ItemKind::UserMessage,
-                    title: String::new(),
-                    input: None,
-                    parent: None,
-                })
-                .item(queued.item_id.clone()),
-            );
+            self.deliver(&user_message_started(
+                &queued.item_id,
+                false,
+                &queued.images,
+            ));
             // The sink can close or switch this session. Keep the message unsent in that case.
             if generation != self.generation.get() || self.state.borrow().running_turn {
-                let item = queued.item_id.clone();
+                let started = user_message_started(&queued.item_id, true, &queued.images);
                 self.queued_prompts.borrow_mut().push_front(queued);
-                self.deliver(
-                    &Envelope::new(Event::ItemStarted {
-                        kind: ItemKind::UserMessage,
-                        title: "queued".to_owned(),
-                        input: Some(serde_json::json!({"queued": true})),
-                        parent: None,
-                    })
-                    .item(item),
-                );
+                self.deliver(&started);
                 return;
             }
             let pt = self.provider_thread.borrow().clone();
             let provider = (!pt.is_empty()).then_some(pt.as_str());
             if !queued.stored {
-                if let Err(e) = self.store.append_user_message_with_id(
+                if let Err(e) = self.store.append_user_input_with_id(
                     &self.thread,
                     provider,
                     &queued.item_id,
                     &queued.text,
+                    &queued
+                        .images
+                        .iter()
+                        .map(|i| i.meta.clone())
+                        .collect::<Vec<_>>(),
                 ) {
                     warn!(error = %e, "could not persist the queued user message");
                 }
@@ -4539,7 +4601,7 @@ impl Inner {
                 stored: true,
                 ..queued
             };
-            let accepted = self.dispatch_in_flight(&sent, handoff);
+            let accepted = self.dispatch_in_flight(&sent, handoff, &queued.images);
             self.settle_news(news, accepted, &sent, &queued.text);
             if !accepted {
                 self.hold_queued_prompt(queued);
@@ -4553,13 +4615,68 @@ impl Inner {
         }
     }
 
+    /// The first queued message the agent can take, out of the queue. One with images waits while
+    /// the agent cannot take them (it may have been written for another agent before a switch):
+    /// sending its words alone would lose them, and refusing it at every dispatch would hold up
+    /// every message behind it. The user is told once; Up takes it back, and a switch to an
+    /// agent that takes images sends it.
+    fn next_sendable_queued(&self) -> Option<QueuedPrompt> {
+        let takes_images = self.adapter.borrow().capabilities().image_input;
+        let at = {
+            let queue = self.queued_prompts.borrow();
+            let at = queue
+                .iter()
+                .position(|q| takes_images || q.images.is_empty());
+            let waiting: Vec<String> = queue
+                .iter()
+                .filter(|q| !takes_images && !q.images.is_empty())
+                .map(|q| q.item_id.clone())
+                .collect();
+            drop(queue);
+            let fresh: Vec<String> = waiting
+                .into_iter()
+                .filter(|id| self.image_waits_told.borrow_mut().insert(id.clone()))
+                .collect();
+            if !fresh.is_empty() {
+                let agent = self.adapter.borrow().driver().info().label;
+                self.emit(Envelope::new(Event::Notice {
+                    text: format!(
+                        "{agent} can't take images, so {} waiting with images {} not sent. \
+                         Press Up in the composer to edit {}, or switch to an agent that takes \
+                         images.",
+                        if fresh.len() == 1 {
+                            "a message"
+                        } else {
+                            "messages"
+                        },
+                        if fresh.len() == 1 { "was" } else { "were" },
+                        if fresh.len() == 1 { "it" } else { "them" },
+                    ),
+                }));
+            }
+            at
+        }?;
+        self.queued_prompts.borrow_mut().remove(at)
+    }
+
     fn pop_queued_prompt(&self) -> Option<(String, String)> {
+        self.pop_queued_input()
+            .map(|(item, input)| (item, input.text))
+    }
+
+    fn pop_queued_input(&self) -> Option<(String, PromptInput)> {
         let queued = self.queued_prompts.borrow_mut().pop_back()?;
         // The last message a dropped switch held was taken back: nothing is held any more.
         if self.switch_marked() == 0 {
             self.switch_held.set(false);
         }
-        Some((queued.item_id, queued.text))
+        Some((
+            queued.item_id,
+            PromptInput {
+                text: queued.text,
+                images: queued.images,
+            },
+        ))
     }
 
     /// Stores the mode the user chose (`wanted_mode`), so a reopened thread starts from it on
@@ -6574,6 +6691,234 @@ fn handoff_turn_end(
 
 /// The stored `HandoffSeeded` for `handoff`: spent only by its acknowledgement
 /// ([`handoff_spent`]).
+impl Inner {
+    /// Keeps [`Inner::show_image_calls`]: a `show_image` call's item while it is open (at most
+    /// [`SHOW_IMAGE_CALLS_KEPT`], newest kept), none past its turn.
+    fn track_show_image_calls(&self, env: &Envelope) {
+        match (&env.event, env.item.as_ref()) {
+            (
+                Event::ItemStarted {
+                    kind, title, input, ..
+                },
+                Some(id),
+            ) if agent_core::delegation::correlation::is_show_image_item(
+                *kind,
+                title,
+                input.as_ref(),
+            ) =>
+            {
+                let mut open = self.show_image_calls.borrow_mut();
+                if !open.contains(id) {
+                    if open.len() >= SHOW_IMAGE_CALLS_KEPT {
+                        open.pop_front();
+                    }
+                    open.push_back(id.clone());
+                }
+            }
+            (Event::ItemCompleted { .. }, Some(id)) => {
+                self.show_image_calls.borrow_mut().retain(|o| o != id);
+            }
+            (Event::TurnCompleted { .. } | Event::SessionExited { .. }, _) => {
+                self.show_image_calls.borrow_mut().clear();
+            }
+            _ => {}
+        }
+    }
+
+    /// Keeps each top-level reply's text while it streams ([`Inner::reply_texts`]); when it
+    /// completes (or its turn ends), the local images its markdown names are shown on it.
+    fn track_reply_images(&self, env: &Envelope) {
+        match (&env.event, env.item.as_ref()) {
+            (
+                Event::ItemStarted {
+                    kind: ItemKind::AssistantMessage,
+                    parent: None,
+                    ..
+                },
+                Some(id),
+            ) => {
+                self.reply_texts.borrow_mut().entry(id.clone()).or_default();
+            }
+            (
+                Event::ContentDelta {
+                    stream: StreamKind::Assistant,
+                    text,
+                },
+                Some(id),
+            ) => {
+                if let Some(t) = self.reply_texts.borrow_mut().get_mut(id) {
+                    t.push_str(text);
+                }
+            }
+            (
+                Event::ContentSnapshot {
+                    stream: StreamKind::Assistant,
+                    text,
+                },
+                Some(id),
+            ) => {
+                if let Some(t) = self.reply_texts.borrow_mut().get_mut(id) {
+                    t.clone_from(text);
+                }
+            }
+            (Event::ItemCompleted { .. }, Some(id)) => {
+                let text = self.reply_texts.borrow_mut().remove(id);
+                if let Some(text) = text {
+                    self.show_reply_images(id.clone(), &text);
+                }
+            }
+            (Event::TurnCompleted { .. } | Event::SessionExited { .. }, _) => {
+                let open: Vec<_> = self.reply_texts.borrow_mut().drain().collect();
+                for (id, text) in open {
+                    self.show_reply_images(id, &text);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Shows the local images a reply's markdown names (`![alt](path)`) on it, as images the
+    /// agent showed: each read off the main thread only when the Local agent's own read policy
+    /// would let it run without asking ([`agent_kit::local_tools::read_unasked`]: inside the
+    /// thread's folder, not a sensitive file, links judged where they lead), then stored. One
+    /// that would ask, is missing or is not an image stays the reply's text, unshown: a reply
+    /// never raises a question, and nothing is fetched from the network.
+    fn show_reply_images(&self, item: String, text: &str) {
+        let paths = agent_core::attachment::markdown_image_paths(text);
+        if paths.is_empty() {
+            return;
+        }
+        let cwd = self.open.borrow().cwd.clone();
+        if cwd.is_empty() {
+            return;
+        }
+        let weak = self.weak_self.borrow().clone();
+        glib::spawn_future_local(async move {
+            let stored = gtk4::gio::spawn_blocking(move || capture_reply_images(&cwd, &paths))
+                .await
+                .unwrap_or_default();
+            let Some(inner) = weak.and_then(|w| w.upgrade()) else {
+                return;
+            };
+            if stored.is_empty() {
+                return;
+            }
+            let used = inner.turn_images.get();
+            let room = agent_core::attachment::MAX_PER_TURN.saturating_sub(used);
+            let shown: Vec<_> = stored.into_iter().take(room).collect();
+            if !shown.is_empty() {
+                inner.turn_images.set(used + shown.len());
+                inner.emit(Envelope::new(Event::Attachments { refs: shown }).item(item));
+            }
+        });
+    }
+
+    /// An image a tool handed the agent ([`Event::ToolImage`]): stored off the main thread (a
+    /// bounded decode, re-encoded, never its raw bytes), then shown on its item as
+    /// [`Event::Attachments`], the form that is persisted. Past
+    /// [`agent_core::attachment::MAX_PER_TURN`] in a turn, the rest are counted in one notice.
+    fn store_tool_image(
+        &self,
+        item: Option<String>,
+        image: agent_core::attachment::ToolImageSource,
+    ) {
+        let Some(item) = item else {
+            return;
+        };
+        let n = self.turn_images.get() + 1;
+        self.turn_images.set(n);
+        if n > agent_core::attachment::MAX_PER_TURN {
+            if n == agent_core::attachment::MAX_PER_TURN + 1 {
+                self.emit(Envelope::new(Event::Notice {
+                    text: format!(
+                        "This turn showed more than {} images; the rest are not shown.",
+                        agent_core::attachment::MAX_PER_TURN
+                    ),
+                }));
+            }
+            return;
+        }
+        let weak = self.weak_self.borrow().clone();
+        let cwd = self.open.borrow().cwd.clone();
+        glib::spawn_future_local(async move {
+            let stored = gtk4::gio::spawn_blocking(move || {
+                crate::attachments::ingest_tool_image(
+                    image,
+                    agent_core::attachment::Origin::ToolResult,
+                    &cwd,
+                )
+            })
+            .await
+            .unwrap_or_else(|_| Err("the image could not be read".to_owned()));
+            let Some(inner) = weak.and_then(|w| w.upgrade()) else {
+                return;
+            };
+            match stored {
+                Ok(r) => inner.emit(Envelope::new(Event::Attachments { refs: vec![r] }).item(item)),
+                Err(why) => {
+                    warn!(error = %why, "a tool's image could not be stored");
+                    inner.emit(Envelope::new(Event::Notice {
+                        text: format!("An image a tool returned couldn't be shown: {why}"),
+                    }));
+                }
+            }
+        });
+    }
+}
+
+/// Reads and stores the images `paths` name for a reply in `cwd` (blocking: on a worker). Only
+/// what the read policy lets run unasked is read; anything else is skipped, logged by count.
+fn capture_reply_images(cwd: &str, paths: &[String]) -> Vec<agent_core::attachment::AttachmentRef> {
+    use agent_kit::local_tools::{read_unasked, Workspace};
+    let Ok(ws) = Workspace::open(Path::new(cwd)) else {
+        return Vec::new();
+    };
+    let Some(store) = crate::attachments::blob_store() else {
+        return Vec::new();
+    };
+    let mut refs = Vec::new();
+    let mut skipped = 0;
+    for path in paths {
+        let read = read_unasked(&ws, path, agent_kit::attachments::MAX_INPUT_BYTES);
+        let stored = read.ok().and_then(|(target, bytes)| {
+            let name = target.file_name().map(|n| n.to_string_lossy().into_owned());
+            store
+                .ingest_bytes(
+                    &bytes,
+                    name.as_deref(),
+                    agent_core::attachment::Origin::AgentShown,
+                )
+                .ok()
+        });
+        match stored {
+            Some(n) => refs.push(n.meta),
+            None => skipped += 1,
+        }
+    }
+    if skipped > 0 {
+        tracing::debug!(skipped, "a reply named images that were not shown");
+    }
+    refs
+}
+
+/// A user message's `ItemStarted`, queued or not, with the refs of the images sent with it: the
+/// one shape the live path, the queue and the store all use, so the view has the images the
+/// first time it sees the item.
+fn user_message_started(item: &str, queued: bool, images: &[PromptImage]) -> Envelope {
+    let refs: Vec<_> = images.iter().map(|i| i.meta.clone()).collect();
+    Envelope::new(Event::ItemStarted {
+        kind: ItemKind::UserMessage,
+        title: if queued {
+            "queued".to_owned()
+        } else {
+            String::new()
+        },
+        input: agent_core::attachment::user_message_input(queued, &refs),
+        parent: None,
+    })
+    .item(item)
+}
+
 fn handoff_seeded(handoff: &Handoff) -> Envelope {
     Envelope::new(Event::HandoffSeeded {
         summary: handoff.summary.clone(),
@@ -6774,6 +7119,25 @@ impl ChatBackend for ChatSession {
     fn steer_prompt(&self, text: &str) {
         self.inner.user_spoke();
         self.inner.steer_prompt(text);
+    }
+
+    fn send_input(&self, input: &PromptInput) {
+        self.inner.user_spoke();
+        self.inner.send_input(input);
+    }
+
+    fn queue_input(&self, input: &PromptInput) {
+        self.inner.user_spoke();
+        self.inner.queue_input(input);
+    }
+
+    fn steer_input(&self, input: &PromptInput) {
+        self.inner.user_spoke();
+        self.inner.steer_input(input);
+    }
+
+    fn pop_queued_input(&self) -> Option<(String, PromptInput)> {
+        self.inner.pop_queued_input()
     }
 
     fn interrupt(&self) {
@@ -9078,7 +9442,7 @@ mod tests {
         }
         fn feed(&mut self, line: &str) -> Vec<Envelope> {
             if self.write_commands {
-                if let Ok(Command::Prompt { text }) = serde_json::from_str(line) {
+                if let Ok(Command::Prompt { text, .. }) = serde_json::from_str(line) {
                     return vec![Envelope::new(Event::Notice { text })];
                 }
             }
@@ -9485,7 +9849,7 @@ mod tests {
         log.borrow()
             .iter()
             .filter_map(|c| match c {
-                Command::Prompt { text } => Some(text.clone()),
+                Command::Prompt { text, .. } => Some(text.clone()),
                 _ => None,
             })
             .collect()
@@ -10454,6 +10818,42 @@ mod tests {
             assert_eq!(session.inner.generation.get(), generation);
             assert!(session.status().running_turn);
             assert_eq!(session.inner.deferred_mode.get(), None);
+        });
+    }
+
+    /// A message queued with images for an agent that takes none (agy, after a switch, say)
+    /// waits without holding up the messages behind it: they go, the user is told once, and Up
+    /// takes it back whole.
+    #[test]
+    fn a_queued_image_message_never_holds_up_the_queue_of_an_agent_without_images() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (session, seen) = recording(ctx, tmp.path(), Box::new(AgyAdapter::new("agy")));
+            session.send_prompt("first");
+            session.queue_input(&PromptInput {
+                text: "with an image".into(),
+                images: vec![staged('a')],
+            });
+            session.queue_prompt("plain after");
+            for _ in 0..2 {
+                session.inner.emit(Envelope::new(Event::TurnCompleted {
+                    state: TurnState::Completed,
+                    error: None,
+                    usage: None,
+                    cost_usd: None,
+                }));
+            }
+            assert!(pump_until(ctx, 5, || stdin_log(tmp.path()).contains("plain after")));
+            assert!(!stdin_log(tmp.path()).contains("with an image"));
+            let told = seen
+                .borrow()
+                .iter()
+                .filter(|e| matches!(&e.event, Event::Notice { text } if text.contains("can't take images")))
+                .count();
+            assert_eq!(told, 1, "told once");
+            let (_, back) = session.pop_queued_input().expect("still queued");
+            assert_eq!(back.text, "with an image");
+            assert_eq!(back.images.len(), 1);
         });
     }
 
@@ -11483,6 +11883,114 @@ mod tests {
         create_provider_thread(store, thread, Driver::Agy, Some("gemini-pro")).expect("pt")
     }
 
+    fn staged(id: char) -> PromptImage {
+        PromptImage {
+            meta: agent_core::attachment::AttachmentRef {
+                id: id.to_string().repeat(64),
+                kind: agent_core::attachment::AttachmentKind::Image,
+                mime: "image/png".into(),
+                width: 4,
+                height: 3,
+                bytes: 3,
+                name: Some("shot.png".into()),
+                origin: agent_core::attachment::Origin::User,
+            },
+            path: format!("/data/{id}.png"),
+            data_base64: "AAAA".into(),
+        }
+    }
+
+    /// A reply's local images are read only as the read policy allows without asking: one in
+    /// the thread's folder is stored as shown by the agent; one outside it, a link leading out,
+    /// a missing file and a file that is not an image are not, and nothing is asked.
+    #[test]
+    fn a_reply_shows_only_the_local_images_it_may_read_unasked() {
+        use std::os::unix::fs::symlink;
+        // A 1×1 PNG.
+        let png = agent_kit::attachments::from_base64(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+        )
+        .expect("png");
+        let root = tempfile::tempdir().expect("dir");
+        let work = root.path().join("work");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(work.join("out")).expect("work");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(work.join("out/chart.png"), &png).expect("chart");
+        std::fs::write(outside.join("secret.png"), &png).expect("secret");
+        symlink(outside.join("secret.png"), work.join("link.png")).expect("link");
+        std::fs::write(work.join("notes.png"), "not an image").expect("notes");
+        let paths: Vec<String> = [
+            "out/chart.png",
+            "../outside/secret.png",
+            "link.png",
+            "missing.png",
+            "notes.png",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let refs = capture_reply_images(&work.to_string_lossy(), &paths);
+        assert_eq!(refs.len(), 1, "{refs:?}");
+        assert_eq!(refs[0].origin, agent_core::attachment::Origin::AgentShown);
+        assert_eq!(refs[0].name.as_deref(), Some("chart.png"));
+        assert_eq!((refs[0].width, refs[0].height), (1, 1));
+    }
+
+    /// Images go to the adapter with their prompt, are stored by ref with the message (never
+    /// their bytes), wait with a queued message, and come back with it when it is pulled back.
+    #[test]
+    fn images_travel_with_their_message_and_never_into_the_store_as_bytes() {
+        in_loop(|_| {
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let log: Log = Rc::default();
+            let (session, seen) = harness(
+                FakeAdapter::boxed(Driver::Claude, &log),
+                open_on("sonnet"),
+                &store,
+                &thread,
+            );
+            session.send_input(&PromptInput {
+                text: "what is this?".into(),
+                images: vec![staged('a')],
+            });
+            let sent: Vec<_> = log
+                .borrow()
+                .iter()
+                .filter_map(|c| match c {
+                    Command::Prompt { text, attachments } => {
+                        Some((text.clone(), attachments.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert_eq!(sent[0].0, "what is this?");
+            assert_eq!(sent[0].1.len(), 1);
+            assert_eq!(sent[0].1[0].meta.id, "a".repeat(64));
+            assert_eq!(sent[0].1[0].path, "/data/a.png");
+            // The view saw the refs on the message's first start.
+            assert!(has(
+                &seen,
+                |e| matches!(e, Event::ItemStarted { kind: ItemKind::UserMessage, input, .. }
+                if agent_core::attachment::refs_in(input.as_ref()).len() == 1)
+            ));
+            let stored =
+                serde_json::to_string(&store.events(&thread, None, 50).expect("ev")).expect("json");
+            assert!(stored.contains(&"a".repeat(64)));
+            assert!(!stored.contains("AAAA"), "image bytes reached the store");
+
+            // A turn is running: the next message waits, images and all, and comes back whole.
+            session.queue_input(&PromptInput {
+                text: "and this".into(),
+                images: vec![staged('b'), staged('c')],
+            });
+            let (_, back) = session.pop_queued_input().expect("queued");
+            assert_eq!(back.text, "and this");
+            assert_eq!(back.images, vec![staged('b'), staged('c')]);
+        });
+    }
+
     #[test]
     fn submitted_work_switches_before_turn_started_and_carries_the_original_task() {
         in_loop(|_| {
@@ -11943,6 +12451,109 @@ mod tests {
             ));
             let all = serde_json::to_string(&*seen.borrow()).expect("json");
             assert!(!all.contains(secret), "a secret reached the sink: {all}");
+        });
+    }
+
+    /// `show_image`'s images go on the call's own tool item, as the agent's: the item its key
+    /// names when that is an open `show_image` call, else the newest open one (agy's id may carry
+    /// another prefix); a completed call or an ended turn takes none, and the turn's cap holds.
+    #[test]
+    fn show_image_attaches_to_its_own_tool_item() {
+        use agent_core::attachment::{AttachmentRef, Origin, MAX_PER_TURN};
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (session, seen) = recording(
+                ctx,
+                tmp.path(),
+                Box::new(agent_core::claude::ClaudeAdapter::new()),
+            );
+            let started = |id: &str, title: &str| {
+                Envelope::new(Event::ItemStarted {
+                    kind: ItemKind::McpTool,
+                    title: title.into(),
+                    input: Some(serde_json::json!({"images": [{"path": "a.png"}]})),
+                    parent: None,
+                })
+                .item(id)
+            };
+            let image = |n: u8| AttachmentRef {
+                id: format!("{n:064x}"),
+                kind: Default::default(),
+                mime: "image/png".into(),
+                width: 4,
+                height: 2,
+                bytes: 10,
+                name: Some("a.png".into()),
+                origin: Origin::AgentShown,
+            };
+            let on = |id: &str| -> Vec<String> {
+                seen.borrow()
+                    .iter()
+                    .filter(|e| e.item.as_deref() == Some(id))
+                    .filter_map(|e| match &e.event {
+                        Event::Attachments { refs } => Some(refs.clone()),
+                        _ => None,
+                    })
+                    .flatten()
+                    .inspect(|r| assert_eq!(r.origin, Origin::AgentShown))
+                    .map(|r| r.id)
+                    .collect()
+            };
+            // Nothing open yet: nowhere to show it.
+            assert!(session.show_agent_images(None, vec![image(9)]).is_err());
+            session
+                .inner
+                .emit(started("toolu_a", "mcp__agent_terminal__show_image"));
+            session
+                .inner
+                .emit(started("toolu_b", "mcp__agent_terminal__show_image"));
+            session
+                .inner
+                .emit(started("toolu_c", "mcp__agent_terminal__cross_agent_list"));
+
+            assert_eq!(
+                session.show_agent_images(Some("toolu_a".into()), vec![image(1)]),
+                Ok(1)
+            );
+            assert_eq!(on("toolu_a"), vec![image(1).id]);
+            // A key naming no open call: the newest open call.
+            assert_eq!(
+                session.show_agent_images(Some("00000000:step-7".into()), vec![image(2)]),
+                Ok(1)
+            );
+            assert_eq!(on("toolu_b"), vec![image(2).id]);
+            assert!(on("toolu_c").is_empty());
+
+            session.inner.emit(
+                Envelope::new(Event::ItemCompleted {
+                    status: ItemStatus::Completed,
+                    output: None,
+                    error: None,
+                })
+                .item("toolu_b"),
+            );
+            assert_eq!(session.show_agent_images(None, vec![image(3)]), Ok(1));
+            assert_eq!(on("toolu_a"), vec![image(1).id, image(3).id]);
+
+            // Past the turn's cap, only what fits is shown.
+            session.inner.turn_images.set(MAX_PER_TURN - 1);
+            assert_eq!(
+                session.show_agent_images(Some("toolu_a".into()), vec![image(4), image(5)]),
+                Ok(1)
+            );
+            assert_eq!(
+                session.show_agent_images(Some("toolu_a".into()), vec![image(6)]),
+                Ok(0)
+            );
+
+            // An ended turn leaves no call open.
+            session.inner.emit(Envelope::new(Event::TurnCompleted {
+                state: TurnState::Completed,
+                usage: None,
+                cost_usd: None,
+                error: None,
+            }));
+            assert!(session.show_agent_images(None, vec![image(7)]).is_err());
         });
     }
 

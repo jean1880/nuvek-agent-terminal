@@ -621,7 +621,13 @@ impl Adapter for AgyAdapter {
     fn encode(&mut self, command: Command) -> Result<Vec<Action>, AdapterError> {
         match command {
             Command::ConfigureLocal { .. } => Err(AdapterError::Unsupported("Local setup")),
-            Command::Prompt { text } => {
+            // agy's stream input is text only: an image block ends the run with "stream input
+            // content block type "image" is not supported (only "text")" (live, 2026-11-02).
+            // Refused before anything is written, so the message is kept, never sent without them.
+            Command::Prompt { attachments, .. } if !attachments.is_empty() => Err(
+                AdapterError::Unsupported("Antigravity can't take images (its input is text only)"),
+            ),
+            Command::Prompt { text, .. } => {
                 // The first token is matched case-insensitively after leading whitespace. Any
                 // other `/word` is forwarded as agent text (custom commands and skills).
                 let trimmed = text.trim();
@@ -1360,6 +1366,7 @@ mod tests {
                 a.on_exit(None);
             } else {
                 a.encode(Command::Prompt {
+                    attachments: Vec::new(),
                     text: "next turn".into(),
                 })
                 .expect("prompt");
@@ -1637,6 +1644,7 @@ mod tests {
         let mut a = AgyAdapter::default();
         a.feed(denial);
         a.encode(Command::Prompt {
+            attachments: Vec::new(),
             text: "go on".into(),
         })
         .expect("prompt");
@@ -1737,6 +1745,7 @@ mod tests {
         let mut a = AgyAdapter::new("/usr/bin/agy");
         assert!(matches!(
             a.encode(Command::Steer {
+                attachments: Vec::new(),
                 text: "also".into()
             }),
             Err(AdapterError::Unsupported(_))
@@ -1752,10 +1761,46 @@ mod tests {
         assert!(!a.capabilities().live_input);
     }
 
+    /// agy's stream input is text only (live, 2026-11-02): a prompt with images is refused before
+    /// anything is written, never sent without them.
+    #[test]
+    fn a_prompt_with_images_is_refused_whole() {
+        let mut a = AgyAdapter::new("/usr/bin/agy");
+        let image = crate::attachment::PromptAttachment {
+            meta: crate::attachment::AttachmentRef {
+                id: "a".repeat(64),
+                kind: crate::attachment::AttachmentKind::Image,
+                mime: "image/png".into(),
+                width: 1,
+                height: 1,
+                bytes: 1,
+                name: None,
+                origin: crate::attachment::Origin::User,
+            },
+            path: "/data/a.png".into(),
+            data_base64: "AAAA".into(),
+        };
+        let refused = a.encode(Command::Prompt {
+            text: "look".into(),
+            attachments: vec![image],
+        });
+        assert!(
+            matches!(&refused, Err(AdapterError::Unsupported(why)) if why.contains("can't take images")),
+            "{refused:?}"
+        );
+        assert!(!a.capabilities().image_input);
+        assert!(a.encode(Command::prompt("look")).is_ok());
+    }
+
     #[test]
     fn prompt_encodes_a_user_event_and_intercepts_side_commands() {
         let mut a = AgyAdapter::new("/usr/bin/agy");
-        let w = a.encode(Command::Prompt { text: "hi".into() }).expect("ok");
+        let w = a
+            .encode(Command::Prompt {
+                attachments: Vec::new(),
+                text: "hi".into(),
+            })
+            .expect("ok");
         let Action::Write(lines) = &w[0] else {
             panic!("expected write")
         };
@@ -1766,6 +1811,7 @@ mod tests {
         for cmd in SIDE_COMMANDS {
             let r = a
                 .encode(Command::Prompt {
+                    attachments: Vec::new(),
                     text: (*cmd).to_owned(),
                 })
                 .expect("side");
@@ -1775,6 +1821,7 @@ mod tests {
         // Only the first token counts, and a path-like slash text is a normal prompt.
         let r = a
             .encode(Command::Prompt {
+                attachments: Vec::new(),
                 text: "/modelx".into(),
             })
             .expect("ok");
@@ -2047,7 +2094,12 @@ mod tests {
     fn side_commands_match_case_insensitively_and_other_slashes_forward() {
         let mut a = AgyAdapter::new("agy");
         for text in ["/Model", "  /MODEL  ", "\n/model"] {
-            let r = a.encode(Command::Prompt { text: text.into() }).expect("ok");
+            let r = a
+                .encode(Command::Prompt {
+                    attachments: Vec::new(),
+                    text: text.into(),
+                })
+                .expect("ok");
             assert!(
                 matches!(&r[0], Action::SideProcess { argv, .. }
                     if argv[..] == ["agy", "-p", "/model", "--output-format", "json"]),
@@ -2056,12 +2108,14 @@ mod tests {
         }
         let r = a
             .encode(Command::Prompt {
+                attachments: Vec::new(),
                 text: "/Usage now".into(),
             })
             .expect("ok");
         assert!(matches!(&r[0], Action::SideProcess { argv, .. } if argv[2] == "/usage now"));
         let r = a
             .encode(Command::Prompt {
+                attachments: Vec::new(),
                 text: "/my-skill go".into(),
             })
             .expect("ok");
@@ -2134,8 +2188,11 @@ mod tests {
         // The prompt's own `user_input` step opens the turn.
         let mut a = AgyAdapter::default();
         a.feed(r#"{"event":"init","conversation_id":"c1","init":{}}"#);
-        a.encode(Command::Prompt { text: "hi".into() })
-            .expect("prompt");
+        a.encode(Command::Prompt {
+            attachments: Vec::new(),
+            text: "hi".into(),
+        })
+        .expect("prompt");
         let ev = a.feed(
             r#"{"event":"step_update","step_update":{"state":"DONE","step_index":0,"step_type":"user_input"}}"#,
         );
@@ -2147,8 +2204,11 @@ mod tests {
     #[test]
     fn on_exit_with_an_open_turn_completes_it() {
         let mut a = AgyAdapter::default();
-        a.encode(Command::Prompt { text: "hi".into() })
-            .expect("prompt");
+        a.encode(Command::Prompt {
+            attachments: Vec::new(),
+            text: "hi".into(),
+        })
+        .expect("prompt");
         a.feed(r#"{"event":"init","conversation_id":"c1","init":{}}"#);
         let ev = a.on_exit(Some(1));
         assert!(matches!(
@@ -2164,8 +2224,11 @@ mod tests {
         ));
 
         let mut a = AgyAdapter::default();
-        a.encode(Command::Prompt { text: "hi".into() })
-            .expect("prompt");
+        a.encode(Command::Prompt {
+            attachments: Vec::new(),
+            text: "hi".into(),
+        })
+        .expect("prompt");
         a.feed(r#"{"event":"init","conversation_id":"c1","init":{}}"#);
         a.encode(Command::Interrupt).expect("interrupt");
         let ev = a.on_exit(Some(130));
@@ -2185,7 +2248,11 @@ mod tests {
     #[test]
     fn thinking_attached_to_actions_and_responses_emits_reasoning_items() {
         let mut a = AgyAdapter::default();
-        a.encode(Command::Prompt { text: "hi".into() }).unwrap();
+        a.encode(Command::Prompt {
+            attachments: Vec::new(),
+            text: "hi".into(),
+        })
+        .unwrap();
         a.feed(r#"{"event":"init","conversation_id":"c1","init":{}}"#);
 
         // Tool step with thinking
@@ -2230,7 +2297,11 @@ mod tests {
         .expect("transcript line");
         let calls = transcript["tool_calls"].clone();
         let mut a = AgyAdapter::default();
-        a.encode(Command::Prompt { text: "hi".into() }).unwrap();
+        a.encode(Command::Prompt {
+            attachments: Vec::new(),
+            text: "hi".into(),
+        })
+        .unwrap();
         a.feed(r#"{"event":"init","conversation_id":"c1","init":{}}"#);
         let step = json!({"event": "step_update", "conversation_id": "c1", "step_update": {
             "step_type": "tool", "step_index": 2, "state": "ACTIVE", "tool_name": "view_file",
@@ -2264,7 +2335,11 @@ mod tests {
     fn w0_agy_thinking_is_one_whole_block_never_streamed() {
         let fixture = include_str!("../../../tests/fixtures/real/agy/read-outside-project.jsonl");
         let mut a = AgyAdapter::default();
-        a.encode(Command::Prompt { text: "hi".into() }).unwrap();
+        a.encode(Command::Prompt {
+            attachments: Vec::new(),
+            text: "hi".into(),
+        })
+        .unwrap();
         let mut out = Vec::new();
         for line in fixture.lines() {
             let mut frame: Value = serde_json::from_str(line).expect("fixture line");
@@ -2313,7 +2388,11 @@ mod tests {
 
     fn turn_adapter() -> AgyAdapter {
         let mut a = AgyAdapter::default();
-        a.encode(Command::Prompt { text: "hi".into() }).unwrap();
+        a.encode(Command::Prompt {
+            attachments: Vec::new(),
+            text: "hi".into(),
+        })
+        .unwrap();
         a.feed(r#"{"event":"init","conversation_id":"c1","init":{}}"#);
         a
     }
@@ -2332,15 +2411,18 @@ mod tests {
         let mut a = AgyAdapter::new("agy");
         let ids: Vec<String> = ["/model", "/usage", "/model"]
             .into_iter()
-            .map(
-                |text| match a.encode(Command::Prompt { text: text.into() }) {
+            .map(|text| {
+                match a.encode(Command::Prompt {
+                    attachments: Vec::new(),
+                    text: text.into(),
+                }) {
                     Ok(actions) => match &actions[0] {
                         Action::SideProcess { id, .. } => id.clone(),
                         other => panic!("{text}: {other:?}"),
                     },
                     Err(e) => panic!("{text}: {e}"),
-                },
-            )
+                }
+            })
             .collect();
         assert_eq!(ids, ["side-1", "side-2", "side-3"]);
     }
@@ -2507,7 +2589,11 @@ mod tests {
     #[test]
     fn an_empty_conversation_id_does_not_make_an_empty_item_prefix() {
         let mut a = AgyAdapter::default();
-        a.encode(Command::Prompt { text: "hi".into() }).unwrap();
+        a.encode(Command::Prompt {
+            attachments: Vec::new(),
+            text: "hi".into(),
+        })
+        .unwrap();
         let out = a.feed(
             &json!({"event": "step_update", "step_update": {"conversation_id": "",
                      "step_type": "tool", "step_index": 1, "state": "ACTIVE",

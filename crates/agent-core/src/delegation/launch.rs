@@ -460,6 +460,18 @@ mod tests {
             &tools,
             &s(&["agent_terminal", "other"])
         ));
+        // `--tools` names Claude's built-in tools only; every one of our own tools, `show_image`
+        // among them, reaches a child of any mode through the overlay's server.
+        for mode in TaskMode::ALL {
+            let mut own = s(child_tools(mode));
+            own.push(format!(
+                "{CLAUDE_OWN_TOOL_PREFIX}{}",
+                super::super::ToolName::ShowImage.as_str()
+            ));
+            assert!(claude_child_init_ok(mode, &own, &servers), "{mode:?}");
+            let args = claude_child_args(mode, "/run/o.json");
+            assert!(!args.iter().any(|a| a.contains("mcp__")), "{mode:?}");
+        }
         assert!(!claude_child_init_ok(TaskMode::Plan, &tools[1..], &servers));
         assert!(!claude_child_init_ok(TaskMode::Plan, &tools, &[]));
         assert!(codex_child_servers_ok(&s(&["agent_terminal"])));

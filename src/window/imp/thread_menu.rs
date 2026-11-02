@@ -576,6 +576,10 @@ impl AgentTerminalWindow {
             },
             move |imp, outcome| {
                 let outcome = outcome.map(|r| r.map_err(|e| e.to_string()));
+                if matches!(outcome, Some(Ok(()))) {
+                    // Its images go with it, once no other thread refers to them.
+                    super::threads::sweep_images();
+                }
                 imp.show_write_notice(delete_notice(stopped, outcome), |_| {});
             },
         );

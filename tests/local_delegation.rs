@@ -102,6 +102,7 @@ fn a_command_cannot_read_the_runners_environment_or_memory() {
     for command in [
         AgentCommand::configure_local(Default::default()),
         AgentCommand::Prompt {
+            attachments: Vec::new(),
             text: "read your parent".into(),
         },
     ] {
@@ -209,6 +210,7 @@ fn the_runner_binds_delegation_only_through_its_startup_frame() {
         child: None,
     });
     send(&AgentCommand::Prompt {
+        attachments: Vec::new(),
         text: "who works for me?".into(),
     });
     let mut seen = Vec::new();

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::adapter::{Action, Adapter, AdapterError, Command, Driver, Mode, OpenSession};
+use crate::attachment::AttachmentRef;
 use crate::caps::Capabilities;
 use crate::event::{Decision, Envelope, Event, ItemKind, ItemStatus, TurnState};
 
@@ -537,6 +538,25 @@ pub struct ChatMessage {
     /// without it. Dropped once the turn ends ([`forget_reasoning`]), and never kept on disk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// The images a user message carries, sent before its text. The transcript keeps each as
+    /// its ref and stored file's path, never its bytes ([`MessageImage::data_base64`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<MessageImage>,
+}
+
+/// One image of a message. What is kept on disk is the ref and the path of the app's stored
+/// blob (`<data>/agent-terminal/attachments/<id>.<ext>`); the bytes are held in memory only
+/// while the turn that sent them runs, and read back from the blob when the conversation is
+/// replayed into a later request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MessageImage {
+    pub meta: AttachmentRef,
+    #[serde(default)]
+    pub path: String,
+    /// The stored bytes as base64. Never serialized: neither the transcript nor any event
+    /// carries them.
+    #[serde(skip)]
+    pub data_base64: Option<String>,
 }
 
 /// Drops the reasoning of earlier turns: it is sent back only within the turn that made it.
@@ -544,6 +564,24 @@ pub fn forget_reasoning(messages: &mut [ChatMessage]) {
     for message in messages {
         message.reasoning_content = None;
     }
+}
+
+/// Drops the image bytes held in memory: a later request reads them back from their blobs.
+pub fn forget_image_data(messages: &mut [ChatMessage]) {
+    for image in messages.iter_mut().flat_map(|m| m.images.iter_mut()) {
+        image.data_base64 = None;
+    }
+}
+
+/// How a request carries a message's images.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImageForm {
+    /// The bytes in hand as a data URL; an image without them as its placeholder text.
+    Data,
+    /// For sizing: an image part whose URL is its placeholder, so the structure (and a
+    /// placeholder that may stand in) is counted while the data is counted apart
+    /// ([`image_data_url_len`]).
+    Sizing,
 }
 
 impl ChatMessage {
@@ -562,6 +600,144 @@ impl ChatMessage {
             ..Self::new("tool", content)
         }
     }
+
+    /// The message with its images replaced by their placeholders in its text: what an older
+    /// exchange is sent as when its images no longer fit.
+    pub fn without_images(&self) -> Self {
+        if self.images.is_empty() {
+            return self.clone();
+        }
+        let refs: Vec<_> = self.images.iter().map(|i| i.meta.clone()).collect();
+        Self {
+            content: crate::attachment::text_with_placeholders(&self.content, &refs),
+            images: Vec::new(),
+            ..self.clone()
+        }
+    }
+
+    /// The message as a request carries it. Without images it is the message as serialized
+    /// (content a plain string). With images, content is the OpenAI-compatible parts: each
+    /// image (an `image_url` data URL, or its placeholder text when its bytes are not in hand),
+    /// then the text, left out when empty.
+    pub(crate) fn request_value(&self, form: ImageForm) -> Value {
+        let mut value = serde_json::to_value(self)
+            .unwrap_or_else(|_| json!({"role": self.role, "content": self.content}));
+        if let Some(map) = value.as_object_mut() {
+            map.remove("images");
+            if !self.images.is_empty() {
+                let mut parts: Vec<Value> = self
+                    .images
+                    .iter()
+                    .map(|image| match (form, &image.data_base64) {
+                        (ImageForm::Sizing, _) => json!({
+                            "type": "image_url",
+                            "image_url": {"url": image.meta.placeholder()}
+                        }),
+                        (ImageForm::Data, Some(data)) => json!({
+                            "type": "image_url",
+                            "image_url": {"url": format!("data:{};base64,{data}", image.meta.mime)}
+                        }),
+                        (ImageForm::Data, None) => {
+                            json!({"type": "text", "text": image.meta.placeholder()})
+                        }
+                    })
+                    .collect();
+                if !self.content.is_empty() {
+                    parts.push(json!({"type": "text", "text": self.content}));
+                }
+                map.insert("content".into(), Value::Array(parts));
+            }
+        }
+        value
+    }
+}
+
+/// The most an image is estimated to cost a request, in tokens.
+pub const MAX_IMAGE_TOKENS: usize = 1600;
+
+/// An image's estimated cost in tokens: `ceil(width × height / 750)`, at most
+/// [`MAX_IMAGE_TOKENS`]. There is no tokenizer here and vision encoders differ (patches of 14
+/// or 28 pixels, merged in twos or fours, tiles); one token per 750 pixels is about what a
+/// 28×28-patch encoder spends, and the cap stands for the downscaling servers apply to a large
+/// image before encoding it. Like [`crate::local_context::estimated_tokens`], an estimate.
+pub fn image_tokens(meta: &AttachmentRef) -> usize {
+    let pixels = u64::from(meta.width) * u64::from(meta.height);
+    usize::try_from(pixels.div_ceil(750))
+        .unwrap_or(usize::MAX)
+        .min(MAX_IMAGE_TOKENS)
+}
+
+/// The length of the data URL an image is sent as, from its stored size: what it adds to a
+/// request's bytes.
+pub fn image_data_url_len(meta: &AttachmentRef) -> usize {
+    let bytes = usize::try_from(meta.bytes).unwrap_or(usize::MAX);
+    "data:;base64,".len() + meta.mime.len() + bytes.div_ceil(3).saturating_mul(4)
+}
+
+/// A stored image's bytes as base64, when they are the image `meta` names: its content
+/// address (SHA-256) and size match. Anything else (a damaged or replaced blob) is `None`, and
+/// the image goes as its placeholder.
+pub fn encode_stored_image(meta: &AttachmentRef, bytes: &[u8]) -> Option<String> {
+    if meta.file_name().is_none() || bytes.len() as u64 != meta.bytes {
+        return None;
+    }
+    (content_address(bytes) == meta.id).then(|| base64_encode(bytes))
+}
+
+/// The content address of stored bytes: lowercase hex SHA-256 ([`AttachmentRef::id`]).
+pub fn content_address(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard, padded base64.
+pub fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(chunk.get(1).copied().unwrap_or(0)) << 8)
+            | u32::from(chunk.get(2).copied().unwrap_or(0));
+        for (i, shift) in [18, 12, 6, 0].into_iter().enumerate() {
+            if i <= chunk.len() {
+                out.push(BASE64[(n >> shift) as usize & 63] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// How many bytes standard, padded base64 `text` decodes to, or `None` when it is not that
+/// (a wrong length, a character outside the alphabet, padding anywhere but the end).
+pub fn base64_decoded_len(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    let padding = bytes.iter().rev().take_while(|b| **b == b'=').count();
+    if padding > 2 {
+        return None;
+    }
+    let body = &bytes[..bytes.len() - padding];
+    if !body.iter().all(|b| BASE64.contains(b)) {
+        return None;
+    }
+    Some(bytes.len() / 4 * 3 - padding)
+}
+
+/// Whether a server error says the model cannot take images.
+pub fn refuses_images(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("multimodal")
+        || error.contains("image input is not supported")
+        || error.contains("does not support image")
+        || error.contains("images are not supported")
 }
 
 /// A tool call as the OpenAI shape carries it: `arguments` is a JSON *string*.
@@ -603,6 +779,11 @@ impl ToolCall {
 /// The body of a streamed `/v1/chat/completions` request: usage asked for in the last chunk,
 /// tools offered when there are any (a server may refuse an empty list).
 pub fn chat_request(model: &str, messages: &[ChatMessage], tools: &[Tool]) -> Value {
+    request_body(model, messages, tools, ImageForm::Data)
+}
+
+fn request_body(model: &str, messages: &[ChatMessage], tools: &[Tool], form: ImageForm) -> Value {
+    let messages: Vec<Value> = messages.iter().map(|m| m.request_value(form)).collect();
     let mut body = json!({
         "model": model,
         "messages": messages,
@@ -622,7 +803,18 @@ pub fn schema_request(
     schemas: &[Value],
     response_tokens: usize,
 ) -> Value {
-    let mut body = chat_request(model, messages, &[]);
+    sized_request(model, messages, schemas, response_tokens, ImageForm::Data)
+}
+
+/// [`schema_request`] in a chosen image form ([`ImageForm::Sizing`] for the planner).
+pub(crate) fn sized_request(
+    model: &str,
+    messages: &[ChatMessage],
+    schemas: &[Value],
+    response_tokens: usize,
+    form: ImageForm,
+) -> Value {
+    let mut body = request_body(model, messages, &[], form);
     body["max_tokens"] = json!(response_tokens);
     if !schemas.is_empty() {
         body["tools"] = json!(schemas);
@@ -1457,14 +1649,11 @@ mod tests {
     fn delegation_tools_follow_the_bridge_and_carry_the_shared_schema() {
         use crate::delegation::ToolName;
         assert_eq!(delegation_tools(BridgeState::Ready), &ToolName::ALL);
-        assert_eq!(
-            delegation_tools(BridgeState::Degraded),
-            &[ToolName::CrossAgentCapabilities]
-        );
-        assert_eq!(
-            delegation_tools(BridgeState::Connecting),
-            &[ToolName::CrossAgentCapabilities]
-        );
+        // A bridge not yet (or no longer) able to delegate offers what degraded mode serves.
+        let degraded = &crate::delegation::tools::DEGRADED_TOOLS;
+        assert_eq!(delegation_tools(BridgeState::Degraded), degraded);
+        assert_eq!(delegation_tools(BridgeState::Connecting), degraded);
+        assert!(degraded.contains(&ToolName::CrossAgentCapabilities));
         assert!(delegation_tools(BridgeState::Unbound).is_empty());
         for tool in ToolName::ALL {
             let schema = delegation_schema(tool);
@@ -1635,6 +1824,131 @@ mod tests {
             assert_eq!(tool.schema()["function"]["name"], tool.name());
         }
         assert_eq!(Tool::from_name("rm_rf"), None);
+    }
+
+    fn image(bytes: &[u8], width: u32, height: u32, data: bool) -> MessageImage {
+        let meta = AttachmentRef {
+            id: content_address(bytes),
+            kind: Default::default(),
+            mime: "image/png".into(),
+            width,
+            height,
+            bytes: bytes.len() as u64,
+            name: None,
+            origin: Default::default(),
+        };
+        MessageImage {
+            path: format!("/data/attachments/{}", meta.file_name().unwrap()),
+            meta,
+            data_base64: data.then(|| base64_encode(bytes)),
+        }
+    }
+
+    #[test]
+    fn images_go_before_the_text_and_a_text_only_message_is_unchanged() {
+        let plain = chat_request("m", &[ChatMessage::new("user", "hi")], &[]);
+        assert_eq!(
+            plain["messages"][0],
+            json!({"role": "user", "content": "hi"})
+        );
+        let shown = image(b"png-bytes", 4, 2, true);
+        let missing = image(b"other", 3, 1, false);
+        let message = ChatMessage {
+            images: vec![shown.clone(), missing.clone()],
+            ..ChatMessage::new("user", "what is this?")
+        };
+        let body = chat_request("m", std::slice::from_ref(&message), &[]);
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([
+                {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{}", base64_encode(b"png-bytes"))}},
+                {"type": "text", "text": "[image: 3×1]"},
+                {"type": "text", "text": "what is this?"}
+            ])
+        );
+        assert!(body["messages"][0].get("images").is_none());
+        let silent = ChatMessage {
+            images: vec![shown],
+            ..ChatMessage::new("user", "")
+        };
+        let parts = chat_request("m", &[silent], &[])["messages"][0]["content"].clone();
+        assert_eq!(
+            parts.as_array().map(Vec::len),
+            Some(1),
+            "no empty text part"
+        );
+        assert_eq!(
+            message.without_images().content,
+            "what is this?\n[image: 4×2] [image: 3×1]"
+        );
+        assert!(message.without_images().images.is_empty());
+    }
+
+    #[test]
+    fn the_transcript_keeps_refs_and_paths_never_bytes() {
+        let shown = image(b"secret-pixels", 4, 2, true);
+        let data = shown.data_base64.clone().unwrap();
+        let mut messages = vec![ChatMessage {
+            images: vec![shown.clone()],
+            ..ChatMessage::new("user", "look")
+        }];
+        let saved = serde_json::to_string(&messages).unwrap();
+        assert!(!saved.contains(&data));
+        assert!(saved.contains(&shown.meta.id) && saved.contains(&shown.path));
+        let read: Vec<ChatMessage> = serde_json::from_str(&saved).unwrap();
+        assert_eq!(read[0].images[0].meta, shown.meta);
+        assert_eq!(read[0].images[0].data_base64, None);
+        forget_image_data(&mut messages);
+        assert_eq!(messages[0].images[0].data_base64, None);
+    }
+
+    #[test]
+    fn stored_images_are_checked_against_their_ref_and_base64_round_trips() {
+        for (bytes, expected) in [
+            (&b""[..], ""),
+            (b"f", "Zg=="),
+            (b"fo", "Zm8="),
+            (b"foo", "Zm9v"),
+            (b"foob", "Zm9vYg=="),
+        ] {
+            assert_eq!(base64_encode(bytes), expected);
+            assert_eq!(base64_decoded_len(expected), Some(bytes.len()));
+        }
+        for bad in ["Zg=", "Z===", "Zm9v!A==", "Zg==Zg==", "=Zg="] {
+            assert_eq!(base64_decoded_len(bad), None, "{bad}");
+        }
+        let good = image(b"pixels", 1, 1, false);
+        assert_eq!(
+            encode_stored_image(&good.meta, b"pixels").as_deref(),
+            Some(&*base64_encode(b"pixels"))
+        );
+        assert_eq!(encode_stored_image(&good.meta, b"pixelz"), None, "hash");
+        assert_eq!(encode_stored_image(&good.meta, b"pixels!"), None, "size");
+        let mut gif = good.meta.clone();
+        gif.mime = "image/gif".into();
+        assert_eq!(encode_stored_image(&gif, b"pixels"), None);
+    }
+
+    #[test]
+    fn an_image_costs_its_pixels_over_750_up_to_1600_tokens() {
+        let cost = |w, h| image_tokens(&image(b"x", w, h, false).meta);
+        assert_eq!(cost(1000, 750), 1000);
+        assert_eq!(cost(1, 1), 1);
+        assert_eq!(cost(751, 1), 2);
+        assert_eq!(cost(4000, 3000), MAX_IMAGE_TOKENS);
+        assert_eq!(cost(u32::MAX, u32::MAX), MAX_IMAGE_TOKENS);
+        assert_eq!(
+            image_data_url_len(&image(b"abcd", 1, 1, false).meta),
+            "data:image/png;base64,".len() + 8
+        );
+    }
+
+    #[test]
+    fn a_server_refusing_images_is_recognised() {
+        assert!(refuses_images(
+            "The model server answered with HTTP 400: Multimodal data provided, but model does not support multimodal requests."
+        ));
+        assert!(!refuses_images("model not found"));
     }
 
     #[test]
@@ -1900,15 +2214,28 @@ data: [DONE]"#;
     #[test]
     fn commands_go_out_as_one_json_line_and_unsupported_ones_are_refused() {
         let mut a = LocalAdapter::new();
-        let actions = a.encode(Command::Prompt { text: "hi".into() }).unwrap();
+        let actions = a
+            .encode(Command::Prompt {
+                attachments: Vec::new(),
+                text: "hi".into(),
+            })
+            .unwrap();
         let Action::Write(lines) = &actions[0] else {
             panic!("a write");
         };
         assert_eq!(
             serde_json::from_str::<Command>(&lines[0]).unwrap(),
-            Command::Prompt { text: "hi".into() }
+            Command::Prompt {
+                attachments: Vec::new(),
+                text: "hi".into()
+            }
         );
-        assert!(a.encode(Command::Steer { text: "x".into() }).is_err());
+        assert!(a
+            .encode(Command::Steer {
+                attachments: Vec::new(),
+                text: "x".into()
+            })
+            .is_err());
         assert!(a
             .encode(Command::Control {
                 id: "c".into(),

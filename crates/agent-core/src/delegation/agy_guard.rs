@@ -27,8 +27,9 @@ pub const WORKSPACE_SOURCE_NAMES: [&str; 7] = [
     "plugins.json",
     "plugins.txt",
 ];
-/// The 8 exact `permissions.allow` rules a hookless agy needs, one per tool in
-/// [`ToolName::ALL`] order.
+/// The 8 exact `permissions.allow` rules a hookless agy needs for delegation, one per delegation
+/// tool in [`ToolName::ALL`] order. `show_image` is not among them: a registration made before it
+/// existed still delegates ([`IMAGE_ALLOW_RULE`]).
 pub const ALLOW_RULES: [&str; 8] = [
     "mcp(agent_terminal/cross_agent_capabilities)",
     "mcp(agent_terminal/cross_agent_spawn)",
@@ -38,6 +39,24 @@ pub const ALLOW_RULES: [&str; 8] = [
     "mcp(agent_terminal/cross_agent_list)",
     "mcp(agent_terminal/cross_agent_cancel)",
     "mcp(agent_terminal/cross_agent_close)",
+];
+
+/// `show_image`'s rule: added by a registration, so a hookless agy may show images, but never
+/// required for delegation (without it, agy itself refuses the call).
+pub const IMAGE_ALLOW_RULE: &str = "mcp(agent_terminal/show_image)";
+
+/// Every rule a registration adds and may later remove: [`ALLOW_RULES`], then
+/// [`IMAGE_ALLOW_RULE`].
+pub const MANAGED_ALLOW_RULES: [&str; 9] = [
+    ALLOW_RULES[0],
+    ALLOW_RULES[1],
+    ALLOW_RULES[2],
+    ALLOW_RULES[3],
+    ALLOW_RULES[4],
+    ALLOW_RULES[5],
+    ALLOW_RULES[6],
+    ALLOW_RULES[7],
+    IMAGE_ALLOW_RULE,
 ];
 
 /// The allow rule for one tool.
@@ -210,8 +229,19 @@ mod tests {
 
     #[test]
     fn allow_rules_match_the_tools() {
+        // Every tool has its managed rule; only `show_image`'s is not required for delegation.
         let built: Vec<String> = ToolName::ALL.into_iter().map(allow_rule).collect();
-        assert_eq!(built, ALLOW_RULES.to_vec());
+        assert_eq!(built, MANAGED_ALLOW_RULES.to_vec());
+        let required: Vec<String> = ToolName::ALL
+            .into_iter()
+            .filter(|t| *t != ToolName::ShowImage)
+            .map(allow_rule)
+            .collect();
+        assert_eq!(required, ALLOW_RULES.to_vec());
+        assert_eq!(allow_rule(ToolName::ShowImage), IMAGE_ALLOW_RULE);
+        // A settings file with the delegation rules only (an earlier registration) misses none.
+        let earlier = serde_json::json!({"permissions": {"allow": ALLOW_RULES}}).to_string();
+        assert_eq!(allow_rules_missing(&earlier), Ok(vec![]));
         assert!(WORKSPACE_SOURCE_NAMES.contains(&"sidecars.json"));
         assert!(WORKSPACE_SOURCE_NAMES.contains(&"sidecars"));
     }

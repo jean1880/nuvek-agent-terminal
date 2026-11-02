@@ -1050,6 +1050,10 @@ impl Supervisor {
             ToolRequest::Send(r) => self.send_worker(&worker, r).await,
             ToolRequest::Cancel(r) => self.cancel_worker_call(&worker, r).await,
             ToolRequest::Close(r) => self.close_worker_call(&worker, r).await,
+            ToolRequest::ShowImage(r) => {
+                self.show_images(conn, &worker, call.invocation.as_ref(), r)
+                    .await
+            }
         }
     }
     /// Whether an agy profile's managed MCP registration would let a child launch: the same

@@ -2095,11 +2095,13 @@ mod tests {
         let user = Body::User {
             text: "hi".into(),
             queued: false,
+            attachments: Vec::new(),
         };
         let reply = Body::Assistant {
             text: String::new(),
             driver: Driver::Claude,
             streaming: true,
+            images: Vec::new(),
         };
         let notice = Body::Notice {
             text: "note".into(),
@@ -2122,6 +2124,7 @@ mod tests {
         let queued = Body::User {
             text: "next".into(),
             queued: true,
+            attachments: Vec::new(),
         };
         assert_eq!(entrance(&queued, Some(&reply)), Some("row-enter"));
         assert_eq!(

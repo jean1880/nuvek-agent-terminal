@@ -924,6 +924,66 @@ fn write_at_with(
     Ok(())
 }
 
+/// Why [`read_unasked`] read nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnaskedRead {
+    /// The read must ask ([`must_ask`]): `target` (where the path leads) is outside the folder
+    /// (`outside`), or is a sensitive file or one with a second hard link inside it.
+    MustAsk { target: PathBuf, outside: bool },
+    /// The file could not be read: a sentence naming the path.
+    Failed(String),
+}
+
+/// Reads the file `path` names (absolute, or relative to the folder) as a read-only call that
+/// may run without asking, at most `max` bytes, judged and opened as the Local agent's own reads
+/// are: resolved once ([`target`]), refused when it [`must_ask`], then opened inside the pinned
+/// folder one component at a time without following a link ([`open_inside`]), without
+/// blocking, and read only when it is a regular file with one link. Returns where it led and
+/// its bytes. A link inside the folder is judged, and read, where it leads.
+pub fn read_unasked(
+    ws: &Workspace,
+    path: &str,
+    max: u64,
+) -> Result<(PathBuf, Vec<u8>), UnaskedRead> {
+    let input = serde_json::json!({ "file_path": path });
+    let shown = absolute(&ws.cwd, path);
+    let Some(judged) = target(ws, Tool::ReadFile, &input) else {
+        return Err(UnaskedRead::Failed(format!(
+            "{} leads through a link that names nothing; nothing was read",
+            shown.display()
+        )));
+    };
+    if must_ask(ws, Tool::ReadFile, Some(&judged)) {
+        let outside = !judged.starts_with(&ws.root);
+        return Err(UnaskedRead::MustAsk {
+            target: judged,
+            outside,
+        });
+    }
+    let fd = open_for_read(ws, &shown, &judged, libc::O_RDONLY | libc::O_NONBLOCK)
+        .map_err(UnaskedRead::Failed)?;
+    let meta = std::fs::File::from(
+        fd.try_clone()
+            .map_err(|e| UnaskedRead::Failed(e.to_string()))?,
+    )
+    .metadata()
+    .map_err(|e| UnaskedRead::Failed(format!("Cannot read {}: {e}", shown.display())))?;
+    if meta.is_dir() {
+        return Err(UnaskedRead::Failed(format!(
+            "{} is a folder, not a file",
+            shown.display()
+        )));
+    }
+    if hard_linked(&meta) {
+        return Err(UnaskedRead::Failed(format!(
+            "{} has another hard link now; nothing was read",
+            shown.display()
+        )));
+    }
+    let bytes = read_open_bytes(fd, &shown, max).map_err(UnaskedRead::Failed)?;
+    Ok((judged, bytes))
+}
+
 /// `approved`: the read was allowed past the folder, so a second hard link does not refuse it.
 fn read_file(
     input: &Value,
@@ -2578,5 +2638,91 @@ mod tests {
         )
         .unwrap();
         assert!(failed.contains("oops") && failed.contains("(exit code 3)"));
+    }
+
+    /// A read that may not ask reads only what a read would without asking: inside the folder,
+    /// a link judged where it leads, and never a pipe, a sensitive or a hard-linked file.
+    #[test]
+    fn an_unasked_read_reads_only_what_may_be_read_without_asking() {
+        let d = dir();
+        let outside = dir();
+        std::fs::write(d.path().join("chart.png"), b"inside").unwrap();
+        std::fs::create_dir(d.path().join("sub")).unwrap();
+        std::fs::write(d.path().join("sub/a.png"), b"nested").unwrap();
+        std::fs::write(outside.path().join("secret.png"), b"outside").unwrap();
+        let w = ws(d.path());
+        let real = d.path().canonicalize().unwrap();
+
+        let (at, bytes) = read_unasked(&w, "chart.png", 1024).unwrap();
+        assert_eq!((at, bytes), (real.join("chart.png"), b"inside".to_vec()));
+        let abs = d.path().join("sub/a.png");
+        assert_eq!(
+            read_unasked(&w, abs.to_str().unwrap(), 1024).unwrap().1,
+            b"nested"
+        );
+        // A link inside the folder to a file inside it is read where it leads.
+        std::os::unix::fs::symlink(d.path().join("sub/a.png"), d.path().join("in.png")).unwrap();
+        assert_eq!(
+            read_unasked(&w, "in.png", 1024).unwrap(),
+            (real.join("sub/a.png"), b"nested".to_vec())
+        );
+
+        // Outside: asked for, so never read here; a link inside leading out is judged there.
+        let out = outside.path().join("secret.png");
+        let outside_real = outside.path().canonicalize().unwrap().join("secret.png");
+        for path in [out.to_str().unwrap().to_owned(), "../x.png".to_owned()] {
+            assert!(
+                matches!(
+                    read_unasked(&w, &path, 1024),
+                    Err(UnaskedRead::MustAsk { outside: true, .. })
+                ),
+                "{path}"
+            );
+        }
+        std::os::unix::fs::symlink(&out, d.path().join("link.png")).unwrap();
+        assert_eq!(
+            read_unasked(&w, "link.png", 1024),
+            Err(UnaskedRead::MustAsk {
+                target: outside_real,
+                outside: true
+            })
+        );
+
+        // Inside but asked for: a sensitive file, or one with a second hard link.
+        std::fs::create_dir(d.path().join(".git")).unwrap();
+        std::fs::write(d.path().join(".git/x.png"), b"git").unwrap();
+        std::fs::hard_link(d.path().join("chart.png"), d.path().join("twin.png")).unwrap();
+        for path in [".git/x.png", "twin.png"] {
+            assert!(
+                matches!(
+                    read_unasked(&w, path, 1024),
+                    Err(UnaskedRead::MustAsk { outside: false, .. })
+                ),
+                "{path}"
+            );
+        }
+
+        // A pipe is refused at once, never waited on; a folder, a missing file and an
+        // over-long one fail with a sentence naming them.
+        let fifo = d.path().join("pipe");
+        let name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid path string; makes a FIFO in the test's own folder.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+        match read_unasked(&w, "pipe", 1024) {
+            Err(UnaskedRead::Failed(why)) => assert!(why.contains("not a regular file"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(2));
+        for (path, said) in [
+            ("sub", "is a folder"),
+            ("missing.png", "Cannot read"),
+            ("sub/a.png", "too large"),
+        ] {
+            match read_unasked(&w, path, 3) {
+                Err(UnaskedRead::Failed(why)) => assert!(why.contains(said), "{path}: {why}"),
+                other => panic!("{path}: {other:?}"),
+            }
+        }
     }
 }

@@ -1114,6 +1114,44 @@ impl StoreHandle {
         })
     }
 
+    /// [`Self::append_user_message`] with the refs of the images sent with it.
+    pub fn append_user_input(
+        &self,
+        thread: &str,
+        provider_thread: Option<&str>,
+        text: &str,
+        refs: &[agent_core::attachment::AttachmentRef],
+    ) -> Result<String> {
+        if let Self::Inline(store) = self {
+            return store.append_user_input(thread, provider_thread, text, refs);
+        }
+        let item = self.new_id()?;
+        // Handed back only once the write is admitted.
+        self.append_user_input_with_id(thread, provider_thread, &item, text, refs)?;
+        Ok(item)
+    }
+
+    /// [`Self::append_user_message_with_id`] with the refs of the images sent with it.
+    pub fn append_user_input_with_id(
+        &self,
+        thread: &str,
+        provider_thread: Option<&str>,
+        item: &str,
+        text: &str,
+        refs: &[agent_core::attachment::AttachmentRef],
+    ) -> Result<()> {
+        let (t, pt, i, text, refs) = (
+            thread.to_owned(),
+            provider_thread.map(str::to_owned),
+            item.to_owned(),
+            text.to_owned(),
+            refs.to_vec(),
+        );
+        self.write("store a message", Some(thread), move |s| {
+            s.append_user_input_with_id(&t, pt.as_deref(), &i, &text, &refs)
+        })
+    }
+
     pub fn mark_read(&self, thread: &str) -> Result<()> {
         let t = thread.to_owned();
         self.write("mark the thread read", Some(thread), move |s| {

@@ -8,6 +8,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use agent_core::adapter::{Driver, Mode};
+use agent_core::attachment::AttachmentRef;
 use agent_core::event::{
     BackgroundTask, BackgroundTaskKind, Decision, Envelope, Event, ItemKind, ItemStatus, PlanStep,
     Question, QuestionSource, ReasoningLabel, ReasoningState, ResponseCapability, StepStatus,
@@ -34,11 +35,15 @@ pub enum Body {
     User {
         text: String,
         queued: bool,
+        /// The images sent with it, by ref.
+        attachments: Vec<AttachmentRef>,
     },
     Assistant {
         text: String,
         driver: Driver,
         streaming: bool,
+        /// Local images the reply showed, captured when it completed.
+        images: Vec<AttachmentRef>,
     },
     Reasoning {
         text: String,
@@ -211,6 +216,9 @@ pub struct Tool {
     pub status: ToolStatus,
     /// A sub-agent's model as its provider reported it ([`Event::SubagentModel`]).
     pub reported_model: Option<String>,
+    /// Images the call showed ([`Event::Attachments`]): a tool's result inside the card, an
+    /// image the agent chose to show (`show_image`) below it.
+    pub images: Vec<AttachmentRef>,
 }
 
 /// One sub-agent, as the explorer lists it.
@@ -1367,6 +1375,7 @@ impl Transcript {
                 WorkerState::Stopped | WorkerState::Unknown => ToolStatus::Interrupted,
             };
             let tool = Tool {
+                images: Vec::new(),
                 kind: ItemKind::Subagent,
                 title: name.clone(),
                 input: Some(
@@ -1998,6 +2007,16 @@ impl Transcript {
                             out.push(Change::Updated(id.clone()));
                         }
                     }
+                    if let Body::User {
+                        attachments: held, ..
+                    } = &mut item.body
+                    {
+                        let refs = agent_core::attachment::refs_in(input.as_ref());
+                        if !refs.is_empty() && *held != refs {
+                            *held = refs;
+                            out.push(Change::Updated(id.clone()));
+                        }
+                    }
                     if let Body::User { queued, .. } = &mut item.body {
                         let is_queued = title == "queued"
                             || input
@@ -2032,12 +2051,14 @@ impl Transcript {
                         Body::User {
                             text: String::new(),
                             queued,
+                            attachments: agent_core::attachment::refs_in(input.as_ref()),
                         }
                     }
                     ItemKind::AssistantMessage => Body::Assistant {
                         text: String::new(),
                         driver,
                         streaming: true,
+                        images: Vec::new(),
                     },
                     ItemKind::Reasoning => Body::new_reasoning(),
                     _ => Body::Tool(Tool {
@@ -2049,6 +2070,7 @@ impl Transcript {
                         error: None,
                         status: ToolStatus::Running,
                         reported_model: None,
+                        images: Vec::new(),
                     }),
                 };
                 if matches!(kind, ItemKind::AssistantMessage | ItemKind::Reasoning) {
@@ -2443,6 +2465,26 @@ impl Transcript {
             }
             // Quota feeds the usage indicator (app-wide service), not the transcript.
             Event::QuotaUpdated { .. } | Event::Unknown => {}
+            // Never delivered to the view: the session stores it and sends refs instead.
+            Event::ToolImage { .. } => {}
+            Event::Attachments { refs } => {
+                let Some(id) = env.item.clone() else {
+                    return out;
+                };
+                if let Some(item) = self.items.get_mut(&id) {
+                    let held = match &mut item.body {
+                        Body::Tool(tool) => Some(&mut tool.images),
+                        Body::Assistant { images, .. } => Some(images),
+                        Body::User { attachments, .. } => Some(attachments),
+                        _ => None,
+                    };
+                    if let Some(held) = held {
+                        if add_images(held, refs) {
+                            out.push(Change::Updated(id));
+                        }
+                    }
+                }
+            }
             // Delegation events are not shown yet.
             Event::DelegatedMessage { .. } | Event::WorkerLinked { .. } => {}
         }
@@ -2551,6 +2593,7 @@ impl Transcript {
                 text: String::new(),
                 driver,
                 streaming: true,
+                images: Vec::new(),
             },
             StreamKind::Reasoning => Body::new_reasoning(),
             // Tool text for a tool we never saw start: nothing to attach it to.
@@ -2662,6 +2705,21 @@ pub(crate) fn reset_clock(at: i64, now: i64) -> Option<String> {
         .format(if same_day { "%H:%M" } else { "%Y-%m-%d %H:%M" })
         .ok()
         .map(Into::into)
+}
+
+/// Adds `refs` an item does not show yet to `held`, up to
+/// [`agent_core::attachment::MAX_PER_ITEM`]; true when anything was added.
+fn add_images(held: &mut Vec<AttachmentRef>, refs: &[AttachmentRef]) -> bool {
+    let before = held.len();
+    for r in refs {
+        if held.len() >= agent_core::attachment::MAX_PER_ITEM {
+            break;
+        }
+        if !held.iter().any(|h| h.id == r.id && h.origin == r.origin) {
+            held.push(r.clone());
+        }
+    }
+    held.len() != before
 }
 
 /// Compact token count for the gauge and the compaction divider: `950`, `21k`, `1.2M`.
@@ -3699,6 +3757,97 @@ mod tests {
 
     fn started(id: &str, kind: ItemKind, parent: Option<&str>) -> Envelope {
         Envelope::item_started(id, kind, format!("title {id}"), None, parent)
+    }
+
+    fn image(id: char, origin: agent_core::attachment::Origin) -> AttachmentRef {
+        AttachmentRef {
+            id: id.to_string().repeat(64),
+            kind: agent_core::attachment::AttachmentKind::Image,
+            mime: "image/png".into(),
+            width: 640,
+            height: 480,
+            bytes: 1000,
+            name: None,
+            origin,
+        }
+    }
+
+    /// A user message's images come with its first `ItemStarted` (live and replayed alike, so the
+    /// bubble never draws without them), survive being queued then sent, and a tool's images
+    /// arrive by `Attachments`, once each, up to the per-item cap.
+    #[test]
+    fn images_reach_the_items_they_belong_to() {
+        use agent_core::attachment::{user_message_input, Origin, MAX_PER_ITEM};
+        let mut t = Transcript::new();
+        let shot = image('a', Origin::User);
+        t.apply(
+            &Envelope::item_started(
+                "u",
+                ItemKind::UserMessage,
+                "queued",
+                user_message_input(true, std::slice::from_ref(&shot)),
+                None,
+            ),
+            Driver::Claude,
+        );
+        let user = |t: &Transcript| match t.get("u").map(|i| &i.body) {
+            Some(Body::User {
+                attachments,
+                queued,
+                ..
+            }) => (attachments.clone(), *queued),
+            other => panic!("not a user message: {other:?}"),
+        };
+        assert_eq!(user(&t), (vec![shot.clone()], true));
+        t.apply(
+            &Envelope::item_started(
+                "u",
+                ItemKind::UserMessage,
+                "",
+                user_message_input(false, std::slice::from_ref(&shot)),
+                None,
+            ),
+            Driver::Claude,
+        );
+        assert_eq!(user(&t), (vec![shot.clone()], false));
+
+        t.apply(&started("read", ItemKind::FileRead, None), Driver::Claude);
+        let result = image('b', Origin::ToolResult);
+        let refs = Envelope::new(Event::Attachments {
+            refs: vec![result.clone()],
+        })
+        .item("read");
+        let changes = t.apply(&refs, Driver::Claude);
+        assert!(changes.contains(&Change::Updated("read".into())));
+        // The same image again changes nothing.
+        assert!(!t
+            .apply(&refs, Driver::Claude)
+            .contains(&Change::Updated("read".into())));
+        let many: Vec<_> = "cdefghijklmnop"
+            .chars()
+            .map(|c| image(c, Origin::AgentShown))
+            .collect();
+        t.apply(
+            &Envelope::new(Event::Attachments { refs: many }).item("read"),
+            Driver::Claude,
+        );
+        match t.get("read").map(|i| &i.body) {
+            Some(Body::Tool(tool)) => {
+                assert_eq!(tool.images.len(), MAX_PER_ITEM);
+                assert_eq!(tool.images[0], result);
+            }
+            other => panic!("not a tool: {other:?}"),
+        }
+        // An image for an item never seen is dropped, not turned into a row.
+        let before = t.order().len();
+        t.apply(
+            &Envelope::new(Event::Attachments {
+                refs: vec![image('z', Origin::ToolResult)],
+            })
+            .item("nowhere"),
+            Driver::Claude,
+        );
+        assert_eq!(t.order().len(), before);
     }
 
     fn delta(id: Option<&str>, stream: StreamKind, text: &str) -> Envelope {

@@ -88,7 +88,10 @@ Architectural mandates, standards, and workflows for this codebase.
     `rmcp` client on one runtime thread per session, discovery and calls; `process`: the exact
     child environment, credential masks and scrubbed stderr; `import`: the pure Codex
     `config.toml` reader), `mcp_guardian` (the `--local-mcp-guardian` role that owns each MCP
-    process group) and `exec` (child processes with a timeout).
+    process group), `attachments` (image normalising under decode limits, metadata dropped by
+    encoding again, and the content-addressed `0600` blob store under
+    `$XDG_DATA_HOME/agent-terminal/attachments`, read back only when its hash matches, swept of
+    blobs no event refers to) and `exec` (child processes with a timeout).
   - `agent-kit`'s `store` is the SQLite thread store (threads, provider
     threads, scrubbed events, app meta such as the open-thread list).
     `store_writer` is the one thread that writes it: the app's main thread
@@ -121,7 +124,9 @@ Architectural mandates, standards, and workflows for this codebase.
     imports that keep `crate::git::…` paths).
   - Chat: `chat/session.rs` (one thread's backend: adapter, process, store,
     switching, handoff), `chat/view/` (the GTK view; it only talks to
-    `ChatBackend`), `agent_proc.rs` (gio process transport),
+    `ChatBackend`; `view/images.rs` draws every image and the viewer, `view/tray.rs` the
+    composer's staged images), `attachments.rs` (taking images in and loading them as textures,
+    off the main thread), `agent_proc.rs` (gio process transport),
     `approval_server.rs` / `approval_hook.rs` (agy's approval socket and the
     `--approval-hook` client), `hook_config.rs` (is the hook installed in
     `~/.gemini/config/hooks.json`), `model_catalog.rs`, `account_status.rs`,
@@ -219,6 +224,23 @@ Architectural mandates, standards, and workflows for this codebase.
   event (`scrub_envelope`) and title, and every handoff (cross-agent switch,
   fork, compact-by-handoff, brief) goes through `agent_core::redact` and the
   handoff budget. A new store write or injected prompt must take the same path.
+- **Images are kept by ref, decoded under bounds, and never redacted, so never sent unasked**:
+  an image a user attaches (picked, pasted, dropped) or an agent's tool returns is decoded under
+  `agent_kit::attachments::normalise`'s limits (20 MB, 16 384 px a side, bounded allocation),
+  resized to 2048 px, re-encoded (no metadata survives) and stored content-addressed (`0600`, in a
+  `0700` `$XDG_DATA_HOME/agent-terminal/attachments`); only the re-encoded copy is ever shown or
+  sent. Events, the store and hand-offs carry an `AttachmentRef` (its sha256 id, size, name),
+  never bytes: `Event::ToolImage` (an adapter's image, base64 or a path) is transient, stored as a
+  blob by the session and replaced by `Event::Attachments` before anything is persisted or shown,
+  and the store refuses it; a `raw` frame over 256 KB is replaced by its size. Base64 never passes
+  through `redact` (it would corrupt it). Because an image cannot be redacted, one reaches an agent
+  only when the user attached it, with its thumbnail in view, and an agent that cannot take images
+  (agy: its stream input is text only) keeps the message in the composer and says so, never
+  sending the text alone. Hand-offs say `[image: name]`. The sweep (`threads::sweep_images`)
+  removes a blob no event refers to once it is a day old, after a thread is deleted and at
+  start-up, and only against the file store (an in-memory or demo store knows no thread's images).
+  "Open in Image Viewer" hands another app a private copy under `$XDG_RUNTIME_DIR/agent-terminal/
+  open`, removed at quit. No image is ever fetched from the network.
 - **A root hears its sub-agents without polling, and never after a stop**: a child's finished
   run, failure or message to its root is posted in the root's thread as the app's notice and
   starts a turn with it (`delegation/wake.rs`, decided in `agent_core::delegation::wake`):
@@ -246,6 +268,22 @@ Architectural mandates, standards, and workflows for this codebase.
   approve it. With nothing declared the task mode decides, and the user's shell and edit rules
   reach a writing child within it (`rule_may_apply`); a plan child has no network unless declared.
   `authority::tests::a_declared_limit_is_refused_and_no_rule_reaches_past_it` proves these.
+- **`show_image` shows the user an image file, and reads only what a read may without
+  asking**: the bridge's ninth tool (`ToolName::ShowImage`, 1 to 5 paths, a caption each) needs
+  no delegation (it is in `DEGRADED_TOOLS`) and is a read for `ChildAuthority::judge`, so a plan
+  child, or one declared nothing, may call it. Each path is resolved once against the caller's
+  working folder and judged as the Local agent's reads are (`local_tools::read_unasked`): a path
+  that leads outside the folder, or to a sensitive or hard-linked file, would ask, and since a
+  bridge call has no way to ask the user it is refused with that reason, never read. The rest is
+  opened from the pinned folder without following a link and without blocking, read only when
+  regular (a pipe or a device is refused), at most 20 MB, then decoded under the attachment
+  bounds and stored off the main thread (`delegation/show_image.rs`). The images go on the
+  call's own tool item as `Event::Attachments` with `Origin::AgentShown` (shown below its card;
+  the caption, redacted, as the image's name): the item the call's invocation key names, else the
+  thread's newest open `show_image` call (`correlation::show_image_item`), counted toward the
+  turn's cap. The model is told one line per image (`Shown to the user: chart.png (1280×720)`, or
+  why not), never the bytes. The agy registration adds its allow rule, but delegation never
+  requires it (`agy_guard::IMAGE_ALLOW_RULE`), so an earlier registration still delegates.
 - **A folder grant is session-only and never wider than its card**: "Allow for session" on an
   edit keeps the file's folder (`always_allow::session_folder`): inside the workspace, or at
   least two levels inside home outside it; never `/`, home or above, and nothing when home is

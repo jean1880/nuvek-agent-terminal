@@ -832,7 +832,7 @@ fn scripted_a_message_mid_turn_steers_the_running_codex_turn() {
                 .order()
                 .iter()
                 .filter_map(|id| match model.get(id).map(|i| &i.body) {
-                    Some(Body::User { text, queued }) => Some((text.clone(), *queued)),
+                    Some(Body::User { text, queued, .. }) => Some((text.clone(), *queued)),
                     _ => None,
                 })
                 .collect()

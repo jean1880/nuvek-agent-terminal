@@ -92,6 +92,16 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   turn for Claude and Codex. For Antigravity (and for slash commands) it is queued instead,
   pinned at the bottom of the transcript, and goes out when the turn ends. `Up` in an empty
   composer takes the last queued one back for editing.
+- **Images in the conversation.** Attach a screenshot or any PNG, JPEG, WebP or GIF with the
+  paperclip, by pasting it (`Ctrl+V`; text on the clipboard still pastes as text) or by dropping
+  it anywhere on the thread: up to five per message, shown in the composer before you send them,
+  then inside your message. Claude, Codex and the Local agent (with a model that reads images)
+  receive them; Antigravity takes text only, so the message stays in the composer and says so.
+  Images an agent looks at (a file it reads, a screenshot from a tool) appear as thumbnails on
+  that step's card, and an image an agent chooses to show you appears under its card. Click any
+  image to view it at full size, step through the others, copy it, save it or open it in your
+  image viewer. Images are resized to 2048 pixels and stripped of their metadata before they are
+  stored or sent, are kept only on your machine, and are removed a day after no thread uses them.
 - **Quick replies.** When a Codex or Antigravity reply ends with a question and a short
   list of choices, the choices appear under it; one click puts the answer in the composer,
   ready to send or edit. Turn them off from the replies themselves or in Settings → General.

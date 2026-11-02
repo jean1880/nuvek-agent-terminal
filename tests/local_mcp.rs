@@ -116,6 +116,9 @@ for line in sys.stdin:
         if scenario == 'secret-key-result':
             respond(request, {'resultType':'complete','content':[{'type':'text','text':'wrote marker'}],
                 'structuredContent':{os.environ['TOKEN']:'kept'}}); continue
+        if scenario == 'image-result':
+            image = {'type':'image','data':os.environ.get('TOKEN','SU1H'),'mimeType':'image/png'}
+            respond(request, {'resultType':'complete','content':[{'type':'text','text':'captured'}] + [image] * 11}); continue
         if scenario == 'structured-result':
             respond(request, {'resultType':'complete','isError':True,
                 'content':[{'type':'text','text':'雪'*20000},{'type':'image','data':'BINARY-CANARY'},{'type':'resource_link','uri':'https://example.com/no-fetch'}],
@@ -631,6 +634,7 @@ fn abrupt_runner_death_closes_the_private_lifetime_pipe_and_kills_descendants() 
             input,
             "{}",
             serde_json::to_string(&agent_core::adapter::Command::Prompt {
+                attachments: Vec::new(),
                 text: "hello".into()
             })
             .unwrap()
@@ -778,6 +782,7 @@ fn runner_stop_restarts_a_fresh_generation_and_stdin_eof_awaits_cleanup() {
         input,
         "{}",
         serde_json::to_string(&agent_core::adapter::Command::Prompt {
+            attachments: Vec::new(),
             text: "first".into()
         })
         .unwrap()
@@ -798,6 +803,7 @@ fn runner_stop_restarts_a_fresh_generation_and_stdin_eof_awaits_cleanup() {
         input,
         "{}",
         serde_json::to_string(&agent_core::adapter::Command::Prompt {
+            attachments: Vec::new(),
             text: "second".into()
         })
         .unwrap()
@@ -972,7 +978,10 @@ impl LiveRunner {
         mut on_card: impl FnMut(&agent_core::event::Envelope),
     ) -> Vec<agent_core::event::Envelope> {
         use agent_core::event::Event;
-        self.send(&agent_core::adapter::Command::Prompt { text: text.into() });
+        self.send(&agent_core::adapter::Command::Prompt {
+            attachments: Vec::new(),
+            text: text.into(),
+        });
         let mut events = Vec::new();
         loop {
             let envelope = self.next();
@@ -1497,6 +1506,7 @@ mod runner {
                     None,
                 );
                 run.send(Command::Prompt {
+                    attachments: Vec::new(),
                     text: "test".into(),
                 });
                 let events = run.turn();
@@ -1533,6 +1543,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let events = run.turn();
@@ -1578,6 +1589,7 @@ mod runner {
                 None,
             );
             run.send(Command::Prompt {
+                attachments: Vec::new(),
                 text: "test".into(),
             });
             let events = run.turn();
@@ -1687,6 +1699,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let card = loop {
@@ -1770,6 +1783,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "first".into(),
         });
         let card = loop {
@@ -1790,6 +1804,7 @@ mod runner {
             |e| e.request == card.request && matches!(e.event, Event::ApprovalResolved { .. })
         ));
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "second".into(),
         });
         let fresh = loop {
@@ -1853,6 +1868,7 @@ mod runner {
                 None,
             );
             run.send(Command::Prompt {
+                attachments: Vec::new(),
                 text: "test".into(),
             });
             let events = run.turn();
@@ -1918,6 +1934,7 @@ mod runner {
                 None,
             );
             run.send(Command::Prompt {
+                attachments: Vec::new(),
                 text: "test".into(),
             });
             let events = run.turn();
@@ -1940,6 +1957,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let events = run.turn();
@@ -1962,6 +1980,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let events = run.turn();
@@ -1996,6 +2015,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let events = run.turn();
@@ -2033,6 +2053,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let events = run.turn();
@@ -2064,6 +2085,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let events = run.turn();
@@ -2119,6 +2141,7 @@ mod runner {
                 None,
             );
             run.send(Command::Prompt {
+                attachments: Vec::new(),
                 text: "test".into(),
             });
             let events = run.turn();
@@ -2169,6 +2192,7 @@ mod runner {
                 None,
             );
             run.send(Command::Prompt {
+                attachments: Vec::new(),
                 text: "test".into(),
             });
             let events = run.turn();
@@ -2216,6 +2240,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let events = run.turn();
@@ -2248,6 +2273,7 @@ mod runner {
                         None,
                     );
                     run.send(Command::Prompt {
+                        attachments: Vec::new(),
                         text: "test".into(),
                     });
                     let events = run.turn();
@@ -2291,6 +2317,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         run.turn();
@@ -2328,6 +2355,7 @@ mod runner {
                 None,
             );
             run.send(Command::Prompt {
+                attachments: Vec::new(),
                 text: "test".into(),
             });
             let events = run.turn();
@@ -2343,6 +2371,75 @@ mod runner {
     }
 
     #[test]
+    fn result_images_reach_the_user_unmasked_and_the_model_reads_placeholders() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut config = config(folder.path(), "image-result");
+        // The image data is exactly a resolved credential: masking it would corrupt the image,
+        // and it is shown only to the user, so it is held aside from masking.
+        config.env.insert(
+            "TOKEN".into(),
+            EnvironmentValue::Reference {
+                from_env: "SOURCE".into(),
+            },
+        );
+        let data = "Q1JFREVOVElBTC1QSVhFTFM=";
+        let run = Run::new(
+            vec![config],
+            Mode::Bypass,
+            BTreeMap::from([("SOURCE".into(), data.into())]),
+            vec![Reply::Calls(vec![(mcp_alias(), json!({}))])],
+            None,
+        );
+        run.send(Command::Prompt {
+            attachments: Vec::new(),
+            text: "test".into(),
+        });
+        let events = run.turn();
+        let item = events
+            .iter()
+            .find(|e| {
+                matches!(e.event, Event::ItemStarted { .. })
+                    && e.item.as_deref().is_some_and(|i| i.starts_with("mcp-"))
+            })
+            .and_then(|e| e.item.clone())
+            .expect("the MCP call's item");
+        let images: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.event {
+                Event::ToolImage { image } => Some((e.item.clone(), image.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(images.len(), agent_core::attachment::MAX_PER_ITEM);
+        for (on, image) in &images {
+            assert_eq!(on.as_deref(), Some(item.as_str()));
+            assert_eq!(
+                image,
+                &agent_core::attachment::ToolImageSource::Inline {
+                    mime: "image/png".into(),
+                    data_base64: data.into()
+                }
+            );
+        }
+        let (bodies, transcript) = run.finish();
+        let result = bodies[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(result.contains("captured"));
+        assert_eq!(result.matches("[image]").count(), 10, "{result}");
+        assert!(result.contains("[1 image not shown: more than 10 in one result]"));
+        for text in [&result, &transcript, &bodies[1].to_string()] {
+            assert!(!text.contains(data));
+        }
+    }
+
+    #[test]
     fn cut_off_replies_and_over_budget_batches_execute_nothing() {
         let folder = tempfile::tempdir().unwrap();
         let run = Run::new(
@@ -2353,6 +2450,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let events = run.turn();
@@ -2376,6 +2474,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         run.turn();
@@ -2403,6 +2502,7 @@ mod runner {
                 None,
             );
             run.send(Command::Prompt {
+                attachments: Vec::new(),
                 text: "test".into(),
             });
             let card = loop {
@@ -2468,6 +2568,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let card = loop {
@@ -2514,6 +2615,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let card = loop {
@@ -2559,6 +2661,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let events = run.turn();
@@ -2609,6 +2712,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let mut count = 0;
@@ -2637,6 +2741,7 @@ mod runner {
                 None,
             );
             run.send(Command::Prompt {
+                attachments: Vec::new(),
                 text: "test".into(),
             });
             if mode == Mode::Ask {
@@ -2691,6 +2796,7 @@ mod runner {
                 None,
             );
             run.send(Command::Prompt {
+                attachments: Vec::new(),
                 text: "test".into(),
             });
             run.turn();
@@ -2723,6 +2829,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let until = Instant::now() + Duration::from_secs(4);
@@ -2772,6 +2879,7 @@ mod runner {
                 None,
             );
             run.send(Command::Prompt {
+                attachments: Vec::new(),
                 text: "test".into(),
             });
             let events = run.turn();
@@ -2840,6 +2948,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let events = run.turn();
@@ -2879,7 +2988,10 @@ mod runner {
         );
         let mut stamps = Vec::new();
         for turn in ["one", "two"] {
-            run.send(Command::Prompt { text: turn.into() });
+            run.send(Command::Prompt {
+                attachments: Vec::new(),
+                text: turn.into(),
+            });
             loop {
                 let env = run.next();
                 if let Event::ApprovalRequested { input, .. } = &env.event {

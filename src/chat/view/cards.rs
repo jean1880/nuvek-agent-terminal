@@ -501,12 +501,20 @@ impl MarkdownView {
 pub enum Row {
     User {
         root: gtk4::Box,
+        /// The bubble: the images (when any) above the text.
+        bubble: gtk4::Box,
+        /// Where the image group goes; rebuilt only when the refs change.
+        images: gtk4::Box,
+        shown: RefCell<Vec<String>>,
         text: gtk4::Label,
     },
     Assistant {
         root: gtk4::Box,
         md: MarkdownView,
         caret: gtk4::Label,
+        /// The local images the reply named, under its text.
+        images: gtk4::Box,
+        shown: RefCell<Vec<String>>,
     },
     Reasoning(ReasoningRow),
     Tool(ToolCard),
@@ -536,13 +544,25 @@ impl Row {
                 if *queued {
                     root.add_css_class("queued");
                 }
-                let text = label("", &["user-bubble"]);
+                let bubble = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+                bubble.add_css_class("user-bubble");
+                let images = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+                images.set_visible(false);
+                bubble.append(&images);
+                let text = label("", &["user-text"]);
                 wrapping(&text);
                 text.set_hexpand(false);
                 text.set_selectable(true);
                 text.set_max_width_chars(72);
-                root.append(&text);
-                Self::User { root, text }
+                bubble.append(&text);
+                root.append(&bubble);
+                Self::User {
+                    root,
+                    bubble,
+                    images,
+                    shown: RefCell::default(),
+                    text,
+                }
             }
             Body::Assistant { driver, .. } => {
                 let root = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
@@ -558,7 +578,16 @@ impl Row {
                 let caret = label("▍", &["stream-caret"]);
                 caret.set_selectable(false);
                 root.append(&caret);
-                Self::Assistant { root, md, caret }
+                let images = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+                images.set_visible(false);
+                root.append(&images);
+                Self::Assistant {
+                    root,
+                    md,
+                    caret,
+                    images,
+                    shown: RefCell::default(),
+                }
             }
             Body::Reasoning { .. } => Self::Reasoning(ReasoningRow::new(&item.id, sink)),
             Body::Tool(_) => Self::Tool(ToolCard::new(&item.id, sink)),
@@ -624,7 +653,7 @@ impl Row {
         match self {
             Self::User { root, .. } | Self::Assistant { root, .. } => root.clone().upcast(),
             Self::Reasoning(r) => r.root.clone().upcast(),
-            Self::Tool(t) => t.root.clone().upcast(),
+            Self::Tool(t) => t.outer.clone().upcast(),
             Self::Static(w) | Self::Switch { root: w, .. } => w.clone(),
             Self::Approval(a) => a.root.clone().upcast(),
             Self::Question(q) => q.root.clone().upcast(),
@@ -676,7 +705,20 @@ impl Row {
 
     pub fn update(&self, item: &Item) {
         match (self, &item.body) {
-            (Self::User { root, text: l }, Body::User { text, queued }) => {
+            (
+                Self::User {
+                    root,
+                    bubble,
+                    images,
+                    shown,
+                    text: l,
+                },
+                Body::User {
+                    text,
+                    queued,
+                    attachments,
+                },
+            ) => {
                 // The prompt a busy switch sent for the user is a marker, not their bubble; the
                 // tooltip keeps what the agent was told.
                 let continuation = super::model::is_switch_continuation(text);
@@ -685,6 +727,29 @@ impl Row {
                 } else {
                     text
                 });
+                // An image alone is a whole message: no empty line under it.
+                l.set_visible(continuation || !text.trim().is_empty() || attachments.is_empty());
+                let ids: Vec<String> = attachments.iter().map(|r| r.id.clone()).collect();
+                if *shown.borrow() != ids {
+                    while let Some(child) = images.first_child() {
+                        images.remove(&child);
+                    }
+                    if !attachments.is_empty() {
+                        images.append(&super::images::group(
+                            attachments,
+                            super::images::Place::Bubble,
+                            None,
+                        ));
+                    }
+                    images.set_visible(!attachments.is_empty());
+                    *shown.borrow_mut() = ids;
+                }
+                if attachments.is_empty() {
+                    bubble.remove_css_class("with-images");
+                } else {
+                    bubble.add_css_class("with-images");
+                }
+                let bubble_widget: &gtk4::Widget = bubble.upcast_ref();
                 l.set_tooltip_text(
                     continuation
                         .then_some(SENT_FOR_YOU)
@@ -702,9 +767,9 @@ impl Row {
                     }
                 }
                 if continuation {
-                    l.remove_css_class("user-bubble");
+                    bubble_widget.remove_css_class("user-bubble");
                 } else {
-                    l.add_css_class("user-bubble");
+                    bubble_widget.add_css_class("user-bubble");
                 }
                 root.set_halign(if continuation {
                     gtk4::Align::Center
@@ -718,13 +783,37 @@ impl Row {
                 }
             }
             (
-                Self::Assistant { md, caret, .. },
+                Self::Assistant {
+                    md,
+                    caret,
+                    images: slot,
+                    shown,
+                    ..
+                },
                 Body::Assistant {
-                    text, streaming, ..
+                    text,
+                    streaming,
+                    images,
+                    driver,
                 },
             ) => {
                 md.set_markdown(text);
                 caret.set_visible(*streaming);
+                let ids: Vec<String> = images.iter().map(|r| r.id.clone()).collect();
+                if *shown.borrow() != ids {
+                    while let Some(child) = slot.first_child() {
+                        slot.remove(&child);
+                    }
+                    if !images.is_empty() {
+                        slot.append(&super::images::group(
+                            images,
+                            super::images::Place::Agent,
+                            Some(driver.info().label),
+                        ));
+                    }
+                    slot.set_visible(!images.is_empty());
+                    *shown.borrow_mut() = ids;
+                }
             }
             (
                 Self::Reasoning(r),
@@ -1097,7 +1186,16 @@ impl ReasoningRow {
 // ---------------------------------------------------------------------------------------------
 
 pub struct ToolCard {
+    /// The card and, below it, the images the agent chose to show (`show_image`).
+    outer: gtk4::Box,
     root: gtk4::Box,
+    /// Small thumbnails of a tool result's images, in the header (collapsed too).
+    strip: gtk4::Box,
+    /// A tool result's images at full grid size, in the body.
+    media: gtk4::Box,
+    /// The images the agent showed, below the card.
+    shown: gtk4::Box,
+    images_shown: RefCell<Vec<String>>,
     header: gtk4::Button,
     is_edit: Rc<Cell<bool>>,
     details_guard: Rc<Cell<bool>>,
@@ -1309,6 +1407,9 @@ impl ToolCard {
         head.append(&kind_icon);
         head.append(&title);
         head.append(&summary);
+        let strip = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        strip.set_visible(false);
+        head.append(&strip);
         head.append(&badge);
         head.append(&chevron);
         header.set_child(Some(&head));
@@ -1334,8 +1435,11 @@ impl ToolCard {
         let error_box = Section::new("Error", &error);
         let children = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
         children.add_css_class("card-children");
+        let media = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        media.set_visible(false);
         body.append(input_box.widget());
         body.append(&children);
+        body.append(&media);
         body.append(output_box.widget());
         body.append(error_box.widget());
         let revealer = gtk4::Revealer::new();
@@ -1388,8 +1492,19 @@ impl ToolCard {
                 }));
             }
         ));
+        let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+        outer.append(&root);
+        let shown = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        shown.add_css_class("shown-images");
+        shown.set_visible(false);
+        outer.append(&shown);
         Self {
+            outer,
             root,
+            strip,
+            media,
+            shown,
+            images_shown: RefCell::default(),
             header,
             is_edit,
             details_guard,
@@ -1410,6 +1525,43 @@ impl ToolCard {
             last_status: Cell::new(None),
             diff,
         }
+    }
+
+    /// A tool result's images in the header strip and the body; the images the agent chose to
+    /// show below the card. Rebuilt only when the refs change.
+    fn show_images(&self, images: &[agent_core::attachment::AttachmentRef]) {
+        let ids: Vec<String> = images.iter().map(|r| r.id.clone()).collect();
+        if *self.images_shown.borrow() == ids {
+            return;
+        }
+        *self.images_shown.borrow_mut() = ids;
+        let (results, shown): (Vec<_>, Vec<_>) = images
+            .iter()
+            .cloned()
+            .partition(|r| r.origin != agent_core::attachment::Origin::AgentShown);
+        for slot in [&self.strip, &self.media, &self.shown] {
+            while let Some(child) = slot.first_child() {
+                slot.remove(&child);
+            }
+        }
+        if !results.is_empty() {
+            self.strip.append(&super::images::strip(&results));
+            self.media.append(&super::images::group(
+                &results,
+                super::images::Place::Card,
+                None,
+            ));
+        }
+        if !shown.is_empty() {
+            self.shown.append(&super::images::group(
+                &shown,
+                super::images::Place::Agent,
+                None,
+            ));
+        }
+        self.strip.set_visible(!results.is_empty());
+        self.media.set_visible(!results.is_empty());
+        self.shown.set_visible(!shown.is_empty());
     }
 
     fn build_diff_ui(id: &str, sink: &RowSink) -> FileDiffUi {
@@ -1562,6 +1714,7 @@ impl ToolCard {
         let Body::Tool(tool) = &item.body else {
             return;
         };
+        self.show_images(&tool.images);
         let is_edit = tool.kind == ItemKind::FileChange;
         self.is_edit.set(is_edit);
         self.diff.bar.set_visible(is_edit);
@@ -3191,6 +3344,7 @@ pub(crate) mod tests {
         let item = Item {
             id: "long".into(),
             body: Body::Tool(super::super::model::Tool {
+                images: Vec::new(),
                 kind: ItemKind::Command,
                 title: "Bash".into(),
                 input: Some(serde_json::json!({"command": "seq 100"})),
@@ -3244,6 +3398,7 @@ pub(crate) mod tests {
         let item = Item {
             id: "edit".into(),
             body: Body::Tool(super::super::model::Tool {
+                images: Vec::new(),
                 kind: ItemKind::FileChange,
                 title: "a.rs (+1 more)".into(),
                 input: Some(serde_json::json!([

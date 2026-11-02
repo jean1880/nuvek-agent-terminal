@@ -320,6 +320,119 @@ pub struct ApprovalAnswer {
     pub edited_arguments: Option<Value>,
 }
 
+/// The most base64 one tool-result image may hold: the MCP transport's frame bound (1 MiB),
+/// which a whole result must fit in to arrive at all.
+pub const MAX_TOOL_IMAGE_BASE64: usize = 1024 * 1024;
+
+/// What the model reads where a tool-result image was shown to the user.
+pub const SHOWN_IMAGE: &str = "[image]";
+
+/// The images [`take_images`] took out of a tool result.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ResultImages {
+    /// Shown to the user, in order ([`crate::event::Event::ToolImage`]).
+    pub images: Vec<crate::attachment::ToolImageSource>,
+    /// Past the per-item cap.
+    pub too_many: usize,
+    /// Over [`MAX_TOOL_IMAGE_BASE64`].
+    pub too_large: usize,
+    /// Not an image type, or its data not base64.
+    pub unreadable: usize,
+}
+
+/// Runs `scrub` over `result` with every image block's `data` held aside, then puts it back.
+/// Credential masking replaces text inside strings; run over base64 it would corrupt the image
+/// (and match nothing a credential looks like as text). The data is binary content the server
+/// produced, which only the user is shown ([`take_images`]): it never reaches the model, the
+/// transcript or any redaction, so leaving it unmasked discloses nothing to either.
+pub fn scrub_outside_image_data(result: &mut Value, scrub: impl FnOnce(&mut Value)) {
+    let mut held = Vec::new();
+    if let Some(blocks) = result.get_mut("content").and_then(Value::as_array_mut) {
+        for (at, block) in blocks.iter_mut().enumerate() {
+            if block.get("type").and_then(Value::as_str) == Some("image") {
+                if let Some(data) = block.get_mut("data") {
+                    held.push((at, data.take()));
+                }
+            }
+        }
+    }
+    scrub(result);
+    if let Some(blocks) = result.get_mut("content").and_then(Value::as_array_mut) {
+        for (at, data) in held {
+            if let Some(block) = blocks.get_mut(at).and_then(Value::as_object_mut) {
+                block.insert("data".into(), data);
+            }
+        }
+    }
+}
+
+/// Takes the image blocks (`{"type":"image","data":<base64>,"mimeType":<mime>}`) out of an MCP
+/// result, before any masking ([`scrub_outside_image_data`]). The first `max` well-formed ones
+/// are returned to be shown to the user and leave [`SHOWN_IMAGE`] for the model; the rest leave
+/// nothing, and a note leading the content says how many were not shown and why, so none is
+/// dropped silently. No base64 is left in `result`.
+pub fn take_images(result: &mut Value, max: usize) -> ResultImages {
+    use crate::attachment::ToolImageSource;
+    let mut out = ResultImages::default();
+    let Some(blocks) = result.get_mut("content").and_then(Value::as_array_mut) else {
+        return out;
+    };
+    let mut kept = Vec::with_capacity(blocks.len());
+    for block in std::mem::take(blocks) {
+        if block.get("type").and_then(Value::as_str) != Some("image") {
+            kept.push(block);
+            continue;
+        }
+        let mime = block.get("mimeType").and_then(Value::as_str).unwrap_or("");
+        let data = block.get("data").and_then(Value::as_str).unwrap_or("");
+        if !mime.starts_with("image/")
+            || data.is_empty()
+            || crate::local_agent::base64_decoded_len(data).is_none()
+        {
+            out.unreadable += 1;
+        } else if data.len() > MAX_TOOL_IMAGE_BASE64 {
+            out.too_large += 1;
+        } else if out.images.len() >= max {
+            out.too_many += 1;
+        } else {
+            out.images.push(ToolImageSource::Inline {
+                mime: mime.to_owned(),
+                data_base64: data.to_owned(),
+            });
+            kept.push(serde_json::json!({"type": "text", "text": SHOWN_IMAGE}));
+        }
+    }
+    let plural = |n: usize| if n == 1 { "image" } else { "images" };
+    let mut notes = Vec::new();
+    if out.too_large > 0 {
+        notes.push(format!(
+            "[{} {} not shown: too large]",
+            out.too_large,
+            plural(out.too_large)
+        ));
+    }
+    if out.too_many > 0 {
+        notes.push(format!(
+            "[{} {} not shown: more than {max} in one result]",
+            out.too_many,
+            plural(out.too_many)
+        ));
+    }
+    if out.unreadable > 0 {
+        notes.push(format!(
+            "[{} {} not shown: unreadable]",
+            out.unreadable,
+            plural(out.unreadable)
+        ));
+    }
+    *blocks = notes
+        .into_iter()
+        .map(|text| serde_json::json!({"type": "text", "text": text}))
+        .chain(kept)
+        .collect();
+    out
+}
+
 /// The caller scrubs first. Whole structured JSON is kept or explicitly omitted; serialized
 /// JSON is never sliced. Resource links are data and are never followed.
 pub fn result_text(result: &Value, reservation: usize) -> String {
@@ -950,6 +1063,61 @@ mod tests {
         )
         .is_ok());
     }
+    #[test]
+    fn result_images_are_taken_out_counted_and_never_left_as_base64() {
+        use crate::attachment::ToolImageSource;
+        use serde_json::json;
+        let big = "A".repeat(MAX_TOOL_IMAGE_BASE64 + 4);
+        let mut blocks = vec![json!({"type":"text","text":"before"})];
+        for n in 0..12 {
+            blocks.push(
+                json!({"type":"image","data":format!("SU1H{n:02}=="),"mimeType":"image/png"}),
+            );
+        }
+        blocks.push(json!({"type":"image","data":big,"mimeType":"image/png"}));
+        blocks.push(json!({"type":"image","data":"not base64!","mimeType":"image/png"}));
+        blocks.push(json!({"type":"image","data":"QUJD","mimeType":"text/plain"}));
+        let mut result = json!({"isError":false,"content":blocks});
+        let taken = take_images(&mut result, 10);
+        assert_eq!(taken.images.len(), 10);
+        assert_eq!(
+            taken.images[0],
+            ToolImageSource::Inline {
+                mime: "image/png".into(),
+                data_base64: "SU1H00==".into()
+            }
+        );
+        assert_eq!(
+            (taken.too_many, taken.too_large, taken.unreadable),
+            (2, 1, 2)
+        );
+        let text = result_text(&result, 30_000);
+        assert!(!text.contains("SU1H") && !text.contains("AAAA"), "{text}");
+        assert!(text.contains("[1 image not shown: too large]"));
+        assert!(text.contains("[2 images not shown: more than 10 in one result]"));
+        assert!(text.contains("[2 images not shown: unreadable]"));
+        assert_eq!(text.matches(SHOWN_IMAGE).count(), 10);
+        assert!(text.contains("before"));
+        let mut plain = json!({"content":[{"type":"text","text":"only"}]});
+        assert_eq!(take_images(&mut plain, 10), ResultImages::default());
+        assert_eq!(plain, json!({"content":[{"type":"text","text":"only"}]}));
+    }
+
+    #[test]
+    fn masking_skips_only_image_data() {
+        use serde_json::json;
+        let mut result = json!({"content":[
+            {"type":"text","text":"key SECRET"},
+            {"type":"image","data":"SECRETdata","mimeType":"image/png"}
+        ]});
+        scrub_outside_image_data(&mut result, |value| {
+            let text = value.to_string().replace("SECRET", "****");
+            *value = serde_json::from_str(&text).unwrap();
+        });
+        assert_eq!(result["content"][0]["text"], "key ****");
+        assert_eq!(result["content"][1]["data"], "SECRETdata");
+    }
+
     #[test]
     fn bounded_results_keep_is_error_json_and_omit_binary_and_links() {
         use serde_json::json;

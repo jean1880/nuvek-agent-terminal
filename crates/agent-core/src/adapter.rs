@@ -315,14 +315,21 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         child: Option<crate::local_agent::LocalChildPolicy>,
     },
+    /// A user message. `attachments` go with it natively ([`crate::caps::Capabilities::
+    /// image_input`]); an adapter that cannot carry them refuses the whole command
+    /// ([`AdapterError::Unsupported`]), never sends the text alone.
     Prompt {
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<crate::attachment::PromptAttachment>,
     },
     /// A user message for the turn that is running ([`crate::caps::Capabilities::live_input`]):
     /// Claude folds it into the turn (verified 2026-10-11), Codex takes it through
     /// `turn/steer`. An adapter that cannot refuses it; the host then queues it as before.
     Steer {
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<crate::attachment::PromptAttachment>,
     },
     /// A delegated message for the running turn `turn` (the native turn id), with no fallback:
     /// the outcome arrives as `Event::ControlResult` with `request == tag` (`ok` when the agent
@@ -375,6 +382,22 @@ pub enum Command {
 }
 
 impl Command {
+    /// A text-only [`Command::Prompt`].
+    pub fn prompt(text: impl Into<String>) -> Self {
+        Command::Prompt {
+            text: text.into(),
+            attachments: Vec::new(),
+        }
+    }
+
+    /// A text-only [`Command::Steer`].
+    pub fn steer(text: impl Into<String>) -> Self {
+        Command::Steer {
+            text: text.into(),
+            attachments: Vec::new(),
+        }
+    }
+
     /// A Local startup frame for a session that takes no part in delegation.
     pub fn configure_local(context: crate::local_context::LocalLaunchContext) -> Self {
         Command::ConfigureLocal {

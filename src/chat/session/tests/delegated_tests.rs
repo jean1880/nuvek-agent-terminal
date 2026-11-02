@@ -2705,6 +2705,7 @@ fn a_dropped_continuation_takes_back_only_its_own_kept_copy() {
             session.inner.pre_init_prompts.borrow_mut().push(Sent {
                 text: text.to_owned(),
                 handoff: None,
+                images: Vec::new(),
             });
         }
         assert_eq!(session.continue_after_limit(), ContinueOutcome::Busy);

@@ -15,6 +15,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use agent_core::attachment::AttachmentRef;
 use agent_core::event::{Envelope, Event, ItemKind, ItemStatus, StreamKind};
 use agent_core::redact::redact;
 use agent_core::redact::stream::{
@@ -345,6 +346,23 @@ pub(crate) fn quiet_injected_panics() {
             }
         }));
     });
+}
+
+/// The largest native frame kept in an event's `raw`. An unparsed line can carry a whole image
+/// as base64 (Claude repeats a read image in `tool_use_result`), which is neither text worth
+/// redacting nor worth keeping.
+pub const RAW_CAP: usize = 256 * 1024;
+
+/// `env` with its `raw` frame replaced by a size marker when that frame is over [`RAW_CAP`];
+/// `None` when it is kept as it is.
+fn raw_over_cap(env: &Envelope) -> Option<Envelope> {
+    let raw = env.raw.as_ref()?;
+    let size = serde_json::to_string(raw).map_or(usize::MAX, |s| s.len());
+    (size > RAW_CAP).then(|| {
+        let mut small = env.clone();
+        small.raw = Some(serde_json::json!({"omitted_bytes": size}));
+        small
+    })
 }
 
 /// The event's wire name (`content_delta`, `item_completed`, …), for logs. Encodes the event, so
@@ -2644,6 +2662,21 @@ impl Store {
         env: &Envelope,
         gate: bool,
     ) -> Result<i64> {
+        // An image's bytes never reach the events table: the session stores them as a blob and
+        // sends refs (`Event::Attachments`) instead.
+        if matches!(env.event, Event::ToolImage { .. }) {
+            return Err(StoreError::Failed(
+                "a tool image is stored as a blob, never as an event".to_owned(),
+            ));
+        }
+        let capped;
+        let env = match raw_over_cap(env) {
+            Some(small) => {
+                capped = small;
+                &capped
+            }
+            None => env,
+        };
         if self.in_batch.get() {
             self.batch_threads.borrow_mut().insert(thread.to_owned());
         }
@@ -3293,8 +3326,20 @@ impl Store {
         provider_thread: Option<&str>,
         text: &str,
     ) -> Result<String> {
+        self.append_user_input(thread, provider_thread, text, &[])
+    }
+
+    /// [`Store::append_user_message`] with the images sent with it, kept by ref in its
+    /// `ItemStarted.input` ([`agent_core::attachment::user_message_input`]); never their bytes.
+    pub fn append_user_input(
+        &self,
+        thread: &str,
+        provider_thread: Option<&str>,
+        text: &str,
+        refs: &[AttachmentRef],
+    ) -> Result<String> {
         let item = self.new_id()?;
-        self.append_user_message_with_id(thread, provider_thread, &item, text)?;
+        self.append_user_input_with_id(thread, provider_thread, &item, text, refs)?;
         Ok(item)
     }
 
@@ -3306,10 +3351,22 @@ impl Store {
         item: &str,
         text: &str,
     ) -> Result<()> {
+        self.append_user_input_with_id(thread, provider_thread, item, text, &[])
+    }
+
+    /// [`Store::append_user_input`] under an item id the caller made ([`Store::new_id`]).
+    pub fn append_user_input_with_id(
+        &self,
+        thread: &str,
+        provider_thread: Option<&str>,
+        item: &str,
+        text: &str,
+        refs: &[AttachmentRef],
+    ) -> Result<()> {
         let started = Envelope::new(Event::ItemStarted {
             kind: ItemKind::UserMessage,
             title: String::new(),
-            input: None,
+            input: agent_core::attachment::user_message_input(false, refs),
             parent: None,
         })
         .item(item);
@@ -3423,6 +3480,41 @@ impl Store {
         )?)
     }
 
+    /// Every attachment id any stored event refers to, in every thread: what the blob store's
+    /// sweep must keep. Refs are read from a user message's `ItemStarted.input.attachments` and
+    /// from `Event::Attachments`; only content addresses count ([`AttachmentRef::valid_id`]). The
+    /// `LIKE` only skips rows cheaply; each candidate is read as plain JSON, not as an
+    /// [`Envelope`], so a row this build cannot decode still keeps its images, and only the `id`
+    /// of a ref is needed.
+    ///
+    /// [`AttachmentRef::valid_id`]: agent_core::attachment::AttachmentRef::valid_id
+    pub fn attachment_ids(&self) -> Result<HashSet<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT envelope_json FROM events WHERE envelope_json LIKE '%\"attachments\"%'",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = HashSet::new();
+        for row in rows {
+            let Ok(value) = serde_json::from_str::<Value>(&row?) else {
+                continue;
+            };
+            let event = &value["event"];
+            let refs = match event["type"].as_str() {
+                Some("attachments") => &event["refs"],
+                Some("item_started") => &event["input"]["attachments"],
+                _ => continue,
+            };
+            let ids = refs
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r["id"].as_str())
+                .filter(|id| agent_core::attachment::AttachmentRef::valid_id(id));
+            out.extend(ids.map(str::to_owned));
+        }
+        Ok(out)
+    }
+
     /// Rebuilds the thread's items with their final text: a snapshot replaces
     /// the deltas accumulated so far, later deltas append to it. Items appear
     /// in the order they first occur. `Reasoning` items are left out: a
@@ -3438,6 +3530,8 @@ impl Store {
         let mut out: Vec<TranscriptMessage> = Vec::new();
         let mut index: HashMap<String, usize> = HashMap::new();
         let mut tools: HashMap<String, ToolInput> = HashMap::new();
+        // The images each user message carried: a hand-off says they were there.
+        let mut images: HashMap<String, Vec<AttachmentRef>> = HashMap::new();
         // Each item's id as stored, by its bounded form, and the items that completed.
         let mut items: HashMap<String, String> = HashMap::new();
         let mut completed: HashSet<String> = HashSet::new();
@@ -3465,8 +3559,15 @@ impl Store {
                     }
                     Event::ItemStarted {
                         kind: ItemKind::UserMessage,
+                        input,
                         ..
-                    } => seed_settled = true,
+                    } => {
+                        seed_settled = true;
+                        let refs = agent_core::attachment::refs_in(input.as_ref());
+                        if let (false, Some(item)) = (refs.is_empty(), &env.item) {
+                            images.insert(item.clone(), refs);
+                        }
+                    }
                     _ => {}
                 }
                 if let Some(item) = &env.item {
@@ -3496,6 +3597,11 @@ impl Store {
         }
         // A hand-off replays this; the model's private thinking must not travel with it.
         out.retain(|m| m.kind != "reasoning");
+        for message in out.iter_mut().filter(|m| m.role == "user") {
+            if let Some(refs) = images.get(&message.item_id) {
+                message.text = agent_core::attachment::text_with_placeholders(&message.text, refs);
+            }
+        }
         for message in out.iter_mut().filter(|m| m.role == "tool") {
             if let Some(tool) = tools.get(&message.item_id) {
                 message.title = tool.title();
@@ -4093,6 +4199,60 @@ mod tests {
             Some("recover me")
         );
         assert!(!s.has_messages(&t).unwrap());
+    }
+
+    #[test]
+    fn attachment_ids_are_found_in_both_shapes_and_only_when_valid() {
+        use agent_core::attachment::{user_message_input, AttachmentKind, AttachmentRef, Origin};
+        let r = |id: &str| AttachmentRef {
+            id: id.to_owned(),
+            kind: AttachmentKind::Image,
+            mime: "image/png".into(),
+            width: 1,
+            height: 1,
+            bytes: 1,
+            name: None,
+            origin: Origin::User,
+        };
+        // Real digests: the store's scrubbing must leave a content address as it is.
+        let [a, b, c] = [b"one".as_slice(), b"two", b"three"].map(crate::attachments::hex_sha256);
+        let s = store();
+        let t = s.create_thread("/w", None).unwrap();
+        let other = s.create_thread("/w", None).unwrap();
+        assert!(s.attachment_ids().unwrap().is_empty());
+        s.append_event(
+            &t,
+            None,
+            &Envelope::new(Event::ItemStarted {
+                kind: ItemKind::UserMessage,
+                title: String::new(),
+                input: user_message_input(false, &[r(&a), r("../../etc/passwd")]),
+                parent: None,
+            }),
+        )
+        .unwrap();
+        s.append_event(
+            &other,
+            None,
+            &Envelope::new(Event::Attachments {
+                refs: vec![r(&b), r(&a.to_uppercase())],
+            }),
+        )
+        .unwrap();
+        // A tool's input that merely names the key is not a ref.
+        s.append_event(
+            &t,
+            None,
+            &Envelope::new(Event::ItemStarted {
+                kind: ItemKind::Command,
+                title: "attachments".into(),
+                input: Some(serde_json::json!({"note": "\"attachments\"", "id": c})),
+                parent: None,
+            }),
+        )
+        .unwrap();
+        let ids = s.attachment_ids().unwrap();
+        assert_eq!(ids, HashSet::from([a, b]));
     }
 
     #[test]
@@ -4757,6 +4917,62 @@ mod tests {
         assert!(s.list_threads(false).expect("l")[0].unread);
         s.mark_read(&t).expect("read");
         assert!(!s.list_threads(false).expect("l")[0].unread);
+    }
+
+    /// A user message's images are kept by ref, every field intact through the scrub (a content
+    /// address is long hex, which must not read as a secret); a tool image is refused; an
+    /// oversized raw frame is replaced by its size.
+    #[test]
+    fn images_are_kept_by_ref_and_their_bytes_never() {
+        use agent_core::attachment::{refs_in, AttachmentKind, Origin, ToolImageSource};
+        let s = store();
+        let t = s.create_thread("/", None).expect("t");
+        let image = AttachmentRef {
+            id: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".into(),
+            kind: AttachmentKind::Image,
+            mime: "image/png".into(),
+            width: 1280,
+            height: 720,
+            bytes: 54_321,
+            name: Some("screenshot.png".into()),
+            origin: Origin::User,
+        };
+        s.append_user_input(&t, None, "look", std::slice::from_ref(&image))
+            .expect("user");
+        let events = s.events(&t, None, 10).expect("events");
+        let input = events.iter().find_map(|(_, e)| match &e.event {
+            Event::ItemStarted { input, .. } => input.clone(),
+            _ => None,
+        });
+        assert_eq!(refs_in(input.as_ref()), vec![image.clone()]);
+        // A hand-off reads the message with its image named, never its bytes.
+        let messages = s.transcript_messages(&t).expect("messages");
+        assert_eq!(messages[0].text, "look\n[image: screenshot.png]");
+        let refs = Envelope::new(Event::Attachments {
+            refs: vec![image.clone()],
+        })
+        .item("tool-1");
+        s.append_event(&t, None, &refs).expect("refs");
+        let stored = s.events(&t, None, 10).expect("events");
+        assert!(stored.iter().any(|(_, e)| e.event
+            == Event::Attachments {
+                refs: vec![image.clone()]
+            }));
+        let tool_image = Envelope::new(Event::ToolImage {
+            image: ToolImageSource::Inline {
+                mime: "image/png".into(),
+                data_base64: "iVBORw0KGgo".into(),
+            },
+        })
+        .item("tool-1");
+        assert!(s.append_event(&t, None, &tool_image).is_err());
+        let huge = Envelope::new(Event::Unknown).raw(serde_json::json!({
+            "tool_use_result": {"file": {"base64": "A".repeat(RAW_CAP + 1)}}
+        }));
+        s.append_event(&t, None, &huge).expect("unknown");
+        let all = serde_json::to_string(&s.events(&t, None, 10).expect("ev")).expect("json");
+        assert!(!all.contains("AAAAAAAA"), "a capped frame kept its bytes");
+        assert!(all.contains("omitted_bytes"));
     }
 
     #[test]

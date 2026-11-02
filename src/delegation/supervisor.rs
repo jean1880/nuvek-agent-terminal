@@ -684,6 +684,49 @@ mod tests {
         });
     }
 
+    /// `show_image` reaches its handler through the authenticated bridge and answers the model in
+    /// lines of text: a path outside the caller's folder is refused, never read.
+    #[test]
+    fn show_image_answers_in_lines_and_refuses_a_path_outside_the_folder() {
+        in_context(async {
+            let (_dir, sup, root) = harness();
+            connect(&sup, &root, ConnId(14)).await;
+            let elsewhere = tempfile::tempdir().unwrap();
+            let outside = elsewhere.path().join("chart.png");
+            std::fs::write(&outside, b"not read").unwrap();
+            let images = vec![
+                agent_core::delegation::wire::ImageSpec {
+                    path: outside.to_string_lossy().into_owned(),
+                    caption: None,
+                },
+                agent_core::delegation::wire::ImageSpec {
+                    path: "missing.png".into(),
+                    caption: Some("A chart".into()),
+                },
+            ];
+            let out = tool(
+                &sup,
+                ConnId(14),
+                1,
+                ToolRequest::ShowImage(agent_core::delegation::wire::ShowImageRequest { images }),
+            )
+            .await;
+            assert_eq!(out["api_version"], 1);
+            assert_eq!(out["shown"], 0);
+            assert_eq!(
+                out["results"][0],
+                format!(
+                    "Not shown: Only images inside the working folder can be shown; this one is \
+                     outside it: {}",
+                    outside.display()
+                )
+            );
+            let missing = out["results"][1].as_str().unwrap();
+            assert!(missing.starts_with("Not shown: Cannot read"), "{missing}");
+            stop(&sup).await;
+        });
+    }
+
     /// A capability is current only under its root's present epoch, and never once the root is
     /// gone or the token is.
     #[test]

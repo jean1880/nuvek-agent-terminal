@@ -429,6 +429,23 @@ pub struct CloseRequest {
     pub idempotency_key: IdempotencyKey,
 }
 
+/// One image `show_image` names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageSpec {
+    /// Absolute, or relative to the caller's working folder.
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+}
+
+/// `show_image` input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShowImageRequest {
+    pub images: Vec<ImageSpec>,
+}
+
 /// A validated tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolRequest {
@@ -440,6 +457,7 @@ pub enum ToolRequest {
     List(ListRequest),
     Cancel(CancelRequest),
     Close(CloseRequest),
+    ShowImage(ShowImageRequest),
 }
 
 /// Reads one tool's argument object field by field, so every refusal names its field.
@@ -615,6 +633,44 @@ fn parse_workspace(v: &Value) -> Result<WorkspaceRequest, ToolError> {
     }
 }
 
+/// `show_image`'s `images`: an array of `{path, caption?}` objects. Bounds are
+/// [`ToolRequest::validate`]'s.
+fn parse_images(v: &Value) -> Result<Vec<ImageSpec>, ToolError> {
+    let items = v
+        .as_array()
+        .ok_or_else(|| ToolError::invalid("images", "not_an_array"))?;
+    items
+        .iter()
+        .map(|item| {
+            let map = item
+                .as_object()
+                .ok_or_else(|| ToolError::invalid("images", "not_an_object"))?;
+            if let Some(k) = map
+                .keys()
+                .find(|k| !matches!(k.as_str(), "path" | "caption"))
+            {
+                return Err(ToolError::invalid(
+                    &format!("images.{}", truncate_bytes(k, 64)),
+                    "unknown_field",
+                ));
+            }
+            let path = match map.get("path") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Null) => return Err(ToolError::invalid("images.path", "null")),
+                Some(_) => return Err(ToolError::invalid("images.path", "not_a_string")),
+                None => return Err(ToolError::invalid("images.path", "required")),
+            };
+            let caption = match map.get("caption") {
+                None => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(Value::Null) => return Err(ToolError::invalid("images.caption", "null")),
+                Some(_) => return Err(ToolError::invalid("images.caption", "not_a_string")),
+            };
+            Ok(ImageSpec { path, caption })
+        })
+        .collect()
+}
+
 /// Parses one tool's arguments: shape, types and formats here, then
 /// [`ToolRequest::validate`] for bounds and cross-field rules. Every refusal is
 /// `invalid_argument` with `details.field` (or the code `validate` names).
@@ -755,6 +811,12 @@ pub fn parse_request(
                 idempotency_key: a.req_parsed("idempotency_key", IdempotencyKey::parse)?,
             })
         }
+        ToolName::ShowImage => {
+            a.only(&["images"])?;
+            ToolRequest::ShowImage(ShowImageRequest {
+                images: parse_images(a.required("images")?)?,
+            })
+        }
     };
     req.validate(limits)?;
     Ok(req)
@@ -816,6 +878,7 @@ impl ToolRequest {
             ToolRequest::List(_) => ToolName::CrossAgentList,
             ToolRequest::Cancel(_) => ToolName::CrossAgentCancel,
             ToolRequest::Close(_) => ToolName::CrossAgentClose,
+            ToolRequest::ShowImage(_) => ToolName::ShowImage,
         }
     }
 
@@ -919,6 +982,30 @@ impl ToolRequest {
             }
             ToolRequest::List(r) => check_range("limit", r.limit, 1, limits.list_page_max),
             ToolRequest::Cancel(_) | ToolRequest::Close(_) => Ok(()),
+            ToolRequest::ShowImage(r) => {
+                use super::tools::{MAX_CAPTION_CHARS, MAX_IMAGE_PATH_BYTES, MAX_SHOW_IMAGES};
+                if r.images.is_empty() {
+                    return Err(ToolError::invalid("images", "empty"));
+                }
+                if r.images.len() > MAX_SHOW_IMAGES {
+                    return Err(ToolError::invalid("images", "too_many_items"));
+                }
+                for image in &r.images {
+                    check_bytes("images.path", &image.path, 1, MAX_IMAGE_PATH_BYTES as u32)?;
+                    // A NUL ends a path at the system call: never a name the user was shown.
+                    if image.path.contains('\0') {
+                        return Err(ToolError::invalid("images.path", "invalid_format"));
+                    }
+                    if image
+                        .caption
+                        .as_ref()
+                        .is_some_and(|c| c.chars().count() > MAX_CAPTION_CHARS)
+                    {
+                        return Err(ToolError::invalid("images.caption", "too_long"));
+                    }
+                }
+                Ok(())
+            }
         }
     }
 
@@ -930,7 +1017,10 @@ impl ToolRequest {
             | ToolRequest::Cancel(_)
             | ToolRequest::Close(_) => true,
             ToolRequest::Read(r) => r.acknowledge.as_ref().is_some_and(|a| !a.is_empty()),
-            ToolRequest::Capabilities(_) | ToolRequest::Wait(_) | ToolRequest::List(_) => false,
+            ToolRequest::Capabilities(_)
+            | ToolRequest::Wait(_)
+            | ToolRequest::List(_)
+            | ToolRequest::ShowImage(_) => false,
         }
     }
 
@@ -971,7 +1061,8 @@ impl ToolRequest {
             ToolRequest::Capabilities(_)
             | ToolRequest::Send(_)
             | ToolRequest::Cancel(_)
-            | ToolRequest::Close(_) => {}
+            | ToolRequest::Close(_)
+            | ToolRequest::ShowImage(_) => {}
         }
         out
     }
@@ -987,6 +1078,7 @@ impl ToolRequest {
             ToolRequest::List(r) => serde_json::to_value(r),
             ToolRequest::Cancel(r) => serde_json::to_value(r),
             ToolRequest::Close(r) => serde_json::to_value(r),
+            ToolRequest::ShowImage(r) => serde_json::to_value(r),
         };
         // These structs hold only strings, numbers, booleans and string maps: serialising
         // them cannot fail. Null would only make attestation and idempotency comparisons
@@ -2181,6 +2273,81 @@ mod tests {
             // The typed request serialises back to exactly the arguments given.
             assert_eq!(req.args_value(), v, "{tool:?}");
         }
+    }
+
+    #[test]
+    fn show_image_takes_one_to_five_paths_with_optional_captions() {
+        let t = ToolName::ShowImage;
+        let one = json!({"images": [{"path": "chart.png"}]});
+        let req = parse(t, one.clone()).expect("one");
+        assert_eq!(req.tool(), t);
+        assert!(!req.is_mutating());
+        assert_eq!(req.args_value(), one);
+        assert_eq!(req.normalised(), req);
+        let five: Vec<Value> = (0..5)
+            .map(|i| json!({"path": format!("/abs/{i}.png"), "caption": "é".repeat(500)}))
+            .collect();
+        match parse(t, json!({ "images": five.clone() })) {
+            Ok(ToolRequest::ShowImage(r)) => {
+                assert_eq!(r.images.len(), 5);
+                assert_eq!(r.images[0].path, "/abs/0.png");
+                assert_eq!(r.images[0].caption.as_deref().map(str::len), Some(1000));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Too many, none, or not a list.
+        let mut six = five.clone();
+        six.push(json!({"path": "x.png"}));
+        assert_invalid(t, json!({ "images": six }), "images");
+        assert_invalid(t, json!({"images": []}), "images");
+        assert_invalid(t, json!({"images": "chart.png"}), "images");
+        assert_invalid(t, json!({}), "images");
+        assert_invalid(t, json!({"images": ["chart.png"]}), "images");
+        // A path that is not a non-empty string of at most 4096 bytes, or holds a NUL.
+        for bad in [json!(7), json!(null), json!(["a.png"])] {
+            assert_invalid(t, json!({"images": [{"path": bad}]}), "images.path");
+        }
+        assert_invalid(t, json!({"images": [{}]}), "images.path");
+        assert_invalid(t, json!({"images": [{"path": ""}]}), "images.path");
+        assert_invalid(
+            t,
+            json!({"images": [{"path": "a\u{0}.png"}]}),
+            "images.path",
+        );
+        assert!(parse(t, json!({"images": [{"path": "a".repeat(4096)}]})).is_ok());
+        assert_invalid(
+            t,
+            json!({"images": [{"path": "a".repeat(4097)}]}),
+            "images.path",
+        );
+        // A caption of at most 500 characters, as a string.
+        assert_invalid(
+            t,
+            json!({"images": [{"path": "a.png", "caption": "x".repeat(501)}]}),
+            "images.caption",
+        );
+        assert_invalid(
+            t,
+            json!({"images": [{"path": "a.png", "caption": 3}]}),
+            "images.caption",
+        );
+        assert_invalid(
+            t,
+            json!({"images": [{"path": "a.png", "alt": "x"}]}),
+            "images.alt",
+        );
+        // The schema says the same bounds.
+        let s = t.input_schema();
+        assert_eq!(s["properties"]["images"]["minItems"], 1);
+        assert_eq!(s["properties"]["images"]["maxItems"], 5);
+        assert_eq!(
+            s["properties"]["images"]["items"]["properties"]["caption"]["maxLength"],
+            500
+        );
+        assert_eq!(
+            s["properties"]["images"]["items"]["additionalProperties"],
+            false
+        );
     }
 
     #[test]

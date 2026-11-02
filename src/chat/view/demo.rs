@@ -368,6 +368,8 @@ impl DemoBackend {
             diff_review_script()
         } else if scene == "queue" {
             queue_script()
+        } else if scene == "images" {
+            images_script()
         } else if scene == "git" {
             git_script()
         } else if scene == "requests" || scene == "requests-risky" {
@@ -400,10 +402,20 @@ impl DemoBackend {
     }
 
     fn reply_turn(&self, text: &str) {
+        self.reply_turn_with(text, &[]);
+    }
+
+    fn reply_turn_with(&self, text: &str, images: &[agent_core::attachment::AttachmentRef]) {
         let user = self.next_id("user");
         let reply = self.next_id("reply");
         let mut steps = vec![
-            Step::Emit(started(&user, ItemKind::UserMessage, "", None, None)),
+            Step::Emit(started(
+                &user,
+                ItemKind::UserMessage,
+                "",
+                agent_core::attachment::user_message_input(false, images),
+                None,
+            )),
             Step::Emit(snapshot(&user, StreamKind::Assistant, text)),
             Step::SetRunning(true),
             Step::Emit(Envelope::new(Event::TurnStarted { model: None })),
@@ -540,6 +552,18 @@ impl DemoBackend {
 impl ChatBackend for DemoBackend {
     fn send_prompt(&self, text: &str) {
         self.reply_turn(text);
+    }
+
+    fn send_input(&self, input: &crate::chat::PromptInput) {
+        self.reply_turn_with(&input.text, &input.refs());
+    }
+
+    fn queue_input(&self, input: &crate::chat::PromptInput) {
+        self.send_input(input);
+    }
+
+    fn steer_input(&self, input: &crate::chat::PromptInput) {
+        self.send_input(input);
     }
 
     fn interrupt(&self) {
@@ -1424,6 +1448,179 @@ fn queue_script() -> Vec<Step> {
         StreamKind::Assistant,
         "Working through the first request. Your next prompts are queued below.\n\nStill going: the reply keeps growing while the queue stays pinned under it.",
     )));
+    s
+}
+
+/// A generated test image (a gradient in `hue`), stored like a user's: no file of the user's is
+/// ever read. `None` when there is no blob store (no data folder).
+fn demo_image(
+    width: u32,
+    height: u32,
+    hue: (u8, u8, u8),
+    name: Option<&str>,
+    origin: agent_core::attachment::Origin,
+) -> Option<agent_core::attachment::AttachmentRef> {
+    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let fx = x as f32 / width.max(1) as f32;
+            let fy = y as f32 / height.max(1) as f32;
+            let shade = |c: u8| (f32::from(c) * (0.45 + 0.55 * fx) * (1.0 - 0.3 * fy)) as u8;
+            pixels.extend([shade(hue.0), shade(hue.1), shade(hue.2), 255]);
+        }
+    }
+    let texture = gtk4::gdk::MemoryTexture::new(
+        i32::try_from(width).ok()?,
+        i32::try_from(height).ok()?,
+        gtk4::gdk::MemoryFormat::R8g8b8a8,
+        &glib::Bytes::from_owned(pixels),
+        (width * 4) as usize,
+    );
+    let png = texture.save_to_png_bytes();
+    let store = crate::attachments::blob_store()?;
+    match store.ingest_bytes(&png, name, origin) {
+        Ok(n) => Some(n.meta),
+        Err(e) => {
+            tracing::warn!("chat demo: could not store a demo image: {e}");
+            None
+        }
+    }
+}
+
+/// `AGENT_TERMINAL_DEMO_SCENE=images`: every place an image appears. A message with one image and
+/// text, one with four images alone, a queued one, a tool that read an image (thumbnails in its
+/// header), an image the agent showed below its `show_image` card, and an image whose file is
+/// gone.
+fn images_script() -> Vec<Step> {
+    use agent_core::attachment::{user_message_input, AttachmentKind, AttachmentRef, Origin};
+    let img = |w, h, hue, name: Option<&str>, origin| demo_image(w, h, hue, name, origin);
+    let shot = img(
+        1280,
+        720,
+        (90, 140, 230),
+        Some("login-error.png"),
+        Origin::User,
+    );
+    let grid: Vec<_> = [
+        (230, 120, 90),
+        (100, 200, 140),
+        (200, 170, 70),
+        (170, 110, 220),
+    ]
+    .into_iter()
+    .filter_map(|hue| img(800, 600, hue, None, Origin::User))
+    .collect();
+    let read = img(
+        900,
+        500,
+        (80, 190, 200),
+        Some("chart.png"),
+        Origin::ToolResult,
+    );
+    let shown = img(
+        1200,
+        700,
+        (120, 200, 120),
+        Some("Latency by endpoint"),
+        Origin::AgentShown,
+    );
+    let queued = img(640, 480, (210, 120, 150), Some("next.png"), Origin::User);
+    let gone = AttachmentRef {
+        id: "0".repeat(64),
+        kind: AttachmentKind::Image,
+        mime: "image/png".into(),
+        width: 800,
+        height: 450,
+        bytes: 12_345,
+        name: Some("deleted.png".into()),
+        origin: Origin::User,
+    };
+    let user = |id: &str, text: &str, refs: Vec<AttachmentRef>, queued: bool| {
+        [
+            Step::Emit(started(
+                id,
+                ItemKind::UserMessage,
+                if queued { "queued" } else { "" },
+                user_message_input(queued, &refs),
+                None,
+            )),
+            Step::Emit(snapshot(id, StreamKind::Assistant, text)),
+        ]
+    };
+    let reply = |id: &str, text: &str| {
+        [
+            Step::Emit(started(id, ItemKind::AssistantMessage, "", None, None)),
+            Step::Emit(snapshot(id, StreamKind::Assistant, text)),
+            Step::Emit(completed(id, ItemStatus::Completed, None, None)),
+        ]
+    };
+    let mut s = vec![Step::Emit(Envelope::new(Event::TurnStarted {
+        model: None,
+    }))];
+    s.extend(user(
+        "img-u1",
+        "The login page shows this error after I submit. What's wrong?",
+        shot.into_iter().collect(),
+        false,
+    ));
+    s.extend(reply(
+        "img-a1",
+        "The form posts to `/api/session`, which answers **401**: the CSRF token is missing.",
+    ));
+    s.push(Step::Emit(started(
+        "img-read",
+        ItemKind::FileRead,
+        "Read",
+        Some(json!({"file_path": "docs/chart.png"})),
+        None,
+    )));
+    s.push(Step::Emit(completed(
+        "img-read",
+        ItemStatus::Completed,
+        Some("[image]"),
+        None,
+    )));
+    if let Some(read) = read {
+        s.push(Step::Emit(
+            Envelope::new(Event::Attachments { refs: vec![read] }).item("img-read"),
+        ));
+    }
+    s.push(Step::Emit(started(
+        "img-show",
+        ItemKind::McpTool,
+        "mcp__agent_terminal__show_image",
+        Some(json!({"images": [{"path": "out/latency.png", "caption": "Latency by endpoint"}]})),
+        None,
+    )));
+    s.push(Step::Emit(completed(
+        "img-show",
+        ItemStatus::Completed,
+        Some("Shown to the user: latency.png (1200×700)"),
+        None,
+    )));
+    if let Some(shown) = shown {
+        s.push(Step::Emit(
+            Envelope::new(Event::Attachments { refs: vec![shown] }).item("img-show"),
+        ));
+    }
+    s.extend(user("img-u2", "", grid, false));
+    s.extend(reply(
+        "img-a2",
+        "Four variants: the second reads best at small sizes.",
+    ));
+    s.extend(user(
+        "img-u3",
+        "This one is from last week.",
+        vec![gone],
+        false,
+    ));
+    s.push(Step::Emit(turn_done(TurnState::Completed, None)));
+    s.extend(user(
+        "img-u4",
+        "And compare with this one next.",
+        queued.into_iter().collect(),
+        true,
+    ));
     s
 }
 

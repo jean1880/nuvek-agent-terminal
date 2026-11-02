@@ -77,10 +77,15 @@ fn user_prompt(record: &serde_json::Value) -> Option<String> {
     let content = record.pointer("/message/content")?;
     let text = match content {
         serde_json::Value::String(s) => s.clone(),
+        // An image the person sent stands as `[image]`: the brief is text, but it must not read
+        // as if nothing was shown.
         serde_json::Value::Array(blocks) => blocks
             .iter()
-            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
-            .filter_map(|b| b.get("text")?.as_str())
+            .filter_map(|b| match b.get("type").and_then(|t| t.as_str()) {
+                Some("text") => b.get("text")?.as_str(),
+                Some("image") => Some("[image]"),
+                _ => None,
+            })
             .collect::<Vec<_>>()
             .join("\n"),
         _ => return None,
@@ -673,6 +678,29 @@ mod tests {
         // The quota error is not mistaken for the last reply.
         assert_eq!(c.last_reply.as_deref(), Some("Half done."));
         assert_eq!(c.touched_files, ["/p/src/b.rs", "/p/src/a.rs"]);
+    }
+
+    /// A prompt sent with an image (as Claude records it) carries `[image]`; an image alone is
+    /// still a request; a tool result's image is not one.
+    #[test]
+    fn a_prompt_with_an_image_says_so_in_the_brief() {
+        let dir = tempdir().unwrap();
+        let path = write_transcript(
+            dir.path(),
+            "s2",
+            &[
+                r#"{"type":"user","message":{"content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBO"}},{"type":"text","text":"What is wrong here?"}]}}"#,
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBO"}}]}]}}"#,
+                r#"{"type":"user","message":{"content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBO"}}]}}"#,
+            ],
+        );
+        let c = read_jsonl_conversation(&path);
+        assert_eq!(
+            c.first_prompt.as_deref(),
+            Some("[image]\nWhat is wrong here?")
+        );
+        assert_eq!(c.recent_prompts.last().map(String::as_str), Some("[image]"));
+        assert!(!c.recent_prompts.iter().any(|p| p.contains("iVBO")));
     }
 
     #[test]

@@ -19,7 +19,165 @@ fn runner() -> PathBuf {
         "the app binary is not built: {} (make test builds it)",
         runner.display()
     );
+    // A runner older than its sources is not the code under test (`cargo test --bin` does not
+    // rebuild it). Its own test harness is no guide: cargo links the two in either order.
+    let built = std::fs::metadata(&runner)
+        .and_then(|m| m.modified())
+        .expect("runner mtime");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut sources = vec![root.join("src")];
+    for entry in std::fs::read_dir(root.join("crates"))
+        .expect("crates")
+        .flatten()
+    {
+        sources.push(entry.path().join("src"));
+    }
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    while let Some(dir) = sources.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                sources.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                if let Ok(modified) = entry.metadata().and_then(|m| m.modified()) {
+                    if newest.as_ref().is_none_or(|(t, _)| modified > *t) {
+                        newest = Some((modified, path));
+                    }
+                }
+            }
+        }
+    }
+    if let Some((modified, path)) = newest {
+        assert!(
+            built >= modified,
+            "the runner {} is older than {}: rebuild it (make test does)",
+            runner.display(),
+            path.display()
+        );
+    }
     runner
+}
+
+/// Makes the harness's root a Local principal whose token was issued to process `runner`, and
+/// returns that token.
+fn local_principal(sup: &Rc<Supervisor>, root: &WorkerId, runner: u32) -> CapabilityToken {
+    let cap = CapabilityToken::from_random([71; 32]);
+    let epoch = sup.epoch(root).unwrap();
+    let mut state = sup.state.borrow_mut();
+    let w = state.workers.get_mut(root).unwrap();
+    w.driver = Driver::Local;
+    let generation = w.generation;
+    w.token = Some(TokenSlot::new(epoch, generation, cap.clone(), Some(runner)));
+    cap
+}
+
+fn local_hello(sup: &Rc<Supervisor>, cap: &CapabilityToken, pid: u32) -> Hello {
+    Hello {
+        api: ApiRange { min: 1, max: 1 },
+        instance: sup.instance.clone(),
+        cap: cap.clone(),
+        bridge: BridgeInfo {
+            version: "test".into(),
+            pid,
+        },
+    }
+}
+
+/// G-L2 on the real supervisor: the worker's own valid token, presented from any process but
+/// its runner (whatever pid the hello claims), is refused; from its runner it is accepted.
+#[test]
+fn a_local_token_from_another_process_is_refused() {
+    in_context(async {
+        let (_dir, sup, root) = harness();
+        let me = std::process::id();
+        let runner = me.wrapping_add(1);
+        let cap = local_principal(&sup, &root, runner);
+        for (conn, claimed) in [(ConnId(81), me), (ConnId(82), runner)] {
+            let refused = sup
+                .authenticate(
+                    conn,
+                    local_hello(&sup, &cap, claimed),
+                    PeerFacts { pid: Some(me) },
+                )
+                .await
+                .expect_err("not its runner");
+            assert_eq!(refused.code, ErrorCode::AuthenticationFailed, "{refused:?}");
+        }
+        // Its runner speaking for itself, but naming another pid in its hello: refused too.
+        let lying = sup
+            .authenticate(
+                ConnId(83),
+                local_hello(&sup, &cap, me),
+                PeerFacts { pid: Some(runner) },
+            )
+            .await
+            .expect_err("a hello naming another pid");
+        assert_eq!(lying.code, ErrorCode::AuthenticationFailed);
+        sup.authenticate(
+            ConnId(84),
+            local_hello(&sup, &cap, runner),
+            PeerFacts { pid: Some(runner) },
+        )
+        .await
+        .expect("its own runner");
+    });
+}
+
+/// G-L3 on the real supervisor: a Local call whose key its stream never showed, or that names
+/// none, is denied as unattested; the same call shown first in its stream is accepted.
+#[test]
+fn an_unobserved_local_call_is_denied() {
+    in_context(async {
+        let (_dir, sup, root) = harness();
+        let me = std::process::id();
+        let cap = local_principal(&sup, &root, me);
+        sup.authenticate(
+            ConnId(85),
+            local_hello(&sup, &cap, me),
+            PeerFacts { pid: Some(me) },
+        )
+        .await
+        .expect("its own runner");
+        let keyed = |id: u64, key: Option<&str>| {
+            let mut call = caps_call(id, false);
+            call.invocation =
+                key.map(|k| agent_core::delegation::InvocationKey::Local { item_id: k.into() });
+            call
+        };
+        for (id, key) in [(1, Some("call-abcd1234-9")), (2, None)] {
+            match sup.call(ConnId(85), keyed(id, key)).await {
+                agent_core::delegation::ipc::CallOutcome::Err(e) => {
+                    assert_eq!(e.code, ErrorCode::AuthorityDenied, "{e:?}");
+                    assert_eq!(
+                        e.details.as_ref().and_then(|d| d.get("reason")),
+                        Some(&json!("unattested")),
+                        "{e:?}"
+                    );
+                }
+                agent_core::delegation::ipc::CallOutcome::Ok(v) => {
+                    panic!("an unobserved call ran: {v}")
+                }
+            }
+        }
+        // Shown in its stream first, under that key and with those arguments: accepted.
+        let call = keyed(3, Some("call-abcd1234-1"));
+        let line = json!({"event": {"type": "item_started", "kind": "mcp_tool",
+            "title": "cross_agent_capabilities",
+            "input": {"server": "agent_terminal", "tool": "cross_agent_capabilities",
+                      "arguments": call.args.clone()}},
+            "item": "call-abcd1234-1"})
+        .to_string();
+        let generation = sup.state.borrow().workers[&root].generation;
+        let hooks = super::super::super::attest::Hooks {
+            supervisor: Rc::downgrade(&sup),
+            worker: root.clone(),
+        };
+        crate::delegation::seam::DelegationHooks::line(&hooks, generation, &line, false);
+        assert!(matches!(
+            sup.call(ConnId(85), call).await,
+            agent_core::delegation::ipc::CallOutcome::Ok(_)
+        ));
+    });
 }
 
 /// A harness whose `local` profile runs the real runner on `model`, with the IPC socket bound

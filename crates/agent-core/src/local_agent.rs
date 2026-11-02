@@ -1649,14 +1649,11 @@ mod tests {
     fn delegation_tools_follow_the_bridge_and_carry_the_shared_schema() {
         use crate::delegation::ToolName;
         assert_eq!(delegation_tools(BridgeState::Ready), &ToolName::ALL);
-        assert_eq!(
-            delegation_tools(BridgeState::Degraded),
-            &[ToolName::CrossAgentCapabilities]
-        );
-        assert_eq!(
-            delegation_tools(BridgeState::Connecting),
-            &[ToolName::CrossAgentCapabilities]
-        );
+        // A bridge not yet (or no longer) able to delegate offers what degraded mode serves.
+        let degraded = &crate::delegation::tools::DEGRADED_TOOLS;
+        assert_eq!(delegation_tools(BridgeState::Degraded), degraded);
+        assert_eq!(delegation_tools(BridgeState::Connecting), degraded);
+        assert!(degraded.contains(&ToolName::CrossAgentCapabilities));
         assert!(delegation_tools(BridgeState::Unbound).is_empty());
         for tool in ToolName::ALL {
             let schema = delegation_schema(tool);

@@ -624,10 +624,7 @@ fn abrupt_runner_death_closes_the_private_lifetime_pipe_and_kills_descendants() 
         writeln!(
             input,
             "{}",
-            serde_json::to_string(&agent_core::adapter::Command::ConfigureLocal {
-                context: Box::new(context)
-            })
-            .unwrap()
+            serde_json::to_string(&agent_core::adapter::Command::configure_local(context)).unwrap()
         )
         .unwrap();
         writeln!(
@@ -771,10 +768,7 @@ fn runner_stop_restarts_a_fresh_generation_and_stdin_eof_awaits_cleanup() {
     writeln!(
         input,
         "{}",
-        serde_json::to_string(&agent_core::adapter::Command::ConfigureLocal {
-            context: Box::new(context)
-        })
-        .unwrap()
+        serde_json::to_string(&agent_core::adapter::Command::configure_local(context)).unwrap()
     )
     .unwrap();
     // Merely configuring a session must not launch any MCP executable.
@@ -862,96 +856,7 @@ fn processes_naming(marker: &str, except: u32) -> Vec<(i32, i32)> {
         .collect()
 }
 
-/// A loopback OpenAI-compatible chat endpoint that answers each request with the next scripted
-/// SSE reply (a plain answer once the script runs out) and records every request body.
-struct ScriptedModel {
-    base: String,
-    address: std::net::SocketAddr,
-    bodies: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-impl ScriptedModel {
-    fn start(replies: Vec<String>) -> Self {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let base = format!("http://{address}");
-        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let recorded = bodies.clone();
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stopping = stop.clone();
-        let thread = std::thread::spawn(move || {
-            let mut replies = std::collections::VecDeque::from(replies);
-            for stream in listener.incoming() {
-                if stopping.load(std::sync::atomic::Ordering::SeqCst) {
-                    break;
-                }
-                let Ok(mut stream) = stream else {
-                    break;
-                };
-                let mut head = Vec::new();
-                let mut byte = [0u8; 1];
-                while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
-                    head.push(byte[0]);
-                }
-                let length: usize = String::from_utf8_lossy(&head)
-                    .to_lowercase()
-                    .lines()
-                    .find_map(|l| l.strip_prefix("content-length:"))
-                    .and_then(|v| v.trim().parse().ok())
-                    .unwrap_or(0);
-                let mut body = vec![0; length];
-                let _ = stream.read_exact(&mut body);
-                if let Ok(value) = serde_json::from_slice(&body) {
-                    recorded.lock().unwrap().push(value);
-                }
-                let reply = replies.pop_front().unwrap_or_else(Self::answer);
-                let _ = stream.write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{reply}",
-                        reply.len()
-                    )
-                    .as_bytes(),
-                );
-                let _ = stream.shutdown(std::net::Shutdown::Both);
-            }
-        });
-        Self {
-            base,
-            address,
-            bodies,
-            stop,
-            thread: Some(thread),
-        }
-    }
-    fn answer() -> String {
-        "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into()
-    }
-    fn calls(calls: &[(&str, serde_json::Value)]) -> String {
-        let calls: Vec<_> = calls
-            .iter()
-            .enumerate()
-            .map(|(index, (name, args))| {
-                serde_json::json!({"index":index,"id":format!("call-{index}"),"type":"function","function":{"name":name,"arguments":args.to_string()}})
-            })
-            .collect();
-        format!(
-            "data: {}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n",
-            serde_json::json!({"choices":[{"delta":{"tool_calls":calls}}]})
-        )
-    }
-}
-impl Drop for ScriptedModel {
-    /// Stops the listener thread: a last connection wakes `accept`, which then sees the flag.
-    fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        let _ = std::net::TcpStream::connect_timeout(&self.address, Duration::from_secs(2));
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
+use agent_kit::test_support::ScriptedModel;
 
 /// The real agent-terminal runner over its pipes, with the production client and guardian, in
 /// a private environment: temporary `HOME` and XDG folders, and `PATH` alone passed through
@@ -1024,9 +929,7 @@ impl LiveRunner {
             events,
             reader: Some(reader),
         };
-        run.send(&agent_core::adapter::Command::ConfigureLocal {
-            context: Box::new(context),
-        });
+        run.send(&agent_core::adapter::Command::configure_local(context));
         run
     }
     fn send(&self, command: &agent_core::adapter::Command) {
@@ -1495,9 +1398,7 @@ mod runner {
                 bodies,
                 state,
             };
-            run.send(Command::ConfigureLocal {
-                context: Box::new(context),
-            });
+            run.send(Command::configure_local(context));
             run
         }
         fn send(&self, command: Command) {

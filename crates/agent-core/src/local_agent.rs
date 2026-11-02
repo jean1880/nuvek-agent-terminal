@@ -362,6 +362,158 @@ pub fn gate(tool: Tool, mode: Mode, outside: bool) -> Gate {
     }
 }
 
+/// What a supervised delegation child may do, sent in its startup frame. The app enforces it
+/// (`ChildAuthority::judge`); the runner only uses it to offer what can be allowed and to ask
+/// before every write and command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalChildPolicy {
+    pub task_mode: crate::delegation::authority::TaskMode,
+    /// What the parent declared beyond reading; `None`: nothing declared, the mode decides.
+    #[serde(default)]
+    pub capabilities: Option<Vec<crate::delegation::authority::Capability>>,
+}
+
+impl LocalChildPolicy {
+    /// The most restrictive policy: a plan child that may do nothing beyond reading. What a
+    /// child adapter falls back to when none was given (fail closed).
+    pub fn read_only() -> Self {
+        Self {
+            task_mode: crate::delegation::authority::TaskMode::Plan,
+            capabilities: Some(Vec::new()),
+        }
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.task_mode.as_mode()
+    }
+
+    fn allows(&self, capability: crate::delegation::authority::Capability) -> bool {
+        self.capabilities
+            .as_ref()
+            .is_none_or(|declared| declared.contains(&capability))
+    }
+
+    /// Whether `tool` is offered at all: a capability the parent left out is not.
+    pub fn offers(&self, tool: Tool) -> bool {
+        use crate::delegation::authority::Capability;
+        match tool {
+            Tool::RunCommand => self.allows(Capability::Exec),
+            Tool::WriteFile | Tool::EditFile => self.allows(Capability::Edit),
+            Tool::ReadFile | Tool::ListDir | Tool::Search => true,
+        }
+    }
+}
+
+/// The built-ins a supervised child is offered in `mode`: those of the mode, less what its
+/// parent did not declare.
+pub fn child_tools(policy: &LocalChildPolicy, mode: Mode) -> Vec<Tool> {
+    tools_for(mode)
+        .into_iter()
+        .filter(|tool| policy.offers(*tool))
+        .collect()
+}
+
+/// The gate of a supervised child: every write and command asks the app, whose inherited
+/// authority judges it (and answers Accept edits itself), in every mode; a plan refuses them.
+/// Reads are gated as a root's are. A child never runs in Bypass: it is gated as Ask.
+pub fn child_gate(tool: Tool, mode: Mode, outside: bool) -> Gate {
+    let mode = if mode == Mode::Bypass {
+        Mode::Ask
+    } else {
+        mode
+    };
+    if !tool.writes() {
+        return gate(tool, mode, outside);
+    }
+    match mode {
+        Mode::Plan => Gate::Refuse("Plan mode is read-only: describe the change instead."),
+        Mode::Ask | Mode::AcceptEdits | Mode::Bypass => Gate::Ask,
+    }
+}
+
+/// Where the runner's own delegation client stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BridgeState {
+    /// No binding in the startup frame: this runner takes no part in delegation.
+    Unbound,
+    Connecting,
+    Ready,
+    /// Refused, revoked or lost for good: only `cross_agent_capabilities` is offered, and it
+    /// says why.
+    Degraded,
+}
+
+/// The delegation tools offered in `state`, as the stdio bridge lists them. They run with no
+/// card in every mode, a plan included: the supervisor judges each call (the caller's live
+/// mode ceiling, depth, limits and capabilities), as it does for every other agent.
+pub fn delegation_tools(state: BridgeState) -> &'static [crate::delegation::ToolName] {
+    match state {
+        BridgeState::Ready => &crate::delegation::ToolName::ALL,
+        BridgeState::Connecting | BridgeState::Degraded => {
+            &crate::delegation::tools::DEGRADED_TOOLS
+        }
+        BridgeState::Unbound => &[],
+    }
+}
+
+/// A delegation tool in the chat request's function shape: the schema the shared parser
+/// enforces.
+pub fn delegation_schema(tool: crate::delegation::ToolName) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": tool.as_str(),
+            "description": tool.description(),
+            "parameters": tool.input_schema(),
+        }
+    })
+}
+
+/// The protocol the runner and the app speak; the child read-back refuses another.
+pub const RUNNER_PROTOCOL: u32 = 1;
+
+/// The request id of a supervised child's policy echo (`Event::ControlResult`).
+pub const CHILD_POLICY_REQUEST: &str = "local-child-policy";
+
+/// What a supervised child's runner reports it applied, before its session starts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChildPolicyEcho {
+    pub protocol: u32,
+    pub supervised: bool,
+    pub mode: Mode,
+    /// The built-ins it offers in that mode, sorted.
+    pub tools: Vec<String>,
+    pub mcp_servers: usize,
+    pub bridge: BridgeState,
+}
+
+impl ChildPolicyEcho {
+    pub fn of(policy: &LocalChildPolicy, mcp_servers: usize, bridge: BridgeState) -> Self {
+        let mut tools: Vec<String> = child_tools(policy, policy.mode())
+            .into_iter()
+            .map(|t| t.name().to_owned())
+            .collect();
+        tools.sort_unstable();
+        Self {
+            protocol: RUNNER_PROTOCOL,
+            supervised: true,
+            mode: policy.mode(),
+            tools,
+            mcp_servers,
+            bridge,
+        }
+    }
+}
+
+/// Child read-back: the runner applied exactly `policy`, runs no user MCP server and its
+/// delegation client is connected. `false` stops the child before its task.
+pub fn child_echo_ok(policy: &LocalChildPolicy, echo: &ChildPolicyEcho) -> bool {
+    *echo == ChildPolicyEcho::of(policy, 0, BridgeState::Ready)
+}
+
 /// One message of the conversation, in the OpenAI chat shape every target server takes, and as
 /// the transcript keeps it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -765,6 +917,11 @@ pub struct LocalAdapter {
     pending: BTreeSet<String>,
     mcp_pending: std::collections::BTreeMap<String, crate::local_mcp::ApprovalStamp>,
     mcp_answered: BTreeSet<String>,
+    /// The binding staged for the next process ([`Adapter::bind_launch`]), taken by its
+    /// handshake: a process gets only its own generation's, once.
+    bridge: Option<crate::delegation::launch::LocalBridge>,
+    /// Set for a supervised delegation child.
+    child: Option<LocalChildPolicy>,
 }
 
 impl Default for LocalAdapter {
@@ -784,7 +941,19 @@ impl LocalAdapter {
             pending: BTreeSet::new(),
             mcp_pending: Default::default(),
             mcp_answered: Default::default(),
+            bridge: None,
+            child: None,
         }
+    }
+
+    /// A supervised delegation child under `policy`.
+    pub fn with_child_policy(mut self, policy: LocalChildPolicy) -> Self {
+        self.child = Some(policy);
+        self
+    }
+
+    pub fn child_policy(&self) -> Option<&LocalChildPolicy> {
+        self.child.as_ref()
     }
 
     fn write(command: &Command) -> Result<Vec<Action>, AdapterError> {
@@ -878,12 +1047,28 @@ impl Adapter for LocalAdapter {
         argv
     }
 
+    fn bind_launch(&mut self, session: &OpenSession) {
+        self.bridge = session
+            .delegation
+            .as_ref()
+            .map(crate::delegation::launch::LocalBridge::from_binding);
+    }
+
     fn handshake(&mut self) -> Vec<String> {
         match serde_json::to_string(&Command::ConfigureLocal {
             context: Box::new(self.context.clone()),
+            bridge: self.bridge.take().map(Box::new),
+            child: self.child.clone(),
         }) {
             Ok(line) => vec![line],
             Err(_) => Vec::new(),
+        }
+    }
+
+    fn supervise_as_child(&mut self) {
+        // A child adapter built without its policy is the most restricted child, never a root.
+        if self.child.is_none() {
+            self.child = Some(LocalChildPolicy::read_only());
         }
     }
 
@@ -991,6 +1176,8 @@ impl Adapter for LocalAdapter {
     fn on_exit(&mut self, code: Option<i32>) -> Vec<Envelope> {
         self.mcp_pending.clear();
         self.mcp_answered.clear();
+        // A binding staged for a process that never took it dies with this one.
+        self.bridge = None;
         let mut out = Vec::new();
         for item in std::mem::take(&mut self.open_items) {
             out.push(Envelope::item_completed(
@@ -1101,7 +1288,9 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Command>(&lines[0]).unwrap(),
             Command::ConfigureLocal {
-                context: Box::new(context)
+                context: Box::new(context),
+                bridge: None,
+                child: None,
             }
         );
         assert!(!adapter.handshake_answered());
@@ -1111,9 +1300,212 @@ mod tests {
             .any(|a| a.contains("context_tokens")));
         assert!(adapter
             .encode(Command::ConfigureLocal {
-                context: Box::default()
+                context: Box::default(),
+                bridge: None,
+                child: None,
             })
             .is_err());
+    }
+
+    fn bound_session() -> OpenSession {
+        use crate::delegation::launch::DelegationBinding;
+        use crate::delegation::token::{CapabilityToken, InstanceNonce};
+        OpenSession {
+            delegation: Some(DelegationBinding {
+                command: "/usr/bin/agent-terminal".into(),
+                endpoint: "/run/user/1000/agent-terminal/delegation-1.sock".into(),
+                instance: InstanceNonce::from_bytes([3; 16]),
+                token: CapabilityToken::from_random([9; 32]),
+            }),
+            ..session()
+        }
+    }
+
+    /// The binding reaches only the startup frame of the launch it was staged for, once; never
+    /// argv, and never a later start the supervisor did not stage.
+    #[test]
+    fn the_bridge_rides_one_startup_frame_and_never_argv() {
+        let bound = bound_session();
+        let secret = bound
+            .delegation
+            .as_ref()
+            .unwrap()
+            .token
+            .expose_secret()
+            .to_owned();
+        let mut adapter = LocalAdapter::new();
+        adapter.bind_launch(&bound);
+        assert!(!adapter.argv(&bound).iter().any(|a| a.contains("atdc_")));
+        assert!(!format!("{adapter:?}").contains(&secret));
+        let lines = adapter.handshake();
+        assert!(lines[0].contains(&secret));
+        let Command::ConfigureLocal { bridge, child, .. } =
+            serde_json::from_str::<Command>(&lines[0]).unwrap()
+        else {
+            panic!("not a configure frame");
+        };
+        assert_eq!(
+            bridge.map(|b| b.endpoint),
+            Some("/run/user/1000/agent-terminal/delegation-1.sock".to_owned())
+        );
+        assert_eq!(child, None);
+        // Taken: a second handshake (a respawn nobody staged) carries none.
+        assert!(!adapter.handshake()[0].contains(&secret));
+        // An unbound launch clears whatever was staged before.
+        adapter.bind_launch(&bound);
+        adapter.bind_launch(&session());
+        assert!(!adapter.handshake()[0].contains("bridge"));
+        // An exit drops a binding no process took.
+        adapter.bind_launch(&bound);
+        adapter.on_exit(Some(0));
+        assert!(!adapter.handshake()[0].contains(&secret));
+    }
+
+    #[test]
+    fn a_child_adapter_always_sends_a_policy() {
+        use crate::delegation::authority::{Capability, TaskMode};
+        let policy = LocalChildPolicy {
+            task_mode: TaskMode::AcceptEdits,
+            capabilities: Some(vec![Capability::Edit]),
+        };
+        let mut adapter = LocalAdapter::new().with_child_policy(policy.clone());
+        adapter.supervise_as_child();
+        let child = |line: &str| match serde_json::from_str::<Command>(line).unwrap() {
+            Command::ConfigureLocal { child, .. } => child,
+            _ => None,
+        };
+        assert_eq!(child(&adapter.handshake()[0]), Some(policy));
+        // Supervised without a policy: the most restricted one, never a root.
+        let mut bare = LocalAdapter::new();
+        bare.supervise_as_child();
+        assert_eq!(
+            child(&bare.handshake()[0]),
+            Some(LocalChildPolicy::read_only())
+        );
+    }
+
+    #[test]
+    fn a_child_is_offered_its_mode_less_what_its_parent_left_out() {
+        use crate::delegation::authority::{Capability, TaskMode};
+        let names = |p: &LocalChildPolicy| {
+            child_tools(p, p.mode())
+                .into_iter()
+                .map(Tool::name)
+                .collect::<Vec<_>>()
+        };
+        let all = |task_mode| LocalChildPolicy {
+            task_mode,
+            capabilities: None,
+        };
+        assert_eq!(names(&all(TaskMode::AcceptEdits)).len(), Tool::ALL.len());
+        assert_eq!(
+            names(&all(TaskMode::Plan)),
+            ["read_file", "list_dir", "search"]
+        );
+        let edit_only = LocalChildPolicy {
+            task_mode: TaskMode::Ask,
+            capabilities: Some(vec![Capability::Edit]),
+        };
+        assert!(!names(&edit_only).contains(&"run_command"));
+        assert!(names(&edit_only).contains(&"write_file"));
+        assert_eq!(
+            names(&LocalChildPolicy {
+                task_mode: TaskMode::AcceptEdits,
+                capabilities: Some(vec![]),
+            }),
+            ["read_file", "list_dir", "search"]
+        );
+    }
+
+    /// A child asks before every write and command in every mode (the app answers Accept
+    /// edits), refuses them in a plan, and is never in Bypass; reads are gated as a root's.
+    #[test]
+    fn the_child_gate_asks_for_every_write_and_command() {
+        for tool in Tool::ALL {
+            for mode in [Mode::Ask, Mode::AcceptEdits, Mode::Plan, Mode::Bypass] {
+                for outside in [false, true] {
+                    let got = child_gate(tool, mode, outside);
+                    let want = if !tool.writes() {
+                        gate(
+                            tool,
+                            if mode == Mode::Bypass {
+                                Mode::Ask
+                            } else {
+                                mode
+                            },
+                            outside,
+                        )
+                    } else if mode == Mode::Plan {
+                        Gate::Refuse("Plan mode is read-only: describe the change instead.")
+                    } else {
+                        Gate::Ask
+                    };
+                    assert_eq!(got, want, "{} {mode:?} {outside}", tool.name());
+                }
+            }
+        }
+        assert_eq!(child_gate(Tool::ReadFile, Mode::Bypass, true), Gate::Ask);
+    }
+
+    #[test]
+    fn delegation_tools_follow_the_bridge_and_carry_the_shared_schema() {
+        use crate::delegation::ToolName;
+        assert_eq!(delegation_tools(BridgeState::Ready), &ToolName::ALL);
+        assert_eq!(
+            delegation_tools(BridgeState::Degraded),
+            &[ToolName::CrossAgentCapabilities]
+        );
+        assert_eq!(
+            delegation_tools(BridgeState::Connecting),
+            &[ToolName::CrossAgentCapabilities]
+        );
+        assert!(delegation_tools(BridgeState::Unbound).is_empty());
+        for tool in ToolName::ALL {
+            let schema = delegation_schema(tool);
+            assert_eq!(schema["function"]["name"], tool.as_str());
+            assert_eq!(schema["function"]["parameters"], tool.input_schema());
+            // Never a built-in's name, never an MCP alias.
+            assert!(Tool::from_name(tool.as_str()).is_none());
+            assert!(!tool.as_str().starts_with("mcp_"));
+        }
+    }
+
+    #[test]
+    fn the_child_echo_matches_only_the_policy_applied() {
+        use crate::delegation::authority::TaskMode;
+        let policy = LocalChildPolicy {
+            task_mode: TaskMode::Plan,
+            capabilities: None,
+        };
+        let echo = ChildPolicyEcho::of(&policy, 0, BridgeState::Ready);
+        assert!(child_echo_ok(&policy, &echo));
+        let json = serde_json::to_value(&echo).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ChildPolicyEcho>(json).unwrap(),
+            echo
+        );
+        for bad in [
+            ChildPolicyEcho::of(&policy, 1, BridgeState::Ready),
+            ChildPolicyEcho::of(&policy, 0, BridgeState::Degraded),
+            ChildPolicyEcho {
+                protocol: RUNNER_PROTOCOL + 1,
+                ..echo.clone()
+            },
+            ChildPolicyEcho {
+                supervised: false,
+                ..echo.clone()
+            },
+            ChildPolicyEcho {
+                tools: vec!["read_file".into(), "write_file".into()],
+                ..echo.clone()
+            },
+            ChildPolicyEcho {
+                mode: Mode::AcceptEdits,
+                ..echo.clone()
+            },
+        ] {
+            assert!(!child_echo_ok(&policy, &bad), "{bad:?}");
+        }
     }
     use super::*;
 

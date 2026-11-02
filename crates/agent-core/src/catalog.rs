@@ -31,6 +31,10 @@ pub struct CatalogModel {
     /// Set when the model is reached through another vendor's route, e.g. `Antigravity` for a
     /// `claude-*` model listed by agy.
     pub via: Option<String>,
+    /// Whether the model can call tools, when its server says (a Local server that reports
+    /// what its models can do); `None`: not said. What decisions read, never the description.
+    #[serde(default)]
+    pub tools: Option<bool>,
 }
 
 /// Finds the `models` array in an `initialize` control response, whether given as the bare
@@ -77,6 +81,7 @@ pub fn parse_claude_initialize(response_json: &Value) -> Vec<CatalogModel> {
                 efforts,
                 default_effort: None,
                 via: None,
+                tools: None,
             })
         })
         .collect()
@@ -104,6 +109,7 @@ pub fn parse_codex_models(result: &Value) -> Vec<CatalogModel> {
             efforts: m.efforts,
             default_effort: m.default_effort,
             via: None,
+            tools: None,
         })
         .collect()
 }
@@ -229,6 +235,7 @@ pub fn parse_agy_models(tsv: &str) -> Vec<CatalogModel> {
                     efforts: Vec::new(),
                     default_effort: None,
                     via,
+                    tools: None,
                 });
                 out.len() - 1
             }
@@ -710,6 +717,7 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
             efforts: efforts.iter().map(|e| (*e).to_owned()).collect(),
             default_effort: None,
             via: None,
+            tools: None,
         }
     }
 

@@ -78,6 +78,10 @@ pub(crate) fn effect(driver: Driver, tool: &str, input: &Value) -> Effect {
             },
         },
         Driver::Local if tool == agent_core::local_mcp::APPROVAL_TOOL => Effect::Mcp { own: false },
+        // The runner's own delegation tools (never carded; if one were, it is ours).
+        Driver::Local if agent_core::delegation::ToolName::parse(tool).is_some() => {
+            Effect::Mcp { own: true }
+        }
         Driver::Local => match agent_core::local_agent::Tool::from_name(tool) {
             Some(agent_core::local_agent::Tool::RunCommand) => Effect::Exec,
             Some(t) if t.writes() => Effect::Edit,
@@ -90,11 +94,21 @@ pub(crate) fn effect(driver: Driver, tool: &str, input: &Value) -> Effect {
 /// Every file an edit names, per provider. Empty: nothing checkable.
 fn edit_paths<'a>(driver: Driver, tool: &str, input: &'a Value) -> Vec<&'a str> {
     match driver {
-        // The Local runner's edit tools take Claude's field name.
-        Driver::Claude | Driver::Local => ["file_path", "notebook_path"]
+        Driver::Claude => ["file_path", "notebook_path"]
             .iter()
             .filter_map(|k| input.get(*k).and_then(Value::as_str))
             .collect(),
+        // The path named and the target the runner resolved it to and will write: both must be
+        // inside the lease. Without the resolved target nothing is checkable (it asks).
+        Driver::Local => match (
+            input.get("file_path").and_then(Value::as_str),
+            input
+                .get(agent_core::local_agent::RESOLVED_PATH)
+                .and_then(Value::as_str),
+        ) {
+            (Some(named), Some(resolved)) => vec![named, resolved],
+            _ => Vec::new(),
+        },
         Driver::Codex if tool == "file_change" => {
             crate::always_allow::codex_change_targets(input).unwrap_or_default()
         }
@@ -370,7 +384,7 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    const DRIVERS: [Driver; 3] = [Driver::Claude, Driver::Codex, Driver::Agy];
+    const DRIVERS: [Driver; 4] = [Driver::Claude, Driver::Codex, Driver::Agy, Driver::Local];
 
     fn fixed_live(valid: bool, bootstrap: bool, parent_mode: Mode) -> LiveAuthority {
         LiveAuthority {
@@ -602,7 +616,11 @@ mod tests {
             ],
             Driver::Local => vec![
                 (Effect::Read, "read_file", json!({"file_path": file})),
-                (Effect::Edit, "edit_file", json!({"file_path": file})),
+                (
+                    Effect::Edit,
+                    "edit_file",
+                    json!({"file_path": file, "resolved_path": file}),
+                ),
                 (Effect::Exec, "run_command", json!({"command": "ls"})),
                 (Effect::Unknown, "Mystery", json!({})),
             ],
@@ -815,6 +833,7 @@ mod tests {
             }
             let own = match driver {
                 Driver::Agy => ("call_mcp_tool", json!({"ServerName": "agent_terminal"})),
+                Driver::Local => ("cross_agent_list", json!({})),
                 _ => ("mcp__agent_terminal__cross_agent_list", json!({})),
             };
             assert_eq!(gate.judge(own.0, &own.1, None), GateVerdict::Defer);
@@ -830,6 +849,84 @@ mod tests {
                 assert!(is_ask_only(&v), "{driver:?} {mode:?}: {v:?}");
             }
         }
+    }
+
+    /// A Local child's own delegation tools are agent-terminal's server (they defer to the
+    /// supervisor), its built-ins map to their effects, and a declared limit refuses its writes
+    /// and commands, never asks.
+    #[test]
+    fn a_local_childs_tools_and_declared_limits() {
+        let f = Fixture::new();
+        for tool in agent_core::delegation::ToolName::ALL {
+            assert_eq!(
+                effect(Driver::Local, tool.as_str(), &json!({})),
+                Effect::Mcp { own: true }
+            );
+        }
+        let read_only = f.gate_with(Driver::Local, TaskMode::AcceptEdits, Some(vec![]));
+        let inside = json!({"file_path": f.inside()});
+        assert_eq!(
+            read_only.judge("read_file", &inside, None),
+            GateVerdict::Defer
+        );
+        for (tool, input) in [
+            (
+                "write_file",
+                json!({"file_path": f.inside(), "content": "x"}),
+            ),
+            ("edit_file", json!({"file_path": f.inside()})),
+            ("run_command", json!({"command": "ls"})),
+        ] {
+            assert!(is_deny(&read_only.judge(tool, &input, None)), "{tool}");
+        }
+        let edits = f.gate_with(
+            Driver::Local,
+            TaskMode::AcceptEdits,
+            Some(vec![Capability::Edit]),
+        );
+        let card = |named: String, resolved: Option<String>| json!({"file_path": named, "resolved_path": resolved});
+        assert_eq!(
+            edits.judge("write_file", &card(f.inside(), Some(f.inside())), None),
+            GateVerdict::Defer
+        );
+        assert!(is_ask_only(&edits.judge(
+            "write_file",
+            &card(f.outside(), Some(f.outside())),
+            None
+        )));
+        // The path named is inside, but the runner resolved it (a link) outside: the target it
+        // will write is what counts. Without the runner's resolved target, nothing is checkable.
+        assert!(is_ask_only(&edits.judge(
+            "write_file",
+            &card(f.inside(), Some(f.outside())),
+            None
+        )));
+        for missing in [card(f.inside(), None), json!({"file_path": f.inside()})] {
+            assert!(
+                is_ask_only(&edits.judge("write_file", &missing, None)),
+                "{missing}"
+            );
+        }
+        assert!(is_deny(&edits.judge(
+            "run_command",
+            &json!({"command": "ls"}),
+            None
+        )));
+        assert!(is_deny(&edits.judge(
+            "run_command",
+            &json!({"command": "agent-terminal --local-agent --server http://h --cwd ."}),
+            None
+        )));
+        let plan = f.gate(Driver::Local, TaskMode::Plan);
+        assert!(is_deny(&plan.judge(
+            "write_file",
+            &json!({"file_path": f.inside()}),
+            None
+        )));
+        assert_eq!(
+            plan.judge("cross_agent_spawn", &json!({}), None),
+            GateVerdict::Defer
+        );
     }
 
     #[test]
@@ -950,7 +1047,7 @@ mod tests {
                 Driver::Claude => ("Bash", "command"),
                 Driver::Codex => ("command_execution", "command"),
                 Driver::Agy => ("run_command", "CommandLine"),
-                Driver::Local => unreachable!("never a delegated child"),
+                Driver::Local => ("run_command", "command"),
             };
             [
                 "cross-agent claude \"review\"",
@@ -991,7 +1088,7 @@ mod tests {
                 Driver::Claude => ("Bash", "command"),
                 Driver::Codex => ("command_execution", "command"),
                 Driver::Agy => ("run_command", "CommandLine"),
-                Driver::Local => unreachable!("never a delegated child"),
+                Driver::Local => ("run_command", "command"),
             };
             for command in [
                 "ls",
@@ -1200,13 +1297,12 @@ mod tests {
                     Driver::Claude => "Write",
                     Driver::Codex => "file_change",
                     Driver::Agy => "write_to_file",
-                    Driver::Local => unreachable!("never a delegated child"),
+                    Driver::Local => "write_file",
                 };
                 let input = match driver {
-                    Driver::Claude => json!({"file_path":path}),
+                    Driver::Claude | Driver::Local => json!({"file_path":path}),
                     Driver::Codex => json!({"changes":[{"path":path}]}),
                     Driver::Agy => json!({"TargetFile":path}),
-                    Driver::Local => unreachable!("never a delegated child"),
                 };
                 assert!(
                     is_ask_only(&gate.judge(tool, &input, None)),

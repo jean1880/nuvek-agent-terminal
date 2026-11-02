@@ -139,6 +139,7 @@ mod tests {
             ],
             default_effort: Some("high".into()),
             via: None,
+            tools: None,
         }
     }
 
@@ -279,6 +280,7 @@ mod tests {
             efforts: vec!["low".into(), "high".into()],
             default_effort: None,
             via: None,
+            tools: None,
         };
         let oss = CatalogModel {
             id: "gpt-oss-120b".into(),

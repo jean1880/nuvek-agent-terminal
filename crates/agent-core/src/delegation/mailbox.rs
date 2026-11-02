@@ -486,7 +486,7 @@ mod tests {
     fn target(driver: Driver, run: Option<RunId>) -> TargetRuntime {
         TargetRuntime {
             driver,
-            live_input: driver != Driver::Agy,
+            live_input: !matches!(driver, Driver::Agy | Driver::Local),
             active_run: run,
             process_alive: true,
             closed: false,
@@ -529,6 +529,21 @@ mod tests {
         assert_eq!(
             plan_delivery(&codex, Delivery::NextTurn, None),
             Ok(DeliveryPlan::QueueNextTurn)
+        );
+        // The Local runner takes nothing into a running turn: it waits for the next, and a
+        // this_run message is refused.
+        let local = target(Driver::Local, Some(run.clone()));
+        assert_eq!(
+            plan_delivery(&local, Delivery::ThisRun, None),
+            Err(ErrorCode::UnsupportedDelivery)
+        );
+        assert_eq!(
+            plan_delivery(&local, Delivery::Auto, None),
+            Ok(DeliveryPlan::QueueNextTurn)
+        );
+        assert_eq!(
+            plan_delivery(&target(Driver::Local, None), Delivery::Auto, None),
+            Ok(DeliveryPlan::StartTurn)
         );
         // No live run.
         let idle = target(Driver::Codex, None);

@@ -12,6 +12,15 @@ separate application/source-review gate.
   bound read-only by bwrap, actual application approval-hook client and Unix
   fixture approval server. No real configuration was changed.
 
+- Local runner (this build, `--provider local`, recorded 2026-11-01): the app's own
+  `agent-terminal --local-agent` on a deterministic loopback OpenAI-compatible model and a
+  fixture delegation socket. G-L1 the capability only in the startup frame (the runner's
+  `/proc` environment and argv, a command's output, every model request, every stdout line
+  and the generated home scanned), G-L2 the connection from the runner's own process
+  (`SO_PEERCRED`), G-L3 the call under the key of the item it showed, with the same
+  arguments, G-L4 a supervised child (policy read back first, a write asked and refused,
+  a plan child offered no writing tool, a frame naming an MCP server refused).
+
 `codex-results.json` intentionally records `G-X2: false`: native spawning really
 executes despite the reported disabled features. Do not interpret the passing
 parent-only file as permission to admit Codex children. Other individual gates

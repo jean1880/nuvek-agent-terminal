@@ -304,9 +304,16 @@ pub struct OpenSession {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
-    /// Internal Local startup handshake, acknowledged by SessionStarted after validation.
+    /// Internal Local startup handshake, acknowledged by SessionStarted after validation. The
+    /// only frame that carries the delegation capability (`bridge`), and only for the
+    /// generation the supervisor staged it for.
     ConfigureLocal {
         context: Box<crate::local_context::LocalLaunchContext>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bridge: Option<Box<crate::delegation::launch::LocalBridge>>,
+        /// Present only for a supervised delegation child.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        child: Option<crate::local_agent::LocalChildPolicy>,
     },
     Prompt {
         text: String,
@@ -365,6 +372,17 @@ pub enum Command {
         id: String,
         control: Control,
     },
+}
+
+impl Command {
+    /// A Local startup frame for a session that takes no part in delegation.
+    pub fn configure_local(context: crate::local_context::LocalLaunchContext) -> Self {
+        Command::ConfigureLocal {
+            context: Box::new(context),
+            bridge: None,
+            child: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -459,6 +477,11 @@ pub trait Adapter {
     }
     /// Full argv (program first) for this session.
     fn argv(&self, session: &OpenSession) -> Vec<String>;
+    /// The session about to be spawned, before [`Adapter::handshake`]: an adapter whose
+    /// handshake carries the generation's delegation binding (the Local runner) takes it here.
+    /// Called for every launch, with or without a binding, so a start the supervisor did not
+    /// stage carries none.
+    fn bind_launch(&mut self, _session: &OpenSession) {}
     /// Lines to write as soon as the process starts (Claude `initialize`); may be empty.
     fn handshake(&mut self) -> Vec<String>;
     /// Whether the running process answered [`Adapter::handshake`] with a reply this adapter

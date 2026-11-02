@@ -156,6 +156,25 @@ impl DelegationHooks for Hooks {
         sup.rotate_before_stop(&self.worker, generation);
         true
     }
+    fn holds_restart(&self) -> bool {
+        let Some(sup) = self.supervisor.upgrade() else {
+            return false;
+        };
+        let thread = {
+            let state = sup.state.borrow();
+            let Some(w) = state.workers.get(&self.worker) else {
+                return false;
+            };
+            if w.row.parent_id.is_some() {
+                return false;
+            }
+            state
+                .roots
+                .get(&w.root)
+                .map(|r| r.row.root_thread_id.clone())
+        };
+        thread.is_some_and(|thread| sup.root_busy(&thread) || sup.root_has_live_children(&thread))
+    }
     fn root_stopped(&self) {
         let Some(sup) = self.supervisor.upgrade() else {
             return;
@@ -360,7 +379,8 @@ impl DelegationHooks for Hooks {
                 let model = match w.driver {
                     Driver::Claude => v.pointer("/message/model").and_then(Value::as_str),
                     Driver::Agy => v.get("model").and_then(Value::as_str),
-                    // Never a delegated worker (`LocalAgentNoBridge`).
+                    // Codex and the Local runner name no effective model per turn: a turn that
+                    // succeeds on the requested one accepts it.
                     Driver::Codex | Driver::Local => None,
                 };
                 if let Some(model) = model.filter(|m| !m.is_empty() && *m != "unrecognized_model") {
@@ -673,8 +693,41 @@ fn observe_calls(
                 );
             }
         }
-        // It has no delegation bridge, so it calls no delegation tool to attest.
-        Driver::Local => {}
+        // The runner's own canonical item for a delegation call, shown before the call is sent:
+        // its item id (minted by the runner, never the model) is the key, with exactly the
+        // arguments sent. Only an item naming the app's own server counts.
+        Driver::Local => {
+            if v.pointer("/event/type").and_then(Value::as_str) != Some("item_started") {
+                return;
+            }
+            let Ok(envelope) = serde_json::from_value::<Envelope>(v.clone()) else {
+                return;
+            };
+            let (
+                Event::ItemStarted {
+                    kind: agent_core::event::ItemKind::McpTool,
+                    input: Some(input),
+                    ..
+                },
+                Some(item),
+            ) = (&envelope.event, envelope.item.as_ref())
+            else {
+                return;
+            };
+            let key = InvocationKey::Local {
+                item_id: item.clone(),
+            };
+            if input["server"].as_str() != Some(agent_core::delegation::SERVER_NAME)
+                || !key.is_well_formed()
+            {
+                return;
+            }
+            if let (Some(tool), Some(args)) = (input["tool"].as_str(), input.get("arguments")) {
+                if !args.is_null() {
+                    record(key, tool, args);
+                }
+            }
+        }
     }
 }
 
@@ -691,21 +744,74 @@ mod tests {
             "tool_info": {"parameters": params}}})
     }
 
-    fn observed(steps: &[Value]) -> usize {
+    /// A fresh salt per run, as the supervisor's own is.
+    fn fresh_salt() -> [u8; 16] {
         use std::hash::{BuildHasher, Hasher};
-        let limits = agent_core::delegation::Limits::default();
-        // A fresh salt per run, as the supervisor's own is.
-        let salt: [u8; 16] = std::array::from_fn(|i| {
+        std::array::from_fn(|i| {
             let mut h = std::collections::hash_map::RandomState::new().build_hasher();
             h.write_usize(i);
             h.finish().to_le_bytes()[0]
-        });
-        let mut calls = ObservedCalls::new(salt, limits.observed_calls as usize);
+        })
+    }
+
+    fn observed(steps: &[Value]) -> usize {
+        let limits = agent_core::delegation::Limits::default();
+        let mut calls = ObservedCalls::new(fresh_salt(), limits.observed_calls as usize);
         let mut seen = std::collections::VecDeque::new();
         for step in steps {
             observe_calls(&mut calls, &mut seen, Driver::Agy, step, &limits);
         }
         calls.len()
+    }
+
+    /// The Local runner's own item for a delegation call is observed under its item id, and
+    /// attests exactly that call; an MCP item of another server, a malformed id, a model's own
+    /// tool card or a withheld argument list never is.
+    #[test]
+    fn local_items_are_observed_under_the_runners_own_key() {
+        let limits = agent_core::delegation::Limits::default();
+        let mut calls = ObservedCalls::new(fresh_salt(), limits.observed_calls as usize);
+        let mut seen = std::collections::VecDeque::new();
+        let item = |id: &str, server: &str, args: Value| {
+            json!({"event": {"type": "item_started", "kind": "mcp_tool", "title": "cross_agent_list",
+                "input": {"server": server, "tool": "cross_agent_list", "arguments": args}},
+                "item": id})
+        };
+        for line in [
+            item("call-abcd1234-1", "agent_terminal", json!({})),
+            item("call-abcd1234-2", "github", json!({})),
+            item("call abcd", "agent_terminal", json!({})),
+            item("call-abcd1234-3", "agent_terminal", Value::Null),
+            json!({"event": {"type": "item_started", "kind": "tool", "title": "cross_agent_list",
+                "input": {"server": "agent_terminal", "tool": "cross_agent_list", "arguments": {}}},
+                "item": "call-abcd1234-4"}),
+        ] {
+            observe_calls(&mut calls, &mut seen, Driver::Local, &line, &limits);
+        }
+        assert_eq!(calls.len(), 1);
+        let args = attestation_arguments(
+            agent_core::delegation::ToolName::CrossAgentList,
+            &json!({}),
+            &limits,
+        )
+        .unwrap();
+        let key = |id: &str| InvocationKey::Local { item_id: id.into() };
+        assert_eq!(
+            calls.attest(
+                Some(&key("call-abcd1234-2")),
+                agent_core::delegation::ToolName::CrossAgentList,
+                &args
+            ),
+            agent_core::delegation::correlation::Attestation::Unattested
+        );
+        assert_eq!(
+            calls.attest(
+                Some(&key("call-abcd1234-1")),
+                agent_core::delegation::ToolName::CrossAgentList,
+                &args
+            ),
+            agent_core::delegation::correlation::Attestation::Attested
+        );
     }
 
     /// The same call is observed whichever case agy spells its parameters in, and a call to

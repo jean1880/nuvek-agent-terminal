@@ -33,6 +33,28 @@ pub enum InvocationKey {
         conversation_id: String,
         step_index: u64,
     },
+    /// The Local runner's own item id for the call (`call-<generation>-<n>`), minted by the
+    /// runner, never by the model, and sent by its own delegation client in `Call.invocation`.
+    /// Never read from `_meta`: an MCP bridge cannot produce one.
+    Local { item_id: String },
+}
+
+/// The longest item id a Local key may carry (the runner's are about 20 bytes).
+pub const MAX_LOCAL_ITEM_ID: usize = 64;
+
+impl InvocationKey {
+    /// A Local key the runner could have minted: `[A-Za-z0-9-]{1,64}`. Other keys pass.
+    pub fn is_well_formed(&self) -> bool {
+        match self {
+            InvocationKey::Local { item_id } => {
+                (1..=MAX_LOCAL_ITEM_ID).contains(&item_id.len())
+                    && item_id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            }
+            _ => true,
+        }
+    }
 }
 
 fn key_field<'a>(meta: &'a Map<String, Value>, name: &str) -> Option<&'a str> {
@@ -386,6 +408,38 @@ mod tests {
             })
         );
         assert_eq!(invocation_from_meta(&Map::new()), None);
+    }
+
+    /// A Local key travels only in the runner's own `Call`: no `_meta` spelling produces one,
+    /// and only an id the runner could have minted is well formed.
+    #[test]
+    fn local_keys_never_come_from_meta() {
+        for m in [
+            meta(json!({"item_id": "call-abcd1234-1"})),
+            meta(json!({"provider": "local", "item_id": "call-abcd1234-1"})),
+            meta(json!({"local": {"item_id": "call-abcd1234-1"}})),
+        ] {
+            assert_eq!(invocation_from_meta(&m), None);
+        }
+        let key = InvocationKey::Local {
+            item_id: "call-abcd1234-1".into(),
+        };
+        let json = serde_json::to_value(&key).expect("ser");
+        assert_eq!(
+            json,
+            json!({"provider": "local", "item_id": "call-abcd1234-1"})
+        );
+        assert_eq!(
+            serde_json::from_value::<InvocationKey>(json).expect("de"),
+            key
+        );
+        assert!(key.is_well_formed());
+        for bad in ["", "call 1", "call/1", &"a".repeat(65)] {
+            assert!(!InvocationKey::Local {
+                item_id: bad.to_owned()
+            }
+            .is_well_formed());
+        }
     }
 
     #[test]

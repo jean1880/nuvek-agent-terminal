@@ -44,11 +44,17 @@ impl ChildPublish for Pass {
 struct Consent {
     allow: Cell<bool>,
     asks: Cell<usize>,
+    /// Sub-agents alive below this root: a restart would cut them.
+    holds: Cell<bool>,
 }
 
 impl DelegationHooks for Consent {
     fn binding(&self, _driver: Driver, _generation: ProcessGeneration) -> Option<LaunchBinding> {
         None
+    }
+
+    fn holds_restart(&self) -> bool {
+        self.holds.get()
     }
 
     fn process_started(&self, _generation: ProcessGeneration, _pid: Option<i32>, _w: ExitWatch) {}
@@ -244,6 +250,108 @@ fn a_worker_pauses_only_when_idle_with_its_supervisors_consent_and_resumes_its_s
 }
 
 /// The supervisor's path pauses only its own workers, never a thread's agent.
+/// A delegation root's new Local settings never restart it under its live sub-agents: they
+/// wait (said once), and apply as a planned rotation once it has none. A delegated child keeps
+/// the settings it was spawned with.
+#[test]
+fn a_delegation_roots_new_local_settings_wait_for_its_sub_agents() {
+    in_loop(|_| {
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let thread = fresh(&store, "/work");
+        let (sink, seen) = make_sink();
+        let hooks = Rc::new(Consent::default());
+        hooks.holds.set(true);
+        let session = ChatSession::with_options(
+            Box::new(agent_core::local_agent::LocalAdapter::new()),
+            super::open_session("unused", vec![], "/work"),
+            SessionStore::from(store.clone()),
+            thread,
+            sink,
+            Err(None),
+            crate::agent_proc::AgentEnv::default(),
+            SessionOptions {
+                generation_base: ProcessGeneration(0),
+                hooks: Some(hooks.clone()),
+                child: None,
+            },
+        );
+        let inner = &session.inner;
+        // Its process is up (stood in for: nothing is spawned here).
+        inner.state.borrow_mut().alive = true;
+        let mut context = agent_core::local_context::LocalLaunchContext::default();
+        context.budget.context_tokens = 65536;
+        session.stage_local_context(Ok(context.clone()));
+        let held = |seen: &super::Seen| {
+            seen.borrow()
+                .iter()
+                .filter(|e| {
+                    matches!(&e.event, Event::Notice { text } if text.contains("sub-agents have finished"))
+                })
+                .count()
+        };
+        for _ in 0..2 {
+            assert!(inner.prepare_local_context(), "the prompt still goes");
+            assert_ne!(inner.adapter.borrow().local_context(), Some(&context));
+            assert!(inner.pending_local_context.borrow().is_some());
+        }
+        assert_eq!(held(&seen), 1, "said once");
+        assert_eq!(hooks.asks.get(), 0, "no rotation while held");
+        // Nothing held, but the supervisor refuses the rotation: still deferred, never stopped.
+        hooks.holds.set(false);
+        assert!(inner.prepare_local_context());
+        assert_ne!(inner.adapter.borrow().local_context(), Some(&context));
+        assert!(inner.state.borrow().alive, "not stopped");
+        assert_eq!(hooks.asks.get(), 1);
+        hooks.allow.set(true);
+        assert!(inner.prepare_local_context());
+        assert_eq!(inner.adapter.borrow().local_context(), Some(&context));
+        assert_eq!(hooks.asks.get(), 2, "applied as a planned rotation");
+
+        // A narrowing never waits: it stops the root at once and says its sub-agents went too.
+        let server: agent_core::local_mcp::McpServerConfig = serde_json::from_value(serde_json::json!({"id":"docs","label":"Docs","enabled":true,"command":"server","args":[],"cwd":"$WORKSPACE","env":{},"tools":[],"approval":"ask","startup_timeout_secs":15,"call_timeout_secs":60})).unwrap();
+        let wider = agent_core::local_context::LocalLaunchContext {
+            mcp_servers: vec![server],
+            ..context.clone()
+        };
+        *inner.adapter.borrow_mut() =
+            Box::new(agent_core::local_agent::LocalAdapter::new().with_context(wider));
+        inner.state.borrow_mut().alive = true;
+        hooks.holds.set(true);
+        session.stage_local_context(Ok(context.clone()));
+        assert!(seen.borrow().iter().any(|e| matches!(
+            &e.event,
+            Event::Notice { text } if text.contains("and so were any of this thread's sub-agents")
+        )));
+
+        // A child ignores staged settings.
+        let child_thread = fresh(&store, "/child");
+        let (sink, _) = make_sink();
+        let child = ChatSession::with_options(
+            Box::new(
+                agent_core::local_agent::LocalAdapter::new()
+                    .with_child_policy(agent_core::local_agent::LocalChildPolicy::read_only()),
+            ),
+            super::open_session("unused", vec![], "/child"),
+            SessionStore::from(store),
+            child_thread,
+            sink,
+            Err(None),
+            crate::agent_proc::AgentEnv::default(),
+            SessionOptions {
+                generation_base: ProcessGeneration(0),
+                hooks: None,
+                child: Some(ChildPolicy {
+                    gate: Rc::new(Defer),
+                    publish: Rc::new(Pass),
+                    mode: Mode::Plan,
+                }),
+            },
+        );
+        child.stage_local_context(Ok(context.clone()));
+        assert!(child.inner.pending_local_context.borrow().is_none());
+    });
+}
+
 #[test]
 fn only_a_delegated_worker_is_paused_for_its_supervisor() {
     in_loop(|_| {

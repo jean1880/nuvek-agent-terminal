@@ -588,6 +588,14 @@ impl AgentTerminalWindow {
                 if profile.disabled || !AgentAvailability::shared().is_ready(driver) {
                     return None;
                 }
+                // Each Local server is its own profile: it delegates only when that profile
+                // itself opted in and its own server lists a chat model.
+                if driver == Driver::Local
+                    && (!profile.available_for_delegation
+                        || !AgentAvailability::shared().server_ready(&profile.id))
+                {
+                    return None;
+                }
                 let resolved = cached_agent(profile)?;
                 if resolved.env_failed {
                     return None;
@@ -607,7 +615,19 @@ impl AgentTerminalWindow {
                     }
                 };
                 let source = own_source(profile, driver);
+                let local_context = if driver == Driver::Local {
+                    match config.borrow().local_defaults.launch(&profile.local) {
+                        Ok(context) => Some(context),
+                        Err(why) => {
+                            warn!(profile = %profile.name, %why, "a Local worker's settings are invalid");
+                            return None;
+                        }
+                    }
+                } else {
+                    None
+                };
                 Some(ResolvedChild {
+                    local_context,
                     program: resolved.program?,
                     extra_args,
                     env,

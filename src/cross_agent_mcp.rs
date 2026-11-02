@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use agent_core::delegation::correlation::invocation_from_meta;
 use agent_core::delegation::ipc::{Call, CallOutcome};
-use agent_core::delegation::wire::{guard_output, parse_request, ToolRequest};
+use agent_core::delegation::wire::{guard_output, parse_request};
 use agent_core::delegation::{ErrorCode, Limits, OperationId, ToolError, ToolName};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, Implementation, ListToolsResult,
@@ -30,7 +30,7 @@ use client::Client;
 /// Runs before GTK initialisation. Stdout is reserved exclusively for MCP frames.
 pub(crate) fn run() -> Result<(), String> {
     let started = Instant::now();
-    let config = client::Config::from_environment();
+    let config = client::from_environment();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -106,10 +106,7 @@ impl ServerHandler for Bridge {
             Ok(parsed) => parsed,
             Err(error) => return Ok(error_result(error).into()),
         };
-        let timeout_ms = match &parsed {
-            ToolRequest::Wait(wait) => wait.timeout_ms.unwrap_or(10_000).saturating_add(2_000),
-            _ => 30_000,
-        };
+        let timeout_ms = agent_core::delegation::call_timeout_ms(&parsed);
         // Correlation is provider-supplied metadata only, never inferred from the MCP id.
         let invocation = invocation_from_meta(&context.meta);
         let call = Call {

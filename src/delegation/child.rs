@@ -136,7 +136,8 @@ impl Supervisor {
                 .workers
                 .get_mut(worker)
                 .ok_or_else(|| error(ErrorCode::NotFound, "worker closed"))?;
-            w.readback = super::readback::Readback::child(spec.driver, spec.mode);
+            w.readback = super::readback::Readback::child(spec.driver, spec.mode)
+                .with_capabilities(spec.capabilities.clone());
             Ok(())
         };
         let session = if let Some(session) = session {
@@ -305,6 +306,40 @@ impl Supervisor {
             ));
         }
         let mut warnings = Vec::new();
+        // The Local agent has no effort setting: a requested one (or the profile's) is never
+        // passed, and is said and recorded as unsupported rather than refusing the spawn.
+        let (effort, ignored_effort) = if driver == Driver::Local {
+            if effort.is_some() {
+                warnings.push(Warning::new(
+                    "effort_not_supported",
+                    "The Local agent has no effort setting; it was ignored.",
+                ));
+            }
+            (None, effort)
+        } else {
+            (effort, None)
+        };
+        // A Local child works only through tools: a model its server does not list, or says
+        // cannot call tools, is refused before anything starts.
+        if driver == Driver::Local {
+            if let Some(model) = &model {
+                if !models.is_empty() && !models.iter().any(|m| &m.id == model) {
+                    return Err(error(
+                        ErrorCode::ProviderUnavailable,
+                        "the profile's model server does not list this model",
+                    ));
+                }
+                if models
+                    .iter()
+                    .any(|m| &m.id == model && crate::model_catalog::cannot_call_tools(m))
+                {
+                    return Err(error(
+                        ErrorCode::ProviderUnavailable,
+                        "this model cannot call tools, and a delegated Local agent needs them",
+                    ));
+                }
+            }
+        }
         if driver == Driver::Codex
             && effort.as_ref().is_some_and(|e| {
                 !models
@@ -370,6 +405,13 @@ impl Supervisor {
                 effort: effort.clone(),
             },
         );
+        if ignored_effort.is_some() {
+            identity.effort = agent_core::delegation::identity::ValueProvenance {
+                requested: ignored_effort,
+                effective: None,
+                source: agent_core::delegation::identity::Provenance::Unsupported,
+            };
+        }
         super::attest::sanitise_identity(&mut identity);
         let plan=SpawnPlan{driver,identity,workspace,launch_json:serde_json::json!({"model":model,"effort":effort,"capabilities":capabilities,"cwd":child_cwd,"source_repo":lease_plan.as_ref().map(|l|&l.source_repo),"branch":lease_plan.as_ref().map(|l|&l.branch),"base_commit":lease_plan.as_ref().map(|l|&l.base_commit)}).to_string(),cwd:child_cwd.to_string_lossy().into_owned(),state:SpawnState::Starting,process_generation:1};
         let mut accept = self.accept_request(
@@ -485,7 +527,8 @@ impl Supervisor {
         };
         let mut runtime = self.worker_rt(row, root, spec.cwd.clone());
         runtime.run = accepted.run.clone();
-        runtime.readback = super::readback::Readback::child(driver, r.task_mode);
+        runtime.readback = super::readback::Readback::child(driver, r.task_mode)
+            .with_capabilities(spec.capabilities.clone());
         runtime.pending = Some(DelegatedInput {
             operation: accepted.operation.clone(),
             epoch,
@@ -681,8 +724,27 @@ impl Supervisor {
             delegation: None,
         };
         let generation_base = self.state.borrow().workers[&worker].generation;
+        // A Local child runs on its profile's instructions and budget, with no user MCP server,
+        // under the policy its parent declared.
+        let adapter: Box<dyn agent_core::adapter::Adapter> = match spec.driver {
+            Driver::Local => Box::new(
+                agent_core::local_agent::LocalAdapter::new()
+                    .with_context(
+                        resolved
+                            .local_context
+                            .clone()
+                            .unwrap_or_default()
+                            .for_delegated_child(),
+                    )
+                    .with_child_policy(agent_core::local_agent::LocalChildPolicy {
+                        task_mode: spec.mode,
+                        capabilities: spec.capabilities.clone(),
+                    }),
+            ),
+            driver => (self.services.make_adapter)(driver, &resolved.program),
+        };
         let session = ChatSession::with_options(
-            (self.services.make_adapter)(spec.driver, &resolved.program),
+            adapter,
             open,
             SessionStore {
                 handle: self.services.handle.clone(),

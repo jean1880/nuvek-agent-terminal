@@ -795,6 +795,16 @@ fn check_base(base: &str, limits: &Limits) -> Result<(), ToolError> {
     Ok(())
 }
 
+/// How long a bridge waits on the supervisor for any call but a wait.
+pub const CALL_TIMEOUT_MS: u32 = 30_000;
+/// What a wait's own timeout is given on top, for the supervisor's answer to arrive.
+pub const CALL_SLACK_MS: u32 = 2_000;
+
+/// [`ToolRequest::call_timeout_ms`]: the one deadline every delegation client gives a call.
+pub fn call_timeout_ms(request: &ToolRequest) -> u32 {
+    request.call_timeout_ms()
+}
+
 impl ToolRequest {
     pub fn tool(&self) -> ToolName {
         match self {
@@ -921,6 +931,18 @@ impl ToolRequest {
             | ToolRequest::Close(_) => true,
             ToolRequest::Read(r) => r.acknowledge.as_ref().is_some_and(|a| !a.is_empty()),
             ToolRequest::Capabilities(_) | ToolRequest::Wait(_) | ToolRequest::List(_) => false,
+        }
+    }
+
+    /// How long a bridge waits on the supervisor for this request: a wait's own timeout (its
+    /// documented default when it names none) plus [`CALL_SLACK_MS`], else [`CALL_TIMEOUT_MS`].
+    pub fn call_timeout_ms(&self) -> u32 {
+        match self.normalised() {
+            ToolRequest::Wait(WaitRequest {
+                timeout_ms: Some(timeout),
+                ..
+            }) => timeout.saturating_add(CALL_SLACK_MS),
+            _ => CALL_TIMEOUT_MS,
         }
     }
 
@@ -1910,6 +1932,24 @@ pub(crate) mod fixtures {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// One deadline for every client: a wait's own timeout (its default when it names none)
+    /// plus the slack, everything else the fixed call deadline.
+    #[test]
+    fn a_call_waits_its_own_timeout_plus_the_slack() {
+        let limits = Limits::default();
+        let wait = |args: Value| parse_request(ToolName::CrossAgentWait, &args, &limits).unwrap();
+        assert_eq!(
+            call_timeout_ms(&wait(json!({"timeout_ms": 5000}))),
+            5000 + CALL_SLACK_MS
+        );
+        assert_eq!(
+            call_timeout_ms(&wait(json!({}))),
+            DEFAULT_WAIT_TIMEOUT_MS + CALL_SLACK_MS
+        );
+        let list = parse_request(ToolName::CrossAgentList, &json!({}), &limits).unwrap();
+        assert_eq!(call_timeout_ms(&list), CALL_TIMEOUT_MS);
+    }
 
     #[test]
     fn state_ref_is_domain_and_value() {

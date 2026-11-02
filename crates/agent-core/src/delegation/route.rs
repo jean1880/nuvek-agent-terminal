@@ -51,13 +51,21 @@ pub enum RouteBlocker {
     AgentSyncEntry,
     /// The route's provider evidence bundle is not recorded.
     EvidenceBundle,
-    /// The Local agent (the app's own runner) has no delegation bridge: it can neither call the
-    /// delegation tools as a parent nor report back as a child.
-    LocalAgentNoBridge,
+    /// G-L1: the Local runner's capability travels only in its stdin startup frame, never in
+    /// argv, an environment, the transcript, the store or a command's environment.
+    LocalBridgeBinding,
+    /// G-L2: a Local runner's connection is bound to that generation's own process id.
+    LocalPeerPin,
+    /// G-L3: every Local call carries a runner-minted key observed in its stream first.
+    LocalAttestation,
+    /// G-L4 (children only): a supervised runner asks the app before every write and command,
+    /// runs no user MCP server, offers only what its mode and capabilities allow, and reads
+    /// that policy back before its task.
+    LocalChildSupervision,
 }
 
 impl RouteBlocker {
-    pub const ALL: [RouteBlocker; 17] = [
+    pub const ALL: [RouteBlocker; 20] = [
         RouteBlocker::ClaudeBashUnderRestricted,
         RouteBlocker::ClaudeTokenPersistence,
         RouteBlocker::CodexAmbientMcp,
@@ -74,7 +82,10 @@ impl RouteBlocker {
         RouteBlocker::AgyAllowRules,
         RouteBlocker::AgentSyncEntry,
         RouteBlocker::EvidenceBundle,
-        RouteBlocker::LocalAgentNoBridge,
+        RouteBlocker::LocalBridgeBinding,
+        RouteBlocker::LocalPeerPin,
+        RouteBlocker::LocalAttestation,
+        RouteBlocker::LocalChildSupervision,
     ];
 
     /// The snake_case name reported in `route_blockers` (at most 64 bytes).
@@ -96,7 +107,10 @@ impl RouteBlocker {
             RouteBlocker::AgyAllowRules => "agy_allow_rules",
             RouteBlocker::AgentSyncEntry => "agent_sync_entry",
             RouteBlocker::EvidenceBundle => "evidence_bundle",
-            RouteBlocker::LocalAgentNoBridge => "local_agent_no_bridge",
+            RouteBlocker::LocalBridgeBinding => "local_bridge_binding",
+            RouteBlocker::LocalPeerPin => "local_peer_pin",
+            RouteBlocker::LocalAttestation => "local_attestation",
+            RouteBlocker::LocalChildSupervision => "local_child_supervision",
         }
     }
 }
@@ -127,7 +141,10 @@ pub fn blocker_scope(b: RouteBlocker) -> BlockerScope {
         | RouteBlocker::AgyAllowRules
         | RouteBlocker::AgentSyncEntry
         | RouteBlocker::EvidenceBundle
-        | RouteBlocker::LocalAgentNoBridge => BlockerScope::AllModes,
+        | RouteBlocker::LocalBridgeBinding
+        | RouteBlocker::LocalPeerPin
+        | RouteBlocker::LocalAttestation
+        | RouteBlocker::LocalChildSupervision => BlockerScope::AllModes,
     }
 }
 
@@ -171,7 +188,7 @@ fn parent_group(d: Driver) -> &'static [RouteBlocker] {
             AgyAttestation,
             AgyTokenPersistence,
         ],
-        Driver::Local => &[LocalAgentNoBridge],
+        Driver::Local => &[LocalBridgeBinding, LocalPeerPin, LocalAttestation],
     }
 }
 
@@ -196,7 +213,12 @@ fn child_group(d: Driver, bridge: ChildBridge) -> &'static [RouteBlocker] {
             AgyAttestation,
             AgyTokenPersistence,
         ],
-        (Driver::Local, _) => &[LocalAgentNoBridge],
+        (Driver::Local, _) => &[
+            LocalBridgeBinding,
+            LocalPeerPin,
+            LocalAttestation,
+            LocalChildSupervision,
+        ],
     }
 }
 
@@ -229,19 +251,26 @@ pub fn gate_evidence(gate: RouteBlocker) -> GateEvidence {
         | AgyPeerAndSingleUse
         | AgyManagedEntry
         | AgyAllowRules
-        | AgentSyncEntry => Passed,
+        | AgentSyncEntry
+        // Recorded in `local.proof.json` (G-L1 to G-L4).
+        | LocalBridgeBinding
+        | LocalPeerPin
+        | LocalAttestation
+        | LocalChildSupervision => Passed,
         // Bundle admission remains route-specific; bridge-free AGY is not implemented.
         EvidenceBundle => PendingReview,
-        LocalAgentNoBridge => Unsupported,
     }
 }
+
+/// Whether the Local route's recorded proof (`local.proof.json`, `make delegation-proof
+/// DELEGATION_PROOF_ARGS=--provider local`) is in.
+const LOCAL_BUNDLE_RECORDED: bool = true;
 
 fn reviewed_bundle(q: &RouteQuery) -> bool {
     match (q.child, q.child_bridge) {
         (Driver::Claude | Driver::Codex, _) | (Driver::Agy, ChildBridge::WithBridge) => true,
         (Driver::Agy, ChildBridge::WithoutBridge) => false,
-        // Refused by its own blocker, not for want of a bundle.
-        (Driver::Local, _) => true,
+        (Driver::Local, _) => LOCAL_BUNDLE_RECORDED,
     }
 }
 
@@ -362,6 +391,8 @@ pub enum ParentBinding {
     PerThreadConfig,
     /// agy's managed entry in `~/.gemini/config/mcp_config.json`.
     PersistentGlobal,
+    /// The Local runner's startup frame on stdin (`Command::ConfigureLocal`).
+    LaunchFrame,
 }
 
 /// Where the token travels.
@@ -371,6 +402,8 @@ pub enum TokenPlacement {
     ServerEnv,
     /// In the provider process's environment (agy, the only channel).
     ProcessEnv,
+    /// Only in the Local runner's memory: its own client connects, no process inherits it.
+    RunnerMemory,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -397,6 +430,8 @@ pub enum BridgeGate {
     ApproveMode,
     /// agy allow rules (hookless) or the app hook.
     AllowRulesOrHook,
+    /// The Local runner's own delegation gate: no card; the supervisor judges each call.
+    AppToolGate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -414,6 +449,9 @@ pub enum ChildMcpIsolation {
     DisabledAndReadBack,
     /// agy: the app hook denies other servers.
     HookDeniesOthers,
+    /// The Local runner: a child's startup frame carries no user server, refused otherwise and
+    /// read back.
+    NoUserServers,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -527,25 +565,26 @@ impl DelegationCaps {
                 write_only_after_result: true,
                 mcp_cancel_on_interrupt: false,
             },
-            // Every route to or from it is refused (`LocalAgentNoBridge`): the most restrictive
-            // facts, so nothing reading them could widen what it may do.
+            // The app's own runner: its client connects from the runner's own process (pinned
+            // by pid), a child is supervised (every write and command asks the app) and has no
+            // native sub-agents. A message while it works waits for its next turn.
             Driver::Local => Self {
-                parent_binding: ParentBinding::LaunchOverlay,
-                token_placement: TokenPlacement::ServerEnv,
-                token_reuse: TokenReuse::SingleUse,
+                parent_binding: ParentBinding::LaunchFrame,
+                token_placement: TokenPlacement::RunnerMemory,
+                token_reuse: TokenReuse::SequentialPerGeneration,
                 peer_check_required: true,
                 attestation_required: true,
                 bridge_restart: BridgeRestart::DeadUntilRelaunch,
                 rebind: Rebind::RelaunchConversation,
-                bridge_gate: BridgeGate::AllowRulesOrHook,
+                bridge_gate: BridgeGate::AppToolGate,
                 child_requires_restricted: true,
                 child_requires_proven_hook: false,
-                child_mcp_isolation: ChildMcpIsolation::StrictConfig,
-                native_delegation: NativeDelegationControl::Unproven,
+                child_mcp_isolation: ChildMcpIsolation::NoUserServers,
+                native_delegation: NativeDelegationControl::ToolListReadBack,
                 plan_enforcement: PlanEnforcement::ToolList,
                 this_run: ThisRunSupport::Unsupported,
                 receipt: Receipt::None,
-                write_only_after_result: true,
+                write_only_after_result: false,
                 mcp_cancel_on_interrupt: false,
             },
         }
@@ -603,8 +642,11 @@ mod tests {
                 AgyManagedEntry => Some(AgyAllowRules),
                 AgyAllowRules => Some(AgentSyncEntry),
                 AgentSyncEntry => Some(EvidenceBundle),
-                EvidenceBundle => Some(LocalAgentNoBridge),
-                LocalAgentNoBridge => None,
+                EvidenceBundle => Some(LocalBridgeBinding),
+                LocalBridgeBinding => Some(LocalPeerPin),
+                LocalPeerPin => Some(LocalAttestation),
+                LocalAttestation => Some(LocalChildSupervision),
+                LocalChildSupervision => None,
             }
         }
         let mut walked = vec![ClaudeBashUnderRestricted];
@@ -634,8 +676,14 @@ mod tests {
                             child_bridge,
                         });
                         if parent == Driver::Local || child == Driver::Local {
-                            assert_eq!(spec.status, RouteStatus::Unverified);
-                            assert_eq!(spec.blockers[0], RouteBlocker::LocalAgentNoBridge);
+                            let pending = local_pending(parent, child, child_bridge);
+                            let status = if pending.is_empty() {
+                                RouteStatus::Verified
+                            } else {
+                                RouteStatus::Unverified
+                            };
+                            assert_eq!(spec.status, status);
+                            assert_eq!(spec.blockers, pending);
                         } else if child == Driver::Agy && child_bridge == ChildBridge::WithoutBridge
                         {
                             assert_eq!(spec.status, RouteStatus::Unverified);
@@ -650,6 +698,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// What a route with the Local agent on either side waits for while its gates are pending:
+    /// the parent's gates when it is the parent, the child's (with supervision) when it is the
+    /// child, each once, then the unrecorded bundle when the child is Local.
+    fn local_pending(parent: Driver, child: Driver, bridge: ChildBridge) -> Vec<RouteBlocker> {
+        use RouteBlocker::*;
+        let mut out = Vec::new();
+        let mut add = |b: RouteBlocker| {
+            if gate_evidence(b) != GateEvidence::Passed && !out.contains(&b) {
+                out.push(b);
+            }
+        };
+        if parent == Driver::Local {
+            for b in [LocalBridgeBinding, LocalPeerPin, LocalAttestation] {
+                add(b);
+            }
+        }
+        if child == Driver::Local {
+            for b in [
+                LocalBridgeBinding,
+                LocalPeerPin,
+                LocalAttestation,
+                LocalChildSupervision,
+            ] {
+                add(b);
+            }
+        }
+        let unrecorded = match child {
+            Driver::Local => !LOCAL_BUNDLE_RECORDED,
+            Driver::Agy => bridge == ChildBridge::WithoutBridge,
+            Driver::Claude | Driver::Codex => false,
+        };
+        if unrecorded {
+            out.push(EvidenceBundle);
+        }
+        out
     }
 
     fn blockers(
@@ -673,12 +758,12 @@ mod tests {
         for gate in RouteBlocker::ALL {
             let expected = match gate {
                 EvidenceBundle => GateEvidence::PendingReview,
-                LocalAgentNoBridge => GateEvidence::Unsupported,
                 _ => GateEvidence::Passed,
             };
             assert_eq!(gate_evidence(gate), expected, "{gate:?}");
         }
-        let bridged = || Driver::ALL.into_iter().filter(|d| *d != Driver::Local);
+        // Every agent, the Local one included, now has its bridge.
+        let bridged = || Driver::ALL.into_iter();
         for parent in bridged() {
             for mode in TaskMode::ALL {
                 for child in bridged() {
@@ -697,8 +782,9 @@ mod tests {
         assert_eq!(blocker_scope(EvidenceBundle), BlockerScope::AllModes);
     }
 
-    /// Every agent with a bridge can be every such agent's sub-agent; the Local agent is
-    /// refused both ways. Codex as a child carries its caveat, which never turns into a blocker.
+    /// Every agent can be every agent's sub-agent, the Local one included once its gates
+    /// pass. Codex as a child carries its caveat, which never turns into a blocker; the Local
+    /// agent carries none.
     #[test]
     fn every_bridged_agent_pair_is_admitted_and_only_codex_children_carry_a_caveat() {
         for parent in Driver::ALL {
@@ -710,7 +796,10 @@ mod tests {
                         task_mode,
                         child_bridge: ChildBridge::WithBridge,
                     });
-                    let expected = if parent == Driver::Local || child == Driver::Local {
+                    let local = parent == Driver::Local || child == Driver::Local;
+                    let expected = if local
+                        && !local_pending(parent, child, ChildBridge::WithBridge).is_empty()
+                    {
                         RouteStatus::Unverified
                     } else {
                         RouteStatus::Verified
@@ -761,8 +850,10 @@ mod tests {
         assert_eq!(choose_agy_variant(Unverified, Unverified, true), None);
         for parent in Driver::ALL {
             for m in TaskMode::ALL {
-                // The Local agent cannot be a parent at all.
-                let bridged = (parent != Driver::Local).then_some(ChildBridge::WithBridge);
+                // A Local parent is admitted once its gates pass.
+                let waiting = parent == Driver::Local
+                    && !local_pending(parent, Driver::Agy, ChildBridge::WithBridge).is_empty();
+                let bridged = (!waiting).then_some(ChildBridge::WithBridge);
                 assert_eq!(agy_child_variant(parent, m, true), bridged);
                 assert_eq!(agy_child_variant(parent, m, false), None);
             }
@@ -791,5 +882,18 @@ mod tests {
             assert_eq!(caps.token_reuse, TokenReuse::SequentialPerGeneration);
             assert_eq!(caps.token_placement, TokenPlacement::ServerEnv);
         }
+        let local = DelegationCaps::of(Driver::Local);
+        assert_eq!(local.parent_binding, ParentBinding::LaunchFrame);
+        assert_eq!(local.token_placement, TokenPlacement::RunnerMemory);
+        assert_eq!(local.token_reuse, TokenReuse::SequentialPerGeneration);
+        assert!(local.peer_check_required && local.attestation_required);
+        assert_eq!(local.bridge_gate, BridgeGate::AppToolGate);
+        assert_eq!(local.child_mcp_isolation, ChildMcpIsolation::NoUserServers);
+        assert_eq!(
+            local.native_delegation,
+            NativeDelegationControl::ToolListReadBack
+        );
+        assert_eq!(local.this_run, ThisRunSupport::Unsupported);
+        assert_eq!(local.receipt, Receipt::None);
     }
 }

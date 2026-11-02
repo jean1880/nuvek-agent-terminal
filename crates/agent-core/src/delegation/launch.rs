@@ -2,8 +2,10 @@
 //! arguments, the Codex thread config, and the child read-back checks.
 //!
 //! The token appears only under a server's `env`, never in argv, and a
-//! [`DelegationBinding`] is never serialised.
+//! [`DelegationBinding`] is never serialised. The Local runner's [`LocalBridge`] is serialised
+//! once, into its startup frame on stdin, and nowhere else.
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use super::authority::TaskMode;
@@ -22,6 +24,43 @@ pub struct DelegationBinding {
     pub endpoint: String,
     pub instance: InstanceNonce,
     pub token: CapabilityToken,
+}
+
+/// The longest socket path a `sockaddr_un` holds (108 bytes with its NUL).
+pub const MAX_ENDPOINT_BYTES: usize = 107;
+
+/// What the Local runner needs to reach the supervisor itself: its own delegation client
+/// connects with it, so no bridge process (and no environment) ever holds the token. It travels
+/// only in the runner's startup frame (`Command::ConfigureLocal`, on stdin). `Debug` hides the
+/// token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalBridge {
+    /// The absolute socket path.
+    pub endpoint: String,
+    pub instance: InstanceNonce,
+    pub token: CapabilityToken,
+}
+
+impl LocalBridge {
+    pub fn from_binding(binding: &DelegationBinding) -> Self {
+        Self {
+            endpoint: binding.endpoint.clone(),
+            instance: binding.instance.clone(),
+            token: binding.token.clone(),
+        }
+    }
+
+    /// The endpoint is an absolute path a Unix socket address can hold.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.endpoint.starts_with('/')
+            || self.endpoint.len() > MAX_ENDPOINT_BYTES
+            || self.endpoint.contains('\0')
+        {
+            return Err("The delegation endpoint is invalid.".to_owned());
+        }
+        Ok(())
+    }
 }
 
 /// Codex's tool timeout for our server, above both bridge timeouts.
@@ -332,6 +371,29 @@ mod tests {
         let dbg = format!("{:?}", binding());
         assert!(!dbg.contains(&secret()[5..]));
         assert!(dbg.contains("atdc_****"));
+        let local = LocalBridge::from_binding(&binding());
+        let dbg = format!("{local:?}");
+        assert!(!dbg.contains(&secret()[5..]));
+        assert!(dbg.contains("atdc_****"));
+    }
+
+    #[test]
+    fn a_local_bridge_round_trips_and_refuses_a_bad_endpoint() {
+        let local = LocalBridge::from_binding(&binding());
+        assert!(local.validate().is_ok());
+        let json = serde_json::to_string(&local).expect("encode");
+        assert_eq!(
+            serde_json::from_str::<LocalBridge>(&json).expect("decode"),
+            local
+        );
+        assert!(serde_json::from_str::<LocalBridge>(&json.replace("}", ",\"x\":1}")).is_err());
+        for endpoint in ["relative.sock".to_owned(), format!("/{}", "a".repeat(107))] {
+            let bad = LocalBridge {
+                endpoint,
+                ..local.clone()
+            };
+            assert!(bad.validate().is_err());
+        }
     }
 
     #[test]

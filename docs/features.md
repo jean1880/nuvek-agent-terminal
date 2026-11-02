@@ -82,8 +82,9 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   Writing children use isolated git worktrees. Only reviewed routes are admitted. Codex
   0.161.0 is admitted as a parent and as a child, with the caveat
   `codex_native_workers_unsupervised`: as a child it still starts its own built-in
-  sub-agents, which run outside Agent Terminal's depth, mode and worktree limits. See the
-  [delegation guide](delegation/user-guide.md).
+  sub-agents, which run outside Agent Terminal's depth, mode and worktree limits. The Local
+  agent is admitted as a parent and as a child too, its every change and command checked as
+  a child. See the [delegation guide](delegation/user-guide.md).
 - **Pending approvals stay within reach.** A panel above the composer keeps approval
   controls available while you scroll, with extra choices in a popover when the
   agent supports them. Pending questions offer a jump back to their answer card.

@@ -251,20 +251,20 @@ pub fn gate_evidence(gate: RouteBlocker) -> GateEvidence {
         | AgyPeerAndSingleUse
         | AgyManagedEntry
         | AgyAllowRules
-        | AgentSyncEntry => Passed,
+        | AgentSyncEntry
+        // Recorded in `local.proof.json` (G-L1 to G-L4).
+        | LocalBridgeBinding
+        | LocalPeerPin
+        | LocalAttestation
+        | LocalChildSupervision => Passed,
         // Bundle admission remains route-specific; bridge-free AGY is not implemented.
         EvidenceBundle => PendingReview,
-        // Implemented; each passes only once its recorded proof and a separate source review
-        // are in (`local.proof.json`).
-        LocalBridgeBinding | LocalPeerPin | LocalAttestation | LocalChildSupervision => {
-            PendingReview
-        }
     }
 }
 
 /// Whether the Local route's recorded proof (`local.proof.json`, `make delegation-proof
 /// DELEGATION_PROOF_ARGS=--provider local`) is in.
-const LOCAL_BUNDLE_RECORDED: bool = false;
+const LOCAL_BUNDLE_RECORDED: bool = true;
 
 fn reviewed_bundle(q: &RouteQuery) -> bool {
     match (q.child, q.child_bridge) {
@@ -757,16 +757,13 @@ mod tests {
         use RouteBlocker::*;
         for gate in RouteBlocker::ALL {
             let expected = match gate {
-                EvidenceBundle
-                | LocalBridgeBinding
-                | LocalPeerPin
-                | LocalAttestation
-                | LocalChildSupervision => GateEvidence::PendingReview,
+                EvidenceBundle => GateEvidence::PendingReview,
                 _ => GateEvidence::Passed,
             };
             assert_eq!(gate_evidence(gate), expected, "{gate:?}");
         }
-        let bridged = || Driver::ALL.into_iter().filter(|d| *d != Driver::Local);
+        // Every agent, the Local one included, now has its bridge.
+        let bridged = || Driver::ALL.into_iter();
         for parent in bridged() {
             for mode in TaskMode::ALL {
                 for child in bridged() {
@@ -785,9 +782,9 @@ mod tests {
         assert_eq!(blocker_scope(EvidenceBundle), BlockerScope::AllModes);
     }
 
-    /// Every agent with a bridge can be every such agent's sub-agent; the Local agent waits on
-    /// its own gates both ways. Codex as a child carries its caveat, which never turns into a
-    /// blocker; the Local agent carries none.
+    /// Every agent can be every agent's sub-agent, the Local one included once its gates
+    /// pass. Codex as a child carries its caveat, which never turns into a blocker; the Local
+    /// agent carries none.
     #[test]
     fn every_bridged_agent_pair_is_admitted_and_only_codex_children_carry_a_caveat() {
         for parent in Driver::ALL {
@@ -853,7 +850,7 @@ mod tests {
         assert_eq!(choose_agy_variant(Unverified, Unverified, true), None);
         for parent in Driver::ALL {
             for m in TaskMode::ALL {
-                // A Local parent waits for its gates.
+                // A Local parent is admitted once its gates pass.
                 let waiting = parent == Driver::Local
                     && !local_pending(parent, Driver::Agy, ChildBridge::WithBridge).is_empty();
                 let bridged = (!waiting).then_some(ChildBridge::WithBridge);

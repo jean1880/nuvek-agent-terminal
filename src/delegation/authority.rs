@@ -101,6 +101,10 @@ pub(crate) fn effect(driver: Driver, tool: &str, input: &Value) -> Effect {
             },
         },
         Driver::Local if tool == agent_core::local_mcp::APPROVAL_TOOL => Effect::Mcp { own: false },
+        // Our `show_image`, by the bare name the runner gives its own tools: a read.
+        Driver::Local if tool == agent_core::delegation::ToolName::ShowImage.as_str() => {
+            Effect::Read
+        }
         // The runner's own delegation tools (never carded; if one were, it is ours).
         Driver::Local if agent_core::delegation::ToolName::parse(tool).is_some() => {
             Effect::Mcp { own: true }
@@ -876,6 +880,8 @@ mod tests {
                     json!({"ServerName": "agent_terminal", "ToolName": "show_image",
                            "Arguments": input}),
                 ),
+                // The Local runner names its own tools bare.
+                Driver::Local => ("show_image", input.clone()),
                 _ => ("mcp__agent_terminal__show_image", input.clone()),
             }
         };
@@ -935,10 +941,13 @@ mod tests {
     fn a_local_childs_tools_and_declared_limits() {
         let f = Fixture::new();
         for tool in agent_core::delegation::ToolName::ALL {
-            assert_eq!(
-                effect(Driver::Local, tool.as_str(), &json!({})),
+            // `show_image` only reads an image for the user: a read, as for every driver.
+            let want = if tool == agent_core::delegation::ToolName::ShowImage {
+                Effect::Read
+            } else {
                 Effect::Mcp { own: true }
-            );
+            };
+            assert_eq!(effect(Driver::Local, tool.as_str(), &json!({})), want);
         }
         let read_only = f.gate_with(Driver::Local, TaskMode::AcceptEdits, Some(vec![]));
         let inside = json!({"file_path": f.inside()});

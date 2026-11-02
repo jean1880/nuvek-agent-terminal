@@ -94,11 +94,21 @@ pub(crate) fn effect(driver: Driver, tool: &str, input: &Value) -> Effect {
 /// Every file an edit names, per provider. Empty: nothing checkable.
 fn edit_paths<'a>(driver: Driver, tool: &str, input: &'a Value) -> Vec<&'a str> {
     match driver {
-        // The Local runner's edit tools take Claude's field name.
-        Driver::Claude | Driver::Local => ["file_path", "notebook_path"]
+        Driver::Claude => ["file_path", "notebook_path"]
             .iter()
             .filter_map(|k| input.get(*k).and_then(Value::as_str))
             .collect(),
+        // The path named and the target the runner resolved it to and will write: both must be
+        // inside the lease. Without the resolved target nothing is checkable (it asks).
+        Driver::Local => match (
+            input.get("file_path").and_then(Value::as_str),
+            input
+                .get(agent_core::local_agent::RESOLVED_PATH)
+                .and_then(Value::as_str),
+        ) {
+            (Some(named), Some(resolved)) => vec![named, resolved],
+            _ => Vec::new(),
+        },
         Driver::Codex if tool == "file_change" => {
             crate::always_allow::codex_change_targets(input).unwrap_or_default()
         }
@@ -606,7 +616,11 @@ mod tests {
             ],
             Driver::Local => vec![
                 (Effect::Read, "read_file", json!({"file_path": file})),
-                (Effect::Edit, "edit_file", json!({"file_path": file})),
+                (
+                    Effect::Edit,
+                    "edit_file",
+                    json!({"file_path": file, "resolved_path": file}),
+                ),
                 (Effect::Exec, "run_command", json!({"command": "ls"})),
                 (Effect::Unknown, "Mystery", json!({})),
             ],
@@ -870,15 +884,29 @@ mod tests {
             TaskMode::AcceptEdits,
             Some(vec![Capability::Edit]),
         );
+        let card = |named: String, resolved: Option<String>| json!({"file_path": named, "resolved_path": resolved});
         assert_eq!(
-            edits.judge("write_file", &json!({"file_path": f.inside()}), None),
+            edits.judge("write_file", &card(f.inside(), Some(f.inside())), None),
             GateVerdict::Defer
         );
         assert!(is_ask_only(&edits.judge(
             "write_file",
-            &json!({"file_path": f.outside()}),
+            &card(f.outside(), Some(f.outside())),
             None
         )));
+        // The path named is inside, but the runner resolved it (a link) outside: the target it
+        // will write is what counts. Without the runner's resolved target, nothing is checkable.
+        assert!(is_ask_only(&edits.judge(
+            "write_file",
+            &card(f.inside(), Some(f.outside())),
+            None
+        )));
+        for missing in [card(f.inside(), None), json!({"file_path": f.inside()})] {
+            assert!(
+                is_ask_only(&edits.judge("write_file", &missing, None)),
+                "{missing}"
+            );
+        }
         assert!(is_deny(&edits.judge(
             "run_command",
             &json!({"command": "ls"}),

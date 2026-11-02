@@ -328,6 +328,12 @@ pub fn tools_for(mode: Mode) -> Vec<Tool> {
         .collect()
 }
 
+/// The field of a Local approval card naming the target the runner resolved the call's path to
+/// and will act on (null for a link that names nothing). A delegated child's authority judges
+/// it as well as the path named; the runner refuses to act if the path leads elsewhere when it
+/// runs.
+pub const RESOLVED_PATH: &str = "resolved_path";
+
 /// What happens to a tool call before it runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gate {

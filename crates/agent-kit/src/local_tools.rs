@@ -264,7 +264,7 @@ pub fn read_must_ask(ws: &Workspace, tool: Tool, input: &Value) -> bool {
 
 /// The path a file `tool` call names, as written: `file_path` for a write or an edit,
 /// [`read_path`] for a read. `None` for a command.
-fn named_path(tool: Tool, input: &Value) -> Option<&str> {
+pub(crate) fn named_path(tool: Tool, input: &Value) -> Option<&str> {
     match tool {
         Tool::RunCommand => None,
         Tool::WriteFile | Tool::EditFile => input.get("file_path").and_then(Value::as_str),

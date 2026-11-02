@@ -1806,7 +1806,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 Gate::Ask => match self.ask(
                     tool,
                     &title,
-                    &input,
+                    &card_input(tool, &input, target.as_deref()),
                     crate::local_tools::card_note(&ws, tool, &input, target.as_deref()),
                     commands,
                 )? {
@@ -2546,6 +2546,21 @@ fn poll(
             Err(TryRecvError::Empty) => return None,
         }
     }
+}
+
+/// What a card for `tool` shows the app: the call's input and, for a call that names a path,
+/// `resolved_path`, the target this runner resolved and will act on (null when the path leads
+/// through a link that names nothing). The app judges that target as well as the path named, so
+/// a link changed between this resolution and the app's judgement cannot move what is allowed;
+/// and the runner refuses to act if the path leads anywhere else when it runs.
+fn card_input(tool: Tool, input: &Value, target: Option<&Path>) -> Value {
+    let mut card = input.clone();
+    if crate::local_tools::named_path(tool, input).is_some() {
+        card[agent_core::local_agent::RESOLVED_PATH] = target
+            .map(|t| Value::String(t.to_string_lossy().into_owned()))
+            .unwrap_or(Value::Null);
+    }
+    card
 }
 
 /// The mode that lets less run unasked: Plan, then Ask, then Accept edits, then Bypass.
@@ -3300,10 +3315,19 @@ mod tests {
                 "{echo:?}"
             );
             run.send(prompt("write it"));
-            let request = run.wait_for(|e| match &e.event {
-                Event::ApprovalRequested { tool, .. } if tool == "write_file" => e.request.clone(),
+            let (request, card) = run.wait_for(|e| match &e.event {
+                Event::ApprovalRequested { tool, input, .. } if tool == "write_file" => {
+                    Some((e.request.clone()?, input.clone()))
+                }
                 _ => None,
             });
+            // The card carries the target this runner resolved and will write: what the app
+            // judges, beside the path named.
+            assert_eq!(card["file_path"], "a.txt");
+            assert_eq!(
+                card[agent_core::local_agent::RESOLVED_PATH],
+                json!(work.path().canonicalize().unwrap().join("a.txt"))
+            );
             // Denied by the app's inherited authority, which says why: the model is told that.
             run.send(Command::Approve {
                 request,
@@ -3365,6 +3389,72 @@ mod tests {
                     .iter()
                     .any(|e| matches!(e.event, Event::SessionStarted { .. })));
             }
+        }
+
+        /// A path named inside the folder that leads outside through a link is shown with the
+        /// target it leads to, which is what the app judges; a link that names nothing shows a
+        /// null target (nothing the app can check).
+        #[test]
+        fn a_childs_card_names_where_a_link_leads() {
+            let sock = tempfile::tempdir().unwrap();
+            let fake = FakeDelegation::start(sock.path(), answer_ok());
+            let work = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("x.txt"), "old").unwrap();
+            std::os::unix::fs::symlink(outside.path().join("x.txt"), work.path().join("link.txt"))
+                .unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let script = Script::new(vec![
+                Ok(tool_call(
+                    "c1",
+                    "write_file",
+                    json!({"file_path": "link.txt", "content": "x"}),
+                )),
+                Ok(text(&["Done"])),
+            ]);
+            let run = start_with_frame(
+                args(work.path(), Mode::AcceptEdits),
+                script,
+                state.path().into(),
+                frame(
+                    &fake,
+                    Some(LocalChildPolicy {
+                        task_mode: TaskMode::AcceptEdits,
+                        capabilities: None,
+                    }),
+                ),
+            );
+            run.send(prompt("write through the link"));
+            let (request, card) = run.wait_for(|e| match &e.event {
+                Event::ApprovalRequested { input, .. } => Some((e.request.clone()?, input.clone())),
+                _ => None,
+            });
+            assert_eq!(card["file_path"], "link.txt");
+            assert_eq!(
+                card[agent_core::local_agent::RESOLVED_PATH],
+                json!(outside.path().canonicalize().unwrap().join("x.txt"))
+            );
+            run.send(Command::Approve {
+                request,
+                decision: Decision::Deny,
+                updated_input: None,
+                message: None,
+            });
+            run.wait_for(completed);
+            run.finish();
+            assert_eq!(
+                std::fs::read_to_string(outside.path().join("x.txt")).unwrap(),
+                "old"
+            );
+            let dangling = card_input(Tool::WriteFile, &json!({"file_path": "gone"}), None);
+            assert_eq!(
+                dangling[agent_core::local_agent::RESOLVED_PATH],
+                Value::Null
+            );
+            let command = card_input(Tool::RunCommand, &json!({"command": "ls"}), None);
+            assert!(command
+                .get(agent_core::local_agent::RESOLVED_PATH)
+                .is_none());
         }
 
         /// A plan child and a child limited to reading are offered no writing tool, and a

@@ -3211,6 +3211,7 @@ impl Inner {
                 .is_some_and(|a| self.rule_may_apply(a, cwd.as_deref()));
         // A Local child asks before every edit (its runner's supervised gate), so its Accept
         // edits is answered here, as a Claude child's is.
+        // The target the runner resolved (and will write) must be one its rules may cover too.
         let local_child_accept_edit = driver == Driver::Local
             && self.child.is_some()
             && self.state.borrow().mode == Mode::AcceptEdits
@@ -3218,7 +3219,16 @@ impl Inner {
             && matches!(action, Some(crate::always_allow::Action::Edit { .. }))
             && action
                 .as_ref()
-                .is_some_and(|a| self.rule_may_apply(a, cwd.as_deref()));
+                .is_some_and(|a| self.rule_may_apply(a, cwd.as_deref()))
+            && input
+                .get(agent_core::local_agent::RESOLVED_PATH)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|resolved| {
+                    let edit = crate::always_allow::Action::Edit {
+                        path: resolved.to_owned(),
+                    };
+                    self.rule_may_apply(&edit, cwd.as_deref())
+                });
         let accept_edit = codex_accept_edit || claude_child_accept_edit || local_child_accept_edit;
         // Dangerous permissive mode: the agent's own bypass should leave nothing to ask, and
         // whatever still arrives (escalations included) is approved, as the user agreed to. A

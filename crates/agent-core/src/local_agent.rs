@@ -1502,15 +1502,28 @@ data: [DONE]"#;
     #[test]
     fn commands_go_out_as_one_json_line_and_unsupported_ones_are_refused() {
         let mut a = LocalAdapter::new();
-        let actions = a.encode(Command::Prompt { text: "hi".into() }).unwrap();
+        let actions = a
+            .encode(Command::Prompt {
+                attachments: Vec::new(),
+                text: "hi".into(),
+            })
+            .unwrap();
         let Action::Write(lines) = &actions[0] else {
             panic!("a write");
         };
         assert_eq!(
             serde_json::from_str::<Command>(&lines[0]).unwrap(),
-            Command::Prompt { text: "hi".into() }
+            Command::Prompt {
+                attachments: Vec::new(),
+                text: "hi".into()
+            }
         );
-        assert!(a.encode(Command::Steer { text: "x".into() }).is_err());
+        assert!(a
+            .encode(Command::Steer {
+                attachments: Vec::new(),
+                text: "x".into()
+            })
+            .is_err());
         assert!(a
             .encode(Command::Control {
                 id: "c".into(),

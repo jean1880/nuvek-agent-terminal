@@ -634,6 +634,7 @@ fn abrupt_runner_death_closes_the_private_lifetime_pipe_and_kills_descendants() 
             input,
             "{}",
             serde_json::to_string(&agent_core::adapter::Command::Prompt {
+                attachments: Vec::new(),
                 text: "hello".into()
             })
             .unwrap()
@@ -784,6 +785,7 @@ fn runner_stop_restarts_a_fresh_generation_and_stdin_eof_awaits_cleanup() {
         input,
         "{}",
         serde_json::to_string(&agent_core::adapter::Command::Prompt {
+            attachments: Vec::new(),
             text: "first".into()
         })
         .unwrap()
@@ -804,6 +806,7 @@ fn runner_stop_restarts_a_fresh_generation_and_stdin_eof_awaits_cleanup() {
         input,
         "{}",
         serde_json::to_string(&agent_core::adapter::Command::Prompt {
+            attachments: Vec::new(),
             text: "second".into()
         })
         .unwrap()
@@ -1069,7 +1072,10 @@ impl LiveRunner {
         mut on_card: impl FnMut(&agent_core::event::Envelope),
     ) -> Vec<agent_core::event::Envelope> {
         use agent_core::event::Event;
-        self.send(&agent_core::adapter::Command::Prompt { text: text.into() });
+        self.send(&agent_core::adapter::Command::Prompt {
+            attachments: Vec::new(),
+            text: text.into(),
+        });
         let mut events = Vec::new();
         loop {
             let envelope = self.next();
@@ -1596,6 +1602,7 @@ mod runner {
                     None,
                 );
                 run.send(Command::Prompt {
+                    attachments: Vec::new(),
                     text: "test".into(),
                 });
                 let events = run.turn();
@@ -1632,6 +1639,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let events = run.turn();
@@ -1677,6 +1685,7 @@ mod runner {
                 None,
             );
             run.send(Command::Prompt {
+                attachments: Vec::new(),
                 text: "test".into(),
             });
             let events = run.turn();
@@ -1786,6 +1795,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let card = loop {
@@ -1869,6 +1879,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "first".into(),
         });
         let card = loop {
@@ -1889,6 +1900,7 @@ mod runner {
             |e| e.request == card.request && matches!(e.event, Event::ApprovalResolved { .. })
         ));
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "second".into(),
         });
         let fresh = loop {
@@ -1952,6 +1964,7 @@ mod runner {
                 None,
             );
             run.send(Command::Prompt {
+                attachments: Vec::new(),
                 text: "test".into(),
             });
             let events = run.turn();
@@ -2006,6 +2019,7 @@ mod runner {
                 None,
             );
             run.send(Command::Prompt {
+                attachments: Vec::new(),
                 text: "test".into(),
             });
             let events = run.turn();
@@ -2028,6 +2042,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let events = run.turn();
@@ -2050,6 +2065,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let events = run.turn();
@@ -2084,6 +2100,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let events = run.turn();
@@ -2121,6 +2138,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let events = run.turn();
@@ -2152,6 +2170,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let events = run.turn();
@@ -2207,6 +2226,7 @@ mod runner {
                 None,
             );
             run.send(Command::Prompt {
+                attachments: Vec::new(),
                 text: "test".into(),
             });
             let events = run.turn();
@@ -2257,6 +2277,7 @@ mod runner {
                 None,
             );
             run.send(Command::Prompt {
+                attachments: Vec::new(),
                 text: "test".into(),
             });
             let events = run.turn();
@@ -2304,6 +2325,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let events = run.turn();
@@ -2336,6 +2358,7 @@ mod runner {
                         None,
                     );
                     run.send(Command::Prompt {
+                        attachments: Vec::new(),
                         text: "test".into(),
                     });
                     let events = run.turn();
@@ -2379,6 +2402,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         run.turn();
@@ -2416,6 +2440,7 @@ mod runner {
                 None,
             );
             run.send(Command::Prompt {
+                attachments: Vec::new(),
                 text: "test".into(),
             });
             let events = run.turn();
@@ -2441,6 +2466,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let events = run.turn();
@@ -2464,6 +2490,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         run.turn();
@@ -2491,6 +2518,7 @@ mod runner {
                 None,
             );
             run.send(Command::Prompt {
+                attachments: Vec::new(),
                 text: "test".into(),
             });
             let card = loop {
@@ -2556,6 +2584,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let card = loop {
@@ -2602,6 +2631,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let card = loop {
@@ -2647,6 +2677,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let events = run.turn();
@@ -2697,6 +2728,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let mut count = 0;
@@ -2725,6 +2757,7 @@ mod runner {
                 None,
             );
             run.send(Command::Prompt {
+                attachments: Vec::new(),
                 text: "test".into(),
             });
             if mode == Mode::Ask {
@@ -2779,6 +2812,7 @@ mod runner {
                 None,
             );
             run.send(Command::Prompt {
+                attachments: Vec::new(),
                 text: "test".into(),
             });
             run.turn();
@@ -2811,6 +2845,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let until = Instant::now() + Duration::from_secs(4);
@@ -2860,6 +2895,7 @@ mod runner {
                 None,
             );
             run.send(Command::Prompt {
+                attachments: Vec::new(),
                 text: "test".into(),
             });
             let events = run.turn();
@@ -2928,6 +2964,7 @@ mod runner {
             None,
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let events = run.turn();
@@ -2967,7 +3004,10 @@ mod runner {
         );
         let mut stamps = Vec::new();
         for turn in ["one", "two"] {
-            run.send(Command::Prompt { text: turn.into() });
+            run.send(Command::Prompt {
+                attachments: Vec::new(),
+                text: turn.into(),
+            });
             loop {
                 let env = run.next();
                 if let Event::ApprovalRequested { input, .. } = &env.event {

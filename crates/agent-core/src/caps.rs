@@ -46,6 +46,12 @@ pub struct Capabilities {
     /// `get_task_output`).
     #[serde(default)]
     pub task_output: bool,
+    /// Takes images with a prompt ([`crate::adapter::Command::Prompt`]`.attachments`): Claude as
+    /// base64 content blocks, Codex as `localImage` paths, the Local agent as `image_url` parts
+    /// (a model server still refuses them for a model without vision). False (agy): its stream
+    /// input is text only (live, 2026-11-02), so the adapter refuses a prompt that carries any.
+    #[serde(default)]
+    pub image_input: bool,
 }
 
 impl Capabilities {
@@ -84,6 +90,8 @@ impl Capabilities {
             live_input: true,
             // `get_task_output`: the last 8 KiB of a shell or Monitor task (CLI 2.1.296 schema).
             task_output: true,
+            // Base64 image content blocks on stream-json stdin (live, 2026-11-02).
+            image_input: true,
         }
     }
 
@@ -113,6 +121,8 @@ impl Capabilities {
             live_input: false,
             // agy reports no background tasks.
             task_output: false,
+            // "stream input content block type \"image\" is not supported (only \"text\")".
+            image_input: false,
         }
     }
 
@@ -152,6 +162,8 @@ impl Capabilities {
             live_input: true,
             // Its workers are sub-agents, shown in the sub-agent panel; no shell task to read.
             task_output: false,
+            // `localImage` inputs, read from any path in every sandbox (live, 2026-11-02).
+            image_input: true,
         }
     }
 
@@ -177,6 +189,8 @@ impl Capabilities {
             forms: false,
             live_input: false,
             task_output: false,
+            // `image_url` data URLs; a model without vision is refused by its server.
+            image_input: true,
         }
     }
 }
@@ -205,10 +219,11 @@ pub enum Feature {
     Forms,
     LiveInput,
     TaskOutput,
+    ImageInput,
 }
 
 impl Feature {
-    pub const ALL: [Feature; 18] = [
+    pub const ALL: [Feature; 19] = [
         Feature::ModelSwitch,
         Feature::ModeChangeRestarts,
         Feature::LiveApprovals,
@@ -227,6 +242,7 @@ impl Feature {
         Feature::Forms,
         Feature::LiveInput,
         Feature::TaskOutput,
+        Feature::ImageInput,
     ];
 
     /// Where the app renders this fact (for people reading the contract test; the test checks
@@ -255,6 +271,7 @@ impl Feature {
             Feature::Forms => "form cards (a tool server's form or link)",
             Feature::LiveInput => "composer while a turn runs: sent at once, or queued",
             Feature::TaskOutput => "background task list: a shell task's live output",
+            Feature::ImageInput => "composer: images sent with a message",
         }
     }
 }
@@ -281,6 +298,7 @@ impl Capabilities {
             Feature::Forms => self.forms,
             Feature::LiveInput => self.live_input,
             Feature::TaskOutput => self.task_output,
+            Feature::ImageInput => self.image_input,
         }
     }
 
@@ -323,6 +341,7 @@ impl Capabilities {
                  turn ends."
             ),
             Feature::TaskOutput => format!("{agent} does not share a background task's output."),
+            Feature::ImageInput => format!("{agent} can't take images (its input is text only)."),
         })
     }
 }
@@ -355,6 +374,7 @@ mod tests {
             forms: _,
             live_input: _,
             task_output: _,
+            image_input: _,
         } = Capabilities::claude();
         let mut seen = std::collections::HashSet::new();
         assert!(Feature::ALL.iter().all(|f| seen.insert(*f)));
@@ -384,7 +404,8 @@ mod tests {
                 PlanMode => Some(Forms),
                 Forms => Some(LiveInput),
                 LiveInput => Some(TaskOutput),
-                TaskOutput => None,
+                TaskOutput => Some(ImageInput),
+                ImageInput => None,
             }
         }
         let mut walked = vec![ModelSwitch];

@@ -680,7 +680,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
 
     fn handle(&mut self, command: Command, commands: &Receiver<RunnerInput>) -> Result<(), Stop> {
         match command {
-            Command::Prompt { text } => self.turn(text, commands),
+            Command::Prompt { text, .. } => self.turn(text, commands),
             Command::Interrupt => {
                 self.stop_mcp();
                 Ok(())
@@ -2366,6 +2366,7 @@ mod tests {
             }))
             .unwrap();
             let mut deferred = vec![Command::Prompt {
+                attachments: Vec::new(),
                 text: "already queued".into(),
             }];
             assert_eq!(
@@ -2386,6 +2387,7 @@ mod tests {
     fn setup_is_required_and_invalid_setup_never_acknowledged() {
         for command in [
             Command::Prompt {
+                attachments: Vec::new(),
                 text: "too early".into(),
             },
             Command::ConfigureLocal {
@@ -2653,6 +2655,7 @@ mod tests {
                         folder.path().join("state"),
                     );
                     run.send(Command::Prompt {
+                        attachments: Vec::new(),
                         text: "test".into(),
                     });
                     let mut failed = false;
@@ -2709,6 +2712,7 @@ mod tests {
             work.path().join("state"),
         );
         run.send(Command::Prompt {
+            attachments: Vec::new(),
             text: "test".into(),
         });
         let mut seen = Vec::new();
@@ -2824,7 +2828,10 @@ mod tests {
     }
 
     fn prompt(text: &str) -> Command {
-        Command::Prompt { text: text.into() }
+        Command::Prompt {
+            attachments: Vec::new(),
+            text: text.into(),
+        }
     }
 
     fn completed(env: &Envelope) -> Option<(TurnState, Option<Usage>, Option<String>)> {

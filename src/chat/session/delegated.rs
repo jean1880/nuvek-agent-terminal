@@ -608,7 +608,10 @@ impl Inner {
             }
             // The item path of `steer_prompt`, without its queue fallback.
             DeliveryPlan::WriteLive { .. } => {
-                if self.command(Command::Steer { text: text.clone() }) {
+                if self.command(Command::Steer {
+                    attachments: Vec::new(),
+                    text: text.clone(),
+                }) {
                     self.remember_pre_init_prompt(&text, None);
                     DelegatedOutcome::Written
                 } else {

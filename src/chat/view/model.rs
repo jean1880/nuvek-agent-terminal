@@ -2443,6 +2443,9 @@ impl Transcript {
             }
             // Quota feeds the usage indicator (app-wide service), not the transcript.
             Event::QuotaUpdated { .. } | Event::Unknown => {}
+            // Never delivered to the view: the session stores it and sends refs instead.
+            Event::ToolImage { .. } => {}
+            Event::Attachments { .. } => {}
             // Delegation events are not shown yet.
             Event::DelegatedMessage { .. } | Event::WorkerLinked { .. } => {}
         }

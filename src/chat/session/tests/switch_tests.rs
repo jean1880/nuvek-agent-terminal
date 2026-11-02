@@ -433,7 +433,7 @@ fn a_busy_same_agent_switch_whose_read_fails_holds_or_sends_on_the_new_model() {
                         |c| matches!(c, Command::SetModel { model, .. } if model == "opus"),
                     );
                     let sent = log.iter().position(
-                        |c| matches!(c, Command::Prompt { text } if text.contains("for opus")),
+                        |c| matches!(c, Command::Prompt { text, .. } if text.contains("for opus")),
                     );
                     matches!((set, sent), (Some(a), Some(b)) if a < b)
                 };
@@ -502,7 +502,7 @@ fn a_switch_on_a_long_thread_never_holds_the_main_loop() {
 fn steered(log: &Log, needle: &str) -> bool {
     log.borrow()
         .iter()
-        .any(|c| matches!(c, Command::Steer { text } if text.contains(needle)))
+        .any(|c| matches!(c, Command::Steer { text, .. } if text.contains(needle)))
 }
 
 fn end_turn(session: &ChatSession) {

@@ -174,6 +174,18 @@ pub enum Event {
         #[serde(default)]
         error: Option<String>,
     },
+    /// Images an item shows (`Envelope::item` is its id): a tool's result, a `show_image` call or
+    /// a reply's local images, by content address. Persisted; the bytes are in the app's blob
+    /// store, never in the event.
+    Attachments {
+        refs: Vec<crate::attachment::AttachmentRef>,
+    },
+    /// One image an adapter found in a tool's result, as the agent gave it. Transient: the app
+    /// stores it and replaces it with [`Event::Attachments`] before the event reaches the view or
+    /// the store, which refuses it. Never redacted (base64 is not text, and would be mangled).
+    ToolImage {
+        image: crate::attachment::ToolImageSource,
+    },
     /// The state of a reasoning item (`Envelope::item` is its id; its text still arrives as
     /// [`StreamKind::Reasoning`] content). Every agent's reasoning is one block in one of
     /// [`ReasoningState`]'s states; `label` says what the model shares (Claude and agy: its

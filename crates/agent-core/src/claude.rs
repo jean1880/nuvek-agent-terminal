@@ -35,6 +35,7 @@ use crate::adapter::{
     Action, Adapter, AdapterError, Command, Control, Driver, Mode, OpenSession, OpenSessionDelta,
     Outbox,
 };
+use crate::attachment::{self, PromptAttachment, ToolImageSource};
 use crate::caps::Capabilities;
 use crate::event::{
     AgentCommand, AgentCommandKind, BackgroundTask, BackgroundTaskKind, Decision, Envelope, Event,
@@ -959,8 +960,21 @@ impl ClaudeAdapter {
                     self.background.insert(id.to_owned());
                     continue;
                 }
-                let text = tool_result_text(b.get("content").unwrap_or(&Value::Null));
+                let content = b.get("content").unwrap_or(&Value::Null);
+                let text = tool_result_text(content);
                 let failed = b.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+                // Transient: the app stores each image and replaces it with a ref before anything
+                // is persisted or shown.
+                out.extend(
+                    tool_result_images(content)
+                        .into_iter()
+                        .map(|(mime, data_base64)| {
+                            Envelope::new(Event::ToolImage {
+                                image: ToolImageSource::Inline { mime, data_base64 },
+                            })
+                            .item(id)
+                        }),
+                );
                 self.close_item(id);
                 out.push(
                     Envelope::new(Event::ItemCompleted {
@@ -1377,9 +1391,9 @@ impl Adapter for ClaudeAdapter {
             // A steer is the same user line: written while a turn runs, Claude folds it into
             // that turn (one `result`, no new `init`); written as the turn ends, it starts the
             // next one, which opens with its own `init` like any prompt.
-            Command::Prompt { text } | Command::Steer { text } => json!({
+            Command::Prompt { text, attachments } | Command::Steer { text, attachments } => json!({
                 "type": "user",
-                "message": {"role": "user", "content": text},
+                "message": {"role": "user", "content": user_content(text, &attachments)},
                 "parent_tool_use_id": null,
             })
             .to_string(),
@@ -1856,6 +1870,48 @@ fn content_text(content: &Value) -> String {
             .join("\n"),
         _ => String::new(),
     }
+}
+
+/// A user message's `content`: the bare text, or, with images, their base64 blocks followed by
+/// the text block (left out when empty: an image alone is a valid message).
+fn user_content(text: String, attachments: &[PromptAttachment]) -> Value {
+    if attachments.is_empty() {
+        return Value::String(text);
+    }
+    let mut blocks: Vec<Value> = attachments
+        .iter()
+        .map(|a| {
+            json!({"type": "image", "source": {
+                "type": "base64", "media_type": a.meta.mime, "data": a.data_base64,
+            }})
+        })
+        .collect();
+    if !text.trim().is_empty() {
+        blocks.push(json!({"type": "text", "text": text}));
+    }
+    Value::Array(blocks)
+}
+
+/// The images of a `tool_result`'s `content` (`{type: image, source: {type: base64, …}}`, what
+/// Read of an image file returns, live 2026-11-02): `(media_type, base64)` each, at most
+/// [`attachment::MAX_PER_ITEM`].
+fn tool_result_images(content: &Value) -> Vec<(String, String)> {
+    let Value::Array(blocks) = content else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter(|b| str_of(b, "type") == Some("image"))
+        .filter_map(|b| {
+            let source = b.get("source")?;
+            (str_of(source, "type")? == "base64").then_some(())?;
+            Some((
+                str_of(source, "media_type")?.to_owned(),
+                str_of(source, "data")?.to_owned(),
+            ))
+        })
+        .take(attachment::MAX_PER_ITEM)
+        .collect()
 }
 
 /// Text of a `tool_result`'s `content`: like [`content_text`], but a block with
@@ -2656,6 +2712,88 @@ mod tests {
             }
             other => panic!("not an ItemCompleted: {other:?}"),
         }
+    }
+
+    /// Read of an image file answers with a base64 image block (live, 2026-11-02): it becomes a
+    /// transient `ToolImage` for that item, ahead of its completion, which keeps the `[image]` text.
+    #[test]
+    fn a_tool_result_image_becomes_a_transient_tool_image() {
+        let mut a = ClaudeAdapter::new();
+        let frame = json!({"type": "user", "uuid": "u2", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t2", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBO"}}
+            ]}
+        ]}});
+        let out = a.feed(&frame.to_string());
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[0].item.as_deref(), Some("t2"));
+        assert_eq!(
+            out[0].event,
+            Event::ToolImage {
+                image: ToolImageSource::Inline {
+                    mime: "image/png".into(),
+                    data_base64: "iVBO".into(),
+                }
+            }
+        );
+        assert!(matches!(&out[1].event, Event::ItemCompleted { output, .. }
+            if output.as_deref() == Some("[image]")));
+    }
+
+    fn image(id: char) -> PromptAttachment {
+        PromptAttachment {
+            meta: attachment::AttachmentRef {
+                id: id.to_string().repeat(64),
+                kind: attachment::AttachmentKind::Image,
+                mime: "image/png".into(),
+                width: 2,
+                height: 2,
+                bytes: 3,
+                name: None,
+                origin: attachment::Origin::User,
+            },
+            path: "/data/a.png".into(),
+            data_base64: format!("DATA{id}"),
+        }
+    }
+
+    fn first_line(actions: Vec<Action>) -> Value {
+        let Some(Action::Write(lines)) = actions.into_iter().next() else {
+            panic!("no write")
+        };
+        serde_json::from_str(&lines[0]).expect("json")
+    }
+
+    #[test]
+    fn a_prompt_with_images_sends_base64_blocks_then_its_text() {
+        let mut a = ClaudeAdapter::new();
+        let line = first_line(
+            a.encode(Command::Prompt {
+                text: "what is this?".into(),
+                attachments: vec![image('a'), image('b')],
+            })
+            .expect("encoded"),
+        );
+        assert_eq!(
+            line["message"]["content"],
+            json!([
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "DATAa"}},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "DATAb"}},
+                {"type": "text", "text": "what is this?"},
+            ])
+        );
+        // An image alone is a message; a steer carries images the same way.
+        let line = first_line(
+            a.encode(Command::Steer {
+                text: " ".into(),
+                attachments: vec![image('c')],
+            })
+            .expect("encoded"),
+        );
+        assert_eq!(line["message"]["content"].as_array().map(Vec::len), Some(1));
+        // No images: the bare string, exactly as before.
+        let line = first_line(a.encode(Command::prompt("hi")).expect("encoded"));
+        assert_eq!(line["message"]["content"], json!("hi"));
     }
 
     #[test]
@@ -3973,6 +4111,7 @@ mod tests {
             written(
                 &mut a,
                 Command::Prompt {
+                    attachments: Vec::new(),
                     text: "hello".into()
                 }
             ),
@@ -3983,6 +4122,7 @@ mod tests {
             written(
                 &mut a,
                 Command::Steer {
+                    attachments: Vec::new(),
                     text: "also".into()
                 }
             ),

@@ -142,6 +142,7 @@ use serde_json::{json, Map, Value};
 use crate::adapter::{
     Action, Adapter, AdapterError, Command, Control, Driver, Mode, OpenSession, Outbox,
 };
+use crate::attachment::{PromptAttachment, ToolImageSource};
 use crate::caps::Capabilities;
 use crate::event::{
     Decision, Envelope, Event, ItemKind, ItemStatus, PlanStep, Question, QuestionOption,
@@ -188,6 +189,30 @@ const QUIET: &[&str] = &[
     "item/autoApprovalReview/completed",
 ];
 
+/// A user message on its way to Codex: its text and images.
+#[derive(Debug, Clone, PartialEq)]
+struct UserInput {
+    text: String,
+    attachments: Vec<PromptAttachment>,
+}
+
+impl UserInput {
+    /// `turn/start` / `turn/steer` `input`: a `localImage` per image (Codex reads the file, from
+    /// any path in every sandbox: live, 2026-11-02), then the text, left out when it is empty and
+    /// images carry the message.
+    fn json(&self) -> Value {
+        let mut items: Vec<Value> = self
+            .attachments
+            .iter()
+            .map(|a| json!({"type": "localImage", "path": a.path}))
+            .collect();
+        if items.is_empty() || !self.text.trim().is_empty() {
+            items.push(json!({"type": "text", "text": self.text}));
+        }
+        Value::Array(items)
+    }
+}
+
 /// A request this adapter sent and has not seen answered.
 #[derive(Debug, Clone)]
 enum Pending {
@@ -208,9 +233,9 @@ enum Pending {
     TurnStart(SubmittedModel),
     Compact,
     Interrupt,
-    /// `turn/steer` carrying this text: refused (the turn ended first), it starts a turn of its
+    /// `turn/steer` carrying this input: refused (the turn ended first), it starts a turn of its
     /// own instead.
-    Steer(String),
+    Steer(UserInput),
     /// A delegated `turn/steer` ([`Command::DelegatedSteer`]): its outcome is a
     /// `ControlResult` for this tag, and a refusal starts nothing.
     DelegatedSteer(String),
@@ -332,7 +357,7 @@ pub struct CodexAdapter {
     effective_mode: Option<Mode>,
     cwd: Option<String>,
     /// Prompts encoded before the thread id arrived.
-    queued: VecDeque<String>,
+    queued: VecDeque<UserInput>,
     outbox: Outbox,
     approvals: HashMap<String, PendingApproval>,
     questions: HashMap<String, PendingQuestion>,
@@ -782,7 +807,7 @@ impl CodexAdapter {
         self.outbox.events.push(Envelope::new(event));
     }
 
-    fn turn_start_line(&mut self, thread: &str, text: &str) -> String {
+    fn turn_start_line(&mut self, thread: &str, input: &UserInput) -> String {
         // Capture before writing: the user can change the picker before turn/started arrives.
         if self.effective_mode.is_none() {
             self.effective_mode = Some(self.mode);
@@ -790,7 +815,7 @@ impl CodexAdapter {
         let (approval, sandbox) = self.policy(self.mode);
         let mut params = Map::new();
         params.insert("threadId".into(), json!(thread));
-        params.insert("input".into(), json!([{"type": "text", "text": text}]));
+        params.insert("input".into(), input.json());
         if let Some(cwd) = &self.cwd {
             params.insert("cwd".into(), json!(cwd));
         }
@@ -938,6 +963,10 @@ impl CodexAdapter {
         self.file_changes.remove(id);
         self.mcp_calls.remove(id);
         let (kind, title, input) = item_info(item);
+        let viewed = (s(item, "type") == Some("imageView"))
+            .then(|| s(item, "path"))
+            .flatten()
+            .map(str::to_owned);
         if matches!(kind, ItemKind::WebSearch | ItemKind::FileChange)
             && self.open_items.iter().any(|open| open == id)
         {
@@ -954,6 +983,16 @@ impl CodexAdapter {
             );
         } else {
             self.start_item(out, id, kind, title, input);
+        }
+        // An image Codex looked at (`imageView`, an absolute path: live, 2026-11-02): the app
+        // reads it under its read policy and shows it in this card.
+        if let Some(path) = viewed {
+            out.push(
+                Envelope::new(Event::ToolImage {
+                    image: ToolImageSource::File { path },
+                })
+                .item(id),
+            );
         }
         // The completed item is authoritative: its text replaces whatever streamed.
         let streamed_text = self.texts.get(id).cloned();
@@ -2219,9 +2258,9 @@ impl CodexAdapter {
             (Pending::Steer(_), Some(_), _) => {}
             // Refused: the turn ended (or another began) before it arrived. The message is not
             // lost: it starts a turn of its own, as it would have from the queue.
-            (Pending::Steer(text), None, error) => {
+            (Pending::Steer(input), None, error) => {
                 if let Some(thread) = self.thread_id.clone() {
-                    let line = self.turn_start_line(&thread, &text);
+                    let line = self.turn_start_line(&thread, &input);
                     self.write(line);
                     out.push(Envelope::new(Event::Notice {
                         text: "Codex finished its turn before your message reached it, so it \
@@ -2283,8 +2322,8 @@ impl CodexAdapter {
             model: startup_model,
             cwd: s(result, "cwd").map(str::to_owned),
         }));
-        while let Some(text) = self.queued.pop_front() {
-            let line = self.turn_start_line(&thread, &text);
+        while let Some(input) = self.queued.pop_front() {
+            let line = self.turn_start_line(&thread, &input);
             self.write(line);
         }
     }
@@ -2468,8 +2507,13 @@ impl Adapter for CodexAdapter {
         }
         match command {
             Command::ConfigureLocal { .. } => Err(AdapterError::Unsupported("Local setup")),
-            Command::Prompt { text } => {
+            Command::Prompt { text, attachments } => {
                 if !self.prompt_starts_turn(&text) {
+                    if !attachments.is_empty() {
+                        return Err(AdapterError::Invalid(
+                            "a command can't carry images".to_owned(),
+                        ));
+                    }
                     let Some(thread) = self.thread_id.clone() else {
                         return Err(AdapterError::Invalid(
                             "the Codex thread is not started yet".to_owned(),
@@ -2483,32 +2527,34 @@ impl Adapter for CodexAdapter {
                     );
                     return Ok(vec![Action::Write(vec![line])]);
                 }
+                let input = UserInput { text, attachments };
                 match self.thread_id.clone() {
                     Some(thread) => {
-                        let line = self.turn_start_line(&thread, &text);
+                        let line = self.turn_start_line(&thread, &input);
                         Ok(vec![Action::Write(vec![line])])
                     }
                     None => {
-                        self.queued.push_back(text);
+                        self.queued.push_back(input);
                         Ok(Vec::new())
                     }
                 }
             }
-            Command::Steer { text } => {
+            Command::Steer { text, attachments } => {
                 // Into the running turn, pinned to it: Codex refuses the steer if that turn is no
                 // longer the active one, and the refusal starts a turn instead (`on_response`).
                 // With no turn running there is nothing to steer: it is a prompt.
                 let (Some(thread), Some(turn)) = (self.thread_id.clone(), self.turn_id.clone())
                 else {
-                    return self.encode(Command::Prompt { text });
+                    return self.encode(Command::Prompt { text, attachments });
                 };
+                let input = UserInput { text, attachments };
                 let line = self.request(
-                    Pending::Steer(text.clone()),
+                    Pending::Steer(input.clone()),
                     "turn/steer",
                     json!({
                         "threadId": thread,
                         "expectedTurnId": turn,
-                        "input": [{"type": "text", "text": text}],
+                        "input": input.json(),
                     }),
                 );
                 Ok(vec![Action::Write(vec![line])])
@@ -3413,7 +3459,10 @@ mod tests {
     fn prompt(adapter: &mut CodexAdapter, text: &str) -> Value {
         one_write(
             adapter
-                .encode(Command::Prompt { text: text.into() })
+                .encode(Command::Prompt {
+                    attachments: Vec::new(),
+                    text: text.into(),
+                })
                 .expect("prompt"),
         )
     }
@@ -3644,6 +3693,7 @@ mod tests {
         let mut a = started(Mode::Ask);
         let idle = one_write(
             a.encode(Command::Steer {
+                attachments: Vec::new(),
                 text: "hello".into(),
             })
             .expect("no turn: a prompt"),
@@ -3653,6 +3703,7 @@ mod tests {
 
         let steer = one_write(
             a.encode(Command::Steer {
+                attachments: Vec::new(),
                 text: "also check the tests".into(),
             })
             .expect("steer"),
@@ -3671,6 +3722,7 @@ mod tests {
         // Refused: the same text starts a turn, and the user is told.
         let again = one_write(
             a.encode(Command::Steer {
+                attachments: Vec::new(),
                 text: "one more thing".into(),
             })
             .expect("steer"),
@@ -3689,6 +3741,93 @@ mod tests {
         assert_eq!(started.len(), 1, "{started:?}");
         assert_eq!(started[0]["method"], "turn/start");
         assert_eq!(started[0]["params"]["input"][0]["text"], "one more thing");
+    }
+
+    fn image(path: &str) -> PromptAttachment {
+        PromptAttachment {
+            meta: crate::attachment::AttachmentRef {
+                id: "a".repeat(64),
+                kind: crate::attachment::AttachmentKind::Image,
+                mime: "image/png".into(),
+                width: 2,
+                height: 2,
+                bytes: 3,
+                name: None,
+                origin: crate::attachment::Origin::User,
+            },
+            path: path.into(),
+            data_base64: "AAAA".into(),
+        }
+    }
+
+    /// Images go as `localImage` paths ahead of the text (live, 2026-11-02), on `turn/start`, on
+    /// `turn/steer`, and on the turn a refused steer starts instead; an image alone has no text
+    /// item, and a slash command never carries one.
+    #[test]
+    fn images_go_as_local_image_paths_on_every_input() {
+        let mut a = started(Mode::Ask);
+        let start = one_write(
+            a.encode(Command::Prompt {
+                text: "what is this?".into(),
+                attachments: vec![image("/data/one.png"), image("/data/two.png")],
+            })
+            .expect("prompt"),
+        );
+        assert_eq!(
+            start["params"]["input"],
+            json!([
+                {"type": "localImage", "path": "/data/one.png"},
+                {"type": "localImage", "path": "/data/two.png"},
+                {"type": "text", "text": "what is this?"},
+            ])
+        );
+        a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu"}}}"#);
+        let steer = one_write(
+            a.encode(Command::Steer {
+                text: String::new(),
+                attachments: vec![image("/data/three.png")],
+            })
+            .expect("steer"),
+        );
+        assert_eq!(
+            steer["params"]["input"],
+            json!([{"type": "localImage", "path": "/data/three.png"}])
+        );
+        a.feed(
+            &json!({"id": steer["id"], "error": {"code": -32600, "message": "expected turn mismatch"}})
+                .to_string(),
+        );
+        let started = writes(&a.drain_outbox().actions);
+        assert_eq!(
+            started[0]["params"]["input"],
+            json!([{"type": "localImage", "path": "/data/three.png"}])
+        );
+        assert!(a
+            .encode(Command::Prompt {
+                text: "/compact".into(),
+                attachments: vec![image("/data/x.png")],
+            })
+            .is_err());
+    }
+
+    /// An image Codex looked at (`imageView`, an absolute path: live, 2026-11-02) is a transient
+    /// `ToolImage` naming the file, on the item's own card.
+    #[test]
+    fn an_image_view_names_its_file_for_the_app_to_read() {
+        let mut a = started(Mode::Ask);
+        let out = a.feed(
+            r#"{"method":"item/completed","params":{"threadId":"th-1","turnId":"tu","item":{"type":"imageView","id":"iv","path":"/work/chart.png"}}}"#,
+        );
+        assert!(
+            out.iter().any(|e| e.item.as_deref() == Some("iv")
+                && e.event
+                    == Event::ToolImage {
+                        image: ToolImageSource::File {
+                            path: "/work/chart.png".into()
+                        }
+                    }),
+            "{out:?}"
+        );
     }
 
     /// A delegated steer is pinned to the turn it names and never falls back: accepted, it is an
@@ -3915,6 +4054,7 @@ mod tests {
             assert!(child.drain_outbox().actions.is_empty());
             assert!(child
                 .encode(Command::Prompt {
+                    attachments: Vec::new(),
                     text: "never run".into()
                 })
                 .is_err());
@@ -4015,6 +4155,7 @@ mod tests {
     fn deferred_modes_preserve_accept_edits_cancel_and_apply_only_to_the_next_turn() {
         let mut a = started(Mode::AcceptEdits);
         a.encode(Command::Prompt {
+            attachments: Vec::new(),
             text: "Edit".into(),
         })
         .expect("prompt");
@@ -4145,6 +4286,7 @@ mod tests {
         // The user types before the thread exists: queued, flushed by the thread/start response.
         assert!(a
             .encode(Command::Prompt {
+                attachments: Vec::new(),
                 text: "list the files".into()
             })
             .expect("queue")
@@ -4385,7 +4527,10 @@ mod tests {
         a.argv(&session(Mode::Ask, Some("th-gone")));
         a.handshake();
         assert!(a
-            .encode(Command::Prompt { text: "hi".into() })
+            .encode(Command::Prompt {
+                attachments: Vec::new(),
+                text: "hi".into()
+            })
             .expect("queued")
             .is_empty());
         let ev = a.feed(
@@ -4434,6 +4579,7 @@ mod tests {
         a.handshake();
         assert!(a
             .encode(Command::Prompt {
+                attachments: Vec::new(),
                 text: "original work".into()
             })
             .expect("queue original")
@@ -4451,6 +4597,7 @@ mod tests {
         assert_eq!(resume["params"]["model"], "selected");
         assert!(a
             .encode(Command::Prompt {
+                attachments: Vec::new(),
                 text: "continue the interrupted work".into()
             })
             .expect("queue continuation")
@@ -4522,6 +4669,7 @@ mod tests {
                 a.argv(&session(Mode::Ask, resume));
                 a.handshake();
                 a.encode(Command::Prompt {
+                    attachments: Vec::new(),
                     text: "continue".into(),
                 })
                 .expect("queue");
@@ -4545,12 +4693,14 @@ mod tests {
                 assert!(a.drain_outbox().actions.is_empty());
                 assert!(a
                     .encode(Command::Prompt {
+                        attachments: Vec::new(),
                         text: "stale retry".into()
                     })
                     .is_err());
                 a.argv(&session(Mode::Ask, resume));
                 a.handshake();
                 a.encode(Command::Prompt {
+                    attachments: Vec::new(),
                     text: "fresh retry".into(),
                 })
                 .expect("queue fresh retry");
@@ -4611,6 +4761,7 @@ mod tests {
             a.argv(&open);
             a.handshake();
             a.encode(Command::Prompt {
+                attachments: Vec::new(),
                 text: "continue".into(),
             })
             .expect("queue continuation");
@@ -4641,6 +4792,7 @@ mod tests {
         a.argv(&open);
         a.handshake();
         a.encode(Command::Prompt {
+            attachments: Vec::new(),
             text: "use default".into(),
         })
         .expect("queue default");
@@ -4663,6 +4815,7 @@ mod tests {
             a.drain_outbox();
             assert!(a
                 .encode(Command::Prompt {
+                    attachments: Vec::new(),
                     text: "queued".into()
                 })
                 .expect("queue")
@@ -4686,7 +4839,10 @@ mod tests {
         a.handshake();
         for text in ["one", "two"] {
             assert!(a
-                .encode(Command::Prompt { text: text.into() })
+                .encode(Command::Prompt {
+                    attachments: Vec::new(),
+                    text: text.into()
+                })
                 .expect("queue")
                 .is_empty());
         }
@@ -5412,7 +5568,11 @@ mod tests {
                         .as_str()
                         .unwrap_or_default()
                         .to_owned();
-                    a.encode(Command::Prompt { text }).expect("prompt");
+                    a.encode(Command::Prompt {
+                        text,
+                        attachments: Vec::new(),
+                    })
+                    .expect("prompt");
                     a.drain_outbox();
                 }
                 (Some("out"), method) => {
@@ -5612,6 +5772,7 @@ mod tests {
             );
         }
         a.encode(Command::Prompt {
+            attachments: Vec::new(),
             text: "next".into(),
         })
         .expect("prompt");
@@ -5649,6 +5810,7 @@ mod tests {
         let completed = r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"completed"}}}"#;
         a.feed(completed);
         a.encode(Command::Prompt {
+            attachments: Vec::new(),
             text: "next".into(),
         })
         .expect("next prompt");
@@ -5730,6 +5892,7 @@ mod tests {
         assert_eq!(a.ended_turns.len(), TURN_TOMBSTONE_LIMIT);
         assert_eq!(a.ended_turn_order.len(), TURN_TOMBSTONE_LIMIT);
         a.encode(Command::Prompt {
+            attachments: Vec::new(),
             text: "next".into(),
         })
         .expect("next prompt");
@@ -5824,6 +5987,7 @@ mod tests {
         a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"completed"}}}"#);
         assert!(a.feed(&plan).is_empty(), "ended plan remains history");
         a.encode(Command::Prompt {
+            attachments: Vec::new(),
             text: "next".into(),
         })
         .expect("next prompt");
@@ -6161,6 +6325,7 @@ mod tests {
         let mut b = CodexAdapter::new();
         assert!(matches!(
             b.encode(Command::Prompt {
+                attachments: Vec::new(),
                 text: "/compact".into()
             }),
             Err(AdapterError::Invalid(_))
@@ -6472,7 +6637,11 @@ mod tests {
     #[test]
     fn a_rejected_turn_start_fails_the_turn_the_ui_began() {
         let mut a = started(Mode::Ask);
-        a.encode(Command::Prompt { text: "x".into() }).expect("ok");
+        a.encode(Command::Prompt {
+            attachments: Vec::new(),
+            text: "x".into(),
+        })
+        .expect("ok");
         let ev = a.feed(r#"{"id":3,"error":{"code":-32600,"message":"no such model"}}"#);
         assert!(matches!(&ev[0].event, Event::Error { message } if message == "no such model"));
         assert!(matches!(
@@ -7064,8 +7233,11 @@ mod tests {
     fn workspace_writability_follows_the_live_turns_sandbox() {
         let mut a = started(Mode::Ask);
         assert_eq!(a.workspace_writable(), Some(false));
-        a.encode(Command::Prompt { text: "go".into() })
-            .expect("prompt");
+        a.encode(Command::Prompt {
+            attachments: Vec::new(),
+            text: "go".into(),
+        })
+        .expect("prompt");
         a.feed(r#"{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-1"}}}"#);
         a.encode(Command::SetMode {
             mode: Mode::AcceptEdits,
@@ -7079,8 +7251,11 @@ mod tests {
         a.feed(r#"{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"tu-1","status":"completed"}}}"#);
         assert_eq!(a.workspace_writable(), Some(true), "the next turn writes");
         let mut b = started(Mode::AcceptEdits);
-        b.encode(Command::Prompt { text: "go".into() })
-            .expect("prompt");
+        b.encode(Command::Prompt {
+            attachments: Vec::new(),
+            text: "go".into(),
+        })
+        .expect("prompt");
         b.encode(Command::SetMode { mode: Mode::Ask })
             .expect("mode");
         assert_eq!(

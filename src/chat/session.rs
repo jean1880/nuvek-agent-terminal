@@ -4116,7 +4116,10 @@ impl Inner {
                 || text.to_owned(),
                 |news| agent_core::delegation::wake::with_user_prompt(news.text(), text),
             );
-            let accepted = self.command(Command::Steer { text: sent.clone() });
+            let accepted = self.command(Command::Steer {
+                attachments: Vec::new(),
+                text: sent.clone(),
+            });
             // Kept before settling, so news given back is taken out of the replayed copy too.
             if accepted {
                 self.remember_pre_init_prompt(&sent, None);
@@ -4333,6 +4336,7 @@ impl Inner {
             self.state.borrow_mut().running_turn = true;
         }
         let accepted = self.command(Command::Prompt {
+            attachments: Vec::new(),
             text: sent.to_owned(),
         });
         if accepted {
@@ -9018,7 +9022,7 @@ mod tests {
         }
         fn feed(&mut self, line: &str) -> Vec<Envelope> {
             if self.write_commands {
-                if let Ok(Command::Prompt { text }) = serde_json::from_str(line) {
+                if let Ok(Command::Prompt { text, .. }) = serde_json::from_str(line) {
                     return vec![Envelope::new(Event::Notice { text })];
                 }
             }
@@ -9425,7 +9429,7 @@ mod tests {
         log.borrow()
             .iter()
             .filter_map(|c| match c {
-                Command::Prompt { text } => Some(text.clone()),
+                Command::Prompt { text, .. } => Some(text.clone()),
                 _ => None,
             })
             .collect()

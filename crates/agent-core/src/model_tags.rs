@@ -769,6 +769,7 @@ mod tests {
             efforts: vec![],
             default_effort: None,
             via: None,
+            tools: None,
         };
         let default = model("default", Some("Sonnet 5.5 · Efficient for routine tasks"));
         assert_eq!(

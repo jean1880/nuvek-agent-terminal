@@ -1475,6 +1475,7 @@ mod tests {
             efforts: efforts.iter().map(|e| (*e).to_owned()).collect(),
             default_effort: None,
             via: None,
+            tools: None,
         }
     }
 

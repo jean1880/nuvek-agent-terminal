@@ -144,6 +144,7 @@ impl DemoModels {
             efforts,
             default_effort: None,
             via: None,
+            tools: None,
         };
         let mut models = vec![
             claude(

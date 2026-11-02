@@ -143,6 +143,7 @@ mod tests {
                         efforts: vec!["low".into(), "high".into()],
                         default_effort: None,
                         via: None,
+                        tools: None,
                     }]
                 }),
                 usage: Rc::new(|_| {

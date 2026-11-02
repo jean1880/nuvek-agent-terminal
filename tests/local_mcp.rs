@@ -1856,7 +1856,7 @@ mod runner {
                 text: "test".into(),
             });
             let events = run.turn();
-            let card = events
+            let mut card = events
                 .iter()
                 .find_map(|e| match &e.event {
                     Event::ApprovalRequested { input, .. } => Some(if tool == "mcp" {
@@ -1867,6 +1867,17 @@ mod runner {
                     _ => None,
                 })
                 .expect("complete card");
+            // A built-in's card also names the target its path resolved to (the app judges it):
+            // here, the file named, in the folder.
+            if tool == "write_file" {
+                let resolved = card
+                    .as_object_mut()
+                    .and_then(|card| card.remove(agent_core::local_agent::RESOLVED_PATH));
+                assert_eq!(
+                    resolved,
+                    Some(json!(folder.path().canonicalize().unwrap().join("marker")))
+                );
+            }
             let expected: Value =
                 serde_json::from_str(&argument.to_string().replace(secret, "[REDACTED]")).unwrap();
             assert_eq!(card, expected);

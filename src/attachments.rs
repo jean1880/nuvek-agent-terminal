@@ -60,8 +60,10 @@ fn stage_blocking(source: Source) -> Result<Staged, String> {
         blob_store().ok_or_else(|| "There is no data folder to keep images in.".to_owned())?;
     let normalised = match source {
         Source::File(path) => store.ingest_path(&path, Origin::User),
+        // Its pixels as they are, never through an encoded file whose size would be capped.
         Source::Texture(texture) => {
-            store.ingest_bytes(&texture.save_to_png_bytes(), None, Origin::User)
+            let (width, height, rgba) = texture_rgba(&texture);
+            store.ingest_rgba(width, height, rgba, None, Origin::User)
         }
     }
     .map_err(|e| e.to_string())?;
@@ -73,6 +75,26 @@ fn stage_blocking(source: Source) -> Result<Staged, String> {
         meta: normalised.meta,
         path: path.to_string_lossy().into_owned(),
     })
+}
+
+/// `texture`'s pixels as straight RGBA, rows packed: its width, height and bytes.
+fn texture_rgba(texture: &gdk::Texture) -> (u32, u32, Vec<u8>) {
+    let width = u32::try_from(texture.width()).unwrap_or(0);
+    let height = u32::try_from(texture.height()).unwrap_or(0);
+    let mut downloader = gdk::TextureDownloader::new(texture);
+    downloader.set_format(gdk::MemoryFormat::R8g8b8a8);
+    let (bytes, stride) = downloader.download_bytes();
+    let row = width as usize * 4;
+    let rgba = if stride == row {
+        bytes.to_vec()
+    } else {
+        bytes
+            .chunks(stride.max(1))
+            .take(height as usize)
+            .flat_map(|line| line.get(..row).unwrap_or(line).iter().copied())
+            .collect()
+    };
+    (width, height, rgba)
 }
 
 /// Stores an image an agent's tool handed back ([`agent_core::event::Event::ToolImage`]) and

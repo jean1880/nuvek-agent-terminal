@@ -155,13 +155,38 @@ pub fn normalise(
     ) {
         return Err(AttachError::NotAnImage);
     }
-    let ((width, height), bytes, mime) = {
-        let _slot = DecodeSlot::take();
-        let image = fit(decode(input, format)?);
-        let size = (image.width(), image.height());
-        let (bytes, mime) = encode(image)?;
-        (size, bytes, mime)
-    };
+    let _slot = DecodeSlot::take();
+    finish(decode(input, format)?, name, origin)
+}
+
+/// [`normalise`] for pixels the app already holds decoded (a pasted or dropped image): `rgba` is
+/// `width`×`height` RGBA, rows packed. Nothing is decoded, so the encoded-size cap does not
+/// apply; the side cap does.
+pub fn normalise_rgba(
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+    name: Option<&str>,
+    origin: Origin,
+) -> Result<Normalised, AttachError> {
+    if width > MAX_SIDE || height > MAX_SIDE {
+        return Err(AttachError::TooLargeToOpen);
+    }
+    let image = image::RgbaImage::from_raw(width, height, rgba)
+        .ok_or_else(|| AttachError::Unreadable("the pixels do not match the size".to_owned()))?;
+    let _slot = DecodeSlot::take();
+    finish(DynamicImage::ImageRgba8(image), name, origin)
+}
+
+/// Fits `image` to [`MAX_EDGE`], encodes it and names it by its bytes.
+fn finish(
+    image: DynamicImage,
+    name: Option<&str>,
+    origin: Origin,
+) -> Result<Normalised, AttachError> {
+    let image = fit(image);
+    let (width, height) = (image.width(), image.height());
+    let (bytes, mime) = encode(image)?;
     let id = hex_sha256(&bytes);
     Ok(Normalised {
         meta: AttachmentRef {
@@ -490,6 +515,21 @@ impl BlobStore {
         Ok(n)
     }
 
+    /// [`normalise_rgba`] then [`Self::put`]: an image the app holds as pixels.
+    pub fn ingest_rgba(
+        &self,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+        name: Option<&str>,
+        origin: Origin,
+    ) -> Result<Normalised, AttachError> {
+        let n = normalise_rgba(width, height, rgba, name, origin)?;
+        self.put(&n)
+            .map_err(|e| AttachError::NotSaved(e.to_string()))?;
+        Ok(n)
+    }
+
     /// Removes every blob not in `referenced` (ids) and older than `grace`, and this module's
     /// temp files older than `grace`. Only names the store writes are looked at, only regular
     /// files (never a link, never a folder), and only in the folder itself.
@@ -779,6 +819,24 @@ mod tests {
         assert_eq!((small.meta.width, small.meta.height), (30, 20));
         assert_eq!(small.meta.origin, Origin::ToolResult);
         assert_eq!(small.meta.name, None);
+    }
+
+    /// Pixels the app already holds (a paste) are fitted and encoded with no encoded-size cap;
+    /// a mismatched buffer and an over-wide image are refused.
+    #[test]
+    fn pasted_pixels_are_fitted_and_encoded_without_a_file_cap() {
+        let rgba = vec![200u8; 4096 * 1024 * 4];
+        let n = normalise_rgba(4096, 1024, rgba, None, Origin::User).expect("pixels");
+        assert_eq!((n.meta.width, n.meta.height), (2048, 512));
+        assert_eq!(n.meta.id, hex_sha256(&n.bytes));
+        assert!(matches!(
+            normalise_rgba(10, 10, vec![0; 12], None, Origin::User),
+            Err(AttachError::Unreadable(_))
+        ));
+        assert!(matches!(
+            normalise_rgba(MAX_SIDE + 1, 1, Vec::new(), None, Origin::User),
+            Err(AttachError::TooLargeToOpen)
+        ));
     }
 
     #[test]

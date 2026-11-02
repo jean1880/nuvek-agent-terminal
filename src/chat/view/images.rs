@@ -308,7 +308,14 @@ fn context_menu(
     let unmapped = from.connect_unmap(glib::clone!(
         #[weak]
         popover,
-        move |_| popover.popdown()
+        move |_| {
+            popover.popdown();
+            // At once: a tile removed by a rebuild is disposed in the same call, and must not
+            // still hold its menu then.
+            if popover.parent().is_some() {
+                popover.unparent();
+            }
+        }
     ));
     let handler = RefCell::new(Some(unmapped));
     popover.connect_closed(glib::clone!(

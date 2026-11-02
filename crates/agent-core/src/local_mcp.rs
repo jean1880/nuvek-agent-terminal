@@ -19,7 +19,11 @@ pub const APPROVAL_OPTIONS: [crate::event::Decision; 4] = [
 pub fn revision(value: &impl Serialize) -> Result<String, &'static str> {
     use sha2::{Digest, Sha256};
     let bytes = serde_json::to_vec(value).map_err(|_| "Could not fingerprint MCP metadata.")?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    // Lowercase hex, byte by byte: the digest type stopped formatting itself as hex in sha2 0.11.
+    Ok(Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 pub fn alias(server: &str, name: &str) -> Result<String, &'static str> {

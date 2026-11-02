@@ -232,7 +232,19 @@ impl ModelRow {
             .await
             .unwrap_or_else(|_| Err("The tags could not be moved".into()));
             match moved {
-                Ok(_) => this.every.set(every),
+                Ok(_) => {
+                    this.every.set(every);
+                    // A toggle made while the move ran must not leave the switch on the old
+                    // state: it shows what the row now writes.
+                    if let Some(switch) = this
+                        .every_switch
+                        .borrow()
+                        .as_ref()
+                        .and_then(|s| s.upgrade())
+                    {
+                        switch.set_active(every);
+                    }
+                }
                 Err(why) => {
                     this.toast(&why);
                     if let Some(switch) = this

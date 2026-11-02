@@ -166,7 +166,7 @@ impl FileLock {
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
             .open(path)?;
         use std::os::fd::AsRawFd;
         // SAFETY: flock on a descriptor this struct owns.
@@ -231,6 +231,16 @@ mod tests {
         );
         let (_, again) = open_regular(&path).expect("open");
         assert_eq!(second, again);
+    }
+
+    #[test]
+    fn a_lock_file_that_is_a_link_is_refused_not_followed() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let (target, lock) = (dir.path().join("elsewhere"), dir.path().join("n.lock"));
+        std::fs::write(&target, "keep").expect("write");
+        std::os::unix::fs::symlink(&target, &lock).expect("link");
+        assert!(FileLock::take(&lock).is_err());
+        assert_eq!(std::fs::read_to_string(&target).expect("read"), "keep");
     }
 
     #[test]

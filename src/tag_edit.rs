@@ -95,7 +95,7 @@ pub fn rescope(
     from: Target<'_>,
     to: Target<'_>,
 ) -> Result<bool, String> {
-    if !path.exists() {
+    if from == to || !path.exists() {
         return Ok(false);
     }
     agent_kit::user_tags_file::update(path, |doc| {
@@ -242,6 +242,13 @@ mod tests {
             }
         )
         .is_none());
+        // Moving to where it already is changes nothing (and never deletes the entry).
+        assert_eq!(
+            rescope(&path, &tags(), local("m", None), local("m", None)),
+            Ok(false)
+        );
+        let doc = agent_kit::user_tags_file::load(&path).expect("load");
+        assert!(user_tags::find(&doc, "m", Some(Driver::Local)).is_some());
         // A refused move (a bad profile id) leaves the entry where it was.
         let long = "p".repeat(65);
         assert!(rescope(&path, &tags(), local("m", None), local("m", Some(&long))).is_err());

@@ -527,7 +527,8 @@ Architectural mandates, standards, and workflows for this codebase.
   model's profile over an unscoped one). The app alone writes the user's file, atomically and
   `0600` (`agent_kit::user_tags_file`, edits in `agent_core::user_tags`), only from Settings →
   Agents → Model Tags and `agent-terminal tags`, and `uninstall` lists it (`Inputs::user_tag_files`).
-  Agents get no tool to change tags: one must not re-tag itself to steer routing. The built-in
+  No agent tool changes tags (the delegation tools only read them); the file is the user's, so
+  any process with the user's shell can still run the command or edit it. The built-in
   list names no local model. Capabilities report each profile's `cost`
   (`config::profile_is_free`; a free one reports usage `ok`, load 0) and each model's
   `tags_source`.

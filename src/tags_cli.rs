@@ -8,8 +8,9 @@
 //! agent-terminal tags unset <model> [--driver D] [--profile P]
 //! ```
 //!
-//! It writes only the user's tag file. Agents have no tool for this on purpose: an agent must not
-//! re-tag itself to steer routing.
+//! It writes only the user's tag file. No agent tool changes tags (the delegation tools only read
+//! them); the file is the user's, so any process with the user's shell can still run this command
+//! or edit the file.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -31,7 +32,7 @@ const USAGE: &str = "usage:
 
 A model is its exact id. --driver is claude, agy, codex or local; --profile is a profile id or
 name (a profile scopes the entry to its server and implies its driver). Only the user's tag file
-is written.";
+is written. No agent tool changes tags, but any process with your shell can run this command.";
 
 /// The files a run reads and writes.
 pub struct Paths<'a> {

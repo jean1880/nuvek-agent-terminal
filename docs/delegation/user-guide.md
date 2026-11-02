@@ -37,8 +37,9 @@ Capabilities also helps a parent choose. Each model can carry tags (what it is g
 for), a tier and an effort per task tier, from your own tag file, a shared one and the
 built-in tags, in that order (see Model tags in the configuration guide). Each model
 reports `tags_source`: `user`, `file`, `built_in`, or null when it has none. Edit your tags
-in Settings → Agents → Model Tags or with `agent-terminal tags`. Agents have no tool to
-change tags, on purpose: an agent must not re-tag itself to steer which agent gets work.
+in Settings → Agents → Model Tags or with `agent-terminal tags`. No agent tool changes
+tags (the delegation tools only read them), but the file is yours: any process with your
+shell access can still run that command or edit the file.
 
 Each profile reports its `cost`: `free` for a model server you run and marked **Free to
 Run** (Ollama and LM Studio by default), `metered` for a vendor's agent or a gateway. A

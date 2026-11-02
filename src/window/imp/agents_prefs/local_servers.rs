@@ -468,7 +468,9 @@ impl AgentTerminalWindow {
             move |r| {
                 if !free_quiet.get() {
                     let on = r.is_active();
-                    obj.imp().edit_server(&id, |p| p.free_to_run = Some(on));
+                    obj.imp().edit_server(&id, |p| {
+                        p.free_to_run = crate::config::free_to_run_choice(p, Driver::Local, on);
+                    });
                 }
             }
         ));

@@ -357,7 +357,8 @@ agent-terminal tags unset <model> [--driver D] [--profile P]
 `--profile` takes a profile id or name and implies its driver. `set` changes only the
 fields given (a new entry starts from the tags the model has now) and prints the result;
 it exits non-zero with a message on an unknown tag or tier. `unset` removes your entry.
-Only your file is written.
+Only your file is written. No agent tool changes tags, but any process with your shell
+access can run this command or edit the file.
 
 ### Claude and Codex on a model server
 

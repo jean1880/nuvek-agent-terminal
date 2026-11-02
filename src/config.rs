@@ -304,6 +304,17 @@ pub fn profile_is_free(profile: &Profile, driver: agent_core::adapter::Driver) -
     })
 }
 
+/// What to store in [`Profile::free_to_run`] when the user picks `on`: nothing when that is what
+/// the server's kind already says, so the switch keeps following the kind.
+pub fn free_to_run_choice(
+    profile: &Profile,
+    driver: agent_core::adapter::Driver,
+    on: bool,
+) -> Option<bool> {
+    let default = profile_provider(profile, driver).is_some_and(|s| s.kind.free_by_default());
+    (on != default).then_some(on)
+}
+
 /// Picks the agent for a new chat thread.
 ///
 /// In order: the explicit "default agent" choice, the default profile's agent
@@ -2560,6 +2571,20 @@ mod tests {
         assert!(!profile_is_free(&Profile::default(), Driver::Codex));
         // A Local profile with no server recorded runs on the default one here.
         assert!(profile_is_free(&Profile::default(), Driver::Local));
+
+        // The switch stores a choice only when it differs from what the kind says.
+        let ollama = on(ProviderKind::Ollama, None);
+        assert_eq!(free_to_run_choice(&ollama, Driver::Local, true), None);
+        assert_eq!(
+            free_to_run_choice(&ollama, Driver::Local, false),
+            Some(false)
+        );
+        let gateway = on(ProviderKind::LiteLlm, None);
+        assert_eq!(free_to_run_choice(&gateway, Driver::Local, false), None);
+        assert_eq!(
+            free_to_run_choice(&gateway, Driver::Local, true),
+            Some(true)
+        );
 
         // A set value survives a save and load; a duplicate keeps it.
         let set = on(ProviderKind::LiteLlm, Some(true));

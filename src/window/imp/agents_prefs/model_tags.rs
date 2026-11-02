@@ -20,7 +20,7 @@ use crate::tag_edit::{self, Effective, Target};
 
 const GROUP_HELP: &str = "The tier, tags and best-for note other agents see for each model when \
 they choose a sub-agent. What you set here is saved in your own tag file and wins over the shared \
-tag file and the built-in tags; Reset puts the model back under them. Agents cannot change these.";
+tag file and the built-in tags; Reset puts the model back under them. No agent tool changes tags; the file is yours.";
 const BEST_FOR_HELP: &str = "A short note on what this model is best for";
 const EVERY_SERVER_HELP: &str = "On: the same model on any Local server gets these tags. Off: \
 only this server's copy does (the same model can suit a large and a small card differently).";
@@ -45,6 +45,15 @@ pub(super) fn summary(effective: Option<&Effective>) -> String {
         "{} · {tags} · {source}",
         e.tier.as_deref().unwrap_or("no tier")
     )
+}
+
+/// The text under a profile's name: its agent and how many models are known.
+pub(super) fn profile_subtitle(agent: &str, models: usize) -> String {
+    match models {
+        0 => format!("{agent} · no model list yet"),
+        1 => format!("{agent} · 1 model"),
+        n => format!("{agent} · {n} models"),
+    }
 }
 
 /// Why `text` cannot be a best-for note.
@@ -87,6 +96,8 @@ struct ModelRow {
     driver: Driver,
     profile_id: String,
     every: Cell<bool>,
+    /// The "Apply to Every Server" switch of a Local row, to put back when a move is refused.
+    every_switch: RefCell<Option<glib::WeakRef<adw::SwitchRow>>>,
     /// Set while code moves a widget: its handler then does nothing.
     quiet: Cell<bool>,
     saved_best_for: RefCell<String>,
@@ -201,42 +212,38 @@ impl ModelRow {
     }
 
     /// Moves the user's entry between "this server" and "every server": written at the new
-    /// scope, then removed from the old one.
+    /// scope, and removed from the old one, in one write. The row's scope changes only once the
+    /// write succeeded; a refusal puts the switch back.
     fn rescope(self: &Rc<Self>, every: bool) {
         let before = self.owned();
-        self.every.set(every);
-        let after = self.owned();
+        let after = Owned {
+            profile: scope_profile(self.driver, every, &self.profile_id),
+            ..before.clone()
+        };
         let Some((file, user)) = self.files() else {
             return;
         };
         let this = self.clone();
         glib::MainContext::default().spawn_local(async move {
-            let moved = gio::spawn_blocking(move || -> Result<(), String> {
+            let moved = gio::spawn_blocking(move || {
                 let tags = load_now(&file, &user).tags.unwrap_or_default();
-                let Some(entry) = agent_kit::user_tags_file::load(&user).ok().and_then(|doc| {
-                    agent_core::user_tags::find(
-                        &doc,
-                        &before.id,
-                        agent_core::user_tags::Scope {
-                            driver: Some(before.driver),
-                            profile: before.profile.as_deref(),
-                        },
-                    )
-                }) else {
-                    return Ok(());
-                };
-                let edit = Edit {
-                    tier: entry.tier,
-                    tags: Some(entry.tags),
-                    best_for: entry.best_for,
-                };
-                tag_edit::set(&user, &tags, after.target(), &edit)?;
-                tag_edit::reset(&user, before.target()).map(|_| ())
+                tag_edit::rescope(&user, &tags, before.target(), after.target())
             })
             .await
             .unwrap_or_else(|_| Err("The tags could not be moved".into()));
-            if let Err(why) = moved {
-                this.toast(&why);
+            match moved {
+                Ok(_) => this.every.set(every),
+                Err(why) => {
+                    this.toast(&why);
+                    if let Some(switch) = this
+                        .every_switch
+                        .borrow()
+                        .as_ref()
+                        .and_then(|s| s.upgrade())
+                    {
+                        switch.set_active(this.every.get());
+                    }
+                }
             }
             this.reload();
         });
@@ -300,26 +307,24 @@ impl AgentTerminalWindow {
                             group.remove(&row);
                         }
                         let timer = obj.imp().agent_edit_timer(&dialog);
-                        if listed.iter().all(|(_, models)| models.is_empty()) {
+                        if listed.is_empty() {
                             let empty = adw::ActionRow::builder()
-                                .title("No models listed yet")
-                                .subtitle(
-                                    "Models appear once an agent or server has listed them; \
-                                     use the refresh button after a scan",
-                                )
+                                .title("No agents enabled")
+                                .subtitle("Enable an agent or add a server above")
                                 .build();
                             group.add(&empty);
                             rows.borrow_mut().push(empty.upcast());
                         }
+                        // Every enabled profile is listed, one whose models are not known yet
+                        // included: it says so rather than being left out.
                         for (profile, models) in &listed {
-                            if models.is_empty() {
-                                continue;
-                            }
-                            let expander = obj
+                            for widget in obj
                                 .imp()
-                                .model_tag_profile_row(profile, models, &tags, &timer, &dialog);
-                            group.add(&expander);
-                            rows.borrow_mut().push(expander.upcast());
+                                .model_tag_profile_row(profile, models, &tags, &timer, &dialog)
+                            {
+                                group.add(&widget);
+                                rows.borrow_mut().push(widget);
+                            }
                         }
                     }
                 ));
@@ -357,23 +362,33 @@ impl AgentTerminalWindow {
         tags: &agent_core::model_tags::ModelTags,
         timer: &Rc<EditDebounce>,
         _dialog: &adw::PreferencesDialog,
-    ) -> adw::ExpanderRow {
+    ) -> Vec<gtk4::Widget> {
         let driver = crate::config::profile_driver(profile).unwrap_or(Driver::Claude);
-        let expander = adw::ExpanderRow::builder()
+        // A plain header row, then the models as rows of the group itself: an expander inside an
+        // expander draws its arrow open while closed (libadwaita 1.5 styles every descendant by
+        // the outer one's state).
+        let header = adw::ActionRow::builder()
             .title(&profile.name)
-            .subtitle(format!(
-                "{} · {} model{}",
-                driver.info().long_label,
-                models.len(),
-                if models.len() == 1 { "" } else { "s" }
-            ))
+            .subtitle(profile_subtitle(driver.info().long_label, models.len()))
             .use_markup(false)
+            .css_classes(["heading"])
             .build();
+        let mut out: Vec<gtk4::Widget> = vec![header.upcast()];
+        if models.is_empty() {
+            let none = adw::ActionRow::builder()
+                .title("No model list yet")
+                .subtitle(
+                    "It appears once the agent or server has listed its models; \
+                     use the refresh button above to look again",
+                )
+                .build();
+            out.push(none.upcast());
+        }
         for model in models {
             let row = self.model_tag_row(profile, driver, model, tags, timer);
-            expander.add_row(&row.row);
+            out.push(row.row.clone().upcast());
         }
-        expander
+        out
     }
 
     fn model_tag_row(
@@ -458,6 +473,7 @@ impl AgentTerminalWindow {
                 seen.as_ref()
                     .is_some_and(|e| e.source == TagSource::User && !e.scoped),
             ),
+            every_switch: RefCell::new(None),
             quiet: Cell::new(false),
             saved_best_for: RefCell::default(),
             row: row.clone(),
@@ -548,6 +564,7 @@ impl AgentTerminalWindow {
                     }
                 }
             ));
+            *state.every_switch.borrow_mut() = Some(every.downgrade());
             row.add_row(&every);
         }
 
@@ -609,6 +626,13 @@ mod tests {
             ..effective(TagSource::User, false)
         };
         assert_eq!(summary(Some(&bare)), "no tier · no tags · yours");
+    }
+
+    #[test]
+    fn a_profile_without_a_model_list_says_so() {
+        assert_eq!(profile_subtitle("Claude", 0), "Claude · no model list yet");
+        assert_eq!(profile_subtitle("Claude", 1), "Claude · 1 model");
+        assert_eq!(profile_subtitle("Ollama", 12), "Ollama · 12 models");
     }
 
     #[test]

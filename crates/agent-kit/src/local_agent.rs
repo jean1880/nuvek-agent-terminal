@@ -16,13 +16,14 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::Duration;
 
 use agent_core::adapter::{Command, Mode};
+use agent_core::attachment::{AttachmentRef, PromptAttachment, ToolImageSource};
 use agent_core::event::{
     Decision, Envelope, Event, ItemKind, ItemStatus, ReasoningLabel, ReasoningState,
     ResponseCapability, StreamKind, TurnState, Usage,
 };
 use agent_core::local_agent::{
-    error_message, gate, refuses_tools, tools_for, ChatMessage, Gate, RunnerArgs, StreamEvent,
-    StreamReader, Tool, ToolCall, APPROVAL_OPTIONS,
+    error_message, gate, refuses_images, refuses_tools, tools_for, ChatMessage, Gate, MessageImage,
+    RunnerArgs, StreamEvent, StreamReader, Tool, ToolCall, APPROVAL_OPTIONS,
 };
 use agent_core::local_context::{exchange_starts, ContextBudget, RequestPlan};
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,7 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(600);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The most a reply may hold in all, and in one line: a server cannot make the runner hold more.
+/// A reply never echoes the request, so the images a request carries do not bear on either.
 const MAX_REPLY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_LINE_BYTES: u64 = 4 * 1024 * 1024;
 /// The longest a reply may go without a line before it counts as stalled.
@@ -290,10 +292,12 @@ pub fn read_commands(input: impl std::io::Read + Send + 'static) -> Receiver<Run
         let mut reader = std::io::BufReader::new(input);
         loop {
             let mut bytes = Vec::new();
-            // Includes startup configuration; oversized or unterminated frames end the input.
+            // Includes startup configuration (bounded again, tighter, by its validation);
+            // oversized or unterminated frames end the input. The cap fits a prompt with the
+            // most images a message may carry at their largest (`MAX_COMMAND_BYTES`).
             let count = match std::io::Read::take(
                 &mut reader,
-                agent_core::local_context::MAX_SETUP_BYTES as u64 + 1,
+                agent_core::local_context::MAX_COMMAND_BYTES as u64 + 1,
             )
             .read_until(b'\n', &mut bytes)
             {
@@ -306,9 +310,9 @@ pub fn read_commands(input: impl std::io::Read + Send + 'static) -> Receiver<Run
             if count == 0 {
                 break;
             }
-            if count > agent_core::local_context::MAX_SETUP_BYTES {
+            if count > agent_core::local_context::MAX_COMMAND_BYTES {
                 let _ = tx.send(RunnerInput::Invalid(
-                    "Local command exceeds the startup frame limit.",
+                    "Local command exceeds the command frame limit.",
                 ));
                 return;
             }
@@ -383,6 +387,14 @@ pub struct Runner<C: ChatClient, W: Write> {
     next_id: u64,
     /// The current model cannot take tools: it goes without them until the model changes.
     no_tools: bool,
+    /// The current model refused images: earlier ones go as placeholders, and a prompt with
+    /// images is refused, until the model changes.
+    no_images: bool,
+    /// The last request was refused for its images and can go again without them.
+    replan: bool,
+    /// Replayed images read back from their blobs this turn (by id and path), so each is read
+    /// once a turn; `None` for one that could not be. Emptied when the turn ends.
+    image_cache: std::collections::HashMap<(String, String), Option<String>>,
     /// What the model is told of a built-in call a Stop ended while it ran: it did start.
     stopped_result: Option<String>,
     /// The thread's folder, opened when the session starts: every write and command is
@@ -427,6 +439,9 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             generation: new_session_id()[..8].to_owned(),
             next_id: 0,
             no_tools: false,
+            no_images: false,
+            replan: false,
+            image_cache: Default::default(),
             stopped_result: None,
             workspace: None,
         }
@@ -474,6 +489,18 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             // A closed stdout means the app is gone; the next read of stdin ends the run.
             let _ = writeln!(self.out, "{line}");
             let _ = self.out.flush();
+        }
+    }
+
+    /// An image a tool call's result showed (`item` is the call's). Emitted without credential
+    /// masking, which would corrupt its base64: it is binary content the server produced, shown
+    /// only to the user (`agent_core::local_mcp::scrub_outside_image_data`). The runner never
+    /// keeps it; the app stores it and puts refs in its place.
+    fn emit_tool_image(&mut self, item: &str, image: ToolImageSource) {
+        if let Ok(value) =
+            serde_json::to_value(Envelope::new(Event::ToolImage { image }).item(item))
+        {
+            self.emit_value(value);
         }
     }
 
@@ -680,14 +707,15 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
 
     fn handle(&mut self, command: Command, commands: &Receiver<RunnerInput>) -> Result<(), Stop> {
         match command {
-            Command::Prompt { text, .. } => self.turn(text, commands),
+            Command::Prompt { text, attachments } => self.turn(text, attachments, commands),
             Command::Interrupt => {
                 self.stop_mcp();
                 Ok(())
             }
             Command::SetModel { model, .. } => {
-                // Another model may take tools: it is offered them again.
+                // Another model may take tools and images: it is offered them again.
                 self.no_tools = false;
+                self.no_images = false;
                 self.model = Some(model.clone());
                 self.emit(Envelope::new(Event::ModelChanged { model }));
                 Ok(())
@@ -942,8 +970,14 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
     }
 
     /// One turn: the prompt, then model requests and tool calls until the model answers.
-    fn turn(&mut self, text: String, commands: &Receiver<RunnerInput>) -> Result<(), Stop> {
+    fn turn(
+        &mut self,
+        text: String,
+        attachments: Vec<PromptAttachment>,
+        commands: &Receiver<RunnerInput>,
+    ) -> Result<(), Stop> {
         self.budget_notice_sent = false;
+        self.image_cache.clear();
         let Some(model) = self.model.clone() else {
             self.emit(Envelope::new(Event::TurnStarted { model: None }));
             self.emit(Envelope::turn_completed(
@@ -955,6 +989,13 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         self.emit(Envelope::new(Event::TurnStarted {
             model: Some(model.clone()),
         }));
+        let images = match self.prompt_images(attachments) {
+            Ok(images) => images,
+            Err(why) => {
+                self.emit(Envelope::turn_completed(TurnState::Failed, Some(&why)));
+                return Ok(());
+            }
+        };
         self.turn_instructions = match crate::local_instructions::discover(
             &self.context.instructions,
             Path::new(&self.args.cwd),
@@ -991,7 +1032,10 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         // Earlier turns' reasoning is not sent again.
         agent_core::local_agent::forget_reasoning(&mut self.messages);
         let exchange_start = self.messages.len();
-        self.messages.push(ChatMessage::new("user", text));
+        self.messages.push(ChatMessage {
+            images,
+            ..ChatMessage::new("user", text)
+        });
         let mut usage = Usage::default();
         let mut result = Ok(());
         let mut failure = None;
@@ -1018,6 +1062,9 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             }
         }
         self.save();
+        // The bytes stay in their blobs: a later request reads them back.
+        agent_core::local_agent::forget_image_data(&mut self.messages);
+        self.image_cache.clear();
         let usage = (usage.input_tokens + usage.output_tokens > 0).then_some(usage);
         let (state, error) = match (&result, failure) {
             (Err(Stop::InvalidInput(why)), _) => (TurnState::Failed, Some((*why).into())),
@@ -1038,6 +1085,106 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             Err(Stop::Interrupted) => Ok(()),
             other => other,
         }
+    }
+
+    /// A prompt's attachments as the user message's images, each with its bytes for this turn:
+    /// the base64 the app sent, or (when it sent none) its blob read back. A malformed one
+    /// fails the turn, saying which; it is never sent as text alone.
+    fn prompt_images(
+        &self,
+        attachments: Vec<PromptAttachment>,
+    ) -> Result<Vec<MessageImage>, String> {
+        use agent_core::attachment::MAX_PER_MESSAGE;
+        use agent_core::local_context::MAX_PROMPT_IMAGE_BYTES;
+        if attachments.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.no_images {
+            return Err(
+                "This model does not take images (its server refused them). Pick a \
+                        model that supports images, or send the message without them."
+                    .to_owned(),
+            );
+        }
+        if attachments.len() > MAX_PER_MESSAGE {
+            return Err(format!(
+                "A message can carry at most {MAX_PER_MESSAGE} images."
+            ));
+        }
+        let mut images = Vec::with_capacity(attachments.len());
+        for attachment in attachments {
+            let PromptAttachment {
+                meta,
+                path,
+                data_base64,
+            } = attachment;
+            let label = meta.placeholder();
+            if meta.file_name().is_none() {
+                return Err(format!("{label} is not a stored PNG or JPEG image."));
+            }
+            let data = if data_base64.is_empty() {
+                read_blob(&meta, &path).ok_or_else(|| format!("{label} could not be read."))?
+            } else {
+                match agent_core::local_agent::base64_decoded_len(&data_base64) {
+                    Some(n) if n as u64 == meta.bytes && n <= MAX_PROMPT_IMAGE_BYTES => data_base64,
+                    _ => {
+                        return Err(format!(
+                            "{label} is not the stored image it names (its data is not base64 \
+                             of its size, or it is over the size limit)."
+                        ))
+                    }
+                }
+            };
+            // A path that is not the blob the ref names is not kept: the image is then sent
+            // this turn only, and as its placeholder afterwards.
+            let path = if blob_path_matches(&meta, &path) {
+                path
+            } else {
+                String::new()
+            };
+            images.push(MessageImage {
+                meta,
+                path,
+                data_base64: Some(data),
+            });
+        }
+        Ok(images)
+    }
+
+    /// Plans the next request ([`agent_core::local_context::plan_request_with`]) over the
+    /// conversation: replayed images are read back from their blobs (once a turn), and with
+    /// [`Self::no_images`] every image goes as its placeholder.
+    fn plan(
+        &mut self,
+        model: &str,
+        system: &str,
+        candidates: &[agent_core::local_context::SchemaCandidate],
+    ) -> Result<RequestPlan, String> {
+        let stripped: Vec<ChatMessage>;
+        let history: &[ChatMessage] = if self.no_images {
+            stripped = self
+                .messages
+                .iter()
+                .map(ChatMessage::without_images)
+                .collect();
+            &stripped
+        } else {
+            &self.messages
+        };
+        let cache = &mut self.image_cache;
+        agent_core::local_context::plan_request_with(
+            model,
+            system,
+            candidates,
+            history,
+            &self.context.budget,
+            &mut |image| {
+                cache
+                    .entry((image.meta.id.clone(), image.path.clone()))
+                    .or_insert_with(|| read_blob(&image.meta, &image.path))
+                    .clone()
+            },
+        )
     }
 
     fn prepare_mcp(&mut self, commands: &Receiver<RunnerInput>) -> Result<(), StepError> {
@@ -1121,7 +1268,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         usage: &mut Usage,
     ) -> Result<StepEnd, StepError> {
         use agent_core::local_context::{
-            bound_result, compose_system, plan_request, reserve_batch_for_any_mode, SchemaCandidate,
+            bound_result, compose_system, reserve_batch_for_any_mode, SchemaCandidate,
         };
         let mut candidates: Vec<_> = if self.no_tools {
             Vec::new()
@@ -1156,14 +1303,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             &self.turn_instructions,
             !self.no_tools,
         );
-        let plan = plan_request(
-            model,
-            &system,
-            &candidates,
-            &self.messages,
-            &self.context.budget,
-        )
-        .map_err(|why| {
+        let plan = self.plan(model, &system, &candidates).map_err(|why| {
             StepError::Failed(format!(
                 "{why}\n{}",
                 self.turn_instructions.sources_summary()
@@ -1171,7 +1311,13 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         })?;
         self.report_budget(&plan);
         let body = plan.body;
-        let (reply, ended, stopped) = self.stream(model, &body, commands, usage)?;
+        let streamed = self.stream(model, &body, commands, usage);
+        drop(body);
+        if streamed.is_err() && std::mem::take(&mut self.replan) {
+            // Refused for earlier images only: the next request sends their placeholders.
+            return Ok(StepEnd::Continue);
+        }
+        let (reply, ended, stopped) = streamed?;
         // A call runs only from a reply that ended as the server meant it to: one the output
         // limit cut off, or that broke off before its end, may hold a half-written call.
         let complete = ended && reply.finish_reason.as_deref() != Some("length");
@@ -1375,16 +1521,25 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                     &self.turn_instructions,
                     false,
                 );
-                let retry = agent_core::local_context::plan_request(
-                    model,
-                    &system,
-                    &[],
-                    &self.messages,
-                    &self.context.budget,
-                )
-                .map_err(StepError::Failed)?;
+                let retry = self.plan(model, &system, &[]).map_err(StepError::Failed)?;
                 self.report_budget(&retry);
                 return self.stream(model, &retry.body, commands, usage);
+            }
+            if !self.no_images && sends_images(body) && refuses_images(&why) {
+                // Until the model changes, images go as placeholders and a prompt with images
+                // is refused. A request whose own message carries images fails with the
+                // server's words; one refused only for earlier images goes again without them.
+                self.no_images = true;
+                let current = exchange_starts(&self.messages).last().copied().unwrap_or(0);
+                if self.messages[current..].iter().all(|m| m.images.is_empty()) {
+                    self.replan = true;
+                    self.emit(Envelope::new(Event::Notice {
+                        text: "This model does not take images, so the conversation's earlier \
+                               images are sent as placeholders. Pick a model that supports \
+                               images to send them."
+                            .to_owned(),
+                    }));
+                }
             }
             return Err(StepError::Failed(provider_failure(
                 &why,
@@ -1934,6 +2089,15 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             }
             match response.recv_timeout(Duration::from_millis(20)) {
                 Ok(Ok(mut value)) => {
+                    // Images are shown to the user, the model reads a placeholder for each,
+                    // and no base64 is left for masking, the model or the transcript.
+                    let images = agent_core::local_mcp::take_images(
+                        &mut value,
+                        agent_core::attachment::MAX_PER_ITEM,
+                    );
+                    for image in images.images {
+                        self.emit_tool_image(&item, image);
+                    }
                     // The call ran: a key that must be masked is masked in the record, never
                     // a reason to report a completed call as failed (the model would retry it).
                     self.masks.value_lossy(&mut value);
@@ -2180,6 +2344,59 @@ fn poll(
             Err(TryRecvError::Empty) => return None,
         }
     }
+}
+
+/// The largest blob read back for a replayed image.
+const MAX_BLOB_BYTES: u64 = 20 * 1024 * 1024;
+
+/// Whether `path` can be the stored blob `meta` names: absolute, and its file name exactly
+/// [`AttachmentRef::file_name`].
+fn blob_path_matches(meta: &AttachmentRef, path: &str) -> bool {
+    let path = Path::new(path);
+    meta.file_name().is_some_and(|name| {
+        path.is_absolute() && path.file_name().and_then(|n| n.to_str()) == Some(name.as_str())
+    })
+}
+
+/// A stored image's bytes as base64, read from the app's blob `path`: only a path naming the
+/// blob ([`blob_path_matches`]), opened without following a link or blocking, a regular file of
+/// at most [`MAX_BLOB_BYTES`] whose content is the image the ref names (its SHA-256 and size).
+/// `None` otherwise: the image is then sent as its placeholder, never an error.
+fn read_blob(meta: &AttachmentRef, path: &str) -> Option<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    if !blob_path_matches(meta, path) {
+        return None;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .ok()?;
+    let stat = file.metadata().ok()?;
+    if !stat.is_file() || stat.len() > MAX_BLOB_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    (&file)
+        .take(MAX_BLOB_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_BLOB_BYTES {
+        return None;
+    }
+    agent_core::local_agent::encode_stored_image(meta, &bytes)
+}
+
+/// Whether a request body sends an image.
+fn sends_images(body: &Value) -> bool {
+    body["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m["content"].as_array())
+        .flatten()
+        .any(|part| part["type"] == "image_url")
 }
 
 /// The text a message carries, in bytes: its content, its calls and its reasoning.
@@ -2608,6 +2825,217 @@ mod tests {
         }
     }
 
+    /// A stored image blob in `dir` and the attachment the app sends for it.
+    fn stored_image(dir: &Path, bytes: &[u8]) -> PromptAttachment {
+        let meta = AttachmentRef {
+            id: agent_core::local_agent::content_address(bytes),
+            kind: Default::default(),
+            mime: "image/png".into(),
+            width: 64,
+            height: 48,
+            bytes: bytes.len() as u64,
+            name: Some("shot.png".into()),
+            origin: Default::default(),
+        };
+        let path = dir.join(meta.file_name().unwrap());
+        std::fs::write(&path, bytes).unwrap();
+        PromptAttachment {
+            meta,
+            path: path.display().to_string(),
+            data_base64: agent_core::local_agent::base64_encode(bytes),
+        }
+    }
+
+    fn turn_end(run: &Run) -> (TurnState, Option<String>) {
+        run.wait_for(|env| completed(env).map(|(state, _, error)| (state, error)))
+    }
+
+    #[test]
+    fn a_prompt_with_images_sends_them_first_and_keeps_only_refs_on_disk() {
+        let work = tempfile::tempdir().unwrap();
+        let blobs = tempfile::tempdir().unwrap();
+        let image = stored_image(blobs.path(), b"\x89PNG first image bytes");
+        let data_url = image.data_url();
+        let script = Script::new(vec![
+            Ok(text(&["a cat"])),
+            Ok(text(&["still a cat"])),
+            Ok(text(&["no image now"])),
+        ]);
+        let run = start(
+            args(work.path(), Mode::Ask),
+            script.clone(),
+            work.path().join("state"),
+        );
+        run.send(Command::Prompt {
+            text: "what is this?".into(),
+            attachments: vec![image.clone()],
+        });
+        assert_eq!(turn_end(&run).0, TurnState::Completed);
+        let transcript = std::fs::read_to_string(work.path().join("state/s-1.json")).unwrap();
+        assert!(!transcript.contains(&image.data_base64));
+        assert!(transcript.contains(&image.meta.id) && transcript.contains(&image.path));
+        // Replayed from its blob into the next turn's request.
+        run.send(prompt("and now?"));
+        assert_eq!(turn_end(&run).0, TurnState::Completed);
+        // A blob that is gone is sent as its placeholder, never an error.
+        std::fs::remove_file(&image.path).unwrap();
+        run.send(prompt("and without it?"));
+        assert_eq!(turn_end(&run).0, TurnState::Completed);
+        run.finish();
+        let bodies = script.bodies();
+        let first = &bodies[0]["messages"][1]["content"];
+        assert_eq!(first[0]["image_url"]["url"], data_url.as_str());
+        assert_eq!(first[1], json!({"type": "text", "text": "what is this?"}));
+        assert_eq!(bodies[1]["messages"][1]["content"], *first);
+        assert_eq!(bodies[1]["messages"][3]["content"], "and now?");
+        assert_eq!(
+            bodies[2]["messages"][1]["content"][0],
+            json!({"type": "text", "text": "[image: shot.png]"})
+        );
+    }
+
+    #[test]
+    fn a_blob_is_read_back_only_when_it_is_the_image_its_ref_names() {
+        let blobs = tempfile::tempdir().unwrap();
+        let image = stored_image(blobs.path(), b"real bytes");
+        assert_eq!(
+            read_blob(&image.meta, &image.path).as_deref(),
+            Some(image.data_base64.as_str())
+        );
+        // Another name, a relative path, a link, a folder and changed content are refused.
+        let other = blobs.path().join("other.png");
+        std::fs::write(&other, b"real bytes").unwrap();
+        assert_eq!(read_blob(&image.meta, &other.display().to_string()), None);
+        assert_eq!(
+            read_blob(&image.meta, image.meta.file_name().as_deref().unwrap()),
+            None
+        );
+        let linked = tempfile::tempdir().unwrap();
+        let link = linked.path().join(image.meta.file_name().unwrap());
+        std::os::unix::fs::symlink(&image.path, &link).unwrap();
+        assert_eq!(read_blob(&image.meta, &link.display().to_string()), None);
+        let folder = tempfile::tempdir().unwrap();
+        let named = folder.path().join(image.meta.file_name().unwrap());
+        std::fs::create_dir(&named).unwrap();
+        assert_eq!(read_blob(&image.meta, &named.display().to_string()), None);
+        std::fs::write(&image.path, b"fake bytes").unwrap();
+        assert_eq!(read_blob(&image.meta, &image.path), None);
+    }
+
+    #[test]
+    fn a_malformed_attachment_fails_the_turn_and_sends_nothing() {
+        let work = tempfile::tempdir().unwrap();
+        let blobs = tempfile::tempdir().unwrap();
+        let script = Script::new(vec![]);
+        let run = start(
+            args(work.path(), Mode::Ask),
+            script.clone(),
+            work.path().join("state"),
+        );
+        let good = stored_image(blobs.path(), b"bytes");
+        let mut wrong_size = good.clone();
+        wrong_size.data_base64 = agent_core::local_agent::base64_encode(b"bytes!");
+        let mut bad_id = good.clone();
+        bad_id.meta.id = "../../etc/passwd".into();
+        for attachments in [
+            vec![wrong_size],
+            vec![bad_id],
+            vec![good.clone(); agent_core::attachment::MAX_PER_MESSAGE + 1],
+        ] {
+            run.send(Command::Prompt {
+                text: "look".into(),
+                attachments,
+            });
+            let (state, error) = turn_end(&run);
+            assert_eq!(state, TurnState::Failed);
+            assert!(error.is_some_and(|e| e.contains("image")));
+        }
+        run.finish();
+        assert!(script.bodies().is_empty());
+    }
+
+    #[test]
+    fn a_model_refusing_images_says_so_and_earlier_images_become_placeholders() {
+        let work = tempfile::tempdir().unwrap();
+        let blobs = tempfile::tempdir().unwrap();
+        let refusal = "The model server answered with HTTP 400: Multimodal data provided, but \
+                       model does not support multimodal requests.";
+        let script = Script::new(vec![
+            Ok(text(&["seen"])),
+            Err(refusal.into()),
+            Ok(text(&["answered without it"])),
+            Err(refusal.into()),
+        ]);
+        let run = start(
+            args(work.path(), Mode::Ask),
+            script.clone(),
+            work.path().join("state"),
+        );
+        let image = stored_image(blobs.path(), b"pixels");
+        run.send(Command::Prompt {
+            text: "look".into(),
+            attachments: vec![image.clone()],
+        });
+        assert_eq!(turn_end(&run).0, TurnState::Completed);
+        // The next model cannot take images: the earlier one goes as its placeholder.
+        run.send(Command::SetModel {
+            model: "text-only".into(),
+            effort: None,
+        });
+        run.send(prompt("and now?"));
+        assert_eq!(turn_end(&run).0, TurnState::Completed);
+        // A new image to a model known to refuse them is refused before any request.
+        run.send(Command::Prompt {
+            text: "this one?".into(),
+            attachments: vec![image.clone()],
+        });
+        let (state, error) = turn_end(&run);
+        assert_eq!(state, TurnState::Failed);
+        assert!(error.unwrap().contains("does not take images"));
+        // Another model is offered images again, and the server's own refusal is shown.
+        run.send(Command::SetModel {
+            model: "other".into(),
+            effort: None,
+        });
+        run.send(Command::Prompt {
+            text: "and this?".into(),
+            attachments: vec![image],
+        });
+        let (state, error) = turn_end(&run);
+        assert_eq!(state, TurnState::Failed);
+        assert!(error.unwrap().contains("Multimodal data provided"));
+        run.finish();
+        let bodies = script.bodies();
+        assert_eq!(bodies.len(), 4);
+        assert!(sends_images(&bodies[1]));
+        assert!(!sends_images(&bodies[2]));
+        assert_eq!(
+            bodies[2]["messages"][1]["content"],
+            "look\n[image: shot.png]"
+        );
+    }
+
+    #[test]
+    fn the_command_frame_fits_a_prompt_with_the_most_images_at_their_largest() {
+        use agent_core::attachment::MAX_PER_MESSAGE;
+        use agent_core::local_context::{MAX_COMMAND_BYTES, MAX_PROMPT_IMAGE_BYTES};
+        let blobs = tempfile::tempdir().unwrap();
+        let mut image = stored_image(blobs.path(), b"x");
+        image.meta.bytes = MAX_PROMPT_IMAGE_BYTES as u64;
+        image.data_base64 = "A".repeat(MAX_PROMPT_IMAGE_BYTES.div_ceil(3) * 4);
+        let line = serde_json::to_string(&Command::Prompt {
+            text: "t".repeat(512 * 1024),
+            attachments: vec![image; MAX_PER_MESSAGE],
+        })
+        .unwrap();
+        assert!(line.len() < MAX_COMMAND_BYTES, "{}", line.len());
+        let commands = read_commands(std::io::Cursor::new(format!("{line}\n")));
+        assert!(matches!(
+            commands.recv_timeout(Duration::from_secs(10)),
+            Ok(RunnerInput::Command(Command::Prompt { attachments, .. })) if attachments.len() == MAX_PER_MESSAGE
+        ));
+    }
+
     #[test]
     fn builtin_spoof_fields_and_wrong_types_never_reach_approval_or_execution() {
         for mode in [Mode::Ask, Mode::AcceptEdits, Mode::Bypass] {
@@ -2854,7 +3282,7 @@ mod tests {
             format!("{{\"type\":\"configure_local\",\"context\":{{\"budget\":{{\"context_tokens\":\"{canary}\"}}}}}}\n").into_bytes(),
             b"{\n".to_vec(),
             vec![0xff, b'\n'],
-            vec![b'x'; agent_core::local_context::MAX_SETUP_BYTES + 1],
+            vec![b'x'; agent_core::local_context::MAX_COMMAND_BYTES + 1],
             format!("{{\"type\":\"configure_local\",\"context\":{{\"extra\":\"{canary}\"}}}}").into_bytes(),
         ] {
             let commands = read_commands(std::io::Cursor::new(input));

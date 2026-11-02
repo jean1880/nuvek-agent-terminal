@@ -1,4 +1,5 @@
-//! The eight tools: names, descriptions and JSON Schemas.
+//! The nine tools: names, descriptions and JSON Schemas. Eight delegate; `show_image` shows the
+//! user an image file and needs no delegation.
 //!
 //! The schemas describe what [`super::wire::parse_request`] enforces; rmcp does not validate
 //! `inputSchema`, so the parser is the check and these are the documentation the model sees.
@@ -13,7 +14,7 @@ use super::limits::Limits;
 use super::mailbox::{DeliveryState, MessageKind};
 use super::wire::{DelegationStatusCode, DispatchState};
 
-/// One of the eight tools.
+/// One of the nine tools.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolName {
@@ -25,10 +26,18 @@ pub enum ToolName {
     CrossAgentList,
     CrossAgentCancel,
     CrossAgentClose,
+    ShowImage,
 }
 
-/// What degraded mode serves.
-pub const DEGRADED_TOOLS: [ToolName; 1] = [ToolName::CrossAgentCapabilities];
+/// What degraded mode serves: `show_image` needs no delegation to be healthy.
+pub const DEGRADED_TOOLS: [ToolName; 2] = [ToolName::CrossAgentCapabilities, ToolName::ShowImage];
+
+/// The most images one `show_image` call names.
+pub const MAX_SHOW_IMAGES: usize = 5;
+/// The longest `show_image` path, in bytes.
+pub const MAX_IMAGE_PATH_BYTES: usize = 4096;
+/// The longest `show_image` caption, in characters.
+pub const MAX_CAPTION_CHARS: usize = 500;
 
 /// Shown in Settings → Agents and as `capabilities.delegation_scope`'s
 /// explanation.
@@ -38,7 +47,7 @@ pub const DELEGATION_SCOPE_TEXT: &str = "Depth and mode limits apply to agents s
     which agent-terminal shows but does not limit.";
 
 impl ToolName {
-    pub const ALL: [ToolName; 8] = [
+    pub const ALL: [ToolName; 9] = [
         ToolName::CrossAgentCapabilities,
         ToolName::CrossAgentSpawn,
         ToolName::CrossAgentSend,
@@ -47,6 +56,7 @@ impl ToolName {
         ToolName::CrossAgentList,
         ToolName::CrossAgentCancel,
         ToolName::CrossAgentClose,
+        ToolName::ShowImage,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -59,6 +69,7 @@ impl ToolName {
             ToolName::CrossAgentList => "cross_agent_list",
             ToolName::CrossAgentCancel => "cross_agent_cancel",
             ToolName::CrossAgentClose => "cross_agent_close",
+            ToolName::ShowImage => "show_image",
         }
     }
 
@@ -78,7 +89,8 @@ impl ToolName {
             ToolName::CrossAgentCapabilities
             | ToolName::CrossAgentRead
             | ToolName::CrossAgentWait
-            | ToolName::CrossAgentList => false,
+            | ToolName::CrossAgentList
+            | ToolName::ShowImage => false,
         }
     }
 
@@ -153,6 +165,11 @@ impl ToolName {
                  started, permanently. Its transcript stays readable. Closing a finished worker \
                  frees its process slot. Pass an idempotency_key."
             }
+            ToolName::ShowImage => {
+                "agent-terminal: Show the user image files (PNG, JPEG, WebP, GIF) in this \
+                 conversation, e.g. a chart or screenshot you produced. Paths may be absolute or \
+                 relative to the working directory."
+            }
         }
     }
 
@@ -220,6 +237,17 @@ impl ToolName {
                 }),
                 &["worker_id", "state"],
             ),
+            ToolName::ShowImage => json!({
+                "type": "object",
+                "properties": {
+                    "api_version": {"type": "integer", "const": 1},
+                    "shown": {"type": "integer", "minimum": 0, "maximum": MAX_SHOW_IMAGES},
+                    "results": {"type": "array", "maxItems": MAX_SHOW_IMAGES,
+                                "items": {"type": "string"},
+                                "description": "One line per image, in order: what was shown, or why not."}
+                },
+                "required": ["api_version", "shown", "results"]
+            }),
         }
     }
 }
@@ -389,6 +417,23 @@ fn input_schema_with(tool: ToolName, l: &Limits) -> Value {
                 "idempotency_key": idempotency_key()
             }),
             &["worker_id", "idempotency_key"],
+        ),
+        ToolName::ShowImage => object(
+            json!({
+                "images": {"type": "array", "minItems": 1, "maxItems": MAX_SHOW_IMAGES,
+                    "items": object(
+                        json!({
+                            "path": {"type": "string", "minLength": 1,
+                                     "description": format!("An image file, absolute or relative \
+                                         to the working directory. At most \
+                                         {MAX_IMAGE_PATH_BYTES} bytes.")},
+                            "caption": {"type": "string", "maxLength": MAX_CAPTION_CHARS,
+                                        "description": "Shown with the image instead of its file name."}
+                        }),
+                        &["path"],
+                    )}
+            }),
+            &["images"],
         ),
     }
 }
@@ -765,7 +810,8 @@ mod tests {
                 CrossAgentWait => Some(CrossAgentList),
                 CrossAgentList => Some(CrossAgentCancel),
                 CrossAgentCancel => Some(CrossAgentClose),
-                CrossAgentClose => None,
+                CrossAgentClose => Some(ShowImage),
+                ShowImage => None,
             }
         }
         let mut walked = vec![CrossAgentCapabilities];
@@ -779,11 +825,12 @@ mod tests {
                 serde_json::to_value(t).expect("ser"),
                 Value::String(t.as_str().to_owned())
             );
-            assert!(t.as_str().starts_with("cross_agent_"));
+            assert!(t.as_str().starts_with("cross_agent_") || t == ShowImage);
             assert!(t.description().contains("agent-terminal"));
         }
         assert_eq!(ToolName::parse("cross_agent_nope"), None);
-        assert_eq!(DEGRADED_TOOLS, [CrossAgentCapabilities]);
+        // Showing an image needs no delegation: degraded mode serves it too.
+        assert_eq!(DEGRADED_TOOLS, [CrossAgentCapabilities, ShowImage]);
         let mutating: Vec<ToolName> = ToolName::ALL
             .into_iter()
             .filter(|t| t.is_mutating())
@@ -1126,6 +1173,27 @@ mod tests {
         )
         .is_ok());
         assert!(validate(state_schema, &Value::Null, "s").is_ok());
+    }
+
+    /// `show_image` answers in short lines, one per image, never the image itself.
+    #[test]
+    fn show_image_output_is_lines_of_text() {
+        let lines: Vec<String> = (0..MAX_SHOW_IMAGES)
+            .map(|i| format!("Shown to the user: {i}.png (1280×720)"))
+            .collect();
+        check(
+            ToolName::ShowImage,
+            &json!({"api_version": 1, "shown": MAX_SHOW_IMAGES, "results": lines}),
+        );
+        let s = ToolName::ShowImage.output_schema();
+        assert!(validate(
+            &s,
+            &json!({"api_version": 1, "shown": 0, "results": [1]}),
+            "o"
+        )
+        .is_err());
+        assert!(validate(&s, &json!({"api_version": 1, "results": []}), "o").is_err());
+        assert!(!ToolName::ShowImage.is_mutating());
     }
 
     #[test]

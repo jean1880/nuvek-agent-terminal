@@ -10,7 +10,7 @@ use std::io::Read;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use agent_core::delegation::agy_guard::ALLOW_RULES;
+use agent_core::delegation::agy_guard::MANAGED_ALLOW_RULES;
 use agent_core::delegation::{BRIDGE_ARG, SERVER_NAME};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -96,11 +96,11 @@ fn yes() -> bool {
 
 fn validate_rules(rules: &[String]) -> Result<(), String> {
     let unique: std::collections::BTreeSet<_> = rules.iter().collect();
-    if rules.len() > ALLOW_RULES.len()
+    if rules.len() > MANAGED_ALLOW_RULES.len()
         || unique.len() != rules.len()
         || rules
             .iter()
-            .any(|rule| !ALLOW_RULES.contains(&rule.as_str()))
+            .any(|rule| !MANAGED_ALLOW_RULES.contains(&rule.as_str()))
     {
         return Err(fail("recovery journal contains unexpected managed rules"));
     }
@@ -454,7 +454,7 @@ fn plan(
     let (server_change, rules_change) = match action {
         Action::Configure => {
             servers.insert(SERVER_NAME.into(), entry);
-            for rule in ALLOW_RULES {
+            for rule in MANAGED_ALLOW_RULES {
                 if !allow.iter().any(|v| v.as_str() == Some(rule)) {
                     allow.push(json!(rule));
                     if !added_rules.iter().any(|r| r == rule) {
@@ -469,8 +469,8 @@ fn plan(
                     command.display()
                 ),
                 format!(
-                    "Add {added} of the {} delegation allow rules. Existing rules are kept.",
-                    ALLOW_RULES.len()
+                    "Add {added} of the {} agent-terminal allow rules. Existing rules are kept.",
+                    MANAGED_ALLOW_RULES.len()
                 ),
             )
         }
@@ -1108,7 +1108,7 @@ mod tests {
         put(
             &home,
             &settings,
-            Some(&json!({"permissions":{"allow":[ALLOW_RULES[0],"Read"]}}).to_string()),
+            Some(&json!({"permissions":{"allow":[MANAGED_ALLOW_RULES[0],"Read"]}}).to_string()),
         )
         .unwrap();
         apply(preview(&home, &state, command, Action::Configure).unwrap()).unwrap();
@@ -1119,7 +1119,7 @@ mod tests {
         let value = object(read(&home, &settings, MAX_FILE).unwrap().as_deref()).unwrap();
         assert_eq!(
             value["permissions"]["allow"],
-            json!([ALLOW_RULES[0], "Read"])
+            json!([MANAGED_ALLOW_RULES[0], "Read"])
         );
         assert_eq!(value["later"], "é🙂");
     }
@@ -1173,7 +1173,7 @@ mod tests {
         put(
             &home,
             &settings,
-            Some(&json!({"permissions":{"allow":[ALLOW_RULES[0],"Read"]}}).to_string()),
+            Some(&json!({"permissions":{"allow":[MANAGED_ALLOW_RULES[0],"Read"]}}).to_string()),
         )
         .unwrap();
         apply(preview(&home, &state, command, Action::Configure).unwrap()).unwrap();
@@ -1187,7 +1187,7 @@ mod tests {
         let after = object(read(&home, &settings, MAX_FILE).unwrap().as_deref()).unwrap();
         assert_eq!(
             after["permissions"]["allow"],
-            json!([ALLOW_RULES[0], "Read"])
+            json!([MANAGED_ALLOW_RULES[0], "Read"])
         );
         assert!(object(
             read(
@@ -1225,7 +1225,9 @@ mod tests {
                 0 => journal["version"] = json!(255),
                 1 => journal["edits"] = json!([]),
                 2 => journal["added_rules"] = json!(["Read"]),
-                3 => journal["added_rules"] = json!([ALLOW_RULES[0], ALLOW_RULES[0]]),
+                3 => {
+                    journal["added_rules"] = json!([MANAGED_ALLOW_RULES[0], MANAGED_ALLOW_RULES[0]])
+                }
                 _ => journal["previous_added_rules"] = json!(["Read"]),
             }
             put(&home, &state.join(JOURNAL), Some(&journal.to_string())).unwrap();
@@ -1382,7 +1384,7 @@ mod tests {
         );
         assert!(change(1).contains("/usr/bin/agent-terminal --cross-agent-mcp"));
         assert!(
-            change(2).starts_with("Create. Add 8 of the 8"),
+            change(2).starts_with("Create. Add 9 of the 9"),
             "{}",
             change(2)
         );
@@ -1401,7 +1403,7 @@ mod tests {
         assert!(rows[0].starts_with("Remove the agent_terminal MCP server"));
         assert_eq!(remove.changes()[1].target, settings);
         assert!(
-            rows[1].starts_with("Remove the 8 allow rules"),
+            rows[1].starts_with("Remove the 9 allow rules"),
             "{}",
             rows[1]
         );

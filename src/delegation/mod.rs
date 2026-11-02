@@ -23,6 +23,7 @@ mod readback;
 mod reconcile;
 mod rundir;
 pub(crate) mod services;
+mod show_image;
 pub(crate) mod supervisor;
 mod waits;
 mod wake;

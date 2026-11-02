@@ -79,6 +79,58 @@ pub fn invocation_from_meta(meta: &Map<String, Value>) -> Option<InvocationKey> 
     None
 }
 
+/// The transcript item a call's key names, as each adapter ids that call's item: Claude's
+/// `tool_use.id`, Codex's `mcpToolCall` item id (its `callId`), and agy's step item
+/// `<conv8>:step-<n>` (the first 8 characters of its conversation id).
+pub fn item_id(key: &InvocationKey) -> String {
+    match key {
+        InvocationKey::Claude { tool_use_id } => tool_use_id.clone(),
+        InvocationKey::Codex { call_id, .. } => call_id.clone(),
+        InvocationKey::Agy {
+            conversation_id,
+            step_index,
+        } => {
+            let prefix: String = conversation_id.chars().take(8).collect();
+            format!("{prefix}:step-{step_index}")
+        }
+    }
+}
+
+/// Whether a started item is a call to our `show_image`: Claude titles it
+/// `mcp__agent_terminal__show_image`, Codex `agent_terminal.show_image`, and agy's
+/// `call_mcp_tool` names the server and tool in its input (in any of its spellings).
+pub fn is_show_image_item(
+    kind: crate::event::ItemKind,
+    title: &str,
+    input: Option<&Value>,
+) -> bool {
+    if kind != crate::event::ItemKind::McpTool {
+        return false;
+    }
+    let name = ToolName::ShowImage.as_str();
+    let server = super::SERVER_NAME;
+    if title == format!("mcp__{server}__{name}") || title == format!("{server}.{name}") {
+        return true;
+    }
+    let field = |keys: &[&str]| -> Option<&str> {
+        let input = input?;
+        keys.iter()
+            .find_map(|k| input.get(*k).and_then(Value::as_str))
+    };
+    field(&["ServerName", "server_name", "serverName"]) == Some(server)
+        && field(&["ToolName", "tool_name", "toolName"]) == Some(name)
+}
+
+/// The item a `show_image` call's images go on: the item its key names when that item is one of
+/// the thread's open `show_image` calls (`open`, oldest first); else the newest open one (agy's
+/// item id can carry another prefix, or the call came with no key); else the keyed id as it is.
+pub fn show_image_item(exact: Option<String>, open: &[String]) -> Option<String> {
+    match exact {
+        Some(id) if open.contains(&id) => Some(id),
+        exact => open.last().cloned().or(exact),
+    }
+}
+
 /// The attestation form of a call's arguments. Its `Debug` prints only the length: it may
 /// hold un-redacted text.
 #[derive(Clone, PartialEq, Eq)]
@@ -619,6 +671,74 @@ mod tests {
         for (n, expected) in sip128 {
             assert_eq!(siphash24_128(&key, &msg[..n]), expected, "128-bit, n={n}");
         }
+    }
+
+    /// A call's images go on the item of the call itself: the id its key names, as each adapter
+    /// ids that item, and the newest open `show_image` call when the key cannot be matched.
+    #[test]
+    fn show_image_lands_on_its_own_tool_item() {
+        use crate::event::ItemKind;
+        let claude = invocation_from_meta(&claude_meta()).expect("claude");
+        assert_eq!(item_id(&claude), "toolu_01JqmgHtuKFaLatCTWfyf523");
+        let codex = invocation_from_meta(&codex_meta()).expect("codex");
+        assert_eq!(item_id(&codex), "exec-c520e370-5e14-491f-82f2-1dee3b60ab00");
+        let agy = invocation_from_meta(&agy_meta()).expect("agy");
+        assert_eq!(item_id(&agy), "00000000:step-2");
+
+        assert!(is_show_image_item(
+            ItemKind::McpTool,
+            "mcp__agent_terminal__show_image",
+            None
+        ));
+        assert!(is_show_image_item(
+            ItemKind::McpTool,
+            "agent_terminal.show_image",
+            None
+        ));
+        for (server, tool) in [
+            ("ServerName", "ToolName"),
+            ("server_name", "tool_name"),
+            ("serverName", "toolName"),
+        ] {
+            let input = json!({server: "agent_terminal", tool: "show_image"});
+            assert!(is_show_image_item(
+                ItemKind::McpTool,
+                "call_mcp_tool",
+                Some(&input)
+            ));
+        }
+        let other = json!({"ServerName": "other", "ToolName": "show_image"});
+        assert!(!is_show_image_item(
+            ItemKind::McpTool,
+            "call_mcp_tool",
+            Some(&other)
+        ));
+        assert!(!is_show_image_item(
+            ItemKind::McpTool,
+            "mcp__agent_terminal__cross_agent_read",
+            None
+        ));
+        assert!(!is_show_image_item(
+            ItemKind::Tool,
+            "mcp__agent_terminal__show_image",
+            None
+        ));
+
+        let open = vec!["a".to_owned(), "b".to_owned()];
+        // The keyed item, when it is open.
+        assert_eq!(
+            show_image_item(Some("a".into()), &open),
+            Some("a".to_owned())
+        );
+        // Fallback: a key naming no open call, or no key, takes the newest open call.
+        assert_eq!(
+            show_image_item(Some("zz:step-9".into()), &open),
+            Some("b".to_owned())
+        );
+        assert_eq!(show_image_item(None, &open), Some("b".to_owned()));
+        // Nothing open: the keyed id as it is, else nowhere.
+        assert_eq!(show_image_item(Some("x".into()), &[]), Some("x".to_owned()));
+        assert_eq!(show_image_item(None, &[]), None);
     }
 
     #[test]

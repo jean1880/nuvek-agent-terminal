@@ -23,20 +23,43 @@ use crate::approval_server::{
 /// matched without regard to case.
 pub(crate) const AGY_SERVER_KEYS: [&str; 3] = ["ServerName", "server_name", "server"];
 
-/// `mcp__<server>__<tool>` as an MCP effect; `None` for any other shape.
+/// Argument names agy's `call_mcp_tool` names its tool by, matched as [`AGY_SERVER_KEYS`] are.
+const AGY_TOOL_KEYS: [&str; 2] = ["ToolName", "tool_name"];
+
+/// Our own `show_image`: it only reads an image file in the agent's folder for the user to see
+/// (`delegation::show_image`), so it is a read in every mode, plan included.
+fn own_tool_effect(name: &str) -> Effect {
+    if name == agent_core::delegation::ToolName::ShowImage.as_str() {
+        Effect::Read
+    } else {
+        Effect::Mcp { own: true }
+    }
+}
+
+/// `mcp__<server>__<tool>` as an MCP effect (our `show_image` a read); `None` for any other
+/// shape.
 fn mcp_prefixed(tool: &str) -> Option<Effect> {
     let (server, name) = tool.strip_prefix("mcp__")?.split_once("__")?;
-    (!server.is_empty() && !name.is_empty()).then_some(Effect::Mcp {
-        own: server == SERVER_NAME,
+    if server.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some(if server == SERVER_NAME {
+        own_tool_effect(name)
+    } else {
+        Effect::Mcp { own: false }
     })
 }
 
 /// agy's `call_mcp_tool`, `list_resources` and `read_resource`: ours only when every server
 /// argument it carries, matched as agy matches names (without regard to case), names
-/// `agent_terminal` and there is at least one.
+/// `agent_terminal` and there is at least one; our `show_image` a read.
 fn agy_mcp(input: &Value) -> Effect {
-    Effect::Mcp {
-        own: sole_str(input, &AGY_SERVER_KEYS) == Some(SERVER_NAME),
+    if sole_str(input, &AGY_SERVER_KEYS) != Some(SERVER_NAME) {
+        return Effect::Mcp { own: false };
+    }
+    match sole_str(input, &AGY_TOOL_KEYS) {
+        Some(name) => own_tool_effect(name),
+        None => Effect::Mcp { own: true },
     }
 }
 
@@ -819,6 +842,60 @@ mod tests {
             };
             assert_eq!(gate.judge(own.0, &own.1, None), GateVerdict::Defer);
         }
+    }
+
+    /// `show_image` only reads an image for the user to see: a read for every driver, allowed to
+    /// a plan child and to one whose parent declared it may do nothing beyond reading.
+    #[test]
+    fn show_image_is_a_read_even_for_a_plan_child_declared_nothing() {
+        let f = Fixture::new();
+        let input = json!({"images": [{"path": "chart.png"}]});
+        let calls = |driver: Driver| -> (&'static str, Value) {
+            match driver {
+                Driver::Agy => (
+                    "call_mcp_tool",
+                    json!({"ServerName": "agent_terminal", "ToolName": "show_image",
+                           "Arguments": input}),
+                ),
+                _ => ("mcp__agent_terminal__show_image", input.clone()),
+            }
+        };
+        for driver in DRIVERS {
+            let (tool, args) = calls(driver);
+            assert_eq!(effect(driver, tool, &args), Effect::Read, "{driver:?}");
+            for mode in TaskMode::ALL {
+                for declared in [None, Some(vec![])] {
+                    let gate = f.gate_with(driver, mode, declared.clone());
+                    assert_eq!(
+                        gate.judge(tool, &args, None),
+                        GateVerdict::Defer,
+                        "{driver:?} {mode:?} {declared:?}"
+                    );
+                }
+            }
+        }
+        // Another server's tool of the same name is not ours.
+        assert_eq!(
+            effect(Driver::Claude, "mcp__other__show_image", &json!({})),
+            Effect::Mcp { own: false }
+        );
+        assert_eq!(
+            effect(
+                Driver::Agy,
+                "call_mcp_tool",
+                &json!({"ServerName": "other", "ToolName": "show_image"})
+            ),
+            Effect::Mcp { own: false }
+        );
+        // Our other tools stay our own MCP.
+        assert_eq!(
+            effect(
+                Driver::Agy,
+                "call_mcp_tool",
+                &json!({"ServerName": "agent_terminal", "ToolName": "cross_agent_list"})
+            ),
+            Effect::Mcp { own: true }
+        );
     }
 
     #[test]

@@ -1,10 +1,11 @@
 //! `cross_agent_capabilities`' models and usage, from the app's catalogue, tag file and account
 //! status. Pure: everything is passed in.
 
+use agent_core::adapter::Driver;
 use agent_core::catalog::CatalogModel;
 use agent_core::delegation::error::truncate_bytes;
 use agent_core::delegation::wire::{
-    CapabilityLimits, ModelInfo, UsageInfo, UsageWindow, MAX_EFFORT_BYTES, MAX_MODEL_BYTES,
+    CapabilityLimits, Cost, ModelInfo, UsageInfo, UsageWindow, MAX_EFFORT_BYTES, MAX_MODEL_BYTES,
     MAX_USAGE_WINDOWS,
 };
 use agent_core::delegation::Limits;
@@ -21,11 +22,15 @@ const MAX_EFFORTS: usize = 8;
 
 /// One catalogue model as listed, with its tags when the tag file has an entry for it. A model
 /// whose id is too long to spawn is not listed; an effort too long to pass is left out.
-pub(super) fn model_info(model: &CatalogModel, tags: Option<&ModelTags>) -> Option<ModelInfo> {
+pub(super) fn model_info(
+    model: &CatalogModel,
+    tags: Option<&ModelTags>,
+    profile_id: Option<&str>,
+) -> Option<ModelInfo> {
     if model.id.is_empty() || model.id.len() > MAX_MODEL_BYTES {
         return None;
     }
-    let entry = tags.and_then(|t| t.lookup_model(model));
+    let entry = tags.and_then(|t| t.lookup_model_for(model, profile_id));
     let effort_ok = |e: &&String| !e.is_empty() && e.len() <= MAX_EFFORT_BYTES;
     let efforts: Vec<String> = model
         .efforts
@@ -45,7 +50,26 @@ pub(super) fn model_info(model: &CatalogModel, tags: Option<&ModelTags>) -> Opti
         tags: entry.map(|e| e.tags.clone()).unwrap_or_default(),
         best_for: entry.and_then(|e| e.best_for.clone()),
         tier: entry.and_then(|e| e.tier.clone()),
+        tags_source: entry.map(|e| e.source),
     })
+}
+
+/// What a profile costs to run, for `capabilities.profiles[].cost`.
+pub(super) fn profile_cost(profile: &crate::config::Profile, driver: Driver) -> Cost {
+    if crate::config::profile_is_free(profile, driver) {
+        Cost::Free
+    } else {
+        Cost::Metered
+    }
+}
+
+/// A profile's usage as listed: a free one has no quota to burn (`ok`, load 0, no window,
+/// whatever its agent's vendor reads); a metered one is its agent's `reading`.
+pub(super) fn profile_usage(cost: Cost, reading: Option<Snapshot>, now: i64) -> Option<UsageInfo> {
+    match cost {
+        Cost::Free => Some(UsageInfo::free()),
+        Cost::Metered => reading.map(|s| usage_info(&s, now)),
+    }
 }
 
 /// The model id an agy child is launched with: a catalogue model listed with efforts gets its
@@ -115,6 +139,7 @@ mod tests {
             ],
             default_effort: Some("high".into()),
             via: None,
+            tools: None,
         }
     }
 
@@ -129,7 +154,8 @@ mod tests {
                                  "reserved": ["max"]}}"#,
         )
         .expect("tags");
-        let opus = model_info(&model(Driver::Agy, "claude-opus-5-5"), Some(&tags)).expect("ok");
+        let opus =
+            model_info(&model(Driver::Agy, "claude-opus-5-5"), Some(&tags), None).expect("ok");
         assert_eq!(opus.tags, ["code", "review"]);
         assert_eq!(opus.tier.as_deref(), Some("deep"));
         assert_eq!(opus.best_for.as_deref(), Some("hard bugs"));
@@ -148,19 +174,99 @@ mod tests {
             "medium not offered"
         );
         assert_eq!(effort.deep.as_deref(), Some("high"), "max not offered");
-        let other = model_info(&model(Driver::Codex, "gpt-6-luna"), Some(&tags)).expect("ok");
+        assert_eq!(
+            opus.tags_source,
+            Some(agent_core::model_tags::TagSource::File)
+        );
+        let other = model_info(&model(Driver::Codex, "gpt-6-luna"), Some(&tags), None).expect("ok");
+        assert_eq!(other.tags_source, None);
         assert!(other.tags.is_empty() && other.tier.is_none() && other.best_for.is_none());
-        let untagged = model_info(&model(Driver::Claude, "opus"), None).expect("ok");
+        let untagged = model_info(&model(Driver::Claude, "opus"), None, None).expect("ok");
         assert!(untagged.tags.is_empty(), "no tag file: listed, no tags");
         assert_eq!(untagged.effort_for, None);
         // A policy, but a model with no effort: null, not an object of nulls.
         let mut bare = model(Driver::Agy, "claude-opus-5-5");
         bare.efforts.clear();
-        let bare = model_info(&bare, Some(&tags)).expect("ok");
+        let bare = model_info(&bare, Some(&tags), None).expect("ok");
         assert_eq!(bare.effort_for, None);
         let v = serde_json::to_value(&bare).expect("ser");
         assert!(v["effort_for"].is_null());
-        assert!(model_info(&model(Driver::Claude, &"m".repeat(129)), None).is_none());
+        assert!(model_info(&model(Driver::Claude, &"m".repeat(129)), None, None).is_none());
+    }
+
+    /// The same Local model id is tagged per server; the source is reported, null without tags.
+    #[test]
+    fn a_models_tags_follow_its_profile_and_report_their_source() {
+        use agent_core::model_tags::TagSource;
+        let layer = |json: &str, source| parse(json).expect("tags").tagged(source);
+        let tags = layer(
+            r#"{"version": 1, "models": [
+                {"match": "m", "driver": "local", "profile": "p-small", "tier": "fast"},
+                {"match": "m", "driver": "local", "tier": "standard", "tags": ["code"]}]}"#,
+            TagSource::User,
+        );
+        let m = model(Driver::Local, "m");
+        let small = model_info(&m, Some(&tags), Some("p-small")).expect("small");
+        let big = model_info(&m, Some(&tags), Some("p-big")).expect("big");
+        assert_eq!(small.tier.as_deref(), Some("fast"));
+        assert_eq!(big.tier.as_deref(), Some("standard"));
+        assert_eq!(big.tags, ["code"]);
+        assert_eq!(small.tags_source, Some(TagSource::User));
+        let none = model_info(&model(Driver::Local, "other"), Some(&tags), None).expect("none");
+        let v = serde_json::to_value(&none).expect("ser");
+        assert!(v["tags_source"].is_null());
+        let v = serde_json::to_value(&small).expect("ser");
+        assert_eq!(v["tags_source"], "user");
+    }
+
+    /// A free profile has no quota to burn whatever its vendor's reading says; a metered one
+    /// reports the reading, or nothing without one.
+    #[test]
+    fn a_free_profile_reports_ok_and_no_load_and_a_metered_one_its_reading() {
+        use agent_core::provider::{ModelProvider, ProviderKind};
+        let now = 1_800_000_000;
+        let busy = Snapshot {
+            windows: vec![QuotaWindow {
+                group: None,
+                label: "Weekly".into(),
+                used: 0.99,
+                resets_at: None,
+            }],
+            read_at: Some(now),
+            ..Snapshot::default()
+        };
+        let free = profile_usage(Cost::Free, Some(busy.clone()), now).expect("free");
+        assert_eq!(free.headroom, Headroom::Ok);
+        assert_eq!(free.load, Some(0.0));
+        assert!(free.windows.is_empty() && !free.refresh_failed && !free.signed_out);
+        assert!(profile_usage(Cost::Free, None, now).is_some());
+        let metered = profile_usage(Cost::Metered, Some(busy), now).expect("metered");
+        assert_eq!(metered.headroom, Headroom::Exhausted);
+        assert!(profile_usage(Cost::Metered, None, now).is_none());
+
+        let server = |kind, free| crate::config::Profile {
+            provider: Some(ModelProvider::new(kind)),
+            free_to_run: free,
+            ..crate::config::Profile::default()
+        };
+        assert_eq!(
+            profile_cost(&server(ProviderKind::Ollama, None), Driver::Local),
+            Cost::Free
+        );
+        assert_eq!(
+            profile_cost(&server(ProviderKind::LiteLlm, None), Driver::Local),
+            Cost::Metered
+        );
+        assert_eq!(
+            profile_cost(&server(ProviderKind::LiteLlm, Some(true)), Driver::Claude),
+            Cost::Free
+        );
+        assert_eq!(
+            profile_cost(&crate::config::Profile::default(), Driver::Claude),
+            Cost::Metered
+        );
+        let v = serde_json::to_value(Cost::Free).expect("ser");
+        assert_eq!(v, "free");
     }
 
     /// agy refuses `--effort` for its catalogue models: the effort goes into the id.
@@ -174,6 +280,7 @@ mod tests {
             efforts: vec!["low".into(), "high".into()],
             default_effort: None,
             via: None,
+            tools: None,
         };
         let oss = CatalogModel {
             id: "gpt-oss-120b".into(),

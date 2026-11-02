@@ -1086,6 +1086,13 @@ pub(crate) const USER_AGENT: &str = concat!("agent-terminal/", env!("CARGO_PKG_V
 /// What a model that the server says cannot call tools is described as in the picker.
 const NO_TOOLS: &str = "Cannot call tools: answers without reading or changing files";
 
+/// Whether the server said this model cannot call tools (a Local server that reports what its
+/// models can do). `false` when it said it can, or said nothing. Read from the typed fact, never
+/// from the description shown for it.
+pub(crate) fn cannot_call_tools(model: &agent_core::catalog::CatalogModel) -> bool {
+    model.tools == Some(false)
+}
+
 /// Reads `provider`'s models for `driver`, off the main thread (blocking). The Local agent asks
 /// the server what each model can do ([`agent_kit::provider_models::fetch_info`]); Claude and
 /// Codex on a server take its list as it is.
@@ -1125,6 +1132,7 @@ fn provider_models(
             efforts: Vec::new(),
             default_effort: None,
             via: Some(provider.kind.label().to_owned()),
+            tools: m.tools,
         })
         .collect()
 }
@@ -1341,6 +1349,7 @@ mod tests {
             efforts: vec![],
             default_effort: None,
             via: None,
+            tools: None,
         }
     }
 
@@ -1951,6 +1960,20 @@ mod tests {
         );
         assert_eq!(local[0].description, None);
         assert_eq!(local[1].description.as_deref(), Some(NO_TOOLS));
+        assert!(cannot_call_tools(&local[1]));
+        assert!(!cannot_call_tools(&local[0]));
+        // The fact, never its wording: a model described otherwise is still known not to call
+        // tools, and one merely described so is not.
+        let reworded = agent_core::catalog::CatalogModel {
+            description: Some("No tools.".into()),
+            ..local[1].clone()
+        };
+        assert!(cannot_call_tools(&reworded));
+        let described = agent_core::catalog::CatalogModel {
+            tools: None,
+            ..local[1].clone()
+        };
+        assert!(!cannot_call_tools(&described));
     }
 
     use crate::freshness::{age_of, freshness, Freshness, DUE_SLACK};

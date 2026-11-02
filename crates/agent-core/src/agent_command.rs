@@ -428,6 +428,7 @@ fn from_words(words: &[String], depth: usize) -> Option<AgentCommand> {
         "claude" => claude(rest),
         "codex" => codex(rest),
         "agy" => agy(rest),
+        "agent-terminal" => local_runner(rest),
         p if SHELLS.contains(&p) => {
             let body = shell_body(rest)?;
             parse_at(&body, depth + 1)
@@ -802,10 +803,69 @@ fn agy(rest: &[String]) -> Option<AgentCommand> {
     })
 }
 
+/// `agent-terminal --local-agent …`: the app's own Local runner started by hand, outside the
+/// app's supervision. Its prompts arrive on stdin, so it names no task. The app's other roles
+/// (its window, `--cross-agent-mcp` with no capability, `--version`) are not agent launches.
+fn local_runner(rest: &[String]) -> Option<AgentCommand> {
+    if rest.first().map(String::as_str) != Some(crate::local_agent::RUNNER_FLAG) {
+        return None;
+    }
+    let args = scan(
+        &rest[1..],
+        &[
+            "server",
+            "key-env",
+            "cwd",
+            "mode",
+            "model",
+            "resume",
+            "session-id",
+        ],
+        false,
+    );
+    Some(AgentCommand {
+        driver: Driver::Local,
+        via: Via::Direct,
+        task: None,
+        model: shown(args.value(&["model"])),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_apps_own_runner_started_by_hand_is_a_launch() {
+        want(
+            "agent-terminal --local-agent --server http://127.0.0.1:11434 --cwd /w --model qwen3:8b",
+            Driver::Local,
+            Via::Direct,
+            None,
+            Some("qwen3:8b"),
+        );
+        want(
+            "cd /w && /usr/bin/agent-terminal --local-agent --server http://h --cwd /w",
+            Driver::Local,
+            Via::Direct,
+            None,
+            None,
+        );
+        for other in [
+            "agent-terminal",
+            "agent-terminal --version",
+            "agent-terminal --cross-agent-mcp",
+            "echo agent-terminal --local-agent",
+        ] {
+            none(other);
+        }
+        assert!(from_tool_input(
+            "run_command",
+            &json!({"command": "bash -lc 'agent-terminal --local-agent --server http://h --cwd .'"})
+        )
+        .is_some());
+    }
 
     fn launch(command: &str) -> AgentCommand {
         parse(command).unwrap_or_else(|| panic!("no launch in {command:?}"))

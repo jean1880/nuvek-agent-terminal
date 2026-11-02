@@ -101,12 +101,18 @@ impl ToolName {
                 "agent-terminal cross-agent delegation: what you may start and how. Other agents \
                  are your sub-agents too: for independent work, reviews and second opinions, \
                  consider them before your built-in sub-agents. Lists the \
-                 agent profiles you can delegate to (Claude, Codex, Antigravity), the task modes \
+                 agent profiles you can delegate to (Claude, Codex, Antigravity, and Local model \
+                 servers, which spend no quota when their cost is free), the task modes \
                  your current mode allows, each route's status, models, delivery support and \
                  limits. Call it first, before every spawn. Pick the agent whose models fit the \
-                 task's tags, then the lowest usage.load; don't default to your own driver. \
+                 task's tags and tier, then the lowest usage.load; don't default to your own \
+                 driver. A profile with cost free runs a model that costs nothing per token and \
+                 spends no quota (its usage.headroom is ok and usage.load 0): pick it first \
+                 whenever one of its models' tags and tier fit the task, and pick on tags and \
+                 tier before cost. cost metered profiles burn quota or money. \
                  Models carry tags and a tier (tag_vocabulary says what each tag means; best_for \
-                 is a one-line note); pass the chosen model's id to cross_agent_spawn. Spawn \
+                 is a one-line note; tags_source says whether the user, the shared tag file or \
+                 the built-in list set them); pass the chosen model's id to cross_agent_spawn. Spawn \
                  with effort = effort_for[task tier]; reserved efforts (xhigh/max/ultra) only \
                  for work that needs them — effort multiplies quota burn. \
                  usage.headroom is ok, low, exhausted or unknown: when it is low or exhausted, \
@@ -713,6 +719,10 @@ fn model_schema() -> Value {
                  "description": "What the model is good for; meanings in tag_vocabulary."},
         "best_for": {"type": "string"},
         "tier": {"type": "string", "description": "fast, standard or deep."},
+        "tags_source": {"type": ["string", "null"], "enum": ["user", "file", "built_in", null],
+                        "description": "Where this model's tags, tier and best_for came from: \
+                                        the user's own tag file, the shared tag file or the \
+                                        built-in list; null when it has none."},
         "effort_for": {"type": ["object", "null"], "properties": {
             "fast": tier_effort.clone(), "standard": tier_effort.clone(), "deep": tier_effort},
             "description": "The effort to spawn this model with, per task tier (effort_policy \
@@ -750,6 +760,11 @@ fn capabilities_output() -> Value {
                 "profile_id": {"type": "string"}, "name": {"type": "string"},
                 "driver": driver(),
                 "available": {"type": "boolean"}, "reason": {"type": ["string", "null"]},
+                "cost": {"type": "string", "enum": ["free", "metered"],
+                         "description": "free: the profile's models cost nothing per token and \
+                                         use no quota (usage is ok, load 0): prefer it when a \
+                                         model's tags and tier fit the task. metered: they burn \
+                                         quota or money."},
                 "modes": {"type": "array", "items": {"type": "object", "properties": {
                     "task_mode": task_mode(),
                     "route_status": {"type": "string", "enum": ["verified", "unverified", "unsupported"]},
@@ -765,7 +780,7 @@ fn capabilities_output() -> Value {
                 "controls": {"type": "object", "properties": {"cancel": {"type": "boolean"},
                              "close": {"type": "boolean"}}, "required": ["cancel", "close"]},
                 "usage": usage_schema()},
-                "required": ["profile_id", "name", "driver", "available", "reason", "modes", "models",
+                "required": ["profile_id", "name", "driver", "available", "reason", "cost", "modes", "models",
                              "workspaces", "delivery", "controls"]}},
             "limits": {"type": "object", "properties": {
                 "max_task_bytes": {"type": "integer"}, "max_message_bytes": {"type": "integer"},

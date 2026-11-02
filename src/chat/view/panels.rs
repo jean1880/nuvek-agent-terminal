@@ -268,6 +268,7 @@ fn catalog_from_payload(driver: Driver, entries: Vec<payload::ModelEntry>) -> Ve
             efforts: Vec::new(),
             default_effort: None,
             via: None,
+            tools: None,
         })
         .collect()
 }
@@ -1338,6 +1339,7 @@ pub(crate) mod tests {
             efforts: Vec::new(),
             default_effort: None,
             via: None,
+            tools: None,
         };
         assert_eq!(picker_subtitle(&row("qwen3.5:9b", "qwen3.5:9b", None)), "");
         assert_eq!(
@@ -1589,6 +1591,7 @@ pub(crate) mod tests {
             efforts: vec![],
             default_effort: None,
             via: None,
+            tools: None,
         };
         assert!(is_current(
             &m,
@@ -1636,6 +1639,7 @@ pub(crate) mod tests {
                 .iter()
                 .map(|id| CatalogModel {
                     via: Some("Ollama".to_owned()),
+                    tools: None,
                     ..model(Driver::Local, id, &[])
                 })
                 .collect(),
@@ -1725,6 +1729,7 @@ pub(crate) mod tests {
             efforts: efforts.iter().map(|e| (*e).to_owned()).collect(),
             default_effort: None,
             via: None,
+            tools: None,
         }
     }
 

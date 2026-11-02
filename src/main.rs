@@ -39,6 +39,8 @@ mod palette;
 mod probe;
 mod style;
 mod support;
+mod tag_edit;
+mod tags_cli;
 #[cfg(not(feature = "terminal"))]
 pub mod terminal_stub;
 #[cfg(test)]
@@ -89,6 +91,11 @@ fn main() -> glib::ExitCode {
     if std::env::args().nth(1).as_deref() == Some("--uninstall") {
         let rest: Vec<String> = std::env::args().skip(2).collect();
         return uninstall::cli(&rest);
+    }
+    // The user's model tags, read and edited from a terminal: no window, no logging setup.
+    if std::env::args().nth(1).as_deref() == Some("tags") {
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        return glib::ExitCode::from(tags_cli::main(&rest).clamp(0, 255) as u8);
     }
     init_logging();
 

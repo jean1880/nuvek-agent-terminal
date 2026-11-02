@@ -228,6 +228,15 @@ impl Scrubber {
         }
         false
     }
+    /// These masks, also masking `secret` exactly (the runner's delegation capability: no model
+    /// text should ever hold it, and none is ever shown if one did).
+    pub fn with_secret(mut self, secret: &str) -> Self {
+        if !secret.is_empty() && !self.0.iter().any(|s| s == secret) {
+            self.0.push(secret.to_owned());
+            self.0.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
+        }
+        self
+    }
     pub fn longest_secret(&self) -> usize {
         self.0.first().map_or(0, String::len)
     }
@@ -754,6 +763,39 @@ mod tests {
             EnvironmentValue::Literal("path".into()),
         );
         assert!(environment(&config, &effective).is_err());
+    }
+    /// No user definition can carry or reference any variable the app strips from every spawn
+    /// (the delegation binding and the approval socket), whatever its spelling.
+    #[test]
+    fn every_stripped_control_variable_is_refused_as_name_and_reference() {
+        let effective = BTreeMap::from([("PATH".into(), "/bin".into())]);
+        for name in agent_core::delegation::env::STRIP_ON_SPAWN {
+            for spelling in [name.to_owned(), name.to_ascii_lowercase()] {
+                let mut named = config();
+                named
+                    .env
+                    .insert(spelling.clone(), EnvironmentValue::Literal("x".into()));
+                assert!(environment(&named, &effective).is_err(), "{spelling}");
+                let mut referenced = config();
+                referenced.env.insert(
+                    "VALUE".into(),
+                    EnvironmentValue::Reference {
+                        from_env: spelling.clone(),
+                    },
+                );
+                assert!(environment(&referenced, &effective).is_err(), "{spelling}");
+            }
+        }
+    }
+    /// The capability added to the masks is masked exactly, longest first, once.
+    #[test]
+    fn an_added_secret_is_masked_exactly() {
+        let masks = Scrubber(vec!["ab".into()])
+            .with_secret("atdc_secret")
+            .with_secret("atdc_secret");
+        assert_eq!(masks.0, vec!["atdc_secret".to_owned(), "ab".to_owned()]);
+        assert_eq!(masks.scrub_exact("x atdc_secret y"), "x [REDACTED] y");
+        assert_eq!(Scrubber::default().with_secret("").0.len(), 0);
     }
     #[test]
     fn stderr_is_drained_bounded_and_scrubbed_across_chunk_and_unicode_boundaries() {

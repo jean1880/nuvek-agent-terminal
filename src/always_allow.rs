@@ -1016,7 +1016,11 @@ impl ActionKind {
             "run_command" | "Bash" | "bash" | "command_execution" => Some(Self::Shell),
             "call_mcp_tool" => Some(Self::Mcp),
             t if t.starts_with("mcp__") => Some(Self::Mcp),
-            "Edit" | "Write" | "MultiEdit" | "NotebookEdit" | "file_change" => Some(Self::Edit),
+            // `write_file` is the Local runner's whole-file write (its `edit_file` is classified
+            // below, as agy's is).
+            "Edit" | "Write" | "MultiEdit" | "NotebookEdit" | "file_change" | "write_file" => {
+                Some(Self::Edit)
+            }
             "Read" => Some(Self::Read),
             t => match classify(t) {
                 ToolClass::Edit => Some(Self::Edit),
@@ -3866,6 +3870,25 @@ mod tests {
         Action::Shell {
             command: command.to_owned(),
         }
+    }
+
+    /// The Local runner's whole-file write is an edit of the file it names, as its `edit_file`
+    /// is: a delegated child's Accept edits and a root's rules read it as one.
+    #[test]
+    fn the_local_runners_writes_are_edits() {
+        for tool in ["write_file", "edit_file"] {
+            assert_eq!(
+                Action::of(tool, &serde_json::json!({"file_path": "notes.txt"})),
+                Some(Action::Edit {
+                    path: "notes.txt".into()
+                }),
+                "{tool}"
+            );
+        }
+        assert_eq!(
+            Action::of("run_command", &serde_json::json!({"command": "ls"})),
+            Some(shell("ls"))
+        );
     }
 
     fn ctx<'a>(driver: &'a str, workspace: &'a Path, cwd: Option<&'a str>) -> Context<'a> {

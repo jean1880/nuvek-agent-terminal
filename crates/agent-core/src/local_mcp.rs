@@ -602,6 +602,24 @@ impl McpServerConfig {
         {
             return Err(format!("Invalid MCP definition or bounds for {}.", self.id));
         }
+        // The delegation tools are the app's own, never a configured server: no definition may
+        // run the bridge or be shown under its name.
+        let reserved = |name: &str| {
+            let name = name.trim().to_ascii_lowercase().replace('-', "_");
+            name == crate::delegation::SERVER_NAME
+        };
+        if reserved(&self.id)
+            || reserved(&self.label)
+            || self
+                .args
+                .iter()
+                .any(|a| a.trim() == crate::delegation::BRIDGE_ARG)
+        {
+            return Err(
+                "agent-terminal's delegation tools are built in; an MCP server cannot run or be named as them."
+                    .into(),
+            );
+        }
         for (name, value) in &self.env {
             if name.len() > 256 || !crate::provider::valid_env_name(name) {
                 return Err(format!("Invalid MCP environment name: {name}"));
@@ -640,8 +658,17 @@ impl McpServerConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolIdentity {
-    Builtin { name: String },
-    Mcp { server_id: String, name: String },
+    Builtin {
+        name: String,
+    },
+    /// One of the app's own delegation tools (`cross_agent_*`): no server, no alias.
+    Delegation {
+        name: String,
+    },
+    Mcp {
+        server_id: String,
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -661,6 +688,19 @@ impl ResolvedTool {
             },
             alias: tool.name().into(),
             schema,
+            server_revision: String::new(),
+            schema_revision: String::new(),
+        }
+    }
+
+    /// A delegation tool, under its own fixed name.
+    pub fn delegation(tool: crate::delegation::ToolName) -> Self {
+        Self {
+            identity: ToolIdentity::Delegation {
+                name: tool.as_str().into(),
+            },
+            alias: tool.as_str().into(),
+            schema: crate::local_agent::delegation_schema(tool),
             server_revision: String::new(),
             schema_revision: String::new(),
         }
@@ -764,6 +804,26 @@ mod tests {
             EnvironmentValue::Literal("private-canary".into()),
         );
         assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn no_definition_runs_or_names_the_delegation_bridge() {
+        assert!(server().validate().is_ok());
+        for label in ["agent_terminal", "Agent-Terminal", " agent_terminal "] {
+            let mut s = server();
+            s.label = label.into();
+            assert!(s.validate().is_err(), "{label}");
+        }
+        let mut s = server();
+        s.id = "agent-terminal".into();
+        assert!(s.validate().is_err());
+        let mut s = server();
+        s.command = "/usr/bin/agent-terminal".into();
+        s.args = vec!["--cross-agent-mcp".into()];
+        assert!(s.validate().is_err());
+        // Its executable alone is not refused: only the bridge role.
+        s.args = vec!["--help".into()];
+        assert!(s.validate().is_ok());
     }
 
     #[test]

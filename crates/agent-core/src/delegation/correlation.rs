@@ -33,6 +33,28 @@ pub enum InvocationKey {
         conversation_id: String,
         step_index: u64,
     },
+    /// The Local runner's own item id for the call (`call-<generation>-<n>`), minted by the
+    /// runner, never by the model, and sent by its own delegation client in `Call.invocation`.
+    /// Never read from `_meta`: an MCP bridge cannot produce one.
+    Local { item_id: String },
+}
+
+/// The longest item id a Local key may carry (the runner's are about 20 bytes).
+pub const MAX_LOCAL_ITEM_ID: usize = 64;
+
+impl InvocationKey {
+    /// A Local key the runner could have minted: `[A-Za-z0-9-]{1,64}`. Other keys pass.
+    pub fn is_well_formed(&self) -> bool {
+        match self {
+            InvocationKey::Local { item_id } => {
+                (1..=MAX_LOCAL_ITEM_ID).contains(&item_id.len())
+                    && item_id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            }
+            _ => true,
+        }
+    }
 }
 
 fn key_field<'a>(meta: &'a Map<String, Value>, name: &str) -> Option<&'a str> {
@@ -93,6 +115,8 @@ pub fn item_id(key: &InvocationKey) -> String {
             let prefix: String = conversation_id.chars().take(8).collect();
             format!("{prefix}:step-{step_index}")
         }
+        // The runner's own id for the call's item.
+        InvocationKey::Local { item_id } => item_id.clone(),
     }
 }
 
@@ -117,8 +141,9 @@ pub fn is_show_image_item(
         keys.iter()
             .find_map(|k| input.get(*k).and_then(Value::as_str))
     };
-    field(&["ServerName", "server_name", "serverName"]) == Some(server)
-        && field(&["ToolName", "tool_name", "toolName"]) == Some(name)
+    // agy's `call_mcp_tool`, and the Local runner's delegation call (`server`, `tool`).
+    field(&["ServerName", "server_name", "serverName", "server"]) == Some(server)
+        && field(&["ToolName", "tool_name", "toolName", "tool"]) == Some(name)
 }
 
 /// The item a `show_image` call's images go on: the item its key names when that item is one of
@@ -440,6 +465,38 @@ mod tests {
         assert_eq!(invocation_from_meta(&Map::new()), None);
     }
 
+    /// A Local key travels only in the runner's own `Call`: no `_meta` spelling produces one,
+    /// and only an id the runner could have minted is well formed.
+    #[test]
+    fn local_keys_never_come_from_meta() {
+        for m in [
+            meta(json!({"item_id": "call-abcd1234-1"})),
+            meta(json!({"provider": "local", "item_id": "call-abcd1234-1"})),
+            meta(json!({"local": {"item_id": "call-abcd1234-1"}})),
+        ] {
+            assert_eq!(invocation_from_meta(&m), None);
+        }
+        let key = InvocationKey::Local {
+            item_id: "call-abcd1234-1".into(),
+        };
+        let json = serde_json::to_value(&key).expect("ser");
+        assert_eq!(
+            json,
+            json!({"provider": "local", "item_id": "call-abcd1234-1"})
+        );
+        assert_eq!(
+            serde_json::from_value::<InvocationKey>(json).expect("de"),
+            key
+        );
+        assert!(key.is_well_formed());
+        for bad in ["", "call 1", "call/1", &"a".repeat(65)] {
+            assert!(!InvocationKey::Local {
+                item_id: bad.to_owned()
+            }
+            .is_well_formed());
+        }
+    }
+
     #[test]
     fn malformed_and_over_long_values_give_none() {
         for bad in [
@@ -684,6 +741,10 @@ mod tests {
         assert_eq!(item_id(&codex), "exec-c520e370-5e14-491f-82f2-1dee3b60ab00");
         let agy = invocation_from_meta(&agy_meta()).expect("agy");
         assert_eq!(item_id(&agy), "00000000:step-2");
+        let local = InvocationKey::Local {
+            item_id: "call-1-3".into(),
+        };
+        assert_eq!(item_id(&local), "call-1-3");
 
         assert!(is_show_image_item(
             ItemKind::McpTool,
@@ -699,6 +760,8 @@ mod tests {
             ("ServerName", "ToolName"),
             ("server_name", "tool_name"),
             ("serverName", "toolName"),
+            // The Local runner's own delegation call.
+            ("server", "tool"),
         ] {
             let input = json!({server: "agent_terminal", tool: "show_image"});
             assert!(is_show_image_item(

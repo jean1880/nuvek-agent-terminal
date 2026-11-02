@@ -857,6 +857,16 @@ fn check_base(base: &str, limits: &Limits) -> Result<(), ToolError> {
     Ok(())
 }
 
+/// How long a bridge waits on the supervisor for any call but a wait.
+pub const CALL_TIMEOUT_MS: u32 = 30_000;
+/// What a wait's own timeout is given on top, for the supervisor's answer to arrive.
+pub const CALL_SLACK_MS: u32 = 2_000;
+
+/// [`ToolRequest::call_timeout_ms`]: the one deadline every delegation client gives a call.
+pub fn call_timeout_ms(request: &ToolRequest) -> u32 {
+    request.call_timeout_ms()
+}
+
 impl ToolRequest {
     pub fn tool(&self) -> ToolName {
         match self {
@@ -1014,6 +1024,18 @@ impl ToolRequest {
         }
     }
 
+    /// How long a bridge waits on the supervisor for this request: a wait's own timeout (its
+    /// documented default when it names none) plus [`CALL_SLACK_MS`], else [`CALL_TIMEOUT_MS`].
+    pub fn call_timeout_ms(&self) -> u32 {
+        match self.normalised() {
+            ToolRequest::Wait(WaitRequest {
+                timeout_ms: Some(timeout),
+                ..
+            }) => timeout.saturating_add(CALL_SLACK_MS),
+            _ => CALL_TIMEOUT_MS,
+        }
+    }
+
     /// A canonical request with every omitted optional field's documented default filled in.
     pub fn normalised(&self) -> ToolRequest {
         let mut out = self.clone();
@@ -1130,6 +1152,20 @@ pub struct ModelInfo {
     /// `effort_policy` ([`crate::model_tags::effort_for`]); null when there is no policy.
     #[serde(default)]
     pub effort_for: Option<crate::model_tags::EffortFor>,
+    /// Which layer `tags`, `tier` and `best_for` came from; null when the model has no entry.
+    #[serde(default)]
+    pub tags_source: Option<crate::model_tags::TagSource>,
+}
+
+/// What running a profile's models costs: `capabilities.profiles[].cost`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Cost {
+    /// Nothing per token and no quota to burn (a model on the user's own server).
+    Free,
+    /// Quota or money per token.
+    #[default]
+    Metered,
 }
 
 /// Quota windows reported per profile, at most this many.
@@ -1189,6 +1225,21 @@ pub struct UsageInfo {
     pub signed_out: bool,
 }
 
+impl UsageInfo {
+    /// The usage of a [`Cost::Free`] profile: no quota to burn, so `ok` with no load and no
+    /// window, whatever any reading of its agent's vendor says.
+    pub fn free() -> UsageInfo {
+        UsageInfo {
+            headroom: crate::model_tags::Headroom::Ok,
+            load: Some(0.0),
+            windows: Vec::new(),
+            age_s: None,
+            refresh_failed: false,
+            signed_out: false,
+        }
+    }
+}
+
 /// `capabilities.profiles[].delivery`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeliverySupport {
@@ -1212,6 +1263,10 @@ pub struct ProfileCapabilities {
     pub driver: Driver,
     pub available: bool,
     pub reason: Option<String>,
+    /// `free` for a profile on a model server the user runs (unless the profile says otherwise),
+    /// `metered` for a vendor's.
+    #[serde(default)]
+    pub cost: Cost,
     pub modes: Vec<ModeAdmission>,
     pub models: Vec<ModelInfo>,
     pub workspaces: Vec<WorkspaceKind>,
@@ -1885,6 +1940,7 @@ pub(crate) mod fixtures {
                     standard: Some(text(c, MAX_EFFORT_NAME_BYTES)),
                     deep: Some(text(c, MAX_EFFORT_NAME_BYTES)),
                 }),
+                tags_source: Some(crate::model_tags::TagSource::BuiltIn),
             })
             .collect();
         let effort_policy = EffortPolicy {
@@ -1936,6 +1992,7 @@ pub(crate) mod fixtures {
                     driver: Driver::Codex,
                     available: true,
                     reason: Some(text(c, MAX_STATUS_REASON_BYTES)),
+                    cost: Cost::Metered,
                     modes: modes.clone(),
                     models: models.clone(),
                     workspaces: vec![
@@ -1967,6 +2024,24 @@ pub(crate) mod fixtures {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// One deadline for every client: a wait's own timeout (its default when it names none)
+    /// plus the slack, everything else the fixed call deadline.
+    #[test]
+    fn a_call_waits_its_own_timeout_plus_the_slack() {
+        let limits = Limits::default();
+        let wait = |args: Value| parse_request(ToolName::CrossAgentWait, &args, &limits).unwrap();
+        assert_eq!(
+            call_timeout_ms(&wait(json!({"timeout_ms": 5000}))),
+            5000 + CALL_SLACK_MS
+        );
+        assert_eq!(
+            call_timeout_ms(&wait(json!({}))),
+            DEFAULT_WAIT_TIMEOUT_MS + CALL_SLACK_MS
+        );
+        let list = parse_request(ToolName::CrossAgentList, &json!({}), &limits).unwrap();
+        assert_eq!(call_timeout_ms(&list), CALL_TIMEOUT_MS);
+    }
 
     #[test]
     fn state_ref_is_domain_and_value() {

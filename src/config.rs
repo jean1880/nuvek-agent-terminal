@@ -143,6 +143,12 @@ pub struct Profile {
     /// provider that cannot be used refuses the start; it never falls back to the vendor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<agent_core::provider::ModelProvider>,
+    /// Whether the models on this profile's model server cost nothing per token, so other agents
+    /// should prefer them when they fit a task (`cross_agent_capabilities` reports it as `cost`).
+    /// `None` follows the server's kind ([`agent_core::provider::ProviderKind::free_by_default`]).
+    /// Only a profile with a server has a cost to set: a vendor's is always metered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_to_run: Option<bool>,
 }
 
 /// A blank profile with a fresh id, so the invariant holds for `..Profile::default()` too.
@@ -172,6 +178,7 @@ impl Default for Profile {
             available_for_delegation: false,
             driver: None,
             provider: None,
+            free_to_run: None,
         }
     }
 }
@@ -285,6 +292,27 @@ pub fn profile_provider(
             agent_core::provider::ModelProvider::new(agent_core::provider::ProviderKind::Ollama)
         })
     })
+}
+
+/// Whether `profile`'s models cost nothing per token: its own say ([`Profile::free_to_run`]),
+/// else its server's kind. A profile with no server runs its vendor's models, which are metered.
+pub fn profile_is_free(profile: &Profile, driver: agent_core::adapter::Driver) -> bool {
+    profile_provider(profile, driver).is_some_and(|server| {
+        profile
+            .free_to_run
+            .unwrap_or_else(|| server.kind.free_by_default())
+    })
+}
+
+/// What to store in [`Profile::free_to_run`] when the user picks `on`: nothing when that is what
+/// the server's kind already says, so the switch keeps following the kind.
+pub fn free_to_run_choice(
+    profile: &Profile,
+    driver: agent_core::adapter::Driver,
+    on: bool,
+) -> Option<bool> {
+    let default = profile_provider(profile, driver).is_some_and(|s| s.kind.free_by_default());
+    (on != default).then_some(on)
 }
 
 /// Picks the agent for a new chat thread.
@@ -827,6 +855,12 @@ pub struct TerminalConfig {
     /// only means models carry no tags.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_tags_path: Option<String>,
+    /// The user's own tag file, which only the app writes (Settings → Agents → Model Tags and
+    /// `agent-terminal tags`) and which goes over [`Self::model_tags_path`]'s file and the
+    /// built-in tags. `None` is `<config dir>/model-tags.user.json`; a set path is absolute or
+    /// starts with `~/`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_model_tags_path: Option<String>,
     /// Set when this process found no settings file at all (none from a pre-rename release
     /// either): a first start, which offers the setup walkthrough. Not persisted.
     #[serde(skip)]
@@ -1205,6 +1239,7 @@ impl Default for TerminalConfig {
             suggest_quick_replies: true,
             permission_sources: Vec::new(),
             model_tags_path: None,
+            user_model_tags_path: None,
             first_run: std::cell::Cell::default(),
             disk_stamp: std::cell::Cell::default(),
             save_blocked: std::cell::Cell::default(),
@@ -1348,6 +1383,23 @@ impl TerminalConfig {
         match set.map(str::trim).filter(|s| !s.is_empty()) {
             Some(p) => PathBuf::from(crate::utils::expand_tilde(p)),
             None => config_dir.join("model-tags.json"),
+        }
+    }
+
+    /// The user's own tag file: [`Self::user_model_tags_path`] with `~/` expanded, or
+    /// `<config dir>/model-tags.user.json` when it is unset or blank.
+    pub fn user_model_tags_file(&self) -> PathBuf {
+        Self::user_model_tags_file_in(
+            self.user_model_tags_path.as_deref(),
+            &Self::config_home().join("agent-terminal"),
+        )
+    }
+
+    /// [`Self::user_model_tags_file`] with the config directory passed in (tests).
+    fn user_model_tags_file_in(set: Option<&str>, config_dir: &Path) -> PathBuf {
+        match set.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(p) => PathBuf::from(crate::utils::expand_tilde(p)),
+            None => config_dir.join("model-tags.user.json"),
         }
     }
 
@@ -2437,6 +2489,110 @@ mod tests {
             TerminalConfig::load_from(&path).model_tags_path.as_deref(),
             Some("~/tags.json")
         );
+    }
+
+    #[test]
+    fn the_user_tag_file_sits_beside_the_shared_one_and_round_trips_when_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"notify_on_bell":false}"#).unwrap();
+        let loaded = TerminalConfig::load_from(&path);
+        assert_eq!(loaded.user_model_tags_path, None, "an older config");
+        let cfg_dir = Path::new("/cfg/agent-terminal");
+        assert_eq!(
+            TerminalConfig::user_model_tags_file_in(None, cfg_dir),
+            cfg_dir.join("model-tags.user.json")
+        );
+        assert_eq!(
+            TerminalConfig::user_model_tags_file_in(Some(" "), cfg_dir),
+            cfg_dir.join("model-tags.user.json")
+        );
+        assert_eq!(
+            TerminalConfig::user_model_tags_file_in(Some("/etc/mine.json"), cfg_dir),
+            PathBuf::from("/etc/mine.json")
+        );
+        let unset = serde_json::to_value(&loaded).unwrap();
+        assert!(unset.get("user_model_tags_path").is_none());
+        let mut set = loaded.clone();
+        set.user_model_tags_path = Some("~/mine.json".into());
+        std::fs::write(&path, serde_json::to_string(&set).unwrap()).unwrap();
+        assert_eq!(
+            TerminalConfig::load_from(&path)
+                .user_model_tags_path
+                .as_deref(),
+            Some("~/mine.json")
+        );
+    }
+
+    /// `free_to_run`: absent in older files, not written until set, and the default follows the
+    /// server's kind; a vendor profile is metered whatever it says.
+    #[test]
+    fn a_profiles_cost_follows_its_say_then_its_servers_kind() {
+        use agent_core::adapter::Driver;
+        use agent_core::provider::{ModelProvider, ProviderKind};
+        let old: Profile = serde_json::from_str(r#"{"name": "Old", "command": "claude"}"#).unwrap();
+        assert_eq!(old.free_to_run, None, "a profile from before the field");
+        assert!(serde_json::to_value(&old)
+            .unwrap()
+            .get("free_to_run")
+            .is_none());
+
+        let on = |kind, free: Option<bool>| Profile {
+            provider: Some(ModelProvider::new(kind)),
+            free_to_run: free,
+            ..Profile::default()
+        };
+        assert!(profile_is_free(
+            &on(ProviderKind::Ollama, None),
+            Driver::Local
+        ));
+        assert!(profile_is_free(
+            &on(ProviderKind::LmStudio, None),
+            Driver::Claude
+        ));
+        assert!(!profile_is_free(
+            &on(ProviderKind::LiteLlm, None),
+            Driver::Local
+        ));
+        assert!(profile_is_free(
+            &on(ProviderKind::LiteLlm, Some(true)),
+            Driver::Local
+        ));
+        assert!(!profile_is_free(
+            &on(ProviderKind::Ollama, Some(false)),
+            Driver::Local
+        ));
+        // A vendor's own models are metered, even if the profile says otherwise.
+        let vendor = Profile {
+            free_to_run: Some(true),
+            ..Profile::default()
+        };
+        assert!(!profile_is_free(&vendor, Driver::Claude));
+        assert!(!profile_is_free(&Profile::default(), Driver::Codex));
+        // A Local profile with no server recorded runs on the default one here.
+        assert!(profile_is_free(&Profile::default(), Driver::Local));
+
+        // The switch stores a choice only when it differs from what the kind says.
+        let ollama = on(ProviderKind::Ollama, None);
+        assert_eq!(free_to_run_choice(&ollama, Driver::Local, true), None);
+        assert_eq!(
+            free_to_run_choice(&ollama, Driver::Local, false),
+            Some(false)
+        );
+        let gateway = on(ProviderKind::LiteLlm, None);
+        assert_eq!(free_to_run_choice(&gateway, Driver::Local, false), None);
+        assert_eq!(
+            free_to_run_choice(&gateway, Driver::Local, true),
+            Some(true)
+        );
+
+        // A set value survives a save and load; a duplicate keeps it.
+        let set = on(ProviderKind::LiteLlm, Some(true));
+        let text = serde_json::to_string(&set).unwrap();
+        assert!(text.contains(r#""free_to_run":true"#));
+        let back: Profile = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.free_to_run, Some(true));
+        assert_eq!(back.duplicate("Copy").free_to_run, Some(true));
     }
 
     #[test]

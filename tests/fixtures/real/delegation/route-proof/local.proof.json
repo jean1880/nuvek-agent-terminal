@@ -1,0 +1,226 @@
+{
+  "evidence_kind": "local",
+  "fixture_version": 1,
+  "frames": [
+    {
+      "at": 0.001035,
+      "bridge": true,
+      "child": null,
+      "event": "configure",
+      "mcp_servers": 0,
+      "scenario": "root"
+    },
+    {
+      "at": 0.04585,
+      "clean": true,
+      "event": "proc_scan",
+      "refused": true,
+      "scenario": "root",
+      "tool": "environ"
+    },
+    {
+      "at": 0.046406,
+      "clean": true,
+      "event": "proc_scan",
+      "refused": false,
+      "scenario": "root",
+      "tool": "cmdline"
+    },
+    {
+      "at": 0.04642,
+      "clean": true,
+      "event": "proc_scan",
+      "refused": true,
+      "scenario": "root",
+      "tool": "mem"
+    },
+    {
+      "at": 1.157216,
+      "event": "offered",
+      "scenario": "root",
+      "tools": [
+        "cross_agent_cancel",
+        "cross_agent_capabilities",
+        "cross_agent_close",
+        "cross_agent_list",
+        "cross_agent_read",
+        "cross_agent_send",
+        "cross_agent_spawn",
+        "cross_agent_wait",
+        "edit_file",
+        "list_dir",
+        "read_file",
+        "run_command",
+        "search",
+        "write_file"
+      ]
+    },
+    {
+      "at": 1.157256,
+      "event": "offered",
+      "scenario": "root",
+      "tools": [
+        "cross_agent_cancel",
+        "cross_agent_capabilities",
+        "cross_agent_close",
+        "cross_agent_list",
+        "cross_agent_read",
+        "cross_agent_send",
+        "cross_agent_spawn",
+        "cross_agent_wait",
+        "edit_file",
+        "list_dir",
+        "read_file",
+        "run_command",
+        "search",
+        "write_file"
+      ]
+    },
+    {
+      "at": 1.157267,
+      "event": "offered",
+      "scenario": "root",
+      "tools": [
+        "cross_agent_cancel",
+        "cross_agent_capabilities",
+        "cross_agent_close",
+        "cross_agent_list",
+        "cross_agent_read",
+        "cross_agent_send",
+        "cross_agent_spawn",
+        "cross_agent_wait",
+        "edit_file",
+        "list_dir",
+        "read_file",
+        "run_command",
+        "search",
+        "write_file"
+      ]
+    },
+    {
+      "at": 1.157274,
+      "cap_is_frame_token": true,
+      "cap_present": true,
+      "event": "hello",
+      "hello_pid_is_runner": true,
+      "peer_is_runner": true,
+      "scenario": "root"
+    },
+    {
+      "at": 1.157288,
+      "event": "item",
+      "key": "proof-key-1",
+      "scenario": "root",
+      "tool": "cross_agent_list"
+    },
+    {
+      "at": 1.157294,
+      "event": "call",
+      "key": "proof-key-1",
+      "same_arguments": true,
+      "scenario": "root",
+      "tool": "cross_agent_list",
+      "within_window": true
+    },
+    {
+      "at": 1.15772,
+      "bridge": true,
+      "child": {
+        "task_mode": "accept_edits"
+      },
+      "event": "configure",
+      "mcp_servers": 0,
+      "scenario": "child-accept-edits"
+    },
+    {
+      "at": 1.169697,
+      "before_session_started": true,
+      "echo": {
+        "bridge": "ready",
+        "mcp_servers": 0,
+        "mode": "accept_edits",
+        "protocol": 1,
+        "supervised": true,
+        "tools": [
+          "edit_file",
+          "list_dir",
+          "read_file",
+          "run_command",
+          "search",
+          "write_file"
+        ]
+      },
+      "event": "child_policy",
+      "scenario": "child-accept-edits"
+    },
+    {
+      "at": 1.175816,
+      "event": "approval",
+      "scenario": "child-accept-edits",
+      "tool": "write_file"
+    },
+    {
+      "at": 1.17586,
+      "decision": "deny",
+      "event": "decision",
+      "scenario": "child-accept-edits"
+    },
+    {
+      "at": 1.180922,
+      "event": "file",
+      "scenario": "child-accept-edits",
+      "written": false
+    },
+    {
+      "at": 1.181235,
+      "bridge": true,
+      "child": {
+        "task_mode": "plan"
+      },
+      "event": "configure",
+      "mcp_servers": 0,
+      "scenario": "child-plan"
+    },
+    {
+      "at": 1.195162,
+      "event": "offered",
+      "scenario": "child-plan",
+      "tools": [
+        "cross_agent_cancel",
+        "cross_agent_capabilities",
+        "cross_agent_close",
+        "cross_agent_list",
+        "cross_agent_read",
+        "cross_agent_send",
+        "cross_agent_spawn",
+        "cross_agent_wait",
+        "list_dir",
+        "read_file",
+        "search"
+      ]
+    },
+    {
+      "at": 1.195457,
+      "bridge": true,
+      "child": {
+        "task_mode": "plan"
+      },
+      "event": "configure",
+      "mcp_servers": 1,
+      "scenario": "child-mcp"
+    },
+    {
+      "at": 1.210763,
+      "event": "refused_startup",
+      "exit_code": 1,
+      "scenario": "child-mcp",
+      "session_started": false
+    },
+    {
+      "at": 1.793548,
+      "count": 0,
+      "event": "leaks"
+    }
+  ],
+  "provider": "local"
+}

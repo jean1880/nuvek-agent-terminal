@@ -40,3 +40,4 @@ mod test_support;
 pub mod text;
 pub mod tool_title;
 pub mod transition;
+pub mod user_tags;

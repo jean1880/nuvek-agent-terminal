@@ -96,6 +96,9 @@ mod tests {
         /// Catalog services for the next harness on this thread (default: none).
         static TEST_CATALOG: RefCell<Option<super::super::services::CatalogServices>> =
             const { RefCell::new(None) };
+        /// For the next harness on this thread: a `local` profile run by this runner binary on
+        /// this model server.
+        static TEST_LOCAL: RefCell<Option<(PathBuf, String)>> = const { RefCell::new(None) };
     }
     /// `request` as the bridge sends it, with call id `id`.
     fn call(id: u64, request: ToolRequest) -> agent_core::delegation::ipc::Call {
@@ -140,6 +143,7 @@ mod tests {
                         efforts: vec!["low".into(), "high".into()],
                         default_effort: None,
                         via: None,
+                        tools: None,
                     }]
                 }),
                 usage: Rc::new(|_| {
@@ -254,7 +258,20 @@ mod tests {
             available_for_delegation: true,
             ..Default::default()
         };
-        let profiles = vec![profile.clone()];
+        let local = TEST_LOCAL.with(|l| l.borrow_mut().take());
+        let mut profiles = vec![profile.clone()];
+        if local.is_some() {
+            profiles.push(Profile {
+                id: "local".into(),
+                name: "Local".into(),
+                command: agent_core::adapter::Driver::Local
+                    .info()
+                    .default_command
+                    .into(),
+                available_for_delegation: true,
+                ..Default::default()
+            });
+        }
         let cwd = dir.path().to_owned();
         let switch = cwd.clone();
         // An `opted-out` file turns delegation off for the fixture profile until it is removed.
@@ -273,12 +290,41 @@ mod tests {
             app_pid: std::process::id(),
             bridge_command: PathBuf::from("/usr/bin/agent-terminal"),
             profiles: Rc::new(profiles),
-            resolve: Rc::new(move |_| {
+            resolve: Rc::new(move |profile: &Profile| {
                 if cwd.join("unavailable").exists() {
                     return None;
                 }
                 if cwd.join("fail-resolve-after-first").exists() {
                     std::fs::write(cwd.join("unavailable"), "").unwrap();
+                }
+                // The `local` profile: the real runner on the test's model server, in a private
+                // home (its conversations go there).
+                if let Some((runner, base)) = local.as_ref().filter(|_| profile.id == "local") {
+                    return Some(super::super::seam::ResolvedChild {
+                        program: runner.to_string_lossy().into_owned(),
+                        extra_args: agent_core::local_agent::RunnerArgs::server_args(base, None),
+                        env: crate::agent_proc::AgentEnv {
+                            unset: std::env::vars_os()
+                                .map(|(k, _)| k.to_string_lossy().into_owned())
+                                .collect(),
+                            env: vec![
+                                ("HOME".into(), cwd.to_string_lossy().into_owned()),
+                                (
+                                    "XDG_STATE_HOME".into(),
+                                    cwd.join("state").to_string_lossy().into_owned(),
+                                ),
+                                (
+                                    "XDG_CONFIG_HOME".into(),
+                                    cwd.join("config").to_string_lossy().into_owned(),
+                                ),
+                                ("PATH".into(), "/usr/bin:/bin".into()),
+                            ],
+                        },
+                        default_model: Some("fixture-model".into()),
+                        default_effort: None,
+                        source: None,
+                        local_context: Some(Default::default()),
+                    });
                 }
                 Some(super::super::seam::ResolvedChild {
                     program: "/usr/bin/python3".into(),
@@ -302,6 +348,7 @@ mod tests {
                     default_model: Some("synthetic-model".into()),
                     default_effort: None,
                     source: None,
+                    local_context: None,
                 })
             }),
             make_adapter: Rc::new(|driver, program| -> Box<dyn agent_core::adapter::Adapter> {
@@ -2153,6 +2200,8 @@ mod tests {
     mod capacity_tests;
     /// Delivery and completion across refusals, revocations, retries and long answers.
     mod delivery_tests;
+    /// The Local agent as a delegated child and as a parent, on the real runner.
+    mod local_tests;
     /// Worker status, run agreement, startup deadlines and paging errors (PR-E).
     mod status_tests;
     /// A root's busy switch continues its task once, however the switch and its rebind interleave.

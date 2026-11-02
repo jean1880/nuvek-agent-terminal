@@ -4,6 +4,7 @@
 //! parts through `gio::spawn_blocking`. Redaction is in `agent-core`.
 
 pub mod attachments;
+pub mod delegation_client;
 pub mod delegation_config;
 pub mod diff;
 pub mod difftool;
@@ -33,4 +34,5 @@ pub mod store_writer;
 pub mod test_support;
 pub mod uninstall;
 pub mod update;
+pub mod user_tags_file;
 pub mod worktree;

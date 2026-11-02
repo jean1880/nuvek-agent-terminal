@@ -119,6 +119,8 @@ pub(crate) struct ResolvedChild {
     /// The model server the profile runs the agent on (`None`: the vendor): the model list a
     /// requested effort is checked against.
     pub source: Option<crate::model_catalog::ServerSource>,
+    /// A Local profile's instructions and budget (its MCP servers are dropped for a child).
+    pub local_context: Option<agent_core::local_context::LocalLaunchContext>,
 }
 
 // ---- IPC (C serves, A dispatches) --------------------------------------------------------------
@@ -262,6 +264,11 @@ pub(crate) trait DelegationHooks {
     /// rebinds quietly. False (the default, and with any delegated work live): the session does
     /// not suspend.
     fn suspending(&self, _generation: ProcessGeneration) -> bool {
+        false
+    }
+    /// A root has sub-agents alive or work under way that a restart of its process would cut
+    /// (its Local settings then wait). A child never holds one (the default).
+    fn holds_restart(&self) -> bool {
         false
     }
     /// The user stopped the turn from inside the session (an approval card's "Stop turn"), not

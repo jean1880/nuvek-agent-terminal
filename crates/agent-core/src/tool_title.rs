@@ -198,8 +198,10 @@ pub fn classify(item: ItemKind, name: &str, input: Option<&Value>) -> ToolTitle 
             // The app's own image tool reads as what it does, naming the files it shows (the
             // images themselves are drawn under the card).
             if action == "agent_terminal/show_image" {
+                // Claude and Codex put the images at the top; the Local runner under `arguments`.
                 let names: Vec<String> = args
                     .get("images")
+                    .or_else(|| args.get("arguments").and_then(|a| a.get("images")))
                     .and_then(Value::as_array)
                     .into_iter()
                     .flatten()
@@ -863,6 +865,16 @@ mod tests {
                 "{name}"
             );
         }
+        // The Local runner's delegation call: the tool by name, its images under `arguments`.
+        assert_eq!(
+            title(
+                ItemKind::McpTool,
+                "show_image",
+                json!({"server": "agent_terminal", "tool": "show_image",
+                    "arguments": {"images": [{"path": "c.png"}]}}),
+            ),
+            "Show image c.png"
+        );
     }
 
     #[test]

@@ -8926,6 +8926,7 @@ pub(super) mod tests {
             efforts: Vec::new(),
             default_effort: None,
             via: Some("Ollama".into()),
+            tools: None,
         };
         let on_server = Profile {
             provider: Some(ollama.clone()),
@@ -9114,6 +9115,7 @@ pub(super) mod tests {
             efforts: Vec::new(),
             default_effort: None,
             via: None,
+            tools: None,
         }];
         let kept = decide_live_model(&list, false, Some("qwen3-coder".into()), None);
         assert_eq!(kept.0.as_deref(), Some("qwen3-coder"));
@@ -10857,6 +10859,7 @@ pub(super) mod tests {
             efforts: vec!["low".into(), "high".into()],
             default_effort: None,
             via: None,
+            tools: None,
         };
         let list = vec![model("default"), model("sonnet")];
         let run =
@@ -10889,6 +10892,7 @@ pub(super) mod tests {
             efforts: vec!["low".into(), "high".into()],
             default_effort: None,
             via: None,
+            tools: None,
         }
     }
 

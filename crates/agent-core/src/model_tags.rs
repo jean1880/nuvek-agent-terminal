@@ -1,8 +1,10 @@
 //! What each model is good for, and how much of an agent's plan is left: the pure half of
 //! `cross_agent_capabilities`' `models[].tags` and `usage.headroom`.
 //!
-//! Every install has the [`built_in`] tags; a user's tag file (`model-tags.json`, contract v1),
-//! authored elsewhere and only read here, goes [`ModelTags::over`] them. Reading
+//! Every install has the [`built_in`] tags; a shared tag file (`model-tags.json`, contract v1),
+//! authored elsewhere and only read here, goes [`ModelTags::over`] them, and the user's own file
+//! (`model-tags.user.json`, the same contract, written only by the app: [`crate::user_tags`])
+//! goes over both. Each entry knows its [`TagSource`]. Reading
 //! is lenient: unknown fields are ignored, unknown tags kept, an entry that cannot match (no
 //! `match`, a driver this build does not know) skipped. Only a file that is not a v1 object with
 //! a `models` array is refused, and the caller then lists models with no tags and says why.
@@ -42,6 +44,8 @@ pub const MAX_TIER_BYTES: usize = 16;
 /// A `match` pattern, in bytes; a longer one is skipped rather than cut (a cut pattern would
 /// match something else).
 pub const MAX_MATCH_BYTES: usize = 128;
+/// An entry's `profile` id, in bytes (a profile id is at most 64).
+pub const MAX_PROFILE_BYTES: usize = 64;
 /// Entries kept, in file order.
 pub const MAX_ENTRIES: usize = 512;
 
@@ -117,6 +121,11 @@ impl Pattern {
         }
     }
 
+    /// The pattern as written, lowercased.
+    pub fn text(&self) -> String {
+        self.pieces.join("*")
+    }
+
     pub fn matches(&self, id: &str) -> bool {
         let id = id.to_lowercase();
         let Some((first, rest)) = self.pieces.split_first() else {
@@ -138,12 +147,41 @@ impl Pattern {
     }
 }
 
+/// Which layer an entry's tags came from, reported as `models[].tags_source`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TagSource {
+    /// The user's own tag file, written only by the app.
+    User,
+    /// The shared tag file, authored elsewhere and only read here.
+    #[default]
+    File,
+    /// The tags every install carries.
+    BuiltIn,
+}
+
+impl TagSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TagSource::User => "user",
+            TagSource::File => "file",
+            TagSource::BuiltIn => "built_in",
+        }
+    }
+}
+
 /// One `models[]` entry of the tag file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagEntry {
+    /// Where the entry was read from; [`parse`] says `File`, [`ModelTags::tagged`] changes it.
+    pub source: TagSource,
     pub pattern: Pattern,
     /// `None`: any driver.
     pub driver: Option<Driver>,
+    /// The id of the one profile whose models this entry is for (the same model id can suit two
+    /// servers differently); `None`: every profile. The app writes it in the user's file only,
+    /// and it is read in any layer.
+    pub profile: Option<String>,
     pub tier: Option<String>,
     pub tags: Vec<String>,
     pub best_for: Option<String>,
@@ -317,8 +355,10 @@ fn entry(v: &Value) -> Option<TagEntry> {
         }
     }
     Some(TagEntry {
+        source: TagSource::File,
         pattern: Pattern::new(pattern),
         driver,
+        profile: text(v, "profile", MAX_PROFILE_BYTES),
         tier: text(v, "tier", MAX_TIER_BYTES),
         tags,
         best_for: text(v, "best_for", MAX_BEST_FOR_BYTES),
@@ -373,10 +413,20 @@ const BUILT_IN_JSON: &str = include_str!("model_tags_default.json");
 
 /// [`BUILT_IN_JSON`], read. Empty only if it failed to parse, which its test rules out.
 pub fn built_in() -> ModelTags {
-    parse(BUILT_IN_JSON).unwrap_or_default()
+    parse(BUILT_IN_JSON)
+        .unwrap_or_default()
+        .tagged(TagSource::BuiltIn)
 }
 
 impl ModelTags {
+    /// These tags with every entry marked as read from `source`.
+    pub fn tagged(mut self, source: TagSource) -> ModelTags {
+        for e in &mut self.entries {
+            e.source = source;
+        }
+        self
+    }
+
     /// These tags (a user's file) over `base` (the built-in ones): their entries are looked up
     /// first, their vocabulary and effort policy win, and `base` fills in what they leave out.
     pub fn over(self, base: ModelTags) -> ModelTags {
@@ -394,23 +444,55 @@ impl ModelTags {
     /// The first entry, in file order, whose pattern matches `id` and whose driver (if any) is
     /// `driver`.
     pub fn lookup(&self, driver: Driver, id: &str) -> Option<&TagEntry> {
-        self.entries
-            .iter()
-            .find(|e| e.driver.is_none_or(|d| d == driver) && e.pattern.matches(id))
+        self.lookup_for(driver, id, None)
+    }
+
+    /// [`Self::lookup`] for a model of the profile `profile`. Layers rank user, file, built-in;
+    /// within a layer an entry scoped to this profile beats one with no profile. An entry scoped
+    /// to another profile never matches, and with no `profile` given only unscoped entries do.
+    pub fn lookup_for(&self, driver: Driver, id: &str, profile: Option<&str>) -> Option<&TagEntry> {
+        let fits = |e: &&TagEntry| e.driver.is_none_or(|d| d == driver) && e.pattern.matches(id);
+        [TagSource::User, TagSource::File, TagSource::BuiltIn]
+            .into_iter()
+            .find_map(|layer| {
+                let mut in_layer = self
+                    .entries
+                    .iter()
+                    .filter(|e| e.source == layer)
+                    .filter(fits);
+                let scoped = profile.and_then(|p| {
+                    self.entries
+                        .iter()
+                        .filter(|e| e.source == layer)
+                        .filter(fits)
+                        .find(|e| e.profile.as_deref() == Some(p))
+                });
+                scoped.or_else(|| in_layer.find(|e| e.profile.is_none()))
+            })
     }
 
     /// [`Self::lookup`] for a catalogue model. An alias with no entry of its own (Claude's
     /// `default`) is looked up as the model its description names first ("Sonnet 5.5 · …").
     pub fn lookup_model(&self, model: &CatalogModel) -> Option<&TagEntry> {
-        self.lookup(model.driver, &model.id).or_else(|| {
-            if model.id != "default" {
-                return None;
-            }
-            let head = model.description.as_deref()?.split('·').next()?.trim();
-            (!head.is_empty())
-                .then(|| self.lookup(model.driver, head))
-                .flatten()
-        })
+        self.lookup_model_for(model, None)
+    }
+
+    /// [`Self::lookup_model`] for a model listed by the profile `profile`.
+    pub fn lookup_model_for(
+        &self,
+        model: &CatalogModel,
+        profile: Option<&str>,
+    ) -> Option<&TagEntry> {
+        self.lookup_for(model.driver, &model.id, profile)
+            .or_else(|| {
+                if model.id != "default" {
+                    return None;
+                }
+                let head = model.description.as_deref()?.split('·').next()?.trim();
+                (!head.is_empty())
+                    .then(|| self.lookup_for(model.driver, head, profile))
+                    .flatten()
+            })
     }
 }
 
@@ -459,6 +541,76 @@ mod tests {
         assert!(
             tags.effort_policy.is_some(),
             "none of its own: the built-in one"
+        );
+    }
+
+    /// The three layers: the user's entry is found first, then the shared file's, then the
+    /// built-in one, and each says where it came from. A `local` driver is accepted.
+    #[test]
+    fn each_entry_reports_the_layer_it_came_from() {
+        let layer = |json: &str, source| parse(json).expect("layer").tagged(source);
+        let file = layer(
+            r#"{"version": 1, "models": [
+                {"match": "*sonnet*", "tier": "deep", "tags": ["code"]}]}"#,
+            TagSource::File,
+        );
+        let user = layer(
+            r#"{"version": 1, "models": [
+                {"match": "mine", "driver": "local", "tier": "fast", "tags": ["fast"]}]}"#,
+            TagSource::User,
+        );
+        let tags = user.over(file.over(built_in()));
+        let source = |d, id: &str| tags.lookup(d, id).map(|e| e.source);
+        assert_eq!(source(Driver::Local, "Mine"), Some(TagSource::User));
+        assert_eq!(source(Driver::Claude, "mine"), None, "driver narrows it");
+        assert_eq!(source(Driver::Claude, "sonnet"), Some(TagSource::File));
+        assert_eq!(source(Driver::Claude, "haiku"), Some(TagSource::BuiltIn));
+        for s in [TagSource::User, TagSource::File, TagSource::BuiltIn] {
+            assert_eq!(serde_json::to_value(s).expect("ser"), s.as_str());
+        }
+        assert_eq!(TagSource::BuiltIn.as_str(), "built_in");
+    }
+
+    /// A profile-scoped entry beats an unscoped one of the same layer for its own profile only;
+    /// a layer above still beats a scoped entry below it.
+    #[test]
+    fn a_profile_scoped_entry_wins_for_its_profile_within_its_layer() {
+        let layer = |json: &str, source| parse(json).expect("layer").tagged(source);
+        let user = layer(
+            r#"{"version": 1, "models": [
+                {"match": "m", "driver": "local", "tier": "standard"},
+                {"match": "m", "driver": "local", "profile": "p-small", "tier": "fast"}]}"#,
+            TagSource::User,
+        );
+        let file = layer(
+            r#"{"version": 1, "models": [
+                {"match": "m", "driver": "local", "profile": "p-big", "tier": "deep"},
+                {"match": "n", "driver": "local", "profile": "p-big", "tier": "deep"}]}"#,
+            TagSource::File,
+        );
+        let tags = user.over(file.over(built_in()));
+        let tier = |id: &str, profile: Option<&str>| {
+            tags.lookup_for(Driver::Local, id, profile)
+                .and_then(|e| e.tier.clone())
+        };
+        assert_eq!(tier("m", Some("p-small")).as_deref(), Some("fast"));
+        assert_eq!(tier("m", Some("p-other")).as_deref(), Some("standard"));
+        assert_eq!(tier("m", None).as_deref(), Some("standard"));
+        assert_eq!(
+            tier("m", Some("p-big")).as_deref(),
+            Some("standard"),
+            "the user's unscoped entry is above the file's scoped one"
+        );
+        assert_eq!(
+            tier("n", Some("p-big")).as_deref(),
+            Some("deep"),
+            "any layer may scope"
+        );
+        assert_eq!(tier("n", Some("p-small")), None);
+        assert_eq!(
+            tier("n", None),
+            None,
+            "a scoped entry never matches without a profile"
         );
     }
 
@@ -617,6 +769,7 @@ mod tests {
             efforts: vec![],
             default_effort: None,
             via: None,
+            tools: None,
         };
         let default = model("default", Some("Sonnet 5.5 · Efficient for routine tasks"));
         assert_eq!(

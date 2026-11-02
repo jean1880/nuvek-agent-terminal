@@ -17,13 +17,15 @@ use std::time::Duration;
 
 use agent_core::adapter::{Command, Mode};
 use agent_core::attachment::{AttachmentRef, PromptAttachment, ToolImageSource};
+use agent_core::delegation::ToolName;
 use agent_core::event::{
     Decision, Envelope, Event, ItemKind, ItemStatus, ReasoningLabel, ReasoningState,
     ResponseCapability, StreamKind, TurnState, Usage,
 };
 use agent_core::local_agent::{
-    error_message, gate, refuses_images, refuses_tools, tools_for, ChatMessage, Gate, MessageImage,
-    RunnerArgs, StreamEvent, StreamReader, Tool, ToolCall, APPROVAL_OPTIONS,
+    child_gate, child_tools, delegation_tools, error_message, gate, refuses_images, refuses_tools,
+    tools_for, BridgeState, ChatMessage, Gate, LocalChildPolicy, MessageImage, RunnerArgs,
+    StreamEvent, StreamReader, Tool, ToolCall, APPROVAL_OPTIONS,
 };
 use agent_core::local_context::{exchange_starts, ContextBudget, RequestPlan};
 use serde::{Deserialize, Serialize};
@@ -244,6 +246,16 @@ pub fn sessions_dir(xdg_state: Option<&str>, home: Option<&str>) -> Option<PathB
 /// `agent-terminal --local-agent …`: parses the arguments, reads the key from its variable, and
 /// runs until stdin closes. The exit code is the process's.
 pub fn main(args: &[String], user_agent: &str) -> i32 {
+    // First of all: this process will hold the model server's key and the delegation
+    // capability. Not dumpable, its `/proc/<pid>/environ` and `mem` are closed to every other
+    // process of this user (the commands it runs included), as are ptrace and core dumps.
+    // Removing a variable later edits only libc's copy, never the kernel's. A process that
+    // cannot be made so does not start.
+    // SAFETY: prctl(PR_SET_DUMPABLE) takes plain integer arguments and touches no memory.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        eprintln!("agent-terminal --local-agent: cannot protect this process's memory");
+        return 2;
+    }
     let args = match RunnerArgs::parse(args) {
         Ok(args) => args,
         Err(why) => {
@@ -261,6 +273,12 @@ pub fn main(args: &[String], user_agent: &str) -> i32 {
         },
         None => None,
     };
+    // The key is held from here on: a command the agent runs (inheriting this environment)
+    // never gets it. Removed while this process has no other thread yet. (The kernel's copy of
+    // the starting environment stays, unreadable to others: see the top of this function.)
+    if let Some(name) = &args.key_env {
+        std::env::remove_var(name);
+    }
     let Some(dir) = sessions_dir(
         std::env::var("XDG_STATE_HOME").ok().as_deref(),
         std::env::var("HOME").ok().as_deref(),
@@ -400,6 +418,15 @@ pub struct Runner<C: ChatClient, W: Write> {
     /// The thread's folder, opened when the session starts: every write and command is
     /// anchored to it.
     workspace: Option<std::sync::Arc<crate::local_tools::Workspace>>,
+    /// This process's own delegation client, when its startup frame carried a binding: the
+    /// capability lives only here, in memory.
+    bridge: Option<crate::delegation_client::Blocking>,
+    /// The binding was there but its client could not start (said by `cross_agent_*` calls).
+    bridge_failed: Option<String>,
+    /// The capability, masked exactly wherever the runner shows text.
+    bridge_secret: Option<String>,
+    /// A supervised delegation child's policy.
+    child: Option<LocalChildPolicy>,
 }
 
 impl<C: ChatClient, W: Write> Runner<C, W> {
@@ -444,6 +471,75 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             image_cache: Default::default(),
             stopped_result: None,
             workspace: None,
+            bridge: None,
+            bridge_failed: None,
+            bridge_secret: None,
+            child: None,
+        }
+    }
+
+    /// Adopts `masks`, keeping the capability masked too.
+    fn adopt_masks(&mut self, masks: crate::local_mcp::CredentialMasks) {
+        self.masks = match &self.bridge_secret {
+            Some(secret) => masks.with_secret(secret),
+            None => masks,
+        };
+    }
+
+    /// Where this runner's delegation client stands.
+    fn bridge_state(&self) -> BridgeState {
+        use crate::delegation_client::Status;
+        match (&self.bridge, &self.bridge_failed) {
+            (Some(bridge), _) => match bridge.status() {
+                Status::Connecting => BridgeState::Connecting,
+                Status::Ready => BridgeState::Ready,
+                Status::Degraded(_) => BridgeState::Degraded,
+            },
+            (None, Some(_)) => BridgeState::Degraded,
+            (None, None) => BridgeState::Unbound,
+        }
+    }
+
+    /// Starts this process's own delegation client with `bridge`, and waits (bounded by the
+    /// welcome deadline) until it is connected or has failed.
+    fn connect_bridge(&mut self, bridge: agent_core::delegation::launch::LocalBridge) {
+        self.bridge_secret = Some(bridge.token.expose_secret().to_owned());
+        let masks = std::mem::take(&mut self.masks);
+        self.adopt_masks(masks);
+        if let Err(why) = bridge.validate() {
+            self.bridge_failed = Some(why);
+            return;
+        }
+        let config = crate::delegation_client::Config::new(
+            PathBuf::from(&bridge.endpoint),
+            bridge.instance,
+            bridge.token,
+            std::process::id(),
+        );
+        match crate::delegation_client::Blocking::start(config) {
+            Ok(client) => {
+                client.wait_ready(Duration::from_millis(
+                    agent_core::delegation::ipc::WELCOME_DEADLINE_MS + 500,
+                ));
+                self.bridge = Some(client);
+            }
+            Err(why) => self.bridge_failed = Some(why.message),
+        }
+    }
+
+    /// `mode`, never wider than a child's task mode.
+    fn within_policy(&self, mode: Mode) -> Mode {
+        match &self.child {
+            Some(policy) => narrower(mode, policy.mode()),
+            None => mode,
+        }
+    }
+
+    /// The built-ins offered now: the mode's, and for a child also within its policy.
+    fn offered_builtins(&self) -> Vec<Tool> {
+        match &self.child {
+            Some(policy) => child_tools(policy, self.mode),
+            None => tools_for(self.mode),
         }
     }
 
@@ -558,12 +654,49 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 }));
                 return 1;
             }
-            Ok(RunnerInput::Command(Command::ConfigureLocal { context })) => {
-                if let Err(why) = context.validate() {
+            Ok(RunnerInput::Command(Command::ConfigureLocal {
+                context,
+                bridge,
+                child,
+            })) => {
+                // A supervised child runs no user MCP server: a frame that names one is refused.
+                let valid = match &child {
+                    Some(_) => context.validate_for_child(),
+                    None => context.validate(),
+                };
+                if let Err(why) = valid {
                     self.emit(Envelope::new(Event::Error { message: why }));
                     return 1;
                 }
+                if child.is_some() && bridge.is_none() {
+                    self.emit(Envelope::new(Event::Error {
+                        message: "A delegated Local agent needs its delegation binding.".into(),
+                    }));
+                    return 1;
+                }
+                if let Some(policy) = child {
+                    // Never wider than the task mode it was started for.
+                    self.mode = narrower(self.mode, policy.mode());
+                    self.child = Some(policy);
+                }
                 self.configure(*context);
+                if let Some(bridge) = bridge {
+                    self.connect_bridge(*bridge);
+                }
+                if let Some(policy) = self.child.clone() {
+                    let echo = agent_core::local_agent::ChildPolicyEcho::of(
+                        &policy,
+                        self.context.mcp_servers.len(),
+                        self.bridge_state(),
+                    );
+                    self.emit(
+                        Envelope::new(Event::ControlResult {
+                            ok: serde_json::to_value(echo).ok(),
+                            error: None,
+                        })
+                        .request(agent_core::local_agent::CHILD_POLICY_REQUEST),
+                    );
+                }
             }
             _ => {
                 self.emit(Envelope::new(Event::Error {
@@ -721,6 +854,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 Ok(())
             }
             Command::SetMode { mode } => {
+                let mode = self.within_policy(mode);
                 self.mode = mode;
                 self.emit(Envelope::new(Event::ModeChanged { mode }));
                 Ok(())
@@ -780,7 +914,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                             Path::new(&self.args.cwd),
                         ) {
                             Ok(session) => {
-                                self.masks = session.masks();
+                                self.adopt_masks(session.masks());
                                 self.mcp = Some(session);
                             }
                             Err(why) => {
@@ -962,6 +1096,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
 
     /// Applies `mode` and says so; whether it narrowed what may run unasked.
     fn set_mode(&mut self, mode: Mode) -> bool {
+        let mode = self.within_policy(mode);
         let narrowed = self.mode == Mode::Bypass && mode != Mode::Bypass
             || mode == Mode::Plan && self.mode != Mode::Plan;
         self.mode = mode;
@@ -1009,6 +1144,13 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 ));
                 return Ok(());
             }
+        };
+        self.turn_instructions.delegation = if self.child.is_some() {
+            Some(agent_core::local_context::DelegationRole::Child)
+        } else if self.bridge_state() == BridgeState::Ready {
+            Some(agent_core::local_context::DelegationRole::Root)
+        } else {
+            None
         };
         if let Err(error) = self.prepare_mcp(commands) {
             self.stop_mcp();
@@ -1201,8 +1343,8 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 )
                 .map_err(StepError::Failed)?,
             );
-            if let Some(session) = &self.mcp {
-                self.masks = session.masks();
+            if let Some(masks) = self.mcp.as_ref().map(crate::local_mcp::Session::masks) {
+                self.adopt_masks(masks);
             }
         }
         let Some(session) = &self.mcp else {
@@ -1273,7 +1415,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         let mut candidates: Vec<_> = if self.no_tools {
             Vec::new()
         } else {
-            tools_for(self.mode)
+            self.offered_builtins()
                 .into_iter()
                 .map(|tool| SchemaCandidate {
                     tool: agent_core::local_mcp::ResolvedTool::builtin(tool, tool.schema()),
@@ -1281,6 +1423,15 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 })
                 .collect()
         };
+        if !self.no_tools {
+            // The app's delegation tools: no card in any mode; the supervisor judges each call.
+            candidates.extend(delegation_tools(self.bridge_state()).iter().map(|tool| {
+                SchemaCandidate {
+                    tool: agent_core::local_mcp::ResolvedTool::delegation(*tool),
+                    priority: 0,
+                }
+            }));
+        }
         if !self.no_tools {
             candidates.extend(self.registry.values().map(|entry| {
                 SchemaCandidate {
@@ -1447,7 +1598,12 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         usage: &mut Usage,
     ) -> Result<(agent_core::local_agent::Reply, bool, Option<Stop>), StepError> {
         // This turn's MCP aliases, so a server repeating one whole with each fragment is read right.
-        let mut reader = StreamReader::with_known_names(self.registry.keys().cloned());
+        let mut reader = StreamReader::with_known_names(
+            self.registry
+                .keys()
+                .cloned()
+                .chain(ToolName::ALL.iter().map(|t| t.as_str().to_owned())),
+        );
         let mut shown = Shown::default();
         let mut stopped = None;
         let mut server_error = None;
@@ -1508,12 +1664,27 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         let failure = failed.or(server_error);
         if let Some(why) = failure {
             if !self.no_tools && body.get("tools").is_some() && refuses_tools(&why) {
+                // A delegated child that cannot use tools cannot read its workspace or report to
+                // its parent: its run fails, never answering blind as if it had worked.
+                if self.child.is_some() {
+                    return Err(StepError::Failed(format!(
+                        "The model {model} cannot call tools, and a delegated Local agent needs \
+                         them. Start it on a model that supports tools."
+                    )));
+                }
                 self.no_tools = true;
                 self.stop_mcp();
+                let delegation = if self.bridge_state() == BridgeState::Unbound {
+                    ""
+                } else {
+                    " It cannot use the cross_agent_* tools either."
+                };
                 self.emit(Envelope::new(Event::Notice {
-                    text: "This model cannot use tools, so it answers without reading or \
-                           changing anything. Pick a model that supports tools to let it work."
-                        .to_owned(),
+                    text: format!(
+                        "This model cannot use tools, so it answers without reading or \
+                         changing anything.{delegation} Pick a model that supports tools to let \
+                         it work."
+                    ),
                 }));
                 let system = agent_core::local_context::compose_system(
                     &self.args.cwd,
@@ -1696,6 +1867,11 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         if let Some(entry) = self.registry.get(&call.function.name).cloned() {
             return self.call_mcp(call, &entry, commands, reservation, advertised);
         }
+        if let Some(tool) = ToolName::parse(&call.function.name)
+            .filter(|_| self.bridge_state() != BridgeState::Unbound)
+        {
+            return self.call_delegation(tool, call, commands, reservation, advertised);
+        }
         if let Some(stop) = self.poll_commands(commands) {
             return Err(StepError::Stop(stop));
         }
@@ -1763,7 +1939,13 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         // Gated in the mode as it is now (a change during the turn is applied as it arrives),
         // and again if it changes while the card is open.
         loop {
-            match gate(tool, self.mode, outside) {
+            // A supervised child asks before every write and command: the app's inherited
+            // authority judges each one.
+            let verdict = match &self.child {
+                Some(_) => child_gate(tool, self.mode, outside),
+                None => gate(tool, self.mode, outside),
+            };
+            match verdict {
                 Gate::Refuse(why) => {
                     self.emit(Envelope::item_completed(
                         &item,
@@ -1779,13 +1961,33 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 Gate::Ask => match self.ask(
                     tool,
                     &title,
-                    &input,
+                    &card_input(tool, &input, target.as_deref()),
                     crate::local_tools::card_note(&ws, tool, &input, target.as_deref()),
                     commands,
                 )? {
                     None => continue,
-                    Some(Decision::Allow | Decision::AllowForSession | Decision::AllowAlways) => {}
-                    Some(Decision::Deny | Decision::Cancel) => {
+                    Some((
+                        Decision::Allow | Decision::AllowForSession | Decision::AllowAlways,
+                        _,
+                    )) => {}
+                    // A refusal the app gave its reason for (a delegated agent's inherited
+                    // authority) is told as it is; otherwise the user declined.
+                    Some((Decision::Deny | Decision::Cancel, Some(reason)))
+                        if !reason.trim().is_empty() =>
+                    {
+                        let reason = agent_core::local_context::bound_result(
+                            &agent_core::redact::redact(&reason),
+                            reservation.saturating_sub(48),
+                        );
+                        self.emit(Envelope::item_completed(
+                            &item,
+                            ItemStatus::Declined,
+                            None,
+                            Some(&reason),
+                        ));
+                        return Ok(format!("Refused: {reason} Do not retry it."));
+                    }
+                    Some((Decision::Deny | Decision::Cancel, _)) => {
                         self.emit(Envelope::item_completed(
                             &item,
                             ItemStatus::Declined,
@@ -1862,6 +2064,164 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 Ok(output)
             }
             Err(why) => fail(self, why),
+        }
+    }
+
+    /// One of the app's delegation tools, called through this process's own client: no card in
+    /// any mode (the supervisor judges the call against the caller's live authority). Its item
+    /// is shown first, under a key this runner mints, with exactly the arguments sent: the
+    /// supervisor attests the call against that line. Arguments that cannot be shown as they
+    /// are (a credential would be masked) are refused, never sent.
+    fn call_delegation(
+        &mut self,
+        tool: ToolName,
+        call: &ToolCall,
+        commands: &Receiver<RunnerInput>,
+        reservation: usize,
+        advertised: bool,
+    ) -> Result<String, StepError> {
+        use crate::delegation_client::Waited;
+        use agent_core::delegation::correlation::InvocationKey;
+        use agent_core::delegation::ipc::{Call, CallOutcome};
+        use agent_core::delegation::{ErrorCode, ToolError};
+        if let Some(stop) = self.poll_commands(commands) {
+            return Err(StepError::Stop(stop));
+        }
+        let item = self.id("call");
+        let arguments = if call.function.arguments.len() <= 65536 {
+            call.input()
+        } else {
+            Err("Delegation arguments exceed 64 KiB.".into())
+        };
+        // Only the exact credentials this runner holds (its MCP servers' and its own capability)
+        // are kept out: there is no card, and the app masks every envelope before it shows or
+        // stores it, as it does any agent's tool input. A key name never masks a value here
+        // (an `idempotency_key` is not a secret).
+        let faithful: Option<Value> = arguments
+            .as_ref()
+            .ok()
+            .filter(|arguments| {
+                let mut shown = (*arguments).clone();
+                self.masks.metadata(&mut shown).is_ok() && shown == **arguments
+            })
+            .cloned();
+        // Emitted as is (no lossy masking): what the supervisor reads back must be exactly the
+        // call it receives, and `faithful` is already what a card would show.
+        let started = Envelope::item_started(
+            &item,
+            ItemKind::McpTool,
+            tool.as_str(),
+            Some(serde_json::json!({
+                "server": agent_core::delegation::SERVER_NAME,
+                "tool": tool.as_str(),
+                "arguments": faithful,
+            })),
+            None,
+        );
+        if let Ok(value) = serde_json::to_value(&started) {
+            self.emit_value(value);
+        }
+        let finish = |me: &mut Self, error: ToolError| -> Result<String, StepError> {
+            let mut value = serde_json::json!({ "error": error });
+            me.masks.value_lossy(&mut value);
+            let output = agent_core::local_context::bound_result(&value.to_string(), reservation);
+            me.emit(Envelope::item_completed(
+                &item,
+                ItemStatus::Failed,
+                None,
+                Some(&output),
+            ));
+            Ok(output)
+        };
+        if !advertised {
+            return finish(
+                self,
+                ToolError::new(
+                    ErrorCode::RuntimeUnavailable,
+                    "this delegation tool was not offered for this request",
+                ),
+            );
+        }
+        if let Err(why) = &arguments {
+            return finish(
+                self,
+                ToolError::new(ErrorCode::InvalidArgument, why.as_str()),
+            );
+        }
+        let Some(arguments) = faithful else {
+            return finish(
+                self,
+                ToolError::new(
+                    ErrorCode::InvalidArgument,
+                    "the arguments hold a credential this agent holds, so they were not sent; \
+                     leave credentials out of delegation calls",
+                ),
+            );
+        };
+        let parsed = match agent_core::delegation::parse_request(
+            tool,
+            &arguments,
+            &agent_core::delegation::Limits::default(),
+        ) {
+            Ok(parsed) => parsed,
+            Err(error) => return finish(self, error),
+        };
+        let Some(bridge) = self.bridge.take() else {
+            let reason = self
+                .bridge_failed
+                .clone()
+                .unwrap_or_else(|| "delegation is unavailable".to_owned());
+            return finish(self, ToolError::new(ErrorCode::RuntimeUnavailable, &reason));
+        };
+        let timeout_ms = agent_core::delegation::call_timeout_ms(&parsed);
+        let request = Call {
+            id: bridge.next_id(),
+            tool,
+            args: arguments,
+            timeout_ms,
+            invocation: Some(InvocationKey::Local {
+                item_id: item.clone(),
+            }),
+        };
+        let mut stopped = None;
+        let waited = bridge.call(request, &mut || {
+            if stopped.is_none() {
+                stopped = self.poll_commands(commands);
+            }
+            stopped.is_some()
+        });
+        self.bridge = Some(bridge);
+        match waited {
+            Waited::Stopped => {
+                self.emit(Envelope::item_completed(
+                    &item,
+                    ItemStatus::Interrupted,
+                    None,
+                    None,
+                ));
+                self.stopped_result = Some(if tool.is_mutating() {
+                    "Stopped by the user while it ran: it was cancelled, but a change the \
+                     supervisor already accepted stands. Check with cross_agent_list or \
+                     cross_agent_read, and retry only with the same idempotency_key."
+                        .to_owned()
+                } else {
+                    "Stopped by the user before it completed.".to_owned()
+                });
+                Err(StepError::Stop(stopped.unwrap_or(Stop::Interrupted)))
+            }
+            Waited::Done(Ok(CallOutcome::Ok(mut value))) => {
+                self.masks.value_lossy(&mut value);
+                let output =
+                    agent_core::local_context::bound_result(&value.to_string(), reservation);
+                self.emit(Envelope::item_completed(
+                    &item,
+                    ItemStatus::Completed,
+                    Some(&output),
+                    None,
+                ));
+                Ok(output)
+            }
+            Waited::Done(Ok(CallOutcome::Err(error)) | Err(error)) => finish(self, error),
         }
     }
 
@@ -2229,7 +2589,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         input: &Value,
         note: Option<String>,
         commands: &Receiver<RunnerInput>,
-    ) -> Result<Option<Decision>, StepError> {
+    ) -> Result<Option<(Decision, Option<String>)>, StepError> {
         let request = self.id("approval");
         if !self.emit_approval(
             Envelope::new(Event::ApprovalRequested {
@@ -2243,19 +2603,20 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             })
             .request(&request),
         ) {
-            return Ok(Some(Decision::Deny));
+            return Ok(Some((Decision::Deny, None)));
         }
         loop {
             match commands.recv_timeout(Duration::from_secs(3600)) {
                 Ok(RunnerInput::Command(Command::Approve {
                     request: answered,
                     decision,
+                    message,
                     ..
                 })) if answered == request => {
                     self.emit(
                         Envelope::new(Event::ApprovalResolved { decision }).request(&request),
                     );
-                    return Ok(Some(decision));
+                    return Ok(Some((decision, message)));
                 }
                 Ok(RunnerInput::Invalid(why)) => {
                     self.emit(Envelope::new(Event::ApprovalExpired).request(&request));
@@ -2397,6 +2758,36 @@ fn sends_images(body: &Value) -> bool {
         .filter_map(|m| m["content"].as_array())
         .flatten()
         .any(|part| part["type"] == "image_url")
+}
+
+/// What a card for `tool` shows the app: the call's input and, for a call that names a path,
+/// `resolved_path`, the target this runner resolved and will act on (null when the path leads
+/// through a link that names nothing). The app judges that target as well as the path named, so
+/// a link changed between this resolution and the app's judgement cannot move what is allowed;
+/// and the runner refuses to act if the path leads anywhere else when it runs.
+fn card_input(tool: Tool, input: &Value, target: Option<&Path>) -> Value {
+    let mut card = input.clone();
+    if crate::local_tools::named_path(tool, input).is_some() {
+        card[agent_core::local_agent::RESOLVED_PATH] = target
+            .map(|t| Value::String(t.to_string_lossy().into_owned()))
+            .unwrap_or(Value::Null);
+    }
+    card
+}
+
+/// The mode that lets less run unasked: Plan, then Ask, then Accept edits, then Bypass.
+fn narrower(a: Mode, b: Mode) -> Mode {
+    let rank = |m: Mode| match m {
+        Mode::Plan => 0,
+        Mode::Ask => 1,
+        Mode::AcceptEdits => 2,
+        Mode::Bypass => 3,
+    };
+    if rank(a) <= rank(b) {
+        a
+    } else {
+        b
+    }
 }
 
 /// The text a message carries, in bytes: its content, its calls and its reasoning.
@@ -2607,15 +2998,13 @@ mod tests {
                 attachments: Vec::new(),
                 text: "too early".into(),
             },
-            Command::ConfigureLocal {
-                context: Box::new(agent_core::local_context::LocalLaunchContext {
-                    budget: agent_core::local_context::ContextBudget {
-                        context_tokens: 1,
-                        ..Default::default()
-                    },
+            Command::configure_local(agent_core::local_context::LocalLaunchContext {
+                budget: agent_core::local_context::ContextBudget {
+                    context_tokens: 1,
                     ..Default::default()
-                }),
-            },
+                },
+                ..Default::default()
+            }),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let (tx, rx) = channel();
@@ -2797,12 +3186,12 @@ mod tests {
         dir: PathBuf,
         context: agent_core::local_context::LocalLaunchContext,
     ) -> Run {
+        start_with_frame(args, script, dir, Command::configure_local(context))
+    }
+
+    fn start_with_frame(args: RunnerArgs, script: Script, dir: PathBuf, frame: Command) -> Run {
         let (commands, rx) = channel();
-        commands
-            .send(RunnerInput::Command(Command::ConfigureLocal {
-                context: Box::new(context),
-            }))
-            .unwrap();
+        commands.send(RunnerInput::Command(frame)).unwrap();
         let (tx, events) = channel();
         let done = std::thread::spawn(move || {
             Runner::new(args, script, dir, Lines(tx, Vec::new())).run(&rx)
@@ -3034,6 +3423,593 @@ mod tests {
             commands.recv_timeout(Duration::from_secs(10)),
             Ok(RunnerInput::Command(Command::Prompt { attachments, .. })) if attachments.len() == MAX_PER_MESSAGE
         ));
+    }
+
+    mod delegation {
+        use super::*;
+        use crate::test_support::FakeDelegation;
+        use agent_core::delegation::correlation::InvocationKey;
+        use agent_core::delegation::ipc::CallOutcome;
+        use agent_core::delegation::launch::LocalBridge;
+        use agent_core::delegation::{CapabilityToken, InstanceNonce, TaskMode};
+
+        fn bridge(fake: &FakeDelegation) -> LocalBridge {
+            LocalBridge {
+                endpoint: fake.path.display().to_string(),
+                instance: InstanceNonce::from_bytes([2; 16]),
+                token: CapabilityToken::from_random([1; 32]),
+            }
+        }
+
+        fn frame(fake: &FakeDelegation, child: Option<LocalChildPolicy>) -> Command {
+            Command::ConfigureLocal {
+                context: Box::default(),
+                bridge: Some(Box::new(bridge(fake))),
+                child,
+            }
+        }
+
+        fn answer_ok() -> crate::test_support::Answer {
+            Box::new(|call| {
+                Some(CallOutcome::Ok(
+                    json!({"workers": [], "tool": call.tool.as_str()}),
+                ))
+            })
+        }
+
+        /// The tool names a request offered.
+        fn offered(body: &Value) -> Vec<String> {
+            body["tools"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|t| t["function"]["name"].as_str().map(str::to_owned))
+                .collect()
+        }
+
+        /// A bound root connects from its own process with the capability from its frame, is
+        /// offered every delegation tool (no card), shows each call under a key it minted and
+        /// sends exactly that key and those arguments.
+        #[test]
+        fn a_bound_root_calls_through_its_own_client_with_its_own_key() {
+            let sock = tempfile::tempdir().unwrap();
+            let fake = FakeDelegation::start(sock.path(), answer_ok());
+            let work = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let script = Script::new(vec![
+                Ok(tool_call("c1", "cross_agent_list", json!({}))),
+                Ok(text(&["Nobody"])),
+            ]);
+            let run = start_with_frame(
+                args(work.path(), Mode::Ask),
+                script.clone(),
+                state.path().into(),
+                frame(&fake, None),
+            );
+            run.send(prompt("who works for me?"));
+            let mut item = None;
+            let mut asked = false;
+            run.wait_for(|e| {
+                match &e.event {
+                    Event::ApprovalRequested { .. } => asked = true,
+                    Event::ItemStarted {
+                        kind: ItemKind::McpTool,
+                        input: Some(input),
+                        ..
+                    } => item = Some((e.item.clone().unwrap(), input.clone())),
+                    _ => {}
+                }
+                completed(e)
+            });
+            run.finish();
+            assert!(!asked, "delegation tools never ask");
+            let (item, input) = item.expect("shown");
+            assert_eq!(input["server"], "agent_terminal");
+            assert_eq!(input["tool"], "cross_agent_list");
+            assert_eq!(input["arguments"], json!({}));
+            let hellos = fake.hellos();
+            assert_eq!(hellos.len(), 1);
+            assert_eq!(
+                hellos[0].0.cap.expose_secret(),
+                bridge(&fake).token.expose_secret()
+            );
+            assert_eq!(hellos[0].0.bridge.pid, std::process::id());
+            assert_eq!(hellos[0].1, Some(std::process::id()));
+            let calls = fake.calls();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                calls[0].invocation,
+                Some(InvocationKey::Local { item_id: item })
+            );
+            assert_eq!(calls[0].args, json!({}));
+            let bodies = script.bodies();
+            let tools = offered(&bodies[0]);
+            for tool in ToolName::ALL {
+                assert!(tools.contains(&tool.as_str().to_owned()), "{tool:?}");
+            }
+            let system = bodies[0]["messages"][0]["content"].as_str().unwrap();
+            assert!(system.contains("cross_agent_capabilities first"));
+            let result = bodies[1]["messages"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()
+                .clone();
+            assert!(result["content"].as_str().unwrap().contains("\"workers\""));
+        }
+
+        /// A key name never masks a delegation argument: an idempotency key (digits and all) and
+        /// the task text are sent exactly as shown; only a credential the runner holds stops a
+        /// call.
+        #[test]
+        fn delegation_arguments_are_sent_as_shown() {
+            let sock = tempfile::tempdir().unwrap();
+            let fake = FakeDelegation::start(sock.path(), answer_ok());
+            let work = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let send = json!({"target": "parent", "text": "step 3 of 7 done", "kind": "report",
+                "delivery": "next_turn", "idempotency_key": "report-2026-11-01-a1b2c3"});
+            let secret = bridge(&fake).token.expose_secret().to_owned();
+            let leak = json!({"target": "parent", "text": secret, "kind": "report",
+                "delivery": "next_turn", "idempotency_key": "report-2"});
+            let script = Script::new(vec![
+                Ok(tool_call("c1", "cross_agent_send", send.clone())),
+                Ok(tool_call("c2", "cross_agent_send", leak)),
+                Ok(text(&["Ok"])),
+            ]);
+            let run = start_with_frame(
+                args(work.path(), Mode::Ask),
+                script.clone(),
+                state.path().into(),
+                frame(&fake, None),
+            );
+            run.send(prompt("report"));
+            run.wait_for(completed);
+            run.finish();
+            let calls = fake.calls();
+            assert_eq!(calls.len(), 1, "the leaking call was never sent");
+            assert_eq!(calls[0].args, send);
+            let told = script.bodies()[2]["messages"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(told.contains("credential"), "{told}");
+            assert!(!told.contains(&secret));
+        }
+
+        /// Plan mode still offers the delegation tools (the supervisor admits only plan
+        /// children); an unbound runner offers none and refuses a call to one.
+        #[test]
+        fn delegation_tools_are_offered_only_with_a_binding() {
+            let sock = tempfile::tempdir().unwrap();
+            let fake = FakeDelegation::start(sock.path(), answer_ok());
+            let work = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let script = Script::new(vec![Ok(text(&["Ok"]))]);
+            let run = start_with_frame(
+                args(work.path(), Mode::Plan),
+                script.clone(),
+                state.path().into(),
+                frame(&fake, None),
+            );
+            run.send(prompt("plan"));
+            run.wait_for(completed);
+            run.finish();
+            let tools = offered(&script.bodies()[0]);
+            assert!(tools.contains(&"cross_agent_spawn".to_owned()));
+            assert!(!tools.contains(&"write_file".to_owned()));
+
+            let script = Script::new(vec![
+                Ok(tool_call("c1", "cross_agent_list", json!({}))),
+                Ok(text(&["Ok"])),
+            ]);
+            let run = start(
+                args(work.path(), Mode::Ask),
+                script.clone(),
+                state.path().into(),
+            );
+            run.send(prompt("go"));
+            run.wait_for(completed);
+            run.finish();
+            let bodies = script.bodies();
+            assert!(!offered(&bodies[0])
+                .iter()
+                .any(|t| t.starts_with("cross_agent_")));
+            let told = bodies[1]["messages"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()
+                .clone();
+            assert!(
+                told["content"].as_str().unwrap().contains("not advertised")
+                    || told["content"].as_str().unwrap().contains("no tool named")
+            );
+            assert!(fake.calls().is_empty());
+        }
+
+        /// A Stop while a call waits cancels it at the supervisor, and the model is told an
+        /// accepted change stands; a revocation leaves only the capabilities tool.
+        #[test]
+        fn a_stop_cancels_a_waiting_call_and_a_revocation_degrades_the_offer() {
+            let sock = tempfile::tempdir().unwrap();
+            let fake = FakeDelegation::start(
+                sock.path(),
+                Box::new(|call| {
+                    (call.tool != ToolName::CrossAgentWait)
+                        .then(|| CallOutcome::Ok(json!({"ok": true})))
+                }),
+            );
+            let work = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let script = Script::new(vec![
+                Ok(tool_call(
+                    "c1",
+                    "cross_agent_wait",
+                    json!({"timeout_ms": 30000}),
+                )),
+                Ok(text(&["Ok"])),
+            ]);
+            let run = start_with_frame(
+                args(work.path(), Mode::Ask),
+                script.clone(),
+                state.path().into(),
+                frame(&fake, None),
+            );
+            run.send(prompt("wait"));
+            let started = std::time::Instant::now();
+            while fake.calls().is_empty() && started.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let call = fake
+                .calls()
+                .first()
+                .cloned()
+                .expect("the wait reached the supervisor");
+            run.send(Command::Interrupt);
+            let state_seen = run.wait_for(|e| completed(e).map(|c| c.0));
+            assert_eq!(state_seen, TurnState::Interrupted);
+            let started = std::time::Instant::now();
+            while !fake.cancels().contains(&call.id) && started.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                fake.cancels().contains(&call.id),
+                "cancelled at the supervisor"
+            );
+            assert!(fake.revoke(), "the live connection was revoked and shut");
+            // The client sees the revocation on its own reader: each next turn's request says
+            // what it is offered, until only the capabilities tool is.
+            let delegation = |body: &Value| {
+                offered(body)
+                    .into_iter()
+                    .filter(|t| t.starts_with("cross_agent_"))
+                    .collect::<Vec<_>>()
+            };
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                run.send(prompt("again"));
+                run.wait_for(completed);
+                let last = script.bodies().last().map(delegation).unwrap_or_default();
+                if last == ["cross_agent_capabilities"] {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "never degraded: {last:?}"
+                );
+            }
+            run.finish();
+        }
+
+        /// A supervised child asks the app before every write (Accept edits included), is
+        /// offered only what its policy allows, reports that policy before its session starts,
+        /// and refuses a frame with an MCP server or without its binding.
+        #[test]
+        fn a_supervised_child_asks_for_every_write_and_reads_its_policy_back() {
+            use agent_core::delegation::authority::Capability;
+            let sock = tempfile::tempdir().unwrap();
+            let fake = FakeDelegation::start(sock.path(), answer_ok());
+            let work = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let policy = LocalChildPolicy {
+                task_mode: TaskMode::AcceptEdits,
+                capabilities: Some(vec![Capability::Edit]),
+            };
+            let script = Script::new(vec![
+                Ok(tool_call(
+                    "c1",
+                    "write_file",
+                    json!({"file_path": "a.txt", "content": "x"}),
+                )),
+                Ok(text(&["Done"])),
+            ]);
+            let run = start_with_frame(
+                args(work.path(), Mode::AcceptEdits),
+                script.clone(),
+                state.path().into(),
+                frame(&fake, Some(policy.clone())),
+            );
+            let echo = run.wait_for(|e| match &e.event {
+                Event::ControlResult { ok: Some(ok), .. }
+                    if e.request.as_deref()
+                        == Some(agent_core::local_agent::CHILD_POLICY_REQUEST) =>
+                {
+                    serde_json::from_value::<agent_core::local_agent::ChildPolicyEcho>(ok.clone())
+                        .ok()
+                }
+                Event::SessionStarted { .. } => panic!("the echo comes first"),
+                _ => None,
+            });
+            assert!(
+                agent_core::local_agent::child_echo_ok(&policy, &echo),
+                "{echo:?}"
+            );
+            run.send(prompt("write it"));
+            let (request, card) = run.wait_for(|e| match &e.event {
+                Event::ApprovalRequested { tool, input, .. } if tool == "write_file" => {
+                    Some((e.request.clone()?, input.clone()))
+                }
+                _ => None,
+            });
+            // The card carries the target this runner resolved and will write: what the app
+            // judges, beside the path named.
+            assert_eq!(card["file_path"], "a.txt");
+            assert_eq!(
+                card[agent_core::local_agent::RESOLVED_PATH],
+                json!(work.path().canonicalize().unwrap().join("a.txt"))
+            );
+            // Denied by the app's inherited authority, which says why: the model is told that.
+            run.send(Command::Approve {
+                request,
+                decision: Decision::Deny,
+                updated_input: None,
+                message: Some("Denied by agent-terminal: outside this agent's worktree".into()),
+            });
+            run.wait_for(completed);
+            run.finish();
+            assert!(!work.path().join("a.txt").exists());
+            let told = script.bodies()[1]["messages"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(told.contains("outside this agent's worktree"), "{told}");
+            assert!(!told.contains("The user declined"), "{told}");
+            let tools = offered(&script.bodies()[0]);
+            assert!(tools.contains(&"write_file".to_owned()));
+            assert!(
+                !tools.contains(&"run_command".to_owned()),
+                "exec was not declared"
+            );
+            let system = script.bodies()[0]["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(system.contains("delegated sub-agent"));
+
+            // A child's frame with an MCP server, or without a binding, is refused.
+            let server: agent_core::local_mcp::McpServerConfig = serde_json::from_value(json!({"id":"docs","label":"Docs","enabled":true,"command":"server","args":[],"cwd":"$WORKSPACE","env":{},"tools":[],"approval":"ask","startup_timeout_secs":15,"call_timeout_secs":60})).unwrap();
+            for bad in [
+                Command::ConfigureLocal {
+                    context: Box::new(agent_core::local_context::LocalLaunchContext {
+                        mcp_servers: vec![server],
+                        ..Default::default()
+                    }),
+                    bridge: Some(Box::new(bridge(&fake))),
+                    child: Some(policy.clone()),
+                },
+                Command::ConfigureLocal {
+                    context: Box::default(),
+                    bridge: None,
+                    child: Some(policy.clone()),
+                },
+            ] {
+                let run = start_with_frame(
+                    args(work.path(), Mode::AcceptEdits),
+                    Script::new(vec![]),
+                    state.path().into(),
+                    bad,
+                );
+                let (events, code) = run.finish();
+                assert_eq!(code, 1);
+                assert!(!events
+                    .iter()
+                    .any(|e| matches!(e.event, Event::SessionStarted { .. })));
+            }
+        }
+
+        /// A path named inside the folder that leads outside through a link is shown with the
+        /// target it leads to, which is what the app judges; a link that names nothing shows a
+        /// null target (nothing the app can check).
+        #[test]
+        fn a_childs_card_names_where_a_link_leads() {
+            let sock = tempfile::tempdir().unwrap();
+            let fake = FakeDelegation::start(sock.path(), answer_ok());
+            let work = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("x.txt"), "old").unwrap();
+            std::os::unix::fs::symlink(outside.path().join("x.txt"), work.path().join("link.txt"))
+                .unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let script = Script::new(vec![
+                Ok(tool_call(
+                    "c1",
+                    "write_file",
+                    json!({"file_path": "link.txt", "content": "x"}),
+                )),
+                Ok(text(&["Done"])),
+            ]);
+            let run = start_with_frame(
+                args(work.path(), Mode::AcceptEdits),
+                script,
+                state.path().into(),
+                frame(
+                    &fake,
+                    Some(LocalChildPolicy {
+                        task_mode: TaskMode::AcceptEdits,
+                        capabilities: None,
+                    }),
+                ),
+            );
+            run.send(prompt("write through the link"));
+            let (request, card) = run.wait_for(|e| match &e.event {
+                Event::ApprovalRequested { input, .. } => Some((e.request.clone()?, input.clone())),
+                _ => None,
+            });
+            assert_eq!(card["file_path"], "link.txt");
+            assert_eq!(
+                card[agent_core::local_agent::RESOLVED_PATH],
+                json!(outside.path().canonicalize().unwrap().join("x.txt"))
+            );
+            run.send(Command::Approve {
+                request,
+                decision: Decision::Deny,
+                updated_input: None,
+                message: None,
+            });
+            run.wait_for(completed);
+            run.finish();
+            assert_eq!(
+                std::fs::read_to_string(outside.path().join("x.txt")).unwrap(),
+                "old"
+            );
+            let dangling = card_input(Tool::WriteFile, &json!({"file_path": "gone"}), None);
+            assert_eq!(
+                dangling[agent_core::local_agent::RESOLVED_PATH],
+                Value::Null
+            );
+            let command = card_input(Tool::RunCommand, &json!({"command": "ls"}), None);
+            assert!(command
+                .get(agent_core::local_agent::RESOLVED_PATH)
+                .is_none());
+        }
+
+        /// A plan child and a child limited to reading are offered no writing tool, and a
+        /// child is never wider than its task mode, whatever it is told.
+        #[test]
+        fn a_child_is_never_offered_more_than_its_policy() {
+            let sock = tempfile::tempdir().unwrap();
+            let fake = FakeDelegation::start(sock.path(), answer_ok());
+            let work = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            for (policy, mode) in [
+                (
+                    LocalChildPolicy {
+                        task_mode: TaskMode::Plan,
+                        capabilities: None,
+                    },
+                    Mode::AcceptEdits,
+                ),
+                (
+                    LocalChildPolicy {
+                        task_mode: TaskMode::AcceptEdits,
+                        capabilities: Some(vec![]),
+                    },
+                    Mode::AcceptEdits,
+                ),
+            ] {
+                let script = Script::new(vec![Ok(text(&["Ok"])), Ok(text(&["Ok"]))]);
+                let run = start_with_frame(
+                    args(work.path(), mode),
+                    script.clone(),
+                    state.path().into(),
+                    frame(&fake, Some(policy)),
+                );
+                run.send(Command::SetMode { mode: Mode::Bypass });
+                run.send(prompt("go"));
+                run.wait_for(completed);
+                run.finish();
+                let tools = offered(&script.bodies()[0]);
+                for writing in ["write_file", "edit_file", "run_command"] {
+                    assert!(!tools.contains(&writing.to_owned()), "{writing}");
+                }
+            }
+        }
+
+        /// A delegated child whose model cannot take tools fails its turn, never answering
+        /// blind.
+        #[test]
+        fn a_child_whose_model_refuses_tools_fails_its_turn() {
+            let sock = tempfile::tempdir().unwrap();
+            let fake = FakeDelegation::start(sock.path(), answer_ok());
+            let work = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let script = Script::new(vec![
+                Err("registry.ollama.ai/library/x does not support tools".into()),
+                Ok(text(&["blind"])),
+            ]);
+            let run = start_with_frame(
+                args(work.path(), Mode::Ask),
+                script.clone(),
+                state.path().into(),
+                frame(
+                    &fake,
+                    Some(LocalChildPolicy {
+                        task_mode: TaskMode::Ask,
+                        capabilities: None,
+                    }),
+                ),
+            );
+            run.send(prompt("go"));
+            let (state_seen, _, error) = run.wait_for(completed);
+            run.finish();
+            assert_eq!(state_seen, TurnState::Failed);
+            assert!(error.unwrap_or_default().contains("cannot call tools"));
+            assert_eq!(script.bodies().len(), 1, "no toolless retry");
+        }
+
+        /// The capability lives in the runner's memory only: a command it runs inherits no
+        /// delegation variable and never sees it.
+        #[test]
+        fn a_command_never_sees_the_capability() {
+            let sock = tempfile::tempdir().unwrap();
+            let fake = FakeDelegation::start(sock.path(), answer_ok());
+            let work = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let script = Script::new(vec![
+                Ok(tool_call("c1", "run_command", json!({"command": "env"}))),
+                Ok(text(&["Ok"])),
+            ]);
+            let run = start_with_frame(
+                args(work.path(), Mode::Bypass),
+                script.clone(),
+                state.path().into(),
+                frame(&fake, None),
+            );
+            run.send(prompt("env"));
+            run.wait_for(completed);
+            let (events, _) = run.finish();
+            let secret = bridge(&fake).token.expose_secret().to_owned();
+            let output = script.bodies()[1]["messages"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(output.contains("PATH="), "the command ran: {output}");
+            assert!(!output.contains(&secret));
+            assert!(!output.contains("AGENT_TERMINAL_DELEGATION"));
+            for body in script.bodies() {
+                assert!(!body.to_string().contains(&secret));
+            }
+            for e in events {
+                assert!(!serde_json::to_string(&e).unwrap().contains(&secret));
+            }
+            for entry in std::fs::read_dir(state.path()).unwrap().flatten() {
+                let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+                assert!(!text.contains(&secret));
+            }
+        }
     }
 
     #[test]
@@ -3335,9 +4311,9 @@ mod tests {
     fn malformed_input_after_setup_is_terminal() {
         let work = tempfile::tempdir().unwrap();
         let (tx, commands) = channel();
-        tx.send(RunnerInput::Command(Command::ConfigureLocal {
-            context: Box::default(),
-        }))
+        tx.send(RunnerInput::Command(Command::configure_local(
+            Default::default(),
+        )))
         .unwrap();
         tx.send(RunnerInput::Invalid("Malformed Local command JSON."))
             .unwrap();
@@ -4361,9 +5337,7 @@ mod tests {
             events,
             done,
         };
-        run.send(Command::ConfigureLocal {
-            context: Box::default(),
-        });
+        run.send(Command::configure_local(Default::default()));
         run.send(prompt("go"));
         run.wait_for(|e| matches!(e.event, Event::ContentDelta { .. }).then_some(()));
         run.send(Command::Interrupt);

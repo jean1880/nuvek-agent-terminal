@@ -1129,14 +1129,12 @@ impl ChatSession {
         if changed && restart_pending && restrictive {
             // A narrowing never waits, not even for live sub-agents: it stops the root at once,
             // and its exit revokes them. Said, so the user knows they went with it.
-            let had_sub_agents = self
-                .inner
-                .hooks
-                .as_ref()
-                .is_some_and(|hooks| hooks.holds_restart());
+            // `holds_restart` is also true for a root that is merely busy, so it cannot say
+            // whether sub-agents existed: a delegation root's notice names them as "any".
+            let delegation_root = self.inner.hooks.is_some();
             self.inner.stop_current();
-            self.note(if had_sub_agents {
-                "Local MCP authority changed: pending approvals and active calls were stopped, and so were this thread's sub-agents. The next prompt uses the saved settings."
+            self.note(if delegation_root {
+                "Local MCP authority changed: pending approvals and active calls were stopped, and so were any of this thread's sub-agents. The next prompt uses the saved settings."
             } else {
                 "Local MCP authority changed: pending approvals and active calls were stopped. The next prompt uses the saved settings."
             });

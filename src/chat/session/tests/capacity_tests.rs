@@ -320,7 +320,7 @@ fn a_delegation_roots_new_local_settings_wait_for_its_sub_agents() {
         session.stage_local_context(Ok(context.clone()));
         assert!(seen.borrow().iter().any(|e| matches!(
             &e.event,
-            Event::Notice { text } if text.contains("and so were this thread's sub-agents")
+            Event::Notice { text } if text.contains("and so were any of this thread's sub-agents")
         )));
 
         // A child ignores staged settings.

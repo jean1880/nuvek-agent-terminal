@@ -1800,8 +1800,28 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                     commands,
                 )? {
                     None => continue,
-                    Some(Decision::Allow | Decision::AllowForSession | Decision::AllowAlways) => {}
-                    Some(Decision::Deny | Decision::Cancel) => {
+                    Some((
+                        Decision::Allow | Decision::AllowForSession | Decision::AllowAlways,
+                        _,
+                    )) => {}
+                    // A refusal the app gave its reason for (a delegated agent's inherited
+                    // authority) is told as it is; otherwise the user declined.
+                    Some((Decision::Deny | Decision::Cancel, Some(reason)))
+                        if !reason.trim().is_empty() =>
+                    {
+                        let reason = agent_core::local_context::bound_result(
+                            &agent_core::redact::redact(&reason),
+                            reservation.saturating_sub(48),
+                        );
+                        self.emit(Envelope::item_completed(
+                            &item,
+                            ItemStatus::Declined,
+                            None,
+                            Some(&reason),
+                        ));
+                        return Ok(format!("Refused: {reason} Do not retry it."));
+                    }
+                    Some((Decision::Deny | Decision::Cancel, _)) => {
                         self.emit(Envelope::item_completed(
                             &item,
                             ItemStatus::Declined,
@@ -1907,12 +1927,16 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         } else {
             Err("Delegation arguments exceed 64 KiB.".into())
         };
+        // Only the exact credentials this runner holds (its MCP servers' and its own capability)
+        // are kept out: there is no card, and the app masks every envelope before it shows or
+        // stores it, as it does any agent's tool input. A key name never masks a value here
+        // (an `idempotency_key` is not a secret).
         let faithful: Option<Value> = arguments
             .as_ref()
             .ok()
             .filter(|arguments| {
                 let mut shown = (*arguments).clone();
-                self.masks.value(&mut shown).is_ok() && shown == **arguments
+                self.masks.metadata(&mut shown).is_ok() && shown == **arguments
             })
             .cloned();
         // Emitted as is (no lossy masking): what the supervisor reads back must be exactly the
@@ -1963,8 +1987,8 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 self,
                 ToolError::new(
                     ErrorCode::InvalidArgument,
-                    "the arguments cannot be shown as they are after secret masking, so they \
-                     were not sent; leave credentials out of delegation calls",
+                    "the arguments hold a credential this agent holds, so they were not sent; \
+                     leave credentials out of delegation calls",
                 ),
             );
         };
@@ -2395,7 +2419,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         input: &Value,
         note: Option<String>,
         commands: &Receiver<RunnerInput>,
-    ) -> Result<Option<Decision>, StepError> {
+    ) -> Result<Option<(Decision, Option<String>)>, StepError> {
         let request = self.id("approval");
         if !self.emit_approval(
             Envelope::new(Event::ApprovalRequested {
@@ -2409,19 +2433,20 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             })
             .request(&request),
         ) {
-            return Ok(Some(Decision::Deny));
+            return Ok(Some((Decision::Deny, None)));
         }
         loop {
             match commands.recv_timeout(Duration::from_secs(3600)) {
                 Ok(RunnerInput::Command(Command::Approve {
                     request: answered,
                     decision,
+                    message,
                     ..
                 })) if answered == request => {
                     self.emit(
                         Envelope::new(Event::ApprovalResolved { decision }).request(&request),
                     );
-                    return Ok(Some(decision));
+                    return Ok(Some((decision, message)));
                 }
                 Ok(RunnerInput::Invalid(why)) => {
                     self.emit(Envelope::new(Event::ApprovalExpired).request(&request));
@@ -3062,6 +3087,49 @@ mod tests {
             assert!(result["content"].as_str().unwrap().contains("\"workers\""));
         }
 
+        /// A key name never masks a delegation argument: an idempotency key (digits and all) and
+        /// the task text are sent exactly as shown; only a credential the runner holds stops a
+        /// call.
+        #[test]
+        fn delegation_arguments_are_sent_as_shown() {
+            let sock = tempfile::tempdir().unwrap();
+            let fake = FakeDelegation::start(sock.path(), answer_ok());
+            let work = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let send = json!({"target": "parent", "text": "step 3 of 7 done", "kind": "report",
+                "delivery": "next_turn", "idempotency_key": "report-2026-11-01-a1b2c3"});
+            let secret = bridge(&fake).token.expose_secret().to_owned();
+            let leak = json!({"target": "parent", "text": secret, "kind": "report",
+                "delivery": "next_turn", "idempotency_key": "report-2"});
+            let script = Script::new(vec![
+                Ok(tool_call("c1", "cross_agent_send", send.clone())),
+                Ok(tool_call("c2", "cross_agent_send", leak)),
+                Ok(text(&["Ok"])),
+            ]);
+            let run = start_with_frame(
+                args(work.path(), Mode::Ask),
+                script.clone(),
+                state.path().into(),
+                frame(&fake, None),
+            );
+            run.send(prompt("report"));
+            run.wait_for(completed);
+            run.finish();
+            let calls = fake.calls();
+            assert_eq!(calls.len(), 1, "the leaking call was never sent");
+            assert_eq!(calls[0].args, send);
+            let told = script.bodies()[2]["messages"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(told.contains("credential"), "{told}");
+            assert!(!told.contains(&secret));
+        }
+
         /// Plan mode still offers the delegation tools (the supervisor admits only plan
         /// children); an unbound runner offers none and refuses a call to one.
         #[test]
@@ -3225,15 +3293,26 @@ mod tests {
                 Event::ApprovalRequested { tool, .. } if tool == "write_file" => e.request.clone(),
                 _ => None,
             });
+            // Denied by the app's inherited authority, which says why: the model is told that.
             run.send(Command::Approve {
                 request,
                 decision: Decision::Deny,
                 updated_input: None,
-                message: None,
+                message: Some("Denied by agent-terminal: outside this agent's worktree".into()),
             });
             run.wait_for(completed);
             run.finish();
             assert!(!work.path().join("a.txt").exists());
+            let told = script.bodies()[1]["messages"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(told.contains("outside this agent's worktree"), "{told}");
+            assert!(!told.contains("The user declined"), "{told}");
             let tools = offered(&script.bodies()[0]);
             assert!(tools.contains(&"write_file".to_owned()));
             assert!(

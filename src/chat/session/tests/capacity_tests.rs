@@ -296,10 +296,32 @@ fn a_delegation_roots_new_local_settings_wait_for_its_sub_agents() {
         }
         assert_eq!(held(&seen), 1, "said once");
         assert_eq!(hooks.asks.get(), 0, "no rotation while held");
+        // Nothing held, but the supervisor refuses the rotation: still deferred, never stopped.
         hooks.holds.set(false);
         assert!(inner.prepare_local_context());
+        assert_ne!(inner.adapter.borrow().local_context(), Some(&context));
+        assert!(inner.state.borrow().alive, "not stopped");
+        assert_eq!(hooks.asks.get(), 1);
+        hooks.allow.set(true);
+        assert!(inner.prepare_local_context());
         assert_eq!(inner.adapter.borrow().local_context(), Some(&context));
-        assert_eq!(hooks.asks.get(), 1, "applied as a planned rotation");
+        assert_eq!(hooks.asks.get(), 2, "applied as a planned rotation");
+
+        // A narrowing never waits: it stops the root at once and says its sub-agents went too.
+        let server: agent_core::local_mcp::McpServerConfig = serde_json::from_value(serde_json::json!({"id":"docs","label":"Docs","enabled":true,"command":"server","args":[],"cwd":"$WORKSPACE","env":{},"tools":[],"approval":"ask","startup_timeout_secs":15,"call_timeout_secs":60})).unwrap();
+        let wider = agent_core::local_context::LocalLaunchContext {
+            mcp_servers: vec![server],
+            ..context.clone()
+        };
+        *inner.adapter.borrow_mut() =
+            Box::new(agent_core::local_agent::LocalAdapter::new().with_context(wider));
+        inner.state.borrow_mut().alive = true;
+        hooks.holds.set(true);
+        session.stage_local_context(Ok(context.clone()));
+        assert!(seen.borrow().iter().any(|e| matches!(
+            &e.event,
+            Event::Notice { text } if text.contains("and so were this thread's sub-agents")
+        )));
 
         // A child ignores staged settings.
         let child_thread = fresh(&store, "/child");

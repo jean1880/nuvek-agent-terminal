@@ -1127,8 +1127,19 @@ impl ChatSession {
         let restart_pending = pending.is_some();
         *self.inner.pending_local_context.borrow_mut() = pending;
         if changed && restart_pending && restrictive {
+            // A narrowing never waits, not even for live sub-agents: it stops the root at once,
+            // and its exit revokes them. Said, so the user knows they went with it.
+            let had_sub_agents = self
+                .inner
+                .hooks
+                .as_ref()
+                .is_some_and(|hooks| hooks.holds_restart());
             self.inner.stop_current();
-            self.note("Local MCP authority changed: pending approvals and active calls were stopped. The next prompt uses the saved settings.");
+            self.note(if had_sub_agents {
+                "Local MCP authority changed: pending approvals and active calls were stopped, and so were this thread's sub-agents. The next prompt uses the saved settings."
+            } else {
+                "Local MCP authority changed: pending approvals and active calls were stopped. The next prompt uses the saved settings."
+            });
             return;
         }
         if changed && restart_pending {
@@ -4327,8 +4338,13 @@ impl Inner {
                 // revoked): never while its sub-agents are alive or busy, whose links the
                 // restart would cut. The settings then wait for them.
                 let alive = self.state.borrow().alive || self.proc.borrow().is_some();
+                // A refused rotation (anything a stop would cut, by the supervisor's own reckoning)
+                // defers the same way: the settings are kept for a later prompt, never applied by
+                // a stop the supervisor did not agree to, which would revoke the root's tree.
                 if let Some(hooks) = self.hooks.clone().filter(|_| alive) {
-                    if hooks.holds_restart() {
+                    if hooks.holds_restart()
+                        || !hooks.suspending(ProcessGeneration(self.process_generation.get()))
+                    {
                         *self.pending_local_context.borrow_mut() = Some(Ok(context));
                         if !self.local_context_held.replace(true) {
                             self.notice(
@@ -4338,7 +4354,6 @@ impl Inner {
                         }
                         return true;
                     }
-                    let _ = hooks.suspending(ProcessGeneration(self.process_generation.get()));
                 }
                 self.local_context_held.set(false);
                 self.stop_current();

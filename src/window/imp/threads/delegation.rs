@@ -552,8 +552,14 @@ impl AgentTerminalWindow {
                 Some(crate::account_status::AccountStatus::shared().snapshot(driver))
             }),
             tags: Rc::new(move || -> crate::delegation::seam::LocalFuture<crate::model_tags_file::TagsState> {
-                let (cache, path) = (tags_cache.clone(), tags_config.borrow().model_tags_file());
-                std::boxed::Box::pin(async move { cache.current(path).await })
+                let (cache, files) = {
+                    let config = tags_config.borrow();
+                    (
+                        tags_cache.clone(),
+                        (config.model_tags_file(), config.user_model_tags_file()),
+                    )
+                };
+                std::boxed::Box::pin(async move { cache.current(files.0, files.1).await })
             }),
             refresh_usage: Rc::new(|wait: std::time::Duration| -> crate::delegation::seam::LocalFuture<()> {
                 std::boxed::Box::pin(async move {

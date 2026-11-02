@@ -1,9 +1,11 @@
-//! The model tag file (`TerminalConfig::model_tags_path`, by default
-//! `~/.config/agent-terminal/model-tags.json`), read off the main thread and cached until its
-//! modification time or size changes. Parsing is [`agent_core::model_tags::parse`]. The file
-//! goes over the built-in tags ([`agent_core::model_tags::built_in`]), so every install has tags:
-//! a missing file is not worth a word, and a refused one is never an error to the caller, only a
-//! reason (`status`) the built-in tags apply alone.
+//! The model tag files, read off the main thread and cached until a file's modification time or
+//! size changes. Two files are read: the shared tag file (`TerminalConfig::model_tags_path`, by
+//! default `~/.config/agent-terminal/model-tags.json`, authored elsewhere) and the user's own
+//! (`TerminalConfig::user_model_tags_path`, by default `model-tags.user.json` beside it, written
+//! only by the app). Parsing is [`agent_core::model_tags::parse`]. The layers stack user over
+//! shared file over the built-in tags ([`agent_core::model_tags::built_in`]), so every install has
+//! tags: a missing file is not worth a word, and a refused one is never an error to the caller,
+//! only a reason (`status`) the layers below it apply alone.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -12,7 +14,7 @@ use std::time::SystemTime;
 
 use agent_core::delegation::error::truncate_bytes;
 use agent_core::delegation::wire::MAX_TAGS_STATUS_BYTES;
-use agent_core::model_tags::{built_in, parse, ModelTags};
+use agent_core::model_tags::{built_in, parse, ModelTags, TagSource};
 use gtk4::gio;
 
 /// A larger file is refused unread.
@@ -22,36 +24,54 @@ pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
 #[derive(Debug, Clone, Default)]
 pub struct TagsState {
     pub tags: Option<Arc<ModelTags>>,
-    /// Why the user's file is not in `tags` (the built-in tags apply alone); `None` when it is,
-    /// or there is none.
+    /// Why a tag file is not in `tags` (the layers below it apply alone); `None` when each one
+    /// is, or there is none.
     pub status: Option<String>,
 }
 
-/// What identifies one version of the file on disk.
+/// What identifies one version of a file on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stamp {
     modified: Option<SystemTime>,
     len: u64,
 }
 
-/// One look at the file: `Unchanged` when its stamp is `known`.
-#[derive(Debug)]
-pub enum Reading {
-    Unchanged,
-    Loaded(Option<Stamp>, TagsState),
+/// One tag file as read: its tags (none when it is missing or refused) and why it was refused.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Layer {
+    pub tags: Option<ModelTags>,
+    pub status: Option<String>,
 }
 
-/// Blocking: stats `path` and, unless its stamp is `known`, reads and parses it.
-pub fn read(path: &Path, known: Option<Stamp>) -> Reading {
+impl Layer {
+    fn refused(what: &str, why: &str) -> Layer {
+        Layer {
+            tags: None,
+            status: Some(format!("{what} {why}")),
+        }
+    }
+}
+
+/// One look at a file: `Unchanged` when its stamp is `known`.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // a short-lived value, matched at once
+pub enum Reading {
+    Unchanged,
+    Loaded(Option<Stamp>, Layer),
+}
+
+/// Blocking: stats `path` and, unless its stamp is `known`, reads and parses it. `what` names the
+/// file in a refusal ("model tag file", "user tag file").
+pub fn read(path: &Path, known: Option<Stamp>, what: &str) -> Reading {
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Reading::Loaded(None, with_tags(None, None));
+            return Reading::Loaded(None, Layer::default());
         }
         Err(e) => {
             return Reading::Loaded(
                 None,
-                refused(&format!("model tag file unreadable: {}", e.kind())),
+                Layer::refused(what, &format!("unreadable: {}", e.kind())),
             )
         }
     };
@@ -63,75 +83,119 @@ pub fn read(path: &Path, known: Option<Stamp>) -> Reading {
         return Reading::Unchanged;
     }
     if !meta.is_file() {
-        return Reading::Loaded(Some(stamp), refused("model tag file is not a regular file"));
+        return Reading::Loaded(Some(stamp), Layer::refused(what, "is not a regular file"));
     }
     if meta.len() > MAX_FILE_BYTES {
-        return Reading::Loaded(Some(stamp), refused("model tag file is too large"));
+        return Reading::Loaded(Some(stamp), Layer::refused(what, "is too large"));
     }
-    let state = match std::fs::read_to_string(path) {
+    let layer = match std::fs::read_to_string(path) {
         Ok(text) => match parse(&text) {
-            Ok(tags) => with_tags(Some(tags), None),
-            Err(why) => refused(&format!("model tag file refused: {why}")),
+            Ok(tags) => Layer {
+                tags: Some(tags),
+                status: None,
+            },
+            Err(why) => Layer::refused(what, &format!("refused: {why}")),
         },
-        Err(e) => refused(&format!("model tag file unreadable: {}", e.kind())),
+        Err(e) => Layer::refused(what, &format!("unreadable: {}", e.kind())),
     };
-    Reading::Loaded(Some(stamp), state)
+    Reading::Loaded(Some(stamp), layer)
 }
 
-/// The built-in tags, with `user`'s over them, and `status` saying why there is no `user`.
-fn with_tags(user: Option<ModelTags>, status: Option<String>) -> TagsState {
+/// The shared file's tags over the built-in ones, and the user's over both. `status` joins the
+/// reasons a file was refused.
+pub fn combine(file: &Layer, user: &Layer) -> TagsState {
     let base = built_in();
+    let shared = match file.tags.clone() {
+        Some(tags) => tags.tagged(TagSource::File).over(base),
+        None => base,
+    };
+    let all = match user.tags.clone() {
+        Some(tags) => tags.tagged(TagSource::User).over(shared),
+        None => shared,
+    };
+    let reasons: Vec<&str> = [&file.status, &user.status]
+        .into_iter()
+        .filter_map(|s| s.as_deref())
+        .collect();
     TagsState {
-        tags: Some(Arc::new(match user {
-            Some(user) => user.over(base),
-            None => base,
-        })),
-        status,
+        tags: Some(Arc::new(all)),
+        status: (!reasons.is_empty())
+            .then(|| truncate_bytes(&reasons.join("; "), MAX_TAGS_STATUS_BYTES).to_owned()),
     }
 }
 
-fn refused(why: &str) -> TagsState {
-    with_tags(
-        None,
-        Some(truncate_bytes(why, MAX_TAGS_STATUS_BYTES).to_owned()),
-    )
+/// Blocking: both files read now, combined (the headless commands and tests).
+pub fn load_now(file: &Path, user: &Path) -> TagsState {
+    let layer = |path: &Path, what: &str| match read(path, None, what) {
+        Reading::Loaded(_, layer) => layer,
+        Reading::Unchanged => Layer::default(),
+    };
+    combine(&layer(file, FILE_NAME), &layer(user, USER_FILE_NAME))
 }
 
-/// What an `Unchanged` reading of `path` stands for: the cached state, when the cache still holds
-/// `path` (a concurrent call for another path may have replaced it meanwhile).
-fn cached_state(last: Option<&(PathBuf, Option<Stamp>, TagsState)>, path: &Path) -> TagsState {
-    match last {
-        Some((p, _, state)) if p == path => state.clone(),
-        _ => refused("model tag file not loaded"),
-    }
+const FILE_NAME: &str = "model tag file";
+const USER_FILE_NAME: &str = "user tag file";
+
+/// A path's last reading.
+#[derive(Debug, Clone)]
+struct Cached {
+    paths: (PathBuf, PathBuf),
+    file: (Option<Stamp>, Layer),
+    user: (Option<Stamp>, Layer),
+    state: TagsState,
 }
 
-/// The last reading of each path asked for (one in practice).
+/// The last reading of the two files asked for.
 #[derive(Default)]
 pub struct TagsCache {
-    last: RefCell<Option<(PathBuf, Option<Stamp>, TagsState)>>,
+    last: RefCell<Option<Cached>>,
 }
 
 impl TagsCache {
-    /// The file's tags: re-read off the main thread only when it changed since the last call.
-    pub async fn current(&self, path: PathBuf) -> TagsState {
-        let known = self
-            .last
-            .borrow()
+    /// The combined tags: each file re-read off the main thread only when it changed since the
+    /// last call.
+    pub async fn current(&self, file: PathBuf, user: PathBuf) -> TagsState {
+        let last = self.last.borrow().clone();
+        let same = last
             .as_ref()
-            .filter(|(p, _, _)| *p == path)
-            .and_then(|(_, stamp, _)| *stamp);
-        let job_path = path.clone();
-        let reading = gio::spawn_blocking(move || read(&job_path, known))
-            .await
-            .unwrap_or_else(|_| Reading::Loaded(None, refused("model tag file could not be read")));
-        match reading {
-            Reading::Unchanged => cached_state(self.last.borrow().as_ref(), &path),
-            Reading::Loaded(stamp, state) => {
-                *self.last.borrow_mut() = Some((path, stamp, state.clone()));
-                state
+            .filter(|c| c.paths.0 == file && c.paths.1 == user);
+        let known = (same.and_then(|c| c.file.0), same.and_then(|c| c.user.0));
+        let job = (file.clone(), user.clone());
+        let readings = gio::spawn_blocking(move || {
+            (
+                read(&job.0, known.0, FILE_NAME),
+                read(&job.1, known.1, USER_FILE_NAME),
+            )
+        })
+        .await;
+        let Ok((file_reading, user_reading)) = readings else {
+            return combine(
+                &Layer::refused(FILE_NAME, "could not be read"),
+                &Layer::default(),
+            );
+        };
+        let cached_file = same.map(|c| c.file.1.clone());
+        let cached_user = same.map(|c| c.user.1.clone());
+        let resolve = |reading: Reading, cached: Option<Layer>, old: Option<Stamp>| match reading {
+            Reading::Loaded(stamp, layer) => (stamp, layer),
+            Reading::Unchanged => (old, cached.unwrap_or_default()),
+        };
+        let file_now = resolve(file_reading, cached_file, known.0);
+        let user_now = resolve(user_reading, cached_user, known.1);
+        // Nothing moved (a file that is not there never has a stamp to match): the same parse.
+        if let Some(c) = same {
+            if c.file == file_now && c.user == user_now {
+                return c.state.clone();
             }
         }
+        let state = combine(&file_now.1, &user_now.1);
+        *self.last.borrow_mut() = Some(Cached {
+            paths: (file, user),
+            file: file_now,
+            user: user_now,
+            state: state.clone(),
+        });
+        state
     }
 }
 
@@ -142,73 +206,128 @@ mod tests {
     const V1: &str = r#"{"version": 1, "vocabulary": {"code": "writes code"},
         "models": [{"match": "*opus*", "tags": ["code"], "tier": "deep"}]}"#;
 
+    fn layer(path: &Path) -> Layer {
+        match read(path, None, FILE_NAME) {
+            Reading::Loaded(_, l) => l,
+            Reading::Unchanged => panic!("no stamp known"),
+        }
+    }
+
     #[test]
     fn a_missing_or_refused_file_leaves_the_built_in_tags_and_a_good_one_goes_over_them() {
         let dir = tempfile::tempdir().expect("tmp");
         let path = dir.path().join("model-tags.json");
-        let Reading::Loaded(None, missing) = read(&path, None) else {
+        let Reading::Loaded(None, missing) = read(&path, None, FILE_NAME) else {
             panic!("missing file");
         };
-        assert_eq!(missing.tags.as_deref(), Some(&built_in()));
-        assert_eq!(missing.status, None, "no file is not worth a word");
+        let state = combine(&missing, &Layer::default());
+        assert_eq!(state.tags.as_deref(), Some(&built_in()));
+        assert_eq!(state.status, None, "no file is not worth a word");
 
         std::fs::write(&path, r#"{"version": 9, "models": []}"#).expect("write");
-        let Reading::Loaded(Some(_), bad) = read(&path, None) else {
-            panic!("bad file");
-        };
+        let bad = combine(&layer(&path), &Layer::default());
         assert_eq!(bad.tags.as_deref(), Some(&built_in()));
         assert!(bad
             .status
             .as_deref()
-            .is_some_and(|s| s.contains("unsupported version 9")));
+            .is_some_and(|s| s.starts_with("model tag file refused: unsupported version 9")));
 
         std::fs::write(&path, V1).expect("write");
-        let Reading::Loaded(Some(stamp), good) = read(&path, None) else {
+        let Reading::Loaded(Some(stamp), good) = read(&path, None, FILE_NAME) else {
             panic!("good file");
         };
+        let good = combine(&good, &Layer::default());
         assert!(good.status.is_none());
         let tags = good.tags.expect("tags");
         assert_eq!(tags.vocabulary["code"], "writes code");
+        let opus = tags
+            .lookup(agent_core::adapter::Driver::Claude, "opus")
+            .expect("opus");
+        assert_eq!(opus.tier.as_deref(), Some("deep"), "the file's entry first");
+        assert_eq!(opus.source, TagSource::File);
+        let luna = tags
+            .lookup(agent_core::adapter::Driver::Codex, "gpt-6-luna")
+            .expect("built in");
         assert_eq!(
-            tags.lookup(agent_core::adapter::Driver::Claude, "opus")
-                .and_then(|e| e.tier.as_deref()),
-            Some("deep"),
-            "the file's entry first"
+            luna.source,
+            TagSource::BuiltIn,
+            "the rest from the built-in ones"
         );
-        assert!(
-            tags.lookup(agent_core::adapter::Driver::Codex, "gpt-6-luna")
-                .is_some(),
-            "the built-in ones fill in the rest"
-        );
-        assert!(matches!(read(&path, Some(stamp)), Reading::Unchanged));
+        assert!(matches!(
+            read(&path, Some(stamp), FILE_NAME),
+            Reading::Unchanged
+        ));
 
         std::fs::write(&path, "x".repeat(MAX_FILE_BYTES as usize + 1)).expect("write");
-        let Reading::Loaded(_, big) = read(&path, Some(stamp)) else {
+        let Reading::Loaded(_, big) = read(&path, Some(stamp), FILE_NAME) else {
             panic!("big file");
         };
         assert_eq!(big.status.as_deref(), Some("model tag file is too large"));
     }
 
+    /// User over file over built-in: the user's entry for a model beats the shared file's, a
+    /// refused user file leaves the shared one in force and says so, and a Local entry never
+    /// catches a vendor model.
     #[test]
-    fn an_unchanged_reading_of_a_path_no_longer_cached_says_so() {
-        let a = PathBuf::from("/a/model-tags.json");
-        let loaded = TagsState {
-            tags: Some(Arc::new(ModelTags::default())),
-            status: None,
-        };
-        let last = (a.clone(), None, loaded);
-        assert!(cached_state(Some(&last), &a).tags.is_some());
-        let other = cached_state(Some(&last), Path::new("/b/model-tags.json"));
-        assert_eq!(other.tags.as_deref(), Some(&built_in()));
-        assert_eq!(other.status.as_deref(), Some("model tag file not loaded"));
-        assert_eq!(
-            cached_state(None, &a).status.as_deref(),
-            Some("model tag file not loaded")
+    fn the_users_file_goes_over_the_shared_one_over_the_built_in_tags() {
+        use agent_core::adapter::Driver;
+        let dir = tempfile::tempdir().expect("tmp");
+        let (file, user) = (
+            dir.path().join("model-tags.json"),
+            dir.path().join("model-tags.user.json"),
         );
-        // A long reason is cut to the wire bound on a character boundary.
-        let long = refused(&"é".repeat(1000));
-        let status = long.status.expect("status");
-        assert!(status.len() <= MAX_TAGS_STATUS_BYTES && status.starts_with('é'));
+        std::fs::write(&file, V1).expect("write");
+        std::fs::write(
+            &user,
+            r#"{"version": 1, "vocabulary": {"mine": "my tag"}, "models": [
+                {"match": "opus", "driver": "claude", "tier": "fast", "tags": ["mine"]},
+                {"match": "tiny-local", "driver": "local", "tier": "fast", "tags": ["fast"]}]}"#,
+        )
+        .expect("write");
+        let state = load_now(&file, &user);
+        assert_eq!(state.status, None);
+        let tags = state.tags.expect("tags");
+        let src = |d, id: &str| tags.lookup(d, id).map(|e| (e.source, e.tier.clone()));
+        assert_eq!(
+            src(Driver::Claude, "opus"),
+            Some((TagSource::User, Some("fast".into())))
+        );
+        assert_eq!(
+            src(Driver::Claude, "claude-opus-5-5"),
+            Some((TagSource::File, Some("deep".into()))),
+            "the user's entry names one model"
+        );
+        assert_eq!(
+            src(Driver::Local, "tiny-local").map(|s| s.0),
+            Some(TagSource::User)
+        );
+        assert_eq!(src(Driver::Claude, "tiny-local"), None);
+        assert_eq!(
+            src(Driver::Claude, "haiku").map(|s| s.0),
+            Some(TagSource::BuiltIn)
+        );
+        assert_eq!(
+            tags.vocabulary["mine"], "my tag",
+            "the user file extends the vocabulary"
+        );
+
+        std::fs::write(&user, "not json").expect("write");
+        let refused = load_now(&file, &user);
+        let tags = refused.tags.expect("tags");
+        assert_eq!(
+            tags.lookup(Driver::Claude, "opus").map(|e| e.source),
+            Some(TagSource::File)
+        );
+        assert!(refused
+            .status
+            .as_deref()
+            .is_some_and(|s| s.starts_with("user tag file refused: not valid JSON")));
+
+        // Both refused: both reasons, within the wire bound.
+        std::fs::write(&file, "also not json").expect("write");
+        let both = load_now(&file, &user).status.expect("status");
+        assert!(both.contains("model tag file") && both.contains("; user tag file"));
+        assert!(both.len() <= MAX_TAGS_STATUS_BYTES);
     }
 
     #[test]
@@ -216,24 +335,51 @@ mod tests {
         use crate::testutil::in_loop;
         let dir = tempfile::tempdir().expect("tmp");
         let path = dir.path().join("model-tags.json");
+        let user = dir.path().join("model-tags.user.json");
         std::fs::write(&path, V1).expect("write");
         in_loop(|ctx| {
             let cache = TagsCache::default();
-            let first = ctx.block_on(cache.current(path.clone()));
-            let second = ctx.block_on(cache.current(path.clone()));
+            let first = ctx.block_on(cache.current(path.clone(), user.clone()));
+            let second = ctx.block_on(cache.current(path.clone(), user.clone()));
             let (a, b) = (first.tags.expect("a"), second.tags.expect("b"));
             assert!(Arc::ptr_eq(&a, &b), "unchanged: the cached parse");
             // Another size is another version, whatever the clock's granularity.
             std::fs::write(&path, V1.replace("writes code", "writes more code")).expect("write");
-            let third = ctx.block_on(cache.current(path.clone()));
+            let third = ctx.block_on(cache.current(path.clone(), user.clone()));
             assert_eq!(
                 third.tags.expect("c").vocabulary["code"],
                 "writes more code"
             );
+            // The user's file appearing is seen, and the shared file is not parsed again.
+            std::fs::write(
+                &user,
+                r#"{"version": 1, "models": [{"match": "*opus*", "tier": "fast"}]}"#,
+            )
+            .expect("write");
+            let fourth = ctx.block_on(cache.current(path.clone(), user.clone()));
+            let tags = fourth.tags.expect("d");
+            assert_eq!(
+                tags.lookup(agent_core::adapter::Driver::Claude, "opus")
+                    .map(|e| e.source),
+                Some(TagSource::User)
+            );
+            assert_eq!(tags.vocabulary["code"], "writes more code");
+            std::fs::remove_file(&user).expect("rm");
             std::fs::remove_file(&path).expect("rm");
-            let gone = ctx.block_on(cache.current(path.clone()));
+            let gone = ctx.block_on(cache.current(path.clone(), user.clone()));
             assert_eq!(gone.tags.as_deref(), Some(&built_in()));
             assert_eq!(gone.status, None);
+            // Another path is not the cached one's reading.
+            std::fs::write(&path, V1).expect("write");
+            let moved = ctx.block_on(cache.current(path.clone(), dir.path().join("other.json")));
+            assert!(moved.tags.is_some());
         });
+    }
+
+    #[test]
+    fn a_long_reason_is_cut_to_the_wire_bound_on_a_character_boundary() {
+        let long = Layer::refused(FILE_NAME, &"é".repeat(1000));
+        let status = combine(&long, &Layer::default()).status.expect("status");
+        assert!(status.len() <= MAX_TAGS_STATUS_BYTES && status.starts_with("model"));
     }
 }

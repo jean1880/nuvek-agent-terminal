@@ -319,7 +319,9 @@ pub fn inputs() -> uninstall::Inputs {
             _ => {}
         }
     }
+    let user_tag_files = vec![config.user_model_tags_file()];
     uninstall::Inputs {
+        user_tag_files,
         xdg_config: var("XDG_CONFIG_HOME"),
         xdg_state: var("XDG_STATE_HOME"),
         xdg_cache: var("XDG_CACHE_HOME"),

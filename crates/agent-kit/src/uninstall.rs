@@ -47,6 +47,9 @@ pub struct Inputs {
     pub agy_homes: Vec<PathBuf>,
     /// The Codex homes the Codex profiles use: each may hold the exported rules file.
     pub codex_homes: Vec<PathBuf>,
+    /// Where the user's model tag file is (the setting's path, or the default beside the
+    /// configuration): the app writes it, and it may be outside the app's folders.
+    pub user_tag_files: Vec<PathBuf>,
     /// The running executable, to tell how the app was installed.
     pub exe: Option<PathBuf>,
     /// The uid that must own every folder removed.
@@ -63,6 +66,9 @@ pub enum Item {
     AgyRegistration { home: PathBuf },
     /// The Codex rules file the app's export writes, whole.
     CodexRules { file: PathBuf },
+    /// The user's model tag file, when it lies outside the app's folders, whole. Only a file
+    /// the app marked as its own (`user_tags_file::is_ours`).
+    UserTags { file: PathBuf },
     /// Checkpoint refs (`refs/agent-terminal/*`) and the private index folder in a repository.
     Checkpoints {
         toplevel: PathBuf,
@@ -84,6 +90,7 @@ impl Item {
                 tilde(&agy.join(".gemini"), home)
             ),
             Item::CodexRules { file } => format!("Codex: {}", tilde(file, home)),
+            Item::UserTags { file } => format!("Model tags: {}", tilde(file, home)),
             Item::Checkpoints { toplevel, refs, .. } => format!(
                 "Checkpoints in {}: {} hidden ref{}",
                 tilde(toplevel, home),
@@ -581,6 +588,23 @@ pub fn plan(inputs: &Inputs) -> Plan {
         }
     }
 
+    // The user's tag file inside an app folder goes with it; one the user moved elsewhere is
+    // removed on its own, and only when the app's marker shows it wrote it.
+    let folders = candidate_folders(inputs);
+    for file in &inputs.user_tag_files {
+        if folders.iter().any(|f| file.starts_with(f)) || items_have_tags(&items, file) {
+            continue;
+        }
+        if crate::user_tags_file::is_ours(file) {
+            items.push(Item::UserTags { file: file.clone() });
+        } else if std::fs::symlink_metadata(file).is_ok() {
+            notes.push(format!(
+                "{} stays: Agent Terminal did not write it.",
+                tilde(file, &inputs.home)
+            ));
+        }
+    }
+
     let mut repos: Vec<Item> = vec![];
     let mut seen_common = BTreeSet::new();
     let mut seen_git_dir = BTreeSet::new();
@@ -663,6 +687,12 @@ pub fn plan(inputs: &Inputs) -> Plan {
     }
 }
 
+fn items_have_tags(items: &[Item], file: &Path) -> bool {
+    items
+        .iter()
+        .any(|i| matches!(i, Item::UserTags { file: f } if f == file))
+}
+
 /// Removes the plan's items, in an order that keeps what a later step needs: registrations and
 /// rules first (their journal is in a folder removed last), then checkpoints, then folders.
 /// Every item is attempted; failures are reported, not fatal. A registration that could not be
@@ -694,6 +724,14 @@ pub fn apply(plan: &Plan, uid: u32, home: &Path) -> Report {
             }
             Item::CodexRules { file } => {
                 record(what, remove_file(file));
+            }
+            Item::UserTags { file } => {
+                let result = if crate::user_tags_file::is_ours(file) {
+                    remove_file(file)
+                } else {
+                    Err("not made by Agent Terminal; left alone".into())
+                };
+                record(what, result);
             }
             Item::Checkpoints {
                 toplevel,
@@ -886,6 +924,43 @@ mod tests {
         assert!(
             candidate_folders(&i).contains(&PathBuf::from("/p/.config/agent-terminal/delegation"))
         );
+    }
+
+    /// The user's tag file: inside the app's folder it goes with it; moved elsewhere it is
+    /// removed on its own, and only when the app's marker shows the app wrote it.
+    #[test]
+    fn the_users_tag_file_is_removed_wherever_it_is_but_only_if_the_app_wrote_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        fs::create_dir_all(home.join(".config/agent-terminal")).unwrap();
+        fs::create_dir_all(home.join("elsewhere")).unwrap();
+        let inside = home.join(".config/agent-terminal/model-tags.user.json");
+        let moved = home.join("elsewhere/tags.json");
+        let hand = home.join("elsewhere/hand.json");
+        for file in [&inside, &moved] {
+            crate::user_tags_file::save(file, &agent_core::user_tags::new_document()).unwrap();
+        }
+        fs::write(&hand, r#"{"version": 1, "models": []}"#).unwrap();
+        let mut i = inputs(home);
+        i.user_tag_files = vec![inside.clone(), moved.clone(), moved.clone(), hand.clone()];
+        let plan = plan(&i);
+        let tag_items: Vec<_> = plan
+            .items
+            .iter()
+            .filter(|item| matches!(item, Item::UserTags { .. }))
+            .collect();
+        assert_eq!(
+            tag_items,
+            [&Item::UserTags {
+                file: moved.clone()
+            }],
+            "inside the app folder it goes with the folder; listed twice, removed once"
+        );
+        assert!(plan.notes.iter().any(|n| n.contains("hand.json")));
+        let report = apply(&plan, uid(), home);
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert!(!moved.exists() && !inside.exists());
+        assert!(hand.exists(), "a file the app did not write stays");
     }
 
     #[test]

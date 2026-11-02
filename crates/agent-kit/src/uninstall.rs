@@ -889,6 +889,18 @@ mod tests {
     }
 
     #[test]
+    fn the_attachment_store_goes_with_the_data_folder() {
+        let home = Path::new("/h");
+        for xdg in [None, Some("/x/data"), Some("relative/data")] {
+            let mut i = inputs(home);
+            i.xdg_data = xdg.map(str::to_owned);
+            let blobs = crate::attachments::BlobStore::location_for(xdg, home.to_str()).unwrap();
+            let folders = candidate_folders(&i);
+            assert!(folders.iter().any(|f| blobs.starts_with(f)), "{blobs:?}");
+        }
+    }
+
+    #[test]
     fn only_real_owned_app_folders_are_removable() {
         let tmp = tempfile::tempdir().unwrap();
         let ours = tmp.path().join(APP_DIR);

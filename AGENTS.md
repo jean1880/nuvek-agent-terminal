@@ -88,7 +88,10 @@ Architectural mandates, standards, and workflows for this codebase.
     `rmcp` client on one runtime thread per session, discovery and calls; `process`: the exact
     child environment, credential masks and scrubbed stderr; `import`: the pure Codex
     `config.toml` reader), `mcp_guardian` (the `--local-mcp-guardian` role that owns each MCP
-    process group) and `exec` (child processes with a timeout).
+    process group), `attachments` (image normalising under decode limits, metadata dropped by
+    encoding again, and the content-addressed `0600` blob store under
+    `$XDG_DATA_HOME/agent-terminal/attachments`, read back only when its hash matches, swept of
+    blobs no event refers to) and `exec` (child processes with a timeout).
   - `agent-kit`'s `store` is the SQLite thread store (threads, provider
     threads, scrubbed events, app meta such as the open-thread list).
     `store_writer` is the one thread that writes it: the app's main thread

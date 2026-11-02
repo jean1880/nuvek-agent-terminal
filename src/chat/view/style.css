@@ -800,7 +800,53 @@ dialog.chat-panel bottom-sheet > sheet,
 .code-copy:focus-visible,
 .section-more:focus-visible,
 .jump-button:focus-visible,
+.image-tile:focus-visible,
+.attach-button:focus-visible,
 .send-button:focus-visible {
     outline: 2px solid @at_accent;
     outline-offset: -2px;
 }
+
+/* ---------------------------------------------------------------- images */
+/* One look for every image: a rounded tile on a neutral backdrop (a transparent PNG reads on any
+   theme), the size reserved before the picture arrives, a soft pulse while it loads. */
+.image-tile {
+    border-radius: 12px;
+    background-color: @at_surface_strong;
+    border: 1px solid @at_border;
+}
+.image-tile.loading { animation: pulse 1400ms ease-in-out infinite; }
+.image-unavailable { color: @at_fg_dim; padding: 6px; }
+.image-strip .image-tile.thumb { border-radius: 6px; }
+.image-more { color: @at_fg_dim; font-size: 0.85em; margin-left: 2px; }
+/* Inside the user's bubble the images nest in its corners (18px bubble, 6px padding, 12px tiles). */
+.user-bubble.with-images { padding: 6px; }
+.user-bubble.with-images .user-text { padding: 4px 9px 4px 9px; }
+.user-row.queued .image-tile { opacity: 0.7; border-style: dashed; }
+/* An image the agent showed sits under its card, in the agent's column. */
+.shown-images { margin-left: 2px; }
+.shown-images .image-tile { border-color: @at_border_strong; }
+
+/* the composer's tray */
+.attachment-tray { padding: 2px 2px 0 2px; }
+.attachment-tray .tray-tile { border-radius: 8px; }
+.tray-remove {
+    min-width: 20px;
+    min-height: 20px;
+    padding: 0;
+    margin: 3px;
+    opacity: 0.75;
+}
+.tray-tile:hover .tray-remove,
+.tray-tile:focus-within .tray-remove,
+.tray-remove:focus-visible { opacity: 1; }
+.tray-note { color: @at_warning_soft; font-size: 0.9em; padding: 0 4px; }
+.drop-hint { color: @at_fg_soft; font-size: 0.92em; padding: 2px 4px; }
+.composer.dropping { border-style: dashed; border-color: @at_accent; }
+button.attach-button { min-width: 36px; min-height: 36px; color: @at_fg_dim; }
+button.attach-button:hover { color: @at_fg_strong; }
+
+/* the viewer */
+.image-viewer-picture { background-color: @at_bg_deep; }
+.image-counter { padding: 2px 10px; border-radius: 999px; font-size: 0.9em; }
+.image-menu-item { padding: 6px 12px; }

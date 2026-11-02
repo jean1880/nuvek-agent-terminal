@@ -46,8 +46,8 @@ use crate::window::sidebar_model::{
     OpenState, Redraw, ResumeAs, RowKey, SidebarModel, SidebarRow,
 };
 use crate::window::sidebar_model::{
-    empty_sidebar_text, limit_wait_text, reopen_offer, sessions_added_toast, thread_activity,
-    ThreadActivity,
+    empty_sidebar_text, image_title, limit_wait_text, reopen_offer, sessions_added_toast,
+    thread_activity, ThreadActivity,
 };
 use agent_core::limit_wait::{LimitRecord, LimitWait, Step, Window as LimitWindow};
 
@@ -783,6 +783,9 @@ pub(super) struct ChatTab {
     confirming_switch: bool,
     /// The user message item awaiting its text, for the title of an untitled thread.
     title_item: Option<String>,
+    /// The title stands for an image-only first message ("Image"): the first message with text
+    /// replaces it.
+    title_provisional: bool,
     /// Sent once the session exists (Continue In from a terminal page); also saved as redacted
     /// unsent metadata so closing during a build does not lose it.
     pending_prompt: Option<String>,
@@ -1298,6 +1301,43 @@ pub(super) fn app_store() -> Rc<Store> {
     }
 }
 
+/// How long after start-up the image sweep waits, so it never competes with opening threads.
+#[cfg_attr(test, allow(dead_code))]
+const IMAGE_SWEEP_DELAY_S: u32 = 30;
+/// How old an unreferenced image must be before the sweep removes it: one just pasted and not
+/// yet sent (or one an agent showed a moment ago, its event still queued) is kept.
+const IMAGE_SWEEP_GRACE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Removes stored images no thread refers to any more (older than [`IMAGE_SWEEP_GRACE`]), off
+/// the main thread. Runs only against the file store (`STORE_PATH`): with none (the in-memory
+/// fallback, demo threads, tests) it does nothing, and a failed read of the refs removes nothing.
+pub(super) fn sweep_images() {
+    if STORE_PATH.with(|p| p.borrow().is_none()) {
+        return;
+    }
+    glib::spawn_future_local(async {
+        let Some(Ok(referenced)) = store_job(|s| s.attachment_ids()).await else {
+            warn!("The image sweep could not read which images are in use; nothing was removed");
+            return;
+        };
+        let Some(blobs) = crate::attachments::blob_store() else {
+            return;
+        };
+        match gtk4::gio::spawn_blocking(move || blobs.sweep(&referenced, IMAGE_SWEEP_GRACE)).await {
+            Ok(Ok(report)) if report.removed > 0 => {
+                info!(
+                    removed = report.removed,
+                    kept = report.kept,
+                    "removed unused images"
+                );
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => warn!("The image sweep failed: {e}"),
+            Err(_) => warn!("The image sweep panicked"),
+        }
+    });
+}
+
 /// [`app_store`], reporting the one failure it cannot recover from: no SQLite at all.
 pub(super) fn try_app_store() -> Result<Rc<Store>, String> {
     if let Some(store) = STORE.with(|s| s.borrow().clone()) {
@@ -1348,6 +1388,9 @@ fn open_store() -> Result<Rc<Store>, String> {
                     }
                 }
                 STORE_PATH.with(|p| *p.borrow_mut() = Some(path));
+                // Only here, on the real store: a fallback or demo store knows no thread's
+                // images, and sweeping against it would remove them all.
+                glib::timeout_add_seconds_local_once(IMAGE_SWEEP_DELAY_S, sweep_images);
                 return Ok(Rc::new(store));
             }
             Err(e) => error!("Cannot open the thread store at {}: {e}", path.display()),
@@ -5523,6 +5566,7 @@ impl AgentTerminalWindow {
                 confirming_close: false,
                 confirming_switch: false,
                 title_item: None,
+                title_provisional: false,
                 pending_prompt: None,
                 pending_handoff: false,
                 profile_id: None,
@@ -6433,13 +6477,24 @@ impl AgentTerminalWindow {
                 }
                 Event::ItemStarted {
                     kind: ItemKind::UserMessage,
+                    input,
                     ..
-                } if chat.title.is_empty() => {
+                } if chat.title.is_empty() || chat.title_provisional => {
                     chat.title_item = env.item.clone();
-                    After::Nothing
+                    // An image alone names the thread for now; the first words replace it.
+                    let refs = agent_core::attachment::refs_in(input.as_ref());
+                    match refs.first() {
+                        Some(first) if chat.title.is_empty() => {
+                            let title = image_title(first);
+                            chat.title = title.clone();
+                            chat.title_provisional = true;
+                            After::Title(title)
+                        }
+                        _ => After::Nothing,
+                    }
                 }
                 Event::ContentSnapshot { text, .. }
-                    if chat.title.is_empty()
+                    if (chat.title.is_empty() || chat.title_provisional)
                         && env.item.is_some()
                         && env.item == chat.title_item =>
                 {
@@ -6449,6 +6504,7 @@ impl AgentTerminalWindow {
                     } else {
                         chat.title = title.clone();
                         chat.title_item = None;
+                        chat.title_provisional = false;
                         After::Title(title)
                     }
                 }

@@ -558,6 +558,17 @@ pub fn display_title(title: &str) -> &str {
     }
 }
 
+/// The title of a thread whose first message is an image alone: its file name, else "Image".
+/// The first message with words replaces it.
+pub fn image_title(image: &agent_core::attachment::AttachmentRef) -> String {
+    image
+        .name
+        .as_deref()
+        .map(thread_title)
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "Image".to_owned())
+}
+
 pub fn thread_title(text: &str) -> String {
     const MAX: usize = 60;
     let line = text
@@ -1859,6 +1870,25 @@ mod tests {
         assert_eq!(t.chars().count(), 60);
         assert!(t.ends_with('…'));
         assert_eq!(thread_title(""), "");
+    }
+
+    #[test]
+    fn an_image_alone_names_the_thread_by_its_file_or_image() {
+        let mut image = agent_core::attachment::AttachmentRef {
+            id: "a".repeat(64),
+            kind: agent_core::attachment::AttachmentKind::Image,
+            mime: "image/png".into(),
+            width: 1,
+            height: 1,
+            bytes: 1,
+            name: Some("login-bug.png".into()),
+            origin: agent_core::attachment::Origin::User,
+        };
+        assert_eq!(image_title(&image), "login-bug.png");
+        image.name = None;
+        assert_eq!(image_title(&image), "Image");
+        image.name = Some("  ".into());
+        assert_eq!(image_title(&image), "Image");
     }
 
     #[test]

@@ -3530,6 +3530,8 @@ impl Store {
         let mut out: Vec<TranscriptMessage> = Vec::new();
         let mut index: HashMap<String, usize> = HashMap::new();
         let mut tools: HashMap<String, ToolInput> = HashMap::new();
+        // The images each user message carried: a hand-off says they were there.
+        let mut images: HashMap<String, Vec<AttachmentRef>> = HashMap::new();
         // Each item's id as stored, by its bounded form, and the items that completed.
         let mut items: HashMap<String, String> = HashMap::new();
         let mut completed: HashSet<String> = HashSet::new();
@@ -3557,8 +3559,15 @@ impl Store {
                     }
                     Event::ItemStarted {
                         kind: ItemKind::UserMessage,
+                        input,
                         ..
-                    } => seed_settled = true,
+                    } => {
+                        seed_settled = true;
+                        let refs = agent_core::attachment::refs_in(input.as_ref());
+                        if let (false, Some(item)) = (refs.is_empty(), &env.item) {
+                            images.insert(item.clone(), refs);
+                        }
+                    }
                     _ => {}
                 }
                 if let Some(item) = &env.item {
@@ -3588,6 +3597,11 @@ impl Store {
         }
         // A hand-off replays this; the model's private thinking must not travel with it.
         out.retain(|m| m.kind != "reasoning");
+        for message in out.iter_mut().filter(|m| m.role == "user") {
+            if let Some(refs) = images.get(&message.item_id) {
+                message.text = agent_core::attachment::text_with_placeholders(&message.text, refs);
+            }
+        }
         for message in out.iter_mut().filter(|m| m.role == "tool") {
             if let Some(tool) = tools.get(&message.item_id) {
                 message.title = tool.title();
@@ -4931,6 +4945,9 @@ mod tests {
             _ => None,
         });
         assert_eq!(refs_in(input.as_ref()), vec![image.clone()]);
+        // A hand-off reads the message with its image named, never its bytes.
+        let messages = s.transcript_messages(&t).expect("messages");
+        assert_eq!(messages[0].text, "look\n[image: screenshot.png]");
         let refs = Envelope::new(Event::Attachments {
             refs: vec![image.clone()],
         })

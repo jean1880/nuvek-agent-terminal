@@ -163,7 +163,19 @@ pub fn tile(
     picture.set_content_fit(fit);
     picture.set_can_shrink(true);
     picture.set_size_request(size.0, size.1);
-    frame.set_child(Some(&picture));
+    // A picture asks for its image's own size; the size request is only a minimum. Two clamps
+    // hold it to the reserved box both ways, so a tile is the same size loading and loaded.
+    let clamp = |orientation, max: i32, child: &gtk4::Widget| {
+        let c = adw::Clamp::new();
+        c.set_orientation(orientation);
+        c.set_maximum_size(max);
+        c.set_tightening_threshold(max);
+        c.set_child(Some(child));
+        c
+    };
+    let tall = clamp(gtk4::Orientation::Vertical, size.1, picture.upcast_ref());
+    let wide = clamp(gtk4::Orientation::Horizontal, size.0, tall.upcast_ref());
+    frame.set_child(Some(&wide));
     let texture: Rc<RefCell<Option<gdk::Texture>>> = Rc::default();
 
     glib::spawn_future_local(glib::clone!(

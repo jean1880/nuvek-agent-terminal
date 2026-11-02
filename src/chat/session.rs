@@ -11542,6 +11542,78 @@ mod tests {
         create_provider_thread(store, thread, Driver::Agy, Some("gemini-pro")).expect("pt")
     }
 
+    fn staged(id: char) -> PromptImage {
+        PromptImage {
+            meta: agent_core::attachment::AttachmentRef {
+                id: id.to_string().repeat(64),
+                kind: agent_core::attachment::AttachmentKind::Image,
+                mime: "image/png".into(),
+                width: 4,
+                height: 3,
+                bytes: 3,
+                name: Some("shot.png".into()),
+                origin: agent_core::attachment::Origin::User,
+            },
+            path: format!("/data/{id}.png"),
+            data_base64: "AAAA".into(),
+        }
+    }
+
+    /// Images go to the adapter with their prompt, are stored by ref with the message (never
+    /// their bytes), wait with a queued message, and come back with it when it is pulled back.
+    #[test]
+    fn images_travel_with_their_message_and_never_into_the_store_as_bytes() {
+        in_loop(|_| {
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let log: Log = Rc::default();
+            let (session, seen) = harness(
+                FakeAdapter::boxed(Driver::Claude, &log),
+                open_on("sonnet"),
+                &store,
+                &thread,
+            );
+            session.send_input(&PromptInput {
+                text: "what is this?".into(),
+                images: vec![staged('a')],
+            });
+            let sent: Vec<_> = log
+                .borrow()
+                .iter()
+                .filter_map(|c| match c {
+                    Command::Prompt { text, attachments } => {
+                        Some((text.clone(), attachments.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert_eq!(sent[0].0, "what is this?");
+            assert_eq!(sent[0].1.len(), 1);
+            assert_eq!(sent[0].1[0].meta.id, "a".repeat(64));
+            assert_eq!(sent[0].1[0].path, "/data/a.png");
+            // The view saw the refs on the message's first start.
+            assert!(has(
+                &seen,
+                |e| matches!(e, Event::ItemStarted { kind: ItemKind::UserMessage, input, .. }
+                if agent_core::attachment::refs_in(input.as_ref()).len() == 1)
+            ));
+            let stored =
+                serde_json::to_string(&store.events(&thread, None, 50).expect("ev")).expect("json");
+            assert!(stored.contains(&"a".repeat(64)));
+            assert!(!stored.contains("AAAA"), "image bytes reached the store");
+
+            // A turn is running: the next message waits, images and all, and comes back whole.
+            session.queue_input(&PromptInput {
+                text: "and this".into(),
+                images: vec![staged('b'), staged('c')],
+            });
+            let (_, back) = session.pop_queued_input().expect("queued");
+            assert_eq!(back.text, "and this");
+            assert_eq!(back.images, vec![staged('b'), staged('c')]);
+        });
+    }
+
     #[test]
     fn submitted_work_switches_before_turn_started_and_carries_the_original_task() {
         in_loop(|_| {

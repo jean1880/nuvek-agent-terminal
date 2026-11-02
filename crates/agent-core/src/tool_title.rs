@@ -194,9 +194,27 @@ pub fn classify(item: ItemKind, name: &str, input: Option<&Value>) -> ToolTitle 
                 .unwrap_or_default()
         }
         ToolKind::Mcp => {
+            let action = mcp_name(&native, args);
+            // The app's own image tool reads as what it does, naming the files it shows (the
+            // images themselves are drawn under the card).
+            if action == "agent_terminal/show_image" {
+                let names: Vec<String> = args
+                    .get("images")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|i| i.get("path").and_then(Value::as_str))
+                    .map(|p| p.rsplit('/').next().unwrap_or(p).to_owned())
+                    .collect();
+                return ToolTitle {
+                    kind,
+                    action: "Show image".to_owned(),
+                    target: names.join(", "),
+                };
+            }
             return ToolTitle {
                 kind,
-                action: mcp_name(&native, args),
+                action,
                 target: String::new(),
             };
         }
@@ -833,6 +851,18 @@ mod tests {
             title(ItemKind::McpTool, "example.list_items", json!({})),
             "example/list_items"
         );
+        // The app's image tool, as Claude and Codex name it.
+        let images = json!({"images": [{"path": "/w/out/latency.png"}, {"path": "b.png"}]});
+        for name in [
+            "mcp__agent_terminal__show_image",
+            "agent_terminal.show_image",
+        ] {
+            assert_eq!(
+                title(ItemKind::McpTool, name, images.clone()),
+                "Show image latency.png, b.png",
+                "{name}"
+            );
+        }
     }
 
     #[test]

@@ -10,6 +10,10 @@ use super::*;
 const LOCAL_GROUP_HELP: &str = "Run threads on models from your own servers: Ollama, LM Studio, \
      vLLM, llama.cpp, LiteLLM or any OpenAI-compatible one. Add as many servers as you like; \
      each lists its models and has its own entry under New Thread With.";
+const FREE_TO_RUN_HELP: &str = "The model costs nothing per token, so other agents should prefer \
+it when it fits the task. Off for a gateway that may reach a paid model.";
+const SERVER_DELEGATION_HELP: &str = "This server alone: other agents may hand it work as a \
+sub-agent (the switch under Cross-agent delegation sets every agent and server).";
 const SERVER_NAME_HELP: &str = "How this server is named in menus, e.g. NAS Ollama";
 const SERVER_TYPE_HELP: &str = "Sets the default address; every type is reached through its \
      OpenAI-compatible API";
@@ -112,7 +116,7 @@ impl AgentTerminalWindow {
     }
 
     /// Applies `edit` to the server profile `id`, saves, and rescans: what is offered follows.
-    fn edit_server(&self, id: &str, edit: impl FnOnce(&mut Profile)) {
+    pub(super) fn edit_server(&self, id: &str, edit: impl FnOnce(&mut Profile)) {
         let changed = {
             let mut config = self.config.borrow_mut();
             config
@@ -139,6 +143,7 @@ impl AgentTerminalWindow {
     pub(super) fn local_servers_group(
         &self,
         dialog: &adw::PreferencesDialog,
+        switches: &Rc<delegation::Switches>,
     ) -> adw::PreferencesGroup {
         let obj = self.obj();
         let add = gtk4::Button::builder()
@@ -167,6 +172,8 @@ impl AgentTerminalWindow {
             rows,
             #[strong]
             rebuild,
+            #[strong]
+            switches,
             move || {
                 for row in rows.borrow_mut().drain(..) {
                     group.remove(&row);
@@ -189,7 +196,9 @@ impl AgentTerminalWindow {
                 }
                 let again = rebuild.borrow().clone();
                 for server in servers {
-                    let row = obj.imp().server_row(&server, &dialog, again.clone());
+                    let row = obj
+                        .imp()
+                        .server_row(&server, &dialog, &switches, again.clone());
                     group.add(&row);
                     rows.borrow_mut().push(row.upcast());
                 }
@@ -202,6 +211,8 @@ impl AgentTerminalWindow {
             obj,
             #[strong]
             fill,
+            #[strong]
+            switches,
             move |_| {
                 let imp = obj.imp();
                 imp.config
@@ -211,6 +222,8 @@ impl AgentTerminalWindow {
                 imp.refresh_profile_selection();
                 imp.refresh_agent_data(super::super::threads::Probes::Force);
                 fill();
+                // A new server is not yet available to other agents: the master switch says so.
+                imp.refresh_master_switch(&switches);
             }
         ));
         group
@@ -221,6 +234,7 @@ impl AgentTerminalWindow {
         &self,
         server: &Profile,
         dialog: &adw::PreferencesDialog,
+        switches: &Rc<delegation::Switches>,
         rebuild: Option<Rc<dyn Fn()>>,
     ) -> adw::ExpanderRow {
         let obj = self.obj();
@@ -435,8 +449,33 @@ impl AgentTerminalWindow {
         row.add_row(&name);
         row.add_row(&name_error);
 
+        // Cost: "free" means no cost per token, so other agents prefer this server's models when
+        // they fit a task. Unset follows the server's type, so a type change moves the switch.
+        let free_row = adw::SwitchRow::builder()
+            .title("Free to Run")
+            .subtitle(FREE_TO_RUN_HELP)
+            .subtitle_lines(0)
+            .active(crate::config::profile_is_free(server, Driver::Local))
+            .build();
+        let free_quiet = Rc::new(std::cell::Cell::new(false));
+        free_row.connect_active_notify(glib::clone!(
+            #[weak]
+            obj,
+            #[strong]
+            id,
+            #[strong]
+            free_quiet,
+            move |r| {
+                if !free_quiet.get() {
+                    let on = r.is_active();
+                    obj.imp().edit_server(&id, |p| p.free_to_run = Some(on));
+                }
+            }
+        ));
+
         let kind_id = id.clone();
         let kind_scan = scan.clone();
+        let kind_free = (free_row.downgrade(), free_quiet.clone());
         let kind_row = self.choice_row(
             "Server Type",
             SERVER_TYPE_HELP,
@@ -453,6 +492,11 @@ impl AgentTerminalWindow {
                         .unwrap_or_else(|| ModelProvider::new(kind));
                     p.provider = Some(ModelProvider { kind, ..current });
                 });
+                if let (Some(row), Some(now)) = (kind_free.0.upgrade(), imp.server_now(&kind_id)) {
+                    kind_free.1.set(true);
+                    row.set_active(crate::config::profile_is_free(&now, Driver::Local));
+                    kind_free.1.set(false);
+                }
                 kind_scan();
             },
         );
@@ -575,6 +619,31 @@ impl AgentTerminalWindow {
             },
         );
         row.add_row(&mode_row);
+        row.add_row(&free_row);
+
+        // This server alone: each Local server is its own profile and opts in on its own.
+        let delegation_row = adw::SwitchRow::builder()
+            .title("Available to Other Agents")
+            .subtitle(SERVER_DELEGATION_HELP)
+            .subtitle_lines(0)
+            .active(server.available_for_delegation)
+            .build();
+        switches.add_server(&id, &delegation_row);
+        delegation_row.connect_active_notify(glib::clone!(
+            #[weak]
+            obj,
+            #[strong]
+            id,
+            #[strong]
+            switches,
+            move |r| {
+                if !switches.quiet() {
+                    obj.imp()
+                        .set_server_delegation(&id, r.is_active(), &switches);
+                }
+            }
+        ));
+        row.add_row(&delegation_row);
 
         // A row with a button (libadwaita 1.5 has no button row).
         let remove_row = adw::ActionRow::builder()
@@ -587,6 +656,7 @@ impl AgentTerminalWindow {
             .css_classes(["destructive-action"])
             .build();
         remove_row.add_suffix(&remove);
+        let remove_switches = switches.clone();
         remove.connect_clicked(glib::clone!(
             #[weak]
             obj,
@@ -609,6 +679,7 @@ impl AgentTerminalWindow {
                 confirm.set_close_response("cancel");
                 let rebuild = rebuild.clone();
                 let id = id.clone();
+                let switches = remove_switches.clone();
                 confirm.connect_response(
                     None,
                     glib::clone!(
@@ -627,6 +698,7 @@ impl AgentTerminalWindow {
                             if let Some(rebuild) = &rebuild {
                                 rebuild();
                             }
+                            imp.refresh_master_switch(&switches);
                         }
                     ),
                 );

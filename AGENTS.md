@@ -520,6 +520,17 @@ Architectural mandates, standards, and workflows for this codebase.
   `git push` (never forced, after a confirmation that shows the command) through the user's own
   git and credentials. Neither runs unasked. The Support menu item (`support.rs`) likewise hands
   a fixed sponsorship URL to the browser on a user action and makes no request itself.
+- **Model tags have three layers and one writer**: a model's tier, tags and best-for come from
+  the user's file (`model-tags.user.json`, `TerminalConfig::user_model_tags_path`), then the
+  shared file (`model-tags.json`, authored elsewhere, read only), then the built-in list
+  (`agent_core::model_tags`; `lookup_for` ranks layer first, then an entry scoped to the
+  model's profile over an unscoped one). The app alone writes the user's file, atomically and
+  `0600` (`agent_kit::user_tags_file`, edits in `agent_core::user_tags`), only from Settings →
+  Agents → Model Tags and `agent-terminal tags`, and `uninstall` lists it (`Inputs::user_tag_files`).
+  Agents get no tool to change tags: one must not re-tag itself to steer routing. The built-in
+  list names no local model. Capabilities report each profile's `cost`
+  (`config::profile_is_free`; a free one reports usage `ok`, load 0) and each model's
+  `tags_source`.
 - **Never block the main thread**: anything that shells out — CLI detection above
   all, which may run `$SHELL -ic` and source the user's rc — goes through
   `gio::spawn_blocking`. A frozen window cannot even repaint its own spinner.

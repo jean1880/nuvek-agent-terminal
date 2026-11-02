@@ -14,6 +14,9 @@ use std::path::PathBuf;
 pub(super) struct Switches {
     master: RefCell<Option<glib::WeakRef<adw::SwitchRow>>>,
     agents: RefCell<Vec<(Driver, glib::WeakRef<adw::SwitchRow>)>>,
+    /// Each Local server's own switch, by profile id (the rows are rebuilt on an add or a
+    /// removal, so a dead one is dropped when the next is added).
+    servers: RefCell<Vec<(String, glib::WeakRef<adw::SwitchRow>)>>,
     pub(super) registration_row: glib::WeakRef<adw::ActionRow>,
     dialog: glib::WeakRef<adw::PreferencesDialog>,
     quiet: Cell<bool>,
@@ -44,26 +47,51 @@ impl Switches {
     pub(super) fn add_agent(&self, driver: Driver, row: &adw::SwitchRow) {
         self.agents.borrow_mut().push((driver, row.downgrade()));
     }
+    /// Registers a Local server's own switch.
+    pub(super) fn add_server(&self, id: &str, row: &adw::SwitchRow) {
+        let mut servers = self.servers.borrow_mut();
+        servers.retain(|(_, r)| r.upgrade().is_some());
+        servers.push((id.to_owned(), row.downgrade()));
+    }
+    fn server_row(&self, id: &str) -> Option<adw::SwitchRow> {
+        self.servers
+            .borrow()
+            .iter()
+            .find(|(i, _)| i == id)
+            .and_then(|(_, row)| row.upgrade())
+    }
     /// Whether code is moving a switch right now (its handler should do nothing).
     pub(super) fn quiet(&self) -> bool {
         self.quiet.get()
     }
 }
 
-/// The master switch's text, and whether it is on: on only when every enabled agent is
-/// available for delegation. Pure, so the mixed case is testable without GTK.
-pub(super) fn master_state(agents: &[(Driver, bool, bool)]) -> (bool, String) {
-    let label = |d: &Driver| d.info().long_label;
+/// Something with its own "available for delegation" switch: one of the vendor agents (one
+/// profile each) or one Local server (any number, each its own profile).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Unit {
+    Agent(Driver),
+    Server(String),
+}
+
+/// One unit's state for the master switch: its name, whether it is switched off in Settings,
+/// and whether it is available for delegation.
+pub(super) type UnitState = (String, bool, bool);
+
+/// The master switch's text, and whether it is on: on only when every enabled agent and every
+/// enabled Local server is available for delegation. Pure, so the mixed case is testable without
+/// GTK.
+pub(super) fn master_state(agents: &[UnitState]) -> (bool, String) {
     let enabled: Vec<_> = agents.iter().filter(|(_, disabled, _)| !disabled).collect();
-    let on: Vec<_> = enabled
+    let on: Vec<&str> = enabled
         .iter()
         .filter(|(_, _, a)| *a)
-        .map(|(d, _, _)| label(d))
+        .map(|(n, _, _)| n.as_str())
         .collect();
-    let off: Vec<_> = enabled
+    let off: Vec<&str> = enabled
         .iter()
         .filter(|(_, _, a)| !*a)
-        .map(|(d, _, _)| label(d))
+        .map(|(n, _, _)| n.as_str())
         .collect();
     let caveat = agent_core::delegation::route::RouteCaveat::CodexNativeWorkersUnsupervised;
     let base = format!(
@@ -87,15 +115,54 @@ pub(super) fn master_state(agents: &[(Driver, bool, bool)]) -> (bool, String) {
 }
 
 impl AgentTerminalWindow {
-    /// The agents' delegation state now: `(driver, disabled, available_for_delegation)`.
-    fn delegation_agents(&self) -> Vec<(Driver, bool, bool)> {
-        Driver::ALL
+    /// The delegation state now of each vendor agent and of each Local server (per profile, as
+    /// the Local agent has any number): what the master switch counts.
+    fn delegation_units(&self) -> Vec<(Unit, UnitState)> {
+        let mut out: Vec<(Unit, UnitState)> = Driver::ALL
             .into_iter()
+            .filter(|d| !d.is_built_in())
             .map(|d| {
                 let p = self.agent_profile_now(d);
-                (d, p.disabled, p.available_for_delegation)
+                (
+                    Unit::Agent(d),
+                    (
+                        d.info().long_label.to_owned(),
+                        p.disabled,
+                        p.available_for_delegation,
+                    ),
+                )
             })
+            .collect();
+        out.extend(self.config.borrow().local_servers().into_iter().map(|p| {
+            (
+                Unit::Server(p.id.clone()),
+                (p.name.clone(), p.disabled, p.available_for_delegation),
+            )
+        }));
+        out
+    }
+
+    fn delegation_agents(&self) -> Vec<UnitState> {
+        self.delegation_units()
+            .into_iter()
+            .map(|(_, s)| s)
             .collect()
+    }
+
+    /// Makes the Local server `id` available for delegation or not: saved at once, its switch and
+    /// the master one put in step. A server stays refused as a delegation target until the
+    /// routes admit the Local agent; the switch records the choice either way.
+    pub(super) fn set_server_delegation(&self, id: &str, on: bool, switches: &Rc<Switches>) {
+        self.edit_server(id, |p| p.available_for_delegation = on);
+        let saved = self
+            .config
+            .borrow()
+            .profile_by_id(id)
+            .is_some_and(|p| p.available_for_delegation);
+        if let Some(row) = switches.server_row(id) {
+            switches.set_quietly(&row, saved);
+        }
+        self.refresh_master_switch(switches);
     }
 
     /// Puts the master switch and its text in step with the saved settings. The switch itself
@@ -224,14 +291,17 @@ impl AgentTerminalWindow {
                 }
                 let on = row.is_active();
                 let imp = obj.imp();
-                for (driver, disabled, available) in imp.delegation_agents() {
+                for (unit, (_, disabled, available)) in imp.delegation_units() {
                     // Turning on skips disabled agents; turning off includes them, and an
                     // Antigravity still in its review (not yet saved on).
-                    let in_review = driver == Driver::Agy && switches.reviewing.get();
+                    let in_review = unit == Unit::Agent(Driver::Agy) && switches.reviewing.get();
                     if (on && disabled) || (available == on && !(in_review && !on)) {
                         continue;
                     }
-                    imp.set_agent_delegation(driver, on, &switches);
+                    match unit {
+                        Unit::Agent(driver) => imp.set_agent_delegation(driver, on, &switches),
+                        Unit::Server(id) => imp.set_server_delegation(&id, on, &switches),
+                    }
                 }
                 imp.refresh_master_switch(&switches);
             }
@@ -254,6 +324,7 @@ impl AgentTerminalWindow {
         let switches = Rc::new(Switches {
             master: RefCell::new(None),
             agents: RefCell::new(Vec::new()),
+            servers: RefCell::new(Vec::new()),
             registration_row: row.downgrade(),
             dialog: dialog.downgrade(),
             quiet: Cell::new(false),
@@ -700,43 +771,50 @@ async fn registration_context(
 
 #[cfg(test)]
 mod tests {
-    use super::master_state;
-    use agent_core::adapter::Driver::{Agy, Claude, Codex};
+    use super::{master_state, UnitState};
+
+    fn u(name: &str, disabled: bool, available: bool) -> UnitState {
+        (name.to_owned(), disabled, available)
+    }
+
+    const CLAUDE: &str = "Claude";
+    const CODEX: &str = "Codex";
+    const AGY: &str = "Antigravity";
 
     #[test]
     fn the_master_switch_is_on_only_when_every_enabled_agent_is() {
-        // (driver, disabled, available)
+        // (name, disabled, available)
         assert!(
             master_state(&[
-                (Claude, false, true),
-                (Codex, false, true),
-                (Agy, false, true)
+                u(CLAUDE, false, true),
+                u(CODEX, false, true),
+                u(AGY, false, true)
             ])
             .0
         );
         assert!(
             !master_state(&[
-                (Claude, false, true),
-                (Codex, false, true),
-                (Agy, false, false)
+                u(CLAUDE, false, true),
+                u(CODEX, false, true),
+                u(AGY, false, false)
             ])
             .0
         );
         // A disabled agent neither holds it off nor counts for it.
         assert!(
             master_state(&[
-                (Claude, false, true),
-                (Codex, false, true),
-                (Agy, true, false)
+                u(CLAUDE, false, true),
+                u(CODEX, false, true),
+                u(AGY, true, false)
             ])
             .0
         );
         // Nothing enabled: nothing to turn on.
         assert!(
             !master_state(&[
-                (Claude, true, true),
-                (Codex, true, false),
-                (Agy, true, false)
+                u(CLAUDE, true, true),
+                u(CODEX, true, false),
+                u(AGY, true, false)
             ])
             .0
         );
@@ -745,9 +823,9 @@ mod tests {
     #[test]
     fn a_mixed_state_names_who_is_on_and_off_and_the_codex_caveat_always_shows() {
         let (on, text) = master_state(&[
-            (Claude, false, true),
-            (Codex, false, true),
-            (Agy, false, false),
+            u(CLAUDE, false, true),
+            u(CODEX, false, true),
+            u(AGY, false, false),
         ]);
         assert!(!on);
         assert!(
@@ -757,14 +835,14 @@ mod tests {
         let caveat = agent_core::delegation::route::RouteCaveat::CodexNativeWorkersUnsupervised;
         for agents in [
             [
-                (Claude, false, true),
-                (Codex, false, true),
-                (Agy, false, true),
+                u(CLAUDE, false, true),
+                u(CODEX, false, true),
+                u(AGY, false, true),
             ],
             [
-                (Claude, false, false),
-                (Codex, false, false),
-                (Agy, false, false),
+                u(CLAUDE, false, false),
+                u(CODEX, false, false),
+                u(AGY, false, false),
             ],
         ] {
             let (_, text) = master_state(&agents);
@@ -774,5 +852,40 @@ mod tests {
             );
             assert!(text.contains(caveat.explain()));
         }
+    }
+
+    /// Local servers count one by one, by name: one server left off keeps the master off and is
+    /// named, a switched-off server counts for nothing, and any number of servers can be added.
+    #[test]
+    fn local_servers_count_per_profile_not_per_agent() {
+        let vendors = [
+            u(CLAUDE, false, true),
+            u(CODEX, false, true),
+            u(AGY, false, true),
+        ];
+        let with = |servers: &[UnitState]| {
+            let mut all = vendors.to_vec();
+            all.extend_from_slice(servers);
+            master_state(&all)
+        };
+        assert!(with(&[]).0);
+        assert!(with(&[u("Ollama", false, true), u("Big card", false, true)]).0);
+        let (on, text) = with(&[u("Ollama", false, true), u("Big card", false, false)]);
+        assert!(!on, "one server off is not all on");
+        assert!(
+            text.starts_with(
+                "Custom: on for Claude, Codex, Antigravity, Ollama; off for Big card."
+            ),
+            "{text}"
+        );
+        // A server switched off in Settings neither holds the master off nor counts for it.
+        assert!(with(&[u("Ollama", false, true), u("Spare", true, false)]).0);
+        // A newly added server is off: the master shows it as not yet included.
+        assert!(!with(&[u("Ollama 2", false, false)]).0);
+        // Only servers, none on: nothing custom.
+        let (on, text) = master_state(&[u("A", false, false), u("B", false, false)]);
+        assert!(!on && !text.starts_with("Custom"), "{text}");
+        let (on, _) = master_state(&[u("A", false, true), u("B", false, true)]);
+        assert!(on);
     }
 }

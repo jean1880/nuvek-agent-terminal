@@ -180,7 +180,16 @@ to add a server; add as many as you like. Each server has:
 - an optional **API Key Variable** and **Environment File**, as for the other agents;
 - **Models on the Server**, what the server listed at its last scan, with **Scan Now**.
   Embedding models are left out: they cannot hold a conversation;
-- a **Default Model** from that list, and a **Default Mode**.
+- a **Default Model** from that list, and a **Default Mode**;
+- **Free to Run** (`free_to_run` in the profile): the model costs nothing per token, so
+  other agents should prefer it when it fits a task. Unset, it follows the type: on for
+  Ollama, LM Studio and the other servers you run yourself, off for LiteLLM (a gateway
+  may reach a paid model) and Other. A profile of a vendor's own agent is always metered.
+  Delegation reports it as the profile's `cost`, with usage `ok` and load 0;
+- **Available to Other Agents** (`available_for_delegation` on the server's own profile,
+  off for a new server): the opt-in for this server alone, as **Available for delegation**
+  is for Claude, Codex and Antigravity. The master switch under Cross-agent delegation
+  counts each server on its own.
 
 A server is ready when it lists at least one chat model. Its threads pick from its own
 models, and keep the server they were opened on. The agent works in the thread's folder with
@@ -316,6 +325,39 @@ disabled and unreviewed; none arrives read-only or approved. Entries with anothe
 interpolation, shell or package-runner indirection (`sh -c`, `npx --call`), source files,
 literal credentials or `agent-terminal` itself are reported, not imported; a credential
 must be mapped to a variable name before its entry can be imported.
+
+### Model tags
+
+Delegation tells a parent what each model is good for: a tier (`fast`, `standard` or
+`deep`), tags from a vocabulary, and a one-line best-for note. They come from three layers,
+the first that matches a model winning:
+
+1. **Your own file**, `model-tags.user.json` beside `config.json` (`user_model_tags_path`
+   in the config moves it). Only Agent Terminal writes it, through Settings → Agents →
+   **Model Tags** or `agent-terminal tags`, so a tool that regenerates the shared file never
+   loses your changes. Its entries name one model exactly, and may be for one profile only
+   (`"profile": "<profile id>"`), so the same model on a large and a small card is tagged
+   per server; an entry for a profile beats one for every profile.
+2. **The shared file**, `model-tags.json` (`model_tags_path`), written by you or another
+   tool and only read here.
+3. **The built-in tags** for each vendor's model families. No local model is tagged built in.
+
+Both files use the same v1 format: `{"version": 1, "vocabulary": {...}, "models": [{"match":
+"<id or pattern>", "driver": "local", "profile": "<id>", "tier": "fast", "tags": ["code"],
+"best_for": "..."}]}`. `driver` is `claude`, `agy`, `codex` or `local`; omit it to match any.
+A tag must be in the vocabulary, which your file may extend. Unknown fields are ignored.
+
+```text
+agent-terminal tags list [--json]
+agent-terminal tags show  <model> [--driver D] [--profile P] [--json]
+agent-terminal tags set   <model> [--driver D] [--profile P] [--tier T] [--tags a,b] [--best-for TEXT]
+agent-terminal tags unset <model> [--driver D] [--profile P]
+```
+
+`--profile` takes a profile id or name and implies its driver. `set` changes only the
+fields given (a new entry starts from the tags the model has now) and prints the result;
+it exits non-zero with a message on an unknown tag or tier. `unset` removes your entry.
+Only your file is written.
 
 ### Claude and Codex on a model server
 

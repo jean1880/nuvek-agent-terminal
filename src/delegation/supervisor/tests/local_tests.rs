@@ -390,7 +390,10 @@ fn a_local_root_spawns_a_sub_agent_and_hears_its_result() {
                    "task_mode": "plan", "workspace": {"kind": "shared_read_only"},
                    "idempotency_key": "local-root-spawn-1"}),
         )]),
+        // A wait returns on any new event, so the first page may hold only the child's progress:
+        // wait again, as a model would, before answering.
         ScriptedModel::calls(&[("cross_agent_wait", json!({"timeout_ms": 8000}))]),
+        ScriptedModel::calls(&[("cross_agent_wait", json!({"timeout_ms": 3000}))]),
         ScriptedModel::text("The helper said its piece."),
     ]);
     in_context(async {
@@ -446,7 +449,7 @@ fn a_local_root_spawns_a_sub_agent_and_hears_its_result() {
         );
         sup.attach_root_session(&thread, Rc::downgrade(&session));
         session.send_prompt("ask a helper");
-        pump_until(|| model.bodies().len() >= 3 && !session.status().running_turn).await;
+        pump_until(|| model.bodies().len() >= 4 && !session.status().running_turn).await;
         let bodies = model.bodies();
         let told = |n: usize| {
             bodies[n]["messages"].as_array().unwrap().last().unwrap()["content"]
@@ -456,9 +459,11 @@ fn a_local_root_spawns_a_sub_agent_and_hears_its_result() {
         };
         assert!(told(1).contains("worker_id"), "spawned: {}", told(1));
         assert!(
-            told(2).contains("The helper's own answer."),
-            "the child's result: {}",
-            told(2)
+            told(2).contains("The helper's own answer.")
+                || told(3).contains("The helper's own answer."),
+            "the child's result: {} / {}",
+            told(2),
+            told(3)
         );
         // The root's runner offered the delegation tools and was told it may use them.
         let system = bodies[0]["messages"][0]["content"].as_str().unwrap();

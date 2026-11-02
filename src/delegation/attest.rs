@@ -744,16 +744,19 @@ mod tests {
             "tool_info": {"parameters": params}}})
     }
 
-    fn observed(steps: &[Value]) -> usize {
+    /// A fresh salt per run, as the supervisor's own is.
+    fn fresh_salt() -> [u8; 16] {
         use std::hash::{BuildHasher, Hasher};
-        let limits = agent_core::delegation::Limits::default();
-        // A fresh salt per run, as the supervisor's own is.
-        let salt: [u8; 16] = std::array::from_fn(|i| {
+        std::array::from_fn(|i| {
             let mut h = std::collections::hash_map::RandomState::new().build_hasher();
             h.write_usize(i);
             h.finish().to_le_bytes()[0]
-        });
-        let mut calls = ObservedCalls::new(salt, limits.observed_calls as usize);
+        })
+    }
+
+    fn observed(steps: &[Value]) -> usize {
+        let limits = agent_core::delegation::Limits::default();
+        let mut calls = ObservedCalls::new(fresh_salt(), limits.observed_calls as usize);
         let mut seen = std::collections::VecDeque::new();
         for step in steps {
             observe_calls(&mut calls, &mut seen, Driver::Agy, step, &limits);
@@ -767,7 +770,7 @@ mod tests {
     #[test]
     fn local_items_are_observed_under_the_runners_own_key() {
         let limits = agent_core::delegation::Limits::default();
-        let mut calls = ObservedCalls::new([3; 16], limits.observed_calls as usize);
+        let mut calls = ObservedCalls::new(fresh_salt(), limits.observed_calls as usize);
         let mut seen = std::collections::VecDeque::new();
         let item = |id: &str, server: &str, args: Value| {
             json!({"event": {"type": "item_started", "kind": "mcp_tool", "title": "cross_agent_list",

@@ -443,6 +443,8 @@ struct Inner {
     /// The open calls to our own `show_image`, by item id, oldest first: where the images such
     /// a call shows go ([`ChatSession::show_agent_images`]).
     show_image_calls: RefCell<std::collections::VecDeque<String>>,
+    /// Each top-level reply's text while it is open, for the local images it names.
+    reply_texts: RefCell<std::collections::HashMap<String, String>>,
     /// Open Codex permission requests, by request id: what the answer may be (see
     /// [`Inner::gate_codex_permissions`]). Never a rule.
     codex_permissions: RefCell<HashMap<String, PermissionCard>>,
@@ -1032,6 +1034,7 @@ impl ChatSession {
             pre_init_prompts: RefCell::new(Vec::new()),
             turn_images: Cell::new(0),
             show_image_calls: RefCell::new(std::collections::VecDeque::new()),
+            reply_texts: RefCell::default(),
             codex_permissions: RefCell::new(HashMap::new()),
             codex_grants: RefCell::new(Vec::new()),
             held_permissions: RefCell::new(HashSet::new()),
@@ -1472,6 +1475,7 @@ impl Inner {
             self.turn_images.set(0);
         }
         self.track_show_image_calls(&env);
+        self.track_reply_images(&env);
         let delivery = ScopedFlag::set(&self.delivering);
         // A prompted turn ran on this native session: there is a conversation to resume.
         if self.prompted.get() && matches!(env.event, Event::TurnCompleted { .. }) {
@@ -6613,6 +6617,94 @@ impl Inner {
         }
     }
 
+    /// Keeps each top-level reply's text while it streams ([`Inner::reply_texts`]); when it
+    /// completes (or its turn ends), the local images its markdown names are shown on it.
+    fn track_reply_images(&self, env: &Envelope) {
+        match (&env.event, env.item.as_ref()) {
+            (
+                Event::ItemStarted {
+                    kind: ItemKind::AssistantMessage,
+                    parent: None,
+                    ..
+                },
+                Some(id),
+            ) => {
+                self.reply_texts.borrow_mut().entry(id.clone()).or_default();
+            }
+            (
+                Event::ContentDelta {
+                    stream: StreamKind::Assistant,
+                    text,
+                },
+                Some(id),
+            ) => {
+                if let Some(t) = self.reply_texts.borrow_mut().get_mut(id) {
+                    t.push_str(text);
+                }
+            }
+            (
+                Event::ContentSnapshot {
+                    stream: StreamKind::Assistant,
+                    text,
+                },
+                Some(id),
+            ) => {
+                if let Some(t) = self.reply_texts.borrow_mut().get_mut(id) {
+                    t.clone_from(text);
+                }
+            }
+            (Event::ItemCompleted { .. }, Some(id)) => {
+                let text = self.reply_texts.borrow_mut().remove(id);
+                if let Some(text) = text {
+                    self.show_reply_images(id.clone(), &text);
+                }
+            }
+            (Event::TurnCompleted { .. } | Event::SessionExited { .. }, _) => {
+                let open: Vec<_> = self.reply_texts.borrow_mut().drain().collect();
+                for (id, text) in open {
+                    self.show_reply_images(id, &text);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Shows the local images a reply's markdown names (`![alt](path)`) on it, as images the
+    /// agent showed: each read off the main thread only when the Local agent's own read policy
+    /// would let it run without asking ([`agent_kit::local_tools::read_unasked`]: inside the
+    /// thread's folder, not a sensitive file, links judged where they lead), then stored. One
+    /// that would ask, is missing or is not an image stays the reply's text, unshown: a reply
+    /// never raises a question, and nothing is fetched from the network.
+    fn show_reply_images(&self, item: String, text: &str) {
+        let paths = agent_core::attachment::markdown_image_paths(text);
+        if paths.is_empty() {
+            return;
+        }
+        let cwd = self.open.borrow().cwd.clone();
+        if cwd.is_empty() {
+            return;
+        }
+        let weak = self.weak_self.borrow().clone();
+        glib::spawn_future_local(async move {
+            let stored = gtk4::gio::spawn_blocking(move || capture_reply_images(&cwd, &paths))
+                .await
+                .unwrap_or_default();
+            let Some(inner) = weak.and_then(|w| w.upgrade()) else {
+                return;
+            };
+            if stored.is_empty() {
+                return;
+            }
+            let used = inner.turn_images.get();
+            let room = agent_core::attachment::MAX_PER_TURN.saturating_sub(used);
+            let shown: Vec<_> = stored.into_iter().take(room).collect();
+            if !shown.is_empty() {
+                inner.turn_images.set(used + shown.len());
+                inner.emit(Envelope::new(Event::Attachments { refs: shown }).item(item));
+            }
+        });
+    }
+
     /// An image a tool handed the agent ([`Event::ToolImage`]): stored off the main thread (a
     /// bounded decode, re-encoded, never its raw bytes), then shown on its item as
     /// [`Event::Attachments`], the form that is persisted. Past
@@ -6662,6 +6754,41 @@ impl Inner {
             }
         });
     }
+}
+
+/// Reads and stores the images `paths` name for a reply in `cwd` (blocking: on a worker). Only
+/// what the read policy lets run unasked is read; anything else is skipped, logged by count.
+fn capture_reply_images(cwd: &str, paths: &[String]) -> Vec<agent_core::attachment::AttachmentRef> {
+    use agent_kit::local_tools::{read_unasked, Workspace};
+    let Ok(ws) = Workspace::open(Path::new(cwd)) else {
+        return Vec::new();
+    };
+    let Some(store) = crate::attachments::blob_store() else {
+        return Vec::new();
+    };
+    let mut refs = Vec::new();
+    let mut skipped = 0;
+    for path in paths {
+        let read = read_unasked(&ws, path, agent_kit::attachments::MAX_INPUT_BYTES);
+        let stored = read.ok().and_then(|(target, bytes)| {
+            let name = target.file_name().map(|n| n.to_string_lossy().into_owned());
+            store
+                .ingest_bytes(
+                    &bytes,
+                    name.as_deref(),
+                    agent_core::attachment::Origin::AgentShown,
+                )
+                .ok()
+        });
+        match stored {
+            Some(n) => refs.push(n.meta),
+            None => skipped += 1,
+        }
+    }
+    if skipped > 0 {
+        tracing::debug!(skipped, "a reply named images that were not shown");
+    }
+    refs
 }
 
 /// A user message's `ItemStarted`, queued or not, with the refs of the images sent with it: the
@@ -11625,6 +11752,42 @@ mod tests {
             path: format!("/data/{id}.png"),
             data_base64: "AAAA".into(),
         }
+    }
+
+    /// A reply's local images are read only as the read policy allows without asking: one in
+    /// the thread's folder is stored as shown by the agent; one outside it, a link leading out,
+    /// a missing file and a file that is not an image are not, and nothing is asked.
+    #[test]
+    fn a_reply_shows_only_the_local_images_it_may_read_unasked() {
+        use std::os::unix::fs::symlink;
+        // A 1×1 PNG.
+        let png = agent_kit::attachments::from_base64(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+        )
+        .expect("png");
+        let root = tempfile::tempdir().expect("dir");
+        let work = root.path().join("work");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(work.join("out")).expect("work");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(work.join("out/chart.png"), &png).expect("chart");
+        std::fs::write(outside.join("secret.png"), &png).expect("secret");
+        symlink(outside.join("secret.png"), work.join("link.png")).expect("link");
+        std::fs::write(work.join("notes.png"), "not an image").expect("notes");
+        let paths: Vec<String> = [
+            "out/chart.png",
+            "../outside/secret.png",
+            "link.png",
+            "missing.png",
+            "notes.png",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let refs = capture_reply_images(&work.to_string_lossy(), &paths);
+        assert_eq!(refs.len(), 1, "{refs:?}");
+        assert_eq!(refs[0].origin, agent_core::attachment::Origin::AgentShown);
+        assert_eq!(refs[0].name.as_deref(), Some("chart.png"));
+        assert_eq!((refs[0].width, refs[0].height), (1, 1));
     }
 
     /// Images go to the adapter with their prompt, are stored by ref with the message (never

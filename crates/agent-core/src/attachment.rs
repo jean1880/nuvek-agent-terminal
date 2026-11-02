@@ -115,6 +115,65 @@ impl PromptAttachment {
     }
 }
 
+/// The local files a reply's markdown images name (`![alt](src)`), in order, at most
+/// [`MAX_PER_ITEM`], each once: absolute or relative paths and `file://` URLs. A web address,
+/// a `data:` URL or any other scheme is never one (the app never fetches an image), and an
+/// image inside a code span or block is text, not an image.
+pub fn markdown_image_paths(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut in_fence = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        // Code spans: only what lies outside backticks is read.
+        for (i, part) in line.split('`').enumerate() {
+            if i % 2 == 1 {
+                continue;
+            }
+            let mut rest = part;
+            while let Some(at) = rest.find("![") {
+                rest = &rest[at + 2..];
+                let Some(close) = rest.find("](") else {
+                    break;
+                };
+                rest = &rest[close + 2..];
+                let Some(end) = rest.find(')') else {
+                    break;
+                };
+                let inner = rest[..end].trim();
+                rest = &rest[end + 1..];
+                // `<path with spaces>`, or a path then an optional "title".
+                let src = match inner.strip_prefix('<') {
+                    Some(angled) => angled.split('>').next().unwrap_or(""),
+                    None => inner.split_whitespace().next().unwrap_or(""),
+                };
+                let src = src.strip_prefix("file://").unwrap_or(src);
+                let scheme = src.split_once(':').is_some_and(|(s, _)| {
+                    !s.is_empty()
+                        && s.chars()
+                            .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+                });
+                if src.is_empty() || scheme || src.starts_with("//") {
+                    continue;
+                }
+                if !out.iter().any(|p| p == src) {
+                    out.push(src.to_owned());
+                }
+                if out.len() == MAX_PER_ITEM {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Where a tool-result image is ([`crate::event::Event::ToolImage`]): its bytes, or a file the
 /// app reads under its read policy (Codex `imageView`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,6 +312,27 @@ mod tests {
         );
         assert_eq!(pasted.accessible_label(), "Image, 320 by 200");
         assert_eq!(r(ID).accessible_label(), "Image, shot.png, 320 by 200");
+    }
+
+    #[test]
+    fn only_local_files_are_read_from_a_reply() {
+        let reply = "Here is the chart:\n\n![latency](out/latency.png \"Latency\")\n\
+            and ![abs](/tmp/a.png), ![file](file:///home/me/b.png), ![sp](<my shots/c.png>)\n\
+            not ![web](https://example.com/x.png) nor ![d](data:image/png;base64,AAAA)\n\
+            nor ![p](//cdn.example.com/y.png) nor `![code](z.png)`\n\
+            ```\n![fenced](f.png)\n```\n![again](out/latency.png)";
+        assert_eq!(
+            markdown_image_paths(reply),
+            [
+                "out/latency.png",
+                "/tmp/a.png",
+                "/home/me/b.png",
+                "my shots/c.png"
+            ]
+        );
+        let many: String = (0..20).map(|i| format!("![x]({i}.png) ")).collect();
+        assert_eq!(markdown_image_paths(&many).len(), MAX_PER_ITEM);
+        assert!(markdown_image_paths("no images ![broken(").is_empty());
     }
 
     #[test]

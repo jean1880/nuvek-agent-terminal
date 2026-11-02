@@ -512,6 +512,9 @@ pub enum Row {
         root: gtk4::Box,
         md: MarkdownView,
         caret: gtk4::Label,
+        /// The local images the reply named, under its text.
+        images: gtk4::Box,
+        shown: RefCell<Vec<String>>,
     },
     Reasoning(ReasoningRow),
     Tool(ToolCard),
@@ -575,7 +578,16 @@ impl Row {
                 let caret = label("▍", &["stream-caret"]);
                 caret.set_selectable(false);
                 root.append(&caret);
-                Self::Assistant { root, md, caret }
+                let images = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+                images.set_visible(false);
+                root.append(&images);
+                Self::Assistant {
+                    root,
+                    md,
+                    caret,
+                    images,
+                    shown: RefCell::default(),
+                }
             }
             Body::Reasoning { .. } => Self::Reasoning(ReasoningRow::new(&item.id, sink)),
             Body::Tool(_) => Self::Tool(ToolCard::new(&item.id, sink)),
@@ -771,13 +783,37 @@ impl Row {
                 }
             }
             (
-                Self::Assistant { md, caret, .. },
+                Self::Assistant {
+                    md,
+                    caret,
+                    images: slot,
+                    shown,
+                    ..
+                },
                 Body::Assistant {
-                    text, streaming, ..
+                    text,
+                    streaming,
+                    images,
+                    driver,
                 },
             ) => {
                 md.set_markdown(text);
                 caret.set_visible(*streaming);
+                let ids: Vec<String> = images.iter().map(|r| r.id.clone()).collect();
+                if *shown.borrow() != ids {
+                    while let Some(child) = slot.first_child() {
+                        slot.remove(&child);
+                    }
+                    if !images.is_empty() {
+                        slot.append(&super::images::group(
+                            images,
+                            super::images::Place::Agent,
+                            Some(driver.info().label),
+                        ));
+                    }
+                    slot.set_visible(!images.is_empty());
+                    *shown.borrow_mut() = ids;
+                }
             }
             (
                 Self::Reasoning(r),

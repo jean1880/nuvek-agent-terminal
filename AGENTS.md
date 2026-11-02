@@ -446,7 +446,10 @@ Architectural mandates, standards, and workflows for this codebase.
   its commands included, and non-root ptrace and core dumps are refused, since it holds the
   server key and the delegation capability. Removing the key variable once read only edits
   libc's copy (so commands do not inherit it); the kernel's copy of the starting environment
-  stays, which non-dumpability is what keeps unreadable.
+  stays, which non-dumpability is what keeps unreadable. **Residual risk:** non-dumpability
+  closes the runner, not where the key came from: a key kept in the profile's environment file,
+  or exported by the user's shell, stays readable there by the agent's commands, which run as the
+  same user.
 - **The Local agent delegates through its own client, never a bridge process**: its binding is
   the open binding (`launch::prepare_with`), which `LocalAdapter` takes through
   `Adapter::bind_launch` into exactly one startup frame (`Command::ConfigureLocal`'s `bridge`;

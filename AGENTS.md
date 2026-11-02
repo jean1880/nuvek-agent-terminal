@@ -124,7 +124,9 @@ Architectural mandates, standards, and workflows for this codebase.
     imports that keep `crate::git::…` paths).
   - Chat: `chat/session.rs` (one thread's backend: adapter, process, store,
     switching, handoff), `chat/view/` (the GTK view; it only talks to
-    `ChatBackend`), `agent_proc.rs` (gio process transport),
+    `ChatBackend`; `view/images.rs` draws every image and the viewer, `view/tray.rs` the
+    composer's staged images), `attachments.rs` (taking images in and loading them as textures,
+    off the main thread), `agent_proc.rs` (gio process transport),
     `approval_server.rs` / `approval_hook.rs` (agy's approval socket and the
     `--approval-hook` client), `hook_config.rs` (is the hook installed in
     `~/.gemini/config/hooks.json`), `model_catalog.rs`, `account_status.rs`,
@@ -222,6 +224,23 @@ Architectural mandates, standards, and workflows for this codebase.
   event (`scrub_envelope`) and title, and every handoff (cross-agent switch,
   fork, compact-by-handoff, brief) goes through `agent_core::redact` and the
   handoff budget. A new store write or injected prompt must take the same path.
+- **Images are kept by ref, decoded under bounds, and never redacted, so never sent unasked**:
+  an image a user attaches (picked, pasted, dropped) or an agent's tool returns is decoded under
+  `agent_kit::attachments::normalise`'s limits (20 MB, 16 384 px a side, bounded allocation),
+  resized to 2048 px, re-encoded (no metadata survives) and stored content-addressed (`0600`, in a
+  `0700` `$XDG_DATA_HOME/agent-terminal/attachments`); only the re-encoded copy is ever shown or
+  sent. Events, the store and hand-offs carry an `AttachmentRef` (its sha256 id, size, name),
+  never bytes: `Event::ToolImage` (an adapter's image, base64 or a path) is transient, stored as a
+  blob by the session and replaced by `Event::Attachments` before anything is persisted or shown,
+  and the store refuses it; a `raw` frame over 256 KB is replaced by its size. Base64 never passes
+  through `redact` (it would corrupt it). Because an image cannot be redacted, one reaches an agent
+  only when the user attached it, with its thumbnail in view, and an agent that cannot take images
+  (agy: its stream input is text only) keeps the message in the composer and says so, never
+  sending the text alone. Hand-offs say `[image: name]`. The sweep (`threads::sweep_images`)
+  removes a blob no event refers to once it is a day old, after a thread is deleted and at
+  start-up, and only against the file store (an in-memory or demo store knows no thread's images).
+  "Open in Image Viewer" hands another app a private copy under `$XDG_RUNTIME_DIR/agent-terminal/
+  open`, removed at quit. No image is ever fetched from the network.
 - **A root hears its sub-agents without polling, and never after a stop**: a child's finished
   run, failure or message to its root is posted in the root's thread as the app's notice and
   starts a turn with it (`delegation/wake.rs`, decided in `agent_core::delegation::wake`):

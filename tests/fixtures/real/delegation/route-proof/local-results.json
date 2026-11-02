@@ -1,0 +1,11 @@
+{
+  "G-L1": true,
+  "G-L2": true,
+  "G-L3": true,
+  "G-L4": true,
+  "model_transport": "local fixture; no model server",
+  "passed": true,
+  "provider": "local",
+  "token_leak_paths": [],
+  "version": "1.2.0"
+}

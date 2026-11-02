@@ -70,6 +70,41 @@ class DelegationProofTests(unittest.TestCase):
         self.assertTrue(started)
         self.assertFalse(json.loads((fixtures/"codex-results.json").read_text())["G-X2"])
 
+    def test_local_recorded_gates_hold_their_evidence(self):
+        fixtures = Path(__file__).resolve().parents[1]/"fixtures/real/delegation/route-proof"
+        payload = json.loads((fixtures/"local.proof.json").read_text())
+        self.assertEqual(payload["evidence_kind"], "local")
+        frames = payload["frames"]
+        def one(event, **match):
+            found = [f for f in frames if f.get("event")==event and all(f.get(k)==v for k,v in match.items())]
+            self.assertTrue(found, (event, match))
+            return found[0]
+        # G-L1: never in the runner's environment or argv, nor any file or line.
+        self.assertTrue(all(f["clean"] for f in frames if f.get("event")=="proc_scan"))
+        self.assertEqual(one("leaks")["count"], 0)
+        # G-L2: its own process, with its frame's capability.
+        hello = one("hello")
+        self.assertTrue(hello["peer_is_runner"] and hello["hello_pid_is_runner"] and hello["cap_is_frame_token"])
+        # G-L3: the call under the key of the item it showed, with the same arguments.
+        call = one("call")
+        self.assertEqual(call["key"], one("item", tool=call["tool"])["key"])
+        self.assertTrue(call["same_arguments"] and call["within_window"])
+        # G-L4: the policy read back first, a write asked and refused, a plan child offered no
+        # writing tool, a child naming an MCP server refused.
+        policy = one("child_policy")
+        self.assertTrue(policy["before_session_started"])
+        self.assertEqual(policy["echo"]["mcp_servers"], 0)
+        self.assertEqual(one("approval")["tool"], "write_file")
+        self.assertFalse(one("file")["written"])
+        plan = one("offered", scenario="child-plan")["tools"]
+        self.assertFalse({"write_file","edit_file","run_command"} & set(plan))
+        refused = one("refused_startup")
+        self.assertEqual(refused["exit_code"], 1)
+        self.assertFalse(refused["session_started"])
+        results = json.loads((fixtures/"local-results.json").read_text())
+        self.assertTrue(all(results[gate] for gate in ["G-L1","G-L2","G-L3","G-L4"]))
+        self.assertEqual(results["token_leak_paths"], [])
+
     def test_scan_ignores_inputs_and_symlinks_but_finds_provider_persistence(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

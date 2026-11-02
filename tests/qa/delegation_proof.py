@@ -36,11 +36,12 @@ NATIVE_TOOLS = {"spawn_agent", "send_input", "wait", "close_agent", "resume_agen
 def export_proof_fixtures(source, destination):
     """Publish gate projections, never provider transcripts or incidental model prose."""
     names = {"claude", "codex", "codex-parent", "codex-parent-resume", "codex-native-control",
-             "agy", "agy-hook", "agy-mcp"}
+             "agy", "agy-hook", "agy-mcp", "local"}
     recordings = {path.stem: [json.loads(line) for line in path.read_text().splitlines()]
                   for path in source.glob("*.jsonl") if path.stem in names}
-    times = [entry["at"] for entries in recordings.values() for entry in entries
-             if isinstance(entry.get("at"), (int, float))]
+    # The Local recording's times are already relative to its own start.
+    times = [entry["at"] for name, entries in recordings.items() if name != "local"
+             for entry in entries if isinstance(entry.get("at"), (int, float))]
     origin = min(times, default=0)
     identifiers = {}
 
@@ -73,6 +74,13 @@ def export_proof_fixtures(source, destination):
 
     def project(entry, name):
         out = {}
+        if name == "local":
+            # Already a gate projection (`local_proof` writes only booleans, counts, fixed tool
+            # names and pseudonymous keys); kept to its known fields, relative times as written.
+            out = {key: value for key, value in entry.items() if key in LOCAL_KEYS}
+            if isinstance(out.get("tools"), list):
+                out["tools"] = [t for t in out["tools"] if isinstance(t, str) and re.fullmatch(r"[a-z_]{1,64}", t)]
+            return out or None
         if "at" in entry:
             out["at"] = round(entry["at"] - origin, 6)
         if name == "agy-mcp":
@@ -182,16 +190,18 @@ def export_proof_fixtures(source, destination):
         (destination / f"{name}.proof.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     def result_projection(value):
         result = {key: item for key, item in value.items()
-                  if key in {"G-C1", "G-C3", "G-X1", "G-X2", "G-X3", "G-A1", "G-A3", "G-A5"} and isinstance(item, bool)
+                  if key in {"G-C1", "G-C3", "G-X1", "G-X2", "G-X3", "G-A1", "G-A3", "G-A5",
+                             "G-L1", "G-L2", "G-L3", "G-L4"} and isinstance(item, bool)
                   or key in {"passed", "overlay_start_and_fresh_resume", "disabled_builtin_without_transport_rejected",
                              "native_started_while_disabled", "native_positive_control_started", "hook_own_queries",
                              "hook_foreign_queries", "hook_native_queries"} and isinstance(item, (bool, int))}
-        if value.get("provider") in {"agy", "claude", "codex", "codex-parent"}:
+        if value.get("provider") in {"agy", "claude", "codex", "codex-parent", "local"}:
             result["provider"] = value["provider"]
         version = re.search(r"\d+\.\d+\.\d+", str(value.get("version", "")))
         if version:
             result["version"] = version.group()
-        if value.get("model_transport") in {"local fixture; no cloud inference", "cloud model; isolated home; no credentials copied"}:
+        if value.get("model_transport") in {"local fixture; no cloud inference", "cloud model; isolated home; no credentials copied",
+                                            "local fixture; no model server"}:
             result["model_transport"] = value["model_transport"]
         for key in ("disabled_tools", "enabled_native_tools"):
             if key in value:
@@ -791,6 +801,312 @@ def agy_proof(base, output, app, auth_file=None):
             "model_transport":"cloud model; isolated home; no credentials copied"}
 
 
+LOCAL_KEYS = {"at", "event", "scenario", "bridge", "child", "mcp_servers", "tools", "cap_present",
+              "cap_is_frame_token", "peer_is_runner", "hello_pid_is_runner", "tool", "key",
+              "same_arguments", "within_window", "before_session_started", "echo", "decision",
+              "written", "exit_code", "session_started", "count", "clean"}
+
+
+def local_token():
+    """A capability canary in the token's own shape (the runner refuses any other)."""
+    import base64
+    return "atdc_" + base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("=")
+
+
+class ChatFixture:
+    """A loopback OpenAI-compatible chat model with scripted replies. Records only the tool
+    NAMES each request offered and whether the canary appeared anywhere in a request."""
+    def __init__(self, canary):
+        self.replies = []
+        self.offered = []
+        self.canary_seen = []
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_POST(self):
+                raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                body = json.loads(raw or b"{}")
+                owner.offered.append(sorted(tool.get("function", {}).get("name", "")
+                                            for tool in body.get("tools", [])))
+                owner.canary_seen.append(canary.encode() in raw)
+                reply = owner.replies.pop(0) if owner.replies else ChatFixture.text("OK")
+                data = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in reply) + "data: [DONE]\n\n"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(data.encode())))
+                self.end_headers()
+                self.wfile.write(data.encode())
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    @staticmethod
+    def call(name, arguments):
+        return [{"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "proof-call", "type": "function",
+                 "function": {"name": name, "arguments": json.dumps(arguments)}}]}}]},
+                {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}]
+
+    @staticmethod
+    def text(text):
+        return [{"choices": [{"delta": {"content": text}, "finish_reason": "stop"}]}]
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.server.server_port}"
+
+    def __exit__(self, *_args):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+
+class DelegationFixture:
+    """A stand-in for the app's delegation socket (4-byte big-endian length, then JSON). It
+    welcomes any hello, recording the peer pid the kernel reports (SO_PEERCRED), and answers
+    every call with an empty worker list."""
+    def __init__(self, path):
+        import socket
+        import struct
+        self.socket_module, self.struct = socket, struct
+        self.hellos, self.calls = [], []
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener.bind(str(path))
+        self.listener.listen(8)
+        self.listener.settimeout(0.2)
+        self.stopping = threading.Event()
+        self.thread = threading.Thread(target=self.accept, daemon=True)
+        self.thread.start()
+
+    def read(self, connection):
+        header = self.exact(connection, 4)
+        if header is None:
+            return None
+        body = self.exact(connection, self.struct.unpack(">I", header)[0])
+        return None if body is None else json.loads(body)
+
+    @staticmethod
+    def exact(connection, size):
+        data = b""
+        while len(data) < size:
+            chunk = connection.recv(size - len(data))
+            if not chunk:
+                return None
+            data += chunk
+        return data
+
+    def write(self, connection, frame):
+        body = json.dumps(frame).encode()
+        connection.sendall(self.struct.pack(">I", len(body)) + body)
+
+    def accept(self):
+        while not self.stopping.is_set():
+            try:
+                connection, _ = self.listener.accept()
+            except (TimeoutError, OSError):
+                continue
+            threading.Thread(target=self.serve, args=(connection,), daemon=True).start()
+
+    def serve(self, connection):
+        socket = self.socket_module
+        with connection:
+            credentials = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                                self.struct.calcsize("3i"))
+            peer, _, _ = self.struct.unpack("3i", credentials)
+            hello = self.read(connection)
+            if not hello or hello.get("t") != "hello":
+                return
+            self.hellos.append({"peer": peer, "pid": hello.get("bridge", {}).get("pid"),
+                                "cap": hello.get("cap"), "instance": hello.get("instance")})
+            self.write(connection, {"t": "welcome", "api": 1, "connection": "c_1",
+                                    "principal": {"worker_id": "w_abcdefgh", "root_id": "w_abcdefgh",
+                                                  "driver": "local", "depth": 0, "can_spawn": True,
+                                                  "task_mode_ceiling": ["ask", "accept_edits", "plan"]},
+                                    "authority_epoch": 1,
+                                    "limits": {"max_frame": 1 << 20, "max_inflight": 4}})
+            while (frame := self.read(connection)) is not None:
+                if frame.get("t") == "call":
+                    self.calls.append({"at": time.time(), "tool": frame.get("tool"),
+                                       "args": frame.get("args"), "invocation": frame.get("invocation")})
+                    self.write(connection, {"t": "result", "id": frame["id"], "ok": {"workers": []}})
+
+    def close(self):
+        self.stopping.set()
+        self.thread.join(timeout=2)
+        self.listener.close()
+
+
+def local_proof(base, output, app):
+    """The Local runner (this build's binary) is its own provider: G-L1 its capability only in
+    its startup frame, G-L2 its connection from its own process, G-L3 every call shown under its
+    own key first, G-L4 a delegated child supervised as its policy says."""
+    assert app.is_file() and os.access(app, os.X_OK), "build agent-terminal before the Local proof"
+    canary = local_token()
+    instance = secrets.token_hex(16)
+    home, work, runtime = base / "home", base / "work", base / "runtime"
+    for path in [home, work, runtime]:
+        path.mkdir(mode=0o700)
+    env = environment(home)
+    log = (output / "local.jsonl").open("w")
+    origin = time.time()
+    keys = {}
+
+    def note(**entry):
+        entry = {key: value for key, value in entry.items() if key in LOCAL_KEYS}
+        entry["at"] = round(time.time() - origin, 6)
+        log.write(json.dumps(entry) + "\n")
+        log.flush()
+
+    def pseudonym(value):
+        return keys.setdefault(value, f"proof-key-{len(keys) + 1}")
+
+    socket_path = runtime / "delegation.sock"
+    delegation = DelegationFixture(socket_path)
+    bridge = {"endpoint": str(socket_path), "instance": instance, "token": canary}
+    results = {"G-L1": True, "G-L2": True, "G-L3": True, "G-L4": True}
+    leaks = []
+    try:
+        with ChatFixture(canary) as model:
+            def runner(scenario, mode, child=None, context=None):
+                argv = [str(app), "--local-agent", "--server", model.url, "--cwd", str(work),
+                        "--mode", mode, "--model", "proof-model"]
+                process = Wire(argv, work, env, output / f"local-{scenario}.jsonl", canary)
+                frame = {"type": "configure_local", "context": context or {}, "bridge": bridge}
+                if child:
+                    frame["child"] = child
+                note(event="configure", scenario=scenario, bridge=True, child=child,
+                     mcp_servers=len((context or {}).get("mcp_servers", [])))
+                process.send(frame)
+                return process
+
+            def turn(process):
+                return process.wait(lambda f: f.get("event", {}).get("type") == "turn_completed", timeout=30)
+
+            # Root: its own client connects with the frame's capability from its own process; a
+            # call goes out under the key of the item it showed first; a command it runs (while
+            # it runs, its /proc files are read) never holds the capability.
+            model.replies = [ChatFixture.call("cross_agent_list", {}),
+                             ChatFixture.call("run_command", {"command": "env; sleep 1"}), ChatFixture.text("OK")]
+            first = len(model.offered)
+            process = runner("root", "bypass")
+            try:
+                process.send({"type": "prompt", "text": "List my workers, then show the environment."})
+                started = process.wait(lambda f: f.get("event", {}).get("type") == "item_started"
+                                       and f["event"].get("kind") == "command", timeout=30)
+                assert started, "the root's command never started"
+                for name in ("environ", "cmdline"):
+                    clean = canary.encode() not in Path(f"/proc/{process.process.pid}/{name}").read_bytes()
+                    note(event="proc_scan", scenario="root", tool=name, clean=clean)
+                    results["G-L1"] &= clean
+                assert turn(process), "the root's turn never ended"
+            finally:
+                process.close()
+            for tools in model.offered[first:]:
+                note(event="offered", scenario="root", tools=[t for t in tools if re.fullmatch(r"[a-z_]{1,64}", t)])
+            hello = delegation.hellos[-1] if delegation.hellos else {}
+            pinned = hello.get("peer") == process.process.pid == hello.get("pid")
+            note(event="hello", scenario="root", cap_present=bool(hello.get("cap")),
+                 cap_is_frame_token=hello.get("cap") == canary,
+                 peer_is_runner=hello.get("peer") == process.process.pid,
+                 hello_pid_is_runner=hello.get("pid") == process.process.pid)
+            results["G-L2"] &= pinned and hello.get("cap") == canary and hello.get("instance") == instance
+            calls = [call for call in delegation.calls]
+            results["G-L3"] &= len(calls) == 1
+            for call in calls:
+                item_id = (call.get("invocation") or {}).get("item_id")
+                shown = [(at, f) for at, f in process.timed_frames if f.get("item") == item_id
+                         and f.get("event", {}).get("type") == "item_started"]
+                same = bool(shown) and shown[0][1]["event"].get("input", {}).get("arguments") == call["args"] \
+                    and shown[0][1]["event"].get("input", {}).get("server") == "agent_terminal" \
+                    and (call.get("invocation") or {}).get("provider") == "local"
+                # The item and the call travel on different channels: the app matches them within
+                # its attestation window, as the agy proof does.
+                within = bool(shown) and abs(shown[0][0] - call["at"]) <= 2
+                note(event="item", scenario="root", tool=call["tool"], key=pseudonym(item_id or ""))
+                note(event="call", scenario="root", tool=call["tool"], key=pseudonym(item_id or ""),
+                     same_arguments=same, within_window=within)
+                results["G-L3"] &= same and within
+            results["G-L1"] &= not any(model.canary_seen)
+            results["G-L1"] &= not any(canary in json.dumps(f) for f in process.frames)
+
+            # A supervised child reports the policy it applied before its session starts, asks
+            # before a write in Accept edits, and leaves nothing behind when the app denies it.
+            model.replies = [ChatFixture.call("write_file", {"file_path": "proof.txt", "content": "x"}),
+                             ChatFixture.text("OK")]
+            process = runner("child-accept-edits", "accept_edits", child={"task_mode": "accept_edits"})
+            try:
+                process.wait(lambda f: f.get("event", {}).get("type") == "session_started", timeout=15)
+                kinds = [f.get("event", {}).get("type") for f in process.frames]
+                echoes = [f for f in process.frames if f.get("request") == "local-child-policy"]
+                echo = echoes[0]["event"].get("ok") if echoes else None
+                before = bool(echoes) and "session_started" in kinds \
+                    and kinds.index("control_result") < kinds.index("session_started")
+                note(event="child_policy", scenario="child-accept-edits", before_session_started=before,
+                     echo=echo)
+                results["G-L4"] &= before and bool(echo) and echo.get("supervised") is True \
+                    and echo.get("mcp_servers") == 0 and echo.get("bridge") == "ready"
+                process.send({"type": "prompt", "text": "Write the proof file."})
+                card = process.wait(lambda f: f.get("event", {}).get("type") == "approval_requested", timeout=30)
+                asked = bool(card) and card["event"].get("tool") == "write_file"
+                note(event="approval", scenario="child-accept-edits", tool=card["event"].get("tool") if card else None)
+                if card:
+                    process.send({"type": "approve", "request": card["request"], "decision": "deny",
+                                  "message": "Denied by the delegation proof"})
+                    note(event="decision", scenario="child-accept-edits", decision="deny")
+                assert turn(process), "the child's turn never ended"
+            finally:
+                process.close()
+            written = (work / "proof.txt").exists()
+            note(event="file", scenario="child-accept-edits", written=written)
+            results["G-L4"] &= asked and not written
+
+            # A plan child is offered no writing tool (its delegation tools stay).
+            model.replies = [ChatFixture.text("OK")]
+            first = len(model.offered)
+            process = runner("child-plan", "plan", child={"task_mode": "plan"})
+            try:
+                process.send({"type": "prompt", "text": "Plan only."})
+                assert turn(process), "the plan child's turn never ended"
+            finally:
+                process.close()
+            offered = model.offered[first] if len(model.offered) > first else []
+            note(event="offered", scenario="child-plan", tools=offered)
+            results["G-L4"] &= not {"write_file", "edit_file", "run_command"} & set(offered) \
+                and "cross_agent_send" in offered
+
+            # A child's frame naming a user MCP server is refused before any session.
+            server = {"id": "docs", "label": "Docs", "enabled": True, "command": "server", "args": [],
+                      "cwd": "$WORKSPACE", "env": {}, "tools": [], "approval": "ask",
+                      "startup_timeout_secs": 15, "call_timeout_secs": 60}
+            process = runner("child-mcp", "plan", child={"task_mode": "plan"}, context={"mcp_servers": [server]})
+            try:
+                process.process.wait(timeout=10)
+            finally:
+                process.close()
+            started = any(f.get("event", {}).get("type") == "session_started" for f in process.frames)
+            note(event="refused_startup", scenario="child-mcp", exit_code=process.process.returncode,
+                 session_started=started)
+            results["G-L4"] &= process.process.returncode == 1 and not started
+            results["G-L1"] &= not any(model.canary_seen)
+    finally:
+        delegation.close()
+        log.close()
+    leaks = scan_canary(home, canary) + scan_canary(work, canary)
+    note_count = len(leaks)
+    with (output / "local.jsonl").open("a") as stream:
+        stream.write(json.dumps({"event": "leaks", "count": note_count, "at": round(time.time() - origin, 6)}) + "\n")
+    results["G-L1"] &= not leaks
+    return {**results, "token_leak_paths": leaks, "provider": "local",
+            "model_transport": "local fixture; no model server"}
+
+
 def main():
     if sys.argv[1:] == ["--mcp-child"]:
         return mcp_child()
@@ -798,7 +1114,7 @@ def main():
         return agy_hook()
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--provider", choices=["codex", "codex-parent", "claude", "agy", "all"], default="all")
+    parser.add_argument("--provider", choices=["codex", "codex-parent", "claude", "agy", "local", "all"], default="all")
     parser.add_argument("--cloud",action="store_true",help="explicitly enable the agy cloud-model probe")
     parser.add_argument("--app",type=Path,default=Path("target/debug/agent-terminal"))
     parser.add_argument("--agy-auth-file",type=Path,help="one existing auth source, bound read-only with bwrap; never read or copied by the harness")
@@ -807,7 +1123,7 @@ def main():
     args = parser.parse_args()
     if args.provider == "agy" and not args.cloud and not args.dry_run:
         parser.error("agy uses its cloud backend; pass --cloud explicitly")
-    providers = ["codex", "codex-parent", "claude"] if args.provider == "all" else [args.provider]
+    providers = ["codex", "codex-parent", "claude", "local"] if args.provider == "all" else [args.provider]
     if args.dry_run:
         cloud = "agy" in providers
         print(json.dumps({"mode": "dry-run", "providers": providers,
@@ -826,9 +1142,16 @@ def main():
                     result = codex_proof(base, args.out, parent_only=provider == "codex-parent")
                 elif provider == "agy":
                     result = agy_proof(base,args.out,args.app.resolve(),args.agy_auth_file)
+                elif provider == "local":
+                    result = local_proof(base, args.out, args.app.resolve())
                 else:
                     result = claude_proof(base, args.out)
-                result["version"] = subprocess.check_output([shutil.which(provider.split("-",1)[0]), "--version"], text=True, timeout=10).strip()
+                if provider == "local":
+                    # The provider is this build: its own version, never a binary on PATH.
+                    manifest = (HERE.parent.parent.parent / "Cargo.toml").read_text()
+                    result["version"] = re.search(r'^version = "([^"]+)"', manifest, re.M).group(1)
+                else:
+                    result["version"] = subprocess.check_output([shutil.which(provider.split("-",1)[0]), "--version"], text=True, timeout=10).strip()
                 result["passed"] = all(value for key, value in result.items() if key.startswith("G-"))
             except (AssertionError, OSError, KeyError, TypeError, ValueError) as error:
                 result = {"provider": provider, "passed": False, "error": str(error)}

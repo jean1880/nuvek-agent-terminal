@@ -110,6 +110,7 @@ fn plant_unspawned(
         prompts: vec![QueuedPrompt {
             item_id,
             text: text.into(),
+            images: Vec::new(),
             stored,
             for_switch: false,
         }],

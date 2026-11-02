@@ -44,7 +44,7 @@ mod reply_questions;
 pub(crate) use delegated::{HeldNews, TakenNews, WakeOutcome};
 pub(crate) use limit::ContinueOutcome;
 
-use super::{ChatBackend, EnvelopeSink, SessionStatus};
+use super::{ChatBackend, EnvelopeSink, PromptImage, PromptInput, SessionStatus};
 use crate::agent_proc::{
     run_side, AgentEnv, AgentProcess, ExitWatch, SpawnSpec, StopPhase, AGY_TIMEOUT,
 };
@@ -632,6 +632,8 @@ struct ThinkingFlag {
 struct QueuedPrompt {
     item_id: String,
     text: String,
+    /// The images sent with it; they wait with it, and go back to the composer with it.
+    images: Vec<PromptImage>,
     stored: bool,
     /// Written while a switch waited to read the thread: meant for its new agent, so held if
     /// the switch does not go ahead ([`Inner::hold_for_switch`]).
@@ -641,6 +643,7 @@ struct QueuedPrompt {
 struct Sent {
     text: String,
     handoff: Option<Handoff>,
+    images: Vec<PromptImage>,
 }
 
 /// The session's machinery at work ([`Inner::work_in_flight`]), with the words each check
@@ -3475,7 +3478,7 @@ impl Inner {
         }
         self.start_process();
         for sent in prompts {
-            if !self.dispatch_in_flight(&sent.text, sent.handoff.clone()) {
+            if !self.dispatch_in_flight(&sent.text, sent.handoff.clone(), &sent.images) {
                 self.held_retries.borrow_mut().push_back(sent);
             }
         }
@@ -4028,29 +4031,26 @@ impl Inner {
     }
 
     fn queue_prompt(self: &Rc<Self>, text: &str) {
+        self.queue_input(&PromptInput::text(text));
+    }
+
+    fn queue_input(self: &Rc<Self>, input: &PromptInput) {
         // A message written first is what goes on, not a "Continue in" still waiting.
         self.continue_on_switch_to.set(None);
         let item = glib::uuid_string_random().to_string();
 
-        self.deliver(
-            &Envelope::new(Event::ItemStarted {
-                kind: ItemKind::UserMessage,
-                title: "queued".to_string(),
-                input: Some(serde_json::json!({"queued": true})),
-                parent: None,
-            })
-            .item(item.clone()),
-        );
+        self.deliver(&user_message_started(&item, true, &input.images));
         self.deliver(
             &Envelope::new(Event::ContentSnapshot {
                 stream: StreamKind::Assistant,
-                text: agent_core::redact::redact(text),
+                text: agent_core::redact::redact(&input.text),
             })
             .item(item.clone()),
         );
         self.queued_prompts.borrow_mut().push_back(QueuedPrompt {
             item_id: item,
-            text: text.to_owned(),
+            text: input.text.clone(),
+            images: input.images.clone(),
             stored: false,
             for_switch: self.switch_reading.get(),
         });
@@ -4064,44 +4064,45 @@ impl Inner {
     /// ride on a real prompt. A write the adapter refuses turns the shown message into a queued
     /// one, so it is never lost.
     fn steer_prompt(self: &Rc<Self>, text: &str) {
+        self.steer_input(&PromptInput::text(text));
+    }
+
+    fn steer_input(self: &Rc<Self>, input: &PromptInput) {
+        let text = input.text.as_str();
         self.continue_on_switch_to.set(None);
         // A switch waiting to read the thread: the message is for its new agent, never a live
         // write into the outgoing one. It queues (and is held if the switch does not happen).
         if self.switch_reading.get() {
-            return self.queue_prompt(text);
+            return self.queue_input(input);
         }
         // The user writes again after a dropped switch's notice: what it held goes as usual.
         self.release_switch_hold();
         if !self.root_prompt_allowed() {
-            return self.queue_prompt(text);
+            return self.queue_input(input);
         }
         if !self.state.borrow().running_turn {
-            return self.send_prompt(text);
+            return self.send_input(input);
         }
         let live = self.adapter.borrow().capabilities().live_input;
         let handoff_waiting =
             self.pending_handoff.borrow().is_some() && !self.handoff_in_flight.get();
         if !live || Self::is_slash_command(text) || handoff_waiting {
-            return self.queue_prompt(text);
+            return self.queue_input(input);
         }
         let pt = self.provider_thread.borrow().clone();
         let provider = (!pt.is_empty()).then_some(pt.as_str());
-        let (item, stored) = match self.store.append_user_message(&self.thread, provider, text) {
-            Ok(item) => (item, true),
-            Err(e) => {
-                warn!(error = %e, "could not persist the user message");
-                (glib::uuid_string_random().to_string(), false)
-            }
-        };
-        self.deliver(
-            &Envelope::new(Event::ItemStarted {
-                kind: ItemKind::UserMessage,
-                title: String::new(),
-                input: None,
-                parent: None,
-            })
-            .item(item.clone()),
-        );
+        let (item, stored) =
+            match self
+                .store
+                .append_user_input(&self.thread, provider, text, &input.refs())
+            {
+                Ok(item) => (item, true),
+                Err(e) => {
+                    warn!(error = %e, "could not persist the user message");
+                    (glib::uuid_string_random().to_string(), false)
+                }
+            };
+        self.deliver(&user_message_started(&item, false, &input.images));
         self.deliver(
             &Envelope::new(Event::ContentSnapshot {
                 stream: StreamKind::Assistant,
@@ -4117,12 +4118,12 @@ impl Inner {
                 |news| agent_core::delegation::wake::with_user_prompt(news.text(), text),
             );
             let accepted = self.command(Command::Steer {
-                attachments: Vec::new(),
+                attachments: input.wire(),
                 text: sent.clone(),
             });
             // Kept before settling, so news given back is taken out of the replayed copy too.
             if accepted {
-                self.remember_pre_init_prompt(&sent, None);
+                self.remember_pre_init_prompt(&sent, None, &input.images);
             }
             self.settle_news(news, accepted, &sent, text);
             if accepted {
@@ -4130,30 +4131,27 @@ impl Inner {
             }
         }
         // Refused: it waits for the turn to end, as a message sent mid-turn always did.
-        self.deliver(
-            &Envelope::new(Event::ItemStarted {
-                kind: ItemKind::UserMessage,
-                title: "queued".to_string(),
-                input: Some(serde_json::json!({"queued": true})),
-                parent: None,
-            })
-            .item(item.clone()),
-        );
+        self.deliver(&user_message_started(&item, true, &input.images));
         self.queued_prompts.borrow_mut().push_back(QueuedPrompt {
             item_id: item,
             text: text.to_owned(),
+            images: input.images.clone(),
             stored,
             for_switch: self.switch_reading.get(),
         });
     }
 
     fn send_prompt(self: &Rc<Self>, text: &str) {
+        self.send_input(&PromptInput::text(text));
+    }
+
+    fn send_input(self: &Rc<Self>, input: &PromptInput) {
         // The user wrote before a "Continue in" switch was made: that message is what goes on.
         self.continue_on_switch_to.set(None);
         if self.rebinding.get() || self.switch_reading.get() {
             // Nothing runs until the rebind starts the next generation, or the switch its new
             // process, which then sends the queue.
-            self.queue_prompt(text);
+            self.queue_input(input);
             return;
         }
         self.release_switch_hold();
@@ -4165,32 +4163,41 @@ impl Inner {
             || self.delivering.get()
             || !self.state.borrow().running_turn && waiting
         {
-            self.queue_prompt(text);
+            self.queue_input(input);
             self.dispatch_queued_prompt();
             return;
         }
-        self.send_prompt_now(text);
+        self.send_input_now(input);
     }
 
     /// A confirmed switch's continuation opens its own turn before queued user input.
     fn send_prompt_now(self: &Rc<Self>, text: &str) {
+        self.send_input_now(&PromptInput::text(text));
+    }
+
+    fn send_input_now(self: &Rc<Self>, input: &PromptInput) {
+        let text = input.text.as_str();
         if !self.root_prompt_allowed() {
-            self.queue_prompt(text);
+            self.queue_input(input);
             return;
         }
         if !self.state.borrow().running_turn && !self.apply_retired() {
-            self.queue_prompt(text);
+            self.queue_input(input);
             return;
         }
         let pt = self.provider_thread.borrow().clone();
         let provider = (!pt.is_empty()).then_some(pt.as_str());
-        let (item, stored) = match self.store.append_user_message(&self.thread, provider, text) {
-            Ok(item) => (item, true),
-            Err(e) => {
-                warn!(error = %e, "could not persist the user message");
-                (glib::uuid_string_random().to_string(), false)
-            }
-        };
+        let (item, stored) =
+            match self
+                .store
+                .append_user_input(&self.thread, provider, text, &input.refs())
+            {
+                Ok(item) => (item, true),
+                Err(e) => {
+                    warn!(error = %e, "could not persist the user message");
+                    (glib::uuid_string_random().to_string(), false)
+                }
+            };
 
         // The handoff rides on the next real prompt: never on a slash command (it would stop
         // being one), nor twice while the turn that carries it runs. It is spent only when that
@@ -4202,15 +4209,7 @@ impl Inner {
             self.pending_handoff.borrow().clone()
         };
 
-        self.deliver(
-            &Envelope::new(Event::ItemStarted {
-                kind: ItemKind::UserMessage,
-                title: String::new(),
-                input: None,
-                parent: None,
-            })
-            .item(item.clone()),
-        );
+        self.deliver(&user_message_started(&item, false, &input.images));
         self.deliver(
             &Envelope::new(Event::ContentSnapshot {
                 stream: StreamKind::Assistant,
@@ -4228,10 +4227,11 @@ impl Inner {
         let queued = QueuedPrompt {
             item_id: item,
             text: text.to_owned(),
+            images: input.images.clone(),
             stored,
             for_switch: false,
         };
-        let accepted = self.dispatch_in_flight(&sent, handoff);
+        let accepted = self.dispatch_in_flight(&sent, handoff, &input.images);
         self.settle_news(news, accepted, &sent, text);
         if accepted {
             self.note_unspawned_prompt(queued);
@@ -4260,25 +4260,22 @@ impl Inner {
     }
 
     fn hold_queued_prompt(&self, queued: QueuedPrompt) {
-        let item = queued.item_id.clone();
+        let started = user_message_started(&queued.item_id, true, &queued.images);
         self.queued_prompts.borrow_mut().push_front(queued);
         self.prompt_in_flight.set(false);
-        self.deliver(
-            &Envelope::new(Event::ItemStarted {
-                kind: ItemKind::UserMessage,
-                title: "queued".to_owned(),
-                input: Some(serde_json::json!({"queued": true})),
-                parent: None,
-            })
-            .item(item),
-        );
+        self.deliver(&started);
     }
 
     /// [`Self::dispatch_sent_prompt`], with a prompt counted in flight while it goes and no
     /// longer once the adapter refused it.
-    fn dispatch_in_flight(self: &Rc<Self>, sent: &str, handoff: Option<Handoff>) -> bool {
+    fn dispatch_in_flight(
+        self: &Rc<Self>,
+        sent: &str,
+        handoff: Option<Handoff>,
+        images: &[PromptImage],
+    ) -> bool {
         self.prompt_in_flight.set(true);
-        let accepted = self.dispatch_sent_prompt(sent, handoff);
+        let accepted = self.dispatch_sent_prompt(sent, handoff, images);
         if !accepted {
             self.prompt_in_flight.set(false);
         }
@@ -4316,7 +4313,12 @@ impl Inner {
     }
 
     /// Sends `sent` as a prompt; true when the adapter took it.
-    fn dispatch_sent_prompt(self: &Rc<Self>, sent: &str, handoff: Option<Handoff>) -> bool {
+    fn dispatch_sent_prompt(
+        self: &Rc<Self>,
+        sent: &str,
+        handoff: Option<Handoff>,
+        images: &[PromptImage],
+    ) -> bool {
         if !self.root_prompt_allowed() {
             return false;
         }
@@ -4336,12 +4338,16 @@ impl Inner {
             self.state.borrow_mut().running_turn = true;
         }
         let accepted = self.command(Command::Prompt {
-            attachments: Vec::new(),
+            attachments: PromptInput {
+                text: String::new(),
+                images: images.to_vec(),
+            }
+            .wire(),
             text: sent.to_owned(),
         });
         if accepted {
             self.prompted.set(true);
-            self.remember_pre_init_prompt(sent, handoff.clone());
+            self.remember_pre_init_prompt(sent, handoff.clone(), images);
         }
         if !accepted && starts_turn {
             self.state.borrow_mut().running_turn = was_running;
@@ -4357,11 +4363,17 @@ impl Inner {
         accepted
     }
 
-    fn remember_pre_init_prompt(&self, text: &str, handoff: Option<Handoff>) {
+    fn remember_pre_init_prompt(
+        &self,
+        text: &str,
+        handoff: Option<Handoff>,
+        images: &[PromptImage],
+    ) {
         if self.adapter.borrow().driver() == Driver::Claude && !self.thinking.init_seen.get() {
             self.pre_init_prompts.borrow_mut().push(Sent {
                 text: text.to_owned(),
                 handoff,
+                images: images.to_vec(),
             });
         }
     }
@@ -4413,7 +4425,7 @@ impl Inner {
             }
             let retry = self.held_retries.borrow_mut().pop_front();
             if let Some(retry) = retry {
-                if !self.dispatch_in_flight(&retry.text, retry.handoff.clone()) {
+                if !self.dispatch_in_flight(&retry.text, retry.handoff.clone(), &retry.images) {
                     self.held_retries.borrow_mut().push_front(retry);
                     return;
                 }
@@ -4430,38 +4442,31 @@ impl Inner {
                 return;
             }
             let generation = self.generation.get();
-            self.deliver(
-                &Envelope::new(Event::ItemStarted {
-                    kind: ItemKind::UserMessage,
-                    title: String::new(),
-                    input: None,
-                    parent: None,
-                })
-                .item(queued.item_id.clone()),
-            );
+            self.deliver(&user_message_started(
+                &queued.item_id,
+                false,
+                &queued.images,
+            ));
             // The sink can close or switch this session. Keep the message unsent in that case.
             if generation != self.generation.get() || self.state.borrow().running_turn {
-                let item = queued.item_id.clone();
+                let started = user_message_started(&queued.item_id, true, &queued.images);
                 self.queued_prompts.borrow_mut().push_front(queued);
-                self.deliver(
-                    &Envelope::new(Event::ItemStarted {
-                        kind: ItemKind::UserMessage,
-                        title: "queued".to_owned(),
-                        input: Some(serde_json::json!({"queued": true})),
-                        parent: None,
-                    })
-                    .item(item),
-                );
+                self.deliver(&started);
                 return;
             }
             let pt = self.provider_thread.borrow().clone();
             let provider = (!pt.is_empty()).then_some(pt.as_str());
             if !queued.stored {
-                if let Err(e) = self.store.append_user_message_with_id(
+                if let Err(e) = self.store.append_user_input_with_id(
                     &self.thread,
                     provider,
                     &queued.item_id,
                     &queued.text,
+                    &queued
+                        .images
+                        .iter()
+                        .map(|i| i.meta.clone())
+                        .collect::<Vec<_>>(),
                 ) {
                     warn!(error = %e, "could not persist the queued user message");
                 }
@@ -4483,7 +4488,7 @@ impl Inner {
                 stored: true,
                 ..queued
             };
-            let accepted = self.dispatch_in_flight(&sent, handoff);
+            let accepted = self.dispatch_in_flight(&sent, handoff, &queued.images);
             self.settle_news(news, accepted, &sent, &queued.text);
             if !accepted {
                 self.hold_queued_prompt(queued);
@@ -4498,12 +4503,23 @@ impl Inner {
     }
 
     fn pop_queued_prompt(&self) -> Option<(String, String)> {
+        self.pop_queued_input()
+            .map(|(item, input)| (item, input.text))
+    }
+
+    fn pop_queued_input(&self) -> Option<(String, PromptInput)> {
         let queued = self.queued_prompts.borrow_mut().pop_back()?;
         // The last message a dropped switch held was taken back: nothing is held any more.
         if self.switch_marked() == 0 {
             self.switch_held.set(false);
         }
-        Some((queued.item_id, queued.text))
+        Some((
+            queued.item_id,
+            PromptInput {
+                text: queued.text,
+                images: queued.images,
+            },
+        ))
     }
 
     /// Stores the mode the user chose (`wanted_mode`), so a reopened thread starts from it on
@@ -6518,6 +6534,24 @@ fn handoff_turn_end(
 
 /// The stored `HandoffSeeded` for `handoff`: spent only by its acknowledgement
 /// ([`handoff_spent`]).
+/// A user message's `ItemStarted`, queued or not, with the refs of the images sent with it: the
+/// one shape the live path, the queue and the store all use, so the view has the images the
+/// first time it sees the item.
+fn user_message_started(item: &str, queued: bool, images: &[PromptImage]) -> Envelope {
+    let refs: Vec<_> = images.iter().map(|i| i.meta.clone()).collect();
+    Envelope::new(Event::ItemStarted {
+        kind: ItemKind::UserMessage,
+        title: if queued {
+            "queued".to_owned()
+        } else {
+            String::new()
+        },
+        input: agent_core::attachment::user_message_input(queued, &refs),
+        parent: None,
+    })
+    .item(item)
+}
+
 fn handoff_seeded(handoff: &Handoff) -> Envelope {
     Envelope::new(Event::HandoffSeeded {
         summary: handoff.summary.clone(),
@@ -6718,6 +6752,25 @@ impl ChatBackend for ChatSession {
     fn steer_prompt(&self, text: &str) {
         self.inner.user_spoke();
         self.inner.steer_prompt(text);
+    }
+
+    fn send_input(&self, input: &PromptInput) {
+        self.inner.user_spoke();
+        self.inner.send_input(input);
+    }
+
+    fn queue_input(&self, input: &PromptInput) {
+        self.inner.user_spoke();
+        self.inner.queue_input(input);
+    }
+
+    fn steer_input(&self, input: &PromptInput) {
+        self.inner.user_spoke();
+        self.inner.steer_input(input);
+    }
+
+    fn pop_queued_input(&self) -> Option<(String, PromptInput)> {
+        self.inner.pop_queued_input()
     }
 
     fn interrupt(&self) {

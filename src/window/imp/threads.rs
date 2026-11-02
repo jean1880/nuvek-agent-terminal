@@ -971,6 +971,9 @@ impl ChatBackend for SessionSlot {
             .map(|source| source as Rc<dyn crate::chat::DiffSource>)
     }
     fn send_prompt(&self, text: &str) {
+        self.send_input(&crate::chat::PromptInput::text(text));
+    }
+    fn send_input(&self, input: &crate::chat::PromptInput) {
         match self.get() {
             Some(s) => {
                 let deferred = self.thread.as_deref().is_some_and(|thread| {
@@ -982,9 +985,9 @@ impl ChatBackend for SessionSlot {
                     })
                 });
                 if deferred {
-                    s.queue_prompt(text);
+                    s.queue_input(input);
                 } else {
-                    s.send_prompt(text);
+                    s.send_input(input);
                 }
             }
             None => {
@@ -1002,10 +1005,16 @@ impl ChatBackend for SessionSlot {
         }
     }
     fn queue_prompt(&self, text: &str) {
+        self.queue_input(&crate::chat::PromptInput::text(text));
+    }
+    fn queue_input(&self, input: &crate::chat::PromptInput) {
         match self.get() {
-            Some(s) => s.queue_prompt(text),
-            None => self.send_prompt(text),
+            Some(s) => s.queue_input(input),
+            None => self.send_input(input),
         }
+    }
+    fn steer_input(&self, input: &crate::chat::PromptInput) {
+        self.queue_input(input);
     }
     fn interrupt(&self) {
         self.switch_serial
@@ -1146,6 +1155,9 @@ impl ChatBackend for SessionSlot {
     }
     fn pop_queued_prompt(&self) -> Option<(String, String)> {
         self.get().and_then(|s| s.pop_queued_prompt())
+    }
+    fn pop_queued_input(&self) -> Option<(String, crate::chat::PromptInput)> {
+        self.get().and_then(|s| s.pop_queued_input())
     }
 }
 

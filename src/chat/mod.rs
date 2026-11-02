@@ -24,6 +24,55 @@ pub const SWITCH_CONTINUATION: &str = "Continue the unfinished task after the mo
     interrupted turn left off. Do not repeat completed actions. Any unanswered approval or \
     question was cancelled by the switch; ask again if it is still needed.";
 
+/// One image staged with a message: its stored copy and, ready to send, its bytes as base64
+/// (encoded once, off the main thread, when it was attached).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptImage {
+    pub meta: agent_core::attachment::AttachmentRef,
+    pub path: String,
+    pub data_base64: std::rc::Rc<str>,
+}
+
+/// What the user sends: the text and the images that go with it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PromptInput {
+    pub text: String,
+    pub images: Vec<PromptImage>,
+}
+
+impl PromptInput {
+    /// Text alone.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+
+    /// The images' refs, what the transcript and the store keep.
+    pub fn refs(&self) -> Vec<agent_core::attachment::AttachmentRef> {
+        self.images.iter().map(|i| i.meta.clone()).collect()
+    }
+
+    /// The images as the adapter takes them.
+    pub fn wire(&self) -> Vec<agent_core::attachment::PromptAttachment> {
+        self.images
+            .iter()
+            .map(|i| agent_core::attachment::PromptAttachment {
+                meta: i.meta.clone(),
+                path: i.path.clone(),
+                data_base64: i.data_base64.to_string(),
+            })
+            .collect()
+    }
+
+    /// The text with a placeholder per image: what a text-only path (a handoff, a notice)
+    /// carries instead.
+    pub fn text_with_placeholders(&self) -> String {
+        agent_core::attachment::text_with_placeholders(&self.text, &self.refs())
+    }
+}
+
 /// What the view can ask of a thread. Results come back as envelopes through the sink given
 /// to the backend at construction (including `ControlResult` for `control`).
 pub trait ChatBackend {
@@ -55,6 +104,25 @@ pub trait ChatBackend {
     /// (`Capabilities::live_input`). A backend that cannot queues it as before.
     fn steer_prompt(&self, text: &str) {
         self.queue_prompt(text);
+    }
+    /// [`Self::send_prompt`] with images. A backend that takes none sends the text alone only
+    /// when there are none; the view never sends images to an agent that cannot take them.
+    fn send_input(&self, input: &PromptInput) {
+        if input.images.is_empty() {
+            self.send_prompt(&input.text);
+        }
+    }
+    /// [`Self::queue_prompt`] with images.
+    fn queue_input(&self, input: &PromptInput) {
+        if input.images.is_empty() {
+            self.queue_prompt(&input.text);
+        }
+    }
+    /// [`Self::steer_prompt`] with images.
+    fn steer_input(&self, input: &PromptInput) {
+        if input.images.is_empty() {
+            self.steer_prompt(&input.text);
+        }
     }
     fn interrupt(&self);
     fn respond_approval(&self, request: &str, decision: Decision);
@@ -123,6 +191,11 @@ pub trait ChatBackend {
     /// Pops the most recent queued user prompt if sitting in queue, returning (item_id, prompt_text).
     fn pop_queued_prompt(&self) -> Option<(String, String)> {
         None
+    }
+    /// [`Self::pop_queued_prompt`] with the images it carried, so they go back in the composer.
+    fn pop_queued_input(&self) -> Option<(String, PromptInput)> {
+        self.pop_queued_prompt()
+            .map(|(item, text)| (item, PromptInput::text(text)))
     }
 }
 

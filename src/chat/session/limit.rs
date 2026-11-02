@@ -75,7 +75,7 @@ impl Inner {
         // Only the copy this dispatch keeps is taken back, never a user's prompt with the same
         // text.
         let kept_before = self.pre_init_prompts.borrow().len();
-        if !self.dispatch_in_flight(&sent, handoff) {
+        if !self.dispatch_in_flight(&sent, handoff, &[]) {
             return ContinueOutcome::Busy;
         }
         // As a wake: started only once the line went to a process that can take it, or is held

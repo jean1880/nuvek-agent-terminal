@@ -255,6 +255,7 @@ fn a_stop_that_drops_a_switch_continuation_never_sends_what_it_carried() {
             .push(crate::chat::session::QueuedPrompt {
                 item_id: "carried-1".into(),
                 text: "the carried message".into(),
+                images: Vec::new(),
                 stored: true,
                 for_switch: false,
             });
@@ -379,6 +380,7 @@ fn messages_given_back_behind_a_held_one_are_said_to_be_held() {
         let prompt = |text: &str, for_switch: bool| QueuedPrompt {
             item_id: format!("item-{text}"),
             text: text.into(),
+            images: Vec::new(),
             stored: true,
             for_switch,
         };

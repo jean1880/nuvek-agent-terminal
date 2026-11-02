@@ -499,7 +499,7 @@ impl Inner {
         // Only the copy this dispatch keeps is taken back, never a user's prompt with the same
         // text.
         let kept_before = self.pre_init_prompts.borrow().len();
-        if !self.dispatch_in_flight(text, None) {
+        if !self.dispatch_in_flight(text, None, &[]) {
             return WakeOutcome::Busy;
         }
         // Started only on positive evidence, as held news is spent: the line went to a process
@@ -600,7 +600,7 @@ impl Inner {
         info!(plan = ?input.plan, "delivering delegated input");
         match input.plan {
             DeliveryPlan::StartTurn => {
-                if self.dispatch_in_flight(&text, None) {
+                if self.dispatch_in_flight(&text, None, &[]) {
                     DelegatedOutcome::TurnStarted
                 } else {
                     DelegatedOutcome::Refused(ErrorCode::InternalError)
@@ -612,7 +612,7 @@ impl Inner {
                     attachments: Vec::new(),
                     text: text.clone(),
                 }) {
-                    self.remember_pre_init_prompt(&text, None);
+                    self.remember_pre_init_prompt(&text, None, &[]);
                     DelegatedOutcome::Written
                 } else {
                     DelegatedOutcome::Refused(ErrorCode::InternalError)

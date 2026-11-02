@@ -30,7 +30,7 @@ use client::Client;
 /// Runs before GTK initialisation. Stdout is reserved exclusively for MCP frames.
 pub(crate) fn run() -> Result<(), String> {
     let started = Instant::now();
-    let config = client::Config::from_environment();
+    let config = client::from_environment();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()

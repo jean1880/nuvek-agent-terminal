@@ -33,6 +33,26 @@ pub(super) const REVOCATION_SETTLE: Duration = Duration::from_secs(5);
 /// `cross_agent_capabilities` with `refresh` waits at most this long for usage probes.
 const USAGE_REFRESH_WAIT: Duration = Duration::from_secs(20);
 
+/// A Local runner's hello is accepted only from the process its token was issued to: the
+/// kernel's peer pid (`SO_PEERCRED`) and the pid the hello names are both that generation's.
+fn local_peer_ok(token_pid: Option<u32>, peer_pid: Option<u32>, hello_pid: u32) -> bool {
+    token_pid.is_some() && token_pid == peer_pid && token_pid == Some(hello_pid)
+}
+
+#[cfg(test)]
+mod local_peer_tests {
+    #[test]
+    fn a_local_hello_is_pinned_to_its_runner() {
+        use super::local_peer_ok;
+        assert!(local_peer_ok(Some(40), Some(40), 40));
+        // Another process with the token, a lying hello, an unknown peer or runner.
+        assert!(!local_peer_ok(Some(40), Some(41), 41));
+        assert!(!local_peer_ok(Some(40), Some(40), 41));
+        assert!(!local_peer_ok(Some(40), None, 40));
+        assert!(!local_peer_ok(None, None, 0));
+    }
+}
+
 impl CallDispatcher for Supervisor {
     fn authenticate(
         &self,
@@ -152,6 +172,13 @@ impl CallDispatcher for Supervisor {
                     }
                 }
                 sup.recheck_agy(&worker).await?;
+            } else if driver == Driver::Local && !local_peer_ok(pid, peer.pid, hello.bridge.pid) {
+                // The Local runner's own client connects from the runner itself: the kernel's
+                // peer pid and the hello's must both be that generation's process.
+                return Err(error(
+                    ErrorCode::AuthenticationFailed,
+                    "the Local runner's connection is not from its own process",
+                ));
             } else if live.is_some() {
                 return Err(error(
                     ErrorCode::AuthenticationFailed,
@@ -265,8 +292,10 @@ impl CallDispatcher for Supervisor {
         let Some((worker, driver)) = lost else {
             return;
         };
-        if driver == Driver::Claude {
-            info!(%worker, "delegation bridge disconnected; it may reconnect");
+        // Claude's bridge, and the Local runner's own client (pinned to its process), may
+        // reconnect once with the same token.
+        if matches!(driver, Driver::Claude | Driver::Local) {
+            info!(%worker, ?driver, "delegation bridge disconnected; it may reconnect");
             return;
         }
         warn!(%worker, ?driver, "delegation bridge connection lost; rebind required");
@@ -994,14 +1023,17 @@ impl Supervisor {
             glib::timeout_future(Duration::from_millis(10)).await;
             self.epoch(&worker)?;
         };
+        // agy and the Local runner must show every call in their own stream first.
+        let enforced = matches!(driver, Driver::Agy | Driver::Local)
+            && agent_core::delegation::correlation::attestation_required(driver, call.tool, false);
+        if enforced && !attested {
+            return Err(error(
+                ErrorCode::AuthorityDenied,
+                "tool call was not observed in this principal's stream",
+            )
+            .with_detail("reason", "unattested"));
+        }
         if driver == Driver::Agy {
-            if !attested {
-                return Err(error(
-                    ErrorCode::AuthorityDenied,
-                    "tool call was not observed in this principal's stream",
-                )
-                .with_detail("reason", "unattested"));
-            }
             self.recheck_agy(&worker).await?;
         }
         // Attestation and the agy recheck awaited: the same checks again before dispatch.

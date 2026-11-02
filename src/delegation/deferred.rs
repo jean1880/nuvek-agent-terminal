@@ -57,7 +57,11 @@ impl Supervisor {
             .ok_or_else(|| error(ErrorCode::NotFound, "unknown worker"))?;
         Ok(TargetRuntime {
             driver: w.driver,
-            live_input: w.driver != agent_core::adapter::Driver::Agy,
+            // agy and the Local runner take no input during a turn: it waits for the next.
+            live_input: !matches!(
+                w.driver,
+                agent_core::adapter::Driver::Agy | agent_core::adapter::Driver::Local
+            ),
             active_run: (w.readback.ready && w.pending.is_none())
                 .then(|| w.run.clone())
                 .flatten(),

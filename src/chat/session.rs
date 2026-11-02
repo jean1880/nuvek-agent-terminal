@@ -307,6 +307,8 @@ struct Inner {
     /// Settings changes are adopted by a resumed Local generation at the next prompt boundary.
     pending_local_context:
         RefCell<Option<Result<agent_core::local_context::LocalLaunchContext, String>>>,
+    /// A pending Local context waits for this delegation root's sub-agents (said once).
+    local_context_held: Cell<bool>,
     adapter: RefCell<Box<dyn Adapter>>,
     open: RefCell<OpenSession>,
     /// Writes are queued to the store writer (never run on this thread); the reads that need
@@ -934,6 +936,7 @@ impl ChatSession {
         };
         let inner = Rc::new(Inner {
             pending_local_context: RefCell::new(None),
+            local_context_held: Cell::new(false),
             adapter: RefCell::new(adapter),
             open: RefCell::new(open),
             store,
@@ -1099,7 +1102,8 @@ impl ChatSession {
         &self,
         context: Result<agent_core::local_context::LocalLaunchContext, String>,
     ) {
-        if self.inner.adapter.borrow().driver() != Driver::Local {
+        // A delegated child's context is the snapshot it was spawned with (no user MCP server).
+        if self.inner.adapter.borrow().driver() != Driver::Local || self.inner.child.is_some() {
             return;
         }
         let context = context.and_then(|value| {
@@ -2043,6 +2047,9 @@ impl Inner {
         self.open.borrow_mut().delegation = binding.as_ref().and_then(|b| b.open.clone());
         let open = self.open.borrow();
         let mut argv = self.adapter.borrow().argv(&open);
+        // The Local runner takes this generation's binding into its startup frame (and nothing,
+        // when none was staged).
+        self.adapter.borrow_mut().bind_launch(&open);
         // A model server's Claude names this process's model in its settings overlay too.
         agent_core::provider::bind_thread_model_args(&mut argv, open.model.as_deref());
         // Claude shares its thinking only with this hidden flag, so it goes only to a
@@ -3202,7 +3209,17 @@ impl Inner {
             && action
                 .as_ref()
                 .is_some_and(|a| self.rule_may_apply(a, cwd.as_deref()));
-        let accept_edit = codex_accept_edit || claude_child_accept_edit;
+        // A Local child asks before every edit (its runner's supervised gate), so its Accept
+        // edits is answered here, as a Claude child's is.
+        let local_child_accept_edit = driver == Driver::Local
+            && self.child.is_some()
+            && self.state.borrow().mode == Mode::AcceptEdits
+            && !forced
+            && matches!(action, Some(crate::always_allow::Action::Edit { .. }))
+            && action
+                .as_ref()
+                .is_some_and(|a| self.rule_may_apply(a, cwd.as_deref()));
+        let accept_edit = codex_accept_edit || claude_child_accept_edit || local_child_accept_edit;
         // Dangerous permissive mode: the agent's own bypass should leave nothing to ask, and
         // whatever still arrives (escalations included) is approved, as the user agreed to. A
         // supervised child never runs it.
@@ -4296,6 +4313,24 @@ impl Inner {
                         return false;
                     }
                 };
+                // A delegation root restarts for new settings only as a planned rotation (nothing
+                // revoked): never while its sub-agents are alive or busy, whose links the
+                // restart would cut. The settings then wait for them.
+                let alive = self.state.borrow().alive || self.proc.borrow().is_some();
+                if let Some(hooks) = self.hooks.clone().filter(|_| alive) {
+                    if hooks.holds_restart() {
+                        *self.pending_local_context.borrow_mut() = Some(Ok(context));
+                        if !self.local_context_held.replace(true) {
+                            self.notice(
+                                "Local settings saved: they apply once this thread's sub-agents \
+                                 have finished.",
+                            );
+                        }
+                        return true;
+                    }
+                    let _ = hooks.suspending(ProcessGeneration(self.process_generation.get()));
+                }
+                self.local_context_held.set(false);
                 self.stop_current();
                 if self.open.borrow().mode == Mode::Bypass {
                     let mode = self.safe_mode.get();
@@ -4314,10 +4349,12 @@ impl Inner {
 
     /// Sends `sent` as a prompt; true when the adapter took it.
     fn dispatch_sent_prompt(self: &Rc<Self>, sent: &str, handoff: Option<Handoff>) -> bool {
-        if !self.root_prompt_allowed() {
+        // New Local settings first: their restart is a planned rotation for a delegation root,
+        // which the rebind gate below then binds again before the prompt goes.
+        if !self.prepare_local_context() {
             return false;
         }
-        if !self.prepare_local_context() {
+        if !self.root_prompt_allowed() {
             return false;
         }
         self.ensure_alive();

@@ -1,7 +1,8 @@
 //! Per-generation launch bindings and Claude overlay files.
 //!
 //! The token reaches only the places the contract's exposure matrix lists: the Claude overlay's
-//! server `env`, agy's process env, and Codex's `OpenSession.delegation`. Never argv.
+//! server `env`, agy's process env, and Codex's and the Local runner's `OpenSession.delegation`
+//! (the Local runner's then goes only into its stdin startup frame). Never argv.
 
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -88,12 +89,10 @@ fn prepare_with(
                 .map(|(k, v)| (k.to_owned(), v))
                 .collect();
         }
-        Driver::Codex => {
+        // Codex takes it in its thread config; the Local adapter puts it in the runner's startup
+        // frame, whose own client connects with it (no bridge process, no environment).
+        Driver::Codex | Driver::Local => {
             launch.open = Some(binding);
-        }
-        // It has no bridge to bind (`LocalAgentNoBridge`): refused before any token travels.
-        Driver::Local => {
-            return Err("the Local agent cannot take part in delegation".to_owned());
         }
     }
     Ok(PreparedBinding {
@@ -288,6 +287,31 @@ mod tests {
             Some(&codex.token)
         );
         // No overlay was written for either.
+        assert_eq!(
+            std::fs::read_dir(tmp.path().join("agent-terminal"))
+                .map(|d| d.count())
+                .ok(),
+            Some(0)
+        );
+    }
+
+    /// The Local runner's binding is only the open binding: no overlay file, no environment and
+    /// no argument, for a root and for a child.
+    #[test]
+    fn the_local_runner_gets_only_the_open_binding() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = private_rundir(tmp.path());
+        for role in [Role::Root, Role::Child] {
+            let local = prepare_binding(&request(Driver::Local, role, dir.clone())).expect("local");
+            assert!(local.overlay.is_none());
+            assert!(local.launch.env.is_empty());
+            assert!(local.launch.argv_tail.is_empty());
+            assert_eq!(
+                local.launch.open.as_ref().map(|b| &b.token),
+                Some(&local.token)
+            );
+            assert!(!format!("{:?}", local.launch).contains(&secret_of(&local)));
+        }
         assert_eq!(
             std::fs::read_dir(tmp.path().join("agent-terminal"))
                 .map(|d| d.count())

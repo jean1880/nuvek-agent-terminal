@@ -19,6 +19,9 @@ pub(super) struct Readback {
     pub(super) failed: bool,
     policy: bool,
     server: bool,
+    /// What a Local child's parent declared beyond reading (its read-back compares the policy
+    /// the runner reports applying).
+    capabilities: Option<Vec<agent_core::delegation::authority::Capability>>,
 }
 pub(super) enum Step {
     Wait,
@@ -34,6 +37,23 @@ impl Readback {
             ..Self::default()
         }
     }
+    /// The capabilities the child was declared with (its Local read-back checks them).
+    pub(super) fn with_capabilities(
+        mut self,
+        capabilities: Option<Vec<agent_core::delegation::authority::Capability>>,
+    ) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// The policy a Local child's runner must report it applied.
+    fn local_policy(&self) -> agent_core::local_agent::LocalChildPolicy {
+        agent_core::local_agent::LocalChildPolicy {
+            task_mode: self.mode.unwrap_or(TaskMode::Plan),
+            capabilities: self.capabilities.clone(),
+        }
+    }
+
     /// The child's process has spawned. agy has no read-back of its own (its launch was proven
     /// before the spawn), but its session takes input only once that spawn is done: before it,
     /// a task is refused as `runtime_unavailable`. So agy becomes ready here, and only here.
@@ -143,6 +163,52 @@ impl Readback {
                 if self.policy && self.server && !self.ready {
                     self.ready = true;
                     return Step::Task;
+                }
+            }
+            // The runner reports the policy it applied (its built-ins for the mode, no user MCP
+            // server, its own delegation client connected) before its session starts.
+            Some(Driver::Local) if !self.ready => {
+                use agent_core::event::{Envelope, Event};
+                use agent_core::local_agent::{
+                    child_echo_ok, ChildPolicyEcho, CHILD_POLICY_REQUEST,
+                };
+                let Ok(envelope) = serde_json::from_value::<Envelope>(v.clone()) else {
+                    return Step::Wait;
+                };
+                match &envelope.event {
+                    Event::ControlResult { ok, .. }
+                        if envelope.request.as_deref() == Some(CHILD_POLICY_REQUEST) =>
+                    {
+                        let echo = ok
+                            .clone()
+                            .and_then(|ok| serde_json::from_value::<ChildPolicyEcho>(ok).ok());
+                        self.policy =
+                            echo.is_some_and(|echo| child_echo_ok(&self.local_policy(), &echo));
+                        if !self.policy {
+                            return self.stop(
+                                ErrorCode::RouteUnverified,
+                                "the Local runner's policy differs from the child policy",
+                            );
+                        }
+                    }
+                    Event::SessionStarted { .. } => {
+                        if !self.policy {
+                            return self.stop(
+                                ErrorCode::RouteUnverified,
+                                "the Local runner started without reporting its child policy",
+                            );
+                        }
+                        self.init = true;
+                        self.ready = true;
+                        return Step::Task;
+                    }
+                    Event::Error { .. } => {
+                        return self.stop(
+                            ErrorCode::ProviderUnavailable,
+                            "the Local runner refused its startup",
+                        );
+                    }
+                    _ => {}
                 }
             }
             _ => {}
@@ -331,6 +397,61 @@ mod tests {
         let mut claude = Readback::child(Driver::Claude, TaskMode::Plan);
         assert!(matches!(claude.started(), Step::Wait));
     }
+    /// A Local child takes its task only after its runner reported the exact policy (with its
+    /// client connected and no user MCP server) and then started; anything else stops it.
+    #[test]
+    fn a_local_child_is_ready_only_after_its_policy_is_read_back() {
+        use agent_core::delegation::authority::Capability;
+        use agent_core::local_agent::{
+            BridgeState, ChildPolicyEcho, LocalChildPolicy, CHILD_POLICY_REQUEST,
+        };
+        let policy = LocalChildPolicy {
+            task_mode: TaskMode::AcceptEdits,
+            capabilities: Some(vec![Capability::Edit]),
+        };
+        let echo = |p: &LocalChildPolicy, servers, bridge| {
+            json!({"event":{"type":"control_result","ok":ChildPolicyEcho::of(p, servers, bridge)},
+                   "request":CHILD_POLICY_REQUEST})
+        };
+        let started = json!({"event":{"type":"session_started","native_id":"s1"}});
+        let guard = || {
+            Readback::child(Driver::Local, TaskMode::AcceptEdits)
+                .with_capabilities(policy.capabilities.clone())
+        };
+        let mut ok = guard();
+        assert!(matches!(
+            ok.line(&echo(&policy, 0, BridgeState::Ready)),
+            Step::Wait
+        ));
+        assert!(!ok.ready);
+        assert!(matches!(ok.line(&started), Step::Task));
+        assert!(ok.ready);
+        let wider = LocalChildPolicy {
+            capabilities: None,
+            ..policy.clone()
+        };
+        for bad in [
+            echo(&policy, 1, BridgeState::Ready),
+            echo(&policy, 0, BridgeState::Degraded),
+            echo(&wider, 0, BridgeState::Ready),
+        ] {
+            let mut g = guard();
+            assert!(matches!(g.line(&bad), Step::Stop(_)), "{bad}");
+            assert!(matches!(g.line(&started), Step::Wait), "stays stopped");
+            assert!(!g.ready);
+        }
+        // Started with no report, or refused: stopped.
+        let mut silent = guard();
+        assert!(matches!(silent.line(&started), Step::Stop(_)));
+        let mut refused = guard();
+        assert!(matches!(
+            refused.line(&json!({"event":{"type":"error","message":"no"}})),
+            Step::Stop(_)
+        ));
+        let mut late = guard();
+        assert!(matches!(late.hello_timeout(true), Step::Stop(_)));
+    }
+
     #[test]
     fn codex_startup_deadline_requires_policy_and_hello() {
         for policy in [false, true] {

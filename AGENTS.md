@@ -441,8 +441,12 @@ Architectural mandates, standards, and workflows for this codebase.
   it ran keeps what it gave back (a writing one is said to have an unknown outcome), never "not
   run". History is sent and kept in whole exchanges. Its conversation is a `0600` file under
   `$XDG_STATE_HOME/agent-terminal/local`, which uninstall removes with the state folder. The
-  server key variable is removed from the runner's own environment once read, so no command
-  inherits it.
+  runner makes itself non-dumpable first thing (`PR_SET_DUMPABLE` 0; it refuses to start
+  otherwise): its `/proc/<pid>/environ` and `mem` are closed to every other process of the user,
+  its commands included, and non-root ptrace and core dumps are refused, since it holds the
+  server key and the delegation capability. Removing the key variable once read only edits
+  libc's copy (so commands do not inherit it); the kernel's copy of the starting environment
+  stays, which non-dumpability is what keeps unreadable.
 - **The Local agent delegates through its own client, never a bridge process**: its binding is
   the open binding (`launch::prepare_with`), which `LocalAdapter` takes through
   `Adapter::bind_launch` into exactly one startup frame (`Command::ConfigureLocal`'s `bridge`;
@@ -451,7 +455,9 @@ Architectural mandates, standards, and workflows for this codebase.
   command it runs, nor any MCP server, ever holds it (a user definition can neither run the
   bridge nor be named as it). The supervisor accepts a Local hello only from that generation's
   own process: the kernel's peer pid and the hello's must both be the runner's
-  (`ops::local_peer_ok`). The `cross_agent_*` tools are the app's own (never MCP aliases),
+  (`ops::local_peer_ok`), with one live connection per token; the client reconnects at most once
+  (the supervisor does not count reconnects, so the pin is what bounds them). The
+  `cross_agent_*` tools are the app's own (never MCP aliases),
   offered only while the client is connected (`cross_agent_capabilities` alone while degraded),
   with no card in any mode, a plan included: the supervisor judges each call, as for every
   other agent. Each call is shown first under a key the runner mints
@@ -460,22 +466,31 @@ Architectural mandates, standards, and workflows for this codebase.
   delegated child's frame also carries its policy (`LocalChildPolicy`): the runner asks the app
   before every write and command in every mode (`local_agent::child_gate`), so
   `ChildAuthority::judge` sees each one (its Accept edits is answered by the app inside the
-  lease, `local_child_accept_edit`), is offered only what its mode and declared capabilities
+  lease, `local_child_accept_edit`); its card carries `resolved_path`, the target the runner
+  resolved and will write, which is judged with the path named (a missing one asks), and the
+  runner refuses to act if the path leads elsewhere when it runs. It is offered only what its mode and declared capabilities
   allow, never widens its mode, refuses a frame with a user MCP server or without its binding,
   fails a turn whose model cannot call tools, and reports the policy it applied before its
   session starts; the child takes its task only once that is read back (`Readback`). A spawn
   on a model its server does not list, or says cannot call tools, is refused; a requested
   effort is ignored with a warning. Route admission waits on the four Local gates
   (`LocalBridgeBinding`, `LocalPeerPin`, `LocalAttestation`, `LocalChildSupervision`), proven
-  by `local.proof.json`. A delegation root's new Local settings never restart it under live
-  sub-agents (`DelegationHooks::holds_restart`): they wait, then apply as a planned rotation.
+  by `local.proof.json`. A delegation root's new Local settings restart it only as a planned
+  rotation the supervisor agreed to: while it has live sub-agents or busy work
+  (`DelegationHooks::holds_restart`), or the supervisor refuses the rotation
+  (`DelegationHooks::suspending`), they wait for a later prompt; a stop it did not agree to
+  would revoke the root's tree. The one exception is a narrowing of its MCP authority, which
+  stops the root at once, live sub-agents and all (its exit revokes them), and says so.
   `tests/local_delegation.rs` and `supervisor::tests::local_tests` prove these on the real
-  runner. **Residual risk (not closed):** the capability is in the runner's memory, readable by
-  a same-user process allowed to trace it (Yama `ptrace_scope` 0, or a debugger); the peer pin
-  makes it useless from any other process. Local attestation is the runner vouching for
-  itself: it proves consistency, not independence. The model server is outside supervision: it
-  receives the task, file contents and results, and a proxy may forward them to a cloud model
-  or run tools of its own that no gate sees.
+  runner. **Residual risk (not closed):** a process able to trace the runner (after
+  non-dumpability, only root or one with `CAP_SYS_PTRACE`) can read its memory, the capability
+  and the server key included, and drive it outright: the peer pin does not help against that,
+  since such a process can act from inside the runner itself. Core dumps are closed by
+  non-dumpability. Local attestation, and the child's policy read-back, are the runner vouching
+  for itself: they prove consistency, not independence; a compromised runner can report
+  whatever it likes. The model server is outside supervision: it receives the task, file
+  contents and results, and a proxy may forward them to a cloud model or run tools of its own
+  that no gate sees.
 - **The Local agent's instructions and MCP tools are the user's, configured in the app, never
   found at launch**: the runner takes one validated `LocalLaunchContext` on stdin
   (`Command::ConfigureLocal`, before any prompt; never argv). Instruction files

@@ -4,8 +4,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::local_mcp::McpServerConfig;
 
-/// Maximum stdin command frame, including its newline.
+/// Maximum setup frame ([`LocalLaunchContext`]), checked by [`LocalLaunchContext::validate`].
 pub const MAX_SETUP_BYTES: usize = 2 * 1024 * 1024;
+
+/// Maximum stdin command line, including its newline. It fits exactly a prompt carrying
+/// [`crate::attachment::MAX_PER_MESSAGE`] images at the largest stored size
+/// ([`MAX_PROMPT_IMAGE_BYTES`]: 5,242,880 bytes of base64 each, 26,214,400 for five), plus 1 MiB
+/// for its text and each image's ref and path. Every other command is far smaller.
+pub const MAX_COMMAND_BYTES: usize =
+    crate::attachment::MAX_PER_MESSAGE * MAX_PROMPT_IMAGE_BYTES.div_ceil(3) * 4 + 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -395,7 +402,63 @@ fn schema_key(candidate: &SchemaCandidate) -> (bool, usize, &str, &str) {
     }
 }
 
-/// Select complete schemas, then newest whole exchanges. The current exchange must fit.
+/// What a run of messages adds to a request.
+#[derive(Debug, Clone, Copy, Default)]
+struct Cost {
+    /// JSON bytes, each image as its sizing part ([`crate::local_agent::ImageForm::Sizing`]),
+    /// plus one separator per message.
+    bytes: usize,
+    /// Estimated image tokens ([`crate::local_agent::image_tokens`]).
+    image_tokens: usize,
+    /// Image data URL bytes ([`crate::local_agent::image_data_url_len`]).
+    image_bytes: usize,
+}
+
+impl std::ops::Add for Cost {
+    type Output = Cost;
+    fn add(self, other: Cost) -> Cost {
+        Cost {
+            bytes: self.bytes.saturating_add(other.bytes),
+            image_tokens: self.image_tokens.saturating_add(other.image_tokens),
+            image_bytes: self.image_bytes.saturating_add(other.image_bytes),
+        }
+    }
+}
+
+fn messages_cost(messages: &[crate::local_agent::ChatMessage]) -> Result<Cost, String> {
+    use crate::local_agent::{image_data_url_len, image_tokens, ImageForm};
+    messages.iter().try_fold(Cost::default(), |total, message| {
+        let images = message
+            .images
+            .iter()
+            .fold(Cost::default(), |c, image| Cost {
+                bytes: 0,
+                image_tokens: c.image_tokens.saturating_add(image_tokens(&image.meta)),
+                image_bytes: c
+                    .image_bytes
+                    .saturating_add(image_data_url_len(&image.meta)),
+            });
+        let bytes = encoded_len(&message.request_value(ImageForm::Sizing))? + 1;
+        Ok(total
+            + images
+            + Cost {
+                bytes,
+                ..Cost::default()
+            })
+    })
+}
+
+/// The largest stored image the app sends, in bytes: its attachment store's cap.
+pub const MAX_PROMPT_IMAGE_BYTES: usize = 3_932_160;
+
+/// The most image data one request may carry, in bytes of data URLs: a message's
+/// [`crate::attachment::MAX_PER_MESSAGE`] images at the largest stored size
+/// ([`MAX_PROMPT_IMAGE_BYTES`], about 26 MB of base64), with room left for older ones. Apart
+/// from [`MAX_REQUEST_BYTES`], which bounds the rest of the request.
+pub const MAX_IMAGE_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+
+/// [`plan_request_with`], sending only the image bytes the messages already hold: any other
+/// image goes as its placeholder.
 pub fn plan_request(
     model: &str,
     system: &str,
@@ -403,7 +466,27 @@ pub fn plan_request(
     history: &[crate::local_agent::ChatMessage],
     budget: &ContextBudget,
 ) -> Result<RequestPlan, String> {
-    use crate::local_agent::{schema_request, ChatMessage};
+    plan_request_with(model, system, candidates, history, budget, &mut |_| None)
+}
+
+/// Select complete schemas, then newest whole exchanges. The current exchange must fit, its
+/// images included: they are never left out. An older exchange that no longer fits with its
+/// images is sent with each image as its placeholder text before it is dropped, and so is
+/// every exchange older than it. Each image costs [`crate::local_agent::image_tokens`] of the
+/// input allowance, and its data URL counts against [`MAX_IMAGE_REQUEST_BYTES`].
+///
+/// `resolve` gives the base64 of a kept image whose bytes the message does not hold (a
+/// replayed one, read back from its blob); `None` sends its placeholder instead. It is asked
+/// only about images the plan keeps.
+pub fn plan_request_with(
+    model: &str,
+    system: &str,
+    candidates: &[SchemaCandidate],
+    history: &[crate::local_agent::ChatMessage],
+    budget: &ContextBudget,
+    resolve: &mut dyn FnMut(&crate::local_agent::MessageImage) -> Option<String>,
+) -> Result<RequestPlan, String> {
+    use crate::local_agent::{schema_request, sized_request, ChatMessage, ImageForm};
     use crate::local_mcp::ToolIdentity;
     budget.validate()?;
     if candidates.len() > 1030 {
@@ -465,40 +548,94 @@ pub fn plan_request(
             budget.failure("system policy, instructions and schemas exceed the input allowance")
         );
     }
-    let mut bytes = base_bytes;
+    let fits = |cost: Cost, count: usize| {
+        cost.bytes <= MAX_REQUEST_BYTES
+            && cost.image_bytes <= MAX_IMAGE_REQUEST_BYTES
+            && estimated_tokens(cost.bytes, count).saturating_add(cost.image_tokens)
+                <= budget.input_allowance()
+    };
+    let mut total = Cost {
+        bytes: base_bytes,
+        ..Cost::default()
+    };
     let mut count = 1;
     let mut keep_from = history.len();
+    // Once an exchange goes without its images, every older one does too: messages from
+    // `keep_from` up to this index are sent with placeholders.
+    let mut strip_before = 0;
     let starts = exchange_starts(history);
     let mut end = history.len();
     for &start in starts.iter().rev() {
-        let exchange_bytes = history[start..end].iter().try_fold(0usize, |n, message| {
-            Ok::<_, String>(n + encoded_len(message)? + 1)
-        })?;
-        let proposed_bytes = bytes.saturating_add(exchange_bytes);
+        let newest = keep_from == history.len();
+        let exchange = &history[start..end];
         let proposed_count = count + end - start;
-        if proposed_bytes > MAX_REQUEST_BYTES
-            || estimated_tokens(proposed_bytes, proposed_count) > budget.input_allowance()
-        {
-            if keep_from == history.len() {
+        let has_images = exchange.iter().any(|m| !m.images.is_empty());
+        let with_images = messages_cost(exchange)?;
+        let chosen =
+            if (strip_before == 0 || !has_images) && fits(total + with_images, proposed_count) {
+                Some((with_images, false))
+            } else if !newest && has_images {
+                let stripped: Vec<_> = exchange.iter().map(ChatMessage::without_images).collect();
+                let without = messages_cost(&stripped)?;
+                fits(total + without, proposed_count).then_some((without, true))
+            } else {
+                None
+            };
+        match chosen {
+            Some((cost, strip)) => {
+                total = total + cost;
+                count = proposed_count;
+                keep_from = start;
+                if strip && strip_before == 0 {
+                    strip_before = end;
+                }
+                end = start;
+            }
+            None if newest && has_images => {
+                return Err(budget.failure(
+                    "the current exchange alone does not fit with its images (each image is \
+                     estimated at up to 1600 tokens)",
+                ));
+            }
+            None if newest => {
                 return Err(budget.failure("the current exchange alone does not fit"));
             }
-            break;
+            None => break,
         }
-        bytes = proposed_bytes;
-        count = proposed_count;
-        keep_from = start;
-        end = start;
     }
     let mut messages = vec![system_message];
-    messages.extend_from_slice(&history[keep_from..]);
+    for (at, message) in history.iter().enumerate().skip(keep_from) {
+        messages.push(if at < strip_before {
+            message.without_images()
+        } else {
+            message.clone()
+        });
+    }
+    let sizing_bytes = encoded_len(&sized_request(
+        model,
+        &messages,
+        &schemas,
+        budget.response_tokens,
+        ImageForm::Sizing,
+    ))?;
+    for image in messages.iter_mut().flat_map(|m| m.images.iter_mut()) {
+        if image.data_base64.is_none() {
+            image.data_base64 = resolve(image);
+        }
+    }
     let body = schema_request(model, &messages, &schemas, budget.response_tokens);
     let request_bytes = encoded_len(&body)?;
+    // The resolver's bytes are the size each ref names; a hard ceiling all the same.
+    if request_bytes > MAX_REQUEST_BYTES.saturating_add(MAX_IMAGE_REQUEST_BYTES) {
+        return Err(budget.failure("the request's images exceed their byte ceiling"));
+    }
     Ok(RequestPlan {
         body,
         schemas,
         excluded,
         history_start: keep_from,
-        input_tokens: estimated_tokens(request_bytes, messages.len()),
+        input_tokens: estimated_tokens(sizing_bytes, messages.len())
+            .saturating_add(total.image_tokens),
         input_allowance: budget.input_allowance(),
         request_bytes,
         static_bytes,
@@ -506,7 +643,8 @@ pub fn plan_request(
 }
 
 /// Reserve the complete assistant call record and a bounded result for every call before any
-/// dispatch. All old exchanges may be dropped, but the active exchange is indivisible.
+/// dispatch. All old exchanges may be dropped, but the active exchange is indivisible, its
+/// images included.
 pub fn reserve_batch(
     model: &str,
     system: &str,
@@ -514,7 +652,7 @@ pub fn reserve_batch(
     history_with_calls: &[crate::local_agent::ChatMessage],
     budget: &ContextBudget,
 ) -> Result<usize, String> {
-    use crate::local_agent::{schema_request, ChatMessage};
+    use crate::local_agent::{image_tokens, sized_request, ChatMessage, ImageForm};
     let assistant = history_with_calls
         .last()
         .ok_or_else(|| budget.failure("missing assistant call record"))?;
@@ -533,16 +671,23 @@ pub fn reserve_batch(
     for call in &assistant.tool_calls {
         messages.push(ChatMessage::tool_result(&call.id, ""));
     }
-    let bytes = encoded_len(&schema_request(
+    let bytes = encoded_len(&sized_request(
         model,
         &messages,
         schemas,
         budget.response_tokens,
+        ImageForm::Sizing,
     ))?;
+    let images: usize = messages
+        .iter()
+        .flat_map(|m| &m.images)
+        .map(|image| image_tokens(&image.meta))
+        .sum();
     // Worst-case JSON escaping uses six bytes per result byte (e.g. control characters).
     let token_bytes = budget
         .input_allowance()
         .saturating_sub(messages.len() * 8)
+        .saturating_sub(images)
         .saturating_mul(2);
     let remaining = token_bytes.min(MAX_REQUEST_BYTES).saturating_sub(bytes);
     let per_result = (remaining / assistant.tool_calls.len() / 6).min(MAX_RESULT_BYTES);
@@ -920,6 +1065,147 @@ mod tests {
             &budget,
         )
         .is_err());
+    }
+
+    fn with_images(text: &str, count: usize, width: u32, height: u32) -> ChatMessage {
+        use crate::local_agent::{content_address, MessageImage};
+        ChatMessage {
+            images: (0..count)
+                .map(|n| {
+                    let bytes = format!("image-{text}-{n}");
+                    MessageImage {
+                        meta: crate::attachment::AttachmentRef {
+                            id: content_address(bytes.as_bytes()),
+                            kind: Default::default(),
+                            mime: "image/png".into(),
+                            width,
+                            height,
+                            bytes: bytes.len() as u64,
+                            name: Some(format!("{text}-{n}.png")),
+                            origin: Default::default(),
+                        },
+                        path: String::new(),
+                        data_base64: None,
+                    }
+                })
+                .collect(),
+            ..ChatMessage::new("user", text)
+        }
+    }
+
+    fn image_budget() -> ContextBudget {
+        // 14336 tokens of input: two messages of five 1600-token images do not fit together.
+        ContextBudget {
+            context_tokens: 16384,
+            response_tokens: 1024,
+            safety_tokens: 1024,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn images_cost_their_tokens_and_their_bytes_are_never_counted_as_text() {
+        let budget = image_budget();
+        let text = plan_request("m", "p", &[], &[ChatMessage::new("user", "hi")], &budget).unwrap();
+        let mut resolved = Vec::new();
+        let plan = plan_request_with(
+            "m",
+            "p",
+            &[],
+            &[with_images("hi", 2, 1000, 750)],
+            &budget,
+            &mut |image| {
+                resolved.push(image.meta.id.clone());
+                Some("QUJD".into())
+            },
+        )
+        .unwrap();
+        assert_eq!(resolved.len(), 2, "each kept image is resolved once");
+        // Two images of 1000 tokens, and the sizing parts' few bytes.
+        assert!(plan.input_tokens >= text.input_tokens + 2000);
+        assert!(plan.input_tokens < text.input_tokens + 2100);
+        let parts = plan.body["messages"][1]["content"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(parts[0]["image_url"]["url"], "data:image/png;base64,QUJD");
+        assert_eq!(parts[2], json!({"type": "text", "text": "hi"}));
+        // A blob that cannot be read goes as its placeholder.
+        let missing =
+            plan_request("m", "p", &[], &[with_images("hi", 1, 10, 10)], &budget).unwrap();
+        assert_eq!(
+            missing.body["messages"][1]["content"][0],
+            json!({"type": "text", "text": "[image: hi-0.png]"})
+        );
+        // A batch reservation leaves room for the active exchange's images.
+        let schemas = vec![Tool::ReadFile.schema()];
+        let calls = assistant_calls(1, 10, 0);
+        let plain = reserve_batch(
+            "m",
+            "p",
+            &schemas,
+            &[ChatMessage::new("user", "hi"), calls.clone()],
+            &budget,
+        )
+        .unwrap();
+        let pictured = reserve_batch(
+            "m",
+            "p",
+            &schemas,
+            &[with_images("hi", 5, 4000, 3000), calls],
+            &budget,
+        )
+        .unwrap();
+        assert!(pictured < plain, "{pictured} {plain}");
+    }
+
+    #[test]
+    fn older_images_become_placeholders_before_their_exchange_is_dropped() {
+        let budget = image_budget();
+        let history = vec![
+            with_images("oldest", 1, 10, 10),
+            ChatMessage::new("assistant", "a tiny image"),
+            with_images("old", 5, 4000, 3000),
+            ChatMessage::new("assistant", "five large images"),
+            with_images("new", 5, 4000, 3000),
+        ];
+        let mut asked = Vec::new();
+        let plan = plan_request_with("m", "p", &[], &history, &budget, &mut |image| {
+            asked.push(image.meta.name.clone().unwrap());
+            Some("QUJD".into())
+        })
+        .unwrap();
+        assert_eq!(plan.history_start, 0, "no exchange is dropped");
+        let sent = plan.body["messages"].as_array().unwrap();
+        // The newest message keeps its images; every older one goes with placeholders, even
+        // the oldest one whose tiny image alone would have fitted.
+        assert_eq!(sent[5]["content"].as_array().unwrap().len(), 6);
+        assert_eq!(
+            sent[3]["content"],
+            "old\n[image: old-0.png] [image: old-1.png] [image: old-2.png] [image: old-3.png] [image: old-4.png]"
+        );
+        assert_eq!(sent[1]["content"], "oldest\n[image: oldest-0.png]");
+        assert!(
+            asked.iter().all(|name| name.starts_with("new-")),
+            "{asked:?}"
+        );
+        assert!(plan.input_tokens <= plan.input_allowance);
+        // Too tight for even the placeholders of the old exchange: it is dropped.
+        let tight = ContextBudget {
+            context_tokens: 10_752,
+            ..image_budget()
+        };
+        let mut long = history.clone();
+        long[2].content = "x".repeat(1000);
+        let plan = plan_request("m", "p", &[], &long, &tight).unwrap();
+        assert_eq!(plan.history_start, 4);
+        // The newest message's images are never left out: too many fail the turn.
+        let error =
+            plan_request("m", "p", &[], &[with_images("new", 9, 4000, 3000)], &budget).unwrap_err();
+        assert!(
+            error.contains("current exchange") && error.contains("images"),
+            "{error}"
+        );
     }
 
     #[test]

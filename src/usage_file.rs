@@ -62,8 +62,8 @@ pub struct AgentEntry {
 /// A Local server's headroom probe, as last read ([`crate::local_headroom`]).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LocalEntry {
-    /// `low` under the threshold, `ok` at or over it, `unknown` with no reading or one older
-    /// than [`HEADROOM_MAX_AGE`].
+    /// `low` under the threshold, `ok` at or over it, `unknown` with no reading, one older
+    /// than [`HEADROOM_MAX_AGE`], or a latest attempt that failed (`probe_failed`).
     pub headroom: Headroom,
     /// 0.0 while `ok`, 1.0 while `low`; null exactly when `headroom` is `unknown`.
     pub load: Option<f64>,
@@ -441,6 +441,10 @@ mod tests {
                 ),
                 ("p-never".into(), reading(4096.0, None, None, true)),
                 (
+                    "p-failing".into(),
+                    reading(4096.0, Some(8192.0), Some(NOW - 5), true),
+                ),
+                (
                     "p-old".into(),
                     reading(
                         4096.0,
@@ -462,6 +466,8 @@ mod tests {
                            "read_at": NOW, "probe_failed": false},
                 "p-never": {"headroom": "unknown", "load": null, "value": null,
                             "low_below": 4096.0, "read_at": null, "probe_failed": true},
+                "p-failing": {"headroom": "unknown", "load": null, "value": 8192.0,
+                              "low_below": 4096.0, "read_at": NOW - 5, "probe_failed": true},
                 "p-old": {"headroom": "unknown", "load": null, "value": 8192.0,
                           "low_below": 4096.0, "read_at": NOW - HEADROOM_MAX_AGE - 1,
                           "probe_failed": false}

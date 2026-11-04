@@ -48,7 +48,8 @@ parent should pick it first whenever one of its models' tags and tier fit the ta
 and tier still come before cost. A Local server joins delegation with its own **Available to
 Other Agents** switch, once its server lists a chat model. A Local server with a **Headroom
 Probe** reports what the probe read instead, free or not: headroom `low` (load 1) while the
-server is busy, `ok` (load 0) otherwise, and `unknown` (load null) without a recent reading,
+server is busy, `ok` (load 0) otherwise, and `unknown` (load null) without a recent reading
+or when its latest probe failed,
 so a parent routes work to another agent while, say, a game holds the server's GPU.
 
 The Local agent (a model on your own server) can be a sub-agent and a parent. As a parent, a

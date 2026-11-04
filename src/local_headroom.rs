@@ -51,8 +51,10 @@ impl ProbeReading {
     }
 
     /// The headroom this reading shows at `now` against the probe configured now.
+    /// A latest attempt that failed is `unknown` whatever an earlier one read: the server may
+    /// have become busy since, so the older number vouches for nothing (it stays recorded).
     pub fn headroom(&self, now: i64) -> Headroom {
-        if self.probe.validate().is_err() {
+        if self.failed || self.probe.validate().is_err() {
             return Headroom::Unknown;
         }
         self.probe
@@ -368,14 +370,16 @@ mod tests {
             NOW,
         );
         assert_eq!(other.headroom, Headroom::Unknown);
-        // A failed attempt after a good reading keeps the reading, and says it failed.
+        // A failed attempt after a good reading is unknown, never the old `ok`, and says it
+        // failed; the reading's age is still reported.
         let failed = ProbeReading {
             failed: true,
             ..read(p.clone(), Some(9000.0), Some(NOW - 10))
         };
         let failing = usage(&p, Some(&failed), NOW);
-        assert_eq!(failing.headroom, Headroom::Ok);
+        assert_eq!((failing.headroom, failing.load), (Headroom::Unknown, None));
         assert!(failing.refresh_failed);
+        assert_eq!(failing.age_s, Some(10));
         // The threshold is the one configured now.
         let stricter = probe("probe-free", 10_000.0);
         let now_busy = usage(&stricter, Some(&read(p, Some(9000.0), Some(NOW))), NOW);

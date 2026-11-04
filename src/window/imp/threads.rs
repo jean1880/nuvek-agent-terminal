@@ -8110,6 +8110,8 @@ impl AgentTerminalWindow {
         }
         // Agents that were missing, or whose binary has gone, are looked for again.
         forget_stale_resolutions();
+        // The Local servers' headroom probes, read at the same cadence as the agents' usage.
+        let headroom_probes = crate::local_headroom::configured(&local_servers);
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
             // The shell's PATH, read once before any agent turns Ready: every agent spawn then
@@ -8231,6 +8233,8 @@ impl AgentTerminalWindow {
                         return;
                     }
                     AccountStatus::shared().refresh_if_due(&targets, now);
+                    crate::local_headroom::LocalHeadroom::shared()
+                        .refresh_if_due(&headroom_probes, now);
                 }
                 Probes::Force => {
                     ModelCatalog::shared().refresh(&targets);
@@ -8238,6 +8242,7 @@ impl AgentTerminalWindow {
                         return;
                     }
                     AccountStatus::shared().refresh(&targets);
+                    crate::local_headroom::LocalHeadroom::shared().refresh(&headroom_probes);
                 }
             }
             if let Some(obj) = obj.upgrade() {

@@ -535,6 +535,7 @@ impl AgentTerminalWindow {
         let config = self.config.clone();
         let profiles = config.clone();
         let tags_config = config.clone();
+        let probe_config = config.clone();
         let weak = self.obj().downgrade();
         // usage.json for tools outside the app; once per process.
         crate::usage_file::install();
@@ -561,20 +562,32 @@ impl AgentTerminalWindow {
                 };
                 std::boxed::Box::pin(async move { cache.current(files.0, files.1).await })
             }),
-            refresh_usage: Rc::new(|wait: std::time::Duration| -> crate::delegation::seam::LocalFuture<()> {
+            refresh_usage: Rc::new(move |wait: std::time::Duration| -> crate::delegation::seam::LocalFuture<()> {
+                // The Local servers' headroom probes start first and run beside the agents'.
+                let probes = crate::local_headroom::configured(probe_config.borrow().local_servers());
                 std::boxed::Box::pin(async move {
+                    let started = std::time::Instant::now();
+                    let floor = crate::delegation::services::USAGE_REFRESH_FLOOR;
+                    let headroom = crate::local_headroom::LocalHeadroom::shared();
+                    headroom.refresh_older_than(&probes, floor, crate::freshness::now_epoch());
                     // The targets of the window's last availability scan: only agents that are
                     // ready, in the environment their threads get.
                     let targets = crate::model_catalog::ModelCatalog::shared().last_targets();
                     crate::account_status::AccountStatus::shared()
+                        .refresh_and_wait(&targets, floor, crate::freshness::now_epoch(), wait)
+                        .await;
+                    headroom
                         .refresh_and_wait(
-                            &targets,
-                            crate::delegation::services::USAGE_REFRESH_FLOOR,
+                            &probes,
+                            floor,
                             crate::freshness::now_epoch(),
-                            wait,
+                            wait.saturating_sub(started.elapsed()),
                         )
                         .await;
                 })
+            }),
+            local_usage: Rc::new(|profile, now| {
+                crate::local_headroom::LocalHeadroom::shared().usage_of(profile, now)
             }),
         };
         crate::delegation::start(crate::delegation::AppServices {

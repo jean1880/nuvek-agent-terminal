@@ -4,6 +4,10 @@
 //!
 //! Never the account: the file is built from the windows and timestamps alone, so no email or
 //! plan label can reach it.
+//!
+//! A Local server with a headroom probe is listed under `local`, keyed by its profile id: the
+//! headroom its last reading shows, the number and threshold, and when it was read. Neither the
+//! probe's command nor its output beyond that number is written.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -55,6 +59,24 @@ pub struct AgentEntry {
     pub windows: Vec<WindowEntry>,
 }
 
+/// A Local server's headroom probe, as last read ([`crate::local_headroom`]).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LocalEntry {
+    /// `low` under the threshold, `ok` at or over it, `unknown` with no reading or one older
+    /// than [`HEADROOM_MAX_AGE`].
+    pub headroom: Headroom,
+    /// 0.0 while `ok`, 1.0 while `low`; null exactly when `headroom` is `unknown`.
+    pub load: Option<f64>,
+    /// The last number the probe printed; null when it never gave one in this run.
+    pub value: Option<f64>,
+    /// The threshold it is read against.
+    pub low_below: f64,
+    /// When `value` was read; null when never.
+    pub read_at: Option<i64>,
+    /// The last attempt gave no reading (failed, timed out or printed no number).
+    pub probe_failed: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct UsageDocument {
     pub version: u32,
@@ -62,10 +84,47 @@ pub struct UsageDocument {
     /// Keyed by driver key (`claude`, `agy`, `codex`). An agent the app knows nothing about yet
     /// (never read, not signed out, no failed probe) is left out.
     pub agents: std::collections::BTreeMap<String, AgentEntry>,
+    /// Keyed by Local server profile id: each enabled server with a headroom probe. Absent when
+    /// none has one.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub local: std::collections::BTreeMap<String, LocalEntry>,
 }
 
-/// The file's contents for `snapshots` at `now`. Only windows and timestamps are copied.
-pub fn document(snapshots: &[(Driver, Snapshot)], now: i64) -> UsageDocument {
+/// The `local` entries for the probe readings `local` at `now`.
+pub fn local_entries(
+    local: &[(String, crate::local_headroom::ProbeReading)],
+    now: i64,
+) -> std::collections::BTreeMap<String, LocalEntry> {
+    local
+        .iter()
+        .map(|(id, r)| {
+            let headroom = r.headroom(now);
+            (
+                id.clone(),
+                LocalEntry {
+                    headroom,
+                    load: agent_core::headroom_probe::load(headroom),
+                    value: r.value.filter(|v| v.is_finite()),
+                    low_below: if r.probe.low_below.is_finite() {
+                        r.probe.low_below
+                    } else {
+                        0.0
+                    },
+                    read_at: r.read_at,
+                    probe_failed: r.failed,
+                },
+            )
+        })
+        .collect()
+}
+
+/// The file's contents for `snapshots` and the Local probe readings `local` at `now`. Only
+/// windows, probe numbers and timestamps are copied.
+pub fn document(
+    snapshots: &[(Driver, Snapshot)],
+    local: &[(String, crate::local_headroom::ProbeReading)],
+    now: i64,
+) -> UsageDocument {
     let agents = snapshots
         .iter()
         .filter(|(_, s)| s.read_at.is_some() || s.signed_out || s.refresh_failed)
@@ -96,6 +155,7 @@ pub fn document(snapshots: &[(Driver, Snapshot)], now: i64) -> UsageDocument {
         version: VERSION,
         written_at: now,
         agents,
+        local: local_entries(local, now),
     }
 }
 
@@ -134,6 +194,12 @@ pub fn install() {
                 .map(|d| (d, status.snapshot(d)))
                 .collect()
         }),
+        Rc::new(|| {
+            crate::local_headroom::LocalHeadroom::shared()
+                .readings()
+                .into_iter()
+                .collect()
+        }),
     );
     // The status is app-wide and lives as long as the process: so do these listeners. A change
     // of what is shown, and every successful reading (which moves `read_at` without one).
@@ -142,11 +208,37 @@ pub fn install() {
     status.connect_changed(move || w.schedule());
     let w = writer.clone();
     status.connect_read(move || w.schedule());
+    // Every probe that ends, read or not.
+    let w = writer.clone();
+    crate::local_headroom::LocalHeadroom::shared().connect_changed(move || w.schedule());
     writer.schedule();
 }
 
 /// The agents last written.
 type Written = std::collections::BTreeMap<String, AgentEntry>;
+/// The Local servers last written.
+type WrittenLocal = std::collections::BTreeMap<String, LocalEntry>;
+
+/// [`same_as_written`] for the Local servers: the same servers and entries, `read_at` moving by
+/// less than [`READ_AT_STEP`] aside.
+pub(crate) fn same_local_as_written(last: &WrittenLocal, new: &WrittenLocal) -> bool {
+    last.len() == new.len()
+        && last.iter().zip(new).all(|((ka, a), (kb, b))| {
+            let moved = match (a.read_at, b.read_at) {
+                (Some(x), Some(y)) => (y - x).abs() >= READ_AT_STEP,
+                (x, y) => x != y,
+            };
+            ka == kb
+                && !moved
+                && LocalEntry {
+                    read_at: b.read_at,
+                    ..a.clone()
+                } == *b
+        })
+}
+
+/// The probe readings the file is written from.
+type LocalSource = Rc<dyn Fn() -> Vec<(String, crate::local_headroom::ProbeReading)>>;
 
 /// Whether `new` says nothing `last` did not: the same agents and entries, except for `read_at`
 /// moving by less than [`READ_AT_STEP`] (a live agent re-read every turn need not rewrite the
@@ -176,21 +268,24 @@ const READ_AT_STEP: i64 = 60;
 pub(crate) struct Writer {
     path: PathBuf,
     snapshots: Rc<dyn Fn() -> Vec<(Driver, Snapshot)>>,
+    local: LocalSource,
     scheduled: Cell<bool>,
     in_flight: Cell<bool>,
     /// Asked to write while a write ran.
     dirty: Cell<bool>,
-    last: RefCell<Option<Written>>,
+    last: RefCell<Option<(Written, WrittenLocal)>>,
 }
 
 impl Writer {
     pub(crate) fn new(
         path: PathBuf,
         snapshots: Rc<dyn Fn() -> Vec<(Driver, Snapshot)>>,
+        local: LocalSource,
     ) -> Rc<Self> {
         Rc::new(Self {
             path,
             snapshots,
+            local,
             scheduled: Cell::new(false),
             in_flight: Cell::new(false),
             dirty: Cell::new(false),
@@ -229,13 +324,10 @@ impl Writer {
     }
 
     async fn write_once(&self) {
-        let doc = document(&(self.snapshots)(), now_epoch());
-        if self
-            .last
-            .borrow()
-            .as_ref()
-            .is_some_and(|last| same_as_written(last, &doc.agents))
-        {
+        let doc = document(&(self.snapshots)(), &(self.local)(), now_epoch());
+        if self.last.borrow().as_ref().is_some_and(|(agents, local)| {
+            same_as_written(agents, &doc.agents) && same_local_as_written(local, &doc.local)
+        }) {
             return;
         }
         let bytes = match serde_json::to_vec_pretty(&doc) {
@@ -251,7 +343,7 @@ impl Writer {
                 .await
                 .unwrap_or_else(|_| Err(std::io::Error::other("the write did not finish")));
         match written {
-            Ok(()) => *self.last.borrow_mut() = Some(doc.agents),
+            Ok(()) => *self.last.borrow_mut() = Some((doc.agents, doc.local)),
             Err(e) => warn!(error = %e, "could not write usage.json"),
         }
     }
@@ -293,6 +385,7 @@ mod tests {
                 (Driver::Codex, snap(0.85, Some(NOW - 10))),
                 (Driver::Agy, Snapshot::default()),
             ],
+            &[],
             NOW,
         );
         let v = serde_json::to_value(&doc).expect("ser");
@@ -312,8 +405,85 @@ mod tests {
                                            "resets_at": "2026-10-20T22:00:00Z"}]}
                 }
             }),
-            "an agent never read is left out"
+            "an agent never read is left out, and no probe: no `local`"
         );
+    }
+
+    /// A probed Local server is listed by profile id with its headroom, number, threshold and
+    /// when it was read; never its command.
+    #[test]
+    fn a_probed_local_server_is_listed_by_profile_id() {
+        use crate::local_headroom::ProbeReading;
+        use agent_core::headroom_probe::HeadroomProbe;
+        let probe = |low_below| HeadroomProbe {
+            argv: vec!["probe-free".into(), "--secret-flag".into()],
+            low_below,
+            timeout_s: 5,
+        };
+        let reading = |low_below, value, read_at, failed| ProbeReading {
+            probe: probe(low_below),
+            value,
+            read_at,
+            tried_at: read_at,
+            failed,
+            running: false,
+        };
+        let doc = document(
+            &[],
+            &[
+                (
+                    "p-busy".into(),
+                    reading(4096.0, Some(512.0), Some(NOW - 5), false),
+                ),
+                (
+                    "p-idle".into(),
+                    reading(4096.0, Some(8192.0), Some(NOW), false),
+                ),
+                ("p-never".into(), reading(4096.0, None, None, true)),
+                (
+                    "p-old".into(),
+                    reading(
+                        4096.0,
+                        Some(8192.0),
+                        Some(NOW - HEADROOM_MAX_AGE - 1),
+                        false,
+                    ),
+                ),
+            ],
+            NOW,
+        );
+        let v = serde_json::to_value(&doc).expect("ser");
+        assert_eq!(
+            v["local"],
+            serde_json::json!({
+                "p-busy": {"headroom": "low", "load": 1.0, "value": 512.0, "low_below": 4096.0,
+                           "read_at": NOW - 5, "probe_failed": false},
+                "p-idle": {"headroom": "ok", "load": 0.0, "value": 8192.0, "low_below": 4096.0,
+                           "read_at": NOW, "probe_failed": false},
+                "p-never": {"headroom": "unknown", "load": null, "value": null,
+                            "low_below": 4096.0, "read_at": null, "probe_failed": true},
+                "p-old": {"headroom": "unknown", "load": null, "value": 8192.0,
+                          "low_below": 4096.0, "read_at": NOW - HEADROOM_MAX_AGE - 1,
+                          "probe_failed": false}
+            })
+        );
+        let text = serde_json::to_string(&doc).expect("ser");
+        assert!(!text.contains("probe-free") && !text.contains("secret-flag"));
+
+        // Rewritten when a server's reading changes, not when only read_at moved a little.
+        let local = |value, read_at| {
+            document(
+                &[],
+                &[("p".into(), reading(1.0, Some(value), Some(read_at), false))],
+                NOW,
+            )
+            .local
+        };
+        let last = local(5.0, NOW - 100);
+        assert!(same_local_as_written(&last, &local(5.0, NOW - 41)));
+        assert!(!same_local_as_written(&last, &local(5.0, NOW - 40)));
+        assert!(!same_local_as_written(&last, &local(0.5, NOW - 100)));
+        assert!(!same_local_as_written(&last, &Default::default()));
     }
 
     #[test]
@@ -329,6 +499,7 @@ mod tests {
                 (Driver::Agy, signed_out),
                 (Driver::Codex, snap(f64::NAN, Some(NOW))),
             ],
+            &[],
             NOW,
         );
         let text = serde_json::to_string(&doc).expect("ser");
@@ -362,18 +533,19 @@ mod tests {
     #[test]
     fn a_read_at_that_moved_a_minute_is_news() {
         let now = now_epoch();
-        let doc = |read_at: i64| document(&[(Driver::Claude, snap(0.4, Some(read_at)))], now);
+        let doc = |read_at: i64| document(&[(Driver::Claude, snap(0.4, Some(read_at)))], &[], now);
         let last = doc(now - 100).agents;
         assert!(same_as_written(&last, &doc(now - 100).agents));
         assert!(same_as_written(&last, &doc(now - 41).agents), "59 s");
         assert!(!same_as_written(&last, &doc(now - 40).agents), "60 s");
-        let other = document(&[(Driver::Claude, snap(0.5, Some(now - 100)))], now).agents;
+        let other = document(&[(Driver::Claude, snap(0.5, Some(now - 100)))], &[], now).agents;
         assert!(!same_as_written(&last, &other), "a window changed");
         let more = document(
             &[
                 (Driver::Claude, snap(0.4, Some(now - 100))),
                 (Driver::Codex, snap(0.1, Some(now))),
             ],
+            &[],
             now,
         )
         .agents;
@@ -389,7 +561,7 @@ mod tests {
         )]));
         let s = source.clone();
         (
-            Writer::new(path, Rc::new(move || s.borrow().clone())),
+            Writer::new(path, Rc::new(move || s.borrow().clone()), Rc::new(Vec::new)),
             source,
         )
     }

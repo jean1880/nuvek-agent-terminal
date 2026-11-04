@@ -63,9 +63,19 @@ pub(super) fn profile_cost(profile: &crate::config::Profile, driver: Driver) -> 
     }
 }
 
-/// A profile's usage as listed: a free one has no quota to burn (`ok`, load 0, no window,
-/// whatever its agent's vendor reads); a metered one is its agent's `reading`.
-pub(super) fn profile_usage(cost: Cost, reading: Option<Snapshot>, now: i64) -> Option<UsageInfo> {
+/// A profile's usage as listed: a Local server with a headroom probe is what the probe read
+/// (`probed`: `low` while its server is busy, `unknown` without a fresh reading), whatever its
+/// cost; otherwise a free one has no quota to burn (`ok`, load 0, no window, whatever its
+/// agent's vendor reads) and a metered one is its agent's `reading`.
+pub(super) fn profile_usage(
+    cost: Cost,
+    reading: Option<Snapshot>,
+    probed: Option<UsageInfo>,
+    now: i64,
+) -> Option<UsageInfo> {
+    if probed.is_some() {
+        return probed;
+    }
     match cost {
         Cost::Free => Some(UsageInfo::free()),
         Cost::Metered => reading.map(|s| usage_info(&s, now)),
@@ -235,14 +245,40 @@ mod tests {
             read_at: Some(now),
             ..Snapshot::default()
         };
-        let free = profile_usage(Cost::Free, Some(busy.clone()), now).expect("free");
+        let free = profile_usage(Cost::Free, Some(busy.clone()), None, now).expect("free");
         assert_eq!(free.headroom, Headroom::Ok);
         assert_eq!(free.load, Some(0.0));
         assert!(free.windows.is_empty() && !free.refresh_failed && !free.signed_out);
-        assert!(profile_usage(Cost::Free, None, now).is_some());
-        let metered = profile_usage(Cost::Metered, Some(busy), now).expect("metered");
+        assert!(profile_usage(Cost::Free, None, None, now).is_some());
+        let metered = profile_usage(Cost::Metered, Some(busy), None, now).expect("metered");
         assert_eq!(metered.headroom, Headroom::Exhausted);
-        assert!(profile_usage(Cost::Metered, None, now).is_none());
+        assert!(profile_usage(Cost::Metered, None, None, now).is_none());
+
+        // A probed server reports its probe, free or not: busy is `low`, no reading `unknown`.
+        let probed = |headroom, load| UsageInfo {
+            headroom,
+            load,
+            ..UsageInfo::free()
+        };
+        let busy_gpu = profile_usage(
+            Cost::Free,
+            None,
+            Some(probed(Headroom::Low, Some(1.0))),
+            now,
+        )
+        .expect("probed");
+        assert_eq!(
+            (busy_gpu.headroom, busy_gpu.load),
+            (Headroom::Low, Some(1.0))
+        );
+        let unread = profile_usage(
+            Cost::Metered,
+            None,
+            Some(probed(Headroom::Unknown, None)),
+            now,
+        )
+        .expect("probed");
+        assert_eq!((unread.headroom, unread.load), (Headroom::Unknown, None));
 
         let server = |kind, free| crate::config::Profile {
             provider: Some(ModelProvider::new(kind)),

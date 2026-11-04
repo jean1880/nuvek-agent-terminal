@@ -621,7 +621,10 @@ Architectural mandates, standards, and workflows for this codebase.
   any process with the user's shell can still run the command or edit it. The built-in
   list names no local model. Capabilities report each profile's `cost`
   (`config::profile_is_free`; a free one reports usage `ok`, load 0) and each model's
-  `tags_source`.
+  `tags_source`. A Local server with a `headroom_probe` reports what the probe read instead
+  (`local_headroom`: the user's command, exec'd with no shell and a minimal environment, off the
+  main thread, bounded by its time limit; `low` under the threshold, `unknown` without a fresh
+  reading, never `ok` by default), also written to `usage.json` under `local`.
 - **Never block the main thread**: anything that shells out — CLI detection above
   all, which may run `$SHELL -ic` and source the user's rc — goes through
   `gio::spawn_blocking`. A frozen window cannot even repaint its own spinner.

@@ -6,6 +6,7 @@
 //! (one GET, off the main thread) and says what it found.
 
 use super::*;
+use agent_core::headroom_probe;
 
 const LOCAL_GROUP_HELP: &str = "Run threads on models from your own servers: Ollama, LM Studio, \
      vLLM, llama.cpp, LiteLLM or any OpenAI-compatible one. Add as many servers as you like; \
@@ -20,6 +21,13 @@ const SERVER_TYPE_HELP: &str = "Sets the default address; every type is reached 
 const SERVER_URL_HELP: &str = "The server's address, e.g. http://192.0.2.10:11434 or \
      http://localhost:8000 (a trailing /v1 is fine). Blank: the server type's default on this \
      machine; Other needs one";
+
+const HEADROOM_PROBE_HELP: &str = "Optional. A command that prints one number, such as the free \
+     memory of the GPU this server runs on. While it reads under Low Below the server counts as \
+     busy and other agents hand work elsewhere. Run directly, never through a shell, with its \
+     words split on spaces; it gets a few seconds. Blank: no probe";
+const LOW_BELOW_HELP: &str = "The probe's reading under which this server is busy, in the \
+     probe's own unit, e.g. 4096";
 
 /// Fills the server list again (after an add or a removal).
 type Refill = Rc<dyn Fn()>;
@@ -646,6 +654,7 @@ impl AgentTerminalWindow {
             }
         ));
         row.add_row(&delegation_row);
+        self.headroom_probe_rows(server, dialog, &row);
 
         // A row with a button (libadwaita 1.5 has no button row).
         let remove_row = adw::ActionRow::builder()
@@ -711,6 +720,91 @@ impl AgentTerminalWindow {
 
         scan();
         row
+    }
+
+    /// Headroom Probe and Low Below: a command printing one number, and the reading under which
+    /// the server counts as busy. Each row commits both (a probe needs the two), so either may be
+    /// typed first; until both are valid nothing is saved.
+    fn headroom_probe_rows(
+        &self,
+        server: &Profile,
+        dialog: &adw::PreferencesDialog,
+        row: &adw::ExpanderRow,
+    ) {
+        let id: Rc<str> = server.id.as_str().into();
+        let saved = server.headroom_probe.as_ref();
+        let (command, command_error) = validated_entry(
+            "Headroom Probe",
+            HEADROOM_PROBE_HELP,
+            &saved.map_or_else(String::new, |p| headroom_probe::command_line(&p.argv)),
+        );
+        let (low, low_error) = validated_entry(
+            "Low Below",
+            LOW_BELOW_HELP,
+            &saved.map_or_else(String::new, |p| p.low_below.to_string()),
+        );
+        // One decision for both rows: the command's text and the threshold's, against what is
+        // saved now.
+        let decide = |imp: &AgentTerminalWindow, id: &str, command: &str, low: &str, commit| {
+            let saved = imp.server_now(id).and_then(|p| p.headroom_probe);
+            crate::config::field_change(
+                headroom_probe::edit(command, low, saved.as_ref()),
+                &saved,
+                commit,
+            )
+        };
+        // A commit of one row settles the other's complaint too.
+        let settled = |entry: &glib::WeakRef<adw::EntryRow>,
+                       feedback: &glib::WeakRef<adw::ActionRow>,
+                       help: &str| {
+            if let (Some(entry), Some(feedback)) = (entry.upgrade(), feedback.upgrade()) {
+                show_validation(&entry, &feedback, help, None);
+            }
+        };
+
+        let timer = self.agent_edit_timer(dialog);
+        let (low_text, decide_id, apply_id) = (low.downgrade(), id.clone(), id.clone());
+        let (low_row, low_feedback) = (low.downgrade(), low_error.downgrade());
+        self.commit_only_entry(
+            &command,
+            &command_error,
+            HEADROOM_PROBE_HELP,
+            &timer,
+            move |imp, text, commit| {
+                let low = low_text.upgrade().map(|r| r.text()).unwrap_or_default();
+                decide(imp, &decide_id, text, &low, commit)
+            },
+            move |imp, value| {
+                if let Some(value) = value {
+                    imp.edit_server(&apply_id, |p| p.headroom_probe = value);
+                }
+                settled(&low_row, &low_feedback, LOW_BELOW_HELP);
+            },
+        );
+        row.add_row(&command);
+        row.add_row(&command_error);
+
+        let timer = self.agent_edit_timer(dialog);
+        let (command_text, decide_id, apply_id) = (command.downgrade(), id.clone(), id);
+        let (command_row, command_feedback) = (command.downgrade(), command_error.downgrade());
+        self.commit_only_entry(
+            &low,
+            &low_error,
+            LOW_BELOW_HELP,
+            &timer,
+            move |imp, text, commit| {
+                let command = command_text.upgrade().map(|r| r.text()).unwrap_or_default();
+                decide(imp, &decide_id, &command, text, commit)
+            },
+            move |imp, value| {
+                if let Some(value) = value {
+                    imp.edit_server(&apply_id, |p| p.headroom_probe = value);
+                }
+                settled(&command_row, &command_feedback, HEADROOM_PROBE_HELP);
+            },
+        );
+        row.add_row(&low);
+        row.add_row(&low_error);
     }
 }
 

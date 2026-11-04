@@ -33,6 +33,7 @@ mod environment_review;
 mod freshness;
 mod hook_config;
 mod icons;
+mod local_headroom;
 mod model_catalog;
 mod model_tags_file;
 mod palette;

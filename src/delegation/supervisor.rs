@@ -175,6 +175,7 @@ mod tests {
                 refresh_usage: Rc::new(|_: Duration| -> super::super::seam::LocalFuture<()> {
                     Box::pin(std::future::ready(()))
                 }),
+                local_usage: Rc::new(|_, _| None),
             })
         });
         in_context(async {

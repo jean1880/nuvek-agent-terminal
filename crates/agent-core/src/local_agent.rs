@@ -542,6 +542,12 @@ pub struct ChatMessage {
     /// its ref and stored file's path, never its bytes ([`MessageImage::data_base64`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<MessageImage>,
+    /// A user message the runner itself adds inside a turn (its one nudge for an answer given
+    /// only as reasoning): it belongs to the current exchange, never starts one
+    /// ([`crate::local_context::exchange_starts`]), so planning keeps it with what it follows.
+    /// Never sent as a field nor kept on disk.
+    #[serde(skip)]
+    pub continues_exchange: bool,
 }
 
 /// One image of a message. What is kept on disk is the ref and the path of the app's stored

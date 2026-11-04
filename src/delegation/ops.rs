@@ -1178,6 +1178,8 @@ impl Supervisor {
                     })
                     .collect();
                 let cost = super::catalog_info::profile_cost(&p, driver);
+                // A Local server's headroom probe, when it has one, says how busy it is.
+                let probed = (self.services.catalog.local_usage)(&p, now);
                 Some(ProfileCapabilities {
                     profile_id: id,
                     name: p.name,
@@ -1215,6 +1217,7 @@ impl Supervisor {
                     usage: super::catalog_info::profile_usage(
                         cost,
                         (self.services.catalog.usage)(driver),
+                        probed,
                         now,
                     ),
                     workspaces: vec![

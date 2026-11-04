@@ -545,6 +545,9 @@ impl Supervisor {
             state.child_specs.insert(worker.clone(), spec.clone());
             state.dispatching.insert(accepted.operation.clone());
         }
+        if let Some(run) = &accepted.run {
+            self.note_run_started(run);
+        }
         self.notify_registry();
         let prepared = self.prepare_launch(&spec, ProcessGeneration(1)).await;
         match prepared {
@@ -869,7 +872,7 @@ impl Supervisor {
     /// and would leave the run open for good (a parent waiting on it would wait out its
     /// deadline). In the writer's order, so whichever ending comes first wins.
     pub(super) fn interrupt_open_runs(self: &Rc<Self>, workers: &[WorkerId]) {
-        let runs: Vec<_> = {
+        let ended: Vec<_> = {
             let mut state = self.state.borrow_mut();
             workers
                 .iter()
@@ -877,13 +880,23 @@ impl Supervisor {
                     let w = state.workers.get_mut(id)?;
                     let run = w.run.take()?;
                     w.last_run = Some(run.clone());
-                    Some(run)
+                    Some((id.clone(), run))
                 })
                 .collect()
         };
-        if runs.is_empty() {
+        if ended.is_empty() {
             return;
         }
+        for (worker, run) in &ended {
+            self.log_run_end(
+                worker,
+                run,
+                agent_core::delegation::lifecycle::RunState::Interrupted,
+                None,
+                None,
+            );
+        }
+        let runs: Vec<_> = ended.into_iter().map(|(_, run)| run).collect();
         let sup = self.clone();
         gtk4::glib::spawn_future_local(async move {
             let ended = sup
@@ -921,6 +934,15 @@ impl Supervisor {
             })
         };
         if let Some((run, pending, root)) = data {
+            if let Some(run) = &run {
+                self.log_run_end(
+                    worker,
+                    run,
+                    agent_core::delegation::lifecycle::RunState::Failed,
+                    None,
+                    None,
+                );
+            }
             let sessions = {
                 let state = self.state.borrow();
                 state

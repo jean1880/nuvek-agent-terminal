@@ -322,6 +322,7 @@ impl Supervisor {
         if let Some(w) = self.state.borrow_mut().workers.get_mut(&entry.worker) {
             w.run = Some(run.clone());
         }
+        self.note_run_started(&run);
         Ok(Some(run))
     }
     async fn deliver(self: &Rc<Self>, mut entry: Delivery) {
@@ -797,6 +798,30 @@ impl Supervisor {
             self.drain_deferred(&entry.worker);
         }
     }
+    /// Tests: fails `entry`'s delivery after it reserved `run` itself, in the worker's current
+    /// generation, as a write the session refused would.
+    #[cfg(test)]
+    pub(super) fn fail_reserved_delivery(self: &Rc<Self>, entry: &Delivery, run: RunId) {
+        let Some(generation) = self
+            .state
+            .borrow()
+            .workers
+            .get(&entry.worker)
+            .map(|w| w.generation)
+        else {
+            return;
+        };
+        let used = Dispatch {
+            run: Some(run),
+            fresh: true,
+            generation,
+        };
+        self.fail_dispatch(
+            entry,
+            &used,
+            error(ErrorCode::ProviderUnavailable, "child session unavailable"),
+        );
+    }
     /// A delivery that failed before it reserved a run: its operation fails, and the worker's
     /// next queued entry is tried, as [`Self::fail_dispatch`] does.
     fn fail_undispatched(self: &Rc<Self>, entry: &Delivery, e: ToolError) {
@@ -885,6 +910,14 @@ impl Supervisor {
         if let Some(w) = self.state.borrow_mut().workers.get_mut(&entry.worker) {
             w.last_run = w.run.take();
         }
+        // Its journal record, which also takes its start time.
+        self.log_run_end(
+            &entry.worker,
+            &run,
+            agent_core::delegation::lifecycle::RunState::Failed,
+            None,
+            None,
+        );
         let reason = e.code.as_str().to_owned();
         let operation = entry.input.operation.clone();
         let fact = DispatchFact::Failed(e);

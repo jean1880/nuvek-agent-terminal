@@ -185,7 +185,33 @@ to add a server; add as many as you like. Each server has:
   other agents should prefer it when it fits a task. Unset, it follows the type: on for
   Ollama, LM Studio and the other servers you run yourself, off for LiteLLM (a gateway
   may reach a paid model) and Other. A profile of a vendor's own agent is always metered.
-  Delegation reports it as the profile's `cost`, with usage `ok` and load 0;
+  Delegation reports it as the profile's `cost`, with usage `ok` and load 0 (unless the
+  server has a headroom probe, below);
+- an optional **Headroom Probe** and **Low Below** (`headroom_probe` in the profile): a
+  command that prints one number, such as the free memory of the GPU the server runs on,
+  and the reading under which the server counts as busy. While the probe reads under
+  **Low Below**, delegation reports the server's headroom as `low` (load 1), so other agents
+  hand work elsewhere; at or over it, `ok` (load 0). A probe that is missing, fails, runs past
+  its time limit, prints anything but one number, or was last read over 20 minutes ago reports
+  `unknown`, never `ok`. The probe runs when the app reads the agents' usage (at most every
+  10 minutes, after a settings change, and when a parent asks for capabilities with
+  `refresh`), off the main thread. It is run directly, never through a shell: the command's
+  words are split on spaces (put a command whose arguments hold spaces in a small script), and
+  it gets only `PATH`, `HOME`, `USER`, `LANG`, `LC_ALL`, `TMPDIR` and `XDG_RUNTIME_DIR` from
+  the app's environment. `SSH_AUTH_SOCK` is not passed, so a probe that needs an SSH agent
+  (say, one reading another machine over `ssh`) gets no reading and reports `unknown`; use a
+  key it can read without an agent. It runs in a process group of its own: at its time limit
+  (`timeout_s` in the profile, 5 seconds by default, 1 to 30), and once it exits, the whole
+  group is ended, so nothing it starts outlives it. Output past 4 KiB ends it with no reading.
+  Both fields are needed: until both are valid, nothing is saved. For example:
+
+  ```json
+  "headroom_probe": {
+    "argv": ["/usr/local/bin/free-gpu-mib"],
+    "low_below": 4096,
+    "timeout_s": 5
+  }
+  ```
 - **Available to Other Agents** (`available_for_delegation` on the server's own profile,
   off for a new server): the opt-in for this server alone, as **Available for delegation**
   is for Claude, Codex and Antigravity. The master switch under Cross-agent delegation

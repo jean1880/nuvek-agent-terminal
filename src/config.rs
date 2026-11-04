@@ -149,6 +149,11 @@ pub struct Profile {
     /// Only a profile with a server has a cost to set: a vendor's is always metered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub free_to_run: Option<bool>,
+    /// A Local server's headroom probe: a command printing one number (free GPU memory, say)
+    /// and the reading under which the server counts as busy, so delegation prefers another
+    /// agent meanwhile. `None`: no probe, and the server's headroom follows its cost alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headroom_probe: Option<agent_core::headroom_probe::HeadroomProbe>,
 }
 
 /// A blank profile with a fresh id, so the invariant holds for `..Profile::default()` too.
@@ -179,6 +184,7 @@ impl Default for Profile {
             driver: None,
             provider: None,
             free_to_run: None,
+            headroom_probe: None,
         }
     }
 }
@@ -2593,6 +2599,59 @@ mod tests {
         let back: Profile = serde_json::from_str(&text).unwrap();
         assert_eq!(back.free_to_run, Some(true));
         assert_eq!(back.duplicate("Copy").free_to_run, Some(true));
+    }
+
+    /// `headroom_probe`: absent in older files and not written until set; a set one survives a
+    /// save and a load (its time limit defaulted when the file names none), and a config file
+    /// holding one loads whole.
+    #[test]
+    fn a_servers_headroom_probe_is_optional_and_round_trips() {
+        use agent_core::headroom_probe::{HeadroomProbe, DEFAULT_TIMEOUT_S};
+        let old: Profile =
+            serde_json::from_str(r#"{"name": "Old", "command": "ollama", "driver": "local"}"#)
+                .unwrap();
+        assert_eq!(old.headroom_probe, None, "a profile from before the field");
+        assert!(serde_json::to_value(&old)
+            .unwrap()
+            .get("headroom_probe")
+            .is_none());
+
+        let probed: Profile = serde_json::from_str(
+            r#"{"name": "Server", "command": "", "driver": "local",
+                "headroom_probe": {"argv": ["probe-free", "--mib"], "low_below": 4096}}"#,
+        )
+        .unwrap();
+        let probe = probed.headroom_probe.clone().expect("read");
+        assert_eq!(probe.argv, ["probe-free", "--mib"]);
+        assert_eq!(probe.low_below, 4096.0);
+        assert_eq!(probe.timeout_s, DEFAULT_TIMEOUT_S);
+        let text = serde_json::to_string(&probed).unwrap();
+        let back: Profile = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.headroom_probe, Some(probe.clone()));
+        assert_eq!(back.duplicate("Copy").headroom_probe, Some(probe));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let config = TerminalConfig {
+            profiles: vec![Profile {
+                headroom_probe: Some(HeadroomProbe {
+                    argv: vec!["probe-free".into()],
+                    low_below: 2.5,
+                    timeout_s: 9,
+                }),
+                ..Profile::default()
+            }],
+            ..TerminalConfig::default()
+        };
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let loaded = TerminalConfig::load_from(&path);
+        let saved = loaded
+            .profiles
+            .iter()
+            .find_map(|p| p.headroom_probe.clone())
+            .expect("kept through a load");
+        assert_eq!(saved.low_below, 2.5);
+        assert_eq!(saved.timeout_s, 9);
     }
 
     #[test]

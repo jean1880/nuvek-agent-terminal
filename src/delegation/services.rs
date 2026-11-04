@@ -53,7 +53,14 @@ pub(crate) struct CatalogServices {
     pub tags: Rc<dyn Fn() -> LocalFuture<TagsState>>,
     /// Re-reads usage that is at least a minute old and waits up to the given time for it.
     pub refresh_usage: Rc<dyn Fn(std::time::Duration) -> LocalFuture<()>>,
+    /// A Local server's usage as its headroom probe last read it, at the given time; `None`
+    /// when the profile has no probe.
+    pub local_usage: LocalUsageFn,
 }
+
+/// [`CatalogServices::local_usage`].
+pub(crate) type LocalUsageFn =
+    Rc<dyn Fn(&Profile, i64) -> Option<agent_core::delegation::wire::UsageInfo>>;
 
 impl Default for CatalogServices {
     fn default() -> Self {
@@ -69,6 +76,7 @@ impl Default for CatalogServices {
             refresh_usage: Rc::new(|_: std::time::Duration| -> LocalFuture<()> {
                 Box::pin(std::future::ready(()))
             }),
+            local_usage: Rc::new(|_, _| None),
         }
     }
 }

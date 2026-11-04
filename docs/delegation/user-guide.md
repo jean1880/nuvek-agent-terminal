@@ -46,7 +46,11 @@ Run** (Ollama and LM Studio by default), `metered` for a vendor's agent or a gat
 free profile spends no quota, so it reports headroom `ok`, load 0 and no windows, and a
 parent should pick it first whenever one of its models' tags and tier fit the task; tags
 and tier still come before cost. A Local server joins delegation with its own **Available to
-Other Agents** switch, once its server lists a chat model.
+Other Agents** switch, once its server lists a chat model. A Local server with a **Headroom
+Probe** reports what the probe read instead, free or not: headroom `low` (load 1) while the
+server is busy, `ok` (load 0) otherwise, and `unknown` (load null) without a recent reading
+or when its latest probe failed,
+so a parent routes work to another agent while, say, a game holds the server's GPU.
 
 The Local agent (a model on your own server) can be a sub-agent and a parent. As a parent, a
 Local thread gets the same eight tools; they run without a card in every mode, and Agent
@@ -65,7 +69,9 @@ fullest window's share (`load`) and a headroom of ok, low, exhausted or unknown,
 parent can spread work across agents with room rather than default to its own. Pass
 `refresh: true` to read usage again first; each agent is read at most once a minute,
 and a signed-out agy never. The same usage, without any account details, is kept in
-`usage.json` in agent-terminal's cache folder for tools outside the app.
+`usage.json` in agent-terminal's cache folder for tools outside the app. Its `local` object
+lists each enabled Local server with a headroom probe by profile id: `headroom`, `load`, the
+last `value` read, `low_below`, `read_at` and `probe_failed` (never the probe's command).
 
 Children appear beside native workers in the worker dock. Select one to inspect its
 activity, transcript, messages, approvals and file changes. Its provider, requested

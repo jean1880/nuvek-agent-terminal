@@ -15,6 +15,7 @@ pub mod fsutil;
 pub mod git;
 pub mod github;
 pub mod handoff;
+pub mod headroom_probe;
 mod heal_tail;
 pub mod local_agent;
 pub mod local_instructions;

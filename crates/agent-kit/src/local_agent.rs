@@ -1182,24 +1182,37 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         let mut result = Ok(());
         let mut failure = None;
         // A reply that answered only in reasoning gets one nudge a turn: `nudge` is where its
-        // pair (that reply, then the nudge) sits while the one request that carries it runs.
+        // pair (that reply, then the nudge) sits while the one request that carries it runs,
+        // with that reasoning, which answers if the nudge's own request fails.
         let mut nudged = false;
-        let mut nudge: Option<usize> = None;
+        let mut nudge: Option<(usize, String)> = None;
         for step in 0..MAX_STEPS {
             let outcome = self.step(&model, commands, &mut usage);
-            if let Some(at) = nudge.take() {
+            let nudge_reasoning = nudge.take().map(|(at, reasoning)| {
                 self.drop_nudge(at);
-            }
+                reasoning
+            });
             match outcome {
                 Ok(StepEnd::Answered) => break,
                 Ok(StepEnd::ReasoningOnly(reasoning)) if !nudged && step + 1 < MAX_STEPS => {
                     nudged = true;
-                    nudge = Some(self.messages.len());
+                    nudge = Some((self.messages.len(), reasoning.clone()));
                     self.messages.push(ChatMessage {
                         reasoning_content: Some(self.safe_text(&reasoning)),
                         ..ChatMessage::new("assistant", "")
                     });
-                    self.messages.push(ChatMessage::new("user", ANSWER_NUDGE));
+                    // Part of this exchange, so planning never keeps it without what it follows.
+                    self.messages.push(ChatMessage {
+                        continues_exchange: true,
+                        ..ChatMessage::new("user", ANSWER_NUDGE)
+                    });
+                }
+                Err(StepError::Failed(_)) if nudge_reasoning.is_some() => {
+                    // The nudge's own request failed: the turn had its answer, in reasoning.
+                    if let Some(reasoning) = nudge_reasoning {
+                        self.answer_from_reasoning(&reasoning);
+                    }
+                    break;
                 }
                 Ok(StepEnd::ReasoningOnly(reasoning)) => {
                     self.answer_from_reasoning(&reasoning);
@@ -2271,6 +2284,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 && pair[0].content.is_empty()
                 && pair[0].tool_calls.is_empty()
                 && pair[1].role == "user"
+                && pair[1].continues_exchange
                 && pair[1].content == ANSWER_NUDGE
         });
         if pair {
@@ -5450,6 +5464,31 @@ mod tests {
             .unwrap()
             .iter()
             .any(|m| m["role"] == "assistant" && m["content"] == answer.as_str()));
+    }
+
+    /// The nudge's own request failing never fails a turn that had its answer: the first
+    /// reasoning answers, marked as such.
+    #[test]
+    fn a_failed_nudge_request_answers_with_the_reasoning() {
+        let work = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let script = Script::new(vec![
+            Ok(reasoning_only("The answer is 42")),
+            Err("The model server answered with HTTP 500: overloaded".into()),
+        ]);
+        let run = start(
+            args(work.path(), Mode::Ask),
+            script.clone(),
+            state.path().into(),
+        );
+        run.send(prompt("what is it?"));
+        let (events, ended) = until_completed(&run);
+        run.finish();
+        assert_eq!(ended, TurnState::Completed);
+        let answer = reply_text(&events);
+        assert!(answer.starts_with(REASONING_ANSWER_LEAD), "{answer}");
+        assert!(answer.ends_with("The answer is 42"), "{answer}");
+        assert_eq!(script.bodies().len(), 2);
     }
 
     #[test]

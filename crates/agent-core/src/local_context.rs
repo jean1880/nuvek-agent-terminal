@@ -419,11 +419,13 @@ impl ContextBudget {
     }
 }
 
+/// Where each exchange begins: at every user message but one the runner added inside a turn
+/// (`ChatMessage::continues_exchange`), which stays part of the exchange it follows.
 pub fn exchange_starts(messages: &[crate::local_agent::ChatMessage]) -> Vec<usize> {
     let mut starts: Vec<_> = messages
         .iter()
         .enumerate()
-        .filter_map(|(at, m)| (m.role == "user").then_some(at))
+        .filter_map(|(at, m)| (m.role == "user" && !m.continues_exchange).then_some(at))
         .collect();
     if !messages.is_empty() && starts.first() != Some(&0) {
         starts.insert(0, 0);
@@ -1088,6 +1090,59 @@ mod tests {
         assert!(plan_request("m", "system", &[], &history, &budget)
             .unwrap_err()
             .contains("current exchange"));
+    }
+
+    /// The runner's nudge belongs to the exchange it follows: under a tight budget the plan
+    /// keeps the prompt, its tool results and the reasoning-only reply with it, and drops only
+    /// older exchanges; never the nudge alone.
+    #[test]
+    fn a_nudge_is_planned_with_its_exchange_never_alone() {
+        let budget = ContextBudget::default();
+        let calls = assistant_calls(1, 10, 10);
+        let nudge = ChatMessage {
+            continues_exchange: true,
+            ..ChatMessage::new("user", "State your answer.")
+        };
+        let mut history = vec![
+            ChatMessage::new("user", "x".repeat(50_000)),
+            ChatMessage::new("assistant", "old"),
+            ChatMessage::new("user", "the real task"),
+            calls.clone(),
+            ChatMessage::tool_result(&calls.tool_calls[0].id, "what the tool found"),
+            ChatMessage {
+                reasoning_content: Some("the answer, thought through".into()),
+                ..ChatMessage::new("assistant", "")
+            },
+            nudge.clone(),
+        ];
+        assert_eq!(
+            exchange_starts(&history),
+            [0, 2],
+            "the nudge starts no exchange"
+        );
+        let plan = plan_request("m", "system", &[], &history, &budget).unwrap();
+        assert_eq!(
+            plan.history_start, 2,
+            "the older exchange goes, this one stays whole"
+        );
+        let sent: Vec<_> = plan.body["messages"].as_array().unwrap().clone();
+        assert_eq!(
+            sent.len(),
+            6,
+            "system and the five messages of this exchange"
+        );
+        assert_eq!(sent[1]["content"], "the real task");
+        assert_eq!(sent[3]["content"], "what the tool found");
+        assert_eq!(sent[5]["content"], "State your answer.");
+        assert!(sent[5].get("continues_exchange").is_none(), "never sent");
+        // Too large with it: the turn fails rather than send the nudge without its exchange.
+        history[2].content = "é".repeat(50_000);
+        assert!(plan_request("m", "system", &[], &history, &budget)
+            .unwrap_err()
+            .contains("current exchange"));
+        // Never kept on disk either: read back, it is an ordinary message.
+        let saved = serde_json::to_string(&nudge).unwrap();
+        assert!(!saved.contains("continues_exchange"));
     }
 
     #[test]

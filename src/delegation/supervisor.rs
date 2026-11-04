@@ -936,6 +936,23 @@ mod tests {
             stop(&sup).await;
         });
     }
+    /// A run is timed from its start, and its end's journal record is written once: the first
+    /// ending takes its start, so a later one (a turn ending after a failure) writes nothing.
+    #[test]
+    fn a_delegated_run_is_timed_from_its_start_and_recorded_once() {
+        in_context(async {
+            let (_dir, sup, root) = harness();
+            let mut request = spawn_request("run-record");
+            request.task = "hold".into();
+            let receipt = sup.spawn_worker(&root, request).await.unwrap();
+            let worker = spawned(&receipt);
+            let run = RunId::parse(receipt["run_id"].as_str().unwrap()).unwrap();
+            assert!(sup.state.borrow().run_started.contains_key(&run));
+            sup.fail_worker(&worker, error(ErrorCode::InternalError, "test end"));
+            assert!(!sup.state.borrow().run_started.contains_key(&run));
+            stop(&sup).await;
+        });
+    }
     #[test]
     fn secret_model_is_rejected_before_acceptance_or_provider_launch() {
         in_context(async {
@@ -2380,6 +2397,9 @@ pub(super) struct Runtime {
     pub roots: HashMap<WorkerId, RootRt>,
     pub threads: HashMap<String, WorkerId>,
     pub workers: HashMap<WorkerId, WorkerRt>,
+    /// When each open delegated run started, for its end's journal record (`run_log`). Taken
+    /// out by the first ending seen, so a run is recorded once however many ways it ends.
+    pub run_started: HashMap<RunId, Instant>,
     pub connections: HashMap<ConnId, WorkerId>,
     pub dispatching: HashSet<OperationId>,
     pub waits: HashMap<(ConnId, u64), WorkerId>,
@@ -2468,6 +2488,41 @@ pub(super) fn opted_in(p: &Profile) -> bool {
 }
 
 impl Supervisor {
+    /// Marks `run` of a delegated worker as started now, for its end's journal record.
+    pub(super) fn note_run_started(&self, run: &RunId) {
+        self.state
+            .borrow_mut()
+            .run_started
+            .insert(run.clone(), Instant::now());
+    }
+
+    /// Writes the journal record of `worker`'s `run`, which ended as `outcome` with `usage` and
+    /// `result`: once per run (the first ending seen wins), and only for a delegated worker.
+    pub(super) fn log_run_end(
+        &self,
+        worker: &WorkerId,
+        run: &RunId,
+        outcome: agent_core::delegation::lifecycle::RunState,
+        usage: Option<&agent_core::event::Usage>,
+        result: Option<&str>,
+    ) {
+        let fields = {
+            let mut state = self.state.borrow_mut();
+            let Some(started) = state.run_started.remove(run) else {
+                return;
+            };
+            let Some(w) = state
+                .workers
+                .get(worker)
+                .filter(|w| w.row.parent_id.is_some())
+            else {
+                return;
+            };
+            super::run_log::fields(&w.row, outcome, Some(started.elapsed()), usage, result)
+        };
+        super::run_log::log(&fields);
+    }
+
     pub(crate) fn root_transfer_stop(self: &Rc<Self>, thread: &str) -> Vec<ChildStop> {
         let children = self.root_closing(thread);
         let data = {

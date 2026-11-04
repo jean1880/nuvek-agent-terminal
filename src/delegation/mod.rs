@@ -21,6 +21,7 @@ mod ops;
 mod publish;
 mod readback;
 mod reconcile;
+mod run_log;
 mod rundir;
 pub(crate) mod services;
 mod show_image;

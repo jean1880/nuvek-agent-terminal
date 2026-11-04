@@ -322,6 +322,7 @@ impl Supervisor {
         if let Some(w) = self.state.borrow_mut().workers.get_mut(&entry.worker) {
             w.run = Some(run.clone());
         }
+        self.note_run_started(&run);
         Ok(Some(run))
     }
     async fn deliver(self: &Rc<Self>, mut entry: Delivery) {

@@ -227,6 +227,13 @@ impl Publisher {
             if let (Event::TurnCompleted { state, usage, .. }, Some(run)) = (&env.event, &scope.run)
             {
                 let (text, cut) = take_result(&mut self.result.borrow_mut());
+                sup.log_run_end(
+                    &self.worker,
+                    run,
+                    agent_core::delegation::lifecycle::run_state_after(*state),
+                    usage.as_ref(),
+                    Some(&text),
+                );
                 let (parts, wake) = result_messages(&sup, &text, cut);
                 wake_text = Some(wake);
                 Some(Completion {
@@ -770,6 +777,16 @@ impl Supervisor {
             (run, w.row.last_activity.clone())
         };
         let result = end.result.or(activity);
+        self.log_run_end(
+            worker,
+            &run,
+            agent_core::delegation::lifecycle::run_state_after(state),
+            usage
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<agent_core::event::Usage>(json).ok())
+                .as_ref(),
+            result.as_deref(),
+        );
         self.state
             .borrow_mut()
             .controls

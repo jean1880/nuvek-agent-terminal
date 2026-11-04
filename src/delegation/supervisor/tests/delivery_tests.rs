@@ -861,6 +861,55 @@ fn a_targets_own_exit_during_preparation_fails_the_delivery() {
     });
 }
 
+/// A follow-up whose delivery fails after it reserved its run ends that run in memory, and its
+/// end's journal record takes the run's start time (none is left behind). The store's side of
+/// that end is not exercised here: this operation was never stored.
+#[test]
+fn an_undelivered_follow_up_ends_its_run_failed_and_records_it() {
+    in_context(async {
+        let (_dir, sup, root) = harness();
+        let worker = spawn_idle(&sup, &root, "undelivered").await;
+        assert!(
+            sup.state.borrow().run_started.is_empty(),
+            "the task's run ended"
+        );
+        let entry = crate::delegation::deferred::Delivery {
+            worker: worker.clone(),
+            input: crate::delegation::seam::DelegatedInput {
+                operation: OperationId::from_suffix(&"6".repeat(32)).unwrap(),
+                epoch: sup.epoch(&root).unwrap(),
+                source: crate::delegation::seam::InputSource::Message {
+                    id: MessageId::from_suffix(&"6".repeat(32)).unwrap(),
+                    kind: agent_core::delegation::mailbox::MessageKind::Instruction,
+                },
+                from: root.clone(),
+                from_label: "root".into(),
+                text: "later".into(),
+                plan: agent_core::delegation::mailbox::DeliveryPlan::StartTurn,
+                tag: "undelivered".into(),
+            },
+            policy: Delivery::NextTurn,
+            reserved: true,
+        };
+        let run = sup
+            .reserve_run(&entry)
+            .await
+            .expect("reserved")
+            .expect("a fresh run");
+        assert!(sup.state.borrow().run_started.contains_key(&run));
+        sup.fail_reserved_delivery(&entry, run.clone());
+        {
+            let state = sup.state.borrow();
+            assert!(state.workers[&worker].run.is_none());
+            assert!(
+                !state.run_started.contains_key(&run),
+                "its start was taken by its record"
+            );
+        }
+        stop(&sup).await;
+    });
+}
+
 /// A cancel that finds the task still pending (its child at its startup check) ends the run
 /// through the one completion, and the child is stopped only after that end committed: the
 /// run is interrupted with its reason, the task's dispatch failed, the parent told, and the

@@ -4,6 +4,11 @@
 //! large its result was. Never the task, the result's text, a path or a credential: only names
 //! the app chose, sizes and counts. A model name passes through the redaction every persisted
 //! text takes, and is cut to a bounded length.
+//!
+//! The record is written when the supervisor ends the run in memory, before the store commits
+//! that end, and the first ending seen wins. In a rare race (two endings, the store keeping the
+//! one written first by its writer, or a commit that fails) the record's outcome can disagree
+//! with the store's; the store is the authority.
 
 use std::time::Duration;
 

@@ -198,8 +198,12 @@ to add a server; add as many as you like. Each server has:
   `refresh`), off the main thread. It is run directly, never through a shell: the command's
   words are split on spaces (put a command whose arguments hold spaces in a small script), and
   it gets only `PATH`, `HOME`, `USER`, `LANG`, `LC_ALL`, `TMPDIR` and `XDG_RUNTIME_DIR` from
-  the app's environment. Its time limit is `timeout_s` in the profile, 5 seconds by default
-  (1 to 30). Both fields are needed: until both are valid, nothing is saved. For example:
+  the app's environment. `SSH_AUTH_SOCK` is not passed, so a probe that needs an SSH agent
+  (say, one reading another machine over `ssh`) gets no reading and reports `unknown`; use a
+  key it can read without an agent. It runs in a process group of its own: at its time limit
+  (`timeout_s` in the profile, 5 seconds by default, 1 to 30), and once it exits, the whole
+  group is ended, so nothing it starts outlives it. Output past 4 KiB ends it with no reading.
+  Both fields are needed: until both are valid, nothing is saved. For example:
 
   ```json
   "headroom_probe": {

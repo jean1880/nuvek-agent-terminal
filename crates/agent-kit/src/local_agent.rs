@@ -1181,9 +1181,30 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         let mut usage = Usage::default();
         let mut result = Ok(());
         let mut failure = None;
+        // A reply that answered only in reasoning gets one nudge a turn: `nudge` is where its
+        // pair (that reply, then the nudge) sits while the one request that carries it runs.
+        let mut nudged = false;
+        let mut nudge: Option<usize> = None;
         for step in 0..MAX_STEPS {
-            match self.step(&model, commands, &mut usage) {
+            let outcome = self.step(&model, commands, &mut usage);
+            if let Some(at) = nudge.take() {
+                self.drop_nudge(at);
+            }
+            match outcome {
                 Ok(StepEnd::Answered) => break,
+                Ok(StepEnd::ReasoningOnly(reasoning)) if !nudged && step + 1 < MAX_STEPS => {
+                    nudged = true;
+                    nudge = Some(self.messages.len());
+                    self.messages.push(ChatMessage {
+                        reasoning_content: Some(self.safe_text(&reasoning)),
+                        ..ChatMessage::new("assistant", "")
+                    });
+                    self.messages.push(ChatMessage::new("user", ANSWER_NUDGE));
+                }
+                Ok(StepEnd::ReasoningOnly(reasoning)) => {
+                    self.answer_from_reasoning(&reasoning);
+                    break;
+                }
                 Ok(StepEnd::Continue) if step + 1 == MAX_STEPS => {
                     failure = Some(format!(
                         "Stopped after {MAX_STEPS} model requests in one turn."
@@ -1475,9 +1496,9 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         let runnable = stopped.is_none() && complete;
         // What arrived before an interrupt is kept, so the next turn knows it was said; calls
         // only when they will each get an answer below. A reply whose calls are dropped and that
-        // said nothing leaves no message.
+        // said nothing (blank text included) leaves no message.
         let calls = runnable && !reply.tool_calls.is_empty();
-        if !reply.text.is_empty() || calls {
+        if !reply.text.trim().is_empty() || calls {
             self.messages.push(ChatMessage {
                 tool_calls: if calls {
                     reply
@@ -1509,6 +1530,9 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             ));
         }
         if reply.tool_calls.is_empty() {
+            if runnable && reply.text.trim().is_empty() && !reply.reasoning.trim().is_empty() {
+                return Ok(StepEnd::ReasoningOnly(reply.reasoning));
+            }
             return Ok(StepEnd::Answered);
         }
         let schemas = if self.no_tools {
@@ -2239,6 +2263,44 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         self.masks.scrub(text)
     }
 
+    /// Takes the reasoning-only reply and the nudge after it out of the conversation once the
+    /// request that carried them is answered: what follows them stays, so the exchange is whole.
+    fn drop_nudge(&mut self, at: usize) {
+        let pair = self.messages.get(at..at + 2).is_some_and(|pair| {
+            pair[0].role == "assistant"
+                && pair[0].content.is_empty()
+                && pair[0].tool_calls.is_empty()
+                && pair[1].role == "user"
+                && pair[1].content == ANSWER_NUDGE
+        });
+        if pair {
+            self.messages.drain(at..at + 2);
+        }
+    }
+
+    /// Ends a turn whose model, nudged once, still answered only in reasoning: the reasoning
+    /// becomes the reply, opened by a line that says so, masked as any reply is.
+    fn answer_from_reasoning(&mut self, reasoning: &str) {
+        let text = self.safe_text(&format!("{REASONING_ANSWER_LEAD}\n\n{}", reasoning.trim()));
+        let id = self.id("assistant");
+        self.emit(Envelope::item_started(
+            &id,
+            ItemKind::AssistantMessage,
+            "assistant",
+            None,
+            None,
+        ));
+        self.emit(Envelope::delta(&id, StreamKind::Assistant, text.clone()));
+        self.emit(Envelope::snapshot(&id, StreamKind::Assistant, text.clone()));
+        self.emit(Envelope::item_completed(
+            id,
+            ItemStatus::Completed,
+            None,
+            None,
+        ));
+        self.messages.push(ChatMessage::new("assistant", text));
+    }
+
     fn poll_mcp(&mut self, commands: &Receiver<RunnerInput>, active: bool) -> Option<Stop> {
         let (stop, narrowed) = self.poll_commands_narrowing(commands);
         if active && narrowed && stop.is_none() {
@@ -2653,7 +2715,19 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
 enum StepEnd {
     Answered,
     Continue,
+    /// A whole reply with no calls and no text whose answer is only in its reasoning (some
+    /// thinking models end that way): the reasoning, as the server sent it.
+    ReasoningOnly(String),
 }
+
+/// What the runner asks, once a turn, of a model whose whole reply was reasoning: the answer
+/// as reply text. Sent with that one request only, never kept in the conversation.
+const ANSWER_NUDGE: &str = "You ended your turn with reasoning only and no reply. State your \
+                            final answer now as plain reply text.";
+
+/// The line that opens an answer taken from reasoning, so the reader knows what it is.
+const REASONING_ANSWER_LEAD: &str =
+    "[The model gave its answer only as reasoning; it is shown here as the reply.]";
 enum McpAnswer {
     Disconnected,
     Allowed,
@@ -5254,6 +5328,204 @@ mod tests {
         assert!(with_calls(&bodies[2]).get("reasoning_content").is_none());
         let saved = std::fs::read_to_string(state.path().join("s-1.json")).unwrap();
         assert!(!saved.contains("I should read it"), "never kept on disk");
+    }
+
+    /// A whole reply that is reasoning only: no text, no call.
+    fn reasoning_only(thought: &str) -> Vec<String> {
+        vec![
+            format!(
+                r#"data: {{"choices":[{{"delta":{{"reasoning":{}}}}}]}}"#,
+                json!(thought)
+            ),
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#.into(),
+            "data: [DONE]".into(),
+        ]
+    }
+
+    /// Every event up to the turn's end, and how it ended.
+    fn until_completed(run: &Run) -> (Vec<Envelope>, TurnState) {
+        let mut seen = Vec::new();
+        let state = run.wait_for(|e| {
+            seen.push(e.clone());
+            completed(e).map(|(state, _, _)| state)
+        });
+        (seen, state)
+    }
+
+    /// The reply text the turn's events carry, as the delegation result reads it.
+    fn reply_text(events: &[Envelope]) -> String {
+        events
+            .iter()
+            .filter_map(|e| match &e.event {
+                Event::ContentSnapshot {
+                    stream: StreamKind::Assistant,
+                    text,
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn holds_nudge(body: &Value) -> bool {
+        body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["content"] == ANSWER_NUDGE)
+    }
+
+    #[test]
+    fn a_reply_only_in_reasoning_is_nudged_once_for_its_answer() {
+        let work = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let script = Script::new(vec![
+            Ok(reasoning_only("The answer is 42")),
+            Ok(text(&["42"])),
+            Ok(text(&["Later"])),
+        ]);
+        let run = start(
+            args(work.path(), Mode::Ask),
+            script.clone(),
+            state.path().into(),
+        );
+        run.send(prompt("what is it?"));
+        let (events, ended) = until_completed(&run);
+        assert_eq!(ended, TurnState::Completed);
+        assert_eq!(reply_text(&events), "42");
+        run.send(prompt("and now?"));
+        run.wait_for(completed);
+        run.finish();
+        let bodies = script.bodies();
+        assert_eq!(bodies.len(), 3);
+        let nudged = bodies[1]["messages"].as_array().unwrap();
+        let last = nudged.len() - 1;
+        assert_eq!(nudged[last]["role"], "user");
+        assert_eq!(nudged[last]["content"], ANSWER_NUDGE);
+        assert_eq!(nudged[last - 1]["role"], "assistant");
+        assert_eq!(nudged[last - 1]["reasoning_content"], "The answer is 42");
+        assert!(bodies[1].get("tools").is_some(), "tools are still offered");
+        // The nudge went with that one request: the conversation keeps the answer, not it.
+        assert!(!holds_nudge(&bodies[2]));
+        let later = bodies[2]["messages"].as_array().unwrap();
+        let roles: Vec<_> = later
+            .iter()
+            .filter(|m| m["role"] != "system")
+            .map(|m| m["role"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "user"]);
+        assert!(later.iter().any(|m| m["content"] == "42"));
+        let saved = std::fs::read_to_string(state.path().join("s-1.json")).unwrap();
+        assert!(!saved.contains(ANSWER_NUDGE), "{saved}");
+    }
+
+    #[test]
+    fn a_nudged_reply_again_only_in_reasoning_is_the_answer_marked_as_such() {
+        let work = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let script = Script::new(vec![
+            Ok(reasoning_only("Thinking it over")),
+            Ok(reasoning_only("The answer is 42")),
+            Ok(text(&["Later"])),
+        ]);
+        let run = start(
+            args(work.path(), Mode::Ask),
+            script.clone(),
+            state.path().into(),
+        );
+        run.send(prompt("what is it?"));
+        let (events, ended) = until_completed(&run);
+        assert_eq!(ended, TurnState::Completed);
+        let answer = reply_text(&events);
+        assert!(answer.starts_with(REASONING_ANSWER_LEAD), "{answer}");
+        assert!(answer.ends_with("The answer is 42"), "{answer}");
+        assert!(!answer.contains("Thinking it over"), "{answer}");
+        run.send(prompt("and now?"));
+        run.wait_for(completed);
+        run.finish();
+        let bodies = script.bodies();
+        assert_eq!(bodies.len(), 3, "never nudged more than once a turn");
+        assert!(!holds_nudge(&bodies[2]));
+        assert!(bodies[2]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["role"] == "assistant" && m["content"] == answer.as_str()));
+    }
+
+    #[test]
+    fn a_reply_with_text_is_never_nudged() {
+        let work = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut thought_then_said =
+            vec![r#"data: {"choices":[{"delta":{"reasoning":"Easy"}}]}"#.to_owned()];
+        thought_then_said.extend(text(&["Hi"]));
+        let script = Script::new(vec![Ok(thought_then_said), Ok(text(&["Plain"]))]);
+        let run = start(
+            args(work.path(), Mode::Ask),
+            script.clone(),
+            state.path().into(),
+        );
+        run.send(prompt("hello"));
+        let (events, ended) = until_completed(&run);
+        assert_eq!(ended, TurnState::Completed);
+        assert_eq!(reply_text(&events), "Hi");
+        assert_eq!(script.bodies().len(), 1);
+        run.send(prompt("again"));
+        let (events, _) = until_completed(&run);
+        assert_eq!(reply_text(&events), "Plain");
+        run.finish();
+        assert_eq!(script.bodies().len(), 2);
+        assert!(!script.bodies().iter().any(holds_nudge));
+    }
+
+    #[test]
+    fn a_stop_during_the_nudge_ends_the_turn_and_keeps_no_nudge() {
+        let work = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let silent = vec![
+            r#"data: {"choices":[{"delta":{"reasoning":"Still thinking"}}]}"#.to_owned(),
+            STALL_MARK.to_owned(),
+        ];
+        let script = Script::new(vec![
+            Ok(reasoning_only("Thinking it over")),
+            Ok(silent),
+            Ok(text(&["Next"])),
+        ]);
+        let run = start(
+            args(work.path(), Mode::Ask),
+            script.clone(),
+            state.path().into(),
+        );
+        run.send(prompt("go"));
+        let mut reasoning_items = 0;
+        run.wait_for(|e| {
+            if matches!(
+                e.event,
+                Event::ItemStarted {
+                    kind: ItemKind::Reasoning,
+                    ..
+                }
+            ) {
+                reasoning_items += 1;
+            }
+            (reasoning_items == 2).then_some(())
+        });
+        run.send(Command::Interrupt);
+        let (events, ended) = until_completed(&run);
+        assert_eq!(ended, TurnState::Interrupted);
+        assert_eq!(reply_text(&events), "");
+        run.send(prompt("again"));
+        run.wait_for(completed);
+        run.finish();
+        let bodies = script.bodies();
+        assert_eq!(bodies.len(), 3);
+        assert!(holds_nudge(&bodies[1]));
+        assert!(!holds_nudge(&bodies[2]));
+        assert!(bodies[2]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["role"] != "assistant"));
     }
 
     #[test]

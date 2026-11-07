@@ -3699,8 +3699,7 @@ impl Inner {
     /// What stops [`Self::suspend`] now, if anything (the first reason found). The process can
     /// be stopped and resumed later with nothing lost only when it is alive, has a conversation
     /// to resume (a native id, and a turn on it or a resumed start), and holds no work,
-    /// question or state that lives only in the process or in flight. Never dangerous permissive
-    /// mode (session-only: a resume would not re-enter it), and never with session grants
+    /// question or state that lives only in the process or in flight. Never with session grants
     /// Codex's own process holds (they would end unannounced). `worker`: the supervisor pausing
     /// one of its delegated workers, the only way one is ever suspended (a thread's idle sweep
     /// never stops a worker; the supervisor never stops anything else this way).
@@ -3710,7 +3709,6 @@ impl Inner {
             (worker && self.child.is_none(), "not a delegated worker"),
             (!state.alive, "not running"),
             (state.running_turn, "a turn is running"),
-            (state.mode == Mode::Bypass, "dangerous permissive mode"),
             (state.native_id.is_none(), "no session id to resume"),
             (
                 !self.has_conversation.get(),
@@ -8573,7 +8571,7 @@ mod tests {
     }
 
     /// Suspension waits for anything a stopped process would lose: no session id yet, a turn
-    /// running, dangerous permissive mode (session-only), a delegated worker's process.
+    /// running, an active provider worker, a delegated worker's process.
     #[test]
     fn a_session_with_anything_going_on_is_not_suspended() {
         in_loop(|ctx| {
@@ -8653,13 +8651,14 @@ mod tests {
             );
             session.inner.state.borrow_mut().mode = Mode::Bypass;
             assert!(
-                !session.suspend_if_idle(),
-                "Bypass would not survive a resume"
+                session.suspend_if_idle(),
+                "an idle Bypass session suspends to save memory"
             );
+            assert!(!session.status().alive);
             session.inner.state.borrow_mut().mode = Mode::Ask;
             session.send_prompt("a turn that never ends");
             assert!(!session.suspend_if_idle(), "a turn is running");
-            assert!(session.status().alive, "refusals stop nothing");
+            assert!(session.status().alive, "prompt resumed it");
         });
     }
 

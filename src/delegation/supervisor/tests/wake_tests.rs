@@ -549,3 +549,26 @@ fn a_root_in_dangerous_permissive_mode_is_woken_with_its_childs_result() {
         stop(&sup).await;
     });
 }
+
+/// An unattended (dangerous permissive) root lends its children Accept edits, so an overnight
+/// run can start workers that write inside their leases; leaving Bypass for Ask takes it back.
+#[test]
+fn a_root_in_dangerous_permissive_mode_may_start_accept_edits_workers() {
+    use agent_core::delegation::authority::permits;
+    in_context(async {
+        let (dir, sup, root) = harness();
+        let r = root_session(&sup, dir.path(), &root).await;
+        r.session.confirm_mode(Mode::Bypass);
+        let lent = sup.principal_mode(&root);
+        assert_eq!(
+            lent,
+            Mode::AcceptEdits,
+            "Bypass lends Accept edits, never itself"
+        );
+        assert!(permits(lent, TaskMode::AcceptEdits));
+        r.session.confirm_mode(Mode::Ask);
+        assert!(!permits(sup.principal_mode(&root), TaskMode::AcceptEdits));
+        r.session.shutdown(false);
+        stop(&sup).await;
+    });
+}

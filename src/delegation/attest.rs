@@ -460,7 +460,7 @@ impl DelegationHooks for Hooks {
                 return;
             };
             let old = w.mode;
-            w.mode = effective.session_safe();
+            w.mode = effective.delegation_safe();
             if w.row.parent_id.is_none()
                 && ceiling(old).iter().any(|m| !ceiling(w.mode).contains(m))
             {

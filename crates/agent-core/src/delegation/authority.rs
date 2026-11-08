@@ -123,12 +123,13 @@ const CEILING_ACCEPT_EDITS: [TaskMode; 3] = [TaskMode::AcceptEdits, TaskMode::As
 const CEILING_ASK: [TaskMode; 2] = [TaskMode::Ask, TaskMode::Plan];
 const CEILING_PLAN: [TaskMode; 1] = [TaskMode::Plan];
 
-/// Mode ceiling, applied to the principal's mode after
-/// [`Mode::session_safe`] (Bypass never propagates: it counts as Ask).
+/// Mode ceiling, applied to the principal's mode after [`Mode::delegation_safe`]: an
+/// unattended Bypass session may start Accept edits children, but Bypass itself never
+/// propagates (a child's mode is fixed at its task mode).
 pub fn ceiling(principal_mode: Mode) -> &'static [TaskMode] {
-    match principal_mode.session_safe() {
-        Mode::AcceptEdits => &CEILING_ACCEPT_EDITS,
-        Mode::Ask | Mode::Bypass => &CEILING_ASK,
+    match principal_mode.delegation_safe() {
+        Mode::AcceptEdits | Mode::Bypass => &CEILING_ACCEPT_EDITS,
+        Mode::Ask => &CEILING_ASK,
         Mode::Plan => &CEILING_PLAN,
     }
 }
@@ -205,12 +206,13 @@ pub struct InheritedAuthority {
     pub workspace: WorkspaceScope,
 }
 
-/// How permissive a mode is: Plan < Ask < AcceptEdits (Bypass counts as Ask).
+/// How permissive a mode is as a delegation ceiling: Plan < Ask < AcceptEdits (Bypass lends
+/// AcceptEdits, see [`Mode::delegation_safe`]).
 fn rank(mode: Mode) -> u8 {
-    match mode.session_safe() {
+    match mode.delegation_safe() {
         Mode::Plan => 0,
-        Mode::Ask | Mode::Bypass => 1,
-        Mode::AcceptEdits => 2,
+        Mode::Ask => 1,
+        Mode::AcceptEdits | Mode::Bypass => 2,
     }
 }
 
@@ -245,8 +247,8 @@ impl InheritedAuthority {
     /// The same authority with its ceiling narrowed to `mode` if that is narrower. Never
     /// widens, and never yields Bypass.
     pub fn narrow(&self, mode: Mode) -> InheritedAuthority {
-        let current = self.mode_ceiling.session_safe();
-        let proposed = mode.session_safe();
+        let current = self.mode_ceiling.delegation_safe();
+        let proposed = mode.delegation_safe();
         let mut out = self.clone();
         out.mode_ceiling = if rank(proposed) < rank(current) {
             proposed
@@ -547,7 +549,7 @@ mod tests {
             &[TaskMode::AcceptEdits, TaskMode::Ask, TaskMode::Plan]
         );
         assert_eq!(ceiling(Mode::Ask), &[TaskMode::Ask, TaskMode::Plan]);
-        assert_eq!(ceiling(Mode::Bypass), ceiling(Mode::Ask));
+        assert_eq!(ceiling(Mode::Bypass), ceiling(Mode::AcceptEdits));
         assert_eq!(ceiling(Mode::Plan), &[TaskMode::Plan]);
     }
 
@@ -556,9 +558,9 @@ mod tests {
         for m in MODES {
             for t in TaskMode::ALL {
                 let expected = match (m, t) {
-                    (Mode::AcceptEdits, _) => true,
-                    (Mode::Ask | Mode::Bypass, TaskMode::AcceptEdits) => false,
-                    (Mode::Ask | Mode::Bypass, _) => true,
+                    (Mode::AcceptEdits | Mode::Bypass, _) => true,
+                    (Mode::Ask, TaskMode::AcceptEdits) => false,
+                    (Mode::Ask, _) => true,
                     (Mode::Plan, TaskMode::Plan) => true,
                     (Mode::Plan, _) => false,
                 };

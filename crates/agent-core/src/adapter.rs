@@ -183,6 +183,17 @@ impl Mode {
         }
     }
 
+    /// The authority a session lends the agents it starts: [`Mode::Bypass`] lends
+    /// [`Mode::AcceptEdits`], so an unattended run's children can edit inside their worktree
+    /// leases without anyone there to approve them, while no child ever runs in Bypass itself.
+    /// Everything else is kept.
+    pub fn delegation_safe(self) -> Mode {
+        match self {
+            Mode::Bypass => Mode::AcceptEdits,
+            other => other,
+        }
+    }
+
     /// The mode's name as the user reads it in a picker or a notice.
     pub fn label(self) -> &'static str {
         match self {
@@ -203,6 +214,14 @@ mod mode_tests {
         assert_eq!(Mode::Bypass.session_safe(), Mode::Ask);
         for m in [Mode::Ask, Mode::AcceptEdits, Mode::Plan] {
             assert_eq!(m.session_safe(), m);
+        }
+    }
+
+    #[test]
+    fn bypass_lends_its_children_accept_edits_and_never_itself() {
+        assert_eq!(Mode::Bypass.delegation_safe(), Mode::AcceptEdits);
+        for m in [Mode::Ask, Mode::AcceptEdits, Mode::Plan] {
+            assert_eq!(m.delegation_safe(), m);
         }
     }
 

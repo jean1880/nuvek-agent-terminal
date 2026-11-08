@@ -1228,8 +1228,13 @@ mod tests {
         f.live.set(fixed_live(true, false, Mode::Ask));
         assert!(is_deny(&gate.judge("Edit", &edit, None)));
         assert!(!gate.rule_may_apply(&Action::Edit { path: file.clone() }, None));
-        // Bypass never propagates: it is Ask.
+        // An unattended Bypass parent lends Accept edits: the child edits inside its lease again,
+        // still through its own gate (never Bypass itself).
         f.live.set(fixed_live(true, false, Mode::Bypass));
+        assert_eq!(gate.judge("Edit", &edit, None), GateVerdict::Defer);
+        assert!(gate.rule_may_apply(&Action::Edit { path: file.clone() }, None));
+        // Back to Ask: outside the ceiling once more.
+        f.live.set(fixed_live(true, false, Mode::Ask));
         assert!(is_deny(&gate.judge("Edit", &edit, None)));
         // An ask child stays inside Ask's ceiling, but not Plan's.
         let ask = f.gate(Driver::Claude, TaskMode::Ask);

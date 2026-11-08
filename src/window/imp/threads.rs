@@ -1121,7 +1121,7 @@ impl ChatBackend for SessionSlot {
     }
     fn set_mode(&self, mode: Mode) {
         if let Some(s) = self.get() {
-            let next = agent_core::delegation::authority::ceiling(mode.session_safe());
+            let next = agent_core::delegation::authority::ceiling(mode);
             if agent_core::delegation::authority::ceiling(s.effective_mode())
                 .iter()
                 .any(|task_mode| !next.contains(task_mode))

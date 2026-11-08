@@ -3153,7 +3153,7 @@ impl Supervisor {
             if let Some(w) = state.workers.get_mut(&id) {
                 w.root_session = session;
                 if let Some(s) = w.root_session.upgrade() {
-                    w.mode = s.effective_mode().session_safe();
+                    w.mode = s.effective_mode().delegation_safe();
                 }
             }
             id
@@ -3797,7 +3797,7 @@ impl Supervisor {
             .map(|w| {
                 w.session()
                     .map_or(w.mode, |s| s.effective_mode())
-                    .session_safe()
+                    .delegation_safe()
             })
             .unwrap_or(Mode::Plan)
     }

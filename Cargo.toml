@@ -25,7 +25,7 @@ members = ["crates/*"]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"
-rmcp = { version = "=3.8.0", default-features = false }
+rmcp = { version = "=3.9.0", default-features = false }
 tokio = { version = "1", default-features = false }
 # Markdown for assistant messages, and the reply-question reader in agent-core. Default
 # features off: no HTML renderer, no getopts binary.

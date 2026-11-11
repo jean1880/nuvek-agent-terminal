@@ -127,8 +127,8 @@ fn native_header_agent_chip_stays_pill_shaped() {
 
     // Zooming up and back to 1.0 must release the scaled header height as well.
     view.set_text_scale(1.6);
-    let _scaled = pill_bounds(1100);
-    assert!(inner.header.bin.height() > steady_bin_h);
+    let scaled = pill_bounds(1100);
+    assert!(scaled.height() > base_h);
     view.set_text_scale(1.0);
     let reset_wide = pill_bounds(1100);
     assert!(

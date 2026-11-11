@@ -353,18 +353,35 @@ pub(super) fn switch(
     serial.set(chosen);
     let armed = session.continue_after_switch_armed();
     glib::MainContext::default().spawn_local(async move {
+        super::resolve_agent(profile.clone()).await;
+
         let problem = supervisor.agy_root_problem(&profile, driver).await;
-        if serial.get() != chosen
-            || !supervisor
-                .prepare_root_switch(&thread, &profile, driver, problem.is_none())
-                .await
-            || serial.get() != chosen
-        {
-            // This switch never reaches the session: a "Continue in" asked for it goes with it,
-            // never one asked for a later pick.
+        if serial.get() != chosen {
             if let Some(armed) = armed {
                 session.forget_continue_after_switch(Some(armed));
             }
+            return;
+        }
+        if !supervisor
+            .prepare_root_switch(&thread, &profile, driver, problem.is_none())
+            .await
+        {
+            tracing::warn!(thread = %thread, agent = ?driver, "failed to prepare root switch");
+            session.note(format!(
+                "Could not switch to {}: root switch preparation failed",
+                driver.info().label
+            ));
+            if let Some(armed) = armed {
+                session.forget_continue_after_switch(Some(armed));
+            }
+            session.rebind_start();
+            return;
+        }
+        if serial.get() != chosen {
+            if let Some(armed) = armed {
+                session.forget_continue_after_switch(Some(armed));
+            }
+            session.rebind_start();
             return;
         }
         go(&session, model, effort, target);

@@ -1263,6 +1263,64 @@ mod tests {
         });
     }
     #[test]
+    fn switching_to_agy_from_another_driver_does_not_require_prior_agy_launch_facts() {
+        in_context(async {
+            let (dir, sup, root) = harness();
+            configure_agy(&sup, dir.path());
+            let thread = sup.state.borrow().roots[&root].row.root_thread_id.clone();
+            let profile = (sup.services.profiles)().remove(0);
+            let resolved = (sup.services.resolve)(&profile).unwrap();
+            let hooks = sup
+                .prepare_root(&thread, &profile, Driver::Claude)
+                .await
+                .unwrap();
+            let provider = sup
+                .services
+                .handle
+                .reader()
+                .add_provider_thread(&thread, "claude", "default")
+                .unwrap();
+            let open = agent_core::adapter::OpenSession {
+                program: resolved.program.clone(),
+                extra_args: resolved.extra_args,
+                cwd: dir.path().to_string_lossy().into_owned(),
+                model: None,
+                effort: None,
+                mode: Mode::Plan,
+                resume: None,
+                new_session_id: None,
+                approval_hook: false,
+                delegation: None,
+            };
+            let session = ChatSession::with_options(
+                Box::new(agent_core::claude::ClaudeAdapter::new()),
+                open,
+                crate::chat::session::SessionStore {
+                    handle: sup.services.handle.clone(),
+                    provider: Some(Some(provider)),
+                },
+                thread.clone(),
+                Rc::new(|_| {}),
+                Err(None),
+                resolved.env,
+                super::super::seam::SessionOptions {
+                    generation_base: sup.root_generation_base(&thread),
+                    hooks: Some(hooks),
+                    child: None,
+                },
+            );
+            sup.attach_root_session(&thread, Rc::downgrade(&session));
+            let prepared = sup
+                .prepare_root_switch(&thread, &profile, Driver::Agy, true)
+                .await;
+            assert!(
+                prepared,
+                "root switch to Agy must succeed when prior session was another driver"
+            );
+            stop(&sup).await;
+        });
+    }
+    #[test]
     fn agy_hello_expiry_ignores_consumed_and_rotated_credentials() {
         in_context(async {
             let (_dir, sup, root) = harness();

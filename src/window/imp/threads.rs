@@ -8284,6 +8284,7 @@ impl AgentTerminalWindow {
     /// An agent's availability changed (or a scan ended): everything that offers agents follows.
     pub(super) fn on_availability_changed(&self) {
         self.fill_new_with_menu();
+        self.fill_new_with_folder_menu();
         // The picker hides agents that are not ready; an open one redraws.
         ModelCatalog::shared().notify();
         self.update_unavailable_banners();

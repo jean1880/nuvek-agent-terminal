@@ -29,6 +29,7 @@ use crate::theme::Theme;
 use crate::utils::{resolve_profile, resolve_working_directory, Launch};
 use adw::prelude::*;
 use adw::subclass::prelude::*;
+use agent_core::adapter::Driver;
 use gtk4::glib;
 use gtk4::{Align, Box, Button, Image, Label, Orientation, ScrolledWindow, Stack};
 use std::cell::RefCell;
@@ -1330,6 +1331,8 @@ pub struct AgentTerminalWindow {
     toast_overlay: RefCell<Option<adw::ToastOverlay>>,
     /// The header's "New Thread With" submenu, refilled when agent detection finishes.
     new_with_menu: RefCell<Option<gtk4::gio::Menu>>,
+    /// The header's "New Thread in Existing Folder With" submenu, refilled when agent detection finishes.
+    new_with_folder_menu: RefCell<Option<gtk4::gio::Menu>>,
     /// The yellow dot on the window menu button, shown while a newer release is known.
     update_dot: RefCell<Option<gtk4::Widget>>,
     /// The window menu's last section: "Check for Updates…", or "Download Update X…" once a
@@ -2007,6 +2010,23 @@ impl AgentTerminalWindow {
             }
         ));
         obj.add_action(&new_thread_agent);
+
+        // New Thread in Existing Folder With <agent>, by driver key.
+        let new_thread_agent_folder = gtk4::gio::SimpleAction::new(
+            "new-thread-agent-folder",
+            Some(&String::static_variant_type()),
+        );
+        new_thread_agent_folder.connect_activate(glib::clone!(
+            #[weak]
+            obj,
+            move |_, target| {
+                let driver = target
+                    .and_then(|t| t.get::<String>())
+                    .and_then(|k| crate::window::sidebar_model::parse_driver(&k));
+                obj.imp().new_tab_in_folder_for_driver(driver);
+            }
+        ));
+        obj.add_action(&new_thread_agent_folder);
 
         self.add_win_action("review-environment", Self::review_current_environment);
 
@@ -2889,6 +2909,54 @@ impl AgentTerminalWindow {
         }
     }
 
+    /// (Re)fills "New Thread in Existing Folder With" with the agents that are installed and enabled.
+    pub(super) fn fill_new_with_folder_menu(&self) {
+        let Some(with) = self.new_with_folder_menu.borrow().clone() else {
+            return;
+        };
+        with.remove_all();
+        let ready: Vec<_> = agent_core::adapter::Driver::ALL
+            .into_iter()
+            .filter(|d| self.agent_usable(*d))
+            .collect();
+        if ready.is_empty() {
+            let label = if crate::availability::AgentAvailability::shared().any_detecting() {
+                "Detecting agents…"
+            } else {
+                "No agent installed and enabled"
+            };
+            with.append_item(&gtk4::gio::MenuItem::new(Some(label), Some("win.no-agent")));
+        }
+        for driver in ready {
+            if driver.is_built_in() {
+                let availability = crate::availability::AgentAvailability::shared();
+                let servers: Vec<Profile> = self
+                    .config
+                    .borrow()
+                    .local_servers()
+                    .into_iter()
+                    .filter(|p| !p.disabled && availability.server_ready(&p.id))
+                    .cloned()
+                    .collect();
+                for server in servers {
+                    let item = gtk4::gio::MenuItem::new(Some(&server.name), None);
+                    item.set_action_and_target_value(
+                        Some("win.new-tab-folder-profile"),
+                        Some(&server.name.to_variant()),
+                    );
+                    with.append_item(&item);
+                }
+                continue;
+            }
+            let item = gtk4::gio::MenuItem::new(Some(driver.info().label), None);
+            item.set_action_and_target_value(
+                Some("win.new-thread-agent-folder"),
+                Some(&driver.info().key.to_variant()),
+            );
+            with.append_item(&item);
+        }
+    }
+
     /// The header's menu: threads first, then resume and hand-off.
     fn build_new_menu(&self) -> gtk4::gio::Menu {
         let menu = gtk4::gio::Menu::new();
@@ -2902,6 +2970,10 @@ impl AgentTerminalWindow {
             Some("New Thread in Existing Folder…"),
             Some("win.new-tab-folder"),
         );
+        let with_folder = gtk4::gio::Menu::new();
+        *self.new_with_folder_menu.borrow_mut() = Some(with_folder.clone());
+        self.fill_new_with_folder_menu();
+        threads.append_submenu(Some("New Thread in Existing Folder With"), &with_folder);
         threads.append(
             Some("Review Multi-Agent Environment…"),
             Some("win.review-environment"),
@@ -3220,9 +3292,24 @@ impl AgentTerminalWindow {
     /// Prompts for a folder, then opens a new tab rooted there running `profile`,
     /// or the active profile when `None`.
     fn new_tab_in_folder(&self, profile: Option<Profile>) {
+        self.new_tab_in_folder_with(None, profile);
+    }
+
+    /// Prompts for a folder, then opens a new tab rooted there running `driver`,
+    /// or the default agent when `None`.
+    fn new_tab_in_folder_for_driver(&self, driver: Option<Driver>) {
+        self.new_tab_in_folder_with(driver, None);
+    }
+
+    fn new_tab_in_folder_with(&self, driver: Option<Driver>, profile: Option<Profile>) {
         let obj = self.obj();
+        let title = match (driver, profile.as_ref()) {
+            (Some(d), _) => format!("Select Folder for New {} Thread", d.info().label),
+            (None, Some(p)) => format!("Select Folder for New Thread ({})", p.name),
+            (None, None) => "Select Folder for New Thread".to_string(),
+        };
         let dialog = gtk4::FileDialog::builder()
-            .title("Select Folder for New Thread")
+            .title(&title)
             .accept_label("Open")
             .modal(true)
             .build();
@@ -3251,17 +3338,19 @@ impl AgentTerminalWindow {
                                 Some(p) if crate::config::profile_driver(&p).is_none() => {
                                     imp.add_terminal_tab(Some(&p), Some(&dir));
                                 }
-                                // The folder picked; the profile chosen, if one was.
+                                // The folder picked; the driver / profile chosen.
                                 p => {
                                     let profile_id = p.as_ref().map(|p| p.id.clone());
-                                    imp.new_chat_thread_with(
-                                        p.as_ref().and_then(crate::config::profile_driver),
-                                        move |driver| threads::NewThread {
+                                    let target_driver = driver.or_else(|| {
+                                        p.as_ref().and_then(crate::config::profile_driver)
+                                    });
+                                    imp.new_chat_thread_with(target_driver, move |driver| {
+                                        threads::NewThread {
                                             dir: Some(dir),
                                             profile_id,
                                             ..threads::NewThread::new(driver)
-                                        },
-                                    );
+                                        }
+                                    });
                                 }
                             }
                         }
@@ -8178,6 +8267,8 @@ mod tests {
         assert!(window.lookup_action("shortcuts").is_some());
         assert!(window.lookup_action("checkpoint-now").is_some());
         assert!(window.lookup_action("new-tab-folder").is_some());
+        assert!(window.lookup_action("new-thread-agent").is_some());
+        assert!(window.lookup_action("new-thread-agent-folder").is_some());
         assert!(window.lookup_action("resume-session").is_some());
         assert_eq!(
             imp.tabs.borrow().len(),

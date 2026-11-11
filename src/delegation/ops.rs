@@ -861,15 +861,22 @@ impl Supervisor {
         if !self.profile_available(worker) {
             return Err(error(ErrorCode::ProviderUnavailable, "profile unavailable"));
         }
-        let actual = {
+        let (actual, switching_from_other) = {
             let state = self.state.borrow();
-            state.workers.get(worker).and_then(|w| {
+            let switching_from_other = state
+                .workers
+                .get(worker)
+                .and_then(|w| w.switch_original.as_ref())
+                .is_some_and(|(_, orig, _)| *orig != Driver::Agy);
+            let facts = state.workers.get(worker).and_then(|w| {
                 w.session()
                     .and_then(|s| s.delegation_launch_facts())
                     .filter(|facts| facts.generation == w.generation)
-            })
+            });
+            (facts, switching_from_other)
         };
-        if actual.is_none()
+        if !switching_from_other
+            && actual.is_none()
             && self
                 .state
                 .borrow()
@@ -882,9 +889,11 @@ impl Supervisor {
                 "live agy launch facts are unavailable",
             ));
         }
-        if let Some(actual) = actual {
-            self.bridge_census_unchanged(worker).await?;
-            return self.check_agy_launch_facts(actual).await;
+        if !switching_from_other {
+            if let Some(actual) = actual {
+                self.bridge_census_unchanged(worker).await?;
+                return self.check_agy_launch_facts(actual).await;
+            }
         }
         let (profile, cwd) = {
             let state = self.state.borrow();

@@ -172,14 +172,26 @@ pub struct Header {
     level: gtk4::LevelBar,
     gauge_label: gtk4::Label,
     last_driver: Cell<Option<Driver>>,
+    steady_height: Rc<Cell<i32>>,
 }
 
-/// Grows `bin`'s height request to `root`'s minimum height. Never shrinks it: the strip changes
-/// by a few pixels as items come and go, and a header that jumps with each would be worse.
-fn fit_height(bin: &adw::BreakpointBin, root: &gtk4::Box) {
+/// Fits `bin`'s height request to `root`'s minimum height. Steady strip changes (items coming and
+/// going across turns or breakpoints) ratchet `steady_height` upward so the header does not jump
+/// by a few pixels, while transient multi-line states (`pending_mode`) release their extra height
+/// once cleared.
+fn fit_height(
+    bin: &adw::BreakpointBin,
+    root: &gtk4::Box,
+    pending_mode: &gtk4::Label,
+    steady_height: &Cell<i32>,
+) {
     let needed = root.measure(gtk4::Orientation::Vertical, -1).0;
-    if needed > bin.height_request() {
-        bin.set_height_request(needed);
+    if !pending_mode.is_visible() && needed > steady_height.get() {
+        steady_height.set(needed);
+    }
+    let target = needed.max(steady_height.get());
+    if target != bin.height_request() {
+        bin.set_height_request(target);
     }
 }
 
@@ -202,16 +214,28 @@ fn set_mode_names(mode: &gtk4::DropDown, guard: &Cell<bool>, names: &[&str]) {
 impl Header {
     /// Re-fits the bin to the strip after its contents changed (see [`fit_height`]).
     pub fn fit_height(&self) {
-        fit_height(&self.bin, &self.root);
+        fit_height(
+            &self.bin,
+            &self.root,
+            &self.pending_mode,
+            &self.steady_height,
+        );
     }
 
     /// A callback for widgets placed in the strip that change size on their own (the usage
     /// meter): re-fits the bin, holding it weakly.
     pub fn refitter(&self) -> impl Fn() + 'static {
-        let (bin, root) = (self.bin.downgrade(), self.root.downgrade());
+        let (bin, root, pending_mode) = (
+            self.bin.downgrade(),
+            self.root.downgrade(),
+            self.pending_mode.downgrade(),
+        );
+        let steady_height = self.steady_height.clone();
         move || {
-            if let (Some(bin), Some(root)) = (bin.upgrade(), root.upgrade()) {
-                fit_height(&bin, &root);
+            if let (Some(bin), Some(root), Some(pending_mode)) =
+                (bin.upgrade(), root.upgrade(), pending_mode.upgrade())
+            {
+                fit_height(&bin, &root, &pending_mode, &steady_height);
             }
         }
     }
@@ -222,6 +246,7 @@ impl Header {
 
         let chip = gtk4::Button::new();
         chip.add_css_class("agent-chip");
+        chip.set_valign(gtk4::Align::Center);
         chip.set_tooltip_text(Some(
             "Switch model or agent in this thread; stops the current turn (/model)",
         ));
@@ -230,7 +255,9 @@ impl Header {
         brand.set_pixel_size(14);
         brand.add_css_class("accent-dot");
         let agent = label("", &["chip-agent"]);
+        agent.set_single_line_mode(true);
         let model = label("", &["chip-model"]);
+        model.set_single_line_mode(true);
         model.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
         model.set_max_width_chars(40);
         chip_box.append(&brand);
@@ -296,6 +323,7 @@ impl Header {
 
         let activity = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
         activity.add_css_class("activity");
+        activity.set_valign(gtk4::Align::Center);
         let spinner = gtk4::Spinner::new();
         activity.append(&spinner);
         let activity_text = label("", &["activity-text"]);
@@ -310,8 +338,10 @@ impl Header {
         activity.set_visible(false);
         root.append(&activity);
         let usage_slot = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        usage_slot.set_valign(gtk4::Align::Center);
         root.append(&usage_slot);
         let subagent_slot = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        subagent_slot.set_valign(gtk4::Align::Center);
         root.append(&subagent_slot);
 
         let gauge = gtk4::Button::new();
@@ -331,6 +361,7 @@ impl Header {
         gauge.set_visible(false);
         // In a slot of its own: `set_gauge` shows and hides the gauge itself.
         let gauge_slot = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        gauge_slot.set_valign(gtk4::Align::Center);
         gauge_slot.append(&gauge);
         root.append(&gauge_slot);
 
@@ -340,15 +371,21 @@ impl Header {
         // width is fixed; the height follows the strip, whose items change (the usage meter is
         // two lines once it has data): see `fit_height`.
         bin.set_width_request(MIN_WIDTH);
+        let steady_height = Rc::new(Cell::new(0));
         // A breakpoint can bring an item back that is taller than what was measured. Not from
         // inside the allocation that switched it.
         bin.connect_current_breakpoint_notify({
-            let (bin, root) = (bin.downgrade(), root.downgrade());
+            let (bin, root, pending_mode) =
+                (bin.downgrade(), root.downgrade(), pending_mode.downgrade());
+            let steady_height = steady_height.clone();
             move |_| {
-                let (bin, root) = (bin.clone(), root.clone());
+                let (bin, root, pending_mode) = (bin.clone(), root.clone(), pending_mode.clone());
+                let steady_height = steady_height.clone();
                 gtk4::glib::idle_add_local_once(move || {
-                    if let (Some(bin), Some(root)) = (bin.upgrade(), root.upgrade()) {
-                        fit_height(&bin, &root);
+                    if let (Some(bin), Some(root), Some(pending_mode)) =
+                        (bin.upgrade(), root.upgrade(), pending_mode.upgrade())
+                    {
+                        fit_height(&bin, &root, &pending_mode, &steady_height);
                     }
                 });
             }
@@ -421,7 +458,7 @@ impl Header {
             }
         });
 
-        fit_height(&bin, &root);
+        fit_height(&bin, &root, &pending_mode, &steady_height);
         Self {
             bin,
             root,
@@ -447,6 +484,7 @@ impl Header {
             level,
             gauge_label,
             last_driver: Cell::new(None),
+            steady_height,
         }
     }
 
@@ -545,6 +583,7 @@ impl Header {
                 adw::LengthUnit::Sp,
             )));
         }
+        self.steady_height.set(0);
         self.fit_height();
     }
 
@@ -793,5 +832,48 @@ mod tests {
             auto_compact_at: None,
         };
         assert_eq!(gauge_fraction(&over), Some((1.0, None)));
+    }
+
+    #[test]
+    fn chip_is_centred_single_line_and_transient_height_recovers() {
+        gtk4::init().expect("GTK init");
+        adw::init().expect("adw init");
+        super::super::load_style();
+
+        let header = Header::new();
+        assert_eq!(header.chip.valign(), gtk4::Align::Center);
+        assert!(header.agent.is_single_line_mode());
+        assert!(header.model.is_single_line_mode());
+
+        header.set_agent(
+            Driver::Claude,
+            None,
+            Some("claude-opus-4-6"),
+            None,
+            Some("high"),
+        );
+        let single_line_chip_h = header.chip.measure(gtk4::Orientation::Vertical, -1).0;
+        let steady_req = header.bin.height_request();
+        assert!(steady_req > 0);
+
+        // Newlines in a user-configured server name or model ID must never make the chip taller.
+        header.set_agent(
+            Driver::Local,
+            Some("Ollama\nRTX 4080"),
+            Some("qwen2.5-coder\n14b"),
+            None,
+            None,
+        );
+        assert_eq!(
+            header.chip.measure(gtk4::Orientation::Vertical, -1).0,
+            single_line_chip_h
+        );
+
+        // A deferred mode switch grows the header strip temporarily while shown, then releases
+        // that extra height once cleared instead of latching it permanently.
+        header.set_pending_mode(Some(Mode::Bypass));
+        assert!(header.bin.height_request() > steady_req);
+        header.set_pending_mode(None);
+        assert_eq!(header.bin.height_request(), steady_req);
     }
 }

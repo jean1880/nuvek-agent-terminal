@@ -62,6 +62,107 @@ fn native_header_lifecycle_hints_survive_narrow_breakpoints() {
     }
 }
 
+/// The agent/model pill keeps its single-line pill height across 2-line usage indicators,
+/// deferred mode switches (including in the narrow compact breakpoint where the pill hides its
+/// text labels), text-scale zoom resets, and multi-line server/model strings.
+#[test]
+#[ignore = "native GTK layout; run alone in an isolated display"]
+fn native_header_agent_chip_stays_pill_shaped() {
+    let ctx = crate::testutil::native_init();
+    let (window, view) = shown_view(1100, &[], &ctx);
+    let inner = view.inner().expect("view");
+
+    let pill_bounds = |w: i32| {
+        window.set_default_size(w, 760);
+        crate::testutil::settle(&ctx);
+        let overflow = crate::testutil::overflowing_bins(view.upcast_ref());
+        assert!(overflow.is_empty(), "overflow at {w}px: {overflow:?}");
+        inner
+            .header
+            .chip
+            .compute_bounds(&inner.header.bin)
+            .expect("mapped chip bounds")
+    };
+
+    let base_wide = pill_bounds(1100);
+    let base_h = base_wide.height();
+    let steady_bin_h = inner.header.bin.height();
+    assert!(
+        base_wide.width() > base_h * 2.0,
+        "wide chip should be pill-shaped, got {base_wide:?}"
+    );
+
+    let base_compact = pill_bounds(420);
+    assert!(
+        (base_compact.height() - base_h).abs() <= 1.0,
+        "compact chip stretched vertically: {} vs {base_h}",
+        base_compact.height()
+    );
+    assert!(
+        base_compact.width() > base_compact.height() * 1.5,
+        "compact chip lost its pill aspect ratio: {base_compact:?}"
+    );
+
+    // Deferred mode switch in compact mode wraps "Next turn: …" onto multiple lines; the agent
+    // chip must stay centred at its single-row height rather than ballooning into a circle.
+    inner.header.set_pending_mode(Some(Mode::Bypass));
+    let pending_compact = pill_bounds(420);
+    assert!(
+        (pending_compact.height() - base_h).abs() <= 1.0,
+        "pending mode ballooned chip height: {} vs {base_h} ({pending_compact:?})",
+        pending_compact.height()
+    );
+    inner.header.set_pending_mode(None);
+    let recovered_compact = pill_bounds(420);
+    assert!(
+        (recovered_compact.height() - base_h).abs() <= 1.0,
+        "cleared pending mode left chip stretched: {}",
+        recovered_compact.height()
+    );
+    assert_eq!(
+        inner.header.bin.height(),
+        steady_bin_h,
+        "header strip failed to release deferred-mode height"
+    );
+
+    // Zooming up and back to 1.0 must release the scaled header height as well.
+    view.set_text_scale(1.6);
+    let _scaled = pill_bounds(1100);
+    assert!(inner.header.bin.height() > steady_bin_h);
+    view.set_text_scale(1.0);
+    let reset_wide = pill_bounds(1100);
+    assert!(
+        (reset_wide.height() - base_h).abs() <= 1.0,
+        "zoom reset left chip stretched: {} vs {base_h}",
+        reset_wide.height()
+    );
+    assert_eq!(
+        inner.header.bin.height(),
+        steady_bin_h,
+        "zoom reset left header strip bloated"
+    );
+
+    // Embedded newlines in server/model names stay single-line.
+    inner.header.set_agent(
+        Driver::Local,
+        Some("Ollama\nRTX 4080"),
+        Some("qwen2.5-coder\n14b"),
+        None,
+        None,
+    );
+    let multiline = pill_bounds(1100);
+    assert!(
+        (multiline.height() - base_h).abs() <= 1.0,
+        "multiline label grew chip height: {} vs {base_h}",
+        multiline.height()
+    );
+
+    window.destroy();
+    while ctx.pending() {
+        ctx.iteration(false);
+    }
+}
+
 #[test]
 #[ignore = "native GTK layout; run alone in an isolated display"]
 fn native_ux_matrix() {

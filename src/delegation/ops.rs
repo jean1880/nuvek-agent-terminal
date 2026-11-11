@@ -1,7 +1,6 @@
 //! Authenticated tools and the durable acceptance/reservation/write protocol.
 use super::seam::{CallDispatcher, ConnId, LocalFuture, PeerFacts, ProcFacts};
 use super::supervisor::{error, opted_in, Supervisor};
-use crate::chat::ChatBackend;
 use agent_core::adapter::Driver;
 use agent_core::delegation::authority::{ceiling, permits, RevocationEvent, TaskMode};
 use agent_core::delegation::correlation::{attestation_arguments, Attestation};
@@ -862,26 +861,21 @@ impl Supervisor {
         if !self.profile_available(worker) {
             return Err(error(ErrorCode::ProviderUnavailable, "profile unavailable"));
         }
-        let (actual, non_agy_session) = {
+        let (actual, switching_from_other) = {
             let state = self.state.borrow();
             let switching_from_other = state
                 .workers
                 .get(worker)
                 .and_then(|w| w.switch_original.as_ref())
                 .is_some_and(|(_, orig, _)| *orig != Driver::Agy);
-            let not_agy = state
-                .workers
-                .get(worker)
-                .and_then(|w| w.session())
-                .is_some_and(|s| s.status().driver != Driver::Agy);
             let facts = state.workers.get(worker).and_then(|w| {
                 w.session()
                     .and_then(|s| s.delegation_launch_facts())
                     .filter(|facts| facts.generation == w.generation)
             });
-            (facts, switching_from_other || not_agy)
+            (facts, switching_from_other)
         };
-        if !non_agy_session
+        if !switching_from_other
             && actual.is_none()
             && self
                 .state
@@ -895,7 +889,7 @@ impl Supervisor {
                 "live agy launch facts are unavailable",
             ));
         }
-        if !non_agy_session {
+        if !switching_from_other {
             if let Some(actual) = actual {
                 self.bridge_census_unchanged(worker).await?;
                 return self.check_agy_launch_facts(actual).await;

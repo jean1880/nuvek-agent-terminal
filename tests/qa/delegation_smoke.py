@@ -59,16 +59,23 @@ def smoke(binary):
             send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
             listed = receive()
             names = [tool["name"] for tool in listed.get("result", {}).get("tools", [])]
-            if listed.get("id") != 2 or names != ["cross_agent_capabilities"]:
+            # The degraded tools: the ones that need no delegation (DEGRADED_TOOLS).
+            if listed.get("id") != 2 or names != ["cross_agent_capabilities", "show_image"]:
                 raise ValueError("unbound bridge advertised privileged tools")
-            send({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
-                "name": "cross_agent_capabilities", "arguments": {},
-            }})
-            reply = receive()
-            result = reply.get("result", {})
-            if (reply.get("id") != 3 or result.get("isError") is not True
-                    or result.get("structuredContent", {}).get("error", {}).get("code") != "runtime_unavailable"):
-                raise ValueError("unbound bridge did not refuse access")
+            # Each still reaches no runtime, so each is refused.
+            for request_id, name, arguments in [
+                (3, "cross_agent_capabilities", {}),
+                (4, "show_image", {"images": [{"path": "chart.png"}]}),
+            ]:
+                send({"jsonrpc": "2.0", "id": request_id, "method": "tools/call", "params": {
+                    "name": name, "arguments": arguments,
+                }})
+                reply = receive()
+                result = reply.get("result", {})
+                if (reply.get("id") != request_id or result.get("isError") is not True
+                        or result.get("structuredContent", {}).get("error", {}).get("code")
+                        != "runtime_unavailable"):
+                    raise ValueError(f"unbound bridge did not refuse {name}")
             process.stdin.close()
             process.wait(timeout=5)
             if process.returncode:

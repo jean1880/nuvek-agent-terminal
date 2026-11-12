@@ -985,7 +985,7 @@ impl CodexAdapter {
             self.start_item(out, id, kind, title, input);
         }
         // An image Codex looked at (`imageView`, an absolute path: live, 2026-11-02): the app
-        // reads it under its read policy and shows it in this card.
+        // reads it wherever it is (Codex already gave it to its model) and shows it in this card.
         if let Some(path) = viewed {
             out.push(
                 Envelope::new(Event::ToolImage {

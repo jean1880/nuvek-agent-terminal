@@ -175,7 +175,7 @@ pub fn markdown_image_paths(text: &str) -> Vec<String> {
 }
 
 /// Where a tool-result image is ([`crate::event::Event::ToolImage`]): its bytes, or a file the
-/// app reads under its read policy (Codex `imageView`).
+/// agent already read, which the app reads wherever it is (Codex `imageView`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
 pub enum ToolImageSource {

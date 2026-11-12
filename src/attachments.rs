@@ -98,11 +98,11 @@ fn texture_rgba(texture: &gdk::Texture) -> (u32, u32, Vec<u8>) {
 }
 
 /// Stores an image an agent's tool handed back ([`agent_core::event::Event::ToolImage`]) and
-/// returns its ref. Blocking: call it on a worker. A file (Codex `imageView`) is a path an agent
-/// named, so it is read only as the read policy lets a read run without asking in the thread's
-/// folder `cwd` ([`agent_kit::local_tools::read_unasked`]: inside it, not sensitive, links judged
-/// where they lead, a regular file under the size cap); its bytes, like any, are decoded under
-/// the same bounds as the user's.
+/// returns its ref. Blocking: call it on a worker. A file (Codex `imageView`) is one the agent
+/// has already read and handed its model, so showing it discloses nothing new: it is read
+/// wherever it is (a relative path against the thread's folder `cwd`), as a file the user picks
+/// is (`BlobStore::ingest_path`: opened without blocking, regular only, under the size cap), and
+/// its bytes, like any, are decoded under the same bounds as the user's.
 pub fn ingest_tool_image(
     image: ToolImageSource,
     origin: Origin,
@@ -116,20 +116,15 @@ pub fn ingest_tool_image(
             store.ingest_bytes(&bytes, None, origin)
         }
         ToolImageSource::File { path } => {
-            use agent_kit::local_tools::{read_unasked, UnaskedRead, Workspace};
-            if cwd.is_empty() {
-                return Err("the thread has no folder to read it in".to_owned());
-            }
-            let ws = Workspace::open(std::path::Path::new(cwd))?;
-            let (target, bytes) = read_unasked(&ws, &path, agent_kit::attachments::MAX_INPUT_BYTES)
-                .map_err(|e| match e {
-                    UnaskedRead::MustAsk { .. } => {
-                        format!("{path} is not one the app reads without asking")
-                    }
-                    UnaskedRead::Failed(why) => why,
-                })?;
-            let name = target.file_name().map(|n| n.to_string_lossy().into_owned());
-            store.ingest_bytes(&bytes, name.as_deref(), origin)
+            let named = std::path::Path::new(&path);
+            let full = if named.is_absolute() {
+                named.to_path_buf()
+            } else if cwd.is_empty() {
+                return Err(format!("{path} is relative and the thread has no folder"));
+            } else {
+                std::path::Path::new(cwd).join(named)
+            };
+            store.ingest_path(&full, origin)
         }
     }
     .map_err(|e| e.to_string())?;
@@ -225,11 +220,12 @@ pub fn remove_private_copies() {
 mod tests {
     use super::*;
 
-    /// A file an agent's tool names (Codex `imageView`) is read only as a read may run without
-    /// asking in the thread's folder: one inside is stored as a tool's image; one outside, or a
-    /// link inside leading out, is not, and says why; inline bytes need no folder.
+    /// A file an agent's tool names (Codex `imageView`) is shown wherever it is: inside the
+    /// thread's folder, outside it (a temp folder), relative to the folder, or through a link.
+    /// What is not an image file is refused and says why: a folder, a file that does not
+    /// decode, a missing one, and a relative path with no folder. Inline bytes need no folder.
     #[test]
-    fn a_viewed_file_is_read_only_inside_the_folder() {
+    fn a_viewed_file_is_shown_wherever_it_is() {
         use std::os::unix::fs::symlink;
         let png = agent_kit::attachments::from_base64(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
@@ -240,25 +236,36 @@ mod tests {
         std::fs::create_dir_all(&work).expect("work");
         std::fs::write(work.join("chart.png"), &png).expect("chart");
         std::fs::write(root.path().join("away.png"), &png).expect("away");
+        std::fs::write(root.path().join("notes.png"), b"not an image").expect("notes");
         symlink(root.path().join("away.png"), work.join("link.png")).expect("link");
         let cwd = work.to_string_lossy().into_owned();
         let file = |path: &str| ToolImageSource::File {
             path: path.to_owned(),
         };
-        let inside = ingest_tool_image(
-            file(&work.join("chart.png").to_string_lossy()),
-            Origin::ToolResult,
-            &cwd,
-        )
-        .expect("inside");
-        assert_eq!(inside.origin, Origin::ToolResult);
-        assert_eq!(inside.name.as_deref(), Some("chart.png"));
-        for outside in [
-            root.path().join("away.png").to_string_lossy().into_owned(),
-            "link.png".to_owned(),
+        for (path, name) in [
+            (
+                work.join("chart.png").to_string_lossy().into_owned(),
+                "chart.png",
+            ),
+            (
+                root.path().join("away.png").to_string_lossy().into_owned(),
+                "away.png",
+            ),
+            ("chart.png".to_owned(), "chart.png"),
+            ("link.png".to_owned(), "link.png"),
         ] {
-            let refused = ingest_tool_image(file(&outside), Origin::ToolResult, &cwd);
-            assert!(refused.is_err(), "{outside}: {refused:?}");
+            let shown = ingest_tool_image(file(&path), Origin::ToolResult, &cwd)
+                .unwrap_or_else(|e| panic!("{path}: {e}"));
+            assert_eq!(shown.origin, Origin::ToolResult);
+            assert_eq!(shown.name.as_deref(), Some(name));
+        }
+        for refused in [
+            root.path().to_string_lossy().into_owned(),
+            root.path().join("notes.png").to_string_lossy().into_owned(),
+            root.path().join("gone.png").to_string_lossy().into_owned(),
+        ] {
+            let out = ingest_tool_image(file(&refused), Origin::ToolResult, &cwd);
+            assert!(out.is_err(), "{refused}: {out:?}");
         }
         assert!(ingest_tool_image(file("chart.png"), Origin::ToolResult, "").is_err());
         let inline = ToolImageSource::Inline {

@@ -229,7 +229,10 @@ Architectural mandates, standards, and workflows for this codebase.
   `agent_kit::attachments::normalise`'s limits (20 MB, 16 384 px a side, bounded allocation),
   resized to 2048 px, re-encoded (no metadata survives) and stored content-addressed (`0600`, in a
   `0700` `$XDG_DATA_HOME/agent-terminal/attachments`); only the re-encoded copy is ever shown or
-  sent. Events, the store and hand-offs carry an `AttachmentRef` (its sha256 id, size, name),
+  sent. A file Codex viewed (`imageView`) is read wherever it is, as a picked file is
+  (`BlobStore::ingest_path`: regular only, under the size cap): Codex already gave it to its model,
+  so showing it discloses nothing new. Events, the store and hand-offs carry an `AttachmentRef`
+  (its sha256 id, size, name),
   never bytes: `Event::ToolImage` (an adapter's image, base64 or a path) is transient, stored as a
   blob by the session and replaced by `Event::Attachments` before anything is persisted or shown,
   and the store refuses it; a `raw` frame over 256 KB is replaced by its size. Base64 never passes

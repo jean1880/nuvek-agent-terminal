@@ -77,6 +77,25 @@ pub enum L2Refusal {
     DiscoveryFailed,
 }
 
+impl std::fmt::Display for L2Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ArgvRedirect(flag) => {
+                write!(f, "its arguments move its configuration (--{flag})")
+            }
+            Self::EnvRedirect(name) => write!(f, "{name} moves its configuration"),
+            Self::HomeMismatch => f.write_str("its home folder could not be verified"),
+            Self::AllowRulesMissing(rules) => {
+                write!(f, "its settings lack the allow rules {}", rules.join(", "))
+            }
+            Self::WorkspaceSource(path) => write!(f, "the workspace declares {path}"),
+            Self::Unreadable(path) => write!(f, "{path} could not be read"),
+            Self::ScanLimit => f.write_str("the workspace's .agents folder is too large to check"),
+            Self::DiscoveryFailed => f.write_str("the workspace folder could not be resolved"),
+        }
+    }
+}
+
 /// How agy's Go flag parser reads `arg`: its name with `-` as `_`, and whether its value is
 /// inline (`=value`). One or two leading dashes; `None` for anything else, three dashes too.
 pub fn flag_name(arg: &str) -> Option<(String, bool)> {

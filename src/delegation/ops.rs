@@ -937,10 +937,10 @@ impl Supervisor {
                 verified_home: home,
                 hookless,
             };
-            super::agy_l2::scan(&input, &limits).map_err(|_| {
+            super::agy_l2::scan(&input, &limits).map_err(|refusal| {
                 error(
                     ErrorCode::WorkspaceUntrusted,
-                    "agy workspace MCP configuration is untrusted",
+                    &format!("agy workspace configuration is untrusted: {refusal}"),
                 )
             })
         })
@@ -975,10 +975,10 @@ impl Supervisor {
                 },
                 &limits,
             )
-            .map_err(|_| {
+            .map_err(|refusal| {
                 error(
                     ErrorCode::WorkspaceUntrusted,
-                    "agy actual launch configuration is untrusted",
+                    &format!("agy actual launch configuration is untrusted: {refusal}"),
                 )
             })
         })

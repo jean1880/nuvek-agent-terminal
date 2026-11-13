@@ -5,6 +5,7 @@ use crate::chat::session::{ChatSession, SwitchTarget};
 use crate::chat::WorkerAction;
 use crate::delegation::seam::WorkerSubscriber;
 use crate::delegation::seam::{ChildStop, ResolvedChild};
+use crate::delegation::supervisor::RootSwitch;
 use agent_core::delegation::scope::{Scope, ScopedEnvelope};
 use agent_core::delegation::wire::WorkerSummary;
 
@@ -15,6 +16,23 @@ pub(super) fn unbound_notice(reason: &str) -> String {
         "Antigravity started without cross-agent delegation: {reason}. Set it up in Settings → \
          Agents → Cross-agent delegation (Configure / Repair), then reopen this thread."
     )
+}
+
+/// The thread's notice when an Antigravity root starts unbound because its workspace withholds
+/// delegation (`RootSwitch::Unbound`): the fix is in the folder, not in Settings.
+pub(super) fn workspace_unbound_notice(reason: &str) -> String {
+    format!(
+        "Antigravity started without cross-agent delegation: {reason}. Once that is fixed in \
+         the thread's folder or its parents, reopen this thread."
+    )
+}
+
+/// The notice for a prepared root switch, if it starts unbound.
+fn switch_notice(outcome: RootSwitch, problem: Option<String>) -> Option<String> {
+    match outcome {
+        RootSwitch::Unbound(reason) => Some(workspace_unbound_notice(&reason)),
+        _ => problem.as_deref().map(unbound_notice),
+    }
 }
 
 /// A preparation continuation belongs to one slot and one start attempt. Stop, transfer and
@@ -362,13 +380,13 @@ pub(super) fn switch(
             }
             return;
         }
-        if !supervisor
+        let outcome = supervisor
             .prepare_root_switch(&thread, &profile, driver, problem.is_none())
-            .await
-        {
-            tracing::warn!(thread = %thread, agent = ?driver, "failed to prepare root switch");
+            .await;
+        if let RootSwitch::Failed(reason) = &outcome {
+            tracing::warn!(thread = %thread, agent = ?driver, %reason, "failed to prepare root switch");
             session.note(format!(
-                "Could not switch to {}: root switch preparation failed",
+                "Could not switch to {}: {reason}",
                 driver.info().label
             ));
             if let Some(armed) = armed {
@@ -377,6 +395,7 @@ pub(super) fn switch(
             session.rebind_start();
             return;
         }
+        let notice = switch_notice(outcome, problem);
         if serial.get() != chosen {
             if let Some(armed) = armed {
                 session.forget_continue_after_switch(Some(armed));
@@ -385,8 +404,8 @@ pub(super) fn switch(
             return;
         }
         go(&session, model, effort, target);
-        if let Some(reason) = problem {
-            session.note(unbound_notice(&reason));
+        if let Some(notice) = notice {
+            session.note(notice);
         }
         session.rebind_start();
     });
@@ -494,20 +513,23 @@ impl AgentTerminalWindow {
         let serial = slot.switch_serial.clone();
         let chosen = serial.get();
         glib::MainContext::default().spawn_local(async move {
-            let (prepared, problem) = match crate::delegation::supervisor() {
+            let (prepared, notice) = match crate::delegation::supervisor() {
                 Some(supervisor) => {
                     let problem = supervisor.agy_root_problem(&profile, driver).await;
-                    let prepared = supervisor
+                    let outcome = supervisor
                         .root_transfer_resume(&thread, &profile, driver, problem.is_none())
                         .await;
-                    (prepared, problem)
+                    if let RootSwitch::Failed(reason) = &outcome {
+                        tracing::warn!(thread = %thread, agent = ?driver, %reason, "failed to resume transferred root");
+                    }
+                    (outcome.is_ready(), switch_notice(outcome, problem))
                 }
                 None => (true, None),
             };
             // Closing, Stop or a newer transfer invalidates this continuation.
             if prepared && serial.get() == chosen && thread_owner(&thread).is_some() {
-                if let Some(reason) = problem {
-                    session.note(unbound_notice(&reason));
+                if let Some(notice) = notice {
+                    session.note(notice);
                 }
                 session.rebind_start();
             }

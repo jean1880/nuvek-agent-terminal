@@ -177,6 +177,7 @@ impl Root {
         // switch and rebind run in the same order as a bound switch's.
         sup.prepare_root_switch(&self.thread, &profile, driver, false)
             .await
+            .is_ready()
             && self.serial.get() == chosen
     }
 

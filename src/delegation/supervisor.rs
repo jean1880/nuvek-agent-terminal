@@ -1262,61 +1262,101 @@ mod tests {
             stop(&sup).await;
         });
     }
+    /// Starts `root` on Claude in `dir`, then prepares its switch to agy with binding asked.
+    /// The session is returned so it outlives the switch.
+    async fn switch_claude_root_to_agy(
+        dir: &std::path::Path,
+        sup: &Rc<Supervisor>,
+        root: &WorkerId,
+    ) -> (RootSwitch, Rc<ChatSession>) {
+        let thread = sup.state.borrow().roots[root].row.root_thread_id.clone();
+        let profile = (sup.services.profiles)().remove(0);
+        let resolved = (sup.services.resolve)(&profile).unwrap();
+        let hooks = sup
+            .prepare_root(&thread, &profile, Driver::Claude)
+            .await
+            .unwrap();
+        let provider = sup
+            .services
+            .handle
+            .reader()
+            .add_provider_thread(&thread, "claude", "default")
+            .unwrap();
+        let open = agent_core::adapter::OpenSession {
+            program: resolved.program.clone(),
+            extra_args: resolved.extra_args,
+            cwd: dir.to_string_lossy().into_owned(),
+            model: None,
+            effort: None,
+            mode: Mode::Plan,
+            resume: None,
+            new_session_id: None,
+            approval_hook: false,
+            delegation: None,
+        };
+        let session = ChatSession::with_options(
+            Box::new(agent_core::claude::ClaudeAdapter::new()),
+            open,
+            crate::chat::session::SessionStore {
+                handle: sup.services.handle.clone(),
+                provider: Some(Some(provider)),
+            },
+            thread.clone(),
+            Rc::new(|_| {}),
+            Err(None),
+            resolved.env,
+            super::super::seam::SessionOptions {
+                generation_base: sup.root_generation_base(&thread),
+                hooks: Some(hooks),
+                child: None,
+            },
+        );
+        sup.attach_root_session(&thread, Rc::downgrade(&session));
+        let outcome = sup
+            .prepare_root_switch(&thread, &profile, Driver::Agy, true)
+            .await;
+        (outcome, session)
+    }
     #[test]
     fn switching_to_agy_from_another_driver_does_not_require_prior_agy_launch_facts() {
         in_context(async {
             let (dir, sup, root) = harness();
             configure_agy(&sup, dir.path());
-            let thread = sup.state.borrow().roots[&root].row.root_thread_id.clone();
-            let profile = (sup.services.profiles)().remove(0);
-            let resolved = (sup.services.resolve)(&profile).unwrap();
-            let hooks = sup
-                .prepare_root(&thread, &profile, Driver::Claude)
-                .await
-                .unwrap();
-            let provider = sup
-                .services
-                .handle
-                .reader()
-                .add_provider_thread(&thread, "claude", "default")
-                .unwrap();
-            let open = agent_core::adapter::OpenSession {
-                program: resolved.program.clone(),
-                extra_args: resolved.extra_args,
-                cwd: dir.path().to_string_lossy().into_owned(),
-                model: None,
-                effort: None,
-                mode: Mode::Plan,
-                resume: None,
-                new_session_id: None,
-                approval_hook: false,
-                delegation: None,
-            };
-            let session = ChatSession::with_options(
-                Box::new(agent_core::claude::ClaudeAdapter::new()),
-                open,
-                crate::chat::session::SessionStore {
-                    handle: sup.services.handle.clone(),
-                    provider: Some(Some(provider)),
-                },
-                thread.clone(),
-                Rc::new(|_| {}),
-                Err(None),
-                resolved.env,
-                super::super::seam::SessionOptions {
-                    generation_base: sup.root_generation_base(&thread),
-                    hooks: Some(hooks),
-                    child: None,
-                },
-            );
-            sup.attach_root_session(&thread, Rc::downgrade(&session));
-            let prepared = sup
-                .prepare_root_switch(&thread, &profile, Driver::Agy, true)
-                .await;
-            assert!(
-                prepared,
+            let (outcome, _session) = switch_claude_root_to_agy(dir.path(), &sup, &root).await;
+            assert_eq!(
+                outcome,
+                RootSwitch::Ready,
                 "root switch to Agy must succeed when prior session was another driver"
             );
+            assert!(!sup.state.borrow().workers[&root].registration_off);
+            stop(&sup).await;
+        });
+    }
+    /// A workspace that withholds delegation (here a `plugin.json` deep in `.agents`) does not
+    /// fail the switch: agy starts unbound, and the refusal names the file.
+    #[test]
+    fn switching_to_agy_in_an_untrusted_workspace_starts_it_unbound_and_says_why() {
+        in_context(async {
+            let (dir, sup, root) = harness();
+            configure_agy(&sup, dir.path());
+            let retired = dir.path().join(".agents/plugins.retired/old");
+            std::fs::create_dir_all(&retired).unwrap();
+            std::fs::write(retired.join("plugin.json"), b"{}").unwrap();
+            let (outcome, _session) = switch_claude_root_to_agy(dir.path(), &sup, &root).await;
+            let RootSwitch::Unbound(reason) = outcome else {
+                panic!("expected an unbound switch, got {outcome:?}");
+            };
+            assert!(
+                reason.contains(".agents/plugins.retired/old/plugin.json"),
+                "{reason}"
+            );
+            {
+                let state = sup.state.borrow();
+                let w = &state.workers[&root];
+                assert!(w.registration_off);
+                assert_eq!(w.driver, Driver::Agy);
+                assert!(w.switch_original.is_none());
+            }
             stop(&sup).await;
         });
     }
@@ -2545,6 +2585,23 @@ pub(super) fn opted_in(p: &Profile) -> bool {
     p.available_for_delegation && !p.disabled
 }
 
+/// What [`Supervisor::prepare_root_switch`] made of a root's move to another profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RootSwitch {
+    /// The root may start: bound, or unbound as the caller asked.
+    Ready,
+    /// The root may start, but unbound: its workspace withholds delegation (why).
+    Unbound(String),
+    /// The switch was not prepared (why); the root keeps its previous profile.
+    Failed(String),
+}
+
+impl RootSwitch {
+    pub(crate) fn is_ready(&self) -> bool {
+        !matches!(self, Self::Failed(_))
+    }
+}
+
 impl Supervisor {
     /// Marks `run` of a delegated worker as started now, for its end's journal record.
     pub(super) fn note_run_started(&self, run: &RunId) {
@@ -2603,10 +2660,10 @@ impl Supervisor {
         profile: &Profile,
         driver: Driver,
         bind: bool,
-    ) -> bool {
+    ) -> RootSwitch {
         let root = self.state.borrow().threads.get(thread).cloned();
         let Some(root) = root else {
-            return true;
+            return RootSwitch::Ready;
         };
         {
             let mut state = self.state.borrow_mut();
@@ -2615,7 +2672,7 @@ impl Supervisor {
                 .get_mut(&root)
                 .filter(|r| r.closed && r.transferring)
             else {
-                return false;
+                return RootSwitch::Failed("the thread is no longer being transferred".into());
             };
             r.transferring = false;
             r.closed = false;
@@ -2624,14 +2681,16 @@ impl Supervisor {
             .await
     }
     /// Moves a thread's root to `profile`. With `bind` false (see [`Self::agy_root_problem`])
-    /// an opted-in profile is treated as opted out for this root: it starts unbound.
+    /// an opted-in profile is treated as opted out for this root: it starts unbound. An agy
+    /// root whose workspace withholds delegation starts unbound too ([`RootSwitch::Unbound`]).
     pub(crate) async fn prepare_root_switch(
         self: &Rc<Self>,
         thread: &str,
         profile: &Profile,
         driver: Driver,
         bind: bool,
-    ) -> bool {
+    ) -> RootSwitch {
+        const SUPERSEDED: &str = "the thread changed while switching";
         let data = {
             let state = self.state.borrow();
             state.threads.get(thread).and_then(|id| {
@@ -2643,13 +2702,13 @@ impl Supervisor {
             })
         };
         let Some((worker, session)) = data else {
-            return true;
+            return RootSwitch::Ready;
         };
         self.rollback_root_switch(&worker, None);
         let ticket = {
             let mut state = self.state.borrow_mut();
             let Some(w) = state.workers.get_mut(&worker) else {
-                return false;
+                return RootSwitch::Failed(SUPERSEDED.into());
             };
             w.switch_revision = w.switch_revision.wrapping_add(1);
             w.switch_original = Some((w.switch_revision, w.driver, w.row.profile_id.clone()));
@@ -2678,14 +2737,14 @@ impl Supervisor {
             .is_some_and(|r| r.revoking)
         {
             if start.elapsed() > std::time::Duration::from_secs(5) {
-                return false;
+                return RootSwitch::Failed("its sub-agents did not stop in time".into());
             }
             glib::timeout_future(std::time::Duration::from_millis(10)).await;
         }
         if !self.root_session_current(&worker, &session)
             || self.state.borrow().workers[&worker].switch_revision != ticket
         {
-            return false;
+            return RootSwitch::Failed(SUPERSEDED.into());
         }
         let id = worker.to_string();
         let profile_id = profile.id.clone();
@@ -2697,7 +2756,7 @@ impl Supervisor {
             .await
             .is_err()
         {
-            return false;
+            return RootSwitch::Failed("the delegation state could not be saved".into());
         }
         if self
             .state
@@ -2706,7 +2765,7 @@ impl Supervisor {
             .get(&worker)
             .is_none_or(|w| w.switch_revision != ticket)
         {
-            return false;
+            return RootSwitch::Failed(SUPERSEDED.into());
         }
         if let Some(w) = self.state.borrow_mut().workers.get_mut(&worker) {
             w.driver = driver;
@@ -2718,27 +2777,39 @@ impl Supervisor {
             if let Some(w) = self.state.borrow_mut().workers.get_mut(&worker) {
                 w.switch_original = None;
             }
-            return true;
+            return RootSwitch::Ready;
         }
-        let prepared = self
+        let staged = self
             .stage(&worker, session.process_generation().next(), profile)
-            .await
-            .is_ok()
-            && self.root_session_current(&worker, &session)
+            .await;
+        let current = self.root_session_current(&worker, &session)
             && self
                 .state
                 .borrow()
                 .workers
                 .get(&worker)
                 .is_some_and(|w| w.switch_revision == ticket);
-        if prepared {
+        let outcome = match staged {
+            _ if !current => RootSwitch::Failed(SUPERSEDED.into()),
+            Ok(()) => RootSwitch::Ready,
+            // The workspace withholds delegation, not the agent: it starts unbound, as when its
+            // registration is unusable, rather than not at all.
+            Err(e) if driver == Driver::Agy && e.code == ErrorCode::WorkspaceUntrusted => {
+                if let Some(w) = self.state.borrow_mut().workers.get_mut(&worker) {
+                    w.registration_off = true;
+                }
+                RootSwitch::Unbound(e.message)
+            }
+            Err(e) => RootSwitch::Failed(e.message),
+        };
+        if outcome.is_ready() {
             if let Some(w) = self.state.borrow_mut().workers.get_mut(&worker) {
                 w.switch_original = None;
             }
         } else {
             self.rollback_root_switch(&worker, Some(ticket));
         }
-        prepared
+        outcome
     }
     fn rollback_root_switch(&self, worker: &WorkerId, ticket: Option<u64>) {
         let restored = {

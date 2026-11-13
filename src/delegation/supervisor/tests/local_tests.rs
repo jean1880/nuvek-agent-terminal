@@ -428,6 +428,7 @@ fn a_local_root_spawns_a_sub_agent_and_hears_its_result() {
             resume: None,
             new_session_id: None,
             approval_hook: false,
+            forced_permissive: false,
             delegation: None,
         };
         let session = ChatSession::with_options(

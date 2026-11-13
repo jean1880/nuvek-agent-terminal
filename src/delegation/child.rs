@@ -602,28 +602,31 @@ impl Supervisor {
             let target = crate::hook_config::HookTarget::new(&resolved.env, Some(spec.cwd.clone()));
             let home = target.home.clone();
             let hook = (self.services.hook_check)(target).await;
-            hook.map_err(|_| {
-                error(
-                    ErrorCode::ProviderUnavailable,
-                    "agy child requires a proven approval hook",
-                )
-            })?;
             self.recheck_agy(&spec.worker).await?;
-            crate::approval_server::ApprovalHandle::bind_child(
-                Ok(()),
-                self.rundir.path(),
-                &spec.thread,
-                &spec.cwd,
-                spec.mode.as_mode(),
-                home,
-            )
-            .map_err(|_| {
-                error(
-                    ErrorCode::ProviderUnavailable,
-                    "cannot bind child approval socket",
+            match hook {
+                Ok(()) => crate::approval_server::ApprovalHandle::bind_child(
+                    Ok(()),
+                    self.rundir.path(),
+                    &spec.thread,
+                    &spec.cwd,
+                    spec.mode.as_mode(),
+                    home,
                 )
-            })
-            .map(Ok)?
+                .map_err(|_| {
+                    error(
+                        ErrorCode::ProviderUnavailable,
+                        "cannot bind child approval socket",
+                    )
+                })
+                .map(Ok)?,
+                // No proven hook: the child runs forced into dangerous permissive mode, like a
+                // thread does, said so on its card; its own tool calls are then not judged.
+                Err(reason) => {
+                    tracing::warn!(worker = %spec.worker, %reason,
+                        "agy child has no proven hook; it runs forced");
+                    Err(Some(reason))
+                }
+            }
         } else {
             Err(None)
         };
@@ -724,6 +727,7 @@ impl Supervisor {
             new_session_id: (spec.driver == Driver::Claude && spec.resume.is_none())
                 .then(|| gtk4::glib::uuid_string_random().to_string()),
             approval_hook: false,
+            forced_permissive: false,
             delegation: None,
         };
         let generation_base = self.state.borrow().workers[&worker].generation;
@@ -924,16 +928,30 @@ impl Supervisor {
         let data = {
             let mut state = self.state.borrow_mut();
             state.workers.get_mut(worker).map(|w| {
+                let is_root = w.row.parent_id.is_none();
                 w.row.state = "failed".into();
                 w.row.delegation_reason = Some(e.message.clone());
                 w.row.last_activity = Some(e.message.clone());
                 let run = w.run.take();
                 w.last_run = run.clone();
                 w.token = None;
-                (run, w.pending.take(), w.root.clone())
+                // A root's delegation failing is not its agent failing: it keeps running, without
+                // sub-agents, until it is bound again (a switch, a reopen).
+                if is_root {
+                    w.registration_off = true;
+                }
+                let root_session = is_root.then(|| w.session()).flatten();
+                (run, w.pending.take(), w.root.clone(), root_session)
             })
         };
-        if let Some((run, pending, root)) = data {
+        if let Some((run, pending, root, root_session)) = data {
+            if let Some(session) = &root_session {
+                session.note(format!(
+                    "Sub-agents are unavailable in this thread: {}. The agent keeps running \
+                     without them.",
+                    e.message
+                ));
+            }
             if let Some(run) = &run {
                 self.log_run_end(
                     worker,
@@ -949,6 +967,8 @@ impl Supervisor {
                     .workers
                     .iter()
                     .filter(|(id, _)| self.visible(worker, id, true))
+                    // The root's own session is the user's thread: it is never stopped here.
+                    .filter(|(_, w)| w.row.parent_id.is_some())
                     .filter_map(|(id, w)| Some((id.clone(), w.session()?)))
                     .collect::<Vec<_>>()
             };

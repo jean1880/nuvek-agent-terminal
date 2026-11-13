@@ -2496,9 +2496,9 @@ impl AgentTerminalWindow {
             .title("Hook Entry")
             .subtitle(
                 "Add it as a top-level key of ~/.gemini/config/hooks.json. Until it is \
-                 installed, Antigravity cannot ask before acting: it refuses shell commands but \
-                 applies file edits on its own, in Plan mode too. Each thread's own directory \
-                 is checked when the thread opens.",
+                 installed, Antigravity cannot ask before acting: it runs in dangerous \
+                 permissive mode, running commands and editing files without asking, and its \
+                 threads say so. Each thread's own directory is checked when the thread opens.",
             )
             .build();
         expander.add_row(&json);

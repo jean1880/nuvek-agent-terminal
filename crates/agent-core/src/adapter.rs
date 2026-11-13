@@ -269,6 +269,7 @@ mod open_session_tests {
             resume: None,
             new_session_id: None,
             approval_hook: false,
+            forced_permissive: false,
             delegation: Some(DelegationBinding {
                 command: "/usr/bin/agent-terminal".into(),
                 endpoint: "/run/user/1000/agent-terminal/delegation-1.sock".into(),
@@ -313,6 +314,11 @@ pub struct OpenSession {
     /// agy only: without it the adapter must not use `--dangerously-skip-permissions`.
     #[serde(default)]
     pub approval_hook: bool,
+    /// agy only: no approval hook gates this process, and it runs in dangerous permissive mode
+    /// anyway, said so in the thread (the app's "forced" state), rather than not at all or in a
+    /// mode that cannot run commands.
+    #[serde(default)]
+    pub forced_permissive: bool,
     /// The cross-agent delegation binding for this process generation, set by the app per
     /// spawn. Holds the capability token, so it is never serialised.
     #[serde(skip)]

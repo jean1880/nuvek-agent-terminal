@@ -414,9 +414,11 @@ impl AgentTerminalWindow {
         }
         // Mid-turn, ask first: the switch stops the turn.
         let id = thread.to_owned();
+        // Through the window's own switch, as the header's picker goes: a delegation root's record
+        // moves with it, so the supervisor never judges the new agent as the old one.
         self.when_not_busy(thread, move |imp| {
-            if let Some(session) = imp.slot_of(&id).and_then(|s| s.get()) {
-                session.switch(driver, model.clone(), effort.clone());
+            if imp.slot_of(&id).and_then(|s| s.get()).is_some() {
+                imp.switch_agent_confirmed(&id, driver, model.clone(), effort.clone(), None);
             }
         });
     }

@@ -494,23 +494,26 @@ fn a_reload_preserves_queued_prompt_order_and_one_prompt_per_turn() {
 }
 
 #[test]
-fn a_canary_restart_preserves_queued_prompt_order_and_one_prompt_per_turn() {
-    in_loop(|_| {
+fn a_canary_trip_leaves_the_turn_and_its_queue_alone() {
+    in_loop(|ctx| {
         let log: Log = Rc::default();
-        let (_, _, session, _) = queued_session(Driver::Agy, &log);
+        let (_, _, session, seen) = queued_session(Driver::Agy, &log);
         session.send_prompt("first");
         session.queue_prompt("second");
-        session.inner.trip_canary();
-        assert_eq!(session.status().mode, Mode::Plan);
-        assert_eq!(prompts(&log), ["first", "second"]);
-        assert!(session.inner.queued_prompts.borrow().is_empty());
-        session.steer_prompt("third");
-        assert_eq!(prompts(&log), ["first", "second"]);
+        let generation = session.inner.generation.get();
+        // Its proof failing forces the thread in place: nothing restarts, nothing is resent.
+        session
+            .inner
+            .canary_verdict(Err("a hook file appeared".into()));
+        assert!(pump_until(ctx, 2, || seen.borrow().iter().any(
+            |e| matches!(e.event, Event::PermissionsForced { reason: Some(_) })
+        )));
+        assert_eq!(session.inner.generation.get(), generation);
+        assert_eq!(session.status().mode, Mode::Ask);
+        assert_eq!(prompts(&log), ["first"]);
         assert!(session.status().running_turn);
-        assert_eq!(session.inner.queued_prompts.borrow().len(), 1);
         turn_completed(&session, TurnState::Completed);
-        assert_eq!(prompts(&log), ["first", "second", "third"]);
-        assert!(session.status().running_turn);
+        assert_eq!(prompts(&log), ["first", "second"]);
         session.shutdown(false);
     });
 }

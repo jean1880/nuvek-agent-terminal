@@ -93,6 +93,7 @@ async fn root_session(sup: &Rc<Supervisor>, dir: &std::path::Path, root: &Worker
         resume: None,
         new_session_id: None,
         approval_hook: false,
+        forced_permissive: false,
         delegation: None,
     };
     let seen: Seen = Rc::default();

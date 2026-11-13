@@ -233,6 +233,13 @@ pub enum Event {
         requested: crate::adapter::Mode,
         effective: crate::adapter::Mode,
     },
+    /// The agent runs in dangerous permissive mode because nothing can gate it (agy with no
+    /// working approval hook), whatever mode the user chose (`reason`: why); `None` when that
+    /// ended. Never the user's choice: the chosen mode is kept and shown again once it lifts.
+    PermissionsForced {
+        #[serde(default)]
+        reason: Option<String>,
+    },
     /// Structured questions (Claude AskUserQuestion, Codex `requestUserInput`), or questions the
     /// app found in a finished reply ([`QuestionSource::Reply`]).
     QuestionRequested {

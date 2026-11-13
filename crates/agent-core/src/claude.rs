@@ -3999,6 +3999,7 @@ mod tests {
             resume: Some("abc".into()),
             new_session_id: Some("zzz".into()),
             approval_hook: false,
+            forced_permissive: false,
             delegation: None,
         };
         assert_eq!(
@@ -4415,6 +4416,7 @@ mod tests {
             resume: None,
             new_session_id: None,
             approval_hook: false,
+            forced_permissive: false,
             delegation: None,
         };
         let argv = a.argv(&session);
@@ -4479,6 +4481,7 @@ mod tests {
                 resume: None,
                 new_session_id: None,
                 approval_hook: false,
+                forced_permissive: false,
                 delegation: None,
             };
             a.argv(&session);

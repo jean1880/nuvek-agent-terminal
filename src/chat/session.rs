@@ -479,6 +479,21 @@ struct Inner {
     watches: RefCell<Vec<(u64, ExitWatch)>>,
     /// A rebind stopped the process: nothing starts one until `rebind_start`.
     rebinding: Cell<bool>,
+    /// Why agy runs in dangerous permissive mode whatever the chosen mode (no hook gates it);
+    /// `None`: it does not. Worked out again at every start (`launch_spec`), and set in place
+    /// when the canary finds the hook not gating a running process.
+    forced: RefCell<Option<String>>,
+    /// The view has been told `forced` once: the first launch always says it, so a reopened
+    /// thread whose stored history was forced is unlocked when its agent is not.
+    forced_told: Cell<bool>,
+    /// Tool steps of this process seen without a hook query while its hook still proved
+    /// installed: the second one forces the process.
+    canary_misses: Cell<u32>,
+    /// Restarts made in a row after the agent exited on its own with a failure; reset once a
+    /// started agent reports its session.
+    crash_restarts: Cell<u32>,
+    /// This process was interrupted (agy exits after one): its exit is not a crash.
+    interrupted: Cell<bool>,
     /// The native id of the running turn (Codex), which a delegated steer is pinned to.
     native_turn: RefCell<Option<String>>,
     /// Open approval requests by the id the view knows them by, so revocation can end them.
@@ -724,16 +739,11 @@ impl Drop for ScopedFlag<'_> {
     }
 }
 
-/// The mode a session can actually run in. agy without its approval hook cannot ask before
-/// acting (headless, it has nobody to ask), so Ask becomes Plan there. Verified live: agy's own
-/// plan mode is not read-only either (it plans, then applies edits); only shell commands are
-/// refused without `--dangerously-skip-permissions`. The notice says so.
-fn effective_mode(hookless_agy: bool, wanted: Mode) -> Mode {
-    if hookless_agy && wanted == Mode::Ask {
-        Mode::Plan
-    } else {
-        wanted
-    }
+/// The mode a session keeps as the user's. agy without its approval hook runs forced into
+/// dangerous permissive mode whatever this says (`Inner::forced`): the chosen mode is kept, not
+/// narrowed, so it applies again as soon as a start proves the hook.
+fn effective_mode(_hookless_agy: bool, wanted: Mode) -> Mode {
+    wanted
 }
 
 /// Whether `mode` is no wider than a supervised child's fixed task mode `ceiling`: Plan, then
@@ -754,10 +764,14 @@ fn mode_within(mode: Mode, ceiling: Mode) -> bool {
 /// before the first check finished). Not "not installed": that is not known yet.
 pub(crate) const HOOK_NOT_CHECKED: &str = "the approval hook has not been checked yet";
 
-/// What hookless agy still does, said in every notice about it.
-const HOOKLESS_STILL: &str = "It refuses shell commands, but applies file edits on its own in \
-                              every mode (in Plan it writes a plan first, then edits). Ask before \
-                              edits is not available.";
+/// What hookless agy does, said in every notice about it.
+const HOOKLESS_STILL: &str = "It runs in dangerous permissive mode: it runs commands and edits \
+                              files without asking you first, whatever mode you choose. The mode \
+                              picker shows this and stays locked until the hook works; your own \
+                              choice applies again from then on.";
+
+/// Why agy runs forced into dangerous permissive mode when no other reason is known.
+const FORCED_NO_HOOK: &str = "Antigravity's approval hook is not installed";
 
 /// The notice for agy running without its approval socket: why (`unbound`, when the hook is
 /// installed but the socket could not be used, or [`HOOK_NOT_CHECKED`]; else the hook is
@@ -1054,6 +1068,11 @@ impl ChatSession {
             stopped_generation: Cell::new(opts.generation_base.0),
             watches: RefCell::new(Vec::new()),
             rebinding: Cell::new(false),
+            forced: RefCell::new(None),
+            forced_told: Cell::new(false),
+            canary_misses: Cell::new(0),
+            crash_restarts: Cell::new(0),
+            interrupted: Cell::new(false),
             native_turn: RefCell::new(None),
             open_approvals: RefCell::new(Vec::new()),
             active_workers: Cell::new(0),
@@ -1094,11 +1113,9 @@ impl ChatSession {
         });
         *inner.weak_self.borrow_mut() = Some(Rc::downgrade(&inner));
         inner.attach_approval();
-        // Said when the user's Ask could not be honoured; a thread already in Plan or Accept
-        // edits does not repeat it on every reopen. An installed hook that could not be used is
-        // always said (it is fixed by a restart, not by the user's mode).
-        let unbound_agy = hookless_agy && inner.unbound.borrow().is_some();
-        if inner.state.borrow().mode != wanted_mode || unbound_agy {
+        // Hookless agy runs forced into dangerous permissive mode: said every time the thread
+        // opens on it, whatever its mode, since nothing asks before it acts.
+        if hookless_agy {
             inner.hookless_notice();
         }
         inner.start_process();
@@ -1440,6 +1457,19 @@ impl Inner {
     fn hookless_notice(&self) {
         let text = hookless_text(self.unbound.borrow().as_deref());
         self.notice(text);
+    }
+
+    /// Records whether the agent runs forced into dangerous permissive mode, and tells the view
+    /// when that changed (the picker locks or unlocks; the chosen mode is kept either way).
+    fn set_forced(&self, reason: Option<String>) {
+        if self.forced_told.replace(true) && *self.forced.borrow() == reason {
+            return;
+        }
+        if let Some(why) = &reason {
+            warn!(reason = %why, "agy runs in dangerous permissive mode: no hook gates it");
+        }
+        self.forced.replace(reason.clone());
+        self.emit(Envelope::new(Event::PermissionsForced { reason }));
     }
 
     // ---- events ----
@@ -2099,6 +2129,18 @@ impl Inner {
         // The delegation binding staged for exactly the next process generation; a start the
         // supervisor did not stage takes none, so it gets no token (fail closed).
         let driver = self.adapter.borrow().driver();
+        // agy with no hook to gate it runs in dangerous permissive mode, and the thread says so;
+        // worked out again for every process, so it lifts once a start proves the hook.
+        let forced = (driver == Driver::Agy && approval.is_none()).then(|| {
+            self.unbound
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| FORCED_NO_HOOK.to_owned())
+        });
+        // It keeps its delegation binding: the supervisor's launch check accepts a forced agy (the
+        // skip flag with no proven hook), so its sub-agents keep working.
+        self.open.borrow_mut().forced_permissive = forced.is_some();
+        self.set_forced(forced);
         let next = ProcessGeneration(self.process_generation.get() + 1);
         // A binding an earlier launch took and never spawned is released before another is
         // taken.
@@ -2192,15 +2234,9 @@ impl Inner {
         self.prompted.set(false);
         self.clear_agy_read();
         self.canary_cancelled.borrow_mut().clear();
+        self.canary_misses.set(0);
+        self.interrupted.set(false);
         *self.starting.borrow_mut() = None;
-        if self.child.is_some()
-            && self.adapter.borrow().driver() == Driver::Agy
-            && self.approval().is_none()
-        {
-            self.error("A delegated Antigravity agent requires a proven approval hook; it was not started.");
-            self.finish_process(Some(1), false);
-            return;
-        }
         if self.adapter.borrow().driver() != Driver::Agy || self.approval().is_none() {
             self.spawn_generation(generation);
             self.notify_lifecycle();
@@ -2251,11 +2287,6 @@ impl Inner {
         // anything is emitted, and spawned only if this start is still the session's afterwards.
         let spec = match verdict {
             Ok(()) => self.launch_spec(),
-            Err(reason) if self.child.is_some() => {
-                self.error(format!("The delegated Antigravity agent's approval hook could not be proven: {reason}. It was not started."));
-                self.finish_process(Some(1), false);
-                return;
-            }
             Err(reason) => {
                 let refused = self.refuse_unproven_hook(reason);
                 let spec = self.launch_spec();
@@ -2291,7 +2322,7 @@ impl Inner {
         self.state.borrow_mut().mode = mode;
         let text = format!(
             "Antigravity's approval hook was checked again just before it started, and could not \
-             be confirmed: {reason}. It runs without asking you first. {HOOKLESS_STILL}"
+             be confirmed: {reason}. {HOOKLESS_STILL}"
         );
         *self.unbound.borrow_mut() = Some(reason);
         RefusedHook {
@@ -2323,6 +2354,12 @@ impl Inner {
 
     fn spawn_generation(self: &Rc<Self>, generation: u64) {
         let spec = self.launch_spec();
+        // Building the launch can tell the sink something (`set_forced`), which may start, stop
+        // or replace this process: only a start still the session's spawns. (`stopping` is no
+        // test here: a restart made while stopping, the thinking retry's, is still its own.)
+        if self.generation.get() != generation {
+            return;
+        }
         self.spawn_spec(generation, spec);
     }
 
@@ -2379,6 +2416,7 @@ impl Inner {
                     .argv
                     .iter()
                     .any(|arg| arg == "--dangerously-skip-permissions"),
+            forced_permissive: self.open.borrow().forced_permissive,
         };
         *self.starting.borrow_mut() = Some(PendingStart {
             generation,
@@ -3479,30 +3517,60 @@ impl Inner {
 
     /// The hook is not gating agy: stop it now and carry on without the skip flag (plan mode, no
     /// socket), so commands are refused again.
+    /// A tool step arrived with no hook query for it. The agent is never stopped for that: the
+    /// hook is proved again first. Still proven, the first such step is taken for a pairing the
+    /// app missed and the agent carries on; a second one, or a proof that fails, means the hook
+    /// is not gating this process, which then carries on forced into dangerous permissive mode,
+    /// said so in the thread (the next start proves the hook again).
     fn trip_canary(self: &Rc<Self>) {
-        if self.child.is_some() {
-            self.error("The delegated Antigravity agent ran a tool without its approval hook; it was stopped.");
-            self.stop_current();
-            *self.approval.borrow_mut() = None;
+        if self.forced.borrow().is_some() {
             return;
         }
-        warn!("agy ran a tool without a hook query; restarting it without the skip flag");
-        self.error(
-            "agy ran a tool without asking agent-terminal; the approval hook is not active \u{2014} restarting it in plan mode without --dangerously-skip-permissions (it refuses commands, but may still edit files)",
-        );
-        self.stop_current();
-        *self.approval.borrow_mut() = None; // closes the socket
-        let native = self.state.borrow().native_id.clone();
-        {
-            let mut open = self.open.borrow_mut();
-            open.mode = Mode::Plan;
-            open.resume = native.or_else(|| open.resume.take());
-            open.new_session_id = None;
+        let generation = self.generation.get();
+        let target = {
+            let open = self.open.borrow();
+            crate::hook_config::HookTarget::new(
+                &self.launch_env.borrow(),
+                Some(PathBuf::from(&open.cwd)).filter(|cwd| !cwd.as_os_str().is_empty()),
+            )
+        };
+        let check = self.hook_check.borrow().clone();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let verdict = gtk4::gio::spawn_blocking(move || check(&target))
+                .await
+                .unwrap_or_else(|_| Err("the hook check panicked".to_owned()));
+            let Some(inner) = weak.upgrade() else { return };
+            if inner.generation.get() == generation && inner.state.borrow().alive {
+                inner.canary_verdict(verdict);
+            }
+        });
+    }
+
+    /// [`Self::trip_canary`]'s fresh proof is in.
+    fn canary_verdict(&self, verdict: Result<(), String>) {
+        if self.forced.borrow().is_some() {
+            return;
         }
-        self.state.borrow_mut().mode = Mode::Plan;
-        self.emit(Envelope::new(Event::ModeChanged { mode: Mode::Plan }));
-        self.start_process();
-        self.dispatch_queue_after_restart();
+        let reason = match verdict {
+            Ok(()) => {
+                let misses = self.canary_misses.get() + 1;
+                self.canary_misses.set(misses);
+                if misses < 2 {
+                    warn!("agy ran a tool without a hook query, but its hook still proves installed; carrying on");
+                    return;
+                }
+                "Antigravity ran tools without asking its approval hook, though the hook is \
+                 installed"
+                    .to_owned()
+            }
+            Err(reason) => format!("Antigravity's approval hook is not working: {reason}"),
+        };
+        warn!(%reason, "agy is not gated by its hook; it carries on in dangerous permissive mode");
+        let text = format!("{reason}. Antigravity keeps working. {HOOKLESS_STILL}");
+        // Forced first: anything the notice reaches already sees it.
+        self.set_forced(Some(reason));
+        self.notice(text);
     }
 
     fn on_exit(self: &Rc<Self>, generation: u64, code: Option<i32>) {
@@ -3524,7 +3592,71 @@ impl Inner {
             Some(code) => format!("it exited (code {code}) before starting"),
             None => "it stopped before starting".to_owned(),
         };
+        let rollbacks = self.rollbacks.get();
         self.roll_back_unstarted(&reason);
+        if self.rollbacks.get() == rollbacks {
+            self.restart_after_crash(code);
+        }
+    }
+
+    /// The agent exited on its own with a failure that nobody asked for: it is started again,
+    /// resuming its session, after 2, 10, then 30 seconds; past that the thread says so and the
+    /// next message starts it. Never after an interrupt (agy exits after one), never for a
+    /// delegated worker (its supervisor decides), never into anything that owns the next start
+    /// or while the thread waits for its usage limit.
+    fn restart_after_crash(self: &Rc<Self>, code: Option<i32>) {
+        const DELAYS: [u64; 3] = [2, 10, 30];
+        let failed = code.is_some_and(|c| c != 0);
+        if !failed
+            || self.interrupted.get()
+            || self.child.is_some()
+            || self.limit_waiting.get()
+            || !self.startable_now()
+        {
+            return;
+        }
+        let attempt = self.crash_restarts.get();
+        let Some(&delay) = DELAYS.get(attempt as usize) else {
+            self.error(
+                "The agent keeps exiting with an error, so it was not started again. Send a \
+                 message to start it.",
+            );
+            return;
+        };
+        self.crash_restarts.set(attempt + 1);
+        warn!(
+            ?code,
+            attempt = attempt + 1,
+            delay,
+            "the agent exited with an error; restarting it"
+        );
+        // Read before anything is said: a sink may start or stop something meanwhile.
+        let generation = self.generation.get();
+        self.notice(format!(
+            "The agent exited unexpectedly (code {}); starting it again in {delay} s.",
+            code.unwrap_or_default()
+        ));
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            glib::timeout_future(Duration::from_secs(delay)).await;
+            let Some(inner) = weak.upgrade() else { return };
+            // Anything that happened meanwhile (a start, a switch, a close, the user's Stop, a
+            // usage limit) owns it now.
+            if inner.generation.get() == generation
+                && inner.startable_now()
+                && !inner.wakes_held.get()
+                && !inner.limit_waiting.get()
+            {
+                if inner.start_unasked() {
+                    inner.dispatch_queue_after_restart();
+                } else {
+                    // Promised a restart: one its supervisor held back is said, not dropped.
+                    inner.notice(
+                        "The agent could not be started again yet; send a message to start it.",
+                    );
+                }
+            }
+        });
     }
 
     /// Claude exited refusing `--thinking-display`. Restarts it ONCE without the flag (the
@@ -3811,6 +3943,33 @@ impl Inner {
         }
     }
 
+    /// No process, none starting, and nothing that owns the next start (idle suspension, a
+    /// rebind, a switch reading the thread, a close, a delegated worker's supervisor): the app
+    /// may start the agent itself for what the user just asked of it, as a message would. Pure:
+    /// it asks the supervisor nothing ([`Self::start_unasked`] does, once it has decided).
+    fn startable_now(&self) -> bool {
+        !self.state.borrow().alive
+            && self.proc.borrow().is_none()
+            && self.starting.borrow().is_none()
+            && !self.suspended.get()
+            && !self.rebinding.get()
+            && !self.switch_reading.get()
+            && !self.closing.get()
+            && !self.stopping.get()
+            && self.child.is_none()
+    }
+
+    /// Starts the stopped agent for something nobody typed a message for (a mode or model
+    /// pick, a crash restart). A delegation root first passes its supervisor's gate, which may
+    /// rebind it instead: that rebind then starts it. True only when this session now has a
+    /// process or a start of its own to write to.
+    fn start_unasked(self: &Rc<Self>) -> bool {
+        if self.root_prompt_allowed() {
+            self.ensure_alive();
+        }
+        self.state.borrow().alive || self.starting.borrow().is_some()
+    }
+
     /// A dead process (agy after an interrupt) is restarted resuming its native session.
     fn ensure_alive(self: &Rc<Self>) {
         // A rebind owns the next start: it waits for the old generation's exit and a staged
@@ -3870,6 +4029,31 @@ impl Inner {
     /// Encodes and carries out one command. False when the adapter refused it.
     fn command(self: &Rc<Self>, command: Command) -> bool {
         let model_change = matches!(command, Command::SetModel { .. });
+        // What the user asks of a stopped agent starts it (as a message does), and is written to
+        // the new process once it is up. Answers to the old process's requests never do: they
+        // have no one left to answer.
+        if matches!(command, Command::SetModel { .. } | Command::SetMode { .. })
+            && self.startable_now()
+            && !self.start_unasked()
+        {
+            // Nothing started now (a delegation root's supervisor rebinds it first, and that
+            // rebind starts it): the choice is kept for that start, never written to no process.
+            match &command {
+                Command::SetModel { model, effort } => self.apply_delta(&OpenSessionDelta {
+                    model: Some(model.clone()),
+                    effort: effort.clone(),
+                    mode: None,
+                    resume: None,
+                }),
+                Command::SetMode { mode } => {
+                    self.open.borrow_mut().mode = *mode;
+                    self.state.borrow_mut().mode = *mode;
+                    self.emit(Envelope::new(Event::ModeChanged { mode: *mode }));
+                }
+                _ => {}
+            }
+            return true;
+        }
         let result = self.adapter.borrow_mut().encode(command);
         match result {
             Ok(actions) => {
@@ -3963,6 +4147,7 @@ impl Inner {
                 Action::Interrupt => {
                     let interrupted = match self.proc.borrow().as_ref() {
                         Some(p) => {
+                            self.interrupted.set(true);
                             p.interrupt();
                             true
                         }
@@ -4071,7 +4256,8 @@ impl Inner {
     /// agy with no approval handle: Plan and Accept edits go to its `--mode` flag, but it cannot
     /// ask before acting.
     fn ask_unavailable(&self) -> bool {
-        self.approval().is_none() && self.adapter.borrow().driver() == Driver::Agy
+        (self.approval().is_none() || self.forced.borrow().is_some())
+            && self.adapter.borrow().driver() == Driver::Agy
     }
 
     /// A first word like `/model` or `/compact`: a command for the agent, which it only
@@ -4427,6 +4613,8 @@ impl Inner {
         handoff: Option<Handoff>,
         images: &[PromptImage],
     ) -> bool {
+        // A new prompt: an earlier interrupt no longer explains an exit.
+        self.interrupted.set(false);
         // New Local settings first: their restart is a planned rotation for a delegation root,
         // which the rebind gate below then binds again before the prompt goes.
         if !self.prepare_local_context() {
@@ -4938,32 +5126,28 @@ impl Inner {
                 return;
             }
         }
-        // Dangerous permissive agy is its hook allowing everything: with no hook, there is
-        // nothing to approve through, and the flag is never passed any other way.
-        if mode == Mode::Bypass && self.ask_unavailable() {
-            self.refuse_mode(
-                "Antigravity cannot run in dangerous permissive mode until the approval hook is \
-                 installed; it stays in its current mode.",
-                true,
-            );
-            return;
-        }
+        // agy with no hook runs forced into dangerous permissive mode: nothing to tell the
+        // process. The choice is kept for the first start that proves the hook, and said so.
+        // Dangerous permissive mode itself is never kept as a choice (it is session-only).
         if self.ask_unavailable() {
-            if mode == Mode::Ask {
-                self.choose_mode(mode);
-                // The picker shows the mode actually running.
+            if mode == Mode::Bypass {
                 self.refuse_mode(
-                    "Antigravity cannot ask before edits until the approval hook is installed; \
-                     it stays in its current mode.",
+                    "Antigravity already runs in dangerous permissive mode here, because its \
+                     approval hook is not working; your own mode is kept for when it does.",
                     true,
                 );
                 return;
-            } else if mode == Mode::Plan {
-                self.notice(
-                    "Antigravity Plan mode refuses shell commands, but may still edit files on \
-                     disk without the approval hook installed.",
-                );
             }
+            self.choose_mode(mode);
+            self.open.borrow_mut().mode = mode;
+            self.state.borrow_mut().mode = mode;
+            self.emit(Envelope::new(Event::ModeChanged { mode }));
+            self.notice(format!(
+                "{} is kept for this thread. Antigravity still runs in dangerous permissive mode \
+                 until its approval hook works.",
+                mode.label()
+            ));
+            return;
         }
         // Suspended: there is no process to tell. The mode is kept for the resume, which starts
         // in it (as any restart does), and the picker shows it now. Never dangerous permissive
@@ -4979,6 +5163,27 @@ impl Inner {
             }
             self.choose_mode(mode);
             self.emit(Envelope::new(Event::ModeChanged { mode }));
+            return;
+        }
+        // Stopped (an exit, a failed start): nothing to tell, so the agent starts again in the
+        // chosen mode, as a message would start it. Never into dangerous permissive mode, which
+        // is entered on a running agent only.
+        if self.startable_now() {
+            if mode == Mode::Bypass {
+                self.refuse_mode(
+                    "The agent is not running; send a message to start it before choosing \
+                     dangerous permissive mode.",
+                    false,
+                );
+                return;
+            }
+            self.choose_mode(mode);
+            self.open.borrow_mut().mode = mode;
+            self.state.borrow_mut().mode = mode;
+            self.emit(Envelope::new(Event::ModeChanged { mode }));
+            if self.start_unasked() {
+                self.dispatch_queue_after_restart();
+            }
             return;
         }
         let restarts = self.adapter.borrow().capabilities().mode_change_restarts;
@@ -5450,6 +5655,11 @@ impl Inner {
             .is_some_and(|c| !c.prepared);
         if unprepared {
             self.switch_continuation.borrow_mut().take();
+        }
+        if state == TurnState::Completed {
+            // A completed turn proves the agent works: crash restarts count from zero again (a
+            // session start does not, since an agent may crash right after it).
+            self.crash_restarts.set(0);
         }
         if state == TurnState::Completed && self.prompted.get() {
             // The agent works again: a "Continue in" asked while it was stopped is moot.
@@ -7826,12 +8036,13 @@ mod tests {
                 &store,
                 &thread,
             );
-            // Without the hook agy cannot ask: Ask runs as Plan, and the user is told.
+            // Without the hook agy cannot ask: it runs forced into dangerous permissive mode, the
+            // user is told, and Ask stays the thread's mode.
             assert!(has(
                 &seen,
                 |e| matches!(e, Event::Notice { text } if text.contains("cannot ask you before acting"))
             ));
-            assert_eq!(session.status().mode, Mode::Plan);
+            assert_eq!(session.status().mode, Mode::Ask);
 
             session.send_prompt("add multiply");
             assert!(pump_until(ctx, 15, || exited_count(&seen) == 1), "no exit");
@@ -7887,10 +8098,13 @@ mod tests {
                 args[1].contains(&format!("--conversation {CONVERSATION}")),
                 "{args:?}"
             );
-            assert!(args.iter().all(|a| a.contains("--mode plan")), "{args:?}");
-            assert!(args
-                .iter()
-                .all(|a| !a.contains("--dangerously-skip-permissions")));
+            // Hookless, both launches run forced: the skip flag alone, no mode flag.
+            assert!(
+                args.iter()
+                    .all(|a| a.contains("--dangerously-skip-permissions")
+                        && !a.split(' ').any(|w| w == "--mode")),
+                "{args:?}"
+            );
         });
     }
 
@@ -8857,6 +9071,7 @@ mod tests {
             .expect("bind");
             let open = OpenSession {
                 approval_hook: false, // the session must not trust the caller's value
+                forced_permissive: false,
                 delegation: None,
                 ..fake_agy(tmp.path())
             };
@@ -8904,13 +9119,14 @@ mod tests {
             );
             drop(session);
 
-            // No handle: flag off, no env, plan mode.
+            // No handle: no env, and agy runs forced (the skip flag alone, said so).
             let tmp = tempfile::tempdir().expect("tmp");
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, "/w");
             let (sink, seen) = make_sink();
             let open = OpenSession {
                 approval_hook: true, // ignored: there is no socket to export
+                forced_permissive: false,
                 delegation: None,
                 ..fake_agy(tmp.path())
             };
@@ -8924,11 +9140,15 @@ mod tests {
             );
             let spec = session.launch_spec();
             assert!(spec.env.is_empty());
-            assert!(!spec
+            assert!(spec
                 .argv
                 .iter()
                 .any(|a| a == "--dangerously-skip-permissions"));
-            assert!(spec.argv.windows(2).any(|w| w == ["--mode", "plan"]));
+            assert!(!spec.argv.iter().any(|a| a == "--mode"));
+            assert!(has(&seen, |e| matches!(
+                e,
+                Event::PermissionsForced { reason: Some(_) }
+            )));
             session.send_prompt("go");
             assert!(pump_until(ctx, 15, || exited_count(&seen) == 1));
             assert_eq!(lines(tmp.path().join("sock.log")), ["unset"]);
@@ -8936,11 +9156,12 @@ mod tests {
         });
     }
 
-    /// A proof that was `Ok` when the socket was bound must not pass the skip flag to a later
-    /// process: a hook file planted after it (here a workspace plugin hook) is caught by the
-    /// fresh check every hooked agy start runs, and that process starts hookless.
+    /// A proof that was `Ok` when the socket was bound does not vouch for a later process: a hook
+    /// file planted after it (here a workspace plugin hook) is caught by the fresh check every
+    /// hooked agy start runs, and that process starts without the app's socket, forced into
+    /// dangerous permissive mode and said so.
     #[test]
-    fn a_hook_planted_after_the_proof_keeps_the_next_agy_start_hookless() {
+    fn a_hook_planted_after_the_proof_forces_the_next_agy_start() {
         in_loop(|ctx| {
             let tmp = tempfile::tempdir().expect("tmp");
             let home = tempfile::tempdir().expect("home");
@@ -9001,17 +9222,17 @@ mod tests {
             assert!(pump_until(ctx, 15, || exited_count(&seen) == 2));
             let args = lines(tmp.path().join("args.log"));
             assert_eq!(args.len(), 2, "{args:?}");
-            assert!(
-                !args[1].contains("--dangerously-skip-permissions"),
-                "the skip flag shipped with an unchecked hook in force: {args:?}"
-            );
-            assert!(args[1].contains("--mode plan"), "{args:?}");
+            assert!(!args[1].split(' ').any(|w| w == "--mode"), "{args:?}");
             assert_eq!(lines(tmp.path().join("sock.log"))[1], "unset");
             assert!(has(&seen, |e| matches!(
                 e,
                 Event::Notice { text } if text.contains(".agents/plugins/p/hooks.json")
             )));
-            assert_eq!(session.status().mode, Mode::Plan);
+            assert!(has(&seen, |e| matches!(
+                e,
+                Event::PermissionsForced { reason: Some(_) }
+            )));
+            assert_eq!(session.status().mode, Mode::Ask);
         });
     }
 
@@ -9057,11 +9278,11 @@ mod tests {
             );
             release.send(()).expect("release");
             assert!(pump_until(ctx, 15, || exited_count(&seen) == 1));
-            let args = lines(tmp.path().join("args.log"));
-            assert!(
-                !args[0].contains("--dangerously-skip-permissions"),
-                "{args:?}"
-            );
+            assert_eq!(lines(tmp.path().join("sock.log")), ["unset"]);
+            assert!(has(&seen, |e| matches!(
+                e,
+                Event::PermissionsForced { reason: Some(_) }
+            )));
             assert!(has(&seen, |e| matches!(
                 e,
                 Event::TurnCompleted {
@@ -9819,20 +10040,21 @@ mod tests {
     }
 
     #[test]
-    fn hookless_agy_keeps_accept_edits_and_turns_ask_into_plan_until_you_leave_it() {
+    fn hookless_agy_keeps_the_chosen_mode_and_is_forced_until_you_leave_it() {
         in_loop(|_| {
-            // Accept edits is a real agy flag: it carries over.
+            // The chosen mode is kept, whatever it is.
             let log: Log = Rc::default();
             let (session, _) = claude_on(Mode::AcceptEdits, &log);
             session.switch(Driver::Agy, Some("gemini-flash".into()), None);
             assert_eq!(session.status().driver, Driver::Agy);
             assert_eq!(session.status().mode, Mode::AcceptEdits);
 
-            // Ask cannot be honoured without the hook: Plan, and the user is told why.
+            // Without the hook agy runs forced into dangerous permissive mode, and says so; Ask
+            // stays the user's choice.
             let log: Log = Rc::default();
             let (session, seen) = claude_on(Mode::Ask, &log);
             session.switch(Driver::Agy, Some("gemini-flash".into()), None);
-            assert_eq!(session.status().mode, Mode::Plan);
+            assert_eq!(session.status().mode, Mode::Ask);
             assert!(has(
                 &seen,
                 |e| matches!(e, Event::Notice { text } if text.contains("cannot ask you before acting"))
@@ -10049,8 +10271,12 @@ mod tests {
                 chosen_mode(events.iter().map(|(_, e)| e))
             };
             session.switch(Driver::Agy, Some("gemini-flash".into()), None);
-            assert_eq!(session.status().mode, Mode::Plan, "hookless agy runs Plan");
-            assert_eq!(chosen(), Some(Mode::Ask), "but the choice stored is Ask");
+            assert_eq!(
+                session.status().mode,
+                Mode::Ask,
+                "hookless agy keeps the choice"
+            );
+            assert_eq!(chosen(), Some(Mode::Ask), "and the choice stored is Ask");
             assert_eq!(session.wanted_mode(), Mode::Ask);
 
             session.set_mode(Mode::AcceptEdits);
@@ -10081,12 +10307,8 @@ mod tests {
             assert_eq!(chosen(), Some(Mode::Ask));
             assert_eq!(session.inner.wanted_mode.get(), Mode::Ask);
             assert_eq!(session.inner.safe_mode.get(), Mode::Ask);
-            assert_eq!(
-                session.status().mode,
-                Mode::AcceptEdits,
-                "the hookless process cannot ask"
-            );
-            assert_eq!(session.inner.open.borrow().mode, Mode::AcceptEdits);
+            // Kept, not sent: the forced process runs the same whatever the mode.
+            assert_eq!(session.status().mode, Mode::Ask);
             assert_eq!(session.inner.generation.get(), generation);
             assert_eq!(session.launch_spec().argv, argv);
             assert!(session.status().running_turn);
@@ -10095,16 +10317,12 @@ mod tests {
             session.shutdown(false);
             let (reopened, _) = harness(Box::new(AgyAdapter::new("agy")), open, &store, &thread);
             assert_eq!(reopened.wanted_mode(), Mode::Ask);
-            assert_eq!(
-                reopened.status().mode,
-                Mode::Plan,
-                "reopening uses the safe fallback for Ask"
-            );
+            assert_eq!(reopened.status().mode, Mode::Ask, "reopening keeps Ask");
             assert!(reopened
                 .launch_spec()
                 .argv
-                .windows(2)
-                .any(|a| a == ["--mode", "plan"]));
+                .iter()
+                .any(|a| a == "--dangerously-skip-permissions"));
         });
     }
 
@@ -10187,7 +10405,8 @@ mod tests {
         });
     }
 
-    /// Hookless agy has nothing to approve through: the pick is refused, and the flag never set.
+    /// Hookless agy already runs forced into dangerous permissive mode: picking it is refused (it
+    /// is never kept as a choice), and nothing is sent.
     #[test]
     fn hookless_agy_refuses_dangerous_permissive_mode() {
         in_loop(|_| {
@@ -10202,7 +10421,7 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, Command::SetMode { mode: Mode::Bypass })));
             assert!(has(&seen, |e| matches!(e, Event::Notice { text }
-                if text.contains("cannot run in dangerous permissive mode"))));
+                if text.contains("already runs in dangerous permissive mode"))));
         });
     }
 
@@ -10283,7 +10502,7 @@ mod tests {
             let text = hookless_text(Some(reason));
             assert!(text.contains(reason), "{text}");
             assert!(!text.contains("installed"), "{text}");
-            assert!(text.contains("applies file edits"), "{text}");
+            assert!(text.contains("dangerous permissive mode"), "{text}");
         }
     }
 
@@ -10791,8 +11010,7 @@ mod tests {
             assert_eq!(session.inner.generation.get(), generation + 2);
             assert_eq!(session.inner.deferred_mode.get(), None);
             assert!(pump_until(ctx, 5, || stdin_log(tmp.path()).contains("second")));
-            let argv = session.launch_spec().argv;
-            assert!(argv.windows(2).any(|a| a == ["--mode", "plan"]), "{argv:?}");
+            assert_eq!(session.status().mode, Mode::Plan);
             assert!(
                 session.status().running_turn,
                 "queued input opens the next turn"
@@ -10811,9 +11029,12 @@ mod tests {
             let (session, _) = recording(ctx, tmp.path(), Box::new(AgyAdapter::new("agy")));
             session.send_prompt("first");
             let generation = session.inner.generation.get();
-            assert_eq!(session.status().mode, Mode::Plan);
+            assert_eq!(session.status().mode, Mode::Ask);
             assert!(!session.status().capabilities.live_approvals);
+            // Forced, a mode change is kept for later: it never restarts the running turn.
             session.set_mode(Mode::Plan);
+            assert_eq!(session.inner.generation.get(), generation);
+            session.set_mode(Mode::AcceptEdits);
             assert_eq!(session.inner.generation.get(), generation);
             assert!(session.status().running_turn);
             assert_eq!(session.inner.deferred_mode.get(), None);
@@ -10857,32 +11078,6 @@ mod tests {
     }
 
     #[test]
-    fn a_confirmed_hookless_agy_mode_change_continues_before_queued_input() {
-        in_loop(|ctx| {
-            let tmp = tempfile::tempdir().expect("tmp");
-            let (session, _) = recording(ctx, tmp.path(), Box::new(AgyAdapter::new("agy")));
-            session.send_prompt("first");
-            session.queue_prompt("second");
-            let generation = session.inner.generation.get();
-            // The view calls the backend only after Switch and Continue was confirmed.
-            session.set_mode(Mode::AcceptEdits);
-            assert_eq!(session.inner.generation.get(), generation + 2);
-            assert!(pump_until(ctx, 5, || stdin_log(tmp.path())
-                .contains("Continue the unfinished task")));
-            assert!(!stdin_log(tmp.path()).contains("second"));
-            assert!(session.status().running_turn);
-            session.inner.emit(Envelope::new(Event::TurnCompleted {
-                state: TurnState::Completed,
-                error: None,
-                usage: None,
-                cost_usd: None,
-            }));
-            assert!(pump_until(ctx, 5, || stdin_log(tmp.path()).contains("second")));
-            assert_eq!(stdin_log(tmp.path()).matches("second").count(), 1);
-        });
-    }
-
-    #[test]
     fn a_reload_adopts_the_deferred_agy_mode_without_an_extra_restart() {
         in_loop(|ctx| {
             let tmp = tempfile::tempdir().expect("tmp");
@@ -10910,70 +11105,6 @@ mod tests {
                 generation + 2,
                 "no deferred restart remains"
             );
-        });
-    }
-
-    #[test]
-    fn hookless_agy_mode_change_keeps_its_choice_when_the_store_read_fails() {
-        in_loop(|ctx| {
-            use agent_kit::store_writer::{Shutdown, StoreWriter};
-            let tmp = tempfile::tempdir().expect("tmp");
-            let path = tmp.path().join("threads.sqlite");
-            let store = Rc::new(Store::open(&path).expect("store"));
-            let thread = fresh(&store, &tmp.path().to_string_lossy());
-            let writer = StoreWriter::spawn(&path).expect("writer");
-            let handle = StoreHandle::Queued {
-                reader: store.clone(),
-                writer: writer.clone(),
-            };
-            let (sink, seen) = make_sink();
-            let session = ChatSession::new(
-                Box::new(AgyAdapter::new("agy")),
-                scripted(tmp.path(), "cat > \"$D/stdin.log\""),
-                handle,
-                thread,
-                sink,
-                None,
-            );
-            session.send_prompt("first");
-            session.queue_prompt("second");
-            assert!(pump_until(ctx, 5, || stdin_log(tmp.path()).contains("first")));
-            let generation = session.inner.generation.get();
-            let argv = session.launch_spec().argv;
-            let chosen = seen
-                .borrow()
-                .iter()
-                .filter(|e| matches!(e.event, Event::ModeChosen { .. }))
-                .count();
-            assert_eq!(writer.shutdown(Duration::from_secs(5)), Shutdown::Drained);
-            assert!(
-                session.inner.store.read(|_| ()).is_err(),
-                "the read really fails"
-            );
-            session.set_mode(Mode::AcceptEdits);
-            assert_eq!(
-                session.inner.wanted_mode.get(),
-                Mode::Ask,
-                "initial Ask is mapped to Plan without the hook"
-            );
-            assert_eq!(session.inner.safe_mode.get(), Mode::Ask);
-            assert_eq!(session.status().mode, Mode::Plan);
-            assert_eq!(session.inner.open.borrow().mode, Mode::Plan);
-            assert_eq!(session.inner.deferred_mode.get(), None);
-            assert_eq!(session.inner.pending_handoff.borrow().as_ref(), None);
-            assert_eq!(session.inner.generation.get(), generation);
-            assert_eq!(session.launch_spec().argv, argv);
-            assert!(session.status().running_turn);
-            assert_eq!(session.inner.queued_prompts.borrow().len(), 1);
-            assert_eq!(
-                seen.borrow()
-                    .iter()
-                    .filter(|e| matches!(e.event, Event::ModeChosen { .. }))
-                    .count(),
-                chosen
-            );
-            assert!(has(&seen, |e| matches!(e, Event::Error { message }
-                if message.contains("Could not read the unfinished task to continue"))));
         });
     }
 
@@ -11049,11 +11180,24 @@ mod tests {
         });
     }
 
+    /// The canary found the hook not gating agy: the thread is forced into dangerous permissive
+    /// mode in place.
     fn hook_missing_error(seen: &Seen) -> bool {
-        has(
-            seen,
-            |e| matches!(e, Event::Error { message } if message.contains("approval hook is not active")),
-        )
+        has(seen, |e| {
+            matches!(e, Event::PermissionsForced { reason: Some(_) })
+        })
+    }
+
+    /// The hook proves for the start, then stops proving: the canary's fresh proof fails.
+    fn proof_holds_then_fails() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        set_test_hook_check(std::sync::Arc::new(move |_| {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Ok(())
+            } else {
+                Err("a hook file appeared".to_owned())
+            }
+        }));
     }
 
     /// Real agy 1.4 step frames, fed through the adapter: each of these steps runs unasked if
@@ -11088,6 +11232,7 @@ mod tests {
                     "tool_info": {"parameters": params}}})
             .to_string();
             in_loop(|ctx| {
+                proof_holds_then_fails();
                 let tmp = tempfile::tempdir().expect("tmp");
                 let store = Rc::new(Store::open_in_memory().expect("store"));
                 let thread = fresh(&store, "/w");
@@ -11112,15 +11257,18 @@ mod tests {
         }
     }
 
+    /// A step with no hook query whose hook no longer proves: agy is never stopped or restarted.
+    /// It carries on, the thread forced into dangerous permissive mode in place, and the user's
+    /// own mode is kept.
     #[test]
-    fn a_tool_with_no_hook_query_stops_agy_and_restarts_it_read_only() {
+    fn a_tool_with_no_hook_query_forces_agy_in_place_and_never_restarts_it() {
         in_loop(|ctx| {
+            proof_holds_then_fails();
             let tmp = tempfile::tempdir().expect("tmp");
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, "/w");
             let (sink, seen) = make_sink();
             let handle = bound_handle(tmp.path());
-            let socket = handle.socket_path().to_owned();
             let open = scripted(tmp.path(), &format!("echo '{STEP}'\nexec sleep 30"));
             let session = ChatSession::new(
                 Box::new(AgyAdapter::new("agy")),
@@ -11135,24 +11283,157 @@ mod tests {
                 pump_until(ctx, 15, || hook_missing_error(&seen)),
                 "no canary"
             );
-            assert!(pump_until(ctx, 15, || {
-                lines(tmp.path().join("args.log")).len() == 2
-            }));
+            // Give a restart, were there one, time to show up.
+            pump_until(ctx, 1, || false);
             let args = lines(tmp.path().join("args.log"));
-            assert!(
-                args[0].contains("--dangerously-skip-permissions"),
-                "{args:?}"
+            assert_eq!(args.len(), 1, "agy was restarted: {args:?}");
+            assert!(session.status().alive, "agy was stopped");
+            assert_eq!(session.status().mode, Mode::Ask, "the user's mode is kept");
+            session.shutdown(false);
+        });
+    }
+
+    /// A Claude script that exits on its first launch (`first_exit`) and stays up afterwards.
+    fn exits_once(dir: &Path, first_exit: i32) -> OpenSession {
+        scripted(
+            dir,
+            &format!(
+                "if [ \"$(wc -l < \"$D/args.log\")\" -le 1 ]; then exit {first_exit}; fi\n\
+                 echo '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"model\":\"m\"}}'\n\
+                 exec sleep 30"
+            ),
+        )
+    }
+
+    fn not_running_error(seen: &Seen) -> bool {
+        has(
+            seen,
+            |e| matches!(e, Event::Error { message } if message.contains("not running")),
+        )
+    }
+
+    /// The agent exited on its own; the user then picks a mode. The agent starts again in it,
+    /// as a message would start it, and the thread never says "The agent is not running".
+    #[test]
+    fn a_mode_picked_on_a_stopped_agent_starts_it_in_that_mode() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let session = ChatSession::new(
+                Box::new(agent_core::claude::ClaudeAdapter::new()),
+                exits_once(tmp.path(), 0),
+                store,
+                thread,
+                sink,
+                None,
             );
             assert!(
-                !args[1].contains("--dangerously-skip-permissions"),
-                "{args:?}"
+                pump_until(ctx, 10, || !session.status().alive),
+                "never exited"
             );
-            assert!(args[1].contains("--mode plan"), "{args:?}");
-            let socks = lines(tmp.path().join("sock.log"));
-            assert_eq!(socks[1], "unset", "the restart has no approval socket");
+            ChatBackend::set_mode(&*session, Mode::Plan);
+            let log = tmp.path().join("args.log");
+            assert!(
+                pump_until(ctx, 10, || lines(log.clone()).len() == 2),
+                "the mode change did not start the agent"
+            );
+            assert!(lines(log).last().is_some_and(|a| a.contains("plan")));
+            assert!(!not_running_error(&seen));
             assert_eq!(session.status().mode, Mode::Plan);
+            session.shutdown(false);
+        });
+    }
+
+    /// An agent that exits with an error nobody asked for is started again on its own, resuming
+    /// its session, and the thread says so.
+    #[test]
+    fn an_agent_that_crashes_is_started_again() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let session = ChatSession::new(
+                Box::new(agent_core::claude::ClaudeAdapter::new()),
+                exits_once(tmp.path(), 3),
+                store,
+                thread,
+                sink,
+                None,
+            );
+            let log = tmp.path().join("args.log");
+            assert!(
+                pump_until(ctx, 10, || lines(log.clone()).len() == 2
+                    && session.status().alive),
+                "the crashed agent was not started again"
+            );
+            assert!(has(&seen, |e| matches!(e, Event::Notice { text }
+                if text.contains("exited unexpectedly"))));
+            session.shutdown(false);
+        });
+    }
+
+    /// A second unpaired step forces agy even with its hook still proving; from then on agy
+    /// counts as unable to ask, so a mode the user picks is kept, never sent to the process
+    /// or turned into a restart.
+    #[test]
+    fn a_second_unpaired_step_forces_agy_and_mode_picks_are_kept() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let handle = bound_handle(tmp.path());
+            let session = ChatSession::new(
+                Box::new(AgyAdapter::new("agy")),
+                scripted(tmp.path(), "exec sleep 30"),
+                store,
+                thread,
+                sink,
+                Some(handle),
+            );
+            assert!(pump_until(ctx, 10, || session.status().alive));
+            assert!(!session.inner.ask_unavailable());
+            session.inner.canary_verdict(Ok(()));
+            assert!(!hook_missing_error(&seen), "one miss forced the thread");
+            session.inner.canary_verdict(Ok(()));
+            assert!(hook_missing_error(&seen), "a second miss did not force it");
+            assert!(session.inner.ask_unavailable());
+            let generation = session.inner.generation.get();
+            session.set_mode(Mode::AcceptEdits);
+            assert_eq!(session.status().mode, Mode::AcceptEdits);
+            assert_eq!(session.inner.generation.get(), generation, "no restart");
+            session.shutdown(false);
+        });
+    }
+
+    /// One step with no hook query while the hook still proves installed is taken for a pairing
+    /// the app missed: agy carries on, gated as before, and the thread is not forced.
+    #[test]
+    fn one_unpaired_step_with_a_proven_hook_carries_on() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let handle = bound_handle(tmp.path());
+            let open = scripted(tmp.path(), &format!("echo '{STEP}'\nexec sleep 30"));
+            let session = ChatSession::new(
+                Box::new(AgyAdapter::new("agy")),
+                open,
+                store,
+                thread,
+                sink,
+                Some(handle),
+            );
+            session.set_canary_grace(Duration::from_millis(100));
+            pump_until(ctx, 2, || false);
+            assert!(!hook_missing_error(&seen), "one miss forced the thread");
+            assert_eq!(lines(tmp.path().join("args.log")).len(), 1);
             assert!(session.status().alive);
-            assert!(!socket.exists(), "the approval socket is closed");
+            session.shutdown(false);
         });
     }
 
@@ -11217,6 +11498,7 @@ mod tests {
     #[test]
     fn a_step_that_ran_and_failed_with_no_hook_query_still_trips_the_canary() {
         in_loop(|ctx| {
+            proof_holds_then_fails();
             let tmp = tempfile::tempdir().expect("tmp");
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, "/w");
@@ -11253,14 +11535,7 @@ mod tests {
                 pump_until(ctx, 15, || hook_missing_error(&seen)),
                 "the canary let a step that ran unasked pass"
             );
-            assert!(pump_until(ctx, 15, || {
-                lines(tmp.path().join("args.log")).len() == 2
-            }));
-            let args = lines(tmp.path().join("args.log"));
-            assert!(
-                !args[1].contains("--dangerously-skip-permissions"),
-                "{args:?}"
-            );
+            assert_eq!(lines(tmp.path().join("args.log")).len(), 1, "no restart");
             session.shutdown(false);
         });
     }
@@ -11529,6 +11804,8 @@ mod tests {
         let tripped = Cell::new(false);
         in_loop(|ctx| {
             use std::io::Write as _;
+            // An unpaired step re-proves the hook; a failing proof is what trips it.
+            proof_holds_then_fails();
             let tmp = tempfile::tempdir().expect("tmp");
             let store = Rc::new(Store::open_in_memory().expect("store"));
             let thread = fresh(&store, "/w");
@@ -11672,11 +11949,14 @@ mod tests {
         let unbound = hookless_text(Some("the running binary was replaced on disk; restart"));
         assert!(unbound.contains("installed, but the running binary was replaced"));
         assert!(!unbound.contains("hooks.json"), "{unbound}");
-        assert!(unbound.contains("applies file edits"));
+        assert!(unbound.contains("dangerous permissive mode"));
     }
 
+    /// Hookless agy runs forced into dangerous permissive mode: every launch carries the skip
+    /// flag alone, a mode the user picks is kept (stored and shown) without a restart, and a
+    /// model switch keeps it.
     #[test]
-    fn hookless_agy_takes_plan_and_accept_edits_as_flags_but_never_ask() {
+    fn hookless_agy_runs_forced_and_keeps_every_mode_the_user_picks() {
         in_loop(|ctx| {
             let tmp = tempfile::tempdir().expect("tmp");
             let store = Rc::new(Store::open_in_memory().expect("store"));
@@ -11687,44 +11967,33 @@ mod tests {
                 &store,
                 &thread,
             );
-            // Asked for Ask (the scripted session's mode): Plan, and the user is told why.
-            assert_eq!(session.status().mode, Mode::Plan);
-            assert!(has(
-                &seen,
-                |e| matches!(e, Event::Notice { text } if text.contains("cannot ask you before acting"))
-            ));
+            assert_eq!(session.status().mode, Mode::Ask);
+            assert!(has(&seen, |e| matches!(
+                e,
+                Event::PermissionsForced { reason: Some(_) }
+            )));
             assert!(pump_until(ctx, 10, || lines(tmp.path().join("args.log"))
                 .len()
                 == 1));
 
-            // Accept edits goes to agy's own flag, through a respawn.
-            session.set_mode(Mode::AcceptEdits);
-            assert_eq!(session.status().mode, Mode::AcceptEdits);
+            for mode in [Mode::AcceptEdits, Mode::Plan, Mode::Ask] {
+                session.set_mode(mode);
+                assert_eq!(session.status().mode, mode);
+                assert_eq!(session.inner.wanted_mode.get(), mode);
+            }
+            assert_eq!(lines(tmp.path().join("args.log")).len(), 1, "no restart");
+
+            // A model switch (respawn) keeps the mode, and the launch stays forced.
+            session.switch(Driver::Agy, Some("gemini-flash".into()), None);
+            assert_eq!(session.status().mode, Mode::Ask);
             assert!(pump_until(ctx, 10, || lines(tmp.path().join("args.log"))
                 .len()
                 == 2));
-
-            // Ask is refused and changes nothing.
-            session.set_mode(Mode::Ask);
-            assert_eq!(session.status().mode, Mode::AcceptEdits);
-            assert!(has(
-                &seen,
-                |e| matches!(e, Event::Notice { text } if text.contains("cannot ask before edits"))
-            ));
-            // A model switch (respawn) keeps the mode.
-            session.switch(Driver::Agy, Some("gemini-flash".into()), None);
-            assert_eq!(session.status().mode, Mode::AcceptEdits);
-            assert!(pump_until(ctx, 10, || lines(tmp.path().join("args.log"))
-                .len()
-                == 3));
-
             let args = lines(tmp.path().join("args.log"));
-            assert!(args[0].contains("--mode plan"), "{args:?}");
-            assert!(args[1].contains("--mode accept-edits"), "{args:?}");
-            assert!(args[2].contains("--mode accept-edits"), "{args:?}");
             assert!(
                 args.iter()
-                    .all(|a| !a.contains("--dangerously-skip-permissions")),
+                    .all(|a| a.contains("--dangerously-skip-permissions")
+                        && !a.split(' ').any(|w| w == "--mode")),
                 "{args:?}"
             );
         });

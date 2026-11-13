@@ -424,10 +424,6 @@ impl ChatView {
         let model = inner.model.borrow();
         inner.plan.set(&model.plan);
         inner.header.set_gauge(model.gauge.as_ref());
-        if let Some(mode) = model.mode {
-            inner.header.set_mode(mode);
-        }
-        inner.header.set_pending_mode(model.pending_mode);
         inner.header.set_extra_access(model.extra_access());
         inner.composer.set_history(model.user_messages());
         drop(model);
@@ -715,15 +711,12 @@ impl Inner {
                 Change::Gauge => self.header.set_gauge(self.model.borrow().gauge.as_ref()),
                 Change::Mode => {
                     let mode = self.model.borrow().mode;
-                    if let Some(mode) = mode {
-                        self.header.set_mode(mode);
-                    }
                     // Entering dangerous permissive mode answers the workers already waiting.
+                    // A forced one never does: the user did not choose it.
                     if mode == Some(Mode::Bypass) {
                         self.queue_worker_flush();
                     }
-                    self.header
-                        .set_pending_mode(self.model.borrow().pending_mode);
+                    self.sync_mode_header(self.backend.status().mode);
                 }
                 Change::Running => self.refresh_status(),
                 Change::Workers => {
@@ -1090,15 +1083,21 @@ impl Inner {
         self.refresh_background(&own, &agents);
         self.composer.set_running(running, stop_note.as_deref());
         self.refresh_agent_chip();
-        self.header
-            .set_mode(self.model.borrow().mode.unwrap_or(status.mode));
-        self.header
-            .set_pending_mode(self.model.borrow().pending_mode);
+        self.sync_mode_header(status.mode);
         self.header
             .gauge
             .set_sensitive(status.capabilities.context_usage);
         self.refresh_interruption();
         self.composer.refresh_placeholder();
+    }
+
+    /// The mode picker as the model has it: its mode (else `fallback`), the next turn's, and the
+    /// forced lock last, so nothing that redraws the mode clears the lock.
+    fn sync_mode_header(&self, fallback: Mode) {
+        let model = self.model.borrow();
+        self.header.set_mode(model.mode.unwrap_or(fallback));
+        self.header.set_pending_mode(model.pending_mode);
+        self.header.set_forced(model.forced.as_deref());
     }
 
     fn refresh_agent_chip(&self) {
@@ -1190,7 +1189,9 @@ impl Inner {
             self.refresh_status();
             return false;
         }
-        if mode == Mode::Ask {
+        // Forced into dangerous permissive mode, any mode is kept for later, and nothing restarts.
+        let forced = self.model.borrow().forced.is_some();
+        if mode == Mode::Ask && !forced {
             if let Some(note) = caps.unsupported_note(
                 agent_core::caps::Feature::LiveApprovals,
                 self.backend.status().driver.info().label,
@@ -1201,7 +1202,7 @@ impl Inner {
                 return false;
             }
         }
-        if mode_change_asks_first(&status, mode) {
+        if !forced && mode_change_asks_first(&status, mode) {
             self.refresh_status();
             let weak = Rc::downgrade(self);
             header::confirm_mode_switch(&self.header.mode, move || {

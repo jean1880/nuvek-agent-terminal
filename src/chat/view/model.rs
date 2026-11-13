@@ -824,6 +824,9 @@ pub struct Transcript {
     pub gauge: Option<Gauge>,
     pub mode: Option<Mode>,
     pub pending_mode: Option<Mode>,
+    /// Why the agent runs in dangerous permissive mode whatever `mode` says
+    /// ([`Event::PermissionsForced`]); `mode` stays the user's choice.
+    pub forced: Option<String>,
     pub running: bool,
     /// Background work still going (sub-agents, background commands), as the agent last listed
     /// it: the main turn may be over while these run.
@@ -2304,6 +2307,10 @@ impl Transcript {
             } => {
                 self.mode = Some(*effective);
                 self.pending_mode = Some(*requested);
+                out.push(Change::Mode);
+            }
+            Event::PermissionsForced { reason } => {
+                self.forced.clone_from(reason);
                 out.push(Change::Mode);
             }
             Event::UsageUpdated {

@@ -1721,6 +1721,7 @@ mod tests {
             resume: None,
             new_session_id: Some("s-1".into()),
             approval_hook: false,
+            forced_permissive: false,
             delegation: None,
         }
     }

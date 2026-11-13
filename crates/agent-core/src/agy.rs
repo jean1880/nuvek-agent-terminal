@@ -593,6 +593,12 @@ impl Adapter for AgyAdapter {
         }
         let plan = || ["--mode", "plan"].map(str::to_owned);
         let accept_edits = || ["--mode", "accept-edits"].map(str::to_owned);
+        // No hook gates it and the thread says so: agy acts without asking, whatever the mode,
+        // rather than running in a mode that cannot run a command.
+        if session.forced_permissive && !session.approval_hook {
+            argv.push(SKIP_PERMISSIONS.to_owned());
+            return argv;
+        }
         match (session.mode, session.approval_hook) {
             // Bypass is the hook allowing everything: with no hook to do it, the session never
             // asks for it, and the strictest launch is the fallback.
@@ -1183,6 +1189,7 @@ mod tests {
             resume: Some("conv-1".into()),
             new_session_id: None,
             approval_hook: hook,
+            forced_permissive: false,
             delegation: None,
         }
     }

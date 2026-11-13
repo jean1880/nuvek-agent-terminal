@@ -58,7 +58,21 @@ impl DelegationHooks for Hooks {
                 return Ok(());
             }
             let generation = facts.generation;
-            let epoch = sup.epoch(&worker).map_err(|e| e.message)?;
+            // A revocation still settling (the exit of the process this start replaces) is
+            // waited for, briefly, rather than failing the start: it ends on its own.
+            let started = std::time::Instant::now();
+            let epoch = loop {
+                match sup.epoch(&worker) {
+                    Ok(epoch) => break epoch,
+                    Err(e)
+                        if e.code == agent_core::delegation::ErrorCode::StaleEpoch
+                            && started.elapsed() < std::time::Duration::from_secs(5) =>
+                    {
+                        glib::timeout_future(std::time::Duration::from_millis(25)).await;
+                    }
+                    Err(e) => return Err(e.message),
+                }
+            };
             let valid = |sup: &Supervisor, epoch| {
                 let state = sup.state.borrow();
                 state
@@ -202,6 +216,29 @@ impl DelegationHooks for Hooks {
         let epoch = sup.epoch(&self.worker).ok()?;
         let mut state = sup.state.borrow_mut();
         let w = state.workers.get_mut(&self.worker)?;
+        // The launch is the truth: a root started on another agent than its record names (a
+        // switch that never told the supervisor) runs that agent, unbound, and is judged as it
+        // from now on, never by the rules of the agent it left.
+        if w.driver != driver && w.row.parent_id.is_none() {
+            tracing::warn!(worker = %self.worker, recorded = ?w.driver, launched = ?driver,
+                "a root launched another agent than its record; it starts unbound");
+            w.driver = driver;
+            w.row.driver = super::supervisor::enum_value(&driver);
+            w.registration_off = true;
+            w.switch_original = None;
+            w.token = None;
+            w.row.delegation_status = "unavailable".into();
+            let stale = [
+                w.staged.take().and_then(|b| b.overlay),
+                w.pending_overlay.take(),
+            ];
+            drop(state);
+            for path in stale.into_iter().flatten() {
+                gio::spawn_blocking(move || super::launch::unlink_overlay(&path));
+            }
+            sup.notify_registry();
+            return None;
+        }
         if w.driver != driver
             || w.staged.as_ref()?.generation != generation
             || w.staged.as_ref()?.worker != self.worker

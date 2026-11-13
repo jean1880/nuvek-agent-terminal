@@ -1042,6 +1042,7 @@ mod tests {
                 effective_home: None,
                 config_redirect_vars: vec![],
                 hook_proven: false,
+                forced_permissive: false,
             };
             sup.state
                 .borrow_mut()
@@ -1145,6 +1146,7 @@ mod tests {
                 effective_home: None,
                 config_redirect_vars: vec![],
                 hook_proven: false,
+                forced_permissive: false,
             };
             let hooks = super::super::attest::Hooks {
                 supervisor: Rc::downgrade(&sup),
@@ -1195,6 +1197,7 @@ mod tests {
                 resume: None,
                 new_session_id: None,
                 approval_hook: false,
+                forced_permissive: false,
                 delegation: None,
             };
             let session = ChatSession::with_options(
@@ -1233,8 +1236,15 @@ mod tests {
                 sup.recheck_agy(&root).await.unwrap_err().code,
                 ErrorCode::WorkspaceUntrusted
             );
-            pump_until(|| sup.state.borrow().workers[&root].generations.is_empty()).await;
+            // The root's delegation fails, never its agent: its token ends, it is unbound, and
+            // its process keeps running.
             assert!(sup.state.borrow().workers[&root].token.is_none());
+            assert!(sup.state.borrow().workers[&root].registration_off);
+            assert!(
+                crate::chat::ChatBackend::status(&*session).alive,
+                "the root's agent was stopped"
+            );
+            session.shutdown(false);
             stop(&sup).await;
         });
     }
@@ -1292,6 +1302,7 @@ mod tests {
             resume: None,
             new_session_id: None,
             approval_hook: false,
+            forced_permissive: false,
             delegation: None,
         };
         let session = ChatSession::with_options(

@@ -3646,9 +3646,15 @@ impl Inner {
                 && inner.startable_now()
                 && !inner.wakes_held.get()
                 && !inner.limit_waiting.get()
-                && inner.start_unasked()
             {
-                inner.dispatch_queue_after_restart();
+                if inner.start_unasked() {
+                    inner.dispatch_queue_after_restart();
+                } else {
+                    // Promised a restart: one its supervisor held back is said, not dropped.
+                    inner.notice(
+                        "The agent could not be started again yet; send a message to start it.",
+                    );
+                }
             }
         });
     }
@@ -3955,12 +3961,12 @@ impl Inner {
 
     /// Starts the stopped agent for something nobody typed a message for (a mode or model
     /// pick, a crash restart). A delegation root first passes its supervisor's gate, which may
-    /// rebind it instead: that rebind then starts it. True when a start is under way.
+    /// rebind it instead: that rebind then starts it. True only when this session now has a
+    /// process or a start of its own to write to.
     fn start_unasked(self: &Rc<Self>) -> bool {
-        if !self.root_prompt_allowed() {
-            return self.rebinding.get() || self.state.borrow().alive;
+        if self.root_prompt_allowed() {
+            self.ensure_alive();
         }
-        self.ensure_alive();
         self.state.borrow().alive || self.starting.borrow().is_some()
     }
 
@@ -4028,8 +4034,25 @@ impl Inner {
         // have no one left to answer.
         if matches!(command, Command::SetModel { .. } | Command::SetMode { .. })
             && self.startable_now()
+            && !self.start_unasked()
         {
-            self.start_unasked();
+            // Nothing started now (a delegation root's supervisor rebinds it first, and that
+            // rebind starts it): the choice is kept for that start, never written to no process.
+            match &command {
+                Command::SetModel { model, effort } => self.apply_delta(&OpenSessionDelta {
+                    model: Some(model.clone()),
+                    effort: effort.clone(),
+                    mode: None,
+                    resume: None,
+                }),
+                Command::SetMode { mode } => {
+                    self.open.borrow_mut().mode = *mode;
+                    self.state.borrow_mut().mode = *mode;
+                    self.emit(Envelope::new(Event::ModeChanged { mode: *mode }));
+                }
+                _ => {}
+            }
+            return true;
         }
         let result = self.adapter.borrow_mut().encode(command);
         match result {

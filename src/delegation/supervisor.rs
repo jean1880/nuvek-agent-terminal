@@ -241,10 +241,11 @@ mod tests {
             }
         });
     }
-    /// `command` picks the fixture profile's driver; `hook_proven` is agy's approval hook.
+    /// `command` picks the fixture profile's driver. (`_hook_proven` is kept for callers; agy runs
+    /// in dangerous permissive mode only, so there is no hook to prove.)
     fn harness_with(
         command: &str,
-        hook_proven: bool,
+        _hook_proven: bool,
     ) -> (tempfile::TempDir, Rc<Supervisor>, WorkerId) {
         let dir = tempfile::tempdir().expect("private directory");
         {
@@ -357,15 +358,6 @@ mod tests {
                     Driver::Agy => Box::new(agent_core::agy::AgyAdapter::new(program)),
                     _ => Box::new(agent_core::claude::ClaudeAdapter::new()),
                 }
-            }),
-            hook_check: Rc::new(move |_| {
-                Box::pin(async move {
-                    if hook_proven {
-                        Ok(())
-                    } else {
-                        Err("not agy".into())
-                    }
-                })
             }),
             tab_open_in: Rc::new(|_| false),
             report: Rc::new(|e| eprintln!("delegation test: {e}")),

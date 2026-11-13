@@ -75,7 +75,7 @@ uninstalling and building from source are in [Installing and uninstalling](docs/
 
 - [Walkthrough](docs/walkthrough.md): the app, step by step, with screenshots
 - [Features](docs/features.md): switching agents, threads, approvals and rules, the git safety net, terminals
-- [Configuration and options](docs/configuration.md): command-line options, environment variables, keyboard shortcuts, settings, profiles and agy's approval hook
+- [Configuration and options](docs/configuration.md): command-line options, environment variables, keyboard shortcuts, settings, profiles and how Antigravity runs
 - [Reference](docs/reference.md): resuming sessions, hand-offs, status indicators, checkpoints, diffs, undo and worktrees
 - [Delegation](docs/delegation/user-guide.md) and [multi-agent environment review](docs/multi-agent-environment-review.md)
 - [Installing and uninstalling](docs/install.md), [Building from source](docs/building.md) and [Troubleshooting](docs/troubleshooting.md)
@@ -92,7 +92,7 @@ privately as described in [SECURITY.md](SECURITY.md).
 - **Logs:** `journalctl --user -t agent-terminal -b`, or run with `RUST_LOG=debug agent-terminal`.
 - **"No AI CLI detected":** install `claude`, `agy` or `codex`, or set its full path in Settings → Agents.
 - **An agent is stuck:** ☰ → **Restart Agent** (`Ctrl+Shift+R`).
-- **agy edits files in Plan mode:** install agy's [approval hook](docs/configuration.md#agys-approval-hook).
+- **agy edits files whatever the mode:** it runs only in [dangerous permissive mode](docs/configuration.md#antigravity-runs-in-dangerous-permissive-mode-only).
 
 More in [Troubleshooting](docs/troubleshooting.md).
 

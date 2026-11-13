@@ -764,40 +764,21 @@ fn mode_within(mode: Mode, ceiling: Mode) -> bool {
 /// before the first check finished). Not "not installed": that is not known yet.
 pub(crate) const HOOK_NOT_CHECKED: &str = "the approval hook has not been checked yet";
 
-/// What hookless agy does, said in every notice about it.
+/// What agy does, said in every notice about it.
 const HOOKLESS_STILL: &str = "It runs in dangerous permissive mode: it runs commands and edits \
-                              files without asking you first, whatever mode you choose. The mode \
-                              picker shows this and stays locked until the hook works; your own \
-                              choice applies again from then on.";
+                              files without asking you first, whatever mode you choose, and the \
+                              mode picker stays locked on it.";
 
 /// Why agy runs forced into dangerous permissive mode when no other reason is known.
-const FORCED_NO_HOOK: &str = "Antigravity's approval hook is not installed";
+const FORCED_NO_HOOK: &str = AGY_PERMISSIVE_ONLY;
 
-/// The notice for agy running without its approval socket: why (`unbound`, when the hook is
-/// installed but the socket could not be used, or [`HOOK_NOT_CHECKED`]; else the hook is
-/// missing), and what it still does.
-fn hookless_text(unbound: Option<&str>) -> String {
-    const STILL: &str = HOOKLESS_STILL;
-    match unbound {
-        Some(HOOK_NOT_CHECKED) => format!(
-            "Antigravity cannot ask you before acting yet: its approval hook has not been checked \
-             yet. {STILL} Once the check has run, switch to Antigravity again (or open a new \
-             thread) to have it ask first."
-        ),
-        Some(reason) if crate::hook_config::verification_refused(reason) => {
-            format!("Antigravity cannot ask you before acting in this thread: {reason}. {STILL}")
-        }
-        Some(reason) => format!(
-            "Antigravity cannot ask you before acting in this thread: its approval hook is \
-             installed, but {reason}. {STILL}"
-        ),
-        None => format!(
-            "Antigravity cannot ask you before acting: the approval hook is not installed. \
-             {STILL} To have it ask you first, add this top-level entry to \
-             ~/.gemini/config/hooks.json:\n{}",
-            crate::hook_config::install_entry_json()
-        ),
-    }
+/// agy runs in dangerous permissive mode only: the app binds it no approval hook.
+pub(crate) const AGY_PERMISSIVE_ONLY: &str = "Antigravity runs only in dangerous permissive mode";
+
+/// The notice for agy: it never asks before acting. (`_unbound`, the old hook's reason, no
+/// longer changes what is said: there is no hook to install or fix.)
+fn hookless_text(_unbound: Option<&str>) -> String {
+    format!("Antigravity cannot ask you before acting. {HOOKLESS_STILL}")
 }
 
 /// A transcript read for one agy `step_update` line: the parsed line and what to look up.
@@ -10485,24 +10466,14 @@ mod tests {
         );
     }
 
+    /// agy's notice says the same thing whatever the old hook's state: it runs in dangerous
+    /// permissive mode only, and nothing asks it to install a hook.
     #[test]
-    fn a_hook_not_checked_yet_is_not_called_missing() {
-        let unchecked = hookless_text(Some(HOOK_NOT_CHECKED));
-        assert!(unchecked.contains("not been checked yet"), "{unchecked}");
-        assert!(!unchecked.contains("not installed"), "{unchecked}");
-        assert!(hookless_text(None).contains("not installed"));
-    }
-
-    #[test]
-    fn a_refused_hook_proof_says_why_without_claiming_it_is_installed() {
-        for reason in [
-            "cannot verify agy's approval hook: ANTIGRAVITY_APP_DATA_DIR is set and may redirect its configuration",
-            crate::hook_config::DIFFERENT_HOME,
-        ] {
-            let text = hookless_text(Some(reason));
-            assert!(text.contains(reason), "{text}");
-            assert!(!text.contains("installed"), "{text}");
+    fn the_agy_notice_says_it_runs_in_dangerous_permissive_mode_only() {
+        for unbound in [None, Some(HOOK_NOT_CHECKED), Some(AGY_PERMISSIVE_ONLY)] {
+            let text = hookless_text(unbound);
             assert!(text.contains("dangerous permissive mode"), "{text}");
+            assert!(!text.contains("hooks.json"), "{text}");
         }
     }
 
@@ -11940,16 +11911,6 @@ mod tests {
             assert_eq!(lines(tmp.path().join("args.log")).len(), 1, "not restarted");
             assert_eq!(session.status().mode, Mode::Ask);
         });
-    }
-
-    #[test]
-    fn an_installed_hook_that_could_not_bind_says_why_not_how_to_install() {
-        let missing = hookless_text(None);
-        assert!(missing.contains("not installed") && missing.contains("hooks.json"));
-        let unbound = hookless_text(Some("the running binary was replaced on disk; restart"));
-        assert!(unbound.contains("installed, but the running binary was replaced"));
-        assert!(!unbound.contains("hooks.json"), "{unbound}");
-        assert!(unbound.contains("dangerous permissive mode"));
     }
 
     /// Hookless agy runs forced into dangerous permissive mode: every launch carries the skip

@@ -464,56 +464,12 @@ or more: `OLLAMA_CONTEXT_LENGTH` for Ollama, the model's context length in LM St
 if it is under 200K, set `CLAUDE_CODE_AUTO_COMPACT_WINDOW` to it in the profile's
 environment file (100K at least) so Claude compacts before the server cuts it off.
 
-## agy's approval hook
+## Antigravity runs in dangerous permissive mode only
 
-`--dangerously-skip-permissions` is agy's name for bypassing its built-in terminal
-permission prompts. Agent Terminal needs that mode only because it is a GUI: agy's
-headless process cannot display and receive its own interactive prompt there. The app
-replaces that prompt path with its local approval hook, so each tool request is sent to
-the thread and waits for your explicit Allow or Deny response. It is not enabled to
-give an agent unasked access to your machine.
-
-With its approval hook installed in `~/.gemini/config/hooks.json` and an approval
-socket live, every tool step agy takes asks the thread first, in the mode you picked.
-
-**Without a working hook, agy runs in dangerous permissive mode, and the thread says
-so.** This happens when the hook is not installed, when a repository holds its own agy
-hooks (`.agents/hooks.json` or `.agents/plugins/<name>/hooks.json`), when a variable
-or flag moves agy's configuration, or when the app finds the hook not asking while agy
-runs. agy then runs commands and edits files without asking anyone. The mode picker is
-locked on **Dangerous permissive (forced)**, with the reason in its tooltip. The mode
-you pick is kept, and applies again from the first start that proves the hook. agy is
-never stopped or switched to Plan for this: it keeps working. Delegated agy sub-agents
-behave the same way, and their declared limits are not enforced while they do.
-
-When the hook seems to miss a tool step while agy runs, the app checks the hook again
-first. If it still proves installed, the miss is ignored once; a second one, or a
-failed check, forces the thread as above.
-
-To install the hook, add this entry as a top-level key of
-`~/.gemini/config/hooks.json`. Settings → Agents shows the same entry, with a Copy
-button and whether it is installed:
-
-```json
-{
-  "agent-terminal-approval": {
-    "PreToolUse": [
-      {
-        "hooks": [
-          {
-            "command": "bash -c '[ -n \"$AGENT_TERMINAL_APPROVAL_SOCKET\" ] || exit 0; exec \"${AGENT_TERMINAL_HOOK_BIN:-agent-terminal}\" --approval-hook'",
-            "timeout": 600,
-            "type": "command"
-          }
-        ],
-        "matcher": ".*"
-      }
-    ]
-  }
-}
-```
-
-The hook does nothing outside Agent Terminal, because the socket variable is unset
-there. The app also checks that the hook really fires: if agy runs a tool without
-asking first, the thread is restarted without `--dangerously-skip-permissions`.
+Headless agy has no working way to ask you before it acts, so Agent Terminal always runs
+it with `--dangerously-skip-permissions`: it runs commands and edits files without
+asking. Its threads say so, and the mode picker is locked on **Dangerous permissive
+(forced)**; the mode you pick is kept, but does not change what agy may do. Delegated agy
+sub-agents run the same way, and their declared limits are not enforced. No approval
+hook needs installing.
 

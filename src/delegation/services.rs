@@ -12,7 +12,6 @@ use agent_kit::store_writer::StoreHandle;
 use super::seam::{LocalFuture, ResolvedChild};
 use crate::account_status::Snapshot;
 use crate::config::Profile;
-use crate::hook_config::HookTarget;
 use crate::model_tags_file::TagsState;
 
 /// The narrow app services the supervisor holds (built from `window::imp::threads`).
@@ -26,7 +25,6 @@ pub(crate) struct AppServices {
     pub profiles: Rc<dyn Fn() -> Vec<Profile>>,
     pub resolve: Rc<ResolveChild>,
     pub make_adapter: Rc<MakeAdapter>,
-    pub hook_check: Rc<HookCheck>,
     pub tab_open_in: Rc<dyn Fn(&Path) -> bool>,
     pub report: Rc<dyn Fn(&str)>,
     /// Models, tags and usage for `cross_agent_capabilities`.
@@ -85,8 +83,6 @@ impl Default for CatalogServices {
 pub(crate) type ResolveChild = dyn Fn(&Profile) -> Option<ResolvedChild>;
 /// `threads::make_adapter`, as a service.
 pub(crate) type MakeAdapter = dyn Fn(Driver, &str) -> Box<dyn Adapter>;
-/// `threads::check_hook`, as a service.
-pub(crate) type HookCheck = dyn Fn(HookTarget) -> LocalFuture<Result<(), String>>;
 
 impl AppServices {
     /// A read on its own connection, after the writer's barrier (`threads::store_job`).

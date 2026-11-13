@@ -26,8 +26,8 @@ thread's agent process and starts it again on the same conversation. Queued prom
 dropped. It also picks up changes to the agent's settings, environment file, MCP servers
 or hooks.
 
-**agy edits files in Plan mode.** It does, without its approval hook. Install the
-[hook](configuration.md#agys-approval-hook).
+**agy edits files whatever the mode.** It does: agy runs only in
+[dangerous permissive mode](configuration.md#antigravity-runs-in-dangerous-permissive-mode-only).
 
 **My local build doesn't start / opens another copy.** Agent Terminal is
 single-instance. If another copy is running, a new launch hands over to it and exits.

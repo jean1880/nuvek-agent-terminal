@@ -951,13 +951,9 @@ impl Supervisor {
     ) -> Result<(), ToolError> {
         let bridge = self.services.bridge_command.clone();
         let limits = self.limits;
-        // agy with no proven hook runs forced into dangerous permissive mode (the skip flag
-        // without the hook): it asks nothing, so the hookless allow rules have nothing to do.
-        let forced = !facts.hook_proven
-            && facts
-                .argv
-                .iter()
-                .any(|a| a == "--dangerously-skip-permissions");
+        // agy with no proven hook runs forced into dangerous permissive mode: it asks nothing, so
+        // the hookless allow rules have nothing to do.
+        let forced = facts.forced_permissive;
         gio::spawn_blocking(move || {
             let home = facts
                 .effective_home

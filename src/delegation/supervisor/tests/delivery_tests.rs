@@ -555,6 +555,7 @@ fn a_sibling_closed_during_the_launch_proof_leaves_the_launch_allowed() {
                 effective_home: Some(dir.path().to_owned()),
                 config_redirect_vars: vec![],
                 hook_proven: true,
+                forced_permissive: false,
             };
             let hooks = crate::delegation::attest::Hooks {
                 supervisor: Rc::downgrade(&sup),

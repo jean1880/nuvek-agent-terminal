@@ -1042,6 +1042,7 @@ mod tests {
                 effective_home: None,
                 config_redirect_vars: vec![],
                 hook_proven: false,
+                forced_permissive: false,
             };
             sup.state
                 .borrow_mut()
@@ -1145,6 +1146,7 @@ mod tests {
                 effective_home: None,
                 config_redirect_vars: vec![],
                 hook_proven: false,
+                forced_permissive: false,
             };
             let hooks = super::super::attest::Hooks {
                 supervisor: Rc::downgrade(&sup),

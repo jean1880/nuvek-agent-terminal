@@ -483,6 +483,9 @@ struct Inner {
     /// `None`: it does not. Worked out again at every start (`launch_spec`), and set in place
     /// when the canary finds the hook not gating a running process.
     forced: RefCell<Option<String>>,
+    /// The view has been told `forced` once: the first launch always says it, so a reopened
+    /// thread whose stored history was forced is unlocked when its agent is not.
+    forced_told: Cell<bool>,
     /// Tool steps of this process seen without a hook query while its hook still proved
     /// installed: the second one forces the process.
     canary_misses: Cell<u32>,
@@ -1066,6 +1069,7 @@ impl ChatSession {
             watches: RefCell::new(Vec::new()),
             rebinding: Cell::new(false),
             forced: RefCell::new(None),
+            forced_told: Cell::new(false),
             canary_misses: Cell::new(0),
             crash_restarts: Cell::new(0),
             interrupted: Cell::new(false),
@@ -1458,7 +1462,7 @@ impl Inner {
     /// Records whether the agent runs forced into dangerous permissive mode, and tells the view
     /// when that changed (the picker locks or unlocks; the chosen mode is kept either way).
     fn set_forced(&self, reason: Option<String>) {
-        if *self.forced.borrow() == reason {
+        if self.forced_told.replace(true) && *self.forced.borrow() == reason {
             return;
         }
         if let Some(why) = &reason {
@@ -1600,7 +1604,6 @@ impl Inner {
             } => {
                 // The agent is up: a switch to it can no longer roll back.
                 *self.rollback.borrow_mut() = None;
-                self.crash_restarts.set(0);
                 self.provider_session_up.set(Some(self.generation.get()));
                 self.confirm_carried();
                 self.confirm_switch();
@@ -2351,6 +2354,12 @@ impl Inner {
 
     fn spawn_generation(self: &Rc<Self>, generation: u64) {
         let spec = self.launch_spec();
+        // Building the launch can tell the sink something (`set_forced`), which may start, stop
+        // or replace this process: only a start still the session's spawns. (`stopping` is no
+        // test here: a restart made while stopping, the thinking retry's, is still its own.)
+        if self.generation.get() != generation {
+            return;
+        }
         self.spawn_spec(generation, spec);
     }
 
@@ -2407,6 +2416,7 @@ impl Inner {
                     .argv
                     .iter()
                     .any(|arg| arg == "--dangerously-skip-permissions"),
+            forced_permissive: self.open.borrow().forced_permissive,
         };
         *self.starting.borrow_mut() = Some(PendingStart {
             generation,
@@ -3557,10 +3567,10 @@ impl Inner {
             Err(reason) => format!("Antigravity's approval hook is not working: {reason}"),
         };
         warn!(%reason, "agy is not gated by its hook; it carries on in dangerous permissive mode");
-        self.notice(format!(
-            "{reason}. Antigravity keeps working. {HOOKLESS_STILL}"
-        ));
+        let text = format!("{reason}. Antigravity keeps working. {HOOKLESS_STILL}");
+        // Forced first: anything the notice reaches already sees it.
         self.set_forced(Some(reason));
+        self.notice(text);
     }
 
     fn on_exit(self: &Rc<Self>, generation: u64, code: Option<i32>) {
@@ -3620,18 +3630,24 @@ impl Inner {
             delay,
             "the agent exited with an error; restarting it"
         );
+        // Read before anything is said: a sink may start or stop something meanwhile.
+        let generation = self.generation.get();
         self.notice(format!(
             "The agent exited unexpectedly (code {}); starting it again in {delay} s.",
             code.unwrap_or_default()
         ));
-        let generation = self.generation.get();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             glib::timeout_future(Duration::from_secs(delay)).await;
             let Some(inner) = weak.upgrade() else { return };
-            // Anything that happened meanwhile (a start, a switch, a close) owns it now.
-            if inner.generation.get() == generation && inner.startable_now() {
-                inner.ensure_alive();
+            // Anything that happened meanwhile (a start, a switch, a close, the user's Stop, a
+            // usage limit) owns it now.
+            if inner.generation.get() == generation
+                && inner.startable_now()
+                && !inner.wakes_held.get()
+                && !inner.limit_waiting.get()
+                && inner.start_unasked()
+            {
                 inner.dispatch_queue_after_restart();
             }
         });
@@ -3922,9 +3938,9 @@ impl Inner {
     }
 
     /// No process, none starting, and nothing that owns the next start (idle suspension, a
-    /// rebind, a switch reading the thread, a close, a delegated worker's supervisor, a
-    /// delegation root's rebind gate): the app may start the agent itself for what the user just
-    /// asked of it, as a message would.
+    /// rebind, a switch reading the thread, a close, a delegated worker's supervisor): the app
+    /// may start the agent itself for what the user just asked of it, as a message would. Pure:
+    /// it asks the supervisor nothing ([`Self::start_unasked`] does, once it has decided).
     fn startable_now(&self) -> bool {
         !self.state.borrow().alive
             && self.proc.borrow().is_none()
@@ -3935,7 +3951,17 @@ impl Inner {
             && !self.closing.get()
             && !self.stopping.get()
             && self.child.is_none()
-            && self.root_prompt_allowed()
+    }
+
+    /// Starts the stopped agent for something nobody typed a message for (a mode or model
+    /// pick, a crash restart). A delegation root first passes its supervisor's gate, which may
+    /// rebind it instead: that rebind then starts it. True when a start is under way.
+    fn start_unasked(self: &Rc<Self>) -> bool {
+        if !self.root_prompt_allowed() {
+            return self.rebinding.get() || self.state.borrow().alive;
+        }
+        self.ensure_alive();
+        self.state.borrow().alive || self.starting.borrow().is_some()
     }
 
     /// A dead process (agy after an interrupt) is restarted resuming its native session.
@@ -4003,7 +4029,7 @@ impl Inner {
         if matches!(command, Command::SetModel { .. } | Command::SetMode { .. })
             && self.startable_now()
         {
-            self.ensure_alive();
+            self.start_unasked();
         }
         let result = self.adapter.borrow_mut().encode(command);
         match result {
@@ -4207,7 +4233,8 @@ impl Inner {
     /// agy with no approval handle: Plan and Accept edits go to its `--mode` flag, but it cannot
     /// ask before acting.
     fn ask_unavailable(&self) -> bool {
-        self.approval().is_none() && self.adapter.borrow().driver() == Driver::Agy
+        (self.approval().is_none() || self.forced.borrow().is_some())
+            && self.adapter.borrow().driver() == Driver::Agy
     }
 
     /// A first word like `/model` or `/compact`: a command for the agent, which it only
@@ -4563,6 +4590,8 @@ impl Inner {
         handoff: Option<Handoff>,
         images: &[PromptImage],
     ) -> bool {
+        // A new prompt: an earlier interrupt no longer explains an exit.
+        self.interrupted.set(false);
         // New Local settings first: their restart is a planned rotation for a delegation root,
         // which the rebind gate below then binds again before the prompt goes.
         if !self.prepare_local_context() {
@@ -5129,8 +5158,9 @@ impl Inner {
             self.open.borrow_mut().mode = mode;
             self.state.borrow_mut().mode = mode;
             self.emit(Envelope::new(Event::ModeChanged { mode }));
-            self.ensure_alive();
-            self.dispatch_queue_after_restart();
+            if self.start_unasked() {
+                self.dispatch_queue_after_restart();
+            }
             return;
         }
         let restarts = self.adapter.borrow().capabilities().mode_change_restarts;
@@ -5602,6 +5632,11 @@ impl Inner {
             .is_some_and(|c| !c.prepared);
         if unprepared {
             self.switch_continuation.borrow_mut().take();
+        }
+        if state == TurnState::Completed {
+            // A completed turn proves the agent works: crash restarts count from zero again (a
+            // session start does not, since an agent may crash right after it).
+            self.crash_restarts.set(0);
         }
         if state == TurnState::Completed && self.prompted.get() {
             // The agent works again: a "Continue in" asked while it was stopped is moot.
@@ -11313,6 +11348,40 @@ mod tests {
             );
             assert!(has(&seen, |e| matches!(e, Event::Notice { text }
                 if text.contains("exited unexpectedly"))));
+            session.shutdown(false);
+        });
+    }
+
+    /// A second unpaired step forces agy even with its hook still proving; from then on agy
+    /// counts as unable to ask, so a mode the user picks is kept, never sent to the process
+    /// or turned into a restart.
+    #[test]
+    fn a_second_unpaired_step_forces_agy_and_mode_picks_are_kept() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (sink, seen) = make_sink();
+            let handle = bound_handle(tmp.path());
+            let session = ChatSession::new(
+                Box::new(AgyAdapter::new("agy")),
+                scripted(tmp.path(), "exec sleep 30"),
+                store,
+                thread,
+                sink,
+                Some(handle),
+            );
+            assert!(pump_until(ctx, 10, || session.status().alive));
+            assert!(!session.inner.ask_unavailable());
+            session.inner.canary_verdict(Ok(()));
+            assert!(!hook_missing_error(&seen), "one miss forced the thread");
+            session.inner.canary_verdict(Ok(()));
+            assert!(hook_missing_error(&seen), "a second miss did not force it");
+            assert!(session.inner.ask_unavailable());
+            let generation = session.inner.generation.get();
+            session.set_mode(Mode::AcceptEdits);
+            assert_eq!(session.status().mode, Mode::AcceptEdits);
+            assert_eq!(session.inner.generation.get(), generation, "no restart");
             session.shutdown(false);
         });
     }

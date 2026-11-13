@@ -225,10 +225,18 @@ impl DelegationHooks for Hooks {
             w.driver = driver;
             w.row.driver = super::supervisor::enum_value(&driver);
             w.registration_off = true;
-            let stale = w.staged.take().and_then(|b| b.overlay);
-            if let Some(path) = stale {
+            w.switch_original = None;
+            w.token = None;
+            w.row.delegation_status = "unavailable".into();
+            let stale = [
+                w.staged.take().and_then(|b| b.overlay),
+                w.pending_overlay.take(),
+            ];
+            drop(state);
+            for path in stale.into_iter().flatten() {
                 gio::spawn_blocking(move || super::launch::unlink_overlay(&path));
             }
+            sup.notify_registry();
             return None;
         }
         if w.driver != driver

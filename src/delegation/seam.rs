@@ -233,6 +233,9 @@ pub(crate) struct DelegationLaunchFacts {
     /// Presence only: configuration redirect values may themselves contain secrets.
     pub config_redirect_vars: Vec<String>,
     pub hook_proven: bool,
+    /// The launch runs forced into dangerous permissive mode (agy with no proven hook): it asks
+    /// nothing, so no hookless allow rule applies to it.
+    pub forced_permissive: bool,
 }
 
 pub(crate) trait DelegationHooks {

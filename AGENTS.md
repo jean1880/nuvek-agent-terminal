@@ -184,36 +184,41 @@ Architectural mandates, standards, and workflows for this codebase.
 
 ## 🔒 Security & Robustness
 
-- **agy never runs with `--dangerously-skip-permissions` unless the hook is
-  proven**: the flag is passed only with an approval socket bound after
-  `hook_config::check_installed` accepted the hooks file (`ApprovalHandle::
-  bind_checked`, given the verdict of the off-main-thread `check_hook`; a
-  verdict not yet in is an `Err`). Without it, the mode picker drives agy's own `--mode`
-  flag (Plan, Accept edits) and Ask is unavailable, because headless agy cannot ask. Never
-  describe hookless agy as read-only: verified live, it refuses shell commands without the flag
-  but applies file edits in every mode, Plan included. The adapter strips the flag from
-  profile arguments, and with it `--gemini_dir`/`--app_data_dir` (which move every hook file
-  away from the `$HOME/.gemini` the proof reads). Any workspace `.agents/hooks.json` or
-  `.agents/plugins/<p>/hooks.json`, in the thread directory or an ancestor up to the repository
-  root, refuses the proof. Outside a repository (or under a toplevel that is not its ancestor)
-  every ancestor up to `/` is checked, the same directories as the delegation guard's
-  (`agy_guard::l2_directories`). A cached verdict only binds the socket and drives the UI: every agy
-  process the session starts with the flag first waits for a fresh `check_target`, run off the
-  main thread right before that spawn (`ChatSession`'s `start_process`; writes are held until it
-  is in), and a failed check starts that process hookless. The session's canary restarts agy
-  without the flag if a tool step arrives without a hook query. **Residual risk (not closed):** a
-  hook file created, or a plugin symlink retargeted, after that fresh check and before agy reads
-  its hooks (or while it runs) is not seen by the proof. The canary bounds it: such a hook only
-  matters if it displaces the app's hook, and the first watched tool step (command, edit, MCP,
-  subagent, web) with no hook query restarts agy without the flag after `CANARY_GRACE` (8 s),
-  so that one step can run unasked. Never add a path that sets the flag any other way.
+- **agy asks through its proven hook, or runs forced into dangerous permissive mode, said so;
+  it is never stopped or narrowed for it**: with an approval socket bound after
+  `hook_config::check_installed` accepted the hooks file (`ApprovalHandle::bind_checked`, given
+  the verdict of the off-main-thread `check_hook`; a verdict not yet in is an `Err`), agy gets
+  `--dangerously-skip-permissions` and the app's hook gates every tool step. Without a proven
+  hook (none installed, unbound, a redirect, a workspace `.agents/hooks.json` or
+  `.agents/plugins/<p>/hooks.json` in the thread directory or an ancestor up to the repository
+  root, or every ancestor up to `/` outside one, the same directories as the delegation guard's
+  `agy_guard::l2_directories`), agy still runs with the flag alone (`OpenSession::
+  forced_permissive`, no `--mode`): the thread is **forced** (`Inner::forced`,
+  `Event::PermissionsForced`), the mode picker is locked on "Dangerous permissive (forced)" with
+  the reason, and the user's chosen mode is kept (stored, shown, never narrowed to Plan) for the
+  first start that proves the hook. Forced is not `Mode::Bypass`: it is never chosen, never
+  stored, and never answers sub-agent cards (`allow_worker_requests`). It is worked out again at
+  every launch (`launch_spec`), so it lifts by itself. The adapter strips the flag from profile
+  arguments, and with it `--gemini_dir`/`--app_data_dir` (which move every hook file away from
+  the `$HOME/.gemini` the proof reads). A cached verdict only binds the socket and drives the UI:
+  every agy process the session starts with its socket first waits for a fresh `check_target`,
+  run off the main thread right before that spawn (`ChatSession`'s `start_process`; writes are
+  held until it is in), and a failed check starts that process forced. The canary never stops
+  agy: a tool step with no hook query proves the hook again (`trip_canary`); still proven, the
+  first such step is taken for a missed pairing (`canary_misses`); a second one, or a failed
+  proof, forces the running process in place (`canary_verdict`), turn and queue untouched.
+  **Accepted risk:** a forced agy acts without asking anyone, and a hook planted in a
+  repository, or one never installed, forces it with no question, only the locked picker and a
+  notice. Agent Client Protocol (`agy acp`, per-call `session/request_permission`) is the
+  intended way out of the hook route.
 - **Dangerous permissive mode (`Mode::Bypass`) is confirmed, session-only and never a
   default**: picking it (dropdown or `/mode`) always shows the warning first, and Cancel changes
   nothing. No process starts in it (`ChatSession::with_env` applies `Mode::session_safe`), it is
   never stored as the thread's choice (`ModeChosen` keeps the last safe mode), a fork or handoff
   gets the safe mode, a switch to another agent ends it, and Settings never offers it. Natively:
   Claude `bypassPermissions` (entered by a resumed restart, since a live `setMode` is a no-op),
-  Codex `never` + `dangerFullAccess`, agy the hook allowing everything; hookless agy refuses it.
+  Codex `never` + `dangerFullAccess`, agy the hook allowing everything; hookless agy refuses it
+  (it already runs forced, which is not this mode: see the agy rule above).
   It never propagates to a delegated worker (its task mode stays inside the root's safe mode), but
   while the root is in it, the root's view answers each live worker approval that offers Allow
   (`allow_worker_requests`): once, keeping no rule, through the shelf's own route, so the worker's
@@ -271,6 +276,12 @@ Architectural mandates, standards, and workflows for this codebase.
   approve it. With nothing declared the task mode decides, and the user's shell and edit rules
   reach a writing child within it (`rule_may_apply`); a plan child has no network unless declared.
   `authority::tests::a_declared_limit_is_refused_and_no_rule_reaches_past_it` proves these.
+  **Accepted exception:** an agy child whose hook does not prove runs forced into dangerous
+  permissive mode like a thread does: none of its own tool calls reaches `judge` (no hook asks),
+  so its task mode and declared limits are not enforced; only its `cross_agent_*` bridge calls
+  stay judged. Its launch check accepts that shape (the skip flag with `hook_proven` false needs no
+  hookless allow rules), but still refuses a workspace that plants agy configuration
+  (`agy_l2::scan`), which guards the delegation capability, not the tool gate.
 - **`show_image` shows the user an image file, and reads only what a read may without
   asking**: the bridge's ninth tool (`ToolName::ShowImage`, 1 to 5 paths, a caption each) needs
   no delegation (it is in `DEGRADED_TOOLS`) and is a read for `ChildAuthority::judge`, so a plan
@@ -635,6 +646,16 @@ Architectural mandates, standards, and workflows for this codebase.
   Surface failures to the user rather than dying.
 - **A dead session is not a reason to destroy UI**: a non-zero exit keeps its tab,
   its scrollback and its error message. Only a clean exit closes a tab.
+- **A thread the user did not stop keeps its agent**: a chat agent that exits with a failure
+  nobody asked for is started again, resuming its session, after 2, 10 and 30 s
+  (`restart_after_crash`; never after an interrupt, for a delegated worker, while the thread waits
+  for its usage limit, or into anything that owns the next start), and past that the thread says
+  so. A mode or model picked while the agent is stopped starts it in that choice
+  (`startable_now`), as a message does: "The agent is not running" is never the answer to
+  something the app can do itself. A delegation root's sub-agents failing never stops the root:
+  `fail_worker` revokes its tree and leaves it running unbound, said in the thread. A root
+  launched on another agent than its supervisor record names is judged as the agent it runs
+  (`Hooks::binding` corrects the record and starts it unbound).
 - **Reference integrity**: GTK signal handlers use weak references
   (`glib::clone!` with `#[weak]`) to avoid reference cycles.
 - **Config writes are atomic**: write to a temp file, `sync_all`, then rename.

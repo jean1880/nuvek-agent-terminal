@@ -473,17 +473,22 @@ replaces that prompt path with its local approval hook, so each tool request is 
 the thread and waits for your explicit Allow or Deny response. It is not enabled to
 give an agent unasked access to your machine.
 
-Agent Terminal passes this flag **only** when its approval hook is installed in
-`~/.gemini/config/hooks.json` and an approval socket is live. That condition is
-deliberately strict: if the hook is absent, unavailable, or fails to ask before a tool
-step, the session is restarted without the flag. The hook is a safety boundary, not a
-way to weaken one.
+With its approval hook installed in `~/.gemini/config/hooks.json` and an approval
+socket live, every tool step agy takes asks the thread first, in the mode you picked.
 
-Without the hook, the mode picker drives agy's own `--mode` flag (Plan or Accept
-edits), and **Ask before edits is unavailable**: headless agy has nobody to ask.
-Without the skip flag agy refuses shell commands in every mode, but **it applies
-file edits in every mode, Plan included** (it writes a plan, then carries it out). The
-thread tells you so.
+**Without a working hook, agy runs in dangerous permissive mode, and the thread says
+so.** This happens when the hook is not installed, when a repository holds its own agy
+hooks (`.agents/hooks.json` or `.agents/plugins/<name>/hooks.json`), when a variable
+or flag moves agy's configuration, or when the app finds the hook not asking while agy
+runs. agy then runs commands and edits files without asking anyone. The mode picker is
+locked on **Dangerous permissive (forced)**, with the reason in its tooltip. The mode
+you pick is kept, and applies again from the first start that proves the hook. agy is
+never stopped or switched to Plan for this: it keeps working. Delegated agy sub-agents
+behave the same way, and their declared limits are not enforced while they do.
+
+When the hook seems to miss a tool step while agy runs, the app checks the hook again
+first. If it still proves installed, the miss is ignored once; a second one, or a
+failed check, forces the thread as above.
 
 To install the hook, add this entry as a top-level key of
 `~/.gemini/config/hooks.json`. Settings → Agents shows the same entry, with a Copy

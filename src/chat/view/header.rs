@@ -571,6 +571,28 @@ impl Header {
             ))]);
     }
 
+    /// Locks the mode picker on dangerous permissive mode while the agent runs in it because
+    /// nothing can gate it (`reason`), and unlocks it on `None`; the caller then shows the user's
+    /// own mode again with [`Self::set_mode`].
+    pub fn set_forced(&self, reason: Option<&str>) {
+        match reason {
+            Some(reason) => {
+                self.mode_guard.set(true);
+                self.mode.set_selected(mode_index(Mode::Bypass));
+                self.mode_guard.set(false);
+                self.mode.add_css_class("mode-danger");
+                self.mode.set_sensitive(false);
+                let text = format!("Dangerous permissive (forced): {reason}");
+                self.mode.set_tooltip_text(Some(&text));
+                self.mode
+                    .update_property(&[gtk4::accessible::Property::Label(&format!(
+                        "Interaction mode: {text}"
+                    ))]);
+            }
+            None => self.mode.set_sensitive(true),
+        }
+    }
+
     pub fn set_text_scale(&self, scale: f64) {
         for (breakpoint, width) in self.breakpoints.iter().zip([
             HIDE_ACTIVITY_WORDS_BELOW,

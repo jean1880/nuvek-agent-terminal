@@ -6092,6 +6092,7 @@ impl AgentTerminalWindow {
                 .then(|| glib::uuid_string_random().to_string()),
             resume,
             approval_hook: false,
+            forced_permissive: false,
             delegation: None,
         };
         let adapter = match configured_adapter(driver, &program, &self.config.borrow(), profile) {

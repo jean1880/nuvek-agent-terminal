@@ -93,8 +93,6 @@ enum Overtaken {
     Stop,
     /// An approval card's Stop turn.
     StopTurn,
-    /// agy ran a tool without its hook: the canary restarts it.
-    Canary,
 }
 
 /// A message written for the new agent while the switch waited is never sent to the old one
@@ -102,7 +100,7 @@ enum Overtaken {
 /// user sends again (then it goes, with the new one, to the agent the thread is on).
 #[test]
 fn a_dropped_switch_holds_the_messages_written_for_its_new_agent_and_says_so() {
-    for how in [Overtaken::Stop, Overtaken::StopTurn, Overtaken::Canary] {
+    for how in [Overtaken::Stop, Overtaken::StopTurn] {
         in_loop(|ctx| {
             let s = slow(Driver::Agy);
             s.hold_writer(800);
@@ -116,7 +114,6 @@ fn a_dropped_switch_holds_the_messages_written_for_its_new_agent_and_says_so() {
                         .inner
                         .finish_hook_approval("h1", Decision::Cancel, false);
                 }
-                Overtaken::Canary => s.session.inner.trip_canary(),
             }
             assert!(s.cancelled_notice(), "the user is told ({how:?})");
             // Well past the writer's wait: the switch never happens, nothing is sent.

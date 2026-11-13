@@ -719,11 +719,14 @@ impl Inner {
                         self.header.set_mode(mode);
                     }
                     // Entering dangerous permissive mode answers the workers already waiting.
+                    // A forced one never does: the user did not choose it.
                     if mode == Some(Mode::Bypass) {
                         self.queue_worker_flush();
                     }
                     self.header
                         .set_pending_mode(self.model.borrow().pending_mode);
+                    let forced = self.model.borrow().forced.clone();
+                    self.header.set_forced(forced.as_deref());
                 }
                 Change::Running => self.refresh_status(),
                 Change::Workers => {

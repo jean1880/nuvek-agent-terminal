@@ -49,6 +49,7 @@ pub fn open_session(
         resume: None,
         new_session_id: None,
         approval_hook: false,
+        forced_permissive: false,
         delegation: None,
     }
 }

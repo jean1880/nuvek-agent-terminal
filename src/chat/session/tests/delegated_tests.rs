@@ -1113,7 +1113,7 @@ fn root_prompt_gate_holds_direct_and_automatic_queued_input_without_losing_it() 
 }
 
 #[test]
-fn an_agy_child_never_falls_back_to_a_hookless_process() {
+fn an_agy_child_whose_hook_does_not_prove_runs_forced() {
     for mode in [Mode::Plan, Mode::Ask, Mode::AcceptEdits] {
         in_loop(|ctx| {
             let tmp = tempfile::tempdir().expect("tmp");
@@ -1151,13 +1151,20 @@ fn an_agy_child_never_falls_back_to_a_hookless_process() {
                     }),
                 },
             );
-            assert!(pump_until(ctx, 10, || !session.status().alive));
-            assert_eq!(session.process_generation(), ProcessGeneration(0));
-            assert!(!tmp.path().join("args.log").exists());
-            assert!(has(
-                &seen,
-                |event| matches!(event, Event::Error {message} if message.contains("not started"))
-            ));
+            // It starts, forced into dangerous permissive mode and said so, rather than not at
+            // all: its limits are not enforced while it runs this way.
+            let args = tmp.path().join("args.log");
+            assert!(
+                pump_until(ctx, 10, || args.exists()),
+                "the child never started"
+            );
+            assert!(std::fs::read_to_string(&args)
+                .unwrap_or_default()
+                .contains("--dangerously-skip-permissions"));
+            assert!(has(&seen, |event| matches!(
+                event,
+                Event::PermissionsForced { reason: Some(_) }
+            )));
             session.shutdown(false);
         });
     }

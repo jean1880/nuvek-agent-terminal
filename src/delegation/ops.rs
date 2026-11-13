@@ -909,12 +909,10 @@ impl Supervisor {
             .ok_or_else(|| error(ErrorCode::ProviderUnavailable, "profile unavailable"))?;
         let resolved = (self.services.resolve)(&profile)
             .ok_or_else(|| error(ErrorCode::ProviderUnavailable, "agent unavailable"))?;
-        let hookless = (self.services.hook_check)(crate::hook_config::HookTarget::new(
-            &resolved.env,
-            Some(cwd.clone()),
-        ))
-        .await
-        .is_err();
+        // An agy whose hook does not prove runs forced into dangerous permissive mode (it asks
+        // nothing), so the hookless allow rules are never needed for it: only the workspace and
+        // redirect checks below judge the launch.
+        let hookless = false;
         self.bridge_census_unchanged(worker).await?;
         let limits = self.limits;
         let bridge_command = self.services.bridge_command.clone();
@@ -953,6 +951,13 @@ impl Supervisor {
     ) -> Result<(), ToolError> {
         let bridge = self.services.bridge_command.clone();
         let limits = self.limits;
+        // agy with no proven hook runs forced into dangerous permissive mode (the skip flag
+        // without the hook): it asks nothing, so the hookless allow rules have nothing to do.
+        let forced = !facts.hook_proven
+            && facts
+                .argv
+                .iter()
+                .any(|a| a == "--dangerously-skip-permissions");
         gio::spawn_blocking(move || {
             let home = facts
                 .effective_home
@@ -971,7 +976,7 @@ impl Supervisor {
                     env,
                     physical_cwd: facts.physical_cwd,
                     verified_home: home,
-                    hookless: !facts.hook_proven,
+                    hookless: !facts.hook_proven && !forced,
                 },
                 &limits,
             )

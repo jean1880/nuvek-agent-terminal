@@ -98,6 +98,7 @@ impl HookTarget {
 }
 
 /// These failures must reach the session notice instead of being called a missing installation.
+#[cfg(test)]
 pub fn verification_refused(reason: &str) -> bool {
     reason.starts_with(UNVERIFIED) || matches!(reason, DIFFERENT_HOME | DIFFERENT_DIRECTORY)
 }

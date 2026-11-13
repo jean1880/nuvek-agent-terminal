@@ -109,12 +109,13 @@ fn an_agy_child_gets_its_task_once_its_process_has_started() {
             "the agy task was not delivered: {state} {error:?}"
         );
         assert!(sup.state.borrow().workers[&worker].readback.ready);
+        // agy runs in dangerous permissive mode only: no child approval socket is bound.
         assert!(
-            std::fs::read_dir(dir.path())
+            !std::fs::read_dir(dir.path())
                 .unwrap()
                 .filter_map(Result::ok)
                 .any(|e| e.file_name().to_string_lossy().starts_with("approval-")),
-            "child approval socket must be bound in the supervisor's runtime directory"
+            "an agy child got an approval socket"
         );
         stop(&sup).await;
     });

@@ -597,36 +597,11 @@ impl Supervisor {
                 })??;
         }
         let approval = if spec.driver == Driver::Agy {
-            let resolved = (self.services.resolve)(&spec.profile)
-                .ok_or_else(|| error(ErrorCode::ProviderUnavailable, "agent unavailable"))?;
-            let target = crate::hook_config::HookTarget::new(&resolved.env, Some(spec.cwd.clone()));
-            let home = target.home.clone();
-            let hook = (self.services.hook_check)(target).await;
+            // agy runs only in dangerous permissive mode, a delegated one too: no hook socket,
+            // and its own tool calls are not judged. The workspace check still guards the
+            // delegation capability.
             self.recheck_agy(&spec.worker).await?;
-            match hook {
-                Ok(()) => crate::approval_server::ApprovalHandle::bind_child(
-                    Ok(()),
-                    self.rundir.path(),
-                    &spec.thread,
-                    &spec.cwd,
-                    spec.mode.as_mode(),
-                    home,
-                )
-                .map_err(|_| {
-                    error(
-                        ErrorCode::ProviderUnavailable,
-                        "cannot bind child approval socket",
-                    )
-                })
-                .map(Ok)?,
-                // No proven hook: the child runs forced into dangerous permissive mode, like a
-                // thread does, said so on its card; its own tool calls are then not judged.
-                Err(reason) => {
-                    tracing::warn!(worker = %spec.worker, %reason,
-                        "agy child has no proven hook; it runs forced");
-                    Err(Some(reason))
-                }
-            }
+            Err(Some(crate::chat::session::AGY_PERMISSIVE_ONLY.to_owned()))
         } else {
             Err(None)
         };

@@ -184,33 +184,21 @@ Architectural mandates, standards, and workflows for this codebase.
 
 ## 🔒 Security & Robustness
 
-- **agy asks through its proven hook, or runs forced into dangerous permissive mode, said so;
-  it is never stopped or narrowed for it**: with an approval socket bound after
-  `hook_config::check_installed` accepted the hooks file (`ApprovalHandle::bind_checked`, given
-  the verdict of the off-main-thread `check_hook`; a verdict not yet in is an `Err`), agy gets
-  `--dangerously-skip-permissions` and the app's hook gates every tool step. Without a proven
-  hook (none installed, unbound, a redirect, a workspace `.agents/hooks.json` or
-  `.agents/plugins/<p>/hooks.json` in the thread directory or an ancestor up to the repository
-  root, or every ancestor up to `/` outside one, the same directories as the delegation guard's
-  `agy_guard::l2_directories`), agy still runs with the flag alone (`OpenSession::
-  forced_permissive`, no `--mode`): the thread is **forced** (`Inner::forced`,
-  `Event::PermissionsForced`), the mode picker is locked on "Dangerous permissive (forced)" with
-  the reason, and the user's chosen mode is kept (stored, shown, never narrowed to Plan) for the
-  first start that proves the hook. Forced is not `Mode::Bypass`: it is never chosen, never
-  stored, and never answers sub-agent cards (`allow_worker_requests`). It is worked out again at
-  every launch (`launch_spec`), so it lifts by itself. The adapter strips the flag from profile
-  arguments, and with it `--gemini_dir`/`--app_data_dir` (which move every hook file away from
-  the `$HOME/.gemini` the proof reads). A cached verdict only binds the socket and drives the UI:
-  every agy process the session starts with its socket first waits for a fresh `check_target`,
-  run off the main thread right before that spawn (`ChatSession`'s `start_process`; writes are
-  held until it is in), and a failed check starts that process forced. The canary never stops
-  agy: a tool step with no hook query proves the hook again (`trip_canary`); still proven, the
-  first such step is taken for a missed pairing (`canary_misses`); a second one, or a failed
-  proof, forces the running process in place (`canary_verdict`), turn and queue untouched.
-  **Accepted risk:** a forced agy acts without asking anyone, and a hook planted in a
-  repository, or one never installed, forces it with no question, only the locked picker and a
-  notice. Agent Client Protocol (`agy acp`, per-call `session/request_permission`) is the
-  intended way out of the hook route.
+- **agy runs only in dangerous permissive mode, and every risk of that is accepted**: headless
+  agy has no working way to ask before it acts, so the app never binds it an approval socket
+  (`bind_approval`, and a delegated agy in `child.rs`, both return `AGY_PERMISSIVE_ONLY`). Every
+  agy process, thread or sub-agent, runs with `--dangerously-skip-permissions` alone
+  (`OpenSession::forced_permissive`, no `--mode`). The thread is **forced** (`Inner::forced`,
+  `Event::PermissionsForced`): the mode picker is locked on "Dangerous permissive (forced)", and
+  the user's chosen mode is only kept and stored. Forced is not `Mode::Bypass`: it is never chosen,
+  never stored, and never answers sub-agent cards (`allow_worker_requests`). With no socket, the
+  hook proof and the canary never run. A delegated agy's own tool calls are not judged (its task
+  mode and declared limits are not enforced); only its `cross_agent_*` bridge calls are. The
+  adapter still strips the flag from profile arguments, with `--gemini_dir`/`--app_data_dir`, and
+  the workspace scan (`agy_l2::scan`) still refuses planted agy configuration for delegation,
+  since that guards the delegation capability. The approval-hook code that remains (approval
+  server, `hook_config`, the canary) is the route any hooked process would take, and is
+  exercised by tests only.
 - **Dangerous permissive mode (`Mode::Bypass`) is confirmed, session-only and never a
   default**: picking it (dropdown or `/mode`) always shows the warning first, and Cancel changes
   nothing. No process starts in it (`ChatSession::with_env` applies `Mode::session_safe`), it is
@@ -276,7 +264,7 @@ Architectural mandates, standards, and workflows for this codebase.
   approve it. With nothing declared the task mode decides, and the user's shell and edit rules
   reach a writing child within it (`rule_may_apply`); a plan child has no network unless declared.
   `authority::tests::a_declared_limit_is_refused_and_no_rule_reaches_past_it` proves these.
-  **Accepted exception:** an agy child whose hook does not prove runs forced into dangerous
+  **Accepted exception:** every agy child runs forced into dangerous
   permissive mode like a thread does: none of its own tool calls reaches `judge` (no hook asks),
   so its task mode and declared limits are not enforced; only its `cross_agent_*` bridge calls
   stay judged. Its launch check accepts that shape (the skip flag with `hook_proven` false needs no

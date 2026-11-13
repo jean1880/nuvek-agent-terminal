@@ -694,7 +694,6 @@ impl AgentTerminalWindow {
                 })
             }),
             make_adapter: Rc::new(make_adapter),
-            hook_check: Rc::new(|target| std::boxed::Box::pin(check_hook(target))),
             tab_open_in: Rc::new(tab_open_in),
             report: Rc::new(move |text| {
                 warn!(message = %agent_core::redact::redact(text), "Delegation");

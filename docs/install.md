@@ -49,7 +49,7 @@ Your configuration and data include:
   the rules file it exported to Codex
 
 Your own settings in those tools are kept. Your worktrees and branches are never touched. If you
-pasted [agy's approval hook](configuration.md#agys-approval-hook) into `~/.gemini/config/hooks.json`, remove
+pasted agy's old approval hook (the `agent-terminal-approval` entry) into `~/.gemini/config/hooks.json`, remove
 that entry yourself: it does nothing without Agent Terminal.
 
 Removing the package directly (`sudo apt remove agent-terminal`) keeps every user's

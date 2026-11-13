@@ -600,7 +600,9 @@ pub struct ApprovalHandle {
 }
 
 impl ApprovalHandle {
-    /// Binds under `$XDG_RUNTIME_DIR/agent-terminal` (see [`runtime_dir`]).
+    /// Binds under `$XDG_RUNTIME_DIR/agent-terminal` (see [`runtime_dir`]). Tests only: agy runs
+    /// in dangerous permissive mode only, so no thread binds one.
+    #[cfg(test)]
     pub fn bind_default(thread: &str, workspace: &Path, mode: Mode) -> Result<Self, String> {
         let dir = runtime_dir(std::env::var("XDG_RUNTIME_DIR").ok().as_deref())
             .ok_or_else(|| "XDG_RUNTIME_DIR is not set".to_owned())?;
@@ -824,7 +826,8 @@ impl ApprovalHandle {
     /// [`Self::bind_default`] only when `hook` says agy's hooks file installs the approval hook
     /// (the result of [`crate::hook_config::check_installed`], which reads a file and so is run
     /// off the main thread by the caller). Fail-closed: an `Err` verdict (including "not checked
-    /// yet") binds nothing and means: run agy read-only.
+    /// yet") binds nothing. Tests only, as [`Self::bind_default`].
+    #[cfg(test)]
     pub fn bind_checked(
         hook: Result<(), String>,
         thread: &str,

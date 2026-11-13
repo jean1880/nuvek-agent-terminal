@@ -24,7 +24,6 @@ use super::diffs::ThreadDiffs;
 use super::*;
 use crate::account_status::AccountStatus;
 use crate::agent_proc::AgentEnv;
-use crate::approval_server::ApprovalHandle;
 use crate::availability::{
     classify, probe_targets, unavailable_banner, AgentAvailability, Availability,
 };
@@ -2909,31 +2908,10 @@ fn make_adapter(driver: Driver, program: &str) -> std::boxed::Box<dyn Adapter> {
     }
 }
 
-/// agy's approval socket, only once its hooks file is proven to install the hook (`hook` is the
-/// verdict of [`check_hook`]). Without one agy runs without the skip flag and cannot ask before
-/// acting; the session says why: how to install the hook (`Err(None)`), or, when it is installed
-/// but the socket failed, the reason (`Err(Some(_))`, such as a binary replaced by an upgrade).
-fn bind_approval(hook: Result<(), String>, thread: &str, cwd: &str, mode: Mode) -> Approval {
-    let installed = hook.is_ok();
-    let refusal = hook
-        .as_ref()
-        .err()
-        .filter(|reason| crate::hook_config::verification_refused(reason))
-        .cloned();
-    // Not checked yet is not "not installed": the notice says which.
-    let unchecked = hook
-        .as_ref()
-        .is_err_and(|r| r == crate::chat::session::HOOK_NOT_CHECKED);
-    ApprovalHandle::bind_checked(hook, thread, std::path::Path::new(cwd), mode).map_err(|reason| {
-        info!("agy runs without its approval hook in this thread: {reason}");
-        if unchecked {
-            Some(crate::chat::session::HOOK_NOT_CHECKED.to_owned())
-        } else if let Some(refusal) = &refusal {
-            Some(refusal.clone())
-        } else {
-            installed.then_some(reason)
-        }
-    })
+/// agy's approval socket: never. agy runs only in dangerous permissive mode (the skip flag, no
+/// hook asking anything), shown as such in its thread; the session's forced state says why.
+fn bind_approval(_hook: Result<(), String>, _thread: &str, _cwd: &str, _mode: Mode) -> Approval {
+    Err(Some(crate::chat::session::AGY_PERMISSIVE_ONLY.to_owned()))
 }
 
 thread_local! {
@@ -11003,23 +10981,13 @@ pub(super) mod tests {
         assert!(before
             .as_ref()
             .is_err_and(|e| e.contains("not been checked")));
-        // It stays closed through the binding: no socket, so agy runs without the skip flag.
-        // But the notice says the hook is not checked yet, not that it is missing.
-        assert!(matches!(
-            bind_approval(before, "t", "/tmp", Mode::Ask),
-            Err(Some(reason)) if reason == crate::chat::session::HOOK_NOT_CHECKED
-        ));
-        // Checked and missing: the install instructions.
-        assert!(matches!(
-            bind_approval(Err("no entry".into()), "t", "/tmp", Mode::Ask),
-            Err(None)
-        ));
-        // Installed, but the socket cannot be used (a relative workspace is refused before
-        // anything is created): the notice carries that reason instead.
-        assert!(matches!(
-            bind_approval(Ok(()), "t", "relative", Mode::Ask),
-            Err(Some(reason)) if !reason.is_empty()
-        ));
+        // Whatever the verdict, agy gets no socket: it runs in dangerous permissive mode only.
+        for verdict in [before, Err("no entry".into()), Ok(())] {
+            assert!(matches!(
+                bind_approval(verdict, "t", "/tmp", Mode::Ask),
+                Err(Some(reason)) if reason == crate::chat::session::AGY_PERMISSIVE_ONLY
+            ));
+        }
         remember_hook_probe(
             target.clone(),
             &crate::hook_config::HookProbe::Missing("not installed".into()),
@@ -11134,8 +11102,8 @@ pub(super) mod tests {
                 .collect(),
         };
         assert!(matches!(
-            bind_approval(hook_for_launch(checked, &cleared, "/tmp"), "t", "/tmp", Mode::Ask),
-            Err(Some(reason)) if reason == crate::chat::session::HOOK_NOT_CHECKED
+            hook_for_launch(checked, &cleared, "/tmp"),
+            Err(reason) if reason == crate::chat::session::HOOK_NOT_CHECKED
         ));
         reset_hook_verdicts();
     }
@@ -11160,8 +11128,8 @@ pub(super) mod tests {
                 .collect(),
         };
         let refusal = hook_for_launch(Ok(()), &env, "/tmp");
-        assert!(matches!(bind_approval(refusal, "t", "/tmp", Mode::Ask),
-            Err(Some(why)) if why.contains("ANTIGRAVITY_APP_DATA_DIR") && !why.contains("private-config-value")));
+        assert!(matches!(refusal,
+            Err(why) if why.contains("ANTIGRAVITY_APP_DATA_DIR") && !why.contains("private-config-value")));
         reset_hook_verdicts();
     }
 
@@ -11327,8 +11295,6 @@ pub(super) mod tests {
         };
         let refusal = hook_for_launch(Ok(()), &env, "/tmp");
         assert_eq!(refusal, Err(crate::hook_config::DIFFERENT_HOME.into()));
-        assert!(matches!(bind_approval(refusal, "t", "/tmp", Mode::Ask),
-            Err(Some(why)) if why == crate::hook_config::DIFFERENT_HOME));
         reset_hook_verdicts();
     }
 

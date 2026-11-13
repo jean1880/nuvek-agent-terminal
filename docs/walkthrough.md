@@ -18,9 +18,9 @@ once, and all of them are in Settings later.
 - **Each agent.** Whether it is installed (with a link to get it if not, and **Check
   Again** once you have), whether it is switched on, and who is signed in, with **Sign In…**
   if nobody is.
-- **Antigravity's approval hook.** Whether it is installed. Without it, agy applies file
-  edits by itself in every mode. Setup never edits agy's files: **Copy** gives you the entry
-  to add yourself (see [agy's approval hook](configuration.md#agys-approval-hook)).
+- **Antigravity's approval hook.** Not needed: agy runs in
+  [dangerous permissive mode](configuration.md#antigravity-runs-in-dangerous-permissive-mode-only)
+  only.
 - **New threads.** Which agent they start on.
 - **Approvals.** Whether your saved **Always allow** rules approve matching requests without
   asking (see [Approvals and rules](features.md#approvals-and-rules)), and whether saving one first lets
@@ -124,6 +124,7 @@ or **Use System Theme** to follow your desktop, light or dark.
 | ![Settings → General with the theme list open](screenshots/settings-theme.png) | ![The window under Use System Theme on a light desktop](screenshots/system-theme.png) |
 | Themes apply to the whole app, live. | **Use System Theme** on a light desktop. |
 
-**Using Antigravity?** Install its [approval hook](configuration.md#agys-approval-hook) so it asks
-before it acts.
+**Using Antigravity?** It runs in
+[dangerous permissive mode](configuration.md#antigravity-runs-in-dangerous-permissive-mode-only)
+only: it acts without asking first.
 

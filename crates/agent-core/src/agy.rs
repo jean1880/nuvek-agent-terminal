@@ -17,6 +17,7 @@ use crate::adapter::{
     Action, Adapter, AdapterError, Command, Control, Driver, Mode, OpenSession, OpenSessionDelta,
     Outbox,
 };
+use crate::attachment::ToolImageSource;
 use crate::caps::Capabilities;
 use crate::delegation::agy_guard;
 use crate::event::{
@@ -455,6 +456,18 @@ impl AgyAdapter {
         self.start_item_with(out, &id, kind, title, params);
         match step.state.as_str() {
             "DONE" => {
+                // An image read: stdout says nothing of it (no output), but the transcript
+                // names the copy agy gave its model (live, 2026-11-14), shown on this card.
+                if kind == ItemKind::FileRead {
+                    for path in &step.transcript_media {
+                        out.push(
+                            Envelope::new(Event::ToolImage {
+                                image: ToolImageSource::File { path: path.clone() },
+                            })
+                            .item(&id),
+                        );
+                    }
+                }
                 let output = info.output.as_ref().map(value_text);
                 self.complete_item(out, &id, ItemStatus::Completed, output, None);
             }
@@ -1060,6 +1073,11 @@ struct Step {
     /// put on the step by the session's transcript reader.
     #[serde(default)]
     transcript_calls: Vec<Value>,
+    /// The images agy handed its model for this step (its transcript's `media`, a copy it
+    /// wrote under the conversation's logs): put on the step by the session's transcript
+    /// reader, which keeps only files inside that folder.
+    #[serde(default)]
+    transcript_media: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -2331,6 +2349,53 @@ mod tests {
         assert_eq!(
             crate::tool_title::classify(kind, &title, Some(&input)).text(),
             "Read /etc/hostname"
+        );
+    }
+
+    /// An image read (live, 2026-11-14: `read_file` on a PNG, no output on stdout) shows the copy
+    /// agy gave its model, which the session put on the step: a `ToolImage` on the read's own
+    /// card, before it completes. Any other kind of step shows none, media or not.
+    #[test]
+    fn an_image_read_shows_the_copy_agy_gave_its_model() {
+        let mut a = AgyAdapter::default();
+        a.encode(Command::Prompt {
+            attachments: Vec::new(),
+            text: "look".into(),
+        })
+        .unwrap();
+        a.feed(r#"{"event":"init","conversation_id":"c1","init":{}}"#);
+        let media =
+            "/h/.gemini/antigravity-cli/brain/c1/.system_generated/logs/media/step_7_media_0.jpg";
+        let step = |index: u64, name: &str| {
+            json!({"event": "step_update", "step_update": {
+                "conversation_id": "c1", "step_index": index, "state": "DONE",
+                "step_type": "tool", "tool_name": name,
+                "tool_info": {"name": name, "parameters": {"Path": "/w/shot.png"}},
+                "transcript_media": [media]}})
+            .to_string()
+        };
+        let out = a.feed(&step(7, "read_file"));
+        let image = out
+            .iter()
+            .position(|e| {
+                e.event
+                    == Event::ToolImage {
+                        image: ToolImageSource::File { path: media.into() },
+                    }
+            })
+            .expect("the image");
+        let done = out
+            .iter()
+            .position(|e| matches!(e.event, Event::ItemCompleted { .. }))
+            .expect("completed");
+        assert_eq!(out[image].item, out[done].item);
+        assert!(image < done, "{out:?}");
+
+        let out = a.feed(&step(8, "run_command"));
+        assert!(
+            !out.iter()
+                .any(|e| matches!(e.event, Event::ToolImage { .. })),
+            "{out:?}"
         );
     }
 

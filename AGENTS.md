@@ -224,7 +224,10 @@ Architectural mandates, standards, and workflows for this codebase.
   `0700` `$XDG_DATA_HOME/agent-terminal/attachments`); only the re-encoded copy is ever shown or
   sent. A file Codex viewed (`imageView`) is read wherever it is, as a picked file is
   (`BlobStore::ingest_path`: regular only, under the size cap): Codex already gave it to its model,
-  so showing it discloses nothing new. Events, the store and hand-offs carry an `AttachmentRef`
+  so showing it discloses nothing new. An image agy read is shown as the copy it gave its model:
+  its transcript's `media` for the read's result step, kept only when it is a plain file directly
+  in that conversation's `logs/media` folder (`agy_transcript::media_path`), read again at the
+  step's DONE frame since stdout says nothing of it. Events, the store and hand-offs carry an `AttachmentRef`
   (its sha256 id, size, name),
   never bytes: `Event::ToolImage` (an adapter's image, base64 or a path) is transient, stored as a
   blob by the session and replaced by `Event::Attachments` before anything is persisted or shown,

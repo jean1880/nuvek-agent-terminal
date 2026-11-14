@@ -422,8 +422,9 @@ struct Inner {
     launch_facts: RefCell<Option<DelegationLaunchFacts>>,
     weak_self: RefCell<Option<std::rc::Weak<Inner>>>,
     prompt_in_flight: Cell<bool>,
-    /// Last step index enriched with thinking from Antigravity transcript, avoiding repeated disk reads.
-    last_enriched_step: Cell<Option<u64>>,
+    /// Last step index enriched with thinking from Antigravity transcript, avoiding repeated disk reads,
+    /// and whether that read was an image read's final one ([`AgyEnrichJob::media`]).
+    last_enriched_step: Cell<Option<(u64, bool)>>,
     /// A new Codex thread id and its provider thread, not stored until a turn on it produces an
     /// item or completes: Codex has no rollout before that, so a stored id could not be resumed.
     provisional_native: RefCell<Option<(ProviderThreadId, String)>>,
@@ -786,7 +787,31 @@ struct AgyEnrichJob {
     val: serde_json::Value,
     conv_id: String,
     step_index: u64,
+    /// The finished step may be an image read (a file read with no output on stdout): its result,
+    /// and the image agy gave its model, are only in the transcript, written about when the
+    /// step finishes, so the read waits briefly for it ([`AGY_MEDIA_WAITS`]).
+    media: bool,
 }
+
+/// Whether an agy `step_update` is a finished file read stdout gave no output for, as an image
+/// read is (live, 2026-11-14: a text read says `42 lines, 6631 bytes`). Pure.
+fn agy_may_be_image_read(step: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let info = step.get("tool_info");
+    let name = step
+        .get("tool_name")
+        .or_else(|| info.and_then(|i| i.get("name")))
+        .and_then(serde_json::Value::as_str);
+    step.get("state").and_then(serde_json::Value::as_str) == Some("DONE")
+        && matches!(name, Some("read_file" | "view_file"))
+        && info
+            .and_then(|i| i.get("output"))
+            .is_none_or(serde_json::Value::is_null)
+}
+
+/// How many times, [`AGY_MEDIA_WAIT`] apart, an image read's transcript is read again for its
+/// result's `media` line before the step is shown without an image.
+const AGY_MEDIA_WAITS: u32 = 5;
+const AGY_MEDIA_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// One thread's chat backend. See the module docs.
 pub struct ChatSession {
@@ -2758,12 +2783,15 @@ impl Inner {
             .get("thinking")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|t| !t.trim().is_empty());
-        if has_thinking {
+        let media = agy_may_be_image_read(step);
+        if has_thinking && !media {
             return None;
         }
         let step_index = step.get("step_index")?.as_u64()?;
-        if self.last_enriched_step.get() == Some(step_index) {
-            return None;
+        match self.last_enriched_step.get() {
+            Some((index, _)) if index == step_index && !media => return None,
+            Some((index, true)) if index == step_index => return None,
+            _ => {}
         }
         let conv_id = step
             .get("conversation_id")
@@ -2774,6 +2802,7 @@ impl Inner {
             val,
             conv_id,
             step_index,
+            media,
         })
     }
 
@@ -2828,8 +2857,17 @@ impl Inner {
                     let me = Rc::clone(self);
                     glib::spawn_future_local(async move {
                         let (conv_id, step_index) = (job.conv_id.clone(), job.step_index);
+                        let waits = if job.media { AGY_MEDIA_WAITS } else { 0 };
                         let record = gtk4::gio::spawn_blocking(move || {
-                            agy_transcript::read_step(&home, &conv_id, step_index)
+                            let mut record = agy_transcript::read_step(&home, &conv_id, step_index);
+                            for _ in 0..waits {
+                                if !record.media.is_empty() {
+                                    break;
+                                }
+                                std::thread::sleep(AGY_MEDIA_WAIT);
+                                record = agy_transcript::read_step(&home, &conv_id, step_index);
+                            }
+                            record
                         })
                         .await
                         .unwrap_or_default();
@@ -2868,6 +2906,7 @@ impl Inner {
         let AgyEnrichJob {
             mut val,
             step_index,
+            media,
             ..
         } = job;
         let original = val.to_string();
@@ -2880,7 +2919,7 @@ impl Inner {
         if record.is_empty() {
             return original;
         }
-        self.last_enriched_step.set(Some(step_index));
+        self.last_enriched_step.set(Some((step_index, media)));
         if let Some(thinking) = record.thinking {
             if let Some(info) = step
                 .get_mut("tool_info")
@@ -2902,6 +2941,17 @@ impl Inner {
             step.insert(
                 "transcript_calls".to_owned(),
                 serde_json::Value::Array(calls),
+            );
+        }
+        if !record.media.is_empty() {
+            let media = record
+                .media
+                .iter()
+                .map(|path| serde_json::Value::String(path.to_string_lossy().into_owned()))
+                .collect();
+            step.insert(
+                "transcript_media".to_owned(),
+                serde_json::Value::Array(media),
             );
         }
         val.to_string()
@@ -13883,6 +13933,82 @@ mod tests {
                 })
                 .count();
             assert_eq!(reasoning_count, 1, "thinking item should not be duplicated");
+        });
+    }
+
+    /// An image read (live, 2026-11-14): the ACTIVE frame's read comes before agy writes the
+    /// result, so the DONE frame of a read with no output is read again, waiting for the
+    /// result's `media`, which goes on the step and comes out of the adapter as the image. A text
+    /// read's DONE frame (it has output) is not read again.
+    #[test]
+    fn an_agy_image_read_is_read_again_when_done_for_its_media() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let logs = tmp
+            .path()
+            .join(".gemini/antigravity-cli/brain/cv/.system_generated/logs");
+        std::fs::create_dir_all(&logs).expect("mkdir");
+        let image = logs.join("media/step_5_media_0.jpg");
+        let call = r#"{"step_index":4,"tool_calls":[{"name":"read_file","args":{"Path":"\"/w/shot.png\""}}]}"#;
+        let result = serde_json::json!({"step_index": 5, "type": "GENERIC",
+            "media": [{"mime_type": "image/jpeg", "uri": format!("file://{}", image.display())}]});
+        let frame = |state: &str, output: Option<&str>| {
+            serde_json::json!({"event": "step_update", "step_update": {
+                "conversation_id": "cv", "state": state, "step_index": 5, "step_type": "tool",
+                "tool_name": "read_file",
+                "tool_info": {"name": "read_file", "output": output,
+                              "parameters": {"Path": "/w/shot.png"}}}})
+            .to_string()
+        };
+        in_loop(|_| {
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, "/w");
+            let (session, _seen) = harness(
+                Box::new(agent_core::agy::AgyAdapter::new("agy")),
+                open_session("unused", Vec::new(), "/w"),
+                &store,
+                &thread,
+            );
+            let inner = &session.inner;
+            // ACTIVE: only the call is written yet.
+            std::fs::write(logs.join("transcript.jsonl"), format!("{call}\n")).expect("write");
+            let job = inner
+                .agy_enrich_job(&frame("ACTIVE", None))
+                .expect("a read");
+            assert!(!job.media);
+            let record = agy_transcript::read_step(tmp.path(), "cv", 5);
+            assert!(record.media.is_empty());
+            inner.apply_agy_record(job, record);
+
+            // A finished text read is not read again.
+            assert!(inner
+                .agy_enrich_job(&frame("DONE", Some("42 lines, 6631 bytes")))
+                .is_none());
+
+            // A finished read with no output is, and its result's media goes on the step.
+            std::fs::write(logs.join("transcript.jsonl"), format!("{call}\n{result}\n"))
+                .expect("write");
+            let job = inner
+                .agy_enrich_job(&frame("DONE", None))
+                .expect("read again");
+            assert!(job.media);
+            let record = agy_transcript::read_step(tmp.path(), "cv", 5);
+            assert_eq!(record.media, std::slice::from_ref(&image));
+            let line = inner.apply_agy_record(job, record);
+            // Once is enough: the same DONE frame again reads nothing.
+            assert!(inner.agy_enrich_job(&frame("DONE", None)).is_none());
+
+            let mut adapter = agent_core::agy::AgyAdapter::new("agy");
+            adapter.feed(r#"{"event":"init","conversation_id":"cv","init":{}}"#);
+            let out = adapter.feed(&line);
+            assert!(
+                out.iter().any(|e| e.event
+                    == Event::ToolImage {
+                        image: agent_core::attachment::ToolImageSource::File {
+                            path: image.display().to_string()
+                        }
+                    }),
+                "{out:?}"
+            );
         });
     }
 

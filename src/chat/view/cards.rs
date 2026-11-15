@@ -360,12 +360,45 @@ fn recolour_all() {
     }
 }
 
+/// Whether a registry of weak entries is worth sweeping for dead ones as `len` grows past
+/// 64: at each power of two, so the sweeps cost a constant per added entry.
+fn prune_due(len: usize) -> bool {
+    len >= 64 && len.is_power_of_two()
+}
+
+/// What a markdown view does about a palette change.
+#[derive(Debug, PartialEq, Eq)]
+enum Refresh {
+    /// Parsed under the colours in use, or nothing to parse.
+    Current,
+    /// On screen: parse again now.
+    Now,
+    /// Not on screen: stays stale until it is mapped.
+    Later,
+}
+
+fn refresh_action(rendered: u64, current: u64, has_text: bool, mapped: bool) -> Refresh {
+    if rendered == current || !has_text {
+        Refresh::Current
+    } else if mapped {
+        Refresh::Now
+    } else {
+        Refresh::Later
+    }
+}
+
 /// Gives `buffer` the source-view scheme of the colours in use, and keeps it in step when they
 /// change.
 pub(super) fn apply_scheme(buffer: &sourceview5::Buffer) {
     crate::palette::on_change(recolour_all);
     buffer.set_style_scheme(current_scheme().as_ref());
-    SOURCE_BUFFERS.with(|all| all.borrow_mut().push(buffer.downgrade()));
+    SOURCE_BUFFERS.with(|all| {
+        let mut all = all.borrow_mut();
+        all.push(buffer.downgrade());
+        if prune_due(all.len()) {
+            all.retain(|b| b.upgrade().is_some());
+        }
+    });
 }
 
 /// A flat "Copy" icon button, named for what it copies (`what`: "Copy output"). Give it its text
@@ -499,7 +532,20 @@ impl MarkdownView {
             source: RefCell::new(String::new()),
             generation: std::cell::Cell::new(crate::palette::generation()),
         });
-        MARKDOWN_VIEWS.with(|all| all.borrow_mut().push(std::rc::Rc::downgrade(&inner)));
+        MARKDOWN_VIEWS.with(|all| {
+            let mut all = all.borrow_mut();
+            all.push(std::rc::Rc::downgrade(&inner));
+            if prune_due(all.len()) {
+                all.retain(|v| v.strong_count() > 0);
+            }
+        });
+        // A view hidden when the theme changed is parsed again as it comes on screen.
+        let weak = std::rc::Rc::downgrade(&inner);
+        inner.root.connect_map(move |_| {
+            if let Some(view) = weak.upgrade() {
+                view.refresh();
+            }
+        });
         Self(inner)
     }
 }
@@ -518,10 +564,17 @@ impl MarkdownInner {
         self.render(text, generation);
     }
 
-    /// Parses again under the colours now in use, when the text was parsed under older ones.
+    /// Parses again under the colours now in use, when the text was parsed under older ones and
+    /// the view is on screen. A hidden one stays stale until it is mapped.
     fn refresh(&self) {
         let generation = crate::palette::generation();
-        if self.generation.get() == generation || self.source.borrow().is_empty() {
+        let action = refresh_action(
+            self.generation.get(),
+            generation,
+            !self.source.borrow().is_empty(),
+            self.root.is_mapped(),
+        );
+        if action != Refresh::Now {
             return;
         }
         let text = self.source.borrow().clone();
@@ -3302,6 +3355,20 @@ pub(super) fn pattern_error(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_visible_stale_view_is_parsed_again_at_once() {
+        assert_eq!(refresh_action(3, 3, true, true), Refresh::Current);
+        assert_eq!(refresh_action(2, 3, false, true), Refresh::Current);
+        assert_eq!(refresh_action(2, 3, true, true), Refresh::Now);
+        assert_eq!(refresh_action(2, 3, true, false), Refresh::Later);
+    }
+
+    #[test]
+    fn registries_are_swept_as_they_grow() {
+        assert!(!prune_due(1) && !prune_due(63) && !prune_due(65));
+        assert!(prune_due(64) && prune_due(128));
+    }
 
     /// A light palette takes the first light scheme installed, a dark one the first dark one,
     /// and with none installed there is no scheme (the buffer's default).

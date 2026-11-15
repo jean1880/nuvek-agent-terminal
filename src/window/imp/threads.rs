@@ -42,7 +42,7 @@ use crate::window::sidebar_model::{
     held_finish_due, is_busy, limit_over, needs_attention, parse_driver, react, redraw_for,
     relative_time, resume_as, row_tooltip, safe_handoff_target, sidebar_sections, stop_heading,
     stored_model, thread_title, turn_finishes_thread, Attention, Badge, ChildAsks, FolderGroup,
-    OpenState, Redraw, ResumeAs, RowKey, SidebarModel, SidebarRow,
+    OpenState, Redraw, ResumeAs, RowKey, SidebarModel, SidebarRow, SidebarSections,
 };
 use crate::window::sidebar_model::{
     empty_sidebar_text, image_title, limit_wait_text, reopen_offer, sessions_added_toast,
@@ -3975,6 +3975,7 @@ impl AgentTerminalWindow {
                         OpenState::Closed
                     },
                     archived: s.archived,
+                    pin_rank: s.pin_rank,
                 }
             })
             .collect();
@@ -3994,6 +3995,7 @@ impl AgentTerminalWindow {
                 background: Vec::new(),
                 open: OpenState::Here,
                 archived: false,
+                pin_rank: None,
             });
         }
         rows
@@ -4140,7 +4142,13 @@ impl AgentTerminalWindow {
         let (title, hint) = empty_sidebar_text(&query);
         sidebar.empty_title.set_text(title);
         sidebar.empty_hint.set_text(hint);
-        let (active, groups) = sidebar_sections(rows, &query, self.show_archived.get());
+        let sections = sidebar_sections(rows, &query, self.show_archived.get());
+        let pinned_active = sections.pinned_active();
+        let SidebarSections {
+            pinned,
+            active,
+            groups,
+        } = sections;
         let groups = fold_groups(
             groups,
             &sidebar.expanded.borrow(),
@@ -4148,6 +4156,8 @@ impl AgentTerminalWindow {
             selected.as_ref(),
         );
         let model = SidebarModel {
+            pinned,
+            pinned_active,
             active,
             groups,
             selected,
@@ -4163,6 +4173,8 @@ impl AgentTerminalWindow {
             return;
         }
         let SidebarModel {
+            pinned,
+            pinned_active,
             active,
             groups,
             selected,
@@ -4181,25 +4193,60 @@ impl AgentTerminalWindow {
         clear_rows(&sidebar.list);
         let mut keys = Vec::new();
         let mut select = None;
-        // Live work first, in a section of its own: each row names its folder (there is no
-        // folder header above it), and a full divider separates it from the rest.
-        if !active.is_empty() {
+        // The pinned threads first, in the user's order, then live work, each in a section of its
+        // own: each row names its folder (there is no folder header above it), and a full divider
+        // separates it from the rest.
+        let has_groups = !groups.is_empty();
+        let has_active = !active.is_empty();
+        let sections = [
+            (
+                "Pinned",
+                "Threads you pinned, in the order you chose",
+                "pinned-section",
+                pinned,
+                has_active || has_groups,
+            ),
+            (
+                "Active",
+                "Threads working, waiting for you, or rate limited",
+                "active-section",
+                active,
+                has_groups,
+            ),
+        ];
+        for (label, tooltip, class, rows, divide) in sections {
+            if rows.is_empty() {
+                continue;
+            }
             let header = gtk4::ListBoxRow::builder()
                 .activatable(false)
                 .selectable(false)
-                .css_classes(["folder-row", "active-section"])
+                .css_classes(["folder-row", class])
                 .build();
+            // Pinned threads that are active are listed under Pinned only; say so here.
+            let counted = class == "active-section" && pinned_active > 0;
+            let text = if counted {
+                format!("{label} (+{pinned_active} pinned)")
+            } else {
+                label.to_owned()
+            };
+            let tooltip = if counted {
+                "Threads working, waiting for you, or rate limited. The pinned ones that are \
+                 too are listed under Pinned."
+            } else {
+                tooltip
+            };
             header.set_child(Some(
                 &Label::builder()
-                    .label("Active")
+                    .label(&text)
                     .xalign(0.0)
                     .css_classes(["folder-label", "caption-heading"])
-                    .tooltip_text("Threads working, waiting for you, or rate limited")
+                    .tooltip_text(tooltip)
                     .build(),
             ));
             sidebar.list.append(&header);
             keys.push(None);
-            for row in active {
+            for row in rows {
                 let widget = self.sidebar_row_widget(&row, now);
                 if let Some(line) = widget.child().and_then(|c| c.downcast::<Box>().ok()) {
                     let folder = Label::builder()
@@ -4209,9 +4256,17 @@ impl AgentTerminalWindow {
                         .css_classes(["thread-folder", "dim-label", "caption"])
                         .tooltip_text(&row.folder)
                         .build();
-                    // After the title, before the badge and age.
-                    if let Some(title) = line.first_child().and_then(|dot| dot.next_sibling()) {
-                        line.insert_child_after(&folder, Some(&title));
+                    // After the title (and the pin), before the badge and age.
+                    let mut anchor = line.first_child().and_then(|dot| dot.next_sibling());
+                    if let Some(next) = anchor
+                        .as_ref()
+                        .and_then(|title| title.next_sibling())
+                        .filter(|n| n.has_css_class("thread-pin"))
+                    {
+                        anchor = Some(next);
+                    }
+                    if let Some(anchor) = anchor {
+                        line.insert_child_after(&folder, Some(&anchor));
                     }
                 }
                 if needs_attention(&row, selected.as_ref(), focused) {
@@ -4224,7 +4279,7 @@ impl AgentTerminalWindow {
                 drawn_rows.push(DrawnRow::new(&widget));
                 keys.push(Some(row.key));
             }
-            if !groups.is_empty() {
+            if divide {
                 let divider = gtk4::ListBoxRow::builder()
                     .activatable(false)
                     .selectable(false)
@@ -4486,6 +4541,15 @@ impl AgentTerminalWindow {
             .tooltip_text(&row.title)
             .build();
         line.append(&title);
+        if row.pin_rank.is_some() {
+            let pin = Image::from_icon_name(crate::icons::PIN_ICON);
+            pin.set_pixel_size(12);
+            pin.add_css_class("thread-pin");
+            pin.add_css_class("dim-label");
+            pin.set_tooltip_text(Some("Pinned"));
+            pin.update_property(&[gtk4::accessible::Property::Label("Pinned")]);
+            line.append(&pin);
+        }
         if row.open == OpenState::Elsewhere {
             let mark = Label::builder()
                 .label("↗")
@@ -10583,6 +10647,7 @@ pub(super) mod tests {
                 model: None,
                 unread: i % 7 == 0,
                 archived: false,
+                pin_rank: None,
             })
             .collect();
         *imp.summaries.borrow_mut() = Some(list);
@@ -12338,6 +12403,128 @@ pub(super) mod tests {
         assert_eq!(unbuilt.clone().with_stored(stored, true), unbuilt);
     }
 
+    /// The toast titles shown so far, oldest first.
+    fn toast_titles(imp: &AgentTerminalWindow) -> Vec<String> {
+        imp.test_toasts
+            .borrow()
+            .iter()
+            .map(|t| t.title().map(|s| s.to_string()).unwrap_or_default())
+            .collect()
+    }
+
+    /// The thread ids in the Pinned section, in order.
+    fn pinned_ids(imp: &AgentTerminalWindow) -> Vec<String> {
+        crate::window::sidebar_model::sidebar_sections(imp.sidebar_rows(), "", true)
+            .pinned
+            .into_iter()
+            .map(|r| match r.key {
+                RowKey::Thread(id) => id,
+                RowKey::Terminal(_) => String::new(),
+            })
+            .collect()
+    }
+
+    /// Pin, move and unpin go through the store writer, list the thread under Pinned, and each
+    /// toast's Undo puts things back (an unpinned thread to the place it had). `a` and `b` are
+    /// two stored threads that are not pinned.
+    fn pin_unpin_round_trip_through_the_writer(
+        imp: &AgentTerminalWindow,
+        ctx: &glib::MainContext,
+        reader: &Store,
+        a: &str,
+        b: &str,
+    ) {
+        use crate::testutil::pump_until;
+        use crate::window::sidebar_model::ThreadAction;
+        let rank_of = |id: &str| reader.thread_summary(id).unwrap().unwrap().pin_rank;
+        let last_is = |text: &str| toast_titles(imp).last().map(String::as_str) == Some(text);
+        let undo = || {
+            let toast = imp.test_toasts.borrow().last().cloned().unwrap();
+            toast.emit_by_name::<()>("button-clicked", &[]);
+        };
+        let (a, b) = (a.to_owned(), b.to_owned());
+
+        imp.run_thread_action(ThreadAction::Pin(a.clone()));
+        assert!(pump_until(ctx, 10, || rank_of(&a) == Some(0)
+            && last_is("Thread pinned")));
+        imp.run_thread_action(ThreadAction::Pin(b.clone()));
+        assert!(pump_until(ctx, 10, || rank_of(&b) == Some(1)));
+        assert!(pump_until(ctx, 10, || pinned_ids(imp) == [a.clone(), b.clone()]));
+
+        imp.run_thread_action(ThreadAction::PinMove(b.clone(), -1));
+        assert!(pump_until(ctx, 10, || rank_of(&b) == Some(0)
+            && rank_of(&a) == Some(1)
+            && last_is("Moved up")));
+        assert!(pump_until(ctx, 10, || pinned_ids(imp) == [b.clone(), a.clone()]));
+        undo();
+        assert!(pump_until(ctx, 10, || rank_of(&b) == Some(1) && rank_of(&a) == Some(0)));
+
+        imp.run_thread_action(ThreadAction::Unpin(a.clone()));
+        assert!(pump_until(ctx, 10, || rank_of(&a).is_none()
+            && rank_of(&b) == Some(0)
+            && last_is("Thread unpinned")));
+        undo();
+        assert!(
+            pump_until(ctx, 10, || rank_of(&a) == Some(0) && rank_of(&b) == Some(1)),
+            "Undo restores the place the thread had"
+        );
+
+        imp.run_thread_action(ThreadAction::Unpin(a.clone()));
+        imp.run_thread_action(ThreadAction::Unpin(b.clone()));
+        assert!(pump_until(ctx, 10, || rank_of(&a).is_none()
+            && rank_of(&b).is_none()
+            && pinned_ids(imp).is_empty()));
+    }
+
+    /// Pinning, moving and unpinning leave every thread's time alone, so the folder groups keep
+    /// the order their newest threads give them.
+    fn pinning_does_not_reorder_folder_groups(
+        imp: &AgentTerminalWindow,
+        ctx: &glib::MainContext,
+        reader: &Store,
+        a: &str,
+    ) {
+        use crate::testutil::pump_until;
+        use crate::window::sidebar_model::{sidebar_sections, ThreadAction};
+        let times = || -> Vec<(String, i64)> {
+            reader
+                .list_threads(true)
+                .unwrap()
+                .into_iter()
+                .map(|t| (t.id, t.updated_at))
+                .collect()
+        };
+        let folders = || -> Vec<String> {
+            sidebar_sections(imp.sidebar_rows(), "", true)
+                .groups
+                .into_iter()
+                .map(|(folder, _)| folder)
+                .collect()
+        };
+        let (before_times, before_folders) = (times(), folders());
+        imp.run_thread_action(ThreadAction::Pin(a.to_owned()));
+        assert!(pump_until(ctx, 10, || reader
+            .thread_summary(a)
+            .unwrap()
+            .is_some_and(|t| t.pin_rank.is_some())));
+        assert_eq!(times(), before_times, "pinning is not activity");
+        assert!(
+            pump_until(ctx, 10, || pinned_ids(imp) == [a.to_owned()]),
+            "the thread is listed under Pinned"
+        );
+        let after = folders();
+        assert!(
+            after
+                .iter()
+                .eq(before_folders.iter().filter(|f| after.contains(f))),
+            "the other folders keep their order: {before_folders:?} then {after:?}"
+        );
+        imp.run_thread_action(ThreadAction::Unpin(a.to_owned()));
+        assert!(pump_until(ctx, 10, || pinned_ids(imp).is_empty()));
+        assert_eq!(times(), before_times, "nor does unpinning");
+        assert_eq!(folders(), before_folders);
+    }
+
     /// Through the store writer: an unsent message makes closing ask; a blank thread left is
     /// discarded with a toast whose Undo makes it again as it was (two toasts at once each undo
     /// their own); an archive's toast comes after the write and its Undo brings the thread back;
@@ -12555,6 +12742,10 @@ pub(super) mod tests {
         settle(&ctx);
         assert!(exists(&kept), "no discard was queued");
         assert_eq!(discards(), 3);
+
+        // Pins, between two threads that are stored and not open.
+        pinning_does_not_reorder_folder_groups(imp, &ctx, &reader, &named);
+        pin_unpin_round_trip_through_the_writer(imp, &ctx, &reader, &named, &kept);
 
         // A page closed before it was ever built: Undo still gets back what the store held.
         let tree = tempfile::tempdir().unwrap();

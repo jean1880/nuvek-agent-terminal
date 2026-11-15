@@ -152,6 +152,18 @@ const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
                 <property name="title">Resume Session</property>
               </object>
             </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;P</property>
+                <property name="title">Pin or Unpin Thread</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Alt&gt;&lt;Shift&gt;Up &lt;Alt&gt;&lt;Shift&gt;Down</property>
+                <property name="title">Move the Selected Pinned Thread (in the Sidebar)</property>
+              </object>
+            </child>
           </object>
         </child>
         <child>
@@ -1997,6 +2009,23 @@ impl AgentTerminalWindow {
             debug!("Action: Checkpoint Now");
             if let Some(page) = imp.selected_page() {
                 imp.request_checkpoint(&page, true);
+            }
+        });
+        // Pins the shown thread to the top of the sidebar, or unpins it.
+        self.add_win_action("toggle-pin", |imp| {
+            debug!("Action: Pin or Unpin Thread");
+            if let Some(thread) = imp.current_thread() {
+                let pinned = imp
+                    .summary_of(&thread)
+                    .is_some_and(|s| s.pin_rank.is_some());
+                imp.change_pin(
+                    &thread,
+                    if pinned {
+                        thread_menu::PinChange::Unpin
+                    } else {
+                        thread_menu::PinChange::Pin { at: None }
+                    },
+                );
             }
         });
         self.add_win_action("toggle-diff", |imp| {
@@ -8783,6 +8812,7 @@ mod tests {
         assert!(window.lookup_action("new-thread-agent").is_some());
         assert!(window.lookup_action("new-thread-agent-folder").is_some());
         assert!(window.lookup_action("resume-session").is_some());
+        assert!(window.lookup_action("toggle-pin").is_some());
         assert_eq!(
             imp.tabs.borrow().len(),
             0,

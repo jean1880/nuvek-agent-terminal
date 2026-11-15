@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Original artwork for agent-terminal (a pushpin: a pinned thread). 16x16 grid, single colour, one plain path.
+     -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <path fill="#2e3436" d="M5 1h6v1.5l-1 .5v2.9l2.2 2.4v1.6H8.8V15H7.2v-4.7H3.8V8.7L6 6.3V3l-1-.5z"/>
+</svg>

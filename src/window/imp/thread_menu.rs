@@ -171,7 +171,18 @@ impl AgentTerminalWindow {
                 let menu_key = keyval == Key::Menu
                     || (keyval == Key::F10 && state.contains(gtk4::gdk::ModifierType::SHIFT_MASK));
                 let delete = matches!(keyval, Key::Delete | Key::KP_Delete);
-                if !menu_key && !delete {
+                // Alt+Shift+Up/Down moves a pinned row along the Pinned section.
+                let reorder = match keyval {
+                    Key::Up => Some(-1i8),
+                    Key::Down => Some(1),
+                    _ => None,
+                }
+                .filter(|_| {
+                    state.contains(
+                        gtk4::gdk::ModifierType::ALT_MASK | gtk4::gdk::ModifierType::SHIFT_MASK,
+                    ) && !state.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
+                });
+                if !menu_key && !delete && reorder.is_none() {
                     return glib::Propagation::Proceed;
                 }
                 let Some(sidebar) = weak_sidebar.upgrade() else {
@@ -183,7 +194,17 @@ impl AgentTerminalWindow {
                 let Some(RowKey::Thread(thread)) = key_of_row(&sidebar, &row) else {
                     return glib::Propagation::Proceed;
                 };
-                if delete {
+                if let Some(delta) = reorder {
+                    // Only a pinned row moves; on any other the keys stay the list's own.
+                    if !obj
+                        .imp()
+                        .summary_of(&thread)
+                        .is_some_and(|s| s.pin_rank.is_some())
+                    {
+                        return glib::Propagation::Proceed;
+                    }
+                    obj.imp().change_pin(&thread, PinChange::Move(delta));
+                } else if delete {
                     obj.imp().confirm_delete(&thread);
                 } else {
                     obj.imp().open_thread_menu(thread, &row, None);
@@ -243,6 +264,7 @@ impl AgentTerminalWindow {
             let input = ThreadMenuInput {
                 thread,
                 archived: summary.archived,
+                pinned: summary.pin_rank.is_some(),
                 has_messages,
                 agents: imp.menu_agents(),
             };
@@ -286,6 +308,11 @@ impl AgentTerminalWindow {
                 }
             }
             ThreadAction::Rename(thread) => self.prompt_rename(&thread),
+            ThreadAction::Pin(thread) => self.change_pin(&thread, PinChange::Pin { at: None }),
+            ThreadAction::Unpin(thread) => self.change_pin(&thread, PinChange::Unpin),
+            ThreadAction::PinMove(thread, delta) => {
+                self.change_pin(&thread, PinChange::Move(delta));
+            }
             ThreadAction::Archive(thread) => self.set_thread_archived(&thread, true),
             ThreadAction::Unarchive(thread) => self.set_thread_archived(&thread, false),
             ThreadAction::Delete(thread) => self.confirm_delete(&thread),
@@ -467,6 +494,49 @@ impl AgentTerminalWindow {
             }
         }
         self.refresh_sidebar();
+    }
+
+    // ---- pin ----
+
+    /// Pins, unpins or moves a thread through the store writer, then says so with an Undo that
+    /// puts it back (an unpinned thread returns to the place it had). Pinning never touches
+    /// `updated_at`, so no folder is reordered by it.
+    pub(super) fn change_pin(&self, thread: &str, change: PinChange) {
+        let (id, undo_id) = (thread.to_owned(), thread.to_owned());
+        let what = match change {
+            PinChange::Pin { .. } => "pin the thread",
+            PinChange::Unpin => "unpin the thread",
+            PinChange::Move(_) => "move the pinned thread",
+        };
+        self.write_store_then(
+            what,
+            move |s| change.apply(s, &id),
+            move |imp, outcome| match outcome {
+                // A move that changed nothing (already at that end) has nothing to say or undo.
+                Some(Ok(receipt)) if receipt.before == receipt.after && change.is_move() => {}
+                Some(Ok(receipt)) => {
+                    let undo = change.undo(receipt);
+                    imp.action_toast(
+                        change.done(),
+                        "Undo",
+                        10,
+                        adw::ToastPriority::Normal,
+                        move |imp| imp.change_pin(&undo_id, undo),
+                    );
+                }
+                failed => {
+                    let error = failed.and_then(Result::err).map_or_else(
+                        || "the thread store did not answer in time".to_owned(),
+                        |e| e.to_string(),
+                    );
+                    present_message(
+                        &imp.obj(),
+                        "Could Not Change the Pin",
+                        &format!("The thread could not be {}: {error}", change.past()),
+                    );
+                }
+            },
+        );
     }
 
     // ---- archive / delete ----
@@ -763,6 +833,94 @@ async fn export_to(
     .await
 }
 
+/// What a pin action does to the Pinned section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::window) enum PinChange {
+    /// Pins the thread: at the end of the Pinned section, or back at place `at` (an undo).
+    Pin {
+        at: Option<i64>,
+    },
+    Unpin,
+    /// Up (negative) or down (positive) the Pinned section.
+    Move(i8),
+}
+
+/// The place a thread had before a pin change and the one it has now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::window) struct PinReceipt {
+    pub before: Option<i64>,
+    pub after: Option<i64>,
+}
+
+impl PinChange {
+    /// The store write.
+    pub(in crate::window) fn apply(
+        self,
+        store: &agent_kit::store::Store,
+        thread: &str,
+    ) -> agent_kit::store::Result<PinReceipt> {
+        let rank = |store: &agent_kit::store::Store| -> agent_kit::store::Result<Option<i64>> {
+            Ok(store.thread_summary(thread)?.and_then(|t| t.pin_rank))
+        };
+        // Read on the writer, in order with the writes: never from the sidebar's cached list.
+        let before = rank(store)?;
+        match self {
+            Self::Pin { at } => {
+                store.set_pinned(thread, true)?;
+                if let Some(rank) = at {
+                    let pinned = store
+                        .list_threads(true)?
+                        .iter()
+                        .filter(|t| t.pin_rank.is_some())
+                        .count() as i64;
+                    store.move_pin(thread, rank - (pinned - 1))?;
+                }
+            }
+            Self::Unpin => store.set_pinned(thread, false)?,
+            Self::Move(delta) => store.move_pin(thread, i64::from(delta))?,
+        }
+        Ok(PinReceipt {
+            before,
+            after: rank(store)?,
+        })
+    }
+
+    fn is_move(self) -> bool {
+        matches!(self, Self::Move(_))
+    }
+
+    /// The change that reverses this one, given what the write found.
+    pub(in crate::window) fn undo(self, receipt: PinReceipt) -> Self {
+        match self {
+            Self::Pin { .. } => Self::Unpin,
+            Self::Unpin => Self::Pin { at: receipt.before },
+            Self::Move(_) => {
+                let back = receipt.before.unwrap_or(0) - receipt.after.unwrap_or(0);
+                Self::Move(i8::try_from(back).unwrap_or(if back < 0 { i8::MIN } else { i8::MAX }))
+            }
+        }
+    }
+
+    /// The toast once it has landed.
+    fn done(self) -> &'static str {
+        match self {
+            Self::Pin { .. } => "Thread pinned",
+            Self::Unpin => "Thread unpinned",
+            Self::Move(d) if d < 0 => "Moved up",
+            Self::Move(_) => "Moved down",
+        }
+    }
+
+    /// What failed, for the failure dialog.
+    fn past(self) -> &'static str {
+        match self {
+            Self::Pin { .. } => "pinned",
+            Self::Unpin => "unpinned",
+            Self::Move(_) => "moved",
+        }
+    }
+}
+
 /// `<source title> (→ <Agent>)`: the title of a thread continued in another agent.
 fn continued_title(source: &str, driver: Driver) -> String {
     format!("{source} (→ {})", driver.info().label)
@@ -813,6 +971,7 @@ pub(super) mod tests {
         let input = ThreadMenuInput {
             thread: "t".into(),
             archived: false,
+            pinned: false,
             has_messages: false,
             agents: vec![MenuAgent {
                 driver: Driver::Claude,
@@ -838,7 +997,7 @@ pub(super) mod tests {
         let housekeeping = model.item_link(1, "section").expect("second section");
         assert_eq!(
             gio_menu_labels_of(&housekeeping),
-            ["Rename…", "Archive", "Delete…"]
+            ["Rename…", "Pin to Top", "Archive", "Delete…"]
         );
         let links = model.item_link(2, "section").expect("third section");
         assert_eq!(

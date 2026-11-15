@@ -568,7 +568,7 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "native GTK; run alone in an isolated display"]
     fn native_usage_chip_hides_when_its_agent_is_not_shown() {
-        gtk4::init().expect("GTK init");
+        crate::testutil::gtk_init().expect("GTK init");
         let usage = UsageIndicator::new(Rc::new(AccountStatus::new()), Some(Driver::Codex));
         let shown = [(Driver::Claude, Snapshot::default())];
         usage.render_snapshots(&shown);
@@ -805,7 +805,7 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "native GTK; run alone in an isolated display"]
     fn native_a_loading_agent_spins_its_own_dot() {
-        gtk4::init().expect("GTK init");
+        crate::testutil::gtk_init().expect("GTK init");
         let snap = Snapshot {
             probing: true,
             ..Snapshot::default()

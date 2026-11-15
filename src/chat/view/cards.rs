@@ -3386,7 +3386,7 @@ pub(crate) mod tests {
         }
 
         // With the schemes this system has installed (none, or no GTK here: nothing to check).
-        if gtk4::init().is_err() {
+        if crate::testutil::gtk_init().is_err() {
             return;
         }
         let manager = sourceview5::StyleSchemeManager::default();
@@ -3479,7 +3479,7 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "native GTK; run alone in an isolated display"]
     fn native_clipping_warning_reaches_both_diff_surfaces() {
-        gtk4::init().expect("GTK init");
+        crate::testutil::gtk_init().expect("GTK init");
         let warning =
             "Only the first 512 KiB of each side were compared; the change may lie beyond.";
         let sink: RowSink = Rc::new(|_| {});

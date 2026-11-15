@@ -1169,7 +1169,7 @@ pub(super) mod tests {
     #[test]
     #[ignore = "native GTK; run alone in an isolated display"]
     fn native_preedit_clears_on_reset_submit_and_focus_leave() {
-        gtk4::init().expect("GTK init");
+        crate::testutil::gtk_init().expect("GTK init");
         let host = Rc::new(Host::default());
         let host_trait: Rc<dyn ComposerHost> = host.clone();
         let composer = Composer::new();
@@ -1220,7 +1220,7 @@ pub(super) mod tests {
     #[test]
     #[ignore = "native GTK; run alone in an isolated display"]
     fn native_preedit_signal_keeps_keys_out_of_composer_actions() {
-        gtk4::init().expect("GTK init");
+        crate::testutil::gtk_init().expect("GTK init");
         let host = Rc::new(Host::default());
         host.running.set(true);
         let host_trait: Rc<dyn ComposerHost> = host.clone();

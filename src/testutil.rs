@@ -375,11 +375,37 @@ pub fn label_texts(root: &gtk4::Widget) -> Vec<String> {
         .collect()
 }
 
+/// The marker `make` sets (`DISPLAY_ENV`) for a run on its private Xvfb display and D-Bus session.
+pub const VIRTUAL_DISPLAY_MARKER: &str = "AGENT_TERMINAL_TEST_DISPLAY";
+
+/// Panics unless the test runs on the private display the make targets provide. A GTK test opens
+/// real windows, and a bare `cargo test` would put them on the developer's own desktop.
+pub fn require_virtual_display() {
+    assert!(
+        std::env::var(VIRTUAL_DISPLAY_MARKER).as_deref() == Ok("xvfb"),
+        "GTK tests open windows: run them through `make test` / `make test-one T=...`, which use \
+         a private Xvfb display ({VIRTUAL_DISPLAY_MARKER}=xvfb is not set)"
+    );
+}
+
+/// `gtk4::init()` for tests: the one way a test initialises GTK, behind
+/// [`require_virtual_display`].
+pub fn gtk_init() -> Result<(), glib::BoolError> {
+    require_virtual_display();
+    gtk4::init()
+}
+
+/// `adw::init()` for tests, behind [`require_virtual_display`] like [`gtk_init`].
+pub fn adw_init() -> Result<(), glib::BoolError> {
+    require_virtual_display();
+    adw::init()
+}
+
 /// GTK, libadwaita, the bundled icons and the stylesheet, as the app sets them up: for the
 /// native tests that present windows. Returns the default main context they run on.
 pub fn native_init() -> glib::MainContext {
-    gtk4::init().expect("GTK must be available for the native gate");
-    adw::init().expect("libadwaita init");
+    gtk_init().expect("GTK must be available for the native gate");
+    adw_init().expect("libadwaita init");
     crate::icons::register();
     crate::load_css();
     glib::MainContext::default()
@@ -532,5 +558,60 @@ pub fn settle(ctx: &glib::MainContext) {
         } else {
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use std::path::{Path, PathBuf};
+
+    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// No test can start GTK or libadwaita without the virtual-display guard: the raw calls
+    /// live only in this file (and the integration test's own copy of the check).
+    #[test]
+    fn gtk_is_initialised_only_through_the_guard() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        rust_files(&root.join("src"), &mut files);
+        rust_files(&root.join("tests"), &mut files);
+        assert!(!files.is_empty(), "no source files found under {root:?}");
+        let mut bad = Vec::new();
+        for file in files {
+            let rel = file.strip_prefix(root).unwrap_or(&file).to_path_buf();
+            if rel == Path::new("src/testutil.rs") {
+                continue;
+            }
+            let gtk_allowed = rel == Path::new("tests/icons.rs");
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            for (n, line) in text.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                let raw_gtk = line.contains("gtk4::init(") || line.contains("gtk::init(");
+                if (raw_gtk && !gtk_allowed) || line.contains("adw::init(") {
+                    bad.push(format!("{}:{}: {}", rel.display(), n + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "initialise GTK through testutil::gtk_init / adw_init / native_init:\n{}",
+            bad.join("\n")
+        );
     }
 }

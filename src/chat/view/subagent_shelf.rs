@@ -218,7 +218,7 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "native GTK; run alone in an isolated display"]
     fn native_unknown_worker_has_no_clear_finished_button() {
-        gtk4::init().expect("GTK init");
+        crate::testutil::gtk_init().expect("GTK init");
         let t = transcript(&[subagent("s1", "Explore")]);
         let shelf = SubagentShelf::new(|_| {}, || {});
         let mut workers = t.subagents();

@@ -3137,8 +3137,8 @@ pub(super) mod tests {
     #[test]
     #[ignore = "needs a display; run alone in an isolated display"]
     fn closing_settings_and_window_flushes_agent_edits() {
-        gtk4::init().unwrap();
-        adw::init().unwrap();
+        crate::testutil::gtk_init().unwrap();
+        crate::testutil::adw_init().unwrap();
         let app = crate::window::imp::test_support::test_app("org.test.SettingsFlush", false);
         let env_file = app.config_dir().join("agent.env");
         std::fs::write(&env_file, "TEST_FLAG=yes\n").unwrap();
@@ -3203,8 +3203,8 @@ pub(super) mod tests {
     #[test]
     #[ignore = "needs a display; run alone in an isolated display"]
     fn invalid_text_keeps_the_saved_command_detection() {
-        gtk4::init().unwrap();
-        adw::init().unwrap();
+        crate::testutil::gtk_init().unwrap();
+        crate::testutil::adw_init().unwrap();
         let app = crate::window::imp::test_support::test_app("org.test.InvalidDetection", false);
         let window = crate::window::AgentTerminalWindow::new(&app);
         let prefs = adw::PreferencesDialog::new();
@@ -3232,8 +3232,8 @@ pub(super) mod tests {
     #[test]
     #[ignore = "needs a display; run alone in an isolated display"]
     fn typing_a_command_runs_one_scan() {
-        gtk4::init().unwrap();
-        adw::init().unwrap();
+        crate::testutil::gtk_init().unwrap();
+        crate::testutil::adw_init().unwrap();
         let app = crate::window::imp::test_support::test_app("org.test.AgentDebounce", false);
         let window = crate::window::AgentTerminalWindow::new(&app);
         let ctx = glib::MainContext::default();
@@ -3437,8 +3437,8 @@ pub(super) mod tests {
     #[test]
     #[ignore = "native GTK layout; run alone in an isolated display"]
     fn native_dropdown_rows_show_their_whole_value() {
-        gtk4::init().expect("GTK must be available for the native gate");
-        adw::init().expect("libadwaita init");
+        crate::testutil::gtk_init().expect("GTK must be available for the native gate");
+        crate::testutil::adw_init().expect("libadwaita init");
         crate::load_css();
         let ctx = glib::MainContext::default();
         let app = crate::window::imp::test_support::test_app("org.test.Dropdowns", false);

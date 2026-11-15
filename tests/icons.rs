@@ -147,6 +147,12 @@ fn bundled_svgs_are_plain_enough_for_gtks_parser() {
 
 #[test]
 fn registered_theme_resolves_bundled_icons() {
+    // The crate's `testutil` is not visible to an integration test: the same check, in short.
+    assert!(
+        std::env::var("AGENT_TERMINAL_TEST_DISPLAY").as_deref() == Ok("xvfb"),
+        "GTK tests open windows: run them through `make test` / `make test-one T=...`, which use \
+         a private Xvfb display (AGENT_TERMINAL_TEST_DISPLAY=xvfb is not set)"
+    );
     if gtk4::init().is_err() {
         eprintln!("no display; skipping the icon theme check");
         return;

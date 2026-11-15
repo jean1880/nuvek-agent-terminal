@@ -688,8 +688,8 @@ mod brand_css_tests {
     #[test]
     #[ignore = "loads the brand CSS on a display; run on a private display"]
     fn coloured_buttons_keep_their_text_colour() {
-        gtk4::init().expect("GTK init");
-        adw::init().expect("adw init");
+        crate::testutil::gtk_init().expect("GTK init");
+        crate::testutil::adw_init().expect("adw init");
         load_css();
         let window = gtk4::Window::new();
         let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);

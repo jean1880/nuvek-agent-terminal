@@ -26,7 +26,8 @@ DISPLAY_ENV = XDG_CONFIG_HOME=$(TEST_HOME)/config XDG_DATA_HOME=$(TEST_HOME)/dat
 	XDG_STATE_HOME=$(TEST_HOME)/state XDG_CACHE_HOME=$(TEST_HOME)/cache \
 	GSETTINGS_BACKEND=memory GTK_A11Y=test GDK_BACKEND=x11 LANG=C.UTF-8 \
 	GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
-	AGENT_TERMINAL_QA_ARTIFACTS=$(QA_ARTIFACTS)/screenshots
+	AGENT_TERMINAL_QA_ARTIFACTS=$(QA_ARTIFACTS)/screenshots \
+	AGENT_TERMINAL_TEST_DISPLAY=xvfb
 DISPLAY_RUN = env $(DISPLAY_ENV) xvfb-run -a dbus-run-session --
 # DISPLAY_RUN with .env (git-ignored, optional) on top: copy .env.example, which documents it.
 DOTENV_RUN = env $(DISPLAY_ENV) $$(if [ -f .env ]; then grep -v '^[[:space:]]*\#' .env; fi) \

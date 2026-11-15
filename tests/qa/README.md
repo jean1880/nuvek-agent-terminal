@@ -17,7 +17,9 @@ Everything runs through the Makefile, with standard tools: `cargo nextest` for t
 Every run gets a private Xvfb display and D-Bus session (`xvfb-run`, `dbus-run-session`),
 private XDG directories under `target/test-home` (emptied before every run, since CI caches
 `target/`), in-memory GSettings and no global or
-system git config, so no test touches your settings, thread store or keyring.
+system git config, so no test touches your settings, thread store or keyring. The run also sets
+`AGENT_TERMINAL_TEST_DISPLAY=xvfb`, and every GTK test checks it before initialising GTK: a bare
+`cargo test` or `cargo nextest` fails with a message instead of opening windows on your desktop.
 
 **Display tests** present windows and measure layout. They are `#[ignore]`d so `make test`
 stays fast, and `make check` runs all of them (`--run-ignored only`) one at a time, so none

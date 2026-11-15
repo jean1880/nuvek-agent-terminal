@@ -535,6 +535,15 @@ impl ChatView {
         }
     }
 
+    /// Appends a block of text (terminal output, a quoted diff, a saved prompt) to the draft at
+    /// the cursor, a blank line apart from the text around it, and focuses the composer. The
+    /// draft is never sent; the caller has already redacted what it passes.
+    pub fn insert_attachment_text(&self, text: &str) {
+        if let Some(inner) = self.inner() {
+            inner.composer.insert_block(text);
+        }
+    }
+
     /// Whether the composer holds unsent text (a thread with one is not blank).
     pub fn has_draft(&self) -> bool {
         self.inner()

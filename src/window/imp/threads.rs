@@ -5485,7 +5485,7 @@ impl AgentTerminalWindow {
         page.set_title(&title);
 
         self.configure_terminal(&terminal);
-        self.wire_input_controllers(&terminal);
+        self.wire_input_controllers(&terminal, true);
         // The drawer's shell exiting just closes the drawer; it never takes the thread.
         terminal.connect_child_exited(glib::clone!(
             #[weak]

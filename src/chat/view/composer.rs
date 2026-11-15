@@ -389,6 +389,22 @@ impl Composer {
         self.view.grab_focus();
     }
 
+    /// Appends `block` at the cursor, set apart from the text around it by a blank line, with the
+    /// cursor after it, and focuses the box. Nothing is sent.
+    pub fn insert_block(&self, block: &str) {
+        let cursor = self.buffer.iter_at_mark(&self.buffer.get_insert());
+        let before = self.buffer.text(&self.buffer.start_iter(), &cursor, false);
+        let after = self.buffer.text(&cursor, &self.buffer.end_iter(), false);
+        let text = block_with_separators(&before, block, &after);
+        self.editing.set(true);
+        self.buffer.insert_at_cursor(&text);
+        self.editing.set(false);
+        reset_preedit(&self.preedit_active);
+        self.refresh_placeholder();
+        self.refresh_trigger();
+        self.view.grab_focus();
+    }
+
     /// Whether the cursor sits after the last character (tests).
     #[cfg(test)]
     pub fn cursor_at_end(&self) -> bool {
@@ -1162,9 +1178,45 @@ pub fn items_for(
     completion_items(builtins(), commands, caps, trigger)
 }
 
+/// `block` as it goes into a draft between `before` and `after` (the text either side of the
+/// cursor): a blank line apart from any text before it, and from any text after it, counting the
+/// newlines already there. With nothing after it, one newline ends it so typing starts on a new
+/// line.
+fn block_with_separators(before: &str, block: &str, after: &str) -> String {
+    let newlines = |s: &str, from_end: bool| -> usize {
+        let it: Box<dyn Iterator<Item = char>> = if from_end {
+            Box::new(s.chars().rev())
+        } else {
+            Box::new(s.chars())
+        };
+        it.take_while(|c| *c == '\n').count()
+    };
+    let lead = if before.is_empty() {
+        0
+    } else {
+        2usize.saturating_sub(newlines(before, true))
+    };
+    let trail = if after.is_empty() {
+        1
+    } else {
+        2usize.saturating_sub(newlines(after, false))
+    };
+    format!("{}{block}{}", "\n".repeat(lead), "\n".repeat(trail))
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    #[test]
+    fn a_block_is_set_apart_by_a_blank_line() {
+        assert_eq!(block_with_separators("", "B", ""), "B\n");
+        assert_eq!(block_with_separators("typed", "B", ""), "\n\nB\n");
+        assert_eq!(block_with_separators("typed\n", "B", ""), "\nB\n");
+        assert_eq!(block_with_separators("typed\n\n", "B", ""), "B\n");
+        assert_eq!(block_with_separators("typed", "B", "more"), "\n\nB\n\n");
+        assert_eq!(block_with_separators("", "B", "\nmore"), "B\n");
+    }
 
     #[test]
     #[ignore = "native GTK; run alone in an isolated display"]

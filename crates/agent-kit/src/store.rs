@@ -254,6 +254,8 @@ pub struct ThreadSummary {
     pub unread: bool,
     /// Hidden from the default list ([`Store::list_threads`] with `include_archived` false).
     pub archived: bool,
+    /// A pinned thread's place among the pinned (0 is first); `None` when not pinned.
+    pub pin_rank: Option<i64>,
 }
 
 /// What [`Store::ensure_search_fts`] found.
@@ -2540,6 +2542,81 @@ impl Store {
         require_row(n, thread)
     }
 
+    /// Pins a thread at the end of the pinned list, or unpins it. Pinning an already pinned thread
+    /// keeps its place. Ranks stay dense (0..n). `updated_at` is never touched, so a pin does not
+    /// reorder folders. A hidden backing thread of a supervised child is refused
+    /// ([`StoreError::NotFound`]): it is never listed, so it is never pinned.
+    pub fn set_pinned(&self, thread: &str, pinned: bool) -> Result<()> {
+        let tx = self.write_txn()?;
+        let visible: bool = self.conn.query_row(
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM threads t WHERE t.id = ?1 AND {NOT_HIDDEN_CHILD})"
+            ),
+            params![thread],
+            |r| r.get(0),
+        )?;
+        if !visible {
+            return Err(StoreError::NotFound(thread.to_string()));
+        }
+        if pinned {
+            self.conn.execute(
+                "UPDATE threads SET pin_rank =
+                     (SELECT COALESCE(MAX(pin_rank), -1) + 1 FROM threads)
+                 WHERE id = ?1 AND pin_rank IS NULL",
+                params![thread],
+            )?;
+        } else {
+            self.conn.execute(
+                "UPDATE threads SET pin_rank = NULL WHERE id = ?1",
+                params![thread],
+            )?;
+        }
+        self.renumber_pins()?;
+        tx.commit()
+    }
+
+    /// Moves a pinned thread `delta` places along the pinned list (negative is up), stopping at
+    /// either end, then renumbers the ranks 0..n. A thread that is not pinned is refused
+    /// ([`StoreError::NotFound`]). `updated_at` is never touched.
+    pub fn move_pin(&self, thread: &str, delta: i64) -> Result<()> {
+        let tx = self.write_txn()?;
+        let mut order: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM threads WHERE pin_rank IS NOT NULL ORDER BY pin_rank, rowid",
+            )?;
+            let ids = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            ids.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let Some(at) = order.iter().position(|id| id == thread) else {
+            return Err(StoreError::NotFound(thread.to_string()));
+        };
+        let last = order.len() as i64 - 1;
+        let to = (at as i64).saturating_add(delta).clamp(0, last) as usize;
+        let id = order.remove(at);
+        order.insert(to, id);
+        for (rank, id) in order.iter().enumerate() {
+            self.conn.execute(
+                "UPDATE threads SET pin_rank = ?2 WHERE id = ?1 AND pin_rank IS NOT ?2",
+                params![id, rank as i64],
+            )?;
+        }
+        tx.commit()
+    }
+
+    /// Renumbers the pinned threads 0..n, keeping their order.
+    fn renumber_pins(&self) -> Result<()> {
+        self.conn.execute(
+            "UPDATE threads SET pin_rank = (
+                 SELECT COUNT(*) FROM threads o
+                 WHERE o.pin_rank IS NOT NULL
+                   AND (o.pin_rank < threads.pin_rank
+                        OR (o.pin_rank = threads.pin_rank AND o.rowid < threads.rowid)))
+             WHERE pin_rank IS NOT NULL",
+            [],
+        )?;
+        Ok(())
+    }
+
     /// Marks every event so far as seen.
     pub fn mark_read(&self, thread: &str) -> Result<()> {
         let n = self.conn.execute(
@@ -4023,7 +4100,7 @@ fn status_name(status: ItemStatus) -> &'static str {
 const SUMMARY_SQL: &str = "SELECT t.id, t.title, t.cwd, t.updated_at,
             p.driver, p.model,
             EXISTS (SELECT 1 FROM events e WHERE e.thread_id = t.id AND e.seq > t.read_seq),
-            t.archived
+            t.archived, t.pin_rank
      FROM threads t
      LEFT JOIN provider_threads p ON p.id = COALESCE(
          t.active_provider_thread,
@@ -4045,6 +4122,7 @@ fn summary_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadSummary> {
         model: r.get(5)?,
         unread: r.get(6)?,
         archived: r.get(7)?,
+        pin_rank: r.get(8)?,
     })
 }
 
@@ -4741,6 +4819,96 @@ mod tests {
         assert_eq!(s.list_threads(true).expect("list").len(), 2);
         s.set_archived(&a, false).expect("unarchive");
         assert_eq!(s.list_threads(false).expect("list").len(), 2);
+    }
+
+    fn pin_order(s: &Store) -> Vec<(String, i64)> {
+        let mut pinned: Vec<(String, i64)> = s
+            .list_threads(true)
+            .expect("list")
+            .into_iter()
+            .filter_map(|t| t.pin_rank.map(|r| (t.title, r)))
+            .collect();
+        pinned.sort_by_key(|(_, r)| *r);
+        pinned
+    }
+
+    #[test]
+    fn pin_and_move_keep_dense_ranks_and_do_not_touch_updated_at() {
+        let s = store();
+        let a = s.create_thread("/a", Some("a")).expect("a");
+        let b = s.create_thread("/b", Some("b")).expect("b");
+        let c = s.create_thread("/c", Some("c")).expect("c");
+        let _d = s.create_thread("/d", Some("d")).expect("d");
+        let stamps = |s: &Store| -> Vec<(String, i64)> {
+            let mut v: Vec<_> = s
+                .list_threads(true)
+                .expect("list")
+                .into_iter()
+                .map(|t| (t.title, t.updated_at))
+                .collect();
+            v.sort();
+            v
+        };
+        let before = stamps(&s);
+
+        s.set_pinned(&c, true).expect("pin c");
+        s.set_pinned(&a, true).expect("pin a");
+        s.set_pinned(&b, true).expect("pin b");
+        s.set_pinned(&a, true)
+            .expect("pinning again keeps the place");
+        let ranked = |names: &[&str]| -> Vec<(String, i64)> {
+            names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| ((*n).to_owned(), i as i64))
+                .collect()
+        };
+        assert_eq!(pin_order(&s), ranked(&["c", "a", "b"]));
+
+        s.move_pin(&b, -1).expect("up");
+        assert_eq!(pin_order(&s), ranked(&["c", "b", "a"]));
+        s.move_pin(&c, 5)
+            .expect("down past the end stops at the end");
+        assert_eq!(pin_order(&s), ranked(&["b", "a", "c"]));
+        s.move_pin(&b, -1).expect("up at the top is a no-op");
+        assert_eq!(pin_order(&s), ranked(&["b", "a", "c"]));
+
+        s.set_pinned(&a, false).expect("unpin the middle");
+        assert_eq!(pin_order(&s), ranked(&["b", "c"]), "ranks close the gap");
+        assert!(matches!(s.move_pin(&a, 1), Err(StoreError::NotFound(_))));
+        assert_eq!(stamps(&s), before, "pins never touch updated_at");
+
+        s.set_archived(&b, true).expect("archive");
+        assert_eq!(
+            pin_order(&s),
+            ranked(&["b", "c"]),
+            "archiving keeps the pin"
+        );
+    }
+
+    #[test]
+    fn summaries_carry_pin_rank() {
+        let s = store();
+        let a = s.create_thread("/a", Some("a")).expect("a");
+        let b = s.create_thread("/b", Some("b")).expect("b");
+        assert_eq!(
+            s.thread_summary(&a).expect("read").expect("a").pin_rank,
+            None
+        );
+        s.set_pinned(&b, true).expect("pin");
+        assert_eq!(
+            s.thread_summary(&b).expect("read").expect("b").pin_rank,
+            Some(0)
+        );
+        let listed = s.list_threads(false).expect("list");
+        assert_eq!(
+            listed.iter().find(|t| t.id == b).map(|t| t.pin_rank),
+            Some(Some(0))
+        );
+        assert!(matches!(
+            s.set_pinned("missing", true),
+            Err(StoreError::NotFound(_))
+        ));
     }
 
     #[test]

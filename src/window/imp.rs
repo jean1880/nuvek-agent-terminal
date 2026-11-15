@@ -473,7 +473,12 @@ fn takes_checkpoints(enabled: bool, remote: Option<&RemoteTab>) -> bool {
 /// Whether a page is saved for Reopen Terminal Tabs: a local terminal page. A remote page never
 /// is, so no `ssh` starts at launch without the user asking.
 fn restorable(tab: &TabState) -> bool {
-    tab.chat.is_none() && tab.remote.is_none()
+    restorable_page(tab.chat.is_some(), tab.remote.as_ref())
+}
+
+/// [`restorable`] from what decides it: not a thread, and not on another machine.
+fn restorable_page(is_thread: bool, remote: Option<&RemoteTab>) -> bool {
+    !is_thread && remote.is_none()
 }
 
 /// How long a tab's output must be still before its turn counts as over and
@@ -3796,6 +3801,9 @@ impl AgentTerminalWindow {
                     return;
                 }
 
+                // The window says the same: the remote shell's own title is the other
+                // machine's text, and may claim to be anything.
+                let session_info = fixed.as_deref().unwrap_or(session_info);
                 if let Some(window_title) = imp.window_title.borrow().as_ref() {
                     window_title.set_subtitle(session_info);
                     if session_info.is_empty() {
@@ -4159,7 +4167,7 @@ impl AgentTerminalWindow {
             Some("win.send-selection"),
         );
         menu.append_section(None, &section);
-        self.attach_terminal_menu(terminal, &menu);
+        self.attach_terminal_menu(terminal, &menu, remote);
     }
 
     /// A remote page's menu: nothing that reads a local folder (checkpoints, changes, sessions
@@ -4209,8 +4217,9 @@ impl AgentTerminalWindow {
     }
 
     /// Opens `menu` on a right click, the Menu key, Shift+F10 or a long press, and Ctrl+click
-    /// opens a hyperlink.
-    fn attach_terminal_menu(&self, terminal: &Terminal, menu: &gtk4::gio::Menu) {
+    /// opens a hyperlink (on a `remote` page, only a web link:
+    /// [`agent_core::remote::remote_link_allowed`]).
+    fn attach_terminal_menu(&self, terminal: &Terminal, menu: &gtk4::gio::Menu, remote: bool) {
         let win = self.obj().clone();
         let popover = gtk4::PopoverMenu::builder()
             .menu_model(menu)
@@ -4298,6 +4307,16 @@ impl AgentTerminalWindow {
                     if modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
                         if let Some(uri) = terminal.hyperlink_hover_uri() {
                             gesture.set_state(gtk4::EventSequenceState::Claimed);
+                            // A remote page's links were written by the other machine: only a
+                            // web link opens here, never a file:// or a handler's scheme.
+                            if remote && !agent_core::remote::remote_link_allowed(&uri) {
+                                info!("Refused a non-web link on a remote page");
+                                if let Some(obj) = window_of(&terminal) {
+                                    obj.imp()
+                                        .show_toast(agent_core::remote::REMOTE_LINK_REFUSED);
+                                }
+                                return;
+                            }
                             debug!("Opening hyperlink: {}", uri);
                             // UriLauncher replaces the deprecated gtk4::show_uri.
                             // Fire-and-forget: the portal owns the outcome, and a
@@ -8270,6 +8289,19 @@ mod tests {
         assert!(!takes_checkpoints(true, Some(&remote)));
         assert!(!takes_checkpoints(false, Some(&remote)));
         assert_eq!(remote.title(), "box:~/src");
+    }
+
+    /// Reopen Terminal Tabs saves local terminal pages only: a remote page reopened at launch
+    /// would start ssh without the user asking.
+    #[test]
+    fn a_remote_page_is_never_saved_for_restore() {
+        let remote = RemoteTab {
+            alias: "box".into(),
+            dir: "~".into(),
+        };
+        assert!(restorable_page(false, None));
+        assert!(!restorable_page(false, Some(&remote)));
+        assert!(!restorable_page(true, None));
     }
 
     #[test]

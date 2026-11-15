@@ -21,14 +21,16 @@ use super::{AgentTerminalWindow, RemoteTab};
 const CHECK_TIMEOUT_SECS: u64 = 20;
 
 /// Whether `alias` answers: `ssh` with [`remote::CHECK_OPTIONS`] running `true` there, never a
-/// prompt, through the timeout runner. Blocking: call it off the main thread.
-fn check_reachable(alias: &str) -> RemoteCheck {
+/// prompt, through the timeout runner, in exactly `env` (`KEY=value` entries: the environment a
+/// remote page gets, `clear_env` removed). Blocking: call it off the main thread.
+fn check_reachable(alias: &str, env: &[String]) -> RemoteCheck {
     let argv = match remote::ssh_check_argv(alias) {
         Ok(argv) => argv,
         Err(why) => return RemoteCheck::Unreachable(why),
     };
     let mut command = std::process::Command::new(&argv[0]);
-    command.args(&argv[1..]);
+    command.args(&argv[1..]).env_clear();
+    command.envs(env.iter().filter_map(|entry| entry.split_once('=')));
     match agent_kit::exec::run_command(command, "ssh", CHECK_TIMEOUT_SECS) {
         Ok(out) => remote::check_outcome(out.status.code(), &String::from_utf8_lossy(&out.stderr)),
         Err(why) => RemoteCheck::Unreachable(why),
@@ -348,12 +350,17 @@ impl Machines {
             .borrow_mut()
             .insert(alias.clone(), RemoteCheck::Checking);
         row.set_subtitle(&glib::markup_escape_text(&RemoteCheck::Checking.describe()));
+        // The same environment a page on that machine gets.
+        let env = self
+            .window()
+            .map(|w| w.imp().terminal_env())
+            .unwrap_or_default();
         let this = Rc::downgrade(self);
         let row = row.downgrade();
         let button = button.downgrade();
         glib::MainContext::default().spawn_local(async move {
             let checked = alias.clone();
-            let result = gtk4::gio::spawn_blocking(move || check_reachable(&checked))
+            let result = gtk4::gio::spawn_blocking(move || check_reachable(&checked, &env))
                 .await
                 .unwrap_or_else(|_| RemoteCheck::Unreachable("the check failed".to_owned()));
             tracing::info!("Remote machine check: {}", result.describe());

@@ -5109,10 +5109,21 @@ impl AgentTerminalWindow {
         *self.shown_thread.borrow_mut() = info.as_ref().map(|(thread, ..)| thread.clone());
         self.refresh_repo_presence(page);
         let Some((thread, title, dir)) = info else {
-            // A terminal page: the 2.x handler puts its terminal title in the subtitle.
+            // A terminal page: the 2.x handler puts its terminal title in the subtitle. A
+            // remote page's is always its machine and folder.
+            let remote = self
+                .with_page_tab(page, |t| t.remote.as_ref().map(super::RemoteTab::title))
+                .flatten();
             if let Some(window_title) = self.window_title.borrow().as_ref() {
                 window_title.set_title("Terminal");
                 window_title.set_tooltip_text(None);
+                if let Some(remote) = &remote {
+                    window_title.set_subtitle(remote);
+                }
+            }
+            if let Some(remote) = &remote {
+                self.obj()
+                    .set_title(Some(&format!("Agent Terminal — {remote}")));
             }
             return;
         };

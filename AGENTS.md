@@ -614,9 +614,13 @@ Architectural mandates, standards, and workflows for this codebase.
   started only by a user action (Check, opening a page or thread on that machine, Reconnect)
   or by a page or thread the user created there, never at startup (remote pages are never
   saved for Reopen Terminal Tabs), always as an argv with no local shell string, and always
-  with `ClearAllForwardings=yes`, `ForwardAgent=no`, `ForwardX11=no` and
-  `PermitLocalCommand=no`, so no `-L`/`-R`/`-D` forwarding from the user's ssh configuration
-  applies and nothing listens on either side. A terminal page runs `ssh -t` with `BatchMode=no`
+  with `ClearAllForwardings=yes`, `ForwardAgent=no`, `ForwardX11=no`, `PermitLocalCommand=no`,
+  `Tunnel=no` and `RemoteCommand=none`, so no `-L`/`-R`/`-D` forwarding or tun device from the
+  user's ssh configuration applies and nothing listens on either side. What ssh writes is the
+  other side's text: Check's reason is redacted before it is cut or shown or logged
+  (`remote::check_outcome`), a remote page keeps `alias:folder` as its page and window title
+  whatever the remote shell sets, and it opens only `http(s)://` links
+  (`remote::remote_link_allowed`), never a `file://` or another scheme's handler. A terminal page runs `ssh -t` with `BatchMode=no`
   (the user answers a host-key or password prompt in the page itself); anything without a
   terminal (Check, and any chat process) runs with `BatchMode=yes`, so it never waits on a
   prompt nobody sees. The remote command is one POSIX line, `cd -- '<folder>' && exec

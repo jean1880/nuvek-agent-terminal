@@ -26,7 +26,9 @@ pub const MAX_DIR_LEN: usize = 4096;
 /// never wait on a prompt nobody can see, and runs with `BatchMode=yes` instead.)
 /// `ClearAllForwardings=yes` overrides any `LocalForward`, `RemoteForward` or `DynamicForward`
 /// in the user's ssh configuration, so the app opens no port on either side; agent, X11 and
-/// local-command execution are off for the same reason.
+/// local-command execution are off for the same reason, and so is `Tunnel` (a tun device, which
+/// `ClearAllForwardings` does not cover). `RemoteCommand=none` keeps a configured remote command
+/// from replacing the one given here.
 pub const TTY_OPTIONS: &[&str] = &[
     "-t",
     "-o",
@@ -43,6 +45,10 @@ pub const TTY_OPTIONS: &[&str] = &[
     "ForwardX11=no",
     "-o",
     "PermitLocalCommand=no",
+    "-o",
+    "Tunnel=no",
+    "-o",
+    "RemoteCommand=none",
 ];
 
 /// Options of the reachability check in Settings: never a prompt (it has no terminal), a short
@@ -61,6 +67,10 @@ pub const CHECK_OPTIONS: &[&str] = &[
     "ForwardX11=no",
     "-o",
     "PermitLocalCommand=no",
+    "-o",
+    "Tunnel=no",
+    "-o",
+    "RemoteCommand=none",
 ];
 
 /// A machine listed in Settings → General → Remote Machines.
@@ -221,6 +231,22 @@ pub fn ssh_check_argv(alias: &str) -> Result<Vec<String>, String> {
     Ok(argv)
 }
 
+/// Whether a link shown on a remote page may be opened on this machine: only `http://` and
+/// `https://` with a host. Anything else (`file://`, `ssh:`, a custom handler's scheme) names
+/// something on the other machine, or asks this one to run a handler the other machine chose.
+pub fn remote_link_allowed(uri: &str) -> bool {
+    let uri = uri.trim();
+    let Some((scheme, rest)) = uri.split_once("://") else {
+        return false;
+    };
+    let web = scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https");
+    web && !rest.is_empty() && !rest.starts_with('/') && !crate::text::has_control_or_bidi(uri, &[])
+}
+
+/// What a remote page says when it refuses a link.
+pub const REMOTE_LINK_REFUSED: &str =
+    "Links to files on another machine cannot open here; only web links can";
+
 /// A terminal page's title: `alias:folder`.
 pub fn page_title(alias: &str, dir: &str) -> String {
     format!("{alias}:{dir}")
@@ -251,10 +277,15 @@ impl RemoteCheck {
 
 /// The check's answer from `ssh`'s exit code and standard error: exit 0 is reachable, anything
 /// else is not, for the last line ssh wrote (bounded), or the exit code when it wrote nothing.
+///
+/// What ssh writes is not ssh's alone: a `ProxyCommand` or a proxy's error can print a
+/// credential. It is redacted first, as a whole, then stripped of hidden characters, and only
+/// then cut to its bound, so no secret is cut short of what masking recognises.
 pub fn check_outcome(code: Option<i32>, stderr: &str) -> RemoteCheck {
     if code == Some(0) {
         return RemoteCheck::Reachable;
     }
+    let stderr = crate::redact::redact(stderr);
     let line = stderr
         .lines()
         .map(str::trim)
@@ -335,11 +366,15 @@ mod tests {
                 "ForwardAgent=no",
                 "ForwardX11=no",
                 "PermitLocalCommand=no",
+                "Tunnel=no",
+                "RemoteCommand=none",
             ] {
                 assert!(joined.contains(&format!("-o {option}")), "{option}");
             }
             // No forwarding or listening flag at all.
-            for flag in ["-L", "-R", "-D", "-A", "-X", "-Y", "-W", "-M", "-f", "-N"] {
+            for flag in [
+                "-L", "-R", "-D", "-A", "-X", "-Y", "-W", "-M", "-f", "-N", "-w", "-S", "-O",
+            ] {
                 assert!(!argv.iter().any(|a| a == flag), "{flag}");
             }
             // `--` comes right before the alias, so nothing after it is an option.
@@ -446,6 +481,62 @@ mod tests {
             check_outcome(None, ""),
             RemoteCheck::Unreachable(_)
         ));
+    }
+
+    /// A credential a ProxyCommand printed is masked before the reason is cut to its bound, even
+    /// when the bound falls inside it.
+    #[test]
+    fn check_outcome_masks_a_secret_before_cutting_the_reason() {
+        let token = "ghp_abcdefghijklmnopqrstuvwxyz0123";
+        let prefix = format!("proxy: {} ", "x".repeat(142));
+        assert_eq!(
+            prefix.len(),
+            150,
+            "the token starts before the 160-byte bound"
+        );
+        let stderr = format!("debug1: hello\n{prefix}{token} rejected\n");
+        let RemoteCheck::Unreachable(why) = check_outcome(Some(255), &stderr) else {
+            panic!("a failed check is unreachable");
+        };
+        assert!(why.len() <= 160, "{}", why.len());
+        assert!(!why.contains("ghp_abc"), "{why}");
+        assert!(!why.contains("abcdefghij"), "{why}");
+        assert!(why.starts_with("proxy: "), "{why}");
+        // A whole secret on its own line is masked too.
+        let RemoteCheck::Unreachable(why) = check_outcome(Some(255), &format!("auth {token}"))
+        else {
+            panic!("a failed check is unreachable");
+        };
+        assert!(!why.contains(token), "{why}");
+    }
+
+    #[test]
+    fn a_remote_page_opens_only_web_links() {
+        for ok in [
+            "https://example.com/a?b=c",
+            "http://192.0.2.7:8080/",
+            "HTTPS://Example.com",
+        ] {
+            assert!(remote_link_allowed(ok), "{ok}");
+        }
+        for refused in [
+            "file:///etc/passwd",
+            "file://box/home/me/.ssh/id_ed25519",
+            "FILE:///tmp/x",
+            "ssh://box",
+            "mailto:me@example.com",
+            "javascript:alert(1)",
+            "vscode://file/etc/passwd",
+            "smb://server/share",
+            "https:///etc/passwd",
+            "https://",
+            "/etc/passwd",
+            "example.com",
+            "",
+            "https://exa\u{202e}mple.com",
+        ] {
+            assert!(!remote_link_allowed(refused), "{refused:?}");
+        }
     }
 
     #[test]

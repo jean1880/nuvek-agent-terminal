@@ -71,20 +71,15 @@ struct Bounded<'a> {
     cut: Option<Trim>,
 }
 
-/// Characters a token cannot continue across, where a cut line may safely restart.
-fn is_separator(c: char) -> bool {
-    c.is_whitespace() || "\"'`=:,;()[]{}<>|&".contains(c)
-}
-
 /// The tail of `raw` worth processing: whole lines, at most `RAW_CHARS_FACTOR` times the
 /// character cap and twice the line cap in line breaks (the strip can add breaks, so there is a
 /// margin). The tail is found from the end, reading only what it keeps; counting what came off
 /// the front is one fast pass over it afterwards.
 ///
-/// A line too long to keep whole is cut in the middle, and redaction matches prefixes and key
-/// names, so a secret whose prefix was cut off would pass as plain text. The kept text therefore
-/// starts after the first separator past the cut, so no partial token survives. A window that
-/// holds no separator (one enormous token) keeps nothing.
+/// Redaction works line by line and matches prefixes, auth schemes and key names, so a line cut
+/// in the middle can leave a secret with nothing to recognise it by. The rest of a cut line is
+/// therefore dropped, up to its break, and only the whole lines after it are kept. A window with
+/// no break after the cut (one enormous line) keeps nothing.
 fn bound_raw(raw: &str, caps: Caps) -> Bounded<'_> {
     let max_chars = caps.max_chars.max(1).saturating_mul(RAW_CHARS_FACTOR);
     let max_breaks = caps.max_lines.max(1).saturating_mul(2);
@@ -116,15 +111,11 @@ fn bound_raw(raw: &str, caps: Caps) -> Bounded<'_> {
         };
     };
     if by == Trim::Chars {
-        // Forward to a line boundary, so redaction sees whole lines. With none in the window
-        // the cut is inside a line: restart after its first separator, or keep nothing.
-        let tail = &raw[start..];
-        start = match tail.find(['\n', '\r']) {
+        // The cut is inside a line: drop the rest of that line, up to and including its break,
+        // so redaction sees only whole lines. With no break in the window, keep nothing.
+        start = match raw[start..].find(['\n', '\r']) {
             Some(p) => start + p + 1,
-            None => match tail.char_indices().find(|(_, c)| is_separator(*c)) {
-                Some((p, c)) => start + p + c.len_utf8(),
-                None => raw.len(),
-            },
+            None => raw.len(),
         };
     }
     Bounded {
@@ -408,33 +399,69 @@ mod tests {
 
     #[test]
     fn a_cut_line_never_keeps_part_of_a_token() {
+        // The raw window is the last 200 characters.
         let caps = Caps {
             max_lines: 5,
-            max_chars: 20,
+            max_chars: 50,
         };
-        // The window is the last 80 characters: it starts 19 characters into the secret.
-        let secret = format!("ghp_{}", "abcdefghijklmnopqrstuvwxyz0123456789");
-        let ok = "ok ".repeat(20);
-        let raw = format!("{}{secret} {}", "word ".repeat(40), ok.trim_end());
+        let pad = "p".repeat(300);
+        let word_cases = [
+            // The cut lands in the secret's own prefix, the auth scheme and the key name.
+            ("ghp_", "ghp_"),
+            (" Authorization: Bearer ", "Bearer"),
+            (" api_key=", "api_key"),
+        ];
+        for suffix in ["", "\nnext line"] {
+            for (lead, word) in word_cases {
+                let prefix = format!("{pad}{lead}");
+                // A value long enough that the window starts two characters into `word`.
+                let at = prefix.find(word).unwrap() + 2;
+                let len = (at + 200).checked_sub(prefix.len() + suffix.len()).unwrap();
+                let value = "VALUE".repeat(len / 5 + 1)[..len].to_string();
+                let raw = format!("{prefix}{value}{suffix}");
+                assert_eq!(raw.len() - 200, at, "{word}: the cut is inside the word");
+                let e = format_excerpt(&raw, caps).unwrap();
+                assert!(e.truncated);
+                assert!(!e.text.contains("VALUE"), "{word}: {}", e.text);
+                assert!(
+                    !e.text.contains("arer") && !e.text.contains("_key"),
+                    "{}",
+                    e.text
+                );
+                if suffix.is_empty() {
+                    // No whole line follows the cut one: only the marker is left.
+                    assert_eq!(e.lines, 0);
+                    assert!(
+                        body(&e).starts_with("[... ") && body(&e).ends_with("omitted ...]"),
+                        "{}",
+                        e.text
+                    );
+                } else {
+                    assert_eq!(body(&e), "[... 1 earlier lines omitted ...]\nnext line");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn whole_lines_after_a_cut_are_kept_and_redacted() {
+        let caps = Caps {
+            max_lines: 5,
+            max_chars: 50,
+        };
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let raw = format!(
+            "{}\nstatus ok\nexport API_TOKEN={secret}\n",
+            "z".repeat(400)
+        );
         let e = format_excerpt(&raw, caps).unwrap();
         assert!(e.truncated);
-        assert!(!e.text.contains(&secret[secret.len() - 8..]), "{}", e.text);
-        assert!(
-            !e.text.contains(&secret[secret.len() - 19..][..8]),
-            "{}",
-            e.text
-        );
-        assert!(body(&e).starts_with("[... "), "{}", e.text);
-        assert!(
-            body(&e).contains("earlier characters omitted"),
-            "{}",
-            e.text
-        );
-        assert!(body(&e).ends_with("ok ok"), "{}", e.text);
-        // The kept text restarts after the first separator past the cut.
-        let line = format!("{}k=v rest", "x".repeat(500));
-        let b = bound_raw(&line, caps);
-        assert_eq!(b.kept, "v rest");
+        assert!(body(&e).starts_with("[... 1 earlier lines omitted ...]\nstatus ok\n"));
+        assert!(body(&e).contains("API_TOKEN=****"), "{}", e.text);
+        assert!(!e.text.contains(secret));
+        assert!(!e.text.contains("zzzz"));
+        assert_eq!(e.lines, 2);
+        assert_eq!(e.masked, 1);
     }
 
     #[test]

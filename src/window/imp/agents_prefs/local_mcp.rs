@@ -641,7 +641,6 @@ impl AgentTerminalWindow {
             .title("Discovery Folder")
             .text(&self.config.borrow().starting_directory)
             .build();
-        crate::a11y::name_apply_button(&folder);
         group.add(&folder);
         let servers=adw::ExpanderRow::builder().title("MCP Server Definitions").subtitle("Disabled definitions are safe to review. Discover tools is the only Settings action that starts a server.").build();
         group.add(&servers);

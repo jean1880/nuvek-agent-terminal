@@ -2151,6 +2151,10 @@ impl AgentTerminalWindow {
                 .icon_name(&indicator.icon_unknown)
                 .tooltip_text(format!("{}: checking…", indicator.label))
                 .build();
+            button.update_property(&[gtk4::accessible::Property::Label(&format!(
+                "{}: checking…",
+                indicator.label
+            ))]);
             header.pack_end(&button);
             self.drive_indicator(button, indicator);
         }
@@ -2248,6 +2252,7 @@ impl AgentTerminalWindow {
                 }
                 button.set_icon_name(icon);
                 button.set_tooltip_text(Some(&tooltip));
+                button.update_property(&[gtk4::accessible::Property::Label(&tooltip)]);
                 for class in [
                     "success-indicator",
                     "warning-indicator",
@@ -8276,8 +8281,32 @@ mod tests {
         crate::testutil::pump_until(&ctx, 20, || !imp.detecting.get());
         imp.finish_shell(None);
         imp.reveal_shell();
-        // A repository with an edited file, so the diff panel has rows and controls to audit.
         let dir = tempfile::tempdir().unwrap();
+        // A diff tool, so each file row's "Open in" button is shown.
+        crate::diff_tool::DiffTools::shared().set(Some(agent_kit::difftool::DiffTool {
+            name: "Audit tool".into(),
+            argv: vec!["meld".into(), "{old}".into(), "{new}".into()],
+        }));
+        // A status indicator in the header.
+        let indicator_file = dir.path().join("indicator");
+        std::fs::write(&indicator_file, "").unwrap();
+        imp.config
+            .borrow_mut()
+            .indicators
+            .push(crate::config::Indicator {
+                label: "Audit indicator".into(),
+                source: crate::config::IndicatorSource::File {
+                    path: indicator_file.to_string_lossy().into_owned(),
+                },
+                refresh_secs: None,
+                icon_ok: "at-security-high-symbolic".into(),
+                icon_warn: "at-dialog-warning-symbolic".into(),
+                icon_unknown: "at-dialog-question-symbolic".into(),
+                action: Default::default(),
+            });
+        let header = imp.header.borrow().clone().expect("the header bar");
+        imp.add_status_indicators(&header);
+        // A repository with an edited file, so the diff panel has rows and controls to audit.
         let run = |args: &[&str]| {
             std::process::Command::new("git")
                 .arg("-C")
@@ -8334,15 +8363,8 @@ mod tests {
 
         let mut problems = Vec::new();
         let mut audit = |what: &str, root: &gtk4::Widget| {
-            let buttons = crate::testutil::descendants(root)
-                .iter()
-                .filter(|w| {
-                    w.is::<gtk4::Button>()
-                        || w.is::<gtk4::MenuButton>()
-                        || w.is::<gtk4::ToggleButton>()
-                })
-                .count();
-            eprintln!("{what}: {buttons} buttons");
+            let buttons = crate::testutil::audited_buttons(root).len();
+            eprintln!("{what}: {buttons} buttons audited");
             for p in crate::testutil::button_problems(root, 24)
                 .into_iter()
                 .chain(crate::testutil::icon_only_without_label(root))
@@ -8357,6 +8379,20 @@ mod tests {
             audit("window", &root) > 20,
             "the window's buttons were walked"
         );
+        // The states that hide a button by default are on: the diff tool's "Open in" buttons
+        // and the header's status indicator are audited, not skipped as hidden.
+        let tooltips: Vec<String> = crate::testutil::audited_buttons(&root)
+            .iter()
+            .filter_map(|b| b.tooltip_text().map(|t| t.to_string()))
+            .collect();
+        assert!(
+            tooltips.iter().any(|t| t.starts_with("Open in")),
+            "a file row's Open in button is audited: {tooltips:?}"
+        );
+        assert!(
+            tooltips.iter().any(|t| t.starts_with("Audit indicator")),
+            "the status indicator is audited: {tooltips:?}"
+        );
 
         // The diff panel popped out into its own window, and docked again.
         let panel = imp
@@ -8368,7 +8404,10 @@ mod tests {
         panel.pop_out(window.upcast_ref(), "Button audit");
         crate::testutil::settle(&ctx);
         assert!(panel.is_detached(), "the panel is in its own window");
-        audit("popped-out diff panel", panel.content.upcast_ref());
+        assert!(
+            audit("popped-out diff panel", panel.content.upcast_ref()) > 0,
+            "the popped-out panel's buttons were walked"
+        );
         panel.dock();
         crate::testutil::settle(&ctx);
 
@@ -8377,9 +8416,46 @@ mod tests {
         crate::testutil::pump_until(&ctx, 5, || window.visible_dialog().is_some());
         crate::testutil::settle(&ctx);
         let dialog = window.visible_dialog().expect("Settings is open");
+        // An entry row that offers Apply shows its button once its text has changed.
+        let rows = crate::testutil::find_all::<adw::EntryRow>(dialog.upcast_ref());
+        let row = rows
+            .iter()
+            .find(|r| r.shows_apply_button())
+            .expect("an entry row with an apply button");
+        row.set_text("changed");
+        crate::testutil::settle(&ctx);
         assert!(
             audit("settings", dialog.upcast_ref()) > 10,
             "Settings' buttons were walked"
+        );
+        assert!(
+            crate::testutil::audited_buttons(dialog.upcast_ref())
+                .iter()
+                .any(|b| b.has_css_class("apply-button")),
+            "a shown apply button is audited"
+        );
+        dialog.close();
+        crate::testutil::settle(&ctx);
+
+        // Rules, seeded in the test home: the saved tool rules' list (a dialog) and the
+        // always-allowed rows (a Settings group), each with a delete button per rule.
+        let rules_path = dir.path().join("rules.json");
+        let rules = crate::always_allow::AlwaysRules {
+            rules: vec![crate::always_allow::Rule::new("*", "Bash", "ls*").expect("a rule")],
+        };
+        rules.save(&rules_path).expect("the rules file is saved");
+        let always = super::agents_prefs::always_allowed_rows_at(Some(rules_path.clone()));
+        assert!(
+            audit("always-allowed rows", always.upcast_ref()) > 0,
+            "the remove button of a remembered rule was walked"
+        );
+        imp.present_rules_dialog_for_test(window.upcast_ref(), rules_path, rules);
+        crate::testutil::pump_until(&ctx, 5, || window.visible_dialog().is_some());
+        crate::testutil::settle(&ctx);
+        let dialog = window.visible_dialog().expect("the rules list is open");
+        assert!(
+            audit("tool rules", dialog.upcast_ref()) > 0,
+            "the delete button of a saved rule was walked"
         );
         dialog.close();
         crate::testutil::settle(&ctx);

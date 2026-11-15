@@ -3130,11 +3130,33 @@ pub(super) struct Sidebar {
     _usage: Rc<UsageIndicator>,
 }
 
-/// The sidebar toggle's words, as its tooltip and its accessible name (a tooltip alone is not
-/// reliably read as a name), so both follow the thread counts it reports.
-fn set_toggle_words(toggle: &gtk4::ToggleButton, text: &str) {
-    toggle.set_tooltip_text(Some(text));
-    toggle.update_property(&[gtk4::accessible::Property::Label(text)]);
+/// The sidebar toggle's tooltip, and its accessible name: the same words without the F9 hint,
+/// which a screen reader would speak as part of the name. Both follow the counts it reports.
+fn set_toggle_words(toggle: &gtk4::ToggleButton, tooltip: &str) {
+    toggle.set_tooltip_text(Some(tooltip));
+    toggle.update_property(&[gtk4::accessible::Property::Label(&toggle_name(tooltip))]);
+}
+
+/// A sidebar toggle tooltip without its key hint (" (F9)" or " · F9").
+fn toggle_name(tooltip: &str) -> String {
+    tooltip.replace(" (F9)", "").replace(" · F9", "")
+}
+
+#[cfg(test)]
+mod toggle_name_tests {
+    use super::toggle_name;
+
+    #[test]
+    fn the_name_keeps_the_words_and_drops_the_key_hint() {
+        assert_eq!(
+            toggle_name("Show or Hide Threads (F9)"),
+            "Show or Hide Threads"
+        );
+        assert_eq!(
+            toggle_name("Show Threads (2 unread threads · F9)"),
+            "Show Threads (2 unread threads)"
+        );
+    }
 }
 
 fn sidebar_focus_target(

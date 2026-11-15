@@ -403,7 +403,6 @@ impl AgentTerminalWindow {
             .title("Preview for Folder")
             .text(self.config.borrow().starting_directory.clone())
             .build();
-        crate::a11y::name_apply_button(&folder);
         let button = gtk4::Button::builder()
             .label("Preview")
             .valign(gtk4::Align::Center)

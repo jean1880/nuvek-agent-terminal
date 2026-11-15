@@ -832,11 +832,16 @@ impl DiffPanel {
         let refresh = |button: &gtk4::Button| match DiffTools::shared().get() {
             Some(tool) => {
                 button.set_visible(true);
-                button.set_tooltip_text(Some(&crate::diff_tool::open_label(&tool)));
+                let label = crate::diff_tool::open_label(&tool);
+                button.set_tooltip_text(Some(&label));
+                button.update_property(&[gtk4::accessible::Property::Label(&label)]);
             }
             None => {
                 button.set_visible(false);
                 button.set_tooltip_text(Some(crate::diff_tool::NO_TOOL_HINT));
+                button.update_property(&[gtk4::accessible::Property::Label(
+                    crate::diff_tool::NO_TOOL_HINT,
+                )]);
             }
         };
         refresh(&button);

@@ -269,6 +269,130 @@ pub fn classify(diff: &str) -> Vec<LineKind> {
         .collect()
 }
 
+/// One line of a unified diff with its place in the old and new file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineRef {
+    /// The 1-based line in the old file: context and removed lines only.
+    pub old: Option<u32>,
+    /// The 1-based line in the new file: context and added lines only.
+    pub new: Option<u32>,
+    /// What [`classify`] makes of the line, so a row agrees with what the panel shows.
+    pub kind: LineKind,
+}
+
+/// A hunk header's `(start, count)` for the old and the new side.
+type HunkRanges = ((u32, u32), (u32, u32));
+
+/// Reads a hunk header, `@@ -a[,b] +c[,d] @@ …`. An omitted count is 1, as git writes it.
+/// Anything else, a combined-diff `@@@` header included, is `None`.
+fn parse_hunk_header(line: &str) -> Option<HunkRanges> {
+    let rest = line.strip_prefix("@@ -")?;
+    let (old, rest) = rest.split_once(" +")?;
+    let (new, _) = rest.split_once(" @@")?;
+    let range = |range: &str| -> Option<(u32, u32)> {
+        match range.split_once(',') {
+            Some((start, count)) => Some((start.parse().ok()?, count.parse().ok()?)),
+            None => Some((range.parse().ok()?, 1)),
+        }
+    };
+    Some((range(old)?, range(new)?))
+}
+
+/// Where the next line of a hunk lands, and how many lines of it each side still owes.
+struct Cursor {
+    old: u32,
+    new: u32,
+    old_left: u32,
+    new_left: u32,
+}
+
+/// Maps each text line of a file's unified diff (the chunk [`split_by_file`] gives, header
+/// included) to its old and new line numbers, one entry per line in order, so entry `i` is row
+/// `i` of [`classify`].
+///
+/// The numbers start at each `@@ -a,b +c,d @@` header (1-based; an omitted count means 1). A
+/// context line advances both counters, an added line only the new one, a removed line only the
+/// old one, and each uses up one of the header's lines on its side. Once a hunk's counts are
+/// spent, the rows after it (up to the next `@@`) carry `None`, though their `kind` stays what
+/// [`classify`] says. File, meta and hunk lines, and `\ No newline`, carry `None`. A hunk whose
+/// header cannot be read, and any line before a first hunk, carry `None` too: never a guess. A
+/// chunk cut short mid-hunk keeps the numbers it has. The arithmetic saturates.
+pub fn parse_hunks(chunk: &str) -> Vec<LineRef> {
+    let mut cursor: Option<Cursor> = None;
+    let kinds = classify(chunk);
+    chunk
+        .lines()
+        .zip(kinds)
+        .map(|(line, kind)| {
+            let (mut old, mut new) = (None, None);
+            match kind {
+                LineKind::File => cursor = None,
+                LineKind::Hunk => {
+                    cursor = parse_hunk_header(line).map(|((o, ol), (n, nl))| Cursor {
+                        old: o,
+                        new: n,
+                        old_left: ol,
+                        new_left: nl,
+                    });
+                }
+                LineKind::Meta => {}
+                LineKind::Context | LineKind::Added | LineKind::Removed => {
+                    if let Some(c) = cursor.as_mut().filter(|c| c.old_left > 0 || c.new_left > 0) {
+                        if kind != LineKind::Added {
+                            old = Some(c.old);
+                            c.old = c.old.saturating_add(1);
+                            c.old_left = c.old_left.saturating_sub(1);
+                        }
+                        if kind != LineKind::Removed {
+                            new = Some(c.new);
+                            c.new = c.new.saturating_add(1);
+                            c.new_left = c.new_left.saturating_sub(1);
+                        }
+                    }
+                }
+            }
+            LineRef { old, new, kind }
+        })
+        .collect()
+}
+
+/// The new-file line a row of the chunk stands for, or `None` for a row past the end, outside a
+/// hunk, or in a hunk with no new-side line (a deleted file).
+///
+/// A context or added row is its own new line. A removed row is the nearest following new-side
+/// line of the same hunk, else the nearest preceding one. A `\ No newline` row, or any other
+/// row of a hunk with no number, is the nearest preceding new-side line, else the nearest
+/// following one. A hunk row is the hunk's first new-side line. A file row, and meta rows
+/// before the first hunk, are `None`.
+pub fn new_line_at(chunk: &str, row: usize) -> Option<u32> {
+    let refs = parse_hunks(chunk);
+    let at = refs.get(row)?;
+    if at.new.is_some() {
+        return at.new;
+    }
+    let is_edge = |r: &LineRef| matches!(r.kind, LineKind::Hunk | LineKind::File);
+    let start = match at.kind {
+        LineKind::File => return None,
+        LineKind::Hunk => row,
+        _ => refs[..row].iter().rposition(is_edge)?,
+    };
+    if refs[start].kind != LineKind::Hunk {
+        return None;
+    }
+    // The hunk runs from its `@@` row to just before the next hunk or file row.
+    let end = refs[start + 1..]
+        .iter()
+        .position(is_edge)
+        .map_or(refs.len(), |p| start + 1 + p);
+    let following = || refs[row + 1..end].iter().find_map(|r| r.new);
+    let preceding = || refs[start..row].iter().rev().find_map(|r| r.new);
+    match at.kind {
+        LineKind::Removed => following().or_else(preceding),
+        LineKind::Hunk => refs[start..end].iter().find_map(|r| r.new),
+        _ => preceding().or_else(following),
+    }
+}
+
 /// At most this much diff text is put in the panel.
 pub const MAX_DIFF_BYTES: usize = 1024 * 1024;
 /// At most this many lines of diff text are put in the panel.
@@ -655,5 +779,232 @@ mod tests {
                 std::path::PathBuf::from("src/foo.rs")
             ]
         );
+    }
+
+    fn lr(old: Option<u32>, new: Option<u32>, kind: LineKind) -> LineRef {
+        LineRef { old, new, kind }
+    }
+
+    const HEAD: &str = "diff --git a/f b/f\nindex 1..2 100644\n--- a/f\n+++ b/f\n";
+
+    #[test]
+    fn parse_hunks_numbers_two_hunks() {
+        let chunk =
+            format!("{HEAD}@@ -1,3 +1,3 @@ fn a\n a\n-b\n+B\n c\n@@ -10,2 +10,3 @@\n x\n+y\n z\n");
+        use LineKind::*;
+        assert_eq!(
+            parse_hunks(&chunk),
+            vec![
+                lr(None, None, File),
+                lr(None, None, Meta),
+                lr(None, None, Meta),
+                lr(None, None, Meta),
+                lr(None, None, Hunk),
+                lr(Some(1), Some(1), Context),
+                lr(Some(2), None, Removed),
+                lr(None, Some(2), Added),
+                lr(Some(3), Some(3), Context),
+                lr(None, None, Hunk),
+                lr(Some(10), Some(10), Context),
+                lr(None, Some(11), Added),
+                lr(Some(11), Some(12), Context),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_hunks_added_only_and_removed_only() {
+        use LineKind::*;
+        assert_eq!(
+            parse_hunks("@@ -4,0 +5,2 @@\n+a\n+b\n"),
+            vec![
+                lr(None, None, Hunk),
+                lr(None, Some(5), Added),
+                lr(None, Some(6), Added),
+            ]
+        );
+        assert_eq!(
+            parse_hunks("@@ -4,2 +3,0 @@\n-a\n-b\n"),
+            vec![
+                lr(None, None, Hunk),
+                lr(Some(4), None, Removed),
+                lr(Some(5), None, Removed),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_hunks_new_and_deleted_file() {
+        use LineKind::*;
+        assert_eq!(
+            parse_hunks("@@ -0,0 +1,3 @@\n+a\n+b\n+c\n"),
+            vec![
+                lr(None, None, Hunk),
+                lr(None, Some(1), Added),
+                lr(None, Some(2), Added),
+                lr(None, Some(3), Added),
+            ]
+        );
+        assert_eq!(
+            parse_hunks("@@ -1,2 +0,0 @@\n-a\n-b\n"),
+            vec![
+                lr(None, None, Hunk),
+                lr(Some(1), None, Removed),
+                lr(Some(2), None, Removed),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_hunks_omitted_counts_mean_one() {
+        use LineKind::*;
+        assert_eq!(
+            parse_hunks("@@ -3 +3 @@\n-a\n+b\n"),
+            vec![
+                lr(None, None, Hunk),
+                lr(Some(3), None, Removed),
+                lr(None, Some(3), Added),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_hunks_removed_line_that_looks_like_a_header() {
+        use LineKind::*;
+        let chunk = format!("{HEAD}@@ -1,2 +1 @@\n--- x\n y\n");
+        let refs = parse_hunks(&chunk);
+        assert_eq!(refs[5], lr(Some(1), None, Removed));
+        assert_eq!(refs[6], lr(Some(2), Some(1), Context));
+    }
+
+    #[test]
+    fn parse_hunks_no_newline_marker_has_no_numbers() {
+        use LineKind::*;
+        assert_eq!(
+            parse_hunks("@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+b\n"),
+            vec![
+                lr(None, None, Hunk),
+                lr(Some(1), None, Removed),
+                lr(None, None, Meta),
+                lr(None, Some(1), Added),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_hunks_malformed_header_gives_no_numbers() {
+        use LineKind::*;
+        for header in [
+            "@@ -x +1 @@",
+            "@@ -1,2 +1,y @@",
+            "@@@ -1 -1 +1 @@@",
+            "@@ -1 +1",
+            "@@",
+        ] {
+            let chunk = format!("{header}\n a\n-b\n+c\n");
+            assert_eq!(
+                parse_hunks(&chunk),
+                vec![
+                    lr(None, None, Hunk),
+                    lr(None, None, Context),
+                    lr(None, None, Removed),
+                    lr(None, None, Added),
+                ],
+                "{header}"
+            );
+        }
+        // Text before any hunk is not numbered either, and a good hunk after a bad one recovers.
+        assert_eq!(
+            parse_hunks(" a\n@@ -x @@\n b\n@@ -2 +2 @@\n c\n"),
+            vec![
+                lr(None, None, Context),
+                lr(None, None, Hunk),
+                lr(None, None, Context),
+                lr(None, None, Hunk),
+                lr(Some(2), Some(2), Context),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_hunks_saturates() {
+        let refs = parse_hunks("@@ -4294967295,3 +4294967295,3 @@\n a\n b\n c\n");
+        assert_eq!(refs[1].new, Some(u32::MAX));
+        assert_eq!(refs[2].new, Some(u32::MAX));
+        assert_eq!(refs[3].old, Some(u32::MAX));
+    }
+
+    #[test]
+    fn new_line_at_maps_removed_header_and_out_of_range_rows() {
+        // Rows: 0 file, 1-3 meta, 4 hunk, 5 context, 6 removed, 7 removed, 8 added,
+        // 9 removed (last in its hunk), 10 hunk, 11 removed, 12 meta.
+        let chunk = format!(
+            "{HEAD}@@ -1,5 +1,3 @@\n a\n-b\n-c\n+D\n-e\n@@ -20,1 +18,0 @@\n-z\n\\ No newline at end of file\n"
+        );
+        assert_eq!(new_line_at(&chunk, 5), Some(1));
+        // A removed row takes the next new-side line.
+        assert_eq!(new_line_at(&chunk, 6), Some(2));
+        assert_eq!(new_line_at(&chunk, 7), Some(2));
+        assert_eq!(new_line_at(&chunk, 8), Some(2));
+        // With none after it, the one before.
+        assert_eq!(new_line_at(&chunk, 9), Some(2));
+        // Header, hunk and meta rows.
+        assert_eq!(new_line_at(&chunk, 0), None);
+        assert_eq!(new_line_at(&chunk, 2), None);
+        assert_eq!(new_line_at(&chunk, 4), Some(1));
+        // A hunk with no new side has nothing to give.
+        assert_eq!(new_line_at(&chunk, 10), None);
+        assert_eq!(new_line_at(&chunk, 11), None);
+        assert_eq!(new_line_at(&chunk, 12), None);
+        // Past the end.
+        assert_eq!(new_line_at(&chunk, 13), None);
+        assert_eq!(new_line_at("", 0), None);
+    }
+
+    #[test]
+    fn new_line_at_marker_row_is_the_nearest_preceding_line_else_the_following() {
+        let chunk = "@@ -7,1 +9,2 @@\n-a\n+b\n+c\n\\ No newline at end of file\n";
+        assert_eq!(new_line_at(chunk, 4), Some(10));
+        let chunk = "@@ -3,1 +3,1 @@\n\\ odd\n a\n";
+        assert_eq!(new_line_at(chunk, 1), Some(3));
+    }
+
+    #[test]
+    fn parse_hunks_stops_numbering_after_a_complete_hunk() {
+        use LineKind::*;
+        assert_eq!(
+            parse_hunks("@@ -1,2 +1,2 @@\n a\n b\n c\n-d\n+e\n@@ -9 +9 @@\n-x\n+y\n"),
+            vec![
+                lr(None, None, Hunk),
+                lr(Some(1), Some(1), Context),
+                lr(Some(2), Some(2), Context),
+                lr(None, None, Context),
+                lr(None, None, Removed),
+                lr(None, None, Added),
+                lr(None, None, Hunk),
+                lr(Some(9), None, Removed),
+                lr(None, Some(9), Added),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_hunks_keeps_numbers_when_the_chunk_ends_mid_hunk() {
+        use LineKind::*;
+        assert_eq!(
+            parse_hunks("@@ -5,4 +5,5 @@\n a\n-b\n+B\n"),
+            vec![
+                lr(None, None, Hunk),
+                lr(Some(5), Some(5), Context),
+                lr(Some(6), None, Removed),
+                lr(None, Some(6), Added),
+            ]
+        );
+        assert_eq!(new_line_at("@@ -5,4 +5,5 @@\n a\n-b\n", 2), Some(5));
+    }
+
+    #[test]
+    fn new_line_at_a_stray_row_after_a_hunk_takes_the_preceding_line() {
+        assert_eq!(new_line_at("@@ -0,0 +4 @@\n+a\n stray\n", 2), Some(4));
     }
 }

@@ -867,13 +867,11 @@ impl PinChange {
         match self {
             Self::Pin { at } => {
                 store.set_pinned(thread, true)?;
-                if let Some(rank) = at {
-                    let pinned = store
-                        .list_threads(true)?
-                        .iter()
-                        .filter(|t| t.pin_rank.is_some())
-                        .count() as i64;
-                    store.move_pin(thread, rank - (pinned - 1))?;
+                if let Some(want) = at {
+                    // From where the thread is now: it may have been pinned already.
+                    if let Some(now) = rank(store)? {
+                        store.move_pin(thread, want - now)?;
+                    }
                 }
             }
             Self::Unpin => store.set_pinned(thread, false)?,
@@ -932,6 +930,28 @@ pub(super) mod tests {
 
     use crate::availability::Availability;
     use crate::window::sidebar_model::MenuAgent;
+
+    #[test]
+    fn an_undone_unpin_moves_from_where_the_thread_is_now() {
+        let store = agent_kit::store::Store::open_in_memory().expect("open");
+        let ids: Vec<String> = ["x", "y", "z"]
+            .iter()
+            .map(|n| store.create_thread("/w", Some(n)).expect("thread"))
+            .collect();
+        for id in &ids {
+            store.set_pinned(id, true).expect("pin");
+        }
+        // x was re-pinned meanwhile (it is first), and the undo wants it second.
+        let receipt = PinChange::Pin { at: Some(1) }
+            .apply(&store, &ids[0])
+            .expect("apply");
+        assert_eq!(receipt.before, Some(0));
+        let rank = |id: &str| store.thread_summary(id).unwrap().unwrap().pin_rank;
+        assert_eq!(
+            [rank(&ids[1]), rank(&ids[0]), rank(&ids[2])],
+            [Some(0), Some(1), Some(2)]
+        );
+    }
 
     #[test]
     fn a_continued_thread_is_titled_after_its_source_and_the_agent() {

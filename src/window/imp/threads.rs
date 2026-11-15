@@ -12469,6 +12469,15 @@ pub(super) mod tests {
             "Undo restores the place the thread had"
         );
 
+        // Moving the top row up changes nothing, so it says nothing.
+        // (The undo above answers with a toast of its own; wait for it first.)
+        assert!(pump_until(ctx, 10, || last_is("Thread pinned")));
+        let shown = toast_titles(imp).len();
+        imp.run_thread_action(ThreadAction::PinMove(a.clone(), -1));
+        pump_until(ctx, 2, || false);
+        assert_eq!(rank_of(&a), Some(0));
+        assert_eq!(toast_titles(imp).len(), shown, "a no-op move adds no toast");
+
         imp.run_thread_action(ThreadAction::Unpin(a.clone()));
         imp.run_thread_action(ThreadAction::Unpin(b.clone()));
         assert!(pump_until(ctx, 10, || rank_of(&a).is_none()

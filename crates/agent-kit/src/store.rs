@@ -2333,6 +2333,8 @@ impl Store {
             }
         }
         self.remember_folders(&folders)?;
+        // A deleted pinned thread leaves no gap in the ranks.
+        self.renumber_pins()?;
         tx.commit()?;
         for t in &all {
             self.tails.borrow_mut().clear_thread(t);
@@ -4884,6 +4886,55 @@ mod tests {
             ranked(&["b", "c"]),
             "archiving keeps the pin"
         );
+    }
+
+    #[test]
+    fn deleting_a_pinned_thread_closes_the_gap_in_the_ranks() {
+        let s = store();
+        let ids: Vec<_> = ["a", "b", "c"]
+            .iter()
+            .map(|n| s.create_thread("/w", Some(n)).expect("thread"))
+            .collect();
+        for id in &ids {
+            s.set_pinned(id, true).expect("pin");
+        }
+        s.delete_thread(&ids[1]).expect("delete the middle one");
+        assert_eq!(
+            pin_order(&s),
+            vec![("a".to_owned(), 0), ("c".to_owned(), 1)]
+        );
+    }
+
+    #[test]
+    fn a_hidden_backing_thread_is_never_pinned_or_moved() {
+        let s = store();
+        let root = s.create_thread("/w", Some("root")).expect("root");
+        let backing = s.create_thread("/w", Some("child")).expect("child");
+        s.conn
+            .execute_batch(&format!(
+                "BEGIN;
+                 INSERT INTO delegation_roots (id, root_thread_id, root_worker_id, task_state,
+                     policy_json, continuation_budget, created_at, updated_at)
+                     VALUES ('r1', '{root}', 'w_root', 'active', '{{}}', 3, 1, 2);
+                 INSERT INTO delegation_workers (id, root_id, parent_id, origin, depth, name,
+                     driver, profile_id, launch_json, backing_thread_id, state, workspace_json,
+                     delegation_status, created_at, updated_at)
+                     VALUES ('w_root', 'r1', NULL, 'root', 0, 'root', 'local', 'p', '{{}}', NULL,
+                             'running', '{{}}', 'available', 1, 2),
+                            ('w_kid', 'r1', 'w_root', 'supervised', 1, 'kid', 'codex', 'p', '{{}}',
+                             '{backing}', 'closed', '{{}}', 'available', 1, 2);
+                 COMMIT;"
+            ))
+            .expect("a supervised child");
+        assert!(matches!(
+            s.set_pinned(&backing, true),
+            Err(StoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            s.move_pin(&backing, 1),
+            Err(StoreError::NotFound(_))
+        ));
+        assert!(pin_order(&s).is_empty());
     }
 
     #[test]

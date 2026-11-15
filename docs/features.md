@@ -117,6 +117,14 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   compact, continue in a new thread, or open the `/context` breakdown; see the
   [reference](reference.md#the-context-gauge).
 - `/rewind` undoes the last turn's changes.
+- **Export a thread.** Right-click a thread and pick **Export…** to save the whole conversation
+  as a Markdown or JSON file, wherever you choose. Each message carries the agent that wrote it, a
+  divider marks every agent switch and notice, and each tool shows its title and, if you leave
+  **Include tool output** on, its output (cut at 20,000 characters per tool, with a note).
+  **Include reasoning** is off by default. Images appear only as `[image: name]`. Secrets
+  matching known patterns are masked; one in another format may remain. The file is written
+  privately (readable only by you) and atomically. The entry is greyed out for a thread with no
+  messages.
 
 ### Approvals and rules
 

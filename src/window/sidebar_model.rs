@@ -697,6 +697,8 @@ pub enum ThreadAction {
     Unarchive(String),
     Delete(String),
     OpenFolder(String),
+    /// Writes the thread to a file the user picks (Markdown or JSON).
+    Export(String),
     ReviewEnvironment(String),
     CopyId(String),
 }
@@ -740,6 +742,7 @@ impl ThreadAction {
             Self::Unarchive(t) => simple("unarchive", t),
             Self::Delete(t) => simple("delete", t),
             Self::OpenFolder(t) => simple("folder", t),
+            Self::Export(t) => simple("export", t),
             Self::ReviewEnvironment(t) => simple("review-environment", t),
             Self::CopyId(t) => simple("copy-id", t),
         }
@@ -783,6 +786,7 @@ impl ThreadAction {
             "unarchive" => simple(Self::Unarchive(thread)),
             "delete" => simple(Self::Delete(thread)),
             "folder" => simple(Self::OpenFolder(thread)),
+            "export" => simple(Self::Export(thread)),
             "review-environment" => simple(Self::ReviewEnvironment(thread)),
             "copy-id" => simple(Self::CopyId(thread)),
             _ => None,
@@ -980,6 +984,11 @@ pub fn thread_menu(input: &ThreadMenuInput) -> Vec<MenuEntry> {
         ]),
         MenuEntry::Section(vec![
             item("Open folder", ThreadAction::OpenFolder(thread.clone())),
+            MenuEntry::Item {
+                label: "Export…".to_owned(),
+                action: ThreadAction::Export(thread.clone()),
+                enabled: input.has_messages,
+            },
             MenuEntry::Item {
                 label: "Review Multi-Agent Environment…".to_owned(),
                 action: ThreadAction::ReviewEnvironment(thread.clone()),
@@ -1675,6 +1684,7 @@ mod tests {
                 "Archive",
                 "Delete…",
                 "Open folder",
+                "Export…",
                 "Review Multi-Agent Environment…",
                 "Copy thread id"
             ]
@@ -1688,6 +1698,7 @@ mod tests {
                 "Unarchive",
                 "Delete…",
                 "Open folder",
+                "Export…",
                 "Review Multi-Agent Environment…",
                 "Copy thread id"
             ]
@@ -1716,6 +1727,7 @@ mod tests {
             ThreadAction::Unarchive("t".into()),
             ThreadAction::Delete("t".into()),
             ThreadAction::OpenFolder("t".into()),
+            ThreadAction::Export("t".into()),
             ThreadAction::ReviewEnvironment("t".into()),
             ThreadAction::CopyId("t".into()),
         ];
@@ -1733,6 +1745,28 @@ mod tests {
             "continue\u{1f}t\u{1f}claude",
         ] {
             assert_eq!(ThreadAction::decode(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn thread_action_export_round_trips() {
+        let action = ThreadAction::Export("t-1".into());
+        assert_eq!(action.encode(), "export\u{1f}t-1");
+        assert_eq!(ThreadAction::decode(&action.encode()), Some(action));
+        assert_eq!(ThreadAction::decode("export\u{1f}"), None);
+        assert_eq!(ThreadAction::decode("export\u{1f}t\u{1f}x"), None);
+    }
+
+    #[test]
+    fn export_is_disabled_without_messages() {
+        for (has_messages, expected) in [(false, false), (true, true)] {
+            let menu = thread_menu(&input(has_messages, false));
+            let entry = items(&menu)
+                .into_iter()
+                .find(|(_, a, _)| matches!(a, ThreadAction::Export(_)))
+                .expect("an Export entry");
+            assert_eq!(entry.0, "Export…");
+            assert_eq!(entry.2, expected);
         }
     }
 

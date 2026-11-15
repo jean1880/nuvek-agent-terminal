@@ -13,6 +13,7 @@
 use std::rc::Rc;
 
 use agent_core::adapter::Driver;
+use agent_core::export::{ExportFormat, ExportOptions};
 use gtk4::gio;
 
 use super::threads::{archive_notice, delete_notice, store_job, NewThread, Sidebar, WriteNotice};
@@ -289,6 +290,7 @@ impl AgentTerminalWindow {
             ThreadAction::Unarchive(thread) => self.set_thread_archived(&thread, false),
             ThreadAction::Delete(thread) => self.confirm_delete(&thread),
             ThreadAction::OpenFolder(thread) => self.open_thread_folder(&thread),
+            ThreadAction::Export(thread) => self.confirm_export(&thread),
             ThreadAction::ReviewEnvironment(thread) => {
                 if let Some(summary) = self.summary_of(&thread) {
                     let driver = self.thread_driver(&thread, &summary);
@@ -587,6 +589,118 @@ impl AgentTerminalWindow {
         );
     }
 
+    // ---- export ----
+
+    /// Asks what to export (format, reasoning, tool output), then where to save it. A thread that
+    /// is gone is a no-op.
+    fn confirm_export(&self, thread: &str) {
+        if self.summary_of(thread).is_none() {
+            return;
+        }
+        let title = self.thread_title_of(thread);
+        let dialog = confirm_dialog(
+            "Export Thread",
+            "",
+            ("cancel", "Cancel"),
+            ("export", "Export…"),
+            adw::ResponseAppearance::Suggested,
+            true,
+        );
+        dialog.set_body(&format!(
+            "Save “{title}” as a file.\n\n{}",
+            agent_core::export::REDACTION_NOTE
+        ));
+        let labels: Vec<&str> = ExportFormat::ALL.iter().map(|f| f.label()).collect();
+        let format = adw::ComboRow::builder()
+            .title("Format")
+            .model(&gtk4::StringList::new(&labels))
+            .build();
+        let reasoning = adw::SwitchRow::builder()
+            .title("Include reasoning")
+            .active(false)
+            .build();
+        let tool_output = adw::SwitchRow::builder()
+            .title("Include tool output")
+            .active(true)
+            .build();
+        let list = gtk4::ListBox::builder()
+            .selection_mode(gtk4::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+        list.append(&format);
+        list.append(&reasoning);
+        list.append(&tool_output);
+        dialog.set_extra_child(Some(&list));
+        let thread = thread.to_owned();
+        self.ask(dialog, "export", move |imp, export| {
+            if !export {
+                return;
+            }
+            let options = ExportOptions {
+                format: export_format_at(format.selected()),
+                include_reasoning: reasoning.is_active(),
+                include_tool_output: tool_output.is_active(),
+            };
+            imp.pick_export_target(thread, title, options);
+        });
+    }
+
+    /// Asks where to save, then exports there: the store read on its worker, the render and write
+    /// on another thread, so nothing blocks the window.
+    fn pick_export_target(&self, thread: String, title: String, options: ExportOptions) {
+        let dialog = gtk4::FileDialog::builder()
+            .title("Export Thread")
+            .accept_label("Export")
+            .modal(true)
+            .build();
+        let today = glib::DateTime::now_local()
+            .ok()
+            .and_then(|d| d.format("%Y-%m-%d").ok())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        dialog.set_initial_name(Some(&export_file_name(&title, &today, options.format)));
+        if let Some(docs) =
+            glib::user_special_dir(glib::UserDirectory::Documents).filter(|p| p.is_dir())
+        {
+            dialog.set_initial_folder(Some(&gio::File::for_path(docs)));
+        }
+        let obj = self.obj().downgrade();
+        glib::MainContext::default().spawn_local(async move {
+            let Some(window) = obj.upgrade() else { return };
+            let Ok(file) = dialog
+                .save_future(Some(window.upcast_ref::<gtk4::Window>()))
+                .await
+            else {
+                return; // Cancelled.
+            };
+            let Some(path) = file.path() else {
+                window.imp().show_toast("That place can't be written to");
+                return;
+            };
+            // Progress only when the work is slow.
+            let done = Rc::new(std::cell::Cell::new(false));
+            glib::timeout_add_local_once(std::time::Duration::from_millis(300), {
+                let (done, obj) = (done.clone(), obj.clone());
+                move || {
+                    if let (false, Some(window)) = (done.get(), obj.upgrade()) {
+                        window.imp().show_toast("Exporting…");
+                    }
+                }
+            });
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let outcome = export_to(thread, options, path).await;
+            done.set(true);
+            let Some(window) = obj.upgrade() else { return };
+            match outcome {
+                Ok(()) => window.imp().show_toast(&format!("Exported to {name}")),
+                Err(why) => window.imp().show_toast(&why),
+            }
+        });
+    }
+
     // ---- folder ----
 
     fn open_thread_folder(&self, thread: &str) {
@@ -608,6 +722,45 @@ impl AgentTerminalWindow {
             },
         );
     }
+}
+
+/// The format at dropdown position `index`; the first (Markdown) for one out of range.
+fn export_format_at(index: u32) -> ExportFormat {
+    ExportFormat::ALL
+        .get(index as usize)
+        .copied()
+        .unwrap_or_default()
+}
+
+/// The save dialog's first name: `<slug-of-title>-<yyyy-mm-dd>.<ext>`.
+fn export_file_name(title: &str, date: &str, format: ExportFormat) -> String {
+    let slug = agent_core::export::file_slug(title);
+    let ext = format.extension();
+    if date.is_empty() {
+        format!("{slug}.{ext}")
+    } else {
+        format!("{slug}-{date}.{ext}")
+    }
+}
+
+/// Reads `thread` on the store's worker, then renders, redacts and writes it to `path` on
+/// another. The error is the text for a toast. Nothing is written when the read fails or the
+/// store's writer did not answer.
+async fn export_to(
+    thread: String,
+    options: ExportOptions,
+    path: std::path::PathBuf,
+) -> Result<(), String> {
+    let version = env!("CARGO_PKG_VERSION");
+    let source =
+        store_job(move |store| agent_kit::export::read_thread(store, &thread, &options, version))
+            .await
+            .ok_or_else(|| "Cannot read the thread".to_owned())?
+            .map_err(|e| e.to_string())?;
+    super::threads::off_main("The export", move || {
+        agent_kit::export::write_export(&source, &options, &path).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// `<source title> (→ <Agent>)`: the title of a thread continued in another agent.
@@ -632,6 +785,27 @@ pub(super) mod tests {
             continued_title("New thread", Driver::Agy),
             "New thread (→ Antigravity)"
         );
+    }
+
+    #[test]
+    fn the_save_dialog_starts_with_a_dated_slug() {
+        assert_eq!(
+            export_file_name("Fix the build!", "2026-11-15", ExportFormat::Markdown),
+            "fix-the-build-2026-11-15.md"
+        );
+        assert_eq!(
+            export_file_name("New thread", "2026-11-15", ExportFormat::Json),
+            "new-thread-2026-11-15.json"
+        );
+        assert_eq!(export_file_name("", "", ExportFormat::Json), "thread.json");
+    }
+
+    #[test]
+    fn the_dropdown_index_picks_its_format() {
+        for (i, f) in ExportFormat::ALL.into_iter().enumerate() {
+            assert_eq!(export_format_at(i as u32), f);
+        }
+        assert_eq!(export_format_at(99), ExportFormat::Markdown);
     }
 
     /// GTK checks, run from the window test (GTK belongs to the one thread that initialised it).
@@ -666,6 +840,24 @@ pub(super) mod tests {
             gio_menu_labels_of(&housekeeping),
             ["Rename…", "Archive", "Delete…"]
         );
+        let links = model.item_link(2, "section").expect("third section");
+        assert_eq!(
+            gio_menu_labels_of(&links),
+            [
+                "Open folder",
+                "Export…",
+                "Review Multi-Agent Environment…",
+                "Copy thread id"
+            ]
+        );
+        // Nothing said yet: Export is greyed out; Open folder is not.
+        let target = |i: i32| {
+            links
+                .item_attribute_value(i, "action", None)
+                .and_then(|v| v.get::<String>())
+        };
+        assert_eq!(target(0).as_deref(), Some(ACTION));
+        assert_eq!(target(1).as_deref(), Some(ACTION_OFF));
         // With no messages "Continue in" is one greyed-out item, not a submenu to open; Switch
         // still opens.
         let action_of = |model: &gio::MenuModel, index: i32| {
@@ -803,6 +995,12 @@ pub(super) mod tests {
                 .as_deref(),
             Some(thread.as_str())
         );
+
+        // Export of a thread that is gone does nothing (no dialog, no error).
+        imp.run_thread_action(ThreadAction::Export("no-such-thread".into()));
+        for _ in 0..20 {
+            ctx.iteration(false);
+        }
 
         // Continue in, before anything was said: there is nothing to hand over, so no thread
         // is made. Judged by which threads are open, not how many pages: blank pages left by

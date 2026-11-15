@@ -296,6 +296,33 @@ pub struct TranscriptMessage {
 /// `role` of the [`TranscriptMessage`] that carries a thread's inherited context.
 pub const INHERITED_ROLE: &str = "inherited";
 
+/// `role` and `kind` of the [`TranscriptMessage`] a notice becomes ([`FoldOptions::keep_notices`]).
+pub const NOTICE_ROLE: &str = "notice";
+
+/// What [`Store::transcript_items`] keeps of a thread. The default is what a hand-off reads:
+/// the model's private thinking and the app's own notices stay out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FoldOptions {
+    /// Keep `reasoning` items, with the text of their reasoning stream.
+    pub keep_reasoning: bool,
+    /// Keep each notice as an item of [`NOTICE_ROLE`], in event order, its id `notice:<seq>`.
+    pub keep_notices: bool,
+}
+
+/// A [`TranscriptMessage`] and where it came from: what a search index, an export or a
+/// comparison of forked threads needs to point back at the stored events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptItem {
+    /// The folded item: its id, role, kind, text, status and title.
+    pub message: TranscriptMessage,
+    /// The driver key (`claude`, `agy`, …) of the provider thread the item's first event was
+    /// stored under; `None` when that event had none (an inherited seed's, say), or its provider
+    /// thread is gone. A caller falls back to the thread's current agent.
+    pub agent: Option<String>,
+    /// The sequence number of the first event that made the item.
+    pub first_seq: i64,
+}
+
 /// `$XDG_STATE_HOME/agent-terminal/threads.db`, falling back to
 /// `~/.local/state/agent-terminal/threads.db`. Takes the environment values so
 /// tests never read the real home. Empty and relative `xdg_state_home` values
@@ -3527,7 +3554,24 @@ impl Store {
     /// with [`INHERITED_ROLE`]. Only that one: every later seed (a switch's)
     /// was built from this same transcript, so carrying it would repeat it.
     pub fn transcript_messages(&self, thread: &str) -> Result<Vec<TranscriptMessage>> {
-        let mut out: Vec<TranscriptMessage> = Vec::new();
+        Ok(self
+            .transcript_items(thread, FoldOptions::default())?
+            .into_iter()
+            .map(|item| item.message)
+            .collect())
+    }
+
+    /// [`Store::transcript_messages`] under `options`, each item with the agent and the event
+    /// sequence it began at ([`TranscriptItem`]). The same fold, read in the same batches, so the
+    /// default options give exactly the hand-off's messages. With
+    /// [`FoldOptions::keep_reasoning`] a reasoning item carries its reasoning text; with
+    /// [`FoldOptions::keep_notices`] each notice is an item of its own, in order.
+    pub fn transcript_items(
+        &self,
+        thread: &str,
+        options: FoldOptions,
+    ) -> Result<Vec<TranscriptItem>> {
+        let mut out: Vec<TranscriptItem> = Vec::new();
         let mut index: HashMap<String, usize> = HashMap::new();
         let mut tools: HashMap<String, ToolInput> = HashMap::new();
         // The images each user message carried: a hand-off says they were there.
@@ -3539,22 +3583,45 @@ impl Store {
         let mut seed_settled = false;
         let mut after = 0;
         loop {
-            let batch = self.events(thread, Some(after), 1000)?;
-            let Some((last, _)) = batch.last() else { break };
-            after = *last;
-            for (seq, env) in batch {
+            let batch = self.events_by_agent(thread, Some(after), 1000)?;
+            let Some(last) = batch.last() else { break };
+            after = last.seq;
+            for StoredEvent {
+                seq,
+                driver,
+                envelope: env,
+            } in batch
+            {
                 match &env.event {
                     Event::HandoffSeeded {
                         summary, carried, ..
                     } if *carried > 0 && !seed_settled => {
                         seed_settled = true;
-                        out.push(TranscriptMessage {
-                            role: INHERITED_ROLE.to_owned(),
-                            kind: "inherited_context".to_owned(),
-                            text: summary.clone(),
-                            item_id: format!("inherited:{seq}"),
-                            status: "completed".to_owned(),
-                            title: String::new(),
+                        out.push(TranscriptItem {
+                            message: TranscriptMessage {
+                                role: INHERITED_ROLE.to_owned(),
+                                kind: "inherited_context".to_owned(),
+                                text: summary.clone(),
+                                item_id: format!("inherited:{seq}"),
+                                status: "completed".to_owned(),
+                                title: String::new(),
+                            },
+                            agent: driver.clone(),
+                            first_seq: seq,
+                        });
+                    }
+                    Event::Notice { text } if options.keep_notices => {
+                        out.push(TranscriptItem {
+                            message: TranscriptMessage {
+                                role: NOTICE_ROLE.to_owned(),
+                                kind: NOTICE_ROLE.to_owned(),
+                                text: text.clone(),
+                                item_id: format!("notice:{seq}"),
+                                status: "completed".to_owned(),
+                                title: String::new(),
+                            },
+                            agent: driver.clone(),
+                            first_seq: seq,
                         });
                     }
                     Event::ItemStarted {
@@ -3577,7 +3644,8 @@ impl Store {
                     }
                     items.entry(key).or_insert_with(|| item.clone());
                 }
-                apply_to_transcript(&mut out, &mut index, &mut tools, env);
+                let origin = Origin { seq, agent: driver };
+                apply_to_transcript(&mut out, &mut index, &mut tools, options, origin, env);
             }
         }
         // A turn still running: an open stream that holds text not yet published shows
@@ -3593,18 +3661,31 @@ impl Store {
                 text: HELD_PLACEHOLDER.to_owned(),
             })
             .item(item);
-            apply_to_transcript(&mut out, &mut index, &mut tools, env);
+            // An item the stored events never named: no event made it, so no agent either.
+            let origin = Origin {
+                seq: after,
+                agent: None,
+            };
+            apply_to_transcript(&mut out, &mut index, &mut tools, options, origin, env);
         }
         // A hand-off replays this; the model's private thinking must not travel with it.
-        out.retain(|m| m.kind != "reasoning");
-        for message in out.iter_mut().filter(|m| m.role == "user") {
-            if let Some(refs) = images.get(&message.item_id) {
-                message.text = agent_core::attachment::text_with_placeholders(&message.text, refs);
-            }
+        if !options.keep_reasoning {
+            out.retain(|i| i.message.kind != "reasoning");
         }
-        for message in out.iter_mut().filter(|m| m.role == "tool") {
-            if let Some(tool) = tools.get(&message.item_id) {
-                message.title = tool.title();
+        for message in out.iter_mut().map(|i| &mut i.message) {
+            match message.role.as_str() {
+                "user" => {
+                    if let Some(refs) = images.get(&message.item_id) {
+                        message.text =
+                            agent_core::attachment::text_with_placeholders(&message.text, refs);
+                    }
+                }
+                "tool" => {
+                    if let Some(tool) = tools.get(&message.item_id) {
+                        message.title = tool.title();
+                    }
+                }
+                _ => {}
             }
         }
         Ok(out)
@@ -3701,22 +3782,35 @@ fn safe_value(value: &Value) -> Option<Value> {
     })
 }
 
+/// The stored event an item's fold step reads: its sequence number and the agent it was stored
+/// under. An item takes both from the first event that makes it.
+struct Origin {
+    seq: i64,
+    agent: Option<String>,
+}
+
 fn apply_to_transcript(
-    out: &mut Vec<TranscriptMessage>,
+    out: &mut Vec<TranscriptItem>,
     index: &mut HashMap<String, usize>,
     tools: &mut HashMap<String, ToolInput>,
+    options: FoldOptions,
+    origin: Origin,
     env: Envelope,
 ) {
     let Some(item) = env.item else { return };
-    let mut slot = |out: &mut Vec<TranscriptMessage>, kind: &str| -> usize {
+    let mut slot = |out: &mut Vec<TranscriptItem>, kind: &str| -> usize {
         *index.entry(item.clone()).or_insert_with(|| {
-            out.push(TranscriptMessage {
-                role: role_of(kind).to_string(),
-                kind: kind.to_string(),
-                text: String::new(),
-                item_id: item.clone(),
-                status: "open".to_string(),
-                title: String::new(),
+            out.push(TranscriptItem {
+                message: TranscriptMessage {
+                    role: role_of(kind).to_string(),
+                    kind: kind.to_string(),
+                    text: String::new(),
+                    item_id: item.clone(),
+                    status: "open".to_string(),
+                    title: String::new(),
+                },
+                agent: origin.agent.clone(),
+                first_seq: origin.seq,
             });
             out.len() - 1
         })
@@ -3759,20 +3853,21 @@ fn apply_to_transcript(
                 tool.streamed = text;
             }
         }
-        Event::ContentDelta { stream, text } if counts_as_text(stream) => {
+        Event::ContentDelta { stream, text } if counts_as_text(stream, options) => {
             let i = slot(out, "unknown");
-            out[i].text.push_str(&text);
+            out[i].message.text.push_str(&text);
         }
-        Event::ContentSnapshot { stream, text } if counts_as_text(stream) => {
+        Event::ContentSnapshot { stream, text } if counts_as_text(stream, options) => {
             let i = slot(out, "unknown");
-            out[i].text = text;
+            out[i].message.text = text;
         }
         Event::ItemCompleted { status, output, .. } => {
             let i = slot(out, "unknown");
-            out[i].status = status_name(status).to_string();
-            if out[i].text.is_empty() {
+            let message = &mut out[i].message;
+            message.status = status_name(status).to_string();
+            if message.text.is_empty() {
                 if let Some(o) = output {
-                    out[i].text = o;
+                    message.text = o;
                 }
             }
         }
@@ -3781,9 +3876,13 @@ fn apply_to_transcript(
 }
 
 /// Tool input lives in `ItemStarted::input`, not in the transcript text, and
-/// reasoning is never part of it.
-fn counts_as_text(stream: StreamKind) -> bool {
-    !matches!(stream, StreamKind::ToolInput | StreamKind::Reasoning)
+/// reasoning is part of it only when the fold keeps reasoning.
+fn counts_as_text(stream: StreamKind, options: FoldOptions) -> bool {
+    match stream {
+        StreamKind::ToolInput => false,
+        StreamKind::Reasoning => options.keep_reasoning,
+        _ => true,
+    }
 }
 
 fn role_of(kind: &str) -> &'static str {
@@ -5127,6 +5226,150 @@ mod tests {
             ));
         }
         assert_eq!(got, expected);
+    }
+
+    const KEEP_ALL: FoldOptions = FoldOptions {
+        keep_reasoning: true,
+        keep_notices: true,
+    };
+
+    fn kinds(items: &[TranscriptItem]) -> Vec<&str> {
+        items.iter().map(|i| i.message.kind.as_str()).collect()
+    }
+
+    #[test]
+    fn reasoning_and_notices_are_folded_only_when_asked() {
+        let s = store();
+        let t = fold_fixture(&s);
+        let head = |options| {
+            let items = s.transcript_items(&t, options).expect("items");
+            items
+                .iter()
+                .take(7)
+                .map(|i| {
+                    (
+                        i.message.kind.clone(),
+                        i.message.item_id.clone(),
+                        i.message.text.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let plain = s
+            .transcript_items(&t, FoldOptions::default())
+            .expect("items");
+        assert_eq!(
+            plain.iter().map(|i| i.message.clone()).collect::<Vec<_>>(),
+            s.transcript_messages(&t).expect("msgs"),
+            "the default options are the hand-off's"
+        );
+        assert!(kinds(&plain)
+            .iter()
+            .all(|k| *k != "reasoning" && *k != NOTICE_ROLE));
+
+        let thinking = head(FoldOptions {
+            keep_reasoning: true,
+            keep_notices: false,
+        });
+        assert!(thinking.contains(&("reasoning".into(), "r1".into(), "weighing it up".into())));
+        assert!(!thinking.iter().any(|(k, ..)| k == NOTICE_ROLE));
+
+        let notices = head(FoldOptions {
+            keep_reasoning: false,
+            keep_notices: true,
+        });
+        assert!(notices
+            .iter()
+            .any(|(k, _, text)| k == NOTICE_ROLE && text == "compacted"));
+        assert!(!notices.iter().any(|(k, ..)| k == "reasoning"));
+
+        let all = s.transcript_items(&t, KEEP_ALL).expect("items");
+        let order: Vec<_> = all
+            .iter()
+            .take(7)
+            .map(|i| (i.message.role.as_str(), i.message.kind.as_str()))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                (INHERITED_ROLE, "inherited_context"),
+                ("user", "user_message"),
+                ("assistant", "reasoning"),
+                ("assistant", "assistant_message"),
+                ("tool", "command"),
+                (NOTICE_ROLE, NOTICE_ROLE),
+                ("user", "user_message"),
+            ]
+        );
+    }
+
+    #[test]
+    fn each_item_keeps_its_first_seq_and_agent_across_a_switch() {
+        let s = store();
+        let t = fold_fixture(&s);
+        let stored = s.events_by_agent(&t, None, usize::MAX).expect("events");
+        let items = s.transcript_items(&t, KEEP_ALL).expect("items");
+        let by_id = |id: &str| {
+            items
+                .iter()
+                .find(|i| i.message.item_id == id)
+                .unwrap_or_else(|| panic!("no item {id}"))
+        };
+        for id in ["r1", "a1", "c1", "bulk-0", "bulk-399"] {
+            let first = stored
+                .iter()
+                .find(|e| e.envelope.item.as_deref() == Some(id))
+                .expect("stored");
+            let item = by_id(id);
+            assert_eq!(item.first_seq, first.seq, "{id}");
+            assert_eq!(item.agent, first.driver, "{id}");
+        }
+        assert_eq!(by_id("r1").agent.as_deref(), Some("claude"));
+        assert_eq!(by_id("c1").agent.as_deref(), Some("claude"));
+        assert_eq!(by_id("bulk-0").agent.as_deref(), Some("agy"));
+        // The inherited seed and the notice: the seed was stored under no provider thread.
+        let seed = &items[0];
+        assert_eq!((seed.first_seq, seed.agent.as_deref()), (1, None));
+        let notice = items
+            .iter()
+            .find(|i| i.message.role == NOTICE_ROLE)
+            .expect("notice");
+        assert_eq!(notice.agent.as_deref(), Some("claude"));
+        let notice_seq = stored
+            .iter()
+            .find(|e| matches!(e.envelope.event, Event::Notice { .. }))
+            .expect("stored notice")
+            .seq;
+        assert_eq!(notice.message.item_id, format!("notice:{notice_seq}"));
+        assert_eq!(notice.first_seq, notice_seq);
+        // The two user messages, either side of the switch.
+        let users: Vec<_> = items
+            .iter()
+            .filter(|i| i.message.role == "user")
+            .map(|i| i.agent.as_deref())
+            .collect();
+        assert_eq!(users, [Some("claude"), Some("agy")]);
+    }
+
+    #[test]
+    fn paging_keeps_the_items_in_event_order() {
+        let s = store();
+        let t = fold_fixture(&s);
+        let items = s.transcript_items(&t, KEEP_ALL).expect("items");
+        // 400 bulk items of 3 events each cross the 1,000-event read batch twice over.
+        let bulk: Vec<_> = items
+            .iter()
+            .filter(|i| i.message.item_id.starts_with("bulk-"))
+            .collect();
+        assert_eq!(bulk.len(), 400);
+        for (n, item) in bulk.iter().enumerate() {
+            assert_eq!(item.message.item_id, format!("bulk-{n}"));
+            assert_eq!(item.message.text, format!("line {n}"));
+        }
+        assert!(
+            items.windows(2).all(|w| w[0].first_seq < w[1].first_seq),
+            "items follow the order of their first events"
+        );
     }
 
     #[test]

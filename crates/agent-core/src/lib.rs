@@ -36,6 +36,7 @@ pub mod redact;
 pub mod sensitive;
 pub mod serde_name;
 pub mod shell_words;
+pub mod spend;
 #[cfg(test)]
 mod test_support;
 pub mod text;

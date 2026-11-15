@@ -139,6 +139,14 @@ pub struct ClaudeAdapter {
     current_effort: std::cell::RefCell<Option<String>>,
     /// The prepared child binding owns the restricted permission/tool arguments.
     child: bool,
+    /// The `total_cost_usd` of the last `result` frame: Claude's total for the life of its
+    /// process, so a turn's own cost is the step from it. Forgotten when the process exits.
+    last_total_cost: Option<f64>,
+    /// The process being launched resumes a session, which may start its total from what the
+    /// session already cost. Its first total is then only a base (no cost is reported for it),
+    /// and later turns report the step from it. Set by `argv`, which takes `&self`; a fresh
+    /// launch reports its first total in full.
+    resume_base_pending: std::cell::Cell<bool>,
 }
 
 impl Default for ClaudeAdapter {
@@ -189,6 +197,8 @@ impl ClaudeAdapter {
             mode: None,
             current_effort: std::cell::RefCell::new(None),
             child: false,
+            last_total_cost: None,
+            resume_base_pending: std::cell::Cell::new(false),
         }
     }
 
@@ -1293,10 +1303,25 @@ impl ClaudeAdapter {
                 detail: info,
             }));
         }
+        // `total_cost_usd` runs on for the whole process; report this turn's share of it.
+        // A resumed process's first total only sets the base: it may hold the session's earlier
+        // cost, which no turn of this process spent.
+        let cost_usd = v
+            .get("total_cost_usd")
+            .and_then(Value::as_f64)
+            .and_then(|now| {
+                if self.resume_base_pending.replace(false) {
+                    self.last_total_cost = crate::spend::next_base(None, now);
+                    return None;
+                }
+                let delta = crate::spend::cumulative_to_delta(self.last_total_cost, now);
+                self.last_total_cost = crate::spend::next_base(self.last_total_cost, now);
+                Some(delta)
+            });
         out.push(Envelope::new(Event::TurnCompleted {
             state,
             usage,
-            cost_usd: v.get("total_cost_usd").and_then(Value::as_f64),
+            cost_usd,
             error,
         }));
         out
@@ -1354,6 +1379,7 @@ impl Adapter for ClaudeAdapter {
         if !self.child {
             argv.extend(["--permission-mode", mode_name(session.mode)].map(str::to_owned));
         }
+        self.resume_base_pending.set(session.resume.is_some());
         // Session flags take `=`; resuming wins over naming a new session.
         if let Some(id) = &session.resume {
             argv.push(format!("--resume={id}"));
@@ -1599,6 +1625,8 @@ impl Adapter for ClaudeAdapter {
             }));
         }
         out.push(Envelope::new(Event::SessionExited { code, expected }));
+        // The next process counts its cost from zero.
+        self.last_total_cost = None;
         self.blocks.clear();
         self.reasoning_shared.clear();
         self.started_items.clear();
@@ -2324,6 +2352,138 @@ mod tests {
         assert_eq!(u.input_tokens, 26 + 57_925 + 10_633);
         assert_eq!(u.cached_input_tokens, 57_925);
         assert!(cost_usd.is_some());
+    }
+
+    /// The `cost_usd` of every `TurnCompleted`, in order.
+    fn turn_costs(out: &[Envelope]) -> Vec<Option<f64>> {
+        out.iter()
+            .filter_map(|e| match &e.event {
+                Event::TurnCompleted { cost_usd, .. } => Some(*cost_usd),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn turn_cost_is_the_step_from_the_process_total() {
+        // The recording's totals are 0.0173455, 0.0173455 (a slash command), 0.02596535 and
+        // 0.05526575: each turn reports only what it added.
+        let (_, out) = replay(CONTROLS);
+        let costs: Vec<f64> = turn_costs(&out).into_iter().flatten().collect();
+        assert_eq!(costs.len(), 4);
+        let expected = [
+            0.0173455,
+            0.0,
+            0.02596535 - 0.0173455,
+            0.05526575 - 0.02596535,
+        ];
+        for (got, want) in costs.iter().zip(expected) {
+            assert!((got - want).abs() < 1e-9, "{got} vs {want}");
+        }
+        assert!((costs.iter().sum::<f64>() - 0.05526575).abs() < 1e-9);
+    }
+
+    /// One `result` frame, with a total when `total` is given.
+    fn result_frame(total: Option<f64>) -> String {
+        let mut v = json!({"type": "result", "subtype": "success", "is_error": false});
+        if let Some(t) = total {
+            v["total_cost_usd"] = json!(t);
+        }
+        v.to_string()
+    }
+
+    /// The costs a launch reports for results carrying these totals.
+    fn costs_for(a: &mut ClaudeAdapter, totals: &[Option<f64>]) -> Vec<Option<f64>> {
+        let mut out = Vec::new();
+        for t in totals {
+            out.extend(a.feed(&result_frame(*t)));
+        }
+        turn_costs(&out)
+    }
+
+    fn launch(a: &ClaudeAdapter, resume: Option<&str>) {
+        let s = OpenSession {
+            program: "claude".into(),
+            extra_args: Vec::new(),
+            cwd: "/w".into(),
+            model: None,
+            effort: None,
+            mode: Mode::AcceptEdits,
+            resume: resume.map(str::to_owned),
+            new_session_id: None,
+            approval_hook: false,
+            forced_permissive: false,
+            delegation: None,
+        };
+        let _ = a.argv(&s);
+    }
+
+    #[test]
+    fn a_resumed_launch_reports_nothing_for_its_first_total_then_steps() {
+        let mut a = ClaudeAdapter::new();
+        launch(&a, Some("abc"));
+        // The session's earlier 3.0 is not this process's spend.
+        let costs = costs_for(&mut a, &[Some(3.0), Some(3.5), Some(3.5)]);
+        assert_eq!(costs, [None, Some(0.5), Some(0.0)]);
+        // A reused adapter resumed after an exit does the same.
+        a.on_exit(Some(0));
+        launch(&a, Some("abc"));
+        assert_eq!(
+            costs_for(&mut a, &[Some(4.0), Some(4.25)]),
+            [None, Some(0.25)]
+        );
+        // A fresh launch on that adapter reports its first total in full.
+        a.on_exit(Some(0));
+        launch(&a, None);
+        assert_eq!(costs_for(&mut a, &[Some(0.25)]), [Some(0.25)]);
+    }
+
+    #[test]
+    fn a_resumed_launch_waits_for_a_result_that_has_a_total() {
+        let mut a = ClaudeAdapter::new();
+        launch(&a, Some("abc"));
+        assert_eq!(
+            costs_for(&mut a, &[None, Some(3.0), Some(3.5)]),
+            [None, None, Some(0.5)]
+        );
+    }
+
+    #[test]
+    fn a_fresh_launch_reports_its_first_total_in_full() {
+        let mut a = ClaudeAdapter::new();
+        launch(&a, None);
+        assert_eq!(
+            costs_for(&mut a, &[Some(0.5), Some(0.75)]),
+            [Some(0.5), Some(0.25)]
+        );
+    }
+
+    #[test]
+    fn a_zero_cost_interrupted_result_does_not_recount_the_session() {
+        let mut a = ClaudeAdapter::new();
+        let costs = costs_for(&mut a, &[Some(0.5), Some(0.0), Some(0.75)]);
+        assert_eq!(costs, [Some(0.5), Some(0.0), Some(0.25)]);
+    }
+
+    #[test]
+    fn a_result_without_a_total_reports_none_and_keeps_the_base() {
+        let mut a = ClaudeAdapter::new();
+        let costs = costs_for(&mut a, &[Some(0.5), None, Some(0.75)]);
+        assert_eq!(costs, [Some(0.5), None, Some(0.25)]);
+    }
+
+    #[test]
+    fn a_new_process_counts_its_cost_from_zero() {
+        let (mut a, first) = replay(CONTROLS);
+        let (_, second) = replay(CONTROLS);
+        assert_eq!(turn_costs(&first), turn_costs(&second));
+        // The same adapter after its process exits starts over too.
+        a.on_exit(Some(0));
+        let mut again = Vec::new();
+        for frame in stdout_frames(CONTROLS, Malformed::Panic) {
+            again.extend(a.feed(&frame));
+        }
+        assert_eq!(turn_costs(&again), turn_costs(&first));
     }
 
     #[test]

@@ -139,6 +139,9 @@ pub struct ClaudeAdapter {
     current_effort: std::cell::RefCell<Option<String>>,
     /// The prepared child binding owns the restricted permission/tool arguments.
     child: bool,
+    /// The `total_cost_usd` of the last `result` frame: Claude's total for the life of its
+    /// process, so a turn's own cost is the step from it. Forgotten when the process exits.
+    last_total_cost: Option<f64>,
 }
 
 impl Default for ClaudeAdapter {
@@ -189,6 +192,7 @@ impl ClaudeAdapter {
             mode: None,
             current_effort: std::cell::RefCell::new(None),
             child: false,
+            last_total_cost: None,
         }
     }
 
@@ -1293,10 +1297,16 @@ impl ClaudeAdapter {
                 detail: info,
             }));
         }
+        // `total_cost_usd` runs on for the whole process; report this turn's share of it.
+        let cost_usd = v.get("total_cost_usd").and_then(Value::as_f64).map(|now| {
+            let delta = crate::spend::cumulative_to_delta(self.last_total_cost, now);
+            self.last_total_cost = Some(now);
+            delta
+        });
         out.push(Envelope::new(Event::TurnCompleted {
             state,
             usage,
-            cost_usd: v.get("total_cost_usd").and_then(Value::as_f64),
+            cost_usd,
             error,
         }));
         out
@@ -1599,6 +1609,8 @@ impl Adapter for ClaudeAdapter {
             }));
         }
         out.push(Envelope::new(Event::SessionExited { code, expected }));
+        // The next process counts its cost from zero.
+        self.last_total_cost = None;
         self.blocks.clear();
         self.reasoning_shared.clear();
         self.started_items.clear();
@@ -2324,6 +2336,49 @@ mod tests {
         assert_eq!(u.input_tokens, 26 + 57_925 + 10_633);
         assert_eq!(u.cached_input_tokens, 57_925);
         assert!(cost_usd.is_some());
+    }
+
+    /// The `cost_usd` of every `TurnCompleted`, in order.
+    fn turn_costs(out: &[Envelope]) -> Vec<Option<f64>> {
+        out.iter()
+            .filter_map(|e| match &e.event {
+                Event::TurnCompleted { cost_usd, .. } => Some(*cost_usd),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn turn_cost_is_the_step_from_the_process_total() {
+        // The recording's totals are 0.0173455, 0.0173455 (a slash command), 0.02596535 and
+        // 0.05526575: each turn reports only what it added.
+        let (_, out) = replay(CONTROLS);
+        let costs: Vec<f64> = turn_costs(&out).into_iter().flatten().collect();
+        assert_eq!(costs.len(), 4);
+        let expected = [
+            0.0173455,
+            0.0,
+            0.02596535 - 0.0173455,
+            0.05526575 - 0.02596535,
+        ];
+        for (got, want) in costs.iter().zip(expected) {
+            assert!((got - want).abs() < 1e-9, "{got} vs {want}");
+        }
+        assert!((costs.iter().sum::<f64>() - 0.05526575).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_new_process_counts_its_cost_from_zero() {
+        let (mut a, first) = replay(CONTROLS);
+        let (_, second) = replay(CONTROLS);
+        assert_eq!(turn_costs(&first), turn_costs(&second));
+        // The same adapter after its process exits starts over too.
+        a.on_exit(Some(0));
+        let mut again = Vec::new();
+        for frame in stdout_frames(CONTROLS, Malformed::Panic) {
+            again.extend(a.feed(&frame));
+        }
+        assert_eq!(turn_costs(&again), turn_costs(&first));
     }
 
     #[test]

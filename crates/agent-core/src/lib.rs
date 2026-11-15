@@ -19,6 +19,7 @@ pub mod codex_rules;
 pub mod commands;
 pub mod delegation;
 pub mod event;
+pub mod fence;
 pub mod form;
 pub mod git_command;
 pub mod handoff_budget;

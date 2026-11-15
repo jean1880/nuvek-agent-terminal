@@ -110,6 +110,12 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   Google's quota are marked *via Antigravity*.
 - **Usage at a glance.** Each agent's quota windows sit in the thread header and at the
   foot of the sidebar, and update every turn.
+- **Context left at a glance.** The header's gauge shows how much of the context window
+  remains ("37% left"), with the tokens used and left in its tooltip. The bar turns amber at
+  75% used (sooner if the agent auto-compacts earlier) and red at 90%. An agent that has not
+  reported its window size shows a dim "context ?" instead of a guess. Click the gauge to
+  compact, continue in a new thread, or open the `/context` breakdown; see the
+  [reference](reference.md#the-context-gauge).
 - `/rewind` undoes the last turn's changes.
 
 ### Approvals and rules

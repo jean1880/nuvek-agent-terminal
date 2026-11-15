@@ -13,7 +13,7 @@ use gtk4::glib;
 use serde_json::Value;
 
 use super::cards::{accent_class, brand_image, label, wrapped_text};
-use super::header::gauge_text;
+use super::header::gauge_used_text;
 use super::model::{format_tokens, Gauge};
 use super::payload;
 use crate::chat::{ChatBackend, ModelSource, SessionStatus};
@@ -1260,7 +1260,7 @@ pub fn context_panel(ctx: &PanelCtx, fallback: Option<Gauge>) {
                 };
                 let content = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
                 if let Some(g) = gauge {
-                    let big = label(&gauge_text(&g), &["context-big"]);
+                    let big = label(&gauge_used_text(&g), &["context-big"]);
                     big.set_halign(gtk4::Align::Center);
                     content.append(&big);
                     if let Some((fill, _)) = super::header::gauge_fraction(&g) {

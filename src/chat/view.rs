@@ -56,6 +56,7 @@ use std::rc::{Rc, Weak};
 use adw::subclass::prelude::*;
 use agent_core::adapter::{Control, Driver, Mode};
 use agent_core::commands::{builtins, compact_text, BuiltinAction, Trigger};
+use agent_core::context_meter::MeterAction;
 use agent_core::event::Event;
 use agent_core::event::{BackgroundTask, BackgroundTaskKind, Envelope, PlanStep, StepStatus};
 use gtk4::prelude::*;
@@ -92,6 +93,23 @@ pub enum ViewAction {
     /// "Don't suggest these" on the quick-reply chips: the window turns the setting off, which
     /// applies at once, and says where it turns back on.
     StopQuickReplies,
+}
+
+/// What a gauge popover action runs: a built-in command, or something for the window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MeterDispatch {
+    Builtin(BuiltinAction),
+    View(ViewAction),
+}
+
+/// Compact is the `/compact` built-in (the agent's own command, else the hand-off notice and
+/// fork); Continue is the hand-off fork itself; the breakdown is `/context`.
+fn meter_dispatch(action: MeterAction) -> MeterDispatch {
+    match action {
+        MeterAction::Compact => MeterDispatch::Builtin(BuiltinAction::Compact),
+        MeterAction::Continue => MeterDispatch::View(ViewAction::CompactByHandoff),
+        MeterAction::Breakdown => MeterDispatch::Builtin(BuiltinAction::OpenContext),
+    }
 }
 
 type ActionHandler = Rc<dyn Fn(&ViewAction)>;
@@ -1084,9 +1102,12 @@ impl Inner {
         self.composer.set_running(running, stop_note.as_deref());
         self.refresh_agent_chip();
         self.sync_mode_header(status.mode);
-        self.header
-            .gauge
-            .set_sensitive(status.capabilities.context_usage);
+        self.header.set_meter_actions(
+            status.capabilities.compact_command.as_deref(),
+            status.driver.info().label,
+            running,
+            status.capabilities.context_usage,
+        );
         self.refresh_interruption();
         self.composer.refresh_placeholder();
     }
@@ -1140,11 +1161,27 @@ impl Inner {
             .connect_clicked(on_inner_ref(&weak, |inner, _: &gtk4::Button| {
                 inner.run_action(BuiltinAction::OpenModelPicker, "")
             }));
-        self.header
-            .gauge
-            .connect_clicked(on_inner_ref(&weak, |inner, _: &gtk4::Button| {
-                inner.run_action(BuiltinAction::OpenContext, "")
-            }));
+        // The gauge opens a popover; the action the user picks arrives here once it has closed.
+        self.header.connect_meter_action({
+            let weak = weak.clone();
+            move |action| {
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                let status = inner.backend.status();
+                // The popover turns Compact and Continue off while a turn runs; one can have
+                // started since it was drawn.
+                let busy = status.running_turn || inner.model.borrow().running;
+                match meter_dispatch(action) {
+                    MeterDispatch::Builtin(BuiltinAction::OpenContext) => {
+                        inner.run_action(BuiltinAction::OpenContext, "")
+                    }
+                    _ if busy => {}
+                    MeterDispatch::Builtin(b) => inner.run_action(b, ""),
+                    MeterDispatch::View(v) => inner.emit(v),
+                }
+            }
+        });
         self.header.mode.connect_selected_notify(on_inner_ref(
             &weak,
             |inner, dd: &gtk4::DropDown| {
@@ -1829,6 +1866,25 @@ pub(crate) mod tests {
     use agent_core::event::Decision;
 
     pub(super) use crate::testutil::native_init;
+
+    #[test]
+    fn gauge_popover_actions_map_to_their_commands() {
+        assert_eq!(
+            meter_dispatch(MeterAction::Compact),
+            MeterDispatch::Builtin(BuiltinAction::Compact)
+        );
+        assert_eq!(
+            meter_dispatch(MeterAction::Continue),
+            MeterDispatch::View(ViewAction::CompactByHandoff)
+        );
+        assert_eq!(
+            meter_dispatch(MeterAction::Breakdown),
+            MeterDispatch::Builtin(BuiltinAction::OpenContext)
+        );
+        for a in MeterAction::ALL {
+            let _ = meter_dispatch(a);
+        }
+    }
 
     /// Iterates the main loop until `cond` holds; false after 5 s.
     pub(super) fn pump_until(ctx: &glib::MainContext, cond: impl Fn() -> bool) -> bool {

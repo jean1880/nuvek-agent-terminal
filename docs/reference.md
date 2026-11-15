@@ -92,6 +92,26 @@ as healthy. Commands run off the UI thread and are killed at their timeout.
 `"action": "send-to-terminal"` adds a button that types the detail into the running
 session, behind a preview.
 
+### The context gauge
+
+The thread header's gauge reads "N% left". It has three states: a known window (a bar and a
+percentage), an unknown window (a dim "context ?", with no bar and no percentage), and no
+gauge at all before the agent has reported anything. An agent that reports tokens used but no
+window size, such as Antigravity, stays unknown, and a Codex reading of zero tokens with no
+window is unknown rather than an empty window.
+
+Click the gauge for a popover with the numbers and three things to do:
+
+- **Compact**: sends the agent's own command, labelled for it ("Compact (Claude's
+  /compact)"). An agent with no such command, such as Antigravity or the Local agent, has no
+  Compact row: Continue does the same work.
+- **Continue in a new thread**: a new thread carrying a budgeted hand-off summary, for any
+  agent.
+- **Context breakdown (/context)**: opens the `/context` panel, for agents that report one.
+
+Compact and Continue are off, with the reason shown, while a turn runs. `/compact` and
+`/context` also work from the composer.
+
 ### Turn checkpoints
 
 In a thread whose folder is inside a git repository, the working tree is snapshotted

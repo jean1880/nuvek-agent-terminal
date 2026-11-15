@@ -8,7 +8,10 @@ use adw::prelude::*;
 use agent_core::adapter::{Driver, Mode};
 
 use super::cards::{accent_class, label, wrapped_text};
-use super::model::{format_tokens, Activity, Gauge};
+use super::model::{Activity, Gauge};
+use agent_core::context_meter::{
+    actions as meter_actions, ActionRow, ContextState, Level, MeterAction,
+};
 
 /// Hookless agy cannot enforce a new policy mid-turn without interrupting it.
 pub fn confirm_mode_switch(parent: &impl IsA<gtk4::Widget>, then: impl Fn() + 'static) {
@@ -114,33 +117,23 @@ fn mode_factory(list: bool) -> gtk4::SignalListItemFactory {
 
 /// Gauge fill (0..=1) and the auto-compact threshold as a fraction, when known.
 pub fn gauge_fraction(g: &Gauge) -> Option<(f64, Option<f64>)> {
-    let max = g.max.filter(|m| *m > 0)? as f64;
-    let fill = (g.used as f64 / max).clamp(0.0, 1.0);
-    let compact = g.auto_compact_at.map(|a| (a as f64 / max).clamp(0.0, 1.0));
-    Some((fill, compact))
+    g.meter().bar()
 }
 
+/// The button's text: "N% left", or a dim "context ?" when the window is not known.
 pub fn gauge_text(g: &Gauge) -> String {
-    match g.max {
-        Some(max) if max > 0 => format!("{} / {}", format_tokens(g.used), format_tokens(max)),
-        _ => format!("{} tokens", format_tokens(g.used)),
-    }
+    g.meter().text()
+}
+
+/// What the window holds, "50k / 200k" or "1.2k tokens" (the `/context` panel's big number).
+pub fn gauge_used_text(g: &Gauge) -> String {
+    g.meter().used_text()
 }
 
 /// The gauge's tooltip. With no known window it says so, so a tooltip from an earlier reading
 /// never outlives the bar it described.
 pub fn gauge_tooltip(g: &Gauge) -> String {
-    if gauge_fraction(g).is_none() {
-        return format!("Context window: {} used; size not reported.", gauge_text(g));
-    }
-    match g.auto_compact_at {
-        Some(at) => format!(
-            "Context window: {} used. Auto-compacts at {}.",
-            gauge_text(g),
-            format_tokens(at)
-        ),
-        None => format!("Context window: {} used.", gauge_text(g)),
-    }
+    g.meter().tooltip()
 }
 
 /// The header's own width breakpoints (sp), widest first. Each drops more of the strip, so it
@@ -155,6 +148,113 @@ const HIDE_GAUGE_BELOW: f64 = 760.0;
 const COMPACT_BELOW: f64 = 500.0;
 /// The narrowest the strip supports: the whole window at its minimum.
 const MIN_WIDTH: i32 = 340;
+
+type MeterHandler = Rc<RefCell<Option<Rc<dyn Fn(MeterAction)>>>>;
+
+/// What the gauge opens: the numbers and state, then Compact, Continue and the breakdown. Each
+/// row is a labelled button with its reason underneath while it is off.
+struct GaugePopover {
+    popover: gtk4::Popover,
+    summary: gtk4::Label,
+    detail: gtk4::Label,
+    rows: Vec<(MeterAction, gtk4::Button, gtk4::Label)>,
+    handler: MeterHandler,
+}
+
+impl GaugePopover {
+    fn new() -> Self {
+        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+        for set in [
+            gtk4::Box::set_margin_top,
+            gtk4::Box::set_margin_bottom,
+            gtk4::Box::set_margin_start,
+            gtk4::Box::set_margin_end,
+        ] {
+            set(&content, 10);
+        }
+        let summary = label("", &["heading"]);
+        summary.set_halign(gtk4::Align::Start);
+        let detail = wrapped_text("", &["dim-label"]);
+        detail.set_max_width_chars(40);
+        content.append(&summary);
+        content.append(&detail);
+        let popover = gtk4::Popover::new();
+        let handler: MeterHandler = Rc::new(RefCell::new(None));
+        let mut rows = Vec::new();
+        for action in MeterAction::ALL {
+            let button = gtk4::Button::with_label("");
+            button.add_css_class("flat");
+            if let Some(l) = button.child().and_downcast::<gtk4::Label>() {
+                l.set_halign(gtk4::Align::Start);
+            }
+            let reason = wrapped_text("", &["dim-label"]);
+            reason.set_max_width_chars(40);
+            reason.set_visible(false);
+            button.connect_clicked({
+                let (handler, popover) = (handler.clone(), popover.downgrade());
+                move |_| {
+                    if let Some(p) = popover.upgrade() {
+                        p.popdown();
+                    }
+                    let f = handler.borrow().clone();
+                    if let Some(f) = f {
+                        f(action);
+                    }
+                }
+            });
+            content.append(&button);
+            content.append(&reason);
+            rows.push((action, button, reason));
+        }
+        popover.set_child(Some(&content));
+        Self {
+            popover,
+            summary,
+            detail,
+            rows,
+            handler,
+        }
+    }
+
+    fn show(&self, g: &Gauge) {
+        let m = g.meter();
+        match m.state() {
+            ContextState::Known { level, .. } => {
+                self.summary.set_text(&m.text());
+                self.detail
+                    .set_text(&format!("{}\n{}", m.tooltip(), level.phrase()));
+            }
+            ContextState::Unknown => {
+                self.summary.set_text("Context size not reported");
+                self.detail.set_text(&m.tooltip());
+            }
+        }
+    }
+
+    fn set_actions(&self, actions: &[ActionRow]) {
+        // A row the agent has no use for (Compact with no native command) is not shown.
+        for (action, button, reason) in &self.rows {
+            if !actions.iter().any(|r| r.action == *action) {
+                button.set_visible(false);
+                reason.set_visible(false);
+            }
+        }
+        for row in actions {
+            let Some((_, button, reason)) = self.rows.iter().find(|(a, ..)| *a == row.action)
+            else {
+                continue;
+            };
+            button.set_visible(true);
+            button.set_label(&row.label);
+            if let Some(l) = button.child().and_downcast::<gtk4::Label>() {
+                l.set_halign(gtk4::Align::Start);
+            }
+            button.set_sensitive(row.enabled);
+            reason.set_text(row.reason.as_deref().unwrap_or(""));
+            reason.set_visible(row.reason.is_some());
+        }
+    }
+}
 
 pub struct Header {
     /// What the view packs: the strip in its breakpoint bin.
@@ -184,9 +284,10 @@ pub struct Header {
     spinner: gtk4::Spinner,
     /// The status the header shows now.
     shown: RefCell<Activity>,
-    pub gauge: gtk4::Button,
+    pub gauge: gtk4::MenuButton,
     level: gtk4::LevelBar,
     gauge_label: gtk4::Label,
+    gauge_pop: GaugePopover,
     last_driver: Cell<Option<Driver>>,
     steady_height: Rc<Cell<i32>>,
 }
@@ -360,7 +461,7 @@ impl Header {
         subagent_slot.set_valign(gtk4::Align::Center);
         root.append(&subagent_slot);
 
-        let gauge = gtk4::Button::new();
+        let gauge = gtk4::MenuButton::new();
         gauge.add_css_class("flat");
         gauge.add_css_class("gauge");
         let gauge_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
@@ -374,6 +475,9 @@ impl Header {
         gauge_box.append(&level);
         gauge_box.append(&gauge_label);
         gauge.set_child(Some(&gauge_box));
+        gauge.update_property(&[gtk4::accessible::Property::Label("Context window")]);
+        let gauge_pop = GaugePopover::new();
+        gauge.set_popover(Some(&gauge_pop.popover));
         gauge.set_visible(false);
         // In a slot of its own: `set_gauge` shows and hides the gauge itself.
         let gauge_slot = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -499,6 +603,7 @@ impl Header {
             gauge,
             level,
             gauge_label,
+            gauge_pop,
             last_driver: Cell::new(None),
             steady_height,
         }
@@ -775,32 +880,64 @@ impl Header {
         self.fit_height();
     }
 
+    /// Sets the popover's rows from what the agent can do now.
+    pub fn set_meter_actions(
+        &self,
+        compact_command: Option<&str>,
+        agent: &str,
+        running: bool,
+        has_breakdown: bool,
+    ) {
+        self.gauge_pop.set_actions(&meter_actions(
+            compact_command,
+            agent,
+            running,
+            has_breakdown,
+        ));
+    }
+
+    /// Called with the popover action the user picked (the popover is already closed).
+    pub fn connect_meter_action(&self, f: impl Fn(MeterAction) + 'static) {
+        *self.gauge_pop.handler.borrow_mut() = Some(Rc::new(f));
+    }
+
     fn show_gauge(&self, gauge: Option<&Gauge>) {
         let Some(g) = gauge else {
             self.gauge.set_visible(false);
             return;
         };
         self.gauge.set_visible(true);
+        let meter = g.meter();
         self.gauge_label.set_text(&gauge_text(g));
-        match gauge_fraction(g) {
-            Some((fill, compact)) => {
+        if meter.state() == ContextState::Unknown {
+            self.gauge_label.add_css_class("gauge-unknown");
+        } else {
+            self.gauge_label.remove_css_class("gauge-unknown");
+        }
+        match meter.bar() {
+            Some((fill, _)) => {
                 self.level.set_visible(true);
                 self.level.set_value(fill);
-                // Past the auto-compact threshold the bar turns amber; near the end, red.
+                // Past the warning point the bar turns amber; at 90% it turns red.
                 self.level
                     .remove_offset_value(Some(gtk4::LEVEL_BAR_OFFSET_LOW));
                 self.level
                     .remove_offset_value(Some(gtk4::LEVEL_BAR_OFFSET_HIGH));
                 self.level
                     .remove_offset_value(Some(gtk4::LEVEL_BAR_OFFSET_FULL));
-                let warn = compact.unwrap_or(0.8);
-                self.level.add_offset_value("ok", warn);
-                self.level.add_offset_value("warn", 0.95_f64.max(warn));
+                self.level.add_offset_value("ok", meter.warn_at());
+                self.level.add_offset_value("warn", Level::HOT_AT);
                 self.level.add_offset_value("hot", 1.0);
             }
             None => self.level.set_visible(false),
         }
         self.gauge.set_tooltip_text(Some(&gauge_tooltip(g)));
+        self.gauge
+            .update_property(&[gtk4::accessible::Property::Label(&format!(
+                "Context window: {}",
+                meter.text()
+            ))]);
+        self.gauge_pop.show(g);
     }
 }
 
@@ -848,14 +985,16 @@ mod tests {
             auto_compact_at: Some(160_000),
         };
         assert_eq!(gauge_fraction(&g), Some((0.25, Some(0.8))));
-        assert_eq!(gauge_text(&g), "50k / 200k");
+        assert_eq!(gauge_text(&g), "75% left");
+        assert_eq!(gauge_used_text(&g), "50k / 200k");
         let unknown = Gauge {
             used: 1_234,
             max: None,
             auto_compact_at: None,
         };
         assert_eq!(gauge_fraction(&unknown), None);
-        assert_eq!(gauge_text(&unknown), "1.2k tokens");
+        assert_eq!(gauge_text(&unknown), "context ?");
+        assert_eq!(gauge_used_text(&unknown), "1.2k tokens");
         // A zero window is as unknown as a missing one: no bar, never a full or empty one.
         let zero = Gauge {
             used: 1_234,
@@ -863,14 +1002,14 @@ mod tests {
             auto_compact_at: None,
         };
         assert_eq!(gauge_fraction(&zero), None);
-        assert_eq!(gauge_text(&zero), "1.2k tokens");
+        assert_eq!(gauge_text(&zero), "context ?");
         assert_eq!(
             gauge_tooltip(&unknown),
-            "Context window: 1.2k tokens used; size not reported."
+            "This agent has not reported its context window size. 1.2k tokens used so far."
         );
         assert_eq!(
             gauge_tooltip(&g),
-            "Context window: 50k / 200k used. Auto-compacts at 160k."
+            "Context window: 50k / 200k used, 150k left. Auto-compacts at 160k."
         );
         let no_compact = Gauge {
             auto_compact_at: None,
@@ -878,7 +1017,7 @@ mod tests {
         };
         assert_eq!(
             gauge_tooltip(&no_compact),
-            "Context window: 50k / 200k used."
+            "Context window: 50k / 200k used, 150k left."
         );
         let over = Gauge {
             used: 300,
@@ -886,6 +1025,73 @@ mod tests {
             auto_compact_at: None,
         };
         assert_eq!(gauge_fraction(&over), Some((1.0, None)));
+        // Codex's "no figure": used 0 and no window reads as unknown, not as an empty window.
+        let codex_blank = Gauge {
+            used: 0,
+            max: None,
+            auto_compact_at: None,
+        };
+        assert_eq!(gauge_fraction(&codex_blank), None);
+        assert_eq!(gauge_text(&codex_blank), "context ?");
+        assert_eq!(
+            gauge_tooltip(&codex_blank),
+            "This agent has not reported its context window size."
+        );
+    }
+
+    #[test]
+    fn gauge_bar_follows_state_and_popover_rows_wait_for_the_turn() {
+        crate::testutil::gtk_init().expect("GTK init");
+        crate::testutil::adw_init().expect("adw init");
+        super::super::load_style();
+        let header = Header::new();
+        let known = Gauge {
+            used: 50_000,
+            max: Some(200_000),
+            auto_compact_at: None,
+        };
+        header.set_gauge(Some(&known));
+        assert!(header.gauge.is_visible() && header.level.is_visible());
+        let unknown = Gauge {
+            used: 0,
+            max: None,
+            auto_compact_at: None,
+        };
+        header.set_gauge(Some(&unknown));
+        assert!(header.gauge.is_visible());
+        assert!(!header.level.is_visible());
+        assert_eq!(header.gauge_label.text(), "context ?");
+
+        header.set_meter_actions(Some("/compact"), "Claude", true, true);
+        for (action, button, reason) in &header.gauge_pop.rows {
+            match action {
+                MeterAction::Breakdown => {
+                    assert!(
+                        button.property::<bool>("sensitive") && !reason.property::<bool>("visible")
+                    );
+                }
+                _ => {
+                    assert!(button.property::<bool>("visible"), "{action:?} visible");
+                    assert!(
+                        !button.property::<bool>("sensitive"),
+                        "{action:?} sensitive"
+                    );
+                    assert!(reason.property::<bool>("visible"));
+                    assert_eq!(reason.text(), "Wait for the current turn to finish.");
+                }
+            }
+        }
+        header.set_meter_actions(Some("/compact"), "Claude", false, true);
+        assert!(header
+            .gauge_pop
+            .rows
+            .iter()
+            .all(|(_, b, r)| b.property::<bool>("sensitive") && !r.property::<bool>("visible")));
+        // No native command: Compact is not offered at all.
+        header.set_meter_actions(None, "Local", false, false);
+        let compact = &header.gauge_pop.rows[0];
+        assert_eq!(compact.0, MeterAction::Compact);
+        assert!(!compact.1.property::<bool>("visible"));
     }
 
     #[test]

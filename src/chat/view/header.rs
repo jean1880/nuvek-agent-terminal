@@ -127,6 +127,22 @@ pub fn gauge_text(g: &Gauge) -> String {
     }
 }
 
+/// The gauge's tooltip. With no known window it says so, so a tooltip from an earlier reading
+/// never outlives the bar it described.
+pub fn gauge_tooltip(g: &Gauge) -> String {
+    if gauge_fraction(g).is_none() {
+        return format!("Context window: {} used; size not reported.", gauge_text(g));
+    }
+    match g.auto_compact_at {
+        Some(at) => format!(
+            "Context window: {} used. Auto-compacts at {}.",
+            gauge_text(g),
+            format_tokens(at)
+        ),
+        None => format!("Context window: {} used.", gauge_text(g)),
+    }
+}
+
 /// The header's own width breakpoints (sp), widest first. Each drops more of the strip, so it
 /// fits the thread at any window size: the activity's words, then the usage meter and the context
 /// gauge, then the sub-agents button and the model's name, with tighter spacing.
@@ -781,18 +797,10 @@ impl Header {
                 self.level.add_offset_value("ok", warn);
                 self.level.add_offset_value("warn", 0.95_f64.max(warn));
                 self.level.add_offset_value("hot", 1.0);
-                let tip = match g.auto_compact_at {
-                    Some(at) => format!(
-                        "Context window: {} used. Auto-compacts at {}.",
-                        gauge_text(g),
-                        format_tokens(at)
-                    ),
-                    None => format!("Context window: {} used.", gauge_text(g)),
-                };
-                self.gauge.set_tooltip_text(Some(&tip));
             }
             None => self.level.set_visible(false),
         }
+        self.gauge.set_tooltip_text(Some(&gauge_tooltip(g)));
     }
 }
 
@@ -848,6 +856,30 @@ mod tests {
         };
         assert_eq!(gauge_fraction(&unknown), None);
         assert_eq!(gauge_text(&unknown), "1.2k tokens");
+        // A zero window is as unknown as a missing one: no bar, never a full or empty one.
+        let zero = Gauge {
+            used: 1_234,
+            max: Some(0),
+            auto_compact_at: None,
+        };
+        assert_eq!(gauge_fraction(&zero), None);
+        assert_eq!(gauge_text(&zero), "1.2k tokens");
+        assert_eq!(
+            gauge_tooltip(&unknown),
+            "Context window: 1.2k tokens used; size not reported."
+        );
+        assert_eq!(
+            gauge_tooltip(&g),
+            "Context window: 50k / 200k used. Auto-compacts at 160k."
+        );
+        let no_compact = Gauge {
+            auto_compact_at: None,
+            ..g
+        };
+        assert_eq!(
+            gauge_tooltip(&no_compact),
+            "Context window: 50k / 200k used."
+        );
         let over = Gauge {
             used: 300,
             max: Some(200),

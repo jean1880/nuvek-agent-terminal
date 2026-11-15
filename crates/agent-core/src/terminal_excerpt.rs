@@ -58,11 +58,34 @@ pub struct Excerpt {
 /// control sequences do not eat the kept text, small enough to strip and redact on the UI thread.
 const RAW_CHARS_FACTOR: usize = 4;
 
+/// What [`bound_raw`] kept of the raw text.
+#[derive(Debug, PartialEq, Eq)]
+struct Bounded<'a> {
+    /// The tail: whole lines, or, when a line was cut, starting after a separator.
+    kept: &'a str,
+    /// Line breaks in what came off the front.
+    lines: usize,
+    /// Characters that came off the front.
+    chars: usize,
+    /// What bound cut it; `None` when nothing was.
+    cut: Option<Trim>,
+}
+
+/// Characters a token cannot continue across, where a cut line may safely restart.
+fn is_separator(c: char) -> bool {
+    c.is_whitespace() || "\"'`=:,;()[]{}<>|&".contains(c)
+}
+
 /// The tail of `raw` worth processing: whole lines, at most `RAW_CHARS_FACTOR` times the
 /// character cap and twice the line cap in line breaks (the strip can add breaks, so there is a
-/// margin). Returns it, how many whole lines came off the front, and what bound cut it (`None`
-/// when nothing was cut). It walks only the part it keeps, from the end.
-fn bound_raw(raw: &str, caps: Caps) -> (&str, usize, Option<Trim>) {
+/// margin). The tail is found from the end, reading only what it keeps; counting what came off
+/// the front is one fast pass over it afterwards.
+///
+/// A line too long to keep whole is cut in the middle, and redaction matches prefixes and key
+/// names, so a secret whose prefix was cut off would pass as plain text. The kept text therefore
+/// starts after the first separator past the cut, so no partial token survives. A window that
+/// holds no separator (one enormous token) keeps nothing.
+fn bound_raw(raw: &str, caps: Caps) -> Bounded<'_> {
     let max_chars = caps.max_chars.max(1).saturating_mul(RAW_CHARS_FACTOR);
     let max_breaks = caps.max_lines.max(1).saturating_mul(2);
     let (mut chars, mut breaks) = (0usize, 0usize);
@@ -85,20 +108,34 @@ fn bound_raw(raw: &str, caps: Caps) -> (&str, usize, Option<Trim>) {
         }
     }
     let Some(mut start) = start else {
-        return (raw, 0, None);
+        return Bounded {
+            kept: raw,
+            lines: 0,
+            chars: 0,
+            cut: None,
+        };
     };
     if by == Trim::Chars {
-        // Forward to a line boundary, so redaction sees whole lines; one long line is cut where
-        // it is.
-        if let Some(p) = raw[start..].find(['\n', '\r']) {
-            start += p + 1;
-        }
+        // Forward to a line boundary, so redaction sees whole lines. With none in the window
+        // the cut is inside a line: restart after its first separator, or keep nothing.
+        let tail = &raw[start..];
+        start = match tail.find(['\n', '\r']) {
+            Some(p) => start + p + 1,
+            None => match tail.char_indices().find(|(_, c)| is_separator(*c)) {
+                Some((p, c)) => start + p + c.len_utf8(),
+                None => raw.len(),
+            },
+        };
     }
-    let dropped = raw.as_bytes()[..start]
-        .iter()
-        .filter(|b| **b == b'\n')
-        .count();
-    (&raw[start..], dropped, Some(by))
+    Bounded {
+        kept: &raw[start..],
+        lines: raw.as_bytes()[..start]
+            .iter()
+            .filter(|b| **b == b'\n')
+            .count(),
+        chars: raw[..start].chars().count(),
+        cut: Some(by),
+    }
 }
 
 /// `raw` as a fenced, redacted, size-capped block, or `None` when it holds nothing but blanks.
@@ -107,8 +144,28 @@ fn bound_raw(raw: &str, caps: Caps) -> (&str, usize, Option<Trim>) {
 /// then control bytes go, then redaction sees every kept line whole, and only then is the head
 /// cut, so a cap can never split a secret that redaction would have caught.
 pub fn format_excerpt(raw: &str, caps: Caps) -> Option<Excerpt> {
-    let (raw, dropped, raw_cut) = bound_raw(raw, caps);
-    let clean = strip_controls(raw);
+    let Bounded {
+        kept,
+        lines: dropped,
+        chars: dropped_chars,
+        cut: raw_cut,
+    } = bound_raw(raw, caps);
+    if kept.is_empty() && raw_cut.is_some() {
+        // One enormous token: nothing of it is safe to show, only that it was there.
+        return Some(Excerpt {
+            text: format!(
+                "{DRAWER_LABEL}\n{}",
+                fenced(&format!(
+                    "[... {dropped_chars} earlier characters omitted ...]"
+                ))
+            ),
+            lines: 0,
+            truncated: true,
+            trimmed_by: Some(Trim::Chars),
+            masked: 0,
+        });
+    }
+    let clean = strip_controls(kept);
     if clean.trim().is_empty() {
         return None;
     }
@@ -148,6 +205,8 @@ pub fn format_excerpt(raw: &str, caps: Caps) -> Option<Excerpt> {
     let lines = body.lines().count();
     if omitted > 0 {
         body = format!("[... {omitted} earlier lines omitted ...]\n{body}");
+    } else if dropped_chars > 0 {
+        body = format!("[... {dropped_chars} earlier characters omitted ...]\n{body}");
     } else if truncated {
         body = format!("[... start of the text omitted ...]\n{body}");
     }
@@ -333,22 +392,65 @@ mod tests {
     fn a_huge_selection_is_bounded_before_it_is_read() {
         let caps = Caps::default();
         let raw: String = (1..=500_000).map(|n| format!("line {n}\n")).collect();
-        let (kept, dropped, cut) = bound_raw(&raw, caps);
-        assert!(kept.chars().count() <= 4 * caps.max_chars, "{}", kept.len());
-        assert!(kept.starts_with("line "), "cut at a line boundary");
-        assert!(dropped > 499_000);
-        assert!(cut.is_some());
+        let b = bound_raw(&raw, caps);
+        assert!(b.kept.chars().count() <= 4 * caps.max_chars);
+        assert!(b.kept.starts_with("line "), "cut at a line boundary");
+        assert!(b.lines > 499_000);
+        assert!(b.cut.is_some());
         let e = format_excerpt(&raw, caps).unwrap();
         assert!(e.truncated);
         assert!(body(&e).starts_with("[... 49"), "{}", &body(&e)[..30]);
         assert!(body(&e).ends_with("line 500000"));
-        // One enormous line is cut where it is, never kept whole.
-        let one = "x".repeat(1_000_000);
-        let (kept, _, cut) = bound_raw(&one, caps);
-        assert_eq!(kept.len(), 4 * caps.max_chars);
-        assert_eq!(cut, Some(Trim::Chars));
         // Within the bounds nothing is cut.
-        assert_eq!(bound_raw("a\nb\n", caps), ("a\nb\n", 0, None));
+        let b = bound_raw("a\nb\n", caps);
+        assert_eq!((b.kept, b.lines, b.chars, b.cut), ("a\nb\n", 0, 0, None));
+    }
+
+    #[test]
+    fn a_cut_line_never_keeps_part_of_a_token() {
+        let caps = Caps {
+            max_lines: 5,
+            max_chars: 20,
+        };
+        // The window is the last 80 characters: it starts 19 characters into the secret.
+        let secret = format!("ghp_{}", "abcdefghijklmnopqrstuvwxyz0123456789");
+        let ok = "ok ".repeat(20);
+        let raw = format!("{}{secret} {}", "word ".repeat(40), ok.trim_end());
+        let e = format_excerpt(&raw, caps).unwrap();
+        assert!(e.truncated);
+        assert!(!e.text.contains(&secret[secret.len() - 8..]), "{}", e.text);
+        assert!(
+            !e.text.contains(&secret[secret.len() - 19..][..8]),
+            "{}",
+            e.text
+        );
+        assert!(body(&e).starts_with("[... "), "{}", e.text);
+        assert!(
+            body(&e).contains("earlier characters omitted"),
+            "{}",
+            e.text
+        );
+        assert!(body(&e).ends_with("ok ok"), "{}", e.text);
+        // The kept text restarts after the first separator past the cut.
+        let line = format!("{}k=v rest", "x".repeat(500));
+        let b = bound_raw(&line, caps);
+        assert_eq!(b.kept, "v rest");
+    }
+
+    #[test]
+    fn one_enormous_token_keeps_only_the_omission_marker() {
+        let caps = Caps::default();
+        let one = "x".repeat(1_000_000);
+        let b = bound_raw(&one, caps);
+        assert_eq!((b.kept, b.cut), ("", Some(Trim::Chars)));
+        let e = format_excerpt(&one, caps).unwrap();
+        assert!(e.truncated);
+        assert_eq!(e.lines, 0);
+        assert_eq!(e.trimmed_by, Some(Trim::Chars));
+        assert!(!e.text.contains("xxxx"), "{}", e.text);
+        assert!(e
+            .text
+            .contains("[... 1000000 earlier characters omitted ...]"));
     }
 
     #[test]

@@ -30,6 +30,7 @@ use crate::heal_tail::HealTails;
 pub mod delegation;
 pub mod delegation_typed;
 mod preflight;
+mod schema_v11;
 mod schema_v8;
 
 pub use preflight::{BACKUP_DIR, PRE_V4_BACKUP_KEY};
@@ -48,7 +49,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Schema version this build writes. Bump it and add a step to [`migrate`]. An existing store is
 /// only ever upgraded by the preflight (`preflight::run`), after a verified backup.
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 /// `PRAGMA synchronous = FULL`: a durable control write's level.
 const SYNC_FULL: i64 = 2;
 /// [`Store::meta`] key of the native sessions whose threads the user deleted (JSON list of
@@ -253,6 +254,15 @@ pub struct ThreadSummary {
     pub unread: bool,
     /// Hidden from the default list ([`Store::list_threads`] with `include_archived` false).
     pub archived: bool,
+}
+
+/// What [`Store::ensure_search_fts`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchIndex {
+    /// The full-text index and its triggers exist.
+    Ready,
+    /// This SQLite has no FTS5 (its error, as text): the store works on without search.
+    Unavailable(String),
 }
 
 /// A provider thread: one native agent session under an app thread.
@@ -1425,6 +1435,10 @@ pub struct Store {
     /// Test hook: the next COMMIT of a transaction of its own (not a batch, not a savepoint) fails.
     #[cfg(test)]
     fail_next_txn_commit: Cell<bool>,
+    /// Test hook: [`Store::ensure_search_fts`] names an FTS module SQLite does not have, as a
+    /// build without FTS5 would meet.
+    #[cfg(test)]
+    fts5_missing: Cell<bool>,
 }
 
 /// A unit of work that commits or rolls back as one: a transaction, or inside a
@@ -1717,6 +1731,8 @@ impl Store {
             fail_sync_switch_in: Cell::new(None),
             #[cfg(test)]
             fail_next_txn_commit: Cell::new(false),
+            #[cfg(test)]
+            fts5_missing: Cell::new(false),
         })
     }
 
@@ -2533,6 +2549,90 @@ impl Store {
             params![thread],
         )?;
         require_row(n, thread)
+    }
+
+    // ---- objects created after open ----
+
+    /// Whether `sqlite_master` holds every one of `names`: a read, so it takes no write lock.
+    fn has_objects(&self, names: &[&str]) -> Result<bool> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = ?1)")?;
+        for name in names {
+            if !stmt.query_row(params![name], |r| r.get::<_, bool>(0))? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn search_fts_present(&self) -> Result<bool> {
+        let mut names = vec![schema_v11::SEARCH_FTS];
+        names.extend(schema_v11::SEARCH_FTS_TRIGGERS);
+        self.has_objects(&names)
+    }
+
+    /// Makes sure the full-text index over `search_items` (`search_fts`, external content, and
+    /// the triggers that keep it in step) exists. Idempotent: when it does, this is one read of
+    /// `sqlite_master` and takes no write lock. Otherwise it is created under the write lock
+    /// (checked again there, since another connection may have made it meanwhile) and rebuilt
+    /// from `search_items`.
+    ///
+    /// A SQLite without FTS5 is no error: the answer is [`SearchIndex::Unavailable`], nothing is
+    /// left half made, and the store works on without search. `Err` only for a failure of the
+    /// store itself (the lock, the disk).
+    ///
+    /// Writers to `search_items` must upsert with `ON CONFLICT DO UPDATE`, never
+    /// `INSERT OR REPLACE`: a replace deletes without firing the delete trigger while
+    /// `recursive_triggers` is off, leaving the index naming text that is gone.
+    pub fn ensure_search_fts(&self) -> Result<SearchIndex> {
+        if self.search_fts_present()? {
+            return Ok(SearchIndex::Ready);
+        }
+        let tx = self.write_txn()?;
+        if !self.search_fts_present()? {
+            #[cfg(test)]
+            let module = if self.fts5_missing.get() {
+                "fts5_not_built_in"
+            } else {
+                "fts5"
+            };
+            #[cfg(not(test))]
+            let module = "fts5";
+            let sql = schema_v11::SEARCH_FTS_SQL.replace("{module}", module);
+            if let Err(e) = self.conn.execute_batch(&sql) {
+                if is_missing_module(&e) {
+                    // `tx` is dropped uncommitted: whatever the batch made is rolled back.
+                    return Ok(SearchIndex::Unavailable(e.to_string()));
+                }
+                return Err(e.into());
+            }
+        }
+        tx.commit()?;
+        Ok(SearchIndex::Ready)
+    }
+
+    /// Test hook: [`Store::ensure_search_fts`] meets a SQLite without FTS5 (`missing`), or the
+    /// real one again.
+    #[cfg(test)]
+    pub(crate) fn simulate_missing_fts5(&self, missing: bool) {
+        self.fts5_missing.set(missing);
+    }
+
+    /// Makes sure `events_turns` exists: the partial index over completed turns that the
+    /// spending history reads live threads' costs through. Idempotent: when it exists, this is
+    /// one read of `sqlite_master` and takes no write lock. Building it parses every stored
+    /// event once, so it is made on first use, through the store writer, off the main thread;
+    /// never in a migration. A query should repeat the index's WHERE term with the literal
+    /// `'turn_completed'`: with the type bound as a parameter, SQLite reaches the index only by
+    /// planning again for each bound value, so the plan is not fixed by the statement.
+    pub fn ensure_spend_index(&self) -> Result<()> {
+        if self.has_objects(&[schema_v11::SPEND_INDEX])? {
+            return Ok(());
+        }
+        let tx = self.write_txn()?;
+        self.conn.execute_batch(schema_v11::SPEND_INDEX_SQL)?;
+        tx.commit()
     }
 
     // ---- provider threads ----
@@ -4079,18 +4179,29 @@ fn migrate_in_txn(conn: &Connection, allow_upgrade: bool) -> Result<()> {
 }
 
 fn schema_version(conn: &Connection) -> Result<i64> {
+    schema_version_within(conn, SCHEMA_VERSION)
+}
+
+/// The database's schema version, refused (`SchemaTooNew`) when newer than `supported`: the
+/// check every build makes against its own [`SCHEMA_VERSION`].
+fn schema_version_within(conn: &Connection, supported: i64) -> Result<i64> {
     let current: i64 = conn.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_version",
         [],
         |r| r.get(0),
     )?;
-    if current > SCHEMA_VERSION {
+    if current > supported {
         return Err(StoreError::SchemaTooNew {
             found: current,
-            supported: SCHEMA_VERSION,
+            supported,
         });
     }
     Ok(current)
+}
+
+/// Whether `e` is SQLite naming a virtual-table module it was built without.
+fn is_missing_module(e: &rusqlite::Error) -> bool {
+    matches!(e, rusqlite::Error::SqliteFailure(_, Some(msg)) if msg.starts_with("no such module"))
 }
 
 /// Brings the schema to [`SCHEMA_VERSION`] inside the caller's reserved transaction (the
@@ -4203,6 +4314,10 @@ fn migrate_locked_to(conn: &Connection, current: i64, target: i64) -> Result<()>
         // An operation outlives the worker it targets and the run it started, so its key
         // still replays; workers are indexed by driver.
         conn.execute_batch(delegation::SCHEMA_V10)?;
+    }
+    if current < 11 && target >= 11 {
+        // Strictly additive: a column and new, empty tables; no rebuild, no event read.
+        conn.execute_batch(schema_v11::SCHEMA_V11)?;
     }
     let broken: Option<String> = conn
         .query_row(
@@ -6514,7 +6629,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .expect("version");
-        assert_eq!(version, 10);
+        assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(operations(&conn), before);
         let broken: i64 = conn
             .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
@@ -6733,11 +6848,21 @@ mod tests {
             ("delegation_event_links", "category"),
             names(&EventCategory::ALL),
         );
-        // Lists that mirror no enum: a task's own state and two flags.
+        expected.insert(("schedules", "mode"), names(&TaskMode::ALL));
+        // Lists that mirror no enum: a task's own state and flags; and the v11 lists whose
+        // enums arrive with their features (to be registered here then).
         let not_enums = [
             ("delegation_roots", "task_state"),
             ("delegation_roots", "continuation_reserved"),
             ("threads", "archived"),
+            ("search_items", "role"),
+            ("schedules", "worktree"),
+            ("schedules", "missed_policy"),
+            ("schedules", "last_outcome"),
+            ("schedules", "paused_reason"),
+            ("spend_ledger", "billing"),
+            ("spend_ledger", "delegated"),
+            ("review_drafts", "side"),
         ];
 
         let tables: Vec<(String, String)> = s

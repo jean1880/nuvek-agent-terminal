@@ -7637,10 +7637,15 @@ fn excerpt_toast(excerpt: &agent_core::terminal_excerpt::Excerpt, thread: &str) 
         });
     }
     if excerpt.truncated {
-        notes.push(format!(
-            "trimmed to the last {} lines",
-            agent_core::terminal_excerpt::EXCERPT_MAX_LINES
-        ));
+        use agent_core::terminal_excerpt::{Trim, EXCERPT_MAX_CHARS, EXCERPT_MAX_LINES};
+        notes.push(match excerpt.trimmed_by {
+            Some(Trim::Chars) => format!(
+                "trimmed to the last {},{:03} characters",
+                EXCERPT_MAX_CHARS / 1000,
+                EXCERPT_MAX_CHARS % 1000
+            ),
+            _ => format!("trimmed to the last {EXCERPT_MAX_LINES} lines"),
+        });
     }
     let notes = if notes.is_empty() {
         String::new()
@@ -7666,11 +7671,12 @@ mod tests {
 
     #[test]
     fn the_send_toast_names_lines_masking_and_cut() {
-        use agent_core::terminal_excerpt::Excerpt;
+        use agent_core::terminal_excerpt::{Excerpt, Trim};
         let mut e = Excerpt {
             text: String::new(),
             lines: 42,
             truncated: false,
+            trimmed_by: None,
             masked: 0,
         };
         assert_eq!(
@@ -7679,9 +7685,15 @@ mod tests {
         );
         e.masked = 1;
         e.truncated = true;
+        e.trimmed_by = Some(Trim::Lines);
         assert_eq!(
             excerpt_toast(&e, "T"),
             "Added 42 lines (1 secret masked, trimmed to the last 200 lines) to the draft of T"
+        );
+        e.trimmed_by = Some(Trim::Chars);
+        assert_eq!(
+            excerpt_toast(&e, "T"),
+            "Added 42 lines (1 secret masked, trimmed to the last 12,000 characters) to the draft of T"
         );
         e.lines = 1;
         e.masked = 3;

@@ -67,16 +67,21 @@ fn contrast(a: (f64, f64, f64), b: (f64, f64, f64)) -> f64 {
     (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
 
+/// The ground a light window's colours are measured against: a grey a step darker than white,
+/// since a light window is rarely pure white (the cream and tinted schemes, a card or a raised
+/// row) and a colour that reads on this reads on those too.
+const LIGHT_GROUND: (f64, f64, f64) = (0.9, 0.9, 0.9);
+
 /// `driver`'s colour for a light window: the accent darkened just enough to keep
-/// [`MIN_CONTRAST`] against white. The bright accents themselves fall to about 2.2-2.8:1 there.
-/// Only the desktop's own theme (Settings → System) can be light; every bundled theme is dark.
+/// [`MIN_CONTRAST`] against [`LIGHT_GROUND`] (so a little over that against white). The bright
+/// accents themselves fall to about 2.2-2.8:1 on white. The desktop's own theme (Settings →
+/// System) and the bundled light schemes are light.
 pub fn rgb_on_light(driver: Driver) -> (f64, f64, f64) {
     let (r, g, b) = rgb(driver);
-    let white = (1.0, 1.0, 1.0);
     (0..=100)
         .map(|step| 1.0 - f64::from(step) / 100.0)
         .map(|keep| (r * keep, g * keep, b * keep))
-        .find(|&shade| contrast(shade, white) >= MIN_CONTRAST)
+        .find(|&shade| contrast(shade, LIGHT_GROUND) >= MIN_CONTRAST)
         .unwrap_or((0.0, 0.0, 0.0))
 }
 
@@ -273,11 +278,12 @@ mod tests {
         );
     }
 
-    /// On a light window every agent's colour keeps 3:1 against white (the bright accents do
-    /// not: Codex's is about 2.2:1), darkened no more than that needs, and keeps its hue.
+    /// On a light window every agent's colour keeps 3:1 against the light ground (the bright
+    /// accents do not: Codex's is about 2.2:1 on white), darkened no more than that needs, and
+    /// keeps its hue.
     #[test]
     fn a_light_window_gets_legible_shades_of_the_same_colours() {
-        let white = (1.0, 1.0, 1.0);
+        let white = LIGHT_GROUND;
         let light = css(false);
         for driver in Driver::ALL {
             let accent = rgb(driver);
@@ -302,6 +308,32 @@ mod tests {
             assert!(light.contains(&line), "{line}");
         }
         assert_eq!(hex(rgb(Driver::Claude)), Driver::Claude.info().accent_hex);
+    }
+
+    /// On every bundled light scheme's background each agent's light shade keeps 3:1, the
+    /// non-text minimum, though a cream background is darker than white.
+    #[test]
+    fn brand_agent_colours_read_on_light_backgrounds() {
+        for choice in crate::config::ThemeChoice::ALL {
+            if choice.is_light() != Some(true) {
+                continue;
+            }
+            let chrome = crate::palette::Chrome::for_choice(choice).expect("bundled");
+            for driver in Driver::ALL {
+                for (ground, bg) in [
+                    ("bg", chrome.bg),
+                    ("surface", chrome.surface),
+                    ("raised", chrome.surface_raised),
+                    ("deep", chrome.bg_deep),
+                ] {
+                    let ratio = contrast(rgb_on_light(driver), (bg.0, bg.1, bg.2));
+                    assert!(
+                        ratio >= 3.0,
+                        "{choice} {driver:?} on {ground}: {ratio:.2}:1"
+                    );
+                }
+            }
+        }
     }
 
     /// GTK refuses an empty class with a critical: the looping droplet has no extra class and

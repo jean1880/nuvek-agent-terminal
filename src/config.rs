@@ -701,6 +701,21 @@ pub enum ThemeChoice {
     SolarizedDark,
     OneDark,
     Monokai,
+    AgentTerminalLight,
+    SolarizedLight,
+    GruvboxLight,
+    OneLight,
+    GithubLight,
+}
+
+/// A `theme` this build does not know (a later version's scheme) loads as the default theme
+/// instead of failing the whole file, which would reset every setting.
+fn tolerant_theme<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ThemeChoice, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(value.clone()).unwrap_or_else(|_| {
+        warn!("unknown theme {value}; using the default theme");
+        ThemeChoice::default()
+    }))
 }
 
 impl std::fmt::Display for ThemeChoice {
@@ -714,6 +729,11 @@ impl std::fmt::Display for ThemeChoice {
             ThemeChoice::SolarizedDark => "Solarized Dark",
             ThemeChoice::OneDark => "One Dark",
             ThemeChoice::Monokai => "Monokai",
+            ThemeChoice::AgentTerminalLight => "Agent Terminal Light",
+            ThemeChoice::SolarizedLight => "Solarized Light",
+            ThemeChoice::GruvboxLight => "Gruvbox Light",
+            ThemeChoice::OneLight => "One Light",
+            ThemeChoice::GithubLight => "GitHub Light",
         };
         f.write_str(name)
     }
@@ -721,7 +741,7 @@ impl std::fmt::Display for ThemeChoice {
 
 impl ThemeChoice {
     /// All choices in display order; the index matches the settings dropdown.
-    pub const ALL: [ThemeChoice; 8] = [
+    pub const ALL: [ThemeChoice; 13] = [
         ThemeChoice::System,
         ThemeChoice::AgentTerminal,
         ThemeChoice::Dracula,
@@ -730,7 +750,33 @@ impl ThemeChoice {
         ThemeChoice::SolarizedDark,
         ThemeChoice::OneDark,
         ThemeChoice::Monokai,
+        ThemeChoice::AgentTerminalLight,
+        ThemeChoice::SolarizedLight,
+        ThemeChoice::GruvboxLight,
+        ThemeChoice::OneLight,
+        ThemeChoice::GithubLight,
     ];
+
+    /// Whether the bundled palette is light (`Some(true)`) or dark (`Some(false)`); `None` for
+    /// the system theme, whose polarity is the desktop's. The match is exhaustive, so a new
+    /// variant must be classified.
+    pub fn is_light(self) -> Option<bool> {
+        match self {
+            ThemeChoice::System => None,
+            ThemeChoice::AgentTerminal
+            | ThemeChoice::Dracula
+            | ThemeChoice::Nord
+            | ThemeChoice::GruvboxDark
+            | ThemeChoice::SolarizedDark
+            | ThemeChoice::OneDark
+            | ThemeChoice::Monokai => Some(false),
+            ThemeChoice::AgentTerminalLight
+            | ThemeChoice::SolarizedLight
+            | ThemeChoice::GruvboxLight
+            | ThemeChoice::OneLight
+            | ThemeChoice::GithubLight => Some(true),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -756,6 +802,7 @@ pub struct TerminalConfig {
     /// config keeps its chosen client across the upgrade; see [`Self::normalize`].
     pub cli_client: CliClient,
     pub starting_directory: String,
+    #[serde(deserialize_with = "tolerant_theme")]
     pub theme: ThemeChoice,
     /// The sessions offered in Settings and the new-tab menu.
     pub profiles: Vec<Profile>,
@@ -2073,10 +2120,15 @@ mod tests {
                 ThemeChoice::SolarizedDark => 5,
                 ThemeChoice::OneDark => 6,
                 ThemeChoice::Monokai => 7,
+                ThemeChoice::AgentTerminalLight => 8,
+                ThemeChoice::SolarizedLight => 9,
+                ThemeChoice::GruvboxLight => 10,
+                ThemeChoice::OneLight => 11,
+                ThemeChoice::GithubLight => 12,
             }
         }
 
-        assert_eq!(ThemeChoice::ALL.len(), 8);
+        assert_eq!(ThemeChoice::ALL.len(), 13);
         for theme in ThemeChoice::ALL {
             let index = expected_index(theme);
             assert_eq!(ThemeChoice::ALL[index], theme);
@@ -2098,6 +2150,52 @@ mod tests {
             serde_json::to_string(&old).expect("serialises"),
             "\"agent-terminal\""
         );
+    }
+
+    /// Every variant is classified, the system theme as neither, and the new schemes load and
+    /// save under their kebab-case names.
+    #[test]
+    fn is_light_classifies_every_variant() {
+        assert_eq!(ThemeChoice::System.is_light(), None);
+        let light: Vec<ThemeChoice> = ThemeChoice::ALL
+            .into_iter()
+            .filter(|t| t.is_light() == Some(true))
+            .collect();
+        assert_eq!(
+            light,
+            [
+                ThemeChoice::AgentTerminalLight,
+                ThemeChoice::SolarizedLight,
+                ThemeChoice::GruvboxLight,
+                ThemeChoice::OneLight,
+                ThemeChoice::GithubLight,
+            ]
+        );
+        for dark in [
+            ThemeChoice::AgentTerminal,
+            ThemeChoice::Dracula,
+            ThemeChoice::Nord,
+            ThemeChoice::GruvboxDark,
+            ThemeChoice::SolarizedDark,
+            ThemeChoice::OneDark,
+            ThemeChoice::Monokai,
+        ] {
+            assert_eq!(dark.is_light(), Some(false), "{dark}");
+        }
+        for (theme, name) in [
+            (ThemeChoice::AgentTerminalLight, "agent-terminal-light"),
+            (ThemeChoice::SolarizedLight, "solarized-light"),
+            (ThemeChoice::GruvboxLight, "gruvbox-light"),
+            (ThemeChoice::OneLight, "one-light"),
+            (ThemeChoice::GithubLight, "github-light"),
+        ] {
+            let json = format!("\"{name}\"");
+            assert_eq!(serde_json::to_string(&theme).expect("serialises"), json);
+            assert_eq!(
+                serde_json::from_str::<ThemeChoice>(&json).expect("loads"),
+                theme
+            );
+        }
     }
 
     #[test]
@@ -2148,6 +2246,29 @@ mod tests {
             leftovers.is_empty(),
             "temp files left behind: {leftovers:?}"
         );
+    }
+
+    /// A theme a later build added must not reset every setting: it loads as the default theme
+    /// and the rest of the file is kept.
+    #[test]
+    fn an_unknown_theme_loads_as_the_default_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            br#"{"theme":"solarized-twilight","scrollback_lines":777}"#,
+        )
+        .unwrap();
+        let loaded = TerminalConfig::read_config(&path)
+            .expect("the file is valid")
+            .expect("it exists");
+        assert_eq!(loaded.theme, ThemeChoice::default());
+        assert_eq!(loaded.scrollback_lines, 777);
+        // A non-string value is tolerated the same way.
+        std::fs::write(&path, br#"{"theme":42,"scrollback_lines":778}"#).unwrap();
+        let loaded = TerminalConfig::read_config(&path).unwrap().unwrap();
+        assert_eq!(loaded.theme, ThemeChoice::default());
+        assert_eq!(loaded.scrollback_lines, 778);
     }
 
     #[test]

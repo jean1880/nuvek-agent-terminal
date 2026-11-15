@@ -176,3 +176,21 @@ git worktree remove <path>      # refuses if it has changes
 git branch -d <branch>          # refuses if it is unmerged
 ```
 
+
+### Theme
+
+The `theme` key in `~/.config/agent-terminal/config.json` takes one of these values
+(Settings → General → Appearance writes it for you):
+
+| Value | Scheme |
+|---|---|
+| `system` | Use System Theme |
+| `agent-terminal` (default; `antigravity` still loads) | Agent Terminal |
+| `dracula`, `nord`, `gruvbox-dark`, `solarized-dark`, `one-dark`, `monokai` | the dark schemes |
+| `agent-terminal-light`, `solarized-light`, `gruvbox-light`, `one-light`, `github-light` | the light schemes |
+
+A light scheme turns the whole window light, including menus, popovers and fields, and
+its code blocks and the composer take a light syntax scheme. Colours that would not read
+on a light background are darkened until they do: the accent and status colours of the
+window and the added, removed and hunk lines of a diff are never paler than a 4.5:1
+contrast, and Solarized Light's text is `#586e75`.

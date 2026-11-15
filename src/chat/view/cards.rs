@@ -307,20 +307,96 @@ impl BlockWidget {
     }
 }
 
-thread_local! {
-    static SCHEME: Option<sourceview5::StyleScheme> = {
-        let manager = sourceview5::StyleSchemeManager::default();
-        ["Adwaita-dark", "oblivion", "cobalt", "classic-dark"]
-            .iter()
-            .find_map(|id| manager.scheme(id))
-    };
+/// GtkSourceView scheme ids tried in order, for a dark window and for a light one. Which are
+/// installed varies by system.
+const DARK_SCHEMES: [&str; 4] = ["Adwaita-dark", "oblivion", "cobalt", "classic-dark"];
+const LIGHT_SCHEMES: [&str; 4] = ["Adwaita", "classic", "kate", "tango"];
+
+/// The first of the scheme ids for `light` that `has` reports installed.
+fn scheme_id(light: bool, has: impl Fn(&str) -> bool) -> Option<&'static str> {
+    let ids = if light { &LIGHT_SCHEMES } else { &DARK_SCHEMES };
+    ids.iter().copied().find(|id| has(id))
 }
 
-/// Gives `buffer` the app's dark source-view scheme (when GtkSourceView has one of them).
+/// The source-view scheme for the colours in use: a light one under a light palette, a dark one
+/// under a dark one. `None` when none of its ids is installed (the buffer's default then).
+fn current_scheme() -> Option<sourceview5::StyleScheme> {
+    let manager = sourceview5::StyleSchemeManager::default();
+    let id = scheme_id(crate::palette::is_light(), |id| {
+        manager.scheme(id).is_some()
+    })?;
+    manager.scheme(id)
+}
+
+thread_local! {
+    /// Every source buffer that follows the palette, so a change of theme re-schemes the ones
+    /// already built. Weak: a closed thread's buffers drop out.
+    static SOURCE_BUFFERS: RefCell<Vec<glib::WeakRef<sourceview5::Buffer>>> =
+        const { RefCell::new(Vec::new()) };
+    /// Every markdown view, for the same reason.
+    static MARKDOWN_VIEWS: RefCell<Vec<std::rc::Weak<MarkdownInner>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Re-draws what took the palette's colours when it was built: every live source buffer's
+/// scheme and every markdown view's inline colours.
+fn recolour_all() {
+    let scheme = current_scheme();
+    let buffers: Vec<sourceview5::Buffer> = SOURCE_BUFFERS.with(|all| {
+        let mut all = all.borrow_mut();
+        all.retain(|b| b.upgrade().is_some());
+        all.iter().filter_map(|b| b.upgrade()).collect()
+    });
+    for buffer in buffers {
+        buffer.set_style_scheme(scheme.as_ref());
+    }
+    let views: Vec<std::rc::Rc<MarkdownInner>> = MARKDOWN_VIEWS.with(|all| {
+        let mut all = all.borrow_mut();
+        all.retain(|v| v.strong_count() > 0);
+        all.iter().filter_map(std::rc::Weak::upgrade).collect()
+    });
+    for view in views {
+        view.refresh();
+    }
+}
+
+/// Whether a registry of weak entries is worth sweeping for dead ones as `len` grows past
+/// 64: at each power of two, so the sweeps cost a constant per added entry.
+fn prune_due(len: usize) -> bool {
+    len >= 64 && len.is_power_of_two()
+}
+
+/// What a markdown view does about a palette change.
+#[derive(Debug, PartialEq, Eq)]
+enum Refresh {
+    /// Parsed under the colours in use, or nothing to parse.
+    Current,
+    /// On screen: parse again now.
+    Now,
+    /// Not on screen: stays stale until it is mapped.
+    Later,
+}
+
+fn refresh_action(rendered: u64, current: u64, has_text: bool, mapped: bool) -> Refresh {
+    if rendered == current || !has_text {
+        Refresh::Current
+    } else if mapped {
+        Refresh::Now
+    } else {
+        Refresh::Later
+    }
+}
+
+/// Gives `buffer` the source-view scheme of the colours in use, and keeps it in step when they
+/// change.
 pub(super) fn apply_scheme(buffer: &sourceview5::Buffer) {
-    SCHEME.with(|s| {
-        if let Some(scheme) = s {
-            buffer.set_style_scheme(Some(scheme));
+    crate::palette::on_change(recolour_all);
+    buffer.set_style_scheme(current_scheme().as_ref());
+    SOURCE_BUFFERS.with(|all| {
+        let mut all = all.borrow_mut();
+        all.push(buffer.downgrade());
+        if prune_due(all.len()) {
+            all.retain(|b| b.upgrade().is_some());
         }
     });
 }
@@ -427,32 +503,86 @@ fn normalise_lang(lang: &str) -> String {
 }
 
 /// A container of markdown blocks that re-renders only the blocks that changed.
-pub struct MarkdownView {
+pub struct MarkdownView(std::rc::Rc<MarkdownInner>);
+
+pub struct MarkdownInner {
     root: gtk4::Box,
     blocks: RefCell<Vec<(Block, BlockWidget)>>,
     source: RefCell<String>,
+    /// The palette generation the blocks were last parsed under: Pango markup carries its
+    /// colours, so a newer palette makes them stale.
+    generation: std::cell::Cell<u64>,
+}
+
+impl std::ops::Deref for MarkdownView {
+    type Target = MarkdownInner;
+    fn deref(&self) -> &MarkdownInner {
+        &self.0
+    }
 }
 
 impl MarkdownView {
     pub fn new() -> Self {
         let root = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
         root.add_css_class("markdown");
-        Self {
+        crate::palette::on_change(recolour_all);
+        let inner = std::rc::Rc::new(MarkdownInner {
             root,
             blocks: RefCell::new(Vec::new()),
             source: RefCell::new(String::new()),
-        }
+            generation: std::cell::Cell::new(crate::palette::generation()),
+        });
+        MARKDOWN_VIEWS.with(|all| {
+            let mut all = all.borrow_mut();
+            all.push(std::rc::Rc::downgrade(&inner));
+            if prune_due(all.len()) {
+                all.retain(|v| v.strong_count() > 0);
+            }
+        });
+        // A view hidden when the theme changed is parsed again as it comes on screen.
+        let weak = std::rc::Rc::downgrade(&inner);
+        inner.root.connect_map(move |_| {
+            if let Some(view) = weak.upgrade() {
+                view.refresh();
+            }
+        });
+        Self(inner)
     }
+}
 
+impl MarkdownInner {
     pub fn widget(&self) -> &gtk4::Box {
         &self.root
     }
 
     pub fn set_markdown(&self, text: &str) {
-        if *self.source.borrow() == text {
+        let generation = crate::palette::generation();
+        if *self.source.borrow() == text && self.generation.get() == generation {
             return;
         }
         text.clone_into(&mut self.source.borrow_mut());
+        self.render(text, generation);
+    }
+
+    /// Parses again under the colours now in use, when the text was parsed under older ones and
+    /// the view is on screen. A hidden one stays stale until it is mapped.
+    fn refresh(&self) {
+        let generation = crate::palette::generation();
+        let action = refresh_action(
+            self.generation.get(),
+            generation,
+            !self.source.borrow().is_empty(),
+            self.root.is_mapped(),
+        );
+        if action != Refresh::Now {
+            return;
+        }
+        let text = self.source.borrow().clone();
+        self.render(&text, generation);
+    }
+
+    fn render(&self, text: &str, generation: u64) {
+        self.generation.set(generation);
         let new = markdown::parse(text);
         let mut blocks = self.blocks.borrow_mut();
         let common = blocks
@@ -3225,6 +3355,51 @@ pub(super) fn pattern_error(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_visible_stale_view_is_parsed_again_at_once() {
+        assert_eq!(refresh_action(3, 3, true, true), Refresh::Current);
+        assert_eq!(refresh_action(2, 3, false, true), Refresh::Current);
+        assert_eq!(refresh_action(2, 3, true, true), Refresh::Now);
+        assert_eq!(refresh_action(2, 3, true, false), Refresh::Later);
+    }
+
+    #[test]
+    fn registries_are_swept_as_they_grow() {
+        assert!(!prune_due(1) && !prune_due(63) && !prune_due(65));
+        assert!(prune_due(64) && prune_due(128));
+    }
+
+    /// A light palette takes the first light scheme installed, a dark one the first dark one,
+    /// and with none installed there is no scheme (the buffer's default).
+    #[test]
+    fn source_scheme_follows_polarity() {
+        let all = |_: &str| true;
+        assert_eq!(scheme_id(true, all), Some("Adwaita"));
+        assert_eq!(scheme_id(false, all), Some("Adwaita-dark"));
+        assert_eq!(scheme_id(true, |id| id == "tango"), Some("tango"));
+        assert_eq!(scheme_id(false, |id| id == "cobalt"), Some("cobalt"));
+        assert_eq!(scheme_id(true, |id| DARK_SCHEMES.contains(&id)), None);
+        assert_eq!(scheme_id(false, |_| false), None);
+        for light in LIGHT_SCHEMES {
+            assert!(!DARK_SCHEMES.contains(&light), "{light} is in both lists");
+        }
+
+        // With the schemes this system has installed (none, or no GTK here: nothing to check).
+        if gtk4::init().is_err() {
+            return;
+        }
+        let manager = sourceview5::StyleSchemeManager::default();
+        if manager.scheme_ids().is_empty() {
+            return;
+        }
+        if let Some(id) = scheme_id(true, |id| manager.scheme(id).is_some()) {
+            assert!(LIGHT_SCHEMES.contains(&id));
+        }
+        if let Some(id) = scheme_id(false, |id| manager.scheme(id).is_some()) {
+            assert!(DARK_SCHEMES.contains(&id));
+        }
+    }
 
     /// A widget that counts the times GTK measures it.
     mod counting {

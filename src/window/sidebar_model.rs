@@ -380,6 +380,8 @@ pub struct SidebarRow {
     pub archived: bool,
     /// A pinned thread's place in the Pinned section (0 is first); `None` when not pinned.
     pub pin_rank: Option<i64>,
+    /// A terminal page on another machine; its `folder` is `alias:folder`.
+    pub remote: bool,
 }
 
 /// Rows matching `query` (case-insensitive, on title and folder), grouped by folder. Groups are
@@ -1128,6 +1130,7 @@ mod tests {
             open: OpenState::Here,
             archived: false,
             pin_rank: None,
+            remote: false,
         }
     }
 
@@ -1364,6 +1367,7 @@ mod tests {
             open: OpenState::Closed,
             archived: false,
             pin_rank: None,
+            remote: false,
         }
     }
 

@@ -8,6 +8,7 @@ mod diffs;
 mod editor_prefs;
 mod environment_review;
 mod pack_animation;
+mod remote;
 mod setup;
 mod thread_menu;
 mod threads;
@@ -436,6 +437,48 @@ struct TabState {
     /// edits are in). `None`: not read yet, or git failed. Only `Some(false)` hides the Changes
     /// toggle ([`AgentTerminalWindow::sync_diff_toggle`]).
     in_repo: Option<bool>,
+    /// Set for a terminal page on another machine (`ssh -t`). Its `dir` is only the local
+    /// folder the `ssh` process starts in: nothing local (checkpoints, diffs, hand-offs, a new
+    /// thread "in this folder") reads it.
+    remote: Option<RemoteTab>,
+}
+
+/// Where a terminal page on another machine runs: the alias `ssh` was given and the folder
+/// there, as typed (`~` allowed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RemoteTab {
+    pub alias: String,
+    pub dir: String,
+}
+
+impl RemoteTab {
+    /// The page's title and sidebar folder: `alias:folder`.
+    pub(super) fn title(&self) -> String {
+        agent_core::remote::page_title(&self.alias, &self.dir)
+    }
+}
+
+/// A remote page's icon (bundled).
+pub(super) const REMOTE_ICON: &str = "at-network-server-symbolic";
+
+/// What a remote page refuses, said once for every local-only control.
+const NOT_ON_REMOTE: &str = "Not available for a folder on another machine";
+
+/// Whether a terminal page takes checkpoints when its turn ends: checkpoints are on, and its
+/// folder is on this machine. A remote page's working tree is out of reach of the local git.
+fn takes_checkpoints(enabled: bool, remote: Option<&RemoteTab>) -> bool {
+    enabled && remote.is_none()
+}
+
+/// Whether a page is saved for Reopen Terminal Tabs: a local terminal page. A remote page never
+/// is, so no `ssh` starts at launch without the user asking.
+fn restorable(tab: &TabState) -> bool {
+    restorable_page(tab.chat.is_some(), tab.remote.as_ref())
+}
+
+/// [`restorable`] from what decides it: not a thread, and not on another machine.
+fn restorable_page(is_thread: bool, remote: Option<&RemoteTab>) -> bool {
+    !is_thread && remote.is_none()
 }
 
 /// How long a tab's output must be still before its turn counts as over and
@@ -1140,6 +1183,42 @@ fn spawn_with_exact_env(
     );
 }
 
+/// Switches `stack` off its loading screen as soon as `terminal` prints anything, then
+/// disconnects: the signal fires on every screen update for the life of the tab, and after the
+/// first one there is nothing left for it to do.
+fn reveal_on_first_output(terminal: &Terminal, stack: &Stack) {
+    let reveal_handler: std::rc::Rc<RefCell<Option<glib::SignalHandlerId>>> =
+        std::rc::Rc::new(RefCell::new(None));
+    let handler_id = terminal.connect_contents_changed(glib::clone!(
+        #[weak]
+        stack,
+        #[strong]
+        reveal_handler,
+        move |terminal| {
+            if stack.visible_child_name().as_deref() == Some("loading") {
+                debug!("Terminal content detected, switching from loading screen");
+                stack.set_visible_child_name("terminal");
+                // Hidden behind the loading screen, the terminal could not
+                // take focus when the window opened, so it lands on a header
+                // button instead. Take it now if this is the tab in view —
+                // but not from an open dialog, or a keypress meant for the
+                // dialog would go to the CLI.
+                let take_focus = window_of(terminal).is_some_and(|obj| {
+                    obj.visible_dialog().is_none()
+                        && obj.imp().current_terminal().as_ref() == Some(terminal)
+                });
+                if take_focus {
+                    terminal.grab_focus();
+                }
+            }
+            if let Some(id) = reveal_handler.borrow_mut().take() {
+                terminal.disconnect(id);
+            }
+        }
+    ));
+    reveal_handler.replace(Some(handler_id));
+}
+
 /// A terminal tab whose model provider refused it: nothing is spawned, and the tab (kept, with
 /// the reason written into it) and a dialog say why.
 fn refuse_terminal(
@@ -1148,7 +1227,7 @@ fn refuse_terminal(
     terminal: &Terminal,
     why: &str,
 ) {
-    warn!("a terminal tab's model provider refused its start");
+    warn!("a terminal tab refused its start");
     stack.set_visible_child_name("terminal");
     terminal.feed(format!("{why}\r\n").as_bytes());
     present_message(parent, "Cannot Start", why);
@@ -1790,7 +1869,9 @@ impl AgentTerminalWindow {
     /// The launch directory of the currently selected tab, if tracked.
     fn current_dir(&self) -> Option<String> {
         let page = self.selected_page()?;
-        self.with_page_tab(&page, |t| t.dir.clone())
+        // A remote page's folder is not on this machine: a new page "here" starts as usual.
+        self.with_page_tab(&page, |t| t.remote.is_none().then(|| t.dir.clone()))
+            .flatten()
     }
 
     /// Adds the window action `name`, which runs `f` (the window held weakly), and returns it.
@@ -2094,6 +2175,13 @@ impl AgentTerminalWindow {
             }
         ));
         obj.add_action(&new_terminal);
+
+        // New Terminal Thread on Another Machine…: the user's own ssh, to a machine listed in
+        // Settings. Only ever on this action, never at startup.
+        self.add_win_action("new-remote-terminal", |imp| {
+            debug!("Action: New Terminal Thread on Another Machine");
+            imp.show_remote_terminal_dialog();
+        });
 
         // New Tab in Folder Action (opens a folder picker)
         self.add_win_action("new-tab-folder", |imp| {
@@ -3034,6 +3122,10 @@ impl AgentTerminalWindow {
             Some("New Thread in Isolated Git Worktree…"),
             Some("win.new-tab-worktree"),
         );
+        threads.append(
+            Some("New Terminal Thread on Another Machine…"),
+            Some("win.new-remote-terminal"),
+        );
         menu.append_section(None, &threads);
         menu.append_section(None, &self.build_session_section());
         // Last, on its own: a recovery tool for a stuck or misbehaving agent, rarely needed.
@@ -3434,6 +3526,26 @@ impl AgentTerminalWindow {
         dir_override: Option<&str>,
         launch: Launch<'_>,
     ) {
+        self.add_terminal_page(profile, dir_override, launch, None);
+    }
+
+    /// A terminal page on another machine: the user's own `ssh -t` to `remote.alias`, in
+    /// `remote.dir` there, running the login shell. Only ever opened by the user (the dialog,
+    /// or Restart on such a page), never at startup: remote pages are not saved for restore.
+    pub(super) fn add_remote_terminal_tab(&self, remote: RemoteTab) {
+        self.add_terminal_page(None, None, Launch::Fresh, Some(remote));
+    }
+
+    /// [`Self::add_terminal_tab_launching`], or with `remote` a page on another machine: no
+    /// profile, no provider, no checkpoints or diff panel, its title fixed to `alias:folder`.
+    fn add_terminal_page(
+        &self,
+        profile: Option<&Profile>,
+        dir_override: Option<&str>,
+        launch: Launch<'_>,
+        remote: Option<RemoteTab>,
+    ) {
+        let profile = if remote.is_some() { None } else { profile };
         let pinned_id = match launch {
             Launch::Resume(_) => None,
             _ => profile
@@ -3511,7 +3623,8 @@ impl AgentTerminalWindow {
         let (diff_panel, paned) = {
             let config = self.config.borrow();
             let panel = DiffPanel::new(&Theme::diff_colours(config.theme));
-            panel.set_shown(config.diff_panel_visible);
+            // A remote page has no local repository to diff.
+            panel.set_shown(config.diff_panel_visible && remote.is_none());
             let paned = gtk4::Paned::builder()
                 .orientation(Orientation::Horizontal)
                 .start_child(&stack)
@@ -3540,7 +3653,13 @@ impl AgentTerminalWindow {
             }
         };
         let page = tab_view.append(&tab_content);
-        page.set_title("Terminal");
+        match &remote {
+            Some(remote) => {
+                page.set_title(&remote.title());
+                page.set_icon(Some(&gtk4::gio::ThemedIcon::new(REMOTE_ICON)));
+            }
+            None => page.set_title("Terminal"),
+        }
         tab_view.set_selected_page(&page);
 
         // Window looked up at click time: the tab may have been dragged to
@@ -3570,15 +3689,18 @@ impl AgentTerminalWindow {
 
         self.configure_terminal(&terminal);
         self.wire_tab_signals(&terminal, &page);
-        self.wire_input_controllers(&terminal, false);
+        self.wire_input_controllers(&terminal, false, remote.is_some());
 
         // Launch the CLI from the override (per-tab dir) or configured starting
         // directory, falling back to $HOME. Record it so "new tab in same
         // directory" can reuse this tab's root.
         let home_dir = env::var("HOME").unwrap_or_else(|_| "/".to_string());
-        let requested_dir = dir_override
-            .map(str::to_string)
-            .unwrap_or_else(|| self.config.borrow().starting_directory.clone());
+        // The local ssh starts in the home folder; the folder that matters is the remote one.
+        let requested_dir = match (&remote, dir_override) {
+            (Some(_), _) => home_dir.clone(),
+            (None, Some(dir)) => dir.to_string(),
+            (None, None) => self.config.borrow().starting_directory.clone(),
+        };
         let work_dir = resolve_working_directory(&requested_dir, &home_dir);
         self.tabs.borrow_mut().push(TabState {
             page: page.clone(),
@@ -3606,10 +3728,15 @@ impl AgentTerminalWindow {
             worktree: None,
             chat: None,
             discovered_repo: None,
-            in_repo: None,
+            // Known outright: the Changes toggle stays hidden, and nothing asks git.
+            in_repo: remote.as_ref().map(|_| false),
+            remote: remote.clone(),
         });
 
-        self.spawn_session(&terminal, &stack, profile, &work_dir, launch);
+        match &remote {
+            Some(remote) => self.spawn_remote_session(&terminal, &stack, remote, &work_dir),
+            None => self.spawn_session(&terminal, &stack, profile, &work_dir, launch),
+        }
         if diff_panel.root.is_visible() {
             self.refresh_diff(&page);
         }
@@ -3649,15 +3776,23 @@ impl AgentTerminalWindow {
                 let title = terminal.window_title();
                 debug!("Terminal window title changed: {:?}", title);
                 let session_info = title.as_deref().unwrap_or("");
-
-                page.set_title(if session_info.is_empty() {
-                    "Terminal"
-                } else {
-                    session_info
-                });
+                let obj = window_of(terminal);
+                // A remote page keeps `alias:folder`: the other machine's shell names neither.
+                let fixed = obj
+                    .as_ref()
+                    .and_then(|obj| {
+                        obj.imp()
+                            .with_page_tab(&page, |t| t.remote.as_ref().map(RemoteTab::title))
+                    })
+                    .flatten();
+                match &fixed {
+                    Some(fixed) => page.set_title(fixed),
+                    None if session_info.is_empty() => page.set_title("Terminal"),
+                    None => page.set_title(session_info),
+                }
 
                 // Only drive the window title from the active tab.
-                let Some(obj) = window_of(terminal) else {
+                let Some(obj) = obj else {
                     return;
                 };
                 let imp = obj.imp();
@@ -3666,6 +3801,9 @@ impl AgentTerminalWindow {
                     return;
                 }
 
+                // The window says the same: the remote shell's own title is the other
+                // machine's text, and may claim to be anything.
+                let session_info = fixed.as_deref().unwrap_or(session_info);
                 if let Some(window_title) = imp.window_title.borrow().as_ref() {
                     window_title.set_subtitle(session_info);
                     if session_info.is_empty() {
@@ -3692,7 +3830,7 @@ impl AgentTerminalWindow {
                 // whether the bell or the quiet timer drives their checkpoints.
                 // Demote to debug once the expected callbacks have been observed.
                 info!("Bell in tab \"{}\"", page.title());
-                if imp.config.borrow().checkpoints {
+                if imp.page_takes_checkpoints(&page) {
                     imp.request_checkpoint(&page, false);
                 }
                 let is_selected = imp.is_selected(&page);
@@ -3830,7 +3968,7 @@ impl AgentTerminalWindow {
                 self.tabs
                     .borrow()
                     .iter()
-                    .filter(|t| t.chat.is_none())
+                    .filter(|t| restorable(t))
                     .position(|t| t.page == page)
             })
             .unwrap_or(0);
@@ -3839,7 +3977,7 @@ impl AgentTerminalWindow {
             .tabs
             .borrow()
             .iter()
-            .filter(|t| t.chat.is_none())
+            .filter(|t| restorable(t))
             .take(crate::config::SessionState::MAX_TABS)
             .map(|t| crate::config::SessionTab {
                 profile: t.profile.clone(),
@@ -3957,6 +4095,13 @@ impl AgentTerminalWindow {
             }
             return;
         }
+        // The user asked: connect again, to the same machine and folder.
+        if let Some(remote) = self.with_page_tab(page, |t| t.remote.clone()).flatten() {
+            info!("Reconnecting a remote terminal page");
+            self.add_remote_terminal_tab(remote);
+            tab_view.close_page(page);
+            return;
+        }
         let (dir, session_id, profile) = self
             .with_page_tab(page, |t| {
                 (Some(t.dir.clone()), t.session_id.clone(), t.profile.clone())
@@ -3999,10 +4144,48 @@ impl AgentTerminalWindow {
 
     /// Attaches the right-click menu and the ctrl-click hyperlink handler.
     ///
-    /// `drawer` is whether the terminal is a thread's drawer rather than a terminal page.
-    fn wire_input_controllers(&self, terminal: &Terminal, drawer: bool) {
-        let win = self.obj().clone();
+    /// `drawer` is whether the terminal is a thread's drawer rather than a terminal page, and
+    /// `remote` whether it is a page on another machine.
+    fn wire_input_controllers(&self, terminal: &Terminal, drawer: bool, remote: bool) {
         // Context Menu (Right Click)
+        let menu = if remote {
+            self.remote_terminal_menu()
+        } else {
+            self.local_terminal_menu()
+        };
+
+        let section = gtk4::gio::Menu::new();
+        section.append(Some("Copy"), Some("win.copy"));
+        section.append(Some("Paste"), Some("win.paste"));
+        // A terminal page has no composer to send to; its entry says so, and stays disabled.
+        section.append(
+            Some(if drawer {
+                "Send Selection to Thread"
+            } else {
+                "Send Selection to Thread (open a thread first)"
+            }),
+            Some("win.send-selection"),
+        );
+        menu.append_section(None, &section);
+        self.attach_terminal_menu(terminal, &menu, remote);
+    }
+
+    /// A remote page's menu: nothing that reads a local folder (checkpoints, changes, sessions
+    /// or a new page "in this folder").
+    fn remote_terminal_menu(&self) -> gtk4::gio::Menu {
+        let menu = gtk4::gio::Menu::new();
+        menu.append(Some("New Thread"), Some("win.new-tab"));
+        menu.append(
+            Some("New Terminal Thread on Another Machine…"),
+            Some("win.new-remote-terminal"),
+        );
+        menu.append(Some("New Window"), Some("app.new-window"));
+        menu.append(Some("Reconnect"), Some("win.restart-tab"));
+        menu
+    }
+
+    /// A local terminal page's (or drawer's) menu.
+    fn local_terminal_menu(&self) -> gtk4::gio::Menu {
         let menu = gtk4::gio::Menu::new();
         menu.append(Some("New Thread"), Some("win.new-tab"));
         menu.append_submenu(
@@ -4030,23 +4213,16 @@ impl AgentTerminalWindow {
         menu.append(Some("Checkpoint Now"), Some("win.checkpoint-now"));
         menu.append(Some("Show or Hide Changes"), Some("win.toggle-diff"));
         menu.append_section(None, &self.build_session_section());
+        menu
+    }
 
-        let section = gtk4::gio::Menu::new();
-        section.append(Some("Copy"), Some("win.copy"));
-        section.append(Some("Paste"), Some("win.paste"));
-        // A terminal page has no composer to send to; its entry says so, and stays disabled.
-        section.append(
-            Some(if drawer {
-                "Send Selection to Thread"
-            } else {
-                "Send Selection to Thread (open a thread first)"
-            }),
-            Some("win.send-selection"),
-        );
-        menu.append_section(None, &section);
-
+    /// Opens `menu` on a right click, the Menu key, Shift+F10 or a long press, and Ctrl+click
+    /// opens a hyperlink (on a `remote` page, only a web link:
+    /// [`agent_core::remote::remote_link_allowed`]).
+    fn attach_terminal_menu(&self, terminal: &Terminal, menu: &gtk4::gio::Menu, remote: bool) {
+        let win = self.obj().clone();
         let popover = gtk4::PopoverMenu::builder()
-            .menu_model(&menu)
+            .menu_model(menu)
             .has_arrow(false)
             .build();
         popover.set_parent(terminal);
@@ -4131,8 +4307,20 @@ impl AgentTerminalWindow {
                     if modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
                         if let Some(uri) = terminal.hyperlink_hover_uri() {
                             gesture.set_state(gtk4::EventSequenceState::Claimed);
-                            debug!("Opening hyperlink: {}", uri);
-                            // UriLauncher replaces the deprecated gtk4::show_uri.
+                            // A remote page's links were written by the other machine: only a
+                            // web link opens here, never a file:// or a handler's scheme.
+                            if remote && !agent_core::remote::remote_link_allowed(&uri) {
+                                info!("Refused a non-web link on a remote page");
+                                if let Some(obj) = window_of(&terminal) {
+                                    obj.imp()
+                                        .show_toast(agent_core::remote::REMOTE_LINK_REFUSED);
+                                }
+                                return;
+                            }
+                            // A link can carry a token in its query: logged masked.
+                            debug!("Opening hyperlink: {}", agent_core::redact::redact(&uri));
+                            // Launched exactly as judged above: the same `uri`, never trimmed
+                            // or rebuilt. UriLauncher replaces the deprecated gtk4::show_uri.
                             // Fire-and-forget: the portal owns the outcome, and a
                             // failure to launch is not actionable from here.
                             gtk4::UriLauncher::new(&uri).launch(
@@ -4383,73 +4571,9 @@ impl AgentTerminalWindow {
             .and_then(|p| p.env_file.clone())
             .filter(|f| !f.trim().is_empty());
         info!("Spawning terminal with shell: {}, argv: {:?}", shell, argv);
-
-        // Switch off the loading screen as soon as the command prints anything,
-        // then disconnect: this signal fires on every screen update for the life
-        // of the tab, and after the first one there is nothing left for it to do.
-        let reveal_handler: std::rc::Rc<RefCell<Option<glib::SignalHandlerId>>> =
-            std::rc::Rc::new(RefCell::new(None));
-        let handler_id = terminal.connect_contents_changed(glib::clone!(
-            #[weak]
-            stack,
-            #[strong]
-            reveal_handler,
-            move |terminal| {
-                if stack.visible_child_name().as_deref() == Some("loading") {
-                    debug!("Terminal content detected, switching from loading screen");
-                    stack.set_visible_child_name("terminal");
-                    // Hidden behind the loading screen, the terminal could not
-                    // take focus when the window opened, so it lands on a header
-                    // button instead. Take it now if this is the tab in view —
-                    // but not from an open dialog, or a keypress meant for the
-                    // dialog would go to the CLI.
-                    let take_focus = window_of(terminal).is_some_and(|obj| {
-                        obj.visible_dialog().is_none()
-                            && obj.imp().current_terminal().as_ref() == Some(terminal)
-                    });
-                    if take_focus {
-                        terminal.grab_focus();
-                    }
-                }
-                if let Some(id) = reveal_handler.borrow_mut().take() {
-                    terminal.disconnect(id);
-                }
-            }
-        ));
-        reveal_handler.replace(Some(handler_id));
-
-        // Inherit the current user environment, then guarantee terminal
-        // capability vars so Claude Code renders its full TUI (status line, etc.).
-        // When launched from the desktop menu the GUI process has no TERM/COLORTERM,
-        // which makes Claude fall back to a degraded renderer that drops the status line.
-        let mut env_strs: Vec<String> = glib::environ()
-            .iter()
-            .map(|os| os.to_string_lossy().to_string())
-            .collect();
-
-        // Drop the launching agent session's own identity before the new session
-        // sees it. Inheriting the environment wholesale is deliberate — it is how
-        // nvm- and asdf-managed CLIs stay reachable — but when this terminal was
-        // itself started from inside an agent session, the parent's session
-        // markers come with it and the CLI we spawn concludes it is a nested
-        // child. Stripping happens before the env_file merge below, so a profile
-        // can deliberately put any of these back.
+        reveal_on_first_output(terminal, stack);
+        let mut env_strs = self.terminal_env();
         let clear = self.config.borrow().clear_env.clone();
-        let cleared = crate::utils::strip_env(&mut env_strs, &clear);
-        if !cleared.is_empty() {
-            info!(
-                "Cleared {} inherited session variable(s) from the child environment: {}",
-                cleared.len(),
-                cleared.join(", ")
-            );
-        }
-
-        if !env_strs.iter().any(|s| s.starts_with("TERM=")) {
-            env_strs.push("TERM=xterm-256color".to_string());
-        }
-        if !env_strs.iter().any(|s| s.starts_with("COLORTERM=")) {
-            env_strs.push("COLORTERM=truecolor".to_string());
-        }
         // A profile's env_file is sourced in a subshell, which is a subprocess and
         // so must not run on the main thread. The terminal widget already exists
         // and is showing the loading screen, so deferring the spawn by one turn of
@@ -4581,6 +4705,120 @@ impl AgentTerminalWindow {
                                         &format!("Error spawning terminal: {err}"),
                                     );
                                 }
+                            }
+                        }
+                    ),
+                );
+            }
+        ));
+    }
+
+    /// The environment a terminal page's process gets before any profile adds to it: the app's
+    /// own, minus `clear_env`, with `TERM`/`COLORTERM` guaranteed. Passed whole to
+    /// [`spawn_with_exact_env`].
+    fn terminal_env(&self) -> Vec<String> {
+        // Inherit the current user environment, then guarantee terminal
+        // capability vars so Claude Code renders its full TUI (status line, etc.).
+        // When launched from the desktop menu the GUI process has no TERM/COLORTERM,
+        // which makes Claude fall back to a degraded renderer that drops the status line.
+        let mut env_strs: Vec<String> = glib::environ()
+            .iter()
+            .map(|os| os.to_string_lossy().to_string())
+            .collect();
+
+        // Drop the launching agent session's own identity before the new session
+        // sees it. Inheriting the environment wholesale is deliberate — it is how
+        // nvm- and asdf-managed CLIs stay reachable — but when this terminal was
+        // itself started from inside an agent session, the parent's session
+        // markers come with it and the CLI we spawn concludes it is a nested
+        // child. Stripping happens before the env_file merge, so a profile
+        // can deliberately put any of these back.
+        let clear = self.config.borrow().clear_env.clone();
+        let cleared = crate::utils::strip_env(&mut env_strs, &clear);
+        if !cleared.is_empty() {
+            info!(
+                "Cleared {} inherited session variable(s) from the child environment: {}",
+                cleared.len(),
+                cleared.join(", ")
+            );
+        }
+
+        if !env_strs.iter().any(|s| s.starts_with("TERM=")) {
+            env_strs.push("TERM=xterm-256color".to_string());
+        }
+        if !env_strs.iter().any(|s| s.starts_with("COLORTERM=")) {
+            env_strs.push("COLORTERM=truecolor".to_string());
+        }
+        env_strs
+    }
+
+    /// Starts a remote page's `ssh -t` in `terminal`: the argv of
+    /// [`agent_core::remote::ssh_tty_argv`] with the local `ssh` resolved on `PATH` (off the
+    /// main thread), no shell around it, in [`Self::terminal_env`] exactly. No profile env file,
+    /// provider or key file: they would only shape the local `ssh`, and the other machine's
+    /// sshd drops most variables anyway. Nothing is written to the terminal before it.
+    fn spawn_remote_session(
+        &self,
+        terminal: &Terminal,
+        stack: &Stack,
+        remote: &RemoteTab,
+        work_dir: &str,
+    ) {
+        let obj = self.obj();
+        let mut argv = match agent_core::remote::ssh_tty_argv(&remote.alias, &remote.dir, &[]) {
+            Ok(argv) => argv,
+            Err(why) => {
+                refuse_terminal(&obj, stack, terminal, &format!("Cannot connect: {why}"));
+                return;
+            }
+        };
+        reveal_on_first_output(terminal, stack);
+        let env_strs = self.terminal_env();
+        let work_dir = work_dir.to_string();
+        glib::MainContext::default().spawn_local(glib::clone!(
+            #[weak]
+            obj,
+            #[weak]
+            stack,
+            #[weak]
+            terminal,
+            async move {
+                let ssh = gtk4::gio::spawn_blocking(|| glib::find_program_in_path("ssh"))
+                    .await
+                    .ok()
+                    .flatten();
+                let Some(ssh) = ssh else {
+                    refuse_terminal(
+                        &obj,
+                        &stack,
+                        &terminal,
+                        "Cannot connect: ssh was not found. Install the OpenSSH client.",
+                    );
+                    return;
+                };
+                argv[0] = ssh.to_string_lossy().into_owned();
+                info!("Opening a terminal page on another machine: {:?}", argv);
+                let argv_ptrs: Vec<&str> = argv.iter().map(String::as_str).collect();
+                let env_ptrs: Vec<&str> = env_strs.iter().map(String::as_str).collect();
+                spawn_with_exact_env(
+                    &terminal,
+                    &work_dir,
+                    &argv_ptrs,
+                    &env_ptrs,
+                    glib::clone!(
+                        #[weak]
+                        obj,
+                        #[weak]
+                        stack,
+                        move |result| {
+                            if let Err(err) = result {
+                                error!("Error starting ssh: {}", err);
+                                stack.set_visible_child_name("terminal");
+                                present_message(
+                                    &obj,
+                                    "Terminal Error",
+                                    &format!("Could not start ssh: {err}"),
+                                );
                             }
                         }
                     ),
@@ -4997,6 +5235,7 @@ impl AgentTerminalWindow {
         let replies = adw::PreferencesGroup::builder().title("Replies").build();
         replies.add(&quick_replies_row);
         general.add(&replies);
+        general.add(&self.remote_machines_group());
         general.add(&self.uninstall_group());
         dialog.add(&general);
 
@@ -5754,6 +5993,14 @@ impl AgentTerminalWindow {
         let Some(page) = self.selected_page() else {
             return;
         };
+        // Its brief would be built from this machine's files, and its target started here.
+        if self
+            .with_page_tab(&page, |t| t.remote.is_some())
+            .unwrap_or(false)
+        {
+            present_message(&self.obj(), "Cannot Hand Off", NOT_ON_REMOTE);
+            return;
+        }
 
         let (source, dir, session_id, since_ms, screen_tail) = {
             let tabs = self.tabs.borrow();
@@ -5960,7 +6207,8 @@ impl AgentTerminalWindow {
             .iter()
             .filter(|tab| {
                 let last = tab.last_output.get();
-                !tab.checkpoint.running()
+                takes_checkpoints(true, tab.remote.as_ref())
+                    && !tab.checkpoint.running()
                     && tab.checkpoint.attempted_for != Some(last)
                     && now.saturating_duration_since(last) >= CHECKPOINT_QUIET
             })
@@ -5969,6 +6217,13 @@ impl AgentTerminalWindow {
         for page in due {
             self.request_checkpoint(&page, false);
         }
+    }
+
+    /// Whether `page`'s bell or quiet output takes a checkpoint ([`takes_checkpoints`]).
+    fn page_takes_checkpoints(&self, page: &adw::TabPage) -> bool {
+        let enabled = self.config.borrow().checkpoints;
+        self.with_page_tab(page, |t| takes_checkpoints(enabled, t.remote.as_ref()))
+            .unwrap_or(false)
     }
 
     /// Snapshots `page`'s working tree off the main thread. `manual` reports
@@ -5980,6 +6235,13 @@ impl AgentTerminalWindow {
             let Some(tab) = tabs.iter_mut().find(|t| &t.page == page) else {
                 return;
             };
+            if !takes_checkpoints(true, tab.remote.as_ref()) {
+                drop(tabs);
+                if manual {
+                    self.show_toast(NOT_ON_REMOTE);
+                }
+                return;
+            }
             if tab.checkpoint.running() {
                 return;
             }
@@ -6238,9 +6500,15 @@ impl AgentTerminalWindow {
         let Some(page) = self.selected_page() else {
             return;
         };
-        let Some(panel) = self.with_page_tab(&page, |t| t.diff_panel.clone()) else {
+        let Some((panel, remote)) =
+            self.with_page_tab(&page, |t| (t.diff_panel.clone(), t.remote.is_some()))
+        else {
             return;
         };
+        if remote {
+            self.show_toast(NOT_ON_REMOTE);
+            return;
+        }
         // A panel in its own window is on show already: bring that window up.
         if panel.is_detached() {
             panel.present();
@@ -6258,14 +6526,19 @@ impl AgentTerminalWindow {
 
     /// Recomputes `page`'s diff off the main thread, if its panel is showing.
     fn refresh_diff(&self, page: &adw::TabPage) {
-        let Some((dir, key, thread_id, panel)) = self.with_page_tab(page, |t| {
-            (
-                t.repo_dir(),
-                t.key,
-                t.chat.as_ref().map(|c| c.thread.clone()),
-                t.diff_panel.clone(),
-            )
-        }) else {
+        let Some((dir, key, thread_id, panel)) = self
+            .with_page_tab(page, |t| {
+                t.remote.is_none().then(|| {
+                    (
+                        t.repo_dir(),
+                        t.key,
+                        t.chat.as_ref().map(|c| c.thread.clone()),
+                        t.diff_panel.clone(),
+                    )
+                })
+            })
+            .flatten()
+        else {
             return;
         };
         if !panel.is_shown() {
@@ -6328,9 +6601,15 @@ impl AgentTerminalWindow {
     /// the Changes toggle to match. The last answer stays on show meanwhile.
     pub(super) fn refresh_repo_presence(&self, page: &adw::TabPage) {
         self.sync_diff_toggle();
-        let Some((dir, thread_id)) = self.with_page_tab(page, |t| {
-            (t.repo_dir(), t.chat.as_ref().map(|c| c.thread.clone()))
-        }) else {
+        // A remote page's answer is fixed: no local repository.
+        let Some((dir, thread_id)) = self
+            .with_page_tab(page, |t| {
+                t.remote
+                    .is_none()
+                    .then(|| (t.repo_dir(), t.chat.as_ref().map(|c| c.thread.clone())))
+            })
+            .flatten()
+        else {
             return;
         };
         let obj = self.obj().downgrade();
@@ -7999,6 +8278,34 @@ mod tests {
         );
     }
 
+    /// The bell handler, the quiet-output poll and Checkpoint Now all ask `takes_checkpoints`
+    /// first: a remote page's working tree is never handed to the local git.
+    #[test]
+    fn remote_tab_takes_no_checkpoint_on_bell() {
+        let remote = RemoteTab {
+            alias: "box".into(),
+            dir: "~/src".into(),
+        };
+        assert!(takes_checkpoints(true, None));
+        assert!(!takes_checkpoints(false, None));
+        assert!(!takes_checkpoints(true, Some(&remote)));
+        assert!(!takes_checkpoints(false, Some(&remote)));
+        assert_eq!(remote.title(), "box:~/src");
+    }
+
+    /// Reopen Terminal Tabs saves local terminal pages only: a remote page reopened at launch
+    /// would start ssh without the user asking.
+    #[test]
+    fn a_remote_page_is_never_saved_for_restore() {
+        let remote = RemoteTab {
+            alias: "box".into(),
+            dir: "~".into(),
+        };
+        assert!(restorable_page(false, None));
+        assert!(!restorable_page(false, Some(&remote)));
+        assert!(!restorable_page(true, None));
+    }
+
     #[test]
     fn a_lost_checkpoint_attempt_expires() {
         let mut track = CheckpointTrack::default();
@@ -8809,6 +9116,7 @@ mod tests {
         assert!(window.lookup_action("shortcuts").is_some());
         assert!(window.lookup_action("checkpoint-now").is_some());
         assert!(window.lookup_action("new-tab-folder").is_some());
+        assert!(window.lookup_action("new-remote-terminal").is_some());
         assert!(window.lookup_action("new-thread-agent").is_some());
         assert!(window.lookup_action("new-thread-agent-folder").is_some());
         assert!(window.lookup_action("resume-session").is_some());
@@ -8901,6 +9209,7 @@ mod tests {
         threads::tests::a_thread_page_runs_a_real_session(window);
         diff_prefs::tests::the_diff_tool_group_saves_only_what_is_valid(window);
         editor_prefs::tests::the_group_saves_only_what_is_valid_and_applies_live(window);
+        remote::tests::the_remote_machines_group_saves_only_valid_aliases(window);
     }
 
     /// A folder outside any repository has nothing to diff: no Changes toggle, no shortcut.

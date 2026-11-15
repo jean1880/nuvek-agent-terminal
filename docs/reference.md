@@ -307,3 +307,55 @@ page has no thread of its own, so its menu shows the item disabled.
   was trimmed.
 - Terminal output can carry instructions aimed at the agent. The label and fence help, but the
   draft is yours to check.
+
+### Remote machines
+
+A terminal page can run on another machine through your own `ssh`. Agent Terminal installs
+nothing there and writes nothing there.
+
+**Listing a machine.** In Settings → General → Remote Machines, type the name you reach it by
+with `ssh` (a `Host` from `~/.ssh/config`, a host name or `user@host`) and press Enter or
+**Add**. A name that `ssh` could read as an option (one starting with `-`) or that holds
+spaces or shell characters is refused as you type, and nothing is saved. Each machine has
+an optional label, **Check** and **Remove**.
+
+**Check** runs `ssh -T -o BatchMode=yes -o ConnectTimeout=10 … -- <machine> true` in the
+background, with the same forwarding, tunnel and remote-command options as a page and the
+same environment, and shows **Reachable**, **Not reachable:** with the reason ssh gave
+(secrets in it masked), or **Not checked**. It never asks for anything, so a machine whose key you have not accepted yet, or
+that needs a password, shows as not reachable: open a terminal on it once and answer there.
+Nothing is checked at startup.
+
+**Opening a terminal there.** **+** → New Terminal Thread on Another Machine… asks for the
+machine and a folder on it (`~` is your home there; `~/src` and absolute paths work). The
+page runs
+
+```
+ssh -t -o BatchMode=no -o ConnectTimeout=15 -o ServerAliveInterval=15 \
+    -o ClearAllForwardings=yes -o ForwardAgent=no -o ForwardX11=no \
+    -o PermitLocalCommand=no -o Tunnel=no -o RemoteCommand=none \
+    -- <machine> "cd -- '<folder>' && exec \"\$SHELL\" -l"
+```
+
+with no local shell around it. The folder is quoted, so nothing in it is expanded there. A
+first connection's host-key question, or a password prompt, appears in the page, where you
+answer it. `ClearAllForwardings=yes` overrides any `LocalForward`, `RemoteForward` or
+`DynamicForward` in your ssh configuration, so no port opens on either machine;
+`Tunnel=no` turns off a configured tun device, and `RemoteCommand=none` keeps a configured
+remote command from replacing the one above. The rest of your configuration still applies as
+you set it: `ProxyCommand` and `ProxyJump` run, `Match exec` conditions run their commands, an
+existing `ControlMaster` socket is reused, and your keys and agent are used to log in. The login
+shell there must understand POSIX `cd --` and `&&` (bash, zsh, dash, fish do; csh does not).
+
+**What works on a remote page:** the terminal itself (scrollback search, copy and paste),
+web links (`http://` and `https://` with Ctrl+click; any other link, a `file://` one above
+all, names something on the other machine and is refused here), its `machine:folder` page
+and window title (whatever title the shell there sets), its sidebar group, notifications on
+the bell, and
+**Reconnect** (the right-click menu, or **Restart** once it has exited), which connects again
+to the same machine and folder.
+
+**What does not:** turn checkpoints, the diff panel and undo, hand-offs, session pickers,
+a profile's environment file or model provider, and **New Thread in This Folder** opening a
+local thread. All of these read or start things on this machine. Remote pages are not
+reopened at launch by Reopen Terminal Tabs, so no `ssh` starts unless you open one.

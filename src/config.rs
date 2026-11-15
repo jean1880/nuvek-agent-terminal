@@ -920,6 +920,9 @@ pub struct TerminalConfig {
     /// starts with `~/`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_model_tags_path: Option<String>,
+    /// The machines New Terminal Thread on Another Machine offers, reached with the user's own
+    /// `ssh` (Settings → General → Remote Machines). Empty by default (and in older files).
+    pub remote_hosts: Vec<agent_core::remote::RemoteHost>,
     /// Set when this process found no settings file at all (none from a pre-rename release
     /// either): a first start, which offers the setup walkthrough. Not persisted.
     #[serde(skip)]
@@ -1300,6 +1303,7 @@ impl Default for TerminalConfig {
             permission_sources: Vec::new(),
             model_tags_path: None,
             user_model_tags_path: None,
+            remote_hosts: Vec::new(),
             first_run: std::cell::Cell::default(),
             disk_stamp: std::cell::Cell::default(),
             save_blocked: std::cell::Cell::default(),
@@ -1592,7 +1596,75 @@ impl TerminalConfig {
             }
         }
 
+        // A hand-edited machine whose name could reach ssh as an option, or that is listed
+        // twice, is never offered.
+        let mut aliases = std::collections::HashSet::new();
+        self.remote_hosts.retain(|host| {
+            if !host.is_valid() {
+                warn!("Ignoring remote machine with an invalid name or label");
+                return false;
+            }
+            if !aliases.insert(host.alias.clone()) {
+                warn!(
+                    "Remote machine '{}' is listed twice; keeping the first",
+                    host.alias
+                );
+                return false;
+            }
+            true
+        });
+
         self
+    }
+
+    /// Adds a machine to [`Self::remote_hosts`], refusing an invalid alias or label and one
+    /// already listed. Nothing changes on a refusal.
+    pub fn add_remote_host(&mut self, alias: &str, label: &str) -> Result<(), String> {
+        let host = agent_core::remote::RemoteHost::new(alias, label)?;
+        if self.remote_hosts.iter().any(|h| h.alias == host.alias) {
+            return Err(format!("{} is already listed", host.alias));
+        }
+        self.remote_hosts.push(host);
+        Ok(())
+    }
+
+    /// Renames the machine at `index`; `Ok(false)` when it already had that alias. Refuses an
+    /// invalid alias or one another machine has, leaving the list as it was.
+    pub fn set_remote_alias(&mut self, index: usize, alias: &str) -> Result<bool, String> {
+        let alias = alias.trim();
+        agent_core::remote::validate_alias(alias)?;
+        if self
+            .remote_hosts
+            .iter()
+            .enumerate()
+            .any(|(i, h)| i != index && h.alias == alias)
+        {
+            return Err(format!("{alias} is already listed"));
+        }
+        let host = self
+            .remote_hosts
+            .get_mut(index)
+            .ok_or_else(|| "That machine is no longer listed".to_owned())?;
+        if host.alias == alias {
+            return Ok(false);
+        }
+        host.alias = alias.to_owned();
+        Ok(true)
+    }
+
+    /// Relabels the machine at `index`; `Ok(false)` when the label is unchanged.
+    pub fn set_remote_label(&mut self, index: usize, label: &str) -> Result<bool, String> {
+        let label = label.trim();
+        agent_core::remote::validate_label(label)?;
+        let host = self
+            .remote_hosts
+            .get_mut(index)
+            .ok_or_else(|| "That machine is no longer listed".to_owned())?;
+        if host.label == label {
+            return Ok(false);
+        }
+        host.label = label.to_owned();
+        Ok(true)
     }
 
     /// Gives every profile a valid, unique id. A missing (or malformed) id is assigned once; of
@@ -1985,6 +2057,70 @@ mod tests {
         assert_eq!(loaded.cli_client, cfg.cli_client);
         assert_eq!(loaded.starting_directory, cfg.starting_directory);
         assert_eq!(loaded.theme, cfg.theme);
+    }
+
+    #[test]
+    fn remote_hosts_default_empty_and_round_trip() {
+        assert!(TerminalConfig::default().remote_hosts.is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        // A file written before the field existed reads as no machines.
+        std::fs::write(&path, br#"{"theme":"dracula"}"#).unwrap();
+        assert!(TerminalConfig::load_from(&path).remote_hosts.is_empty());
+
+        let mut cfg = TerminalConfig::default();
+        cfg.add_remote_host("gpu.example.com", "GPU box").unwrap();
+        cfg.add_remote_host("me@192.0.2.7", "").unwrap();
+        assert!(cfg.save_to(&path));
+        let loaded = TerminalConfig::load_from(&path);
+        assert_eq!(loaded.remote_hosts, cfg.remote_hosts);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"remote_hosts\""), "{text}");
+    }
+
+    #[test]
+    fn a_hand_edited_invalid_or_repeated_remote_host_is_dropped_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            br#"{"remote_hosts":[{"alias":"-oProxyCommand=x"},{"alias":"box","label":"A"},{"alias":"box","label":"B"},{"alias":"b c"}]}"#,
+        )
+        .unwrap();
+        let loaded = TerminalConfig::load_from(&path);
+        assert_eq!(
+            loaded.remote_hosts,
+            vec![agent_core::remote::RemoteHost::new("box", "A").unwrap()]
+        );
+    }
+
+    /// What the Remote Machines group saves: only valid, unlisted aliases and valid labels, and
+    /// a refusal leaves the list as it was.
+    #[test]
+    fn remote_machine_settings_save_only_valid_aliases() {
+        let mut cfg = TerminalConfig::default();
+        for bad in ["", "-v", "box;id", "a b", "$(id)"] {
+            assert!(cfg.add_remote_host(bad, "").is_err(), "{bad:?}");
+        }
+        assert!(cfg.remote_hosts.is_empty());
+        cfg.add_remote_host(" box ", "").unwrap();
+        assert_eq!(cfg.remote_hosts[0].alias, "box");
+        assert!(cfg.add_remote_host("box", "again").is_err());
+        cfg.add_remote_host("other", "").unwrap();
+
+        assert!(cfg.set_remote_alias(0, "-oX=y").is_err());
+        assert!(cfg.set_remote_alias(0, "other").is_err());
+        assert!(cfg.set_remote_alias(9, "fine").is_err());
+        assert_eq!(cfg.remote_hosts[0].alias, "box");
+        assert_eq!(cfg.set_remote_alias(0, "box"), Ok(false));
+        assert_eq!(cfg.set_remote_alias(0, "box2"), Ok(true));
+        assert_eq!(cfg.remote_hosts[0].alias, "box2");
+
+        assert!(cfg.set_remote_label(0, "bad\u{1b}[2J").is_err());
+        assert_eq!(cfg.remote_hosts[0].label, "");
+        assert_eq!(cfg.set_remote_label(0, " Build box "), Ok(true));
+        assert_eq!(cfg.remote_hosts[0].display_name(), "Build box");
+        assert!(cfg.remote_hosts.iter().all(|h| h.is_valid()));
     }
 
     #[test]

@@ -393,6 +393,13 @@ pub fn new_line_at(chunk: &str, row: usize) -> Option<u32> {
     }
 }
 
+/// The new-file line the first hunk of `diff` starts at (the line an editor should open on), or
+/// `None` when the diff has no hunk or its first hunk has no new-side line.
+pub fn first_hunk_line(diff: &str) -> Option<u32> {
+    let row = classify(diff).iter().position(|k| *k == LineKind::Hunk)?;
+    new_line_at(diff, row)
+}
+
 /// At most this much diff text is put in the panel.
 pub const MAX_DIFF_BYTES: usize = 1024 * 1024;
 /// At most this many lines of diff text are put in the panel.
@@ -786,6 +793,14 @@ mod tests {
     }
 
     const HEAD: &str = "diff --git a/f b/f\nindex 1..2 100644\n--- a/f\n+++ b/f\n";
+
+    #[test]
+    fn the_first_hunk_line_is_where_an_editor_opens() {
+        let chunk = format!("{HEAD}@@ -10,2 +12,3 @@\n a\n+b\n c\n@@ -40 +50 @@\n-x\n+y\n");
+        assert_eq!(first_hunk_line(&chunk), Some(12));
+        assert_eq!(first_hunk_line(HEAD), None);
+        assert_eq!(first_hunk_line(""), None);
+    }
 
     #[test]
     fn parse_hunks_numbers_two_hunks() {

@@ -123,13 +123,21 @@ pub fn preset_index(tool: &DiffTool) -> Option<usize> {
 
 /// One piece of an argv element.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Piece<'a> {
+pub(crate) enum Piece<'a> {
     Text(String),
     Holder(&'a str),
 }
 
 /// Splits `element` into literal text and placeholders. `Err` names the problem.
 fn pieces(element: &str) -> Result<Vec<Piece<'_>>, String> {
+    pieces_with(element, &PLACEHOLDERS)
+}
+
+/// [`pieces`] for a tool that has its own placeholder names (the editor's).
+pub(crate) fn pieces_with<'a>(
+    element: &'a str,
+    names: &[&'static str],
+) -> Result<Vec<Piece<'a>>, String> {
     let mut out = Vec::new();
     let mut text = String::new();
     let mut rest = element;
@@ -146,10 +154,14 @@ fn pieces(element: &str) -> Result<Vec<Piece<'_>>, String> {
                 return Err(format!("an unclosed {{ in “{element}”"));
             };
             let name = &tail[1..close];
-            let Some(known) = PLACEHOLDERS.iter().find(|p| **p == name) else {
+            let Some(known) = names.iter().find(|p| **p == name) else {
                 return Err(format!(
                     "unknown placeholder {{{name}}} (use {})",
-                    PLACEHOLDERS.map(|p| format!("{{{p}}}")).join(", ")
+                    names
+                        .iter()
+                        .map(|p| format!("{{{p}}}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ));
             };
             if !text.is_empty() {

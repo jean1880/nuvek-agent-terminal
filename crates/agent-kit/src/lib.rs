@@ -9,6 +9,7 @@ pub mod delegation_config;
 pub mod diff;
 pub mod difftool;
 pub mod editdiff;
+pub mod editor;
 pub mod exec;
 pub mod filediff;
 pub mod fsutil;

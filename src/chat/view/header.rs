@@ -848,6 +848,14 @@ mod tests {
         };
         assert_eq!(gauge_fraction(&unknown), None);
         assert_eq!(gauge_text(&unknown), "1.2k tokens");
+        // A zero window is as unknown as a missing one: no bar, never a full or empty one.
+        let zero = Gauge {
+            used: 1_234,
+            max: Some(0),
+            auto_compact_at: None,
+        };
+        assert_eq!(gauge_fraction(&zero), None);
+        assert_eq!(gauge_text(&zero), "1.2k tokens");
         let over = Gauge {
             used: 300,
             max: Some(200),

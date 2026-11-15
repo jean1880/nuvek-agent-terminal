@@ -705,15 +705,14 @@ impl Adapter for AgyAdapter {
                         &["-p", "/config", "--output-format", "json"],
                     ),
                     Control::ContextUsage => {
-                        let max = 1_048_576;
                         let event = if self.context_tokens > 0 {
                             self.outbox.events.push(Envelope::new(Event::UsageUpdated {
                                 used: self.context_tokens,
-                                max: Some(max),
+                                max: None,
                                 auto_compact_at: None,
                             }));
                             Event::ControlResult {
-                                ok: Some(json!({"used": self.context_tokens, "max": max})),
+                                ok: Some(json!({"used": self.context_tokens, "max": null})),
                                 error: None,
                             }
                         } else {
@@ -1298,7 +1297,7 @@ mod tests {
             &outbox.events[0].event,
             Event::UsageUpdated {
                 used: 1000,
-                max: Some(1_048_576),
+                max: None,
                 ..
             }
         ));
@@ -1308,7 +1307,7 @@ mod tests {
                 error: None,
             } => {
                 assert_eq!(val["used"], 1000);
-                assert_eq!(val["max"], 1_048_576);
+                assert!(val["max"].is_null());
             }
             other => panic!("expected ControlResult ok, got {other:?}"),
         }

@@ -340,7 +340,7 @@ mod tests {
     /// must add none (every loading mark logged one).
     #[test]
     fn a_drip_adds_no_empty_class() {
-        gtk4::init().expect("GTK init");
+        crate::testutil::gtk_init().expect("GTK init");
         let warnings = crate::testutil::GtkWarningCapture::start();
         for driver in Driver::ALL {
             let _ = drip(driver);

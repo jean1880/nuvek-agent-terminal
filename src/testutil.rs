@@ -375,10 +375,30 @@ pub fn label_texts(root: &gtk4::Widget) -> Vec<String> {
         .collect()
 }
 
+/// The marker `make` sets (`DISPLAY_ENV`) for a run on its private Xvfb display and D-Bus session.
+pub const VIRTUAL_DISPLAY_MARKER: &str = "AGENT_TERMINAL_TEST_DISPLAY";
+
+/// Panics unless the test runs on the private display the make targets provide. A GTK test opens
+/// real windows, and a bare `cargo test` would put them on the developer's own desktop.
+pub fn require_virtual_display() {
+    assert!(
+        std::env::var(VIRTUAL_DISPLAY_MARKER).as_deref() == Ok("xvfb"),
+        "GTK tests open windows: run them through `make test` / `make test-one T=...`, which use \
+         a private Xvfb display ({VIRTUAL_DISPLAY_MARKER}=xvfb is not set)"
+    );
+}
+
+/// `gtk4::init()` for tests: the one way a test initialises GTK, behind
+/// [`require_virtual_display`].
+pub fn gtk_init() -> Result<(), glib::BoolError> {
+    require_virtual_display();
+    gtk4::init()
+}
+
 /// GTK, libadwaita, the bundled icons and the stylesheet, as the app sets them up: for the
 /// native tests that present windows. Returns the default main context they run on.
 pub fn native_init() -> glib::MainContext {
-    gtk4::init().expect("GTK must be available for the native gate");
+    gtk_init().expect("GTK must be available for the native gate");
     adw::init().expect("libadwaita init");
     crate::icons::register();
     crate::load_css();

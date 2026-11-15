@@ -1868,7 +1868,7 @@ pub(crate) mod tests {
     #[ignore = "constructs GTK widgets; run on a private display"]
     fn hookless_agy_mode_confirmation_cancel_changes_nothing() {
         use adw::prelude::AdwWindowExt;
-        gtk4::init().expect("GTK init");
+        crate::testutil::gtk_init().expect("GTK init");
         adw::init().expect("adw init");
         let backend = StubBackend::fixed(Driver::Agy);
         {
@@ -2085,7 +2085,7 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "constructs GTK widgets; run on a private display"]
     fn a_crash_does_not_store_a_context_poll_error() {
-        gtk4::init().expect("GTK init");
+        crate::testutil::gtk_init().expect("GTK init");
         adw::init().expect("adw init");
         let context = glib::MainContext::default();
         let _guard = context.acquire().expect("main context");
@@ -2246,7 +2246,7 @@ pub(crate) mod tests {
     fn completed_plans_retire_to_history_and_new_turns_start_fresh() {
         use agent_core::event::{Event, TurnState};
 
-        gtk4::init().expect("GTK init");
+        crate::testutil::gtk_init().expect("GTK init");
         adw::init().expect("adw init");
         let context = glib::MainContext::default();
         let until = |condition: &dyn Fn() -> bool| {
@@ -3937,7 +3937,7 @@ pub(crate) mod tests {
     #[ignore = "presents a window; run on a private display"]
     fn jump_to_latest_returns_to_the_bottom() {
         use agent_core::event::Event;
-        gtk4::init().expect("GTK init");
+        crate::testutil::gtk_init().expect("GTK init");
         let ctx = glib::MainContext::default();
         let settle = |ms: u64| {
             let until = std::time::Instant::now() + std::time::Duration::from_millis(ms);
@@ -4150,7 +4150,7 @@ pub(crate) mod tests {
     #[ignore = "presents a window; run on a private display"]
     fn a_thread_streamed_on_another_tab_shows_what_a_visible_one_does() {
         use agent_core::event::{Event, ItemKind, ItemStatus};
-        gtk4::init().expect("GTK init");
+        crate::testutil::gtk_init().expect("GTK init");
         adw::init().expect("adw init");
         let ctx = glib::MainContext::default();
         let pump = |ms: u64| {
@@ -4539,7 +4539,7 @@ pub(crate) mod tests {
     fn stream_cost_of_a_long_thinking_block() {
         use agent_core::event::{Event, ItemKind, StreamKind};
         use std::time::{Duration, Instant};
-        gtk4::init().expect("GTK init");
+        crate::testutil::gtk_init().expect("GTK init");
         let ctx = glib::MainContext::default();
         let backend = StubBackend::new(Driver::Claude);
         let view = ChatView::new(backend);
@@ -5242,7 +5242,7 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "needs a display; run alone: cargo test interruption_shelf -- --ignored"]
     fn interruption_shelf_reveals_and_collapses() {
-        gtk4::init().expect("GTK must be available for the native gate");
+        crate::testutil::gtk_init().expect("GTK must be available for the native gate");
         let sent = Rc::new(RefCell::new(Vec::new()));
         let shelf = interruption::InterruptionShelf::new(
             Rc::new(move |e| sent.borrow_mut().push(e)),

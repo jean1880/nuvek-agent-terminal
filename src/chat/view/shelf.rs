@@ -255,7 +255,7 @@ mod tests {
     #[test]
     #[ignore = "native GTK; run alone in an isolated display"]
     fn native_shelves_stack_as_one_card() {
-        gtk4::init().expect("GTK init");
+        crate::testutil::gtk_init().expect("GTK init");
         let stack = ShelfStack::new();
         let top = Shelf::new("at-utilities-terminal-symbolic", "the top", None);
         let bottom = Shelf::new("at-utilities-terminal-symbolic", "the bottom", None);

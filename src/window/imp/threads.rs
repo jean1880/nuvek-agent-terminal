@@ -9183,7 +9183,7 @@ pub(super) mod tests {
     #[test]
     #[ignore = "needs a display; run alone in an isolated display"]
     fn a_failed_custom_profile_does_not_strand_a_switch_while_its_driver_is_ready() {
-        gtk4::init().unwrap();
+        crate::testutil::gtk_init().unwrap();
         adw::init().unwrap();
         let app = crate::window::imp::test_support::test_app("org.test.SwitchFailedProfile", false);
         let ctx = glib::MainContext::default();
@@ -9564,7 +9564,7 @@ pub(super) mod tests {
     #[test]
     #[ignore = "needs a display; run alone in an isolated display"]
     fn the_last_window_keeps_its_snapshot_when_pages_detach() {
-        gtk4::init().unwrap();
+        crate::testutil::gtk_init().unwrap();
         adw::init().unwrap();
         crate::icons::register();
         let app = crate::window::imp::test_support::test_app("org.test.ClosingLayout", true);
@@ -9623,7 +9623,7 @@ pub(super) mod tests {
     #[test]
     #[ignore = "needs a display; run alone in an isolated display"]
     fn only_the_selected_page_is_visible() {
-        gtk4::init().unwrap();
+        crate::testutil::gtk_init().unwrap();
         adw::init().unwrap();
         crate::icons::register();
         let app = crate::window::imp::test_support::test_app("org.test.OnlySelectedVisible", true);
@@ -9671,7 +9671,7 @@ pub(super) mod tests {
     #[ignore = "needs a display; run alone in an isolated display"]
     fn focus_follows_a_page_switch_into_the_shown_page() {
         use adw::prelude::AdwWindowExt;
-        gtk4::init().unwrap();
+        crate::testutil::gtk_init().unwrap();
         adw::init().unwrap();
         let ctx = glib::MainContext::default();
         let view = adw::TabView::new();
@@ -9730,7 +9730,7 @@ pub(super) mod tests {
     #[test]
     #[ignore = "needs a display; run alone in an isolated display"]
     fn an_unshown_thread_page_keeps_its_skeleton_still() {
-        gtk4::init().unwrap();
+        crate::testutil::gtk_init().unwrap();
         adw::init().unwrap();
         crate::icons::register();
         let app = crate::window::imp::test_support::test_app("org.test.StillSkeleton", true);
@@ -9776,7 +9776,7 @@ pub(super) mod tests {
     #[test]
     #[ignore = "needs a display; run alone in an isolated display"]
     fn leaving_a_blank_thread_discards_it_and_a_titled_one_stays() {
-        gtk4::init().unwrap();
+        crate::testutil::gtk_init().unwrap();
         adw::init().unwrap();
         crate::icons::register();
         let app = crate::window::imp::test_support::test_app("org.test.BlankThreads", true);
@@ -9833,7 +9833,7 @@ pub(super) mod tests {
     #[test]
     #[ignore = "needs a display; run alone in an isolated display"]
     fn the_reopen_offer_shows_in_every_window_and_is_spent_once() {
-        gtk4::init().unwrap();
+        crate::testutil::gtk_init().unwrap();
         adw::init().unwrap();
         crate::icons::register();
         let app = crate::window::imp::test_support::test_app("org.test.ReopenOffer", true);
@@ -9884,7 +9884,7 @@ pub(super) mod tests {
     #[test]
     #[ignore = "needs a display; run alone in an isolated display"]
     fn opening_a_thread_in_two_windows_keeps_one_page_and_remote_actions_reach_it() {
-        gtk4::init().unwrap();
+        crate::testutil::gtk_init().unwrap();
         adw::init().unwrap();
         let app = crate::window::imp::test_support::test_app("org.test.ThreadOwners", false);
         let first = crate::window::AgentTerminalWindow::new(&app);
@@ -10577,7 +10577,7 @@ pub(super) mod tests {
     #[test]
     #[ignore = "needs a display; run alone: cargo test clear_rows -- --ignored"]
     fn clear_rows_ends_and_keeps_an_open_menu() {
-        gtk4::init().expect("GTK init");
+        crate::testutil::gtk_init().expect("GTK init");
         let list = gtk4::ListBox::new();
         for _ in 0..3 {
             list.append(&gtk4::Label::new(Some("row")));
@@ -11897,7 +11897,7 @@ pub(super) mod tests {
     #[test]
     #[ignore = "needs a display; run alone in an isolated display"]
     fn a_failed_switch_rolls_back_onto_the_threads_own_profile() {
-        gtk4::init().unwrap();
+        crate::testutil::gtk_init().unwrap();
         adw::init().unwrap();
         crate::icons::register();
         let app =
@@ -12023,7 +12023,7 @@ pub(super) mod tests {
     #[ignore = "needs a display; run alone in an isolated display"]
     fn a_worktree_thread_keeps_its_worktree_and_profile_through_the_writer_and_a_reopen() {
         use crate::testutil::pump_until;
-        gtk4::init().unwrap();
+        crate::testutil::gtk_init().unwrap();
         adw::init().unwrap();
         crate::icons::register();
         let config_home = tempfile::tempdir().unwrap();
@@ -12311,7 +12311,7 @@ pub(super) mod tests {
     #[ignore = "needs a display; run alone in an isolated display"]
     fn close_guards_ask_for_drafts_and_discards_and_archives_can_be_undone() {
         use crate::testutil::{pump_until, settle};
-        gtk4::init().unwrap();
+        crate::testutil::gtk_init().unwrap();
         adw::init().unwrap();
         crate::icons::register();
         let config_home = tempfile::tempdir().unwrap();

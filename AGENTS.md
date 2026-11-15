@@ -713,7 +713,9 @@ The graph is a snapshot: confirm what it says in the source before editing. Refr
    CI enforces fmt, clippy, and tests under Xvfb.
 5. **Testing**: `make test` while working; `make check` is what CI and a release run (lint,
    the suite, the `#[ignore]`d display tests one at a time); `make coverage` holds
-   `COVERAGE_FLOOR`. Never run a test script by hand. Mutation testing (`cargo mutants`) runs
+   `COVERAGE_FLOOR`. Never run a test script by hand. GTK tests refuse to run outside the make
+   targets' private display (`testutil::require_virtual_display`, the `AGENT_TERMINAL_TEST_DISPLAY`
+   marker). Mutation testing (`cargo mutants`) runs
    in CI only (`mutants.yml`), never on a developer machine. Mutation tests run only in
    resource-limited CI because mutants may allocate without bound. Details: `tests/qa/README.md`.
 6. **Installation**: do **NOT** run `make install` on developer/daily-driver

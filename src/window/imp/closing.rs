@@ -575,7 +575,7 @@ mod tests {
     #[test]
     #[ignore = "native GTK window; run alone in an isolated display"]
     fn native_closing_waits_for_agents_then_closes() {
-        gtk4::init().expect("GTK must be available for the native gate");
+        crate::testutil::gtk_init().expect("GTK must be available for the native gate");
         adw::init().expect("libadwaita init");
         crate::icons::register();
         crate::load_css();

@@ -7556,7 +7556,7 @@ mod tests {
             // These GTK checks run in one dedicated test on a private display.
             // The test backend exposes the accessible properties and relations.
             std::env::set_var("GTK_A11Y", "test");
-            gtk4::init().expect("GTK init failed");
+            crate::testutil::gtk_init().expect("GTK init failed");
         }
     }
 

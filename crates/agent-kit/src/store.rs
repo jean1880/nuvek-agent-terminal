@@ -319,7 +319,9 @@ pub struct TranscriptItem {
     /// stored under; `None` when that event had none (an inherited seed's, say), or its provider
     /// thread is gone. A caller falls back to the thread's current agent.
     pub agent: Option<String>,
-    /// The sequence number of the first event that made the item.
+    /// The sequence number of the first event that made the item. An item made only by a held
+    /// stream (text not yet stored: [`HELD_PLACEHOLDER`]) has no such event: it carries the last
+    /// sequence number read (0 on a thread with no events), which points at no event of its own.
     pub first_seq: i64,
 }
 
@@ -3798,6 +3800,9 @@ fn apply_to_transcript(
     env: Envelope,
 ) {
     let Some(item) = env.item else { return };
+    let on_reasoning = index
+        .get(&item)
+        .is_some_and(|&i| out[i].message.kind == "reasoning");
     let mut slot = |out: &mut Vec<TranscriptItem>, kind: &str| -> usize {
         *index.entry(item.clone()).or_insert_with(|| {
             out.push(TranscriptItem {
@@ -3853,11 +3858,13 @@ fn apply_to_transcript(
                 tool.streamed = text;
             }
         }
-        Event::ContentDelta { stream, text } if counts_as_text(stream, options) => {
+        Event::ContentDelta { stream, text } if counts_as_text(stream, options, on_reasoning) => {
             let i = slot(out, "unknown");
             out[i].message.text.push_str(&text);
         }
-        Event::ContentSnapshot { stream, text } if counts_as_text(stream, options) => {
+        Event::ContentSnapshot { stream, text }
+            if counts_as_text(stream, options, on_reasoning) =>
+        {
             let i = slot(out, "unknown");
             out[i].message.text = text;
         }
@@ -3875,12 +3882,13 @@ fn apply_to_transcript(
     }
 }
 
-/// Tool input lives in `ItemStarted::input`, not in the transcript text, and
-/// reasoning is part of it only when the fold keeps reasoning.
-fn counts_as_text(stream: StreamKind, options: FoldOptions) -> bool {
+/// Tool input lives in `ItemStarted::input`, not in the transcript text. Reasoning is part of it
+/// only when the fold keeps reasoning, and then only on an item already started as reasoning
+/// (`on_reasoning`): a reasoning stream that names any other item, or none yet, is not text.
+fn counts_as_text(stream: StreamKind, options: FoldOptions, on_reasoning: bool) -> bool {
     match stream {
         StreamKind::ToolInput => false,
-        StreamKind::Reasoning => options.keep_reasoning,
+        StreamKind::Reasoning => options.keep_reasoning && on_reasoning,
         _ => true,
     }
 }
@@ -5349,6 +5357,24 @@ mod tests {
             .map(|i| i.agent.as_deref())
             .collect();
         assert_eq!(users, [Some("claude"), Some("agy")]);
+    }
+
+    #[test]
+    fn reasoning_text_lands_only_on_a_reasoning_item() {
+        let s = store();
+        let t = s.create_thread("/", None).expect("t");
+        for e in [
+            started("a1", ItemKind::AssistantMessage),
+            delta("a1", "answer"),
+            stream_delta("a1", StreamKind::Reasoning, "stray thinking"),
+            stream_delta("orphan", StreamKind::Reasoning, "no start"),
+            completed("a1", ItemStatus::Completed),
+        ] {
+            s.append_event(&t, None, &e).expect("append");
+        }
+        let items = s.transcript_items(&t, KEEP_ALL).expect("items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].message.text, "answer");
     }
 
     #[test]

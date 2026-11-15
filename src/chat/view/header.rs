@@ -891,7 +891,7 @@ mod tests {
     #[test]
     fn chip_is_centred_single_line_and_transient_height_recovers() {
         crate::testutil::gtk_init().expect("GTK init");
-        adw::init().expect("adw init");
+        crate::testutil::adw_init().expect("adw init");
         super::super::load_style();
 
         let header = Header::new();

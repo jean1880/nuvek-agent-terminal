@@ -1869,7 +1869,7 @@ pub(crate) mod tests {
     fn hookless_agy_mode_confirmation_cancel_changes_nothing() {
         use adw::prelude::AdwWindowExt;
         crate::testutil::gtk_init().expect("GTK init");
-        adw::init().expect("adw init");
+        crate::testutil::adw_init().expect("adw init");
         let backend = StubBackend::fixed(Driver::Agy);
         {
             let mut status = backend.status.borrow_mut();
@@ -2086,7 +2086,7 @@ pub(crate) mod tests {
     #[ignore = "constructs GTK widgets; run on a private display"]
     fn a_crash_does_not_store_a_context_poll_error() {
         crate::testutil::gtk_init().expect("GTK init");
-        adw::init().expect("adw init");
+        crate::testutil::adw_init().expect("adw init");
         let context = glib::MainContext::default();
         let _guard = context.acquire().expect("main context");
         let fixture = pending_init_session();
@@ -2247,7 +2247,7 @@ pub(crate) mod tests {
         use agent_core::event::{Event, TurnState};
 
         crate::testutil::gtk_init().expect("GTK init");
-        adw::init().expect("adw init");
+        crate::testutil::adw_init().expect("adw init");
         let context = glib::MainContext::default();
         let until = |condition: &dyn Fn() -> bool| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -4151,7 +4151,7 @@ pub(crate) mod tests {
     fn a_thread_streamed_on_another_tab_shows_what_a_visible_one_does() {
         use agent_core::event::{Event, ItemKind, ItemStatus};
         crate::testutil::gtk_init().expect("GTK init");
-        adw::init().expect("adw init");
+        crate::testutil::adw_init().expect("adw init");
         let ctx = glib::MainContext::default();
         let pump = |ms: u64| {
             let until = std::time::Instant::now() + std::time::Duration::from_millis(ms);

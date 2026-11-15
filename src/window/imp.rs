@@ -7990,7 +7990,7 @@ mod tests {
         use agent_core::adapter::Driver;
         use gtk4::Orientation::{Horizontal, Vertical};
         init_gtk();
-        adw::init().expect("adw init");
+        crate::testutil::adw_init().expect("adw init");
         crate::icons::register();
         crate::load_css();
         let app = crate::window::imp::test_support::test_app("org.test.SmallWindow", false);

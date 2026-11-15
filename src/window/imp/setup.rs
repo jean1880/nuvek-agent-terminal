@@ -221,7 +221,7 @@ mod tests {
     #[ignore = "native GTK layout; run alone in an isolated display"]
     fn native_closing_setup_ends_the_first_run() {
         crate::testutil::gtk_init().expect("GTK must be available for the native gate");
-        adw::init().expect("libadwaita init");
+        crate::testutil::adw_init().expect("libadwaita init");
         crate::icons::register();
         crate::load_css();
         let config_home = tempfile::tempdir().unwrap();
@@ -267,7 +267,7 @@ mod tests {
     #[ignore = "native GTK layout; run alone in an isolated display"]
     fn native_welcome_button_is_inside_the_dialog() {
         crate::testutil::gtk_init().expect("GTK must be available for the native gate");
-        adw::init().expect("libadwaita init");
+        crate::testutil::adw_init().expect("libadwaita init");
         crate::icons::register();
         crate::load_css();
         let app = crate::window::imp::test_support::test_app("org.test.Welcome", false);

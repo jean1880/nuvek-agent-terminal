@@ -8268,7 +8268,7 @@ mod tests {
     fn every_button_in_the_window_is_named_and_sized() {
         use agent_core::adapter::Driver;
         init_gtk();
-        adw::init().expect("adw init");
+        crate::testutil::adw_init().expect("adw init");
         crate::icons::register();
         crate::load_css();
         let app = crate::window::imp::test_support::test_app("org.test.ButtonAudit", false);

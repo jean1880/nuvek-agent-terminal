@@ -232,11 +232,19 @@ impl GaugePopover {
     }
 
     fn set_actions(&self, actions: &[ActionRow]) {
+        // A row the agent has no use for (Compact with no native command) is not shown.
+        for (action, button, reason) in &self.rows {
+            if !actions.iter().any(|r| r.action == *action) {
+                button.set_visible(false);
+                reason.set_visible(false);
+            }
+        }
         for row in actions {
             let Some((_, button, reason)) = self.rows.iter().find(|(a, ..)| *a == row.action)
             else {
                 continue;
             };
+            button.set_visible(true);
             button.set_label(&row.label);
             if let Some(l) = button.child().and_downcast::<gtk4::Label>() {
                 l.set_halign(gtk4::Align::Start);
@@ -1029,6 +1037,61 @@ mod tests {
             gauge_tooltip(&codex_blank),
             "This agent has not reported its context window size."
         );
+    }
+
+    #[test]
+    fn gauge_bar_follows_state_and_popover_rows_wait_for_the_turn() {
+        gtk4::init().expect("GTK init");
+        adw::init().expect("adw init");
+        super::super::load_style();
+        let header = Header::new();
+        let known = Gauge {
+            used: 50_000,
+            max: Some(200_000),
+            auto_compact_at: None,
+        };
+        header.set_gauge(Some(&known));
+        assert!(header.gauge.is_visible() && header.level.is_visible());
+        let unknown = Gauge {
+            used: 0,
+            max: None,
+            auto_compact_at: None,
+        };
+        header.set_gauge(Some(&unknown));
+        assert!(header.gauge.is_visible());
+        assert!(!header.level.is_visible());
+        assert_eq!(header.gauge_label.text(), "context ?");
+
+        header.set_meter_actions(Some("/compact"), "Claude", true, true);
+        for (action, button, reason) in &header.gauge_pop.rows {
+            match action {
+                MeterAction::Breakdown => {
+                    assert!(
+                        button.property::<bool>("sensitive") && !reason.property::<bool>("visible")
+                    );
+                }
+                _ => {
+                    assert!(button.property::<bool>("visible"), "{action:?} visible");
+                    assert!(
+                        !button.property::<bool>("sensitive"),
+                        "{action:?} sensitive"
+                    );
+                    assert!(reason.property::<bool>("visible"));
+                    assert_eq!(reason.text(), "Wait for the current turn to finish.");
+                }
+            }
+        }
+        header.set_meter_actions(Some("/compact"), "Claude", false, true);
+        assert!(header
+            .gauge_pop
+            .rows
+            .iter()
+            .all(|(_, b, r)| b.property::<bool>("sensitive") && !r.property::<bool>("visible")));
+        // No native command: Compact is not offered at all.
+        header.set_meter_actions(None, "Local", false, false);
+        let compact = &header.gauge_pop.rows[0];
+        assert_eq!(compact.0, MeterAction::Compact);
+        assert!(!compact.1.property::<bool>("visible"));
     }
 
     #[test]

@@ -1102,9 +1102,6 @@ impl Inner {
         self.composer.set_running(running, stop_note.as_deref());
         self.refresh_agent_chip();
         self.sync_mode_header(status.mode);
-        self.header
-            .gauge
-            .set_sensitive(status.capabilities.context_usage);
         self.header.set_meter_actions(
             status.capabilities.compact_command.as_deref(),
             status.driver.info().label,

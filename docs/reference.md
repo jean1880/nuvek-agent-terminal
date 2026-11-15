@@ -103,9 +103,10 @@ window is unknown rather than an empty window.
 Click the gauge for a popover with the numbers and three things to do:
 
 - **Compact**: sends the agent's own command, labelled for it ("Compact (Claude's
-  /compact)"). An agent with no such command, such as Antigravity, compacts by hand-off
-  instead: the thread continues in a new thread with a budgeted summary.
-- **Continue in a new thread**: the same hand-off fork, for any agent.
+  /compact)"). An agent with no such command, such as Antigravity or the Local agent, has no
+  Compact row: Continue does the same work.
+- **Continue in a new thread**: a new thread carrying a budgeted hand-off summary, for any
+  agent.
 - **Context breakdown (/context)**: opens the `/context` panel, for agents that report one.
 
 Compact and Continue are off, with the reason shown, while a turn runs. `/compact` and

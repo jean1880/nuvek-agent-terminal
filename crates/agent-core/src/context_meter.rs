@@ -215,38 +215,38 @@ pub struct ActionRow {
 }
 
 /// The popover's rows. `compact_command` is the agent's native one (`/compact`), if any.
-/// Compact and Continue wait for the turn to end; the breakdown only reads.
+/// Compact and Continue wait for the turn to end; the breakdown only reads. An agent with no
+/// native command gets no Compact row, since compacting by hand-off is Continue.
 pub fn actions(
     compact_command: Option<&str>,
     agent: &str,
     running: bool,
     has_breakdown: bool,
-) -> [ActionRow; 3] {
+) -> Vec<ActionRow> {
     let busy = running.then(|| "Wait for the current turn to finish.".to_owned());
-    let compact_label = match compact_command.map(str::trim).filter(|c| !c.is_empty()) {
-        Some(cmd) => format!("Compact ({agent}'s {cmd})"),
-        None => "Compact by hand-off".to_owned(),
-    };
-    [
-        ActionRow {
+    let mut rows = Vec::with_capacity(3);
+    // With no native command, Compact would do what Continue does: leave it out.
+    if let Some(cmd) = compact_command.map(str::trim).filter(|c| !c.is_empty()) {
+        rows.push(ActionRow {
             action: MeterAction::Compact,
-            label: compact_label,
+            label: format!("Compact ({agent}'s {cmd})"),
             enabled: !running,
             reason: busy.clone(),
-        },
-        ActionRow {
-            action: MeterAction::Continue,
-            label: "Continue in a new thread".to_owned(),
-            enabled: !running,
-            reason: busy,
-        },
-        ActionRow {
-            action: MeterAction::Breakdown,
-            label: "Context breakdown (/context)".to_owned(),
-            enabled: has_breakdown,
-            reason: (!has_breakdown).then(|| format!("{agent} has no context breakdown.")),
-        },
-    ]
+        });
+    }
+    rows.push(ActionRow {
+        action: MeterAction::Continue,
+        label: "Continue in a new thread".to_owned(),
+        enabled: !running,
+        reason: busy,
+    });
+    rows.push(ActionRow {
+        action: MeterAction::Breakdown,
+        label: "Context breakdown (/context)".to_owned(),
+        enabled: has_breakdown,
+        reason: (!has_breakdown).then(|| format!("{agent} has no context breakdown.")),
+    });
+    rows
 }
 
 #[cfg(test)]
@@ -324,7 +324,7 @@ mod tests {
                 MeterAction::Compact | MeterAction::Continue | MeterAction::Breakdown => {}
             }
         }
-        let rows = actions(None, "agy", false, false);
+        let rows = actions(Some("/compact"), "Claude", false, false);
         for (row, a) in rows.iter().zip(MeterAction::ALL) {
             assert_eq!(row.action, a);
         }
@@ -356,13 +356,16 @@ mod tests {
         let idle = actions(Some("/compact"), "Claude", false, true);
         assert_eq!(idle[0].label, "Compact (Claude's /compact)");
         assert!(idle.iter().all(|r| r.enabled && r.reason.is_none()));
-        let busy = actions(None, "agy", true, true);
-        assert_eq!(busy[0].label, "Compact by hand-off");
+        let busy = actions(Some("/compact"), "Claude", true, true);
         assert!(!busy[0].enabled && !busy[1].enabled);
         assert!(busy[0].reason.is_some() && busy[1].reason.is_some());
         // Reading the breakdown is allowed mid-turn.
         assert!(busy[2].enabled);
+        // No native command: no Compact row, only Continue and the breakdown.
         let none = actions(None, "Local", false, false);
-        assert!(!none[2].enabled && none[2].reason.is_some());
+        let kinds: Vec<_> = none.iter().map(|r| r.action).collect();
+        assert_eq!(kinds, [MeterAction::Continue, MeterAction::Breakdown]);
+        assert!(none[0].enabled);
+        assert!(!none[1].enabled && none[1].reason.is_some());
     }
 }

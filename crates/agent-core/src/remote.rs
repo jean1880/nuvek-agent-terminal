@@ -234,14 +234,33 @@ pub fn ssh_check_argv(alias: &str) -> Result<Vec<String>, String> {
 /// Whether a link shown on a remote page may be opened on this machine: only `http://` and
 /// `https://` with a host. Anything else (`file://`, `ssh:`, a custom handler's scheme) names
 /// something on the other machine, or asks this one to run a handler the other machine chose.
+///
+/// Judged as given, never trimmed, since the caller launches exactly this string: no ASCII
+/// whitespace anywhere, no control, bidi or otherwise hidden character, at most
+/// [`MAX_LINK_LEN`] bytes. The authority (after `://`, up to the first `/`, `?` or `#`) must
+/// name a host, must not start with `:` (a port with no host), and must hold no `@`: neither
+/// `user:pass@` nor `https://trusted.example@other.example`, which reads as one host and goes
+/// to the other.
 pub fn remote_link_allowed(uri: &str) -> bool {
-    let uri = uri.trim();
+    if uri.len() > MAX_LINK_LEN
+        || uri.bytes().any(|b| b.is_ascii_whitespace())
+        || crate::text::has_hidden(uri)
+        || crate::text::has_control_or_bidi(uri, &[])
+    {
+        return false;
+    }
     let Some((scheme, rest)) = uri.split_once("://") else {
         return false;
     };
-    let web = scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https");
-    web && !rest.is_empty() && !rest.starts_with('/') && !crate::text::has_control_or_bidi(uri, &[])
+    if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    !authority.is_empty() && !authority.starts_with(':') && !authority.contains('@')
 }
+
+/// The longest link a remote page opens.
+pub const MAX_LINK_LEN: usize = 4096;
 
 /// What a remote page says when it refuses a link.
 pub const REMOTE_LINK_REFUSED: &str =
@@ -516,10 +535,31 @@ mod tests {
             "https://example.com/a?b=c",
             "http://192.0.2.7:8080/",
             "HTTPS://Example.com",
+            "HTTPS://Example.com/path",
+            "https://example.com#top",
+            "https://example.com/a@b",
         ] {
             assert!(remote_link_allowed(ok), "{ok}");
         }
+        let long = format!("https://example.com/{}", "a".repeat(5_000));
+        assert!(long.len() > MAX_LINK_LEN);
+        assert!(!remote_link_allowed(&long), "a 5,000-byte link");
         for refused in [
+            "\nhttps://example.com",
+            "https://example.com\n",
+            "https://example.com/a b",
+            " https://example.com",
+            "https://example.com\t",
+            "https://?q",
+            "https://#f",
+            "https://:80",
+            "https://:80/x",
+            "https://user@",
+            "https://user:pass@example.com/",
+            "https://trusted.com@evil.example",
+            "https://example.com\u{a0}/x",
+            "https://exa\u{3164}mple.com",
+            "https://exa\u{200b}mple.com",
             "file:///etc/passwd",
             "file://box/home/me/.ssh/id_ed25519",
             "FILE:///tmp/x",

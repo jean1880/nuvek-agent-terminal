@@ -4317,8 +4317,10 @@ impl AgentTerminalWindow {
                                 }
                                 return;
                             }
-                            debug!("Opening hyperlink: {}", uri);
-                            // UriLauncher replaces the deprecated gtk4::show_uri.
+                            // A link can carry a token in its query: logged masked.
+                            debug!("Opening hyperlink: {}", agent_core::redact::redact(&uri));
+                            // Launched exactly as judged above: the same `uri`, never trimmed
+                            // or rebuilt. UriLauncher replaces the deprecated gtk4::show_uri.
                             // Fire-and-forget: the portal owns the outcome, and a
                             // failure to launch is not actionable from here.
                             gtk4::UriLauncher::new(&uri).launch(

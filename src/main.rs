@@ -10,6 +10,7 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
 
+mod accels;
 mod accept_loop;
 mod account_status;
 mod agent_home;
@@ -209,72 +210,9 @@ fn main() -> glib::ExitCode {
         ));
         app.add_action(&continue_tab_in);
 
-        // All shortcuts are application accelerators bound to window actions, so
-        // they are caught before VTE sees the key press.
-        // Anything handled by a controller on the terminal widget stops working
-        // the moment focus moves — to the settings dialog, the search entry, a
-        // header button — which is exactly when a user reaches for copy or zoom.
-        #[cfg(target_os = "macos")]
-        {
-            app.set_accels_for_action("win.new-tab", &["<Meta>t", "<Primary><Shift>T"]);
-            app.set_accels_for_action("win.close-tab", &["<Meta>w", "<Primary><Shift>W"]);
-            app.set_accels_for_action("win.copy", &["<Meta>c", "<Primary><Shift>C"]);
-            app.set_accels_for_action("win.paste", &["<Meta>v", "<Primary><Shift>V"]);
-            app.set_accels_for_action("win.search", &["<Meta>f", "<Primary><Shift>F"]);
-            app.set_accels_for_action(
-                "win.toggle-sidebar",
-                &["F9", "<Meta>b", "<Primary><Shift>B"],
-            );
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            app.set_accels_for_action("win.new-tab", &["<Ctrl><Shift>T"]);
-            app.set_accels_for_action("win.close-tab", &["<Ctrl><Shift>W"]);
-            app.set_accels_for_action("win.copy", &["<Ctrl><Shift>C"]);
-            app.set_accels_for_action("win.paste", &["<Ctrl><Shift>V"]);
-            app.set_accels_for_action("win.search", &["<Ctrl><Shift>F"]);
-            app.set_accels_for_action("win.toggle-sidebar", &["F9", "<Primary><Shift>B"]);
-        }
-
-        for (action, accels) in [
-            ("win.restart-tab", &["<Primary><Shift>R"][..]),
-            ("win.toggle-diff", &["<Primary><Shift>D"]),
-            ("win.new-tab-worktree", &["<Primary><Shift>G"]),
-            ("win.new-tab-folder", &["<Primary><Shift>O"]),
-            ("win.checkpoint-now", &["<Primary><Shift>S"]),
-            ("win.resume-session", &["<Primary><Shift>E"]),
-            ("win.toggle-drawer", &["<Ctrl>grave", "<Primary>J"]),
-            ("win.preferences", &["<Primary>comma"]),
-            ("win.shortcuts", &["<Primary>question"]),
-            // Both the shifted and unshifted key, so Ctrl+= works on layouts
-            // where + needs Shift.
-            (
-                "win.zoom-in",
-                &["<Primary>plus", "<Primary>equal", "<Primary>KP_Add"],
-            ),
-            ("win.zoom-out", &["<Primary>minus", "<Primary>KP_Subtract"]),
-            ("win.zoom-reset", &["<Primary>0", "<Primary>KP_0"]),
-            ("win.next-tab", &["<Primary>Tab", "<Primary>Page_Down"]),
-            (
-                "win.previous-tab",
-                &["<Primary><Shift>Tab", "<Primary>Page_Up"],
-            ),
-        ] {
-            app.set_accels_for_action(action, accels);
-        }
-
-        // Alt+1..9 select a tab by position; Alt+9 means "last", as is
-        // conventional, rather than the ninth tab specifically.
-        for n in 1..=9i32 {
-            let index = if n == 9 { -1 } else { n - 1 };
-            app.set_accels_for_action(&format!("win.select-tab({index})"), &[&format!("<Alt>{n}")]);
-            // Ctrl+Alt+N opens a tab as the Nth configured profile, in the
-            // current tab's directory.
-            app.set_accels_for_action(
-                &format!("win.new-tab-profile-at({})", n - 1),
-                &[&format!("<Ctrl><Alt>{n}")],
-            );
-        }
+        // Every shortcut is an application accelerator bound to a window action, so it is
+        // caught before VTE sees the key press (see `accels`).
+        accels::apply(app);
     });
 
     // The old side of any file opened in an external diff tool is deleted with the app, and no

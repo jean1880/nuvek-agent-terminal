@@ -10,6 +10,7 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
 
+mod a11y;
 mod accels;
 mod accept_loop;
 mod account_status;
@@ -541,17 +542,22 @@ fn load_css() {
             color: @at_fg_soft;
             margin-left: 6px;
         }
+        /* A spin button's own buttons are touch targets too. */
+        spinbutton > button {
+            min-width: 24px;
+            min-height: 24px;
+        }
         .folder-toggle {
             padding: 2px 4px;
-            min-height: 0;
+            min-height: 24px;
         }
         .folder-toggle .folder-label {
             margin-left: 0;
         }
         .folder-new-thread {
             padding: 2px;
-            min-height: 0;
-            min-width: 0;
+            min-height: 24px;
+            min-width: 24px;
         }
         .update-dot {
             color: @at_warning;
@@ -620,8 +626,8 @@ fn load_css() {
             padding: 0 5px;
         }
         .thread-close, .thread-delete {
-            min-width: 20px;
-            min-height: 20px;
+            min-width: 24px;
+            min-height: 24px;
             padding: 0;
             opacity: 0.45;
         }

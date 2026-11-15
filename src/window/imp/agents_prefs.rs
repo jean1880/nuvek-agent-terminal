@@ -1196,6 +1196,7 @@ impl AgentTerminalWindow {
         let on_change = validate.clone();
         sources_row.connect_changed(move |_| on_change(true, false));
         sources_row.set_show_apply_button(true);
+        crate::a11y::name_apply_button(&sources_row);
         let on_apply = validate.clone();
         sources_row.connect_apply(move |_| on_apply(false, true));
         let on_enter = validate.clone();
@@ -2028,6 +2029,7 @@ impl AgentTerminalWindow {
         let obj = self.obj();
         let decide = Rc::new(decide);
         row.set_show_apply_button(true);
+        crate::a11y::name_apply_button(row);
         let commit = Rc::new(glib::clone!(
             #[weak]
             obj,
@@ -2470,6 +2472,9 @@ impl AgentTerminalWindow {
             .valign(Align::Center)
             .css_classes(["flat"])
             .build();
+        copy.update_property(&[gtk4::accessible::Property::Label(
+            "Copy the hooks.json entry",
+        )]);
         let to_copy = entry.clone();
         copy.connect_clicked(move |b| {
             b.clipboard().set_text(&to_copy);

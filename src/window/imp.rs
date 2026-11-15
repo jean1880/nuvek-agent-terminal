@@ -913,19 +913,23 @@ fn build_search_bar(terminal: &Terminal) -> (gtk4::SearchBar, gtk4::SearchEntry)
         .icon_name("at-go-up-symbolic")
         .tooltip_text("Previous match (Shift+Enter)")
         .build();
+    previous.update_property(&[gtk4::accessible::Property::Label("Previous match")]);
     let next = Button::builder()
         .icon_name("at-go-down-symbolic")
         .tooltip_text("Next match (Enter)")
         .build();
+    next.update_property(&[gtk4::accessible::Property::Label("Next match")]);
 
     let case_sensitive = gtk4::ToggleButton::builder()
         .icon_name("at-format-text-italic-symbolic")
         .tooltip_text("Match case")
         .build();
+    case_sensitive.update_property(&[gtk4::accessible::Property::Label("Match case")]);
     let use_regex = gtk4::ToggleButton::builder()
         .icon_name("at-system-search-symbolic")
         .tooltip_text("Regular expression")
         .build();
+    use_regex.update_property(&[gtk4::accessible::Property::Label("Regular expression")]);
 
     let row = Box::builder()
         .orientation(Orientation::Horizontal)
@@ -2346,6 +2350,7 @@ impl AgentTerminalWindow {
             .icon_name("at-emblem-system-symbolic")
             .tooltip_text("Settings (Ctrl+,)")
             .build();
+        settings_btn.update_property(&[gtk4::accessible::Property::Label("Settings")]);
         settings_btn.connect_clicked(glib::clone!(
             #[weak]
             obj,
@@ -2601,6 +2606,7 @@ impl AgentTerminalWindow {
                 .icon_name("at-list-add-symbolic")
                 .tooltip_text("New Thread (Ctrl+Shift+T)")
                 .build();
+            new_btn.update_property(&[gtk4::accessible::Property::Label("New thread")]);
             new_btn.connect_clicked(glib::clone!(
                 #[weak]
                 obj,
@@ -2615,11 +2621,15 @@ impl AgentTerminalWindow {
                 .tooltip_text("Show or Hide Terminal Drawer (Ctrl+J)")
                 .action_name("win.toggle-drawer")
                 .build();
+            drawer_btn.update_property(&[gtk4::accessible::Property::Label(
+                "Show or hide the terminal drawer",
+            )]);
             let diff_btn = Button::builder()
                 .icon_name(crate::icons::GIT_ICON)
                 .tooltip_text("Show or Hide Changes (Ctrl+Shift+D)")
                 .action_name("win.toggle-diff")
                 .build();
+            diff_btn.update_property(&[gtk4::accessible::Property::Label("Show or hide changes")]);
             // No page is on show yet: `sync_diff_toggle` reveals it. The holder also follows the
             // button, which the narrow breakpoint hides, so an empty holder never takes the
             // header's spacing.
@@ -4621,6 +4631,7 @@ impl AgentTerminalWindow {
             .build();
         scrollback_row.add_suffix(&scroll_spin);
         scroll_spin.update_property(&[gtk4::accessible::Property::Label("Scrollback Lines")]);
+        crate::a11y::name_spin_buttons(&scroll_spin, "scrollback lines");
 
         let suspend_spin = gtk4::SpinButton::builder()
             .adjustment(&gtk4::Adjustment::new(
@@ -4644,6 +4655,7 @@ impl AgentTerminalWindow {
         suspend_spin.update_property(&[gtk4::accessible::Property::Label(
             "Pause Idle Agents After (Minutes)",
         )]);
+        crate::a11y::name_spin_buttons(&suspend_spin, "idle pause minutes");
 
         // Built from the configured profiles. Index 0 is auto-detection, so the
         // list is one longer than the profile list and every later index is
@@ -4672,6 +4684,7 @@ impl AgentTerminalWindow {
             .build();
         font_scale_row.add_suffix(&font_scale_spin);
         font_scale_spin.update_property(&[gtk4::accessible::Property::Label("Text Scale")]);
+        crate::a11y::name_spin_buttons(&font_scale_spin, "text scale");
         *self.font_scale_spin.borrow_mut() = font_scale_spin.downgrade();
 
         let cli_client_row = adw::ComboRow::builder()
@@ -8238,6 +8251,155 @@ mod tests {
             "layout changes must not change permission mode"
         );
         assert!(failures.is_empty(), "{}", failures.join("; "));
+    }
+
+    /// Every button in the window is named for assistive technology and is a usable target:
+    /// the sidebar, header, thread (header, shelves, composer, transcript), the diff panel (beside
+    /// the thread and popped out), every popover's contents and the Settings dialog with all its
+    /// pages. An icon with no text carries an explicit accessible label (a tooltip is no name).
+    /// This is a gate: it has no allowlist.
+    #[test]
+    #[ignore = "presents the window and Settings; run on a private display"]
+    fn every_button_in_the_window_is_named_and_sized() {
+        use agent_core::adapter::Driver;
+        init_gtk();
+        adw::init().expect("adw init");
+        crate::icons::register();
+        crate::load_css();
+        let app = crate::window::imp::test_support::test_app("org.test.ButtonAudit", false);
+        let window = super::super::AgentTerminalWindow::new(&app);
+        let imp = window.imp();
+        for p in imp.config.borrow_mut().profiles.iter_mut() {
+            p.command = format!("/nonexistent/{}", p.command);
+        }
+        let ctx = glib::MainContext::default();
+        crate::testutil::pump_until(&ctx, 20, || !imp.detecting.get());
+        imp.finish_shell(None);
+        imp.reveal_shell();
+        // A repository with an edited file, so the diff panel has rows and controls to audit.
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let repo = run(&["init", "-q"]);
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
+        let _ = run(&["add", "."]) && run(&["commit", "-qm", "first"]);
+        std::fs::write(dir.path().join("a.txt"), "one\nthree\nfour\n").unwrap();
+        imp.new_chat_thread(
+            Some(Driver::Claude),
+            Some(dir.path().to_string_lossy().into_owned()),
+            None,
+        );
+        let built = crate::testutil::pump_until(&ctx, 30, || {
+            imp.tabs
+                .borrow()
+                .iter()
+                .any(|t| t.chat.as_ref().is_some_and(|c| c.view.is_some()))
+        });
+        assert!(built, "the thread's view was built");
+        let view = imp
+            .tabs
+            .borrow()
+            .iter()
+            .find_map(|t| t.chat.as_ref().and_then(|c| c.view.clone()))
+            .expect("a thread view");
+        view.replay(&crate::chat::view::demo::DemoBackend::script_envelopes());
+        let availability = crate::availability::AgentAvailability::shared();
+        crate::testutil::pump_until(&ctx, 20, || !availability.any_detecting());
+        for driver in [Driver::Claude, Driver::Agy] {
+            availability.set(
+                driver,
+                crate::availability::Availability::Ready("/bin/true".into()),
+            );
+        }
+        crate::chat::view::demo::observe_demo_quota(&crate::account_status::AccountStatus::shared());
+        window.set_default_size(1200, 800);
+        window.present();
+        imp.split_view
+            .borrow()
+            .as_ref()
+            .expect("the split view")
+            .set_show_sidebar(true);
+        imp.toggle_diff_panel();
+        if repo {
+            crate::testutil::pump_until(&ctx, 10, || false);
+        }
+        crate::testutil::settle(&ctx);
+
+        let mut problems = Vec::new();
+        let mut audit = |what: &str, root: &gtk4::Widget| {
+            let buttons = crate::testutil::descendants(root)
+                .iter()
+                .filter(|w| {
+                    w.is::<gtk4::Button>()
+                        || w.is::<gtk4::MenuButton>()
+                        || w.is::<gtk4::ToggleButton>()
+                })
+                .count();
+            eprintln!("{what}: {buttons} buttons");
+            for p in crate::testutil::button_problems(root, 24)
+                .into_iter()
+                .chain(crate::testutil::icon_only_without_label(root))
+            {
+                problems.push(format!("{what}: {p}"));
+            }
+            buttons
+        };
+        let root: gtk4::Widget = window.clone().upcast();
+        // The walk saw the surfaces it guards: a floor, so an emptied tree cannot pass.
+        assert!(
+            audit("window", &root) > 20,
+            "the window's buttons were walked"
+        );
+
+        // The diff panel popped out into its own window, and docked again.
+        let panel = imp
+            .tabs
+            .borrow()
+            .iter()
+            .find_map(|t| t.chat.as_ref().map(|_| t.diff_panel.clone()))
+            .expect("a thread's diff panel");
+        panel.pop_out(window.upcast_ref(), "Button audit");
+        crate::testutil::settle(&ctx);
+        assert!(panel.is_detached(), "the panel is in its own window");
+        audit("popped-out diff panel", panel.content.upcast_ref());
+        panel.dock();
+        crate::testutil::settle(&ctx);
+
+        // Settings, every page of it (pages that are not current are built too).
+        imp.show_preferences();
+        crate::testutil::pump_until(&ctx, 5, || window.visible_dialog().is_some());
+        crate::testutil::settle(&ctx);
+        let dialog = window.visible_dialog().expect("Settings is open");
+        assert!(
+            audit("settings", dialog.upcast_ref()) > 10,
+            "Settings' buttons were walked"
+        );
+        dialog.close();
+        crate::testutil::settle(&ctx);
+
+        // The set-up walkthrough, which Settings re-runs.
+        imp.show_setup();
+        crate::testutil::pump_until(&ctx, 5, || window.visible_dialog().is_some());
+        crate::testutil::settle(&ctx);
+        let dialog = window.visible_dialog().expect("the walkthrough is open");
+        assert!(
+            audit("set-up walkthrough", dialog.upcast_ref()) > 0,
+            "the walkthrough's buttons were walked"
+        );
+        dialog.close();
+        crate::testutil::settle(&ctx);
+
+        window.destroy();
+        problems.sort();
+        problems.dedup();
+        assert!(problems.is_empty(), "button problems: {problems:#?}");
     }
 
     /// The chat-first shell, without a main loop: nothing is resolved or spawned (the agent

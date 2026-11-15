@@ -457,8 +457,9 @@ pub fn selectable_labels_in_click_targets(root: &gtk4::Widget) -> Vec<String> {
     out
 }
 
-/// Accessibility and hit-target problems of every button under `root`: no accessible name, or
-/// smaller than `min` px in either direction (natural size, so it works unmapped).
+/// Accessibility and hit-target problems of every button under `root`, popover contents
+/// included (a popover is audited while closed, as long as its button is shown): no accessible
+/// name, or smaller than `min` px in either direction (natural size, so it works unmapped).
 pub fn button_problems(root: &gtk4::Widget, min: i32) -> Vec<String> {
     use gtk4::prelude::*;
     let mut out = Vec::new();
@@ -471,7 +472,7 @@ pub fn button_problems(root: &gtk4::Widget, min: i32) -> Vec<String> {
         let inner = widget
             .parent()
             .is_some_and(|p| p.is::<gtk4::MenuButton>() || p.is::<adw::SplitButton>());
-        if !button || inner || !shown(&widget) {
+        if !button || inner || !shown_or_in_popover(&widget) {
             continue;
         }
         let named = widget
@@ -490,13 +491,7 @@ pub fn button_problems(root: &gtk4::Widget, min: i32) -> Vec<String> {
                 w.downcast_ref::<gtk4::Label>()
                     .is_some_and(|l| !l.text().is_empty())
             });
-        let describe = || {
-            format!(
-                "{} ({})",
-                widget.type_().name(),
-                widget.css_classes().join(".")
-            )
-        };
+        let describe = || describe_button(&widget);
         if !named {
             out.push(format!("{} has no accessible name", describe()));
         }
@@ -534,17 +529,92 @@ pub fn blocks_without_copy(root: &gtk4::Widget) -> Vec<String> {
         .collect()
 }
 
-/// Whether `widget` and every ancestor is visible (a hidden widget measures 0x0).
-pub fn shown(widget: &gtk4::Widget) -> bool {
+/// A button for a failure message: its type, CSS classes and the ancestors above it, with a row's title.
+fn describe_button(widget: &gtk4::Widget) -> String {
+    use gtk4::prelude::*;
+    let mut place = Vec::new();
+    let mut at = widget.parent();
+    while let Some(parent) = at {
+        if place.len() == 6 {
+            break;
+        }
+        let title = parent
+            .downcast_ref::<adw::PreferencesRow>()
+            .map(|row| format!(" {:?}", adw::prelude::PreferencesRowExt::title(row)))
+            .unwrap_or_default();
+        place.push(format!(
+            "{}({}){title}",
+            parent.type_().name(),
+            parent.css_classes().join(".")
+        ));
+        at = parent.parent();
+    }
+    format!(
+        "{} ({}) in {}",
+        widget.type_().name(),
+        widget.css_classes().join("."),
+        place.join(" < ")
+    )
+}
+
+/// Whether `widget` and every ancestor is visible (a hidden widget measures 0x0), except that a
+/// popover counts as visible whenever its own parent is: its contents are built and measured
+/// while it is closed, and are what opens on a click.
+pub fn shown_or_in_popover(widget: &gtk4::Widget) -> bool {
     use gtk4::prelude::*;
     let mut at = Some(widget.clone());
     while let Some(w) = at {
-        if !w.is_visible() {
+        if !w.is::<gtk4::Popover>() && !w.is_visible() {
             return false;
         }
         at = w.parent();
     }
     true
+}
+
+/// Every `Button`, `MenuButton` and `ToggleButton` under `root` (popover contents included) that
+/// shows an icon and no text, yet has no explicit accessible label. A tooltip alone does not
+/// count: it is not reliably exposed as a name.
+pub fn icon_only_without_label(root: &gtk4::Widget) -> Vec<String> {
+    use gtk4::prelude::*;
+    let mut out = Vec::new();
+    for widget in descendants(root) {
+        let icon_name = if let Some(b) = widget.downcast_ref::<gtk4::Button>() {
+            b.icon_name().filter(|n| !n.is_empty())
+        } else if let Some(b) = widget.downcast_ref::<gtk4::MenuButton>() {
+            b.icon_name().filter(|n| !n.is_empty())
+        } else {
+            None
+        };
+        if !widget.is::<gtk4::Button>() && !widget.is::<gtk4::MenuButton>() {
+            continue;
+        }
+        let inner = widget
+            .parent()
+            .is_some_and(|p| p.is::<gtk4::MenuButton>() || p.is::<adw::SplitButton>());
+        if inner || !shown_or_in_popover(&widget) {
+            continue;
+        }
+        let has_text = descendants(&widget).iter().any(|w| {
+            w.downcast_ref::<gtk4::Label>()
+                .is_some_and(|l| !l.text().is_empty())
+        });
+        let has_icon = icon_name.is_some()
+            || descendants(&widget)
+                .iter()
+                .any(|w| w.is::<gtk4::Image>() || w.is::<gtk4::Picture>());
+        if has_icon
+            && !has_text
+            && !gtk4::test_accessible_has_property(&widget, gtk4::AccessibleProperty::Label)
+        {
+            out.push(format!(
+                "{} shows an icon with no text and no accessible label (tooltip {:?})",
+                describe_button(&widget),
+                widget.tooltip_text()
+            ));
+        }
+    }
+    out
 }
 
 /// Runs the loop until nothing has happened for 100 ms (layout, scrolling and idle work have

@@ -3130,6 +3130,13 @@ pub(super) struct Sidebar {
     _usage: Rc<UsageIndicator>,
 }
 
+/// The sidebar toggle's words, as its tooltip and its accessible name (a tooltip alone is not
+/// reliably read as a name), so both follow the thread counts it reports.
+fn set_toggle_words(toggle: &gtk4::ToggleButton, text: &str) {
+    toggle.set_tooltip_text(Some(text));
+    toggle.update_property(&[gtk4::accessible::Property::Label(text)]);
+}
+
 fn sidebar_focus_target(
     sidebar: &Sidebar,
     focus: &gtk4::Widget,
@@ -3254,6 +3261,7 @@ impl AgentTerminalWindow {
                 .tooltip_text("Show or Hide Threads (F9)")
                 .active(split.shows_sidebar())
                 .build();
+            set_toggle_words(&toggle, "Show or Hide Threads (F9)");
             split
                 .bind_property("show-sidebar", &toggle, "active")
                 .bidirectional()
@@ -3579,7 +3587,7 @@ impl AgentTerminalWindow {
         if sidebar_shown {
             toggle.remove_css_class("needs-attention");
             toggle.remove_css_class("has-unread");
-            toggle.set_tooltip_text(Some("Show or Hide Threads (F9)"));
+            set_toggle_words(&toggle, "Show or Hide Threads (F9)");
             return;
         }
         let rows = self.sidebar_rows();
@@ -3601,7 +3609,7 @@ impl AgentTerminalWindow {
                 1 => "Show Threads (1 thread needs approval · F9)".to_string(),
                 n => format!("Show Threads ({n} threads need approval · F9)"),
             };
-            toggle.set_tooltip_text(Some(&text));
+            set_toggle_words(&toggle, &text);
         } else if unread > 0 {
             toggle.remove_css_class("needs-attention");
             toggle.add_css_class("has-unread");
@@ -3609,11 +3617,11 @@ impl AgentTerminalWindow {
                 1 => "Show Threads (1 unread thread · F9)".to_string(),
                 n => format!("Show Threads ({n} unread threads · F9)"),
             };
-            toggle.set_tooltip_text(Some(&text));
+            set_toggle_words(&toggle, &text);
         } else {
             toggle.remove_css_class("needs-attention");
             toggle.remove_css_class("has-unread");
-            toggle.set_tooltip_text(Some("Show or Hide Threads (F9)"));
+            set_toggle_words(&toggle, "Show or Hide Threads (F9)");
         }
     }
 
@@ -4357,6 +4365,9 @@ impl AgentTerminalWindow {
             .valign(Align::Center)
             .css_classes(["flat", "folder-new-thread"])
             .build();
+        new.update_property(&[gtk4::accessible::Property::Label(
+            "New thread in this folder",
+        )]);
         new.connect_clicked(glib::clone!(
             #[weak]
             obj,
@@ -4514,6 +4525,7 @@ impl AgentTerminalWindow {
                 .css_classes(["flat", "circular", "thread-delete"])
                 .valign(Align::Center)
                 .build();
+            delete.update_property(&[gtk4::accessible::Property::Label("Delete thread")]);
             let thread = thread_id.clone();
             delete.connect_clicked(glib::clone!(
                 #[weak]
@@ -4529,6 +4541,7 @@ impl AgentTerminalWindow {
                 .css_classes(["flat", "circular", "thread-close"])
                 .valign(Align::Center)
                 .build();
+            close.update_property(&[gtk4::accessible::Property::Label("Close thread")]);
             let key = row.key.clone();
             close.connect_clicked(glib::clone!(
                 #[weak]

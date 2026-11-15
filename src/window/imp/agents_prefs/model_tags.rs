@@ -275,6 +275,7 @@ impl AgentTerminalWindow {
             .valign(gtk4::Align::Center)
             .css_classes(["flat"])
             .build();
+        refresh.update_property(&[gtk4::accessible::Property::Label("List the models again")]);
         let group = adw::PreferencesGroup::builder()
             .title("Model Tags")
             .description(GROUP_HELP)

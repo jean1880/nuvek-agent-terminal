@@ -209,7 +209,7 @@ pub struct DiffPanel {
     /// while the panel is popped out (then it is hidden and empty).
     pub root: gtk4::Box,
     /// Everything the panel shows: in `root`, or in its own window when popped out.
-    content: gtk4::Box,
+    pub(in crate::window) content: gtk4::Box,
     /// The window the panel is popped out into, if it is.
     detached: Rc<RefCell<Option<adw::Window>>>,
     /// The parent window's destroy handler while popped out, to drop on docking.
@@ -280,6 +280,7 @@ impl DiffPanel {
             .tooltip_text("Refresh")
             .css_classes(["flat"])
             .build();
+        refresh.update_property(&[gtk4::accessible::Property::Label("Refresh changes")]);
         let header = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Horizontal)
             .spacing(6)
@@ -296,6 +297,7 @@ impl DiffPanel {
             .css_classes(["flat"])
             .visible(false)
             .build();
+        undo.update_property(&[gtk4::accessible::Property::Label("Undo these changes")]);
         let pop = gtk4::Button::builder()
             .icon_name(crate::icons::POP_OUT_ICON)
             .css_classes(["flat"])

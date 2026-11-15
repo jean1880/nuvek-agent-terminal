@@ -8416,23 +8416,43 @@ mod tests {
         crate::testutil::pump_until(&ctx, 5, || window.visible_dialog().is_some());
         crate::testutil::settle(&ctx);
         let dialog = window.visible_dialog().expect("Settings is open");
-        // An entry row that offers Apply shows its button once its text has changed.
+        // An entry row that offers Apply shows its button once its text has been edited, which
+        // libadwaita counts only while the row's text has focus: the focus-within flag stands in
+        // for a focused window, so no key event or wait is needed.
         let rows = crate::testutil::find_all::<adw::EntryRow>(dialog.upcast_ref());
         let row = rows
             .iter()
             .find(|r| r.shows_apply_button())
             .expect("an entry row with an apply button");
+        let text = row
+            .delegate()
+            .and_then(|d| d.dynamic_cast::<gtk4::Widget>().ok())
+            .expect("the entry row's text");
+        text.set_state_flags(gtk4::StateFlags::FOCUS_WITHIN, false);
         row.set_text("changed");
-        crate::testutil::settle(&ctx);
+        let settings_buttons = audit("settings", dialog.upcast_ref());
+        let applies = crate::testutil::audited_buttons(dialog.upcast_ref())
+            .iter()
+            .filter(|b| crate::a11y::is_apply_button(b))
+            .count();
+        eprintln!("settings: {applies} of them apply buttons");
         assert!(
-            audit("settings", dialog.upcast_ref()) > 10,
-            "Settings' buttons were walked"
+            applies > 0,
+            "a shown apply button is audited (an apply button appears only once its row's text \
+             was edited)"
         );
+        // No page goes unaudited: each is shown (a hidden one would be skipped), and what the
+        // pages hold apart from apply buttons does not depend on the libadwaita version.
+        for page in crate::testutil::find_all::<adw::PreferencesPage>(dialog.upcast_ref()) {
+            assert!(
+                crate::testutil::shown_or_in_popover(page.upcast_ref()),
+                "Settings page {:?} is hidden, so its buttons are not audited",
+                adw::prelude::PreferencesPageExt::title(&page)
+            );
+        }
         assert!(
-            crate::testutil::audited_buttons(dialog.upcast_ref())
-                .iter()
-                .any(|b| b.has_css_class("apply-button")),
-            "a shown apply button is audited"
+            settings_buttons - applies > 30,
+            "Settings' buttons were walked ({settings_buttons}, {applies} of them apply buttons)"
         );
         dialog.close();
         crate::testutil::settle(&ctx);

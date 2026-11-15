@@ -23,17 +23,40 @@ pub fn name_spin_buttons(spin: &gtk4::SpinButton, what: &str) {
     }
 }
 
-/// Names the checkmark button an entry row shows once its text has changed. libadwaita builds
-/// that button when the text first changes, so the row is named again on each change.
-pub fn name_apply_button(row: &adw::EntryRow) {
-    name_apply_button_now(row);
-    row.connect_changed(name_apply_button_now);
+/// Whether `widget` is an entry row's apply button, on any libadwaita the app supports.
+/// libadwaita 1.9 gives it an `apply-button` style class; 1.5 has only `suggested-action` and
+/// `circular`, so there it is the row's round accent button that is not one of the row's
+/// prefixes or suffixes (which hold the app's own widgets).
+pub fn is_apply_button(widget: &gtk4::Widget) -> bool {
+    if !widget.is::<gtk4::Button>() {
+        return false;
+    }
+    if widget.has_css_class("apply-button") {
+        return true;
+    }
+    if !(widget.has_css_class("suggested-action") && widget.has_css_class("circular")) {
+        return false;
+    }
+    let mut at = widget.parent();
+    while let Some(parent) = at {
+        if parent.has_css_class("suffixes") || parent.has_css_class("prefixes") {
+            return false;
+        }
+        if parent.is::<adw::EntryRow>() {
+            return true;
+        }
+        at = parent.parent();
+    }
+    false
 }
 
-fn name_apply_button_now(row: &adw::EntryRow) {
+/// Names the checkmark button an entry row has (it is built with the row and shown once the
+/// text has been edited). Found by what it is, not where it sits: libadwaita 1.5 puts it
+/// beside the editable area, 1.9 inside it.
+pub fn name_apply_button(row: &adw::EntryRow) {
     let mut stack = vec![row.clone().upcast::<gtk4::Widget>()];
     while let Some(widget) = stack.pop() {
-        if widget.is::<gtk4::Button>() && widget.has_css_class("apply-button") {
+        if is_apply_button(&widget) {
             widget.update_property(&[gtk4::accessible::Property::Label("Apply")]);
             return;
         }

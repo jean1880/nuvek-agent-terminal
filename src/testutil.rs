@@ -480,7 +480,7 @@ pub fn audited_buttons(root: &gtk4::Widget) -> Vec<gtk4::Widget> {
 /// An entry row's apply button on a row that does not show one: it exists but never appears.
 fn unused_apply_button(widget: &gtk4::Widget) -> bool {
     use gtk4::prelude::*;
-    if !widget.has_css_class("apply-button") {
+    if !crate::a11y::is_apply_button(widget) {
         return false;
     }
     let mut at = widget.parent();

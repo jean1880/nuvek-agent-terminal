@@ -703,8 +703,19 @@ fn watch_system() {
     }
 }
 
+/// `css` without its `:root` block when the libadwaita in use (`adw_minor`, of major version 1)
+/// predates 1.6: GTK before 4.16 has no `:root` selector and warns about the rule, and such a
+/// libadwaita reads the legacy named colours instead.
+fn without_unsupported_root(css: &str, adw_minor: u32) -> &str {
+    if adw_minor >= 6 {
+        return css;
+    }
+    css.find(":root {").map_or(css, |at| &css[..at])
+}
+
 /// Replaces the theme stylesheet with `css`.
 fn load(css: &str) {
+    let css = without_unsupported_root(css, adw::minor_version());
     let Some(display) = gdk::Display::default() else {
         return;
     };
@@ -726,6 +737,18 @@ fn load(css: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `:root` variables go only to a libadwaita that reads them (1.6 and later); the
+    /// named colours before them stay for every version.
+    #[test]
+    fn the_root_block_is_left_out_before_libadwaita_1_6() {
+        let css = Chrome::agent_terminal().css();
+        assert!(css.contains(":root {"));
+        assert_eq!(without_unsupported_root(&css, 6), css);
+        let old = without_unsupported_root(&css, 5);
+        assert!(!old.contains(":root") && !old.contains("--window-bg-color"));
+        assert!(old.contains("@define-color window_bg_color"));
+    }
 
     /// Every theme defines every name: a stylesheet naming one a theme lacks would draw it
     /// transparent (or not at all).

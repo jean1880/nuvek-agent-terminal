@@ -623,6 +623,13 @@ pub struct Gauge {
     pub auto_compact_at: Option<u64>,
 }
 
+impl Gauge {
+    /// The pure reading the header, the popover and the `/context` panel share.
+    pub fn meter(&self) -> agent_core::context_meter::ContextMeter {
+        agent_core::context_meter::ContextMeter::new(self.used, self.max, self.auto_compact_at)
+    }
+}
+
 /// What the thread is doing, counting its background work as well as the main agent's turn: the
 /// one status the view shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2735,21 +2742,7 @@ pub fn is_switch_continuation(text: &str) -> bool {
     text == crate::chat::SWITCH_CONTINUATION
 }
 
-pub fn format_tokens(n: u64) -> String {
-    if n < 1_000 {
-        n.to_string()
-    } else if n < 1_000_000 {
-        let k = n as f64 / 1_000.0;
-        if k < 10.0 {
-            format!("{k:.1}k").replace(".0k", "k")
-        } else {
-            format!("{}k", (k).round() as u64)
-        }
-    } else {
-        let m = n as f64 / 1_000_000.0;
-        format!("{m:.1}M").replace(".0M", "M")
-    }
-}
+pub use agent_core::context_meter::format_tokens;
 
 #[cfg(test)]
 mod tests {

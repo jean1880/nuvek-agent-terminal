@@ -148,6 +148,7 @@
 .usage-popover contents { background-color: @at_surface; color: @at_fg; }
 .gauge { padding: 2px 8px; border-radius: 8px; }
 .gauge .gauge-text { color: @at_fg_dim; font-family: monospace; font-size: 0.85em; }
+.gauge .gauge-text.gauge-unknown { opacity: 0.6; }
 
 levelbar.context-level trough {
     min-height: 6px;

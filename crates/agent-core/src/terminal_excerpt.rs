@@ -180,8 +180,10 @@ pub fn format_excerpt(raw: &str, caps: Caps) -> Option<Excerpt> {
     let mut cut_line = false;
     let len = body.chars().count();
     if len > caps.max_chars {
-        // One line alone is over the cap: keep its end.
-        body = body.chars().skip(len - caps.max_chars).collect();
+        // One line alone is over the cap: keep its end, never starting inside a mask.
+        let chars: Vec<char> = body.chars().collect();
+        let from = snap_past_mask(&chars, len - caps.max_chars);
+        body = chars[from..].iter().collect();
         cut_line = true;
         trim = Some(Trim::Chars);
     }
@@ -208,6 +210,37 @@ pub fn format_excerpt(raw: &str, caps: Caps) -> Option<Excerpt> {
         trimmed_by: trim,
         masked,
     })
+}
+
+/// `cut`, moved forward to the end of the mask it falls inside (`****` and up to four characters,
+/// or a PEM marker), so a tail never starts with half a mask that `count_masks` would miss.
+fn snap_past_mask(chars: &[char], cut: usize) -> usize {
+    const PEM: &str = "[REDACTED PEM BLOCK]";
+    let at = |s: usize, pat: &str| {
+        pat.chars()
+            .enumerate()
+            .all(|(k, p)| chars.get(s + k) == Some(&p))
+    };
+    let mut snapped = cut;
+    for s in cut.saturating_sub(PEM.len())..cut {
+        let end = if at(s, "****") {
+            // The mask is the stars and at most four more characters on the same line.
+            let tail = chars[(s + 4).min(chars.len())..]
+                .iter()
+                .take(4)
+                .take_while(|c| **c != '\n')
+                .count();
+            s + 4 + tail
+        } else if at(s, PEM) {
+            s + PEM.len()
+        } else {
+            continue;
+        };
+        if cut < end {
+            snapped = snapped.max(end);
+        }
+    }
+    snapped.min(chars.len())
 }
 
 /// Masks the redaction added to the last `kept` lines of the text. Line by line when redaction
@@ -423,6 +456,9 @@ mod tests {
                 let e = format_excerpt(&raw, caps).unwrap();
                 assert!(e.truncated);
                 assert!(!e.text.contains("VALUE"), "{word}: {}", e.text);
+                if word == "ghp_" {
+                    assert!(!e.text.contains("p_"), "{}", e.text);
+                }
                 assert!(
                     !e.text.contains("arer") && !e.text.contains("_key"),
                     "{}",
@@ -441,6 +477,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_char_cap_never_starts_inside_a_mask() {
+        // "API_TOKEN=****ter2" is 18 characters; the mask fills the last eight.
+        let raw = "API_TOKEN=hunter2hunter2";
+        let caps = |max_chars| Caps {
+            max_lines: 5,
+            max_chars,
+        };
+        // A cap of 6 would start inside the stars: the whole mask goes instead of half of it.
+        let e = format_excerpt(raw, caps(6)).unwrap();
+        assert!(e.truncated);
+        assert!(!e.text.contains("**"), "{}", e.text);
+        assert_eq!(e.masked, 0);
+        // A cap of 8 starts exactly on the mask: it stays whole and is counted.
+        let e = format_excerpt(raw, caps(8)).unwrap();
+        assert_eq!(body(&e), "[... start of the text omitted ...]\n****ter2");
+        assert_eq!(e.masked, 1);
+        // The helper on its own, for the PEM marker too.
+        let chars: Vec<char> = "ab[REDACTED PEM BLOCK]cd".chars().collect();
+        assert_eq!(snap_past_mask(&chars, 10), 22);
+        assert_eq!(snap_past_mask(&chars, 2), 2);
+        assert_eq!(snap_past_mask(&chars, 22), 22);
     }
 
     #[test]

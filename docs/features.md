@@ -184,7 +184,10 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
 
 - **Themes**, in Settings → General → Appearance:
   - **Agent Terminal** (default), Dracula, Nord, Gruvbox Dark, Solarized Dark, One Dark
-    and Monokai. Each applies live to the whole app: threads, terminals and diffs.
+    and Monokai.
+  - **Agent Terminal Light**, Solarized Light, Gruvbox Light, One Light and GitHub
+    Light turn the whole window light, code blocks included.
+  - Each applies live to the whole app: threads, terminals and diffs.
   - **Use System Theme** has no colours of its own. It takes them from your desktop's
     GTK theme (light or dark, its accent colour, any `~/.config/gtk-4.0/gtk.css`) and
     follows it as it changes. Terminals get the desktop's text and background with

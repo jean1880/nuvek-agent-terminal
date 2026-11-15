@@ -158,6 +158,62 @@ impl Theme {
                     0x75715e, 0xf92672, 0xa6e22e, 0xf4bf75, 0x66d9ef, 0xae81ff, 0xa1efe4, 0xf9f8f5,
                 ],
             ),
+            ThemeChoice::AgentTerminalLight => Self::scheme(
+                0xfbf9ff,
+                0x2a2547,
+                0x6a4fd6,
+                0xd9d0ff,
+                [
+                    0x2d283e, 0xc2323f, 0x1a7f5a, 0x8a5a00, 0x1f6fb5, 0x6a4fd6, 0x0e7490, 0xd8d4e8,
+                    0x6d6794, 0xd9455a, 0x23956c, 0xa66a00, 0x2f82cf, 0x8468ea, 0x1792b0, 0xffffff,
+                ],
+            ),
+            ThemeChoice::SolarizedLight => Self {
+                // Selected text is Solarized's darker base: its text colour reads only 4.4:1 on
+                // the selection.
+                highlight_fg: hex(0x073642),
+                ..Self::scheme(
+                    0xfdf6e3,
+                    0x586e75,
+                    0x586e75,
+                    0xeee8d5,
+                    [
+                        0x073642, 0xdc322f, 0x859900, 0xb58900, 0x268bd2, 0xd33682, 0x2aa198,
+                        0xeee8d5, 0x002b36, 0xcb4b16, 0x586e75, 0x657b83, 0x839496, 0x6c71c4,
+                        0x93a1a1, 0xfdf6e3,
+                    ],
+                )
+            },
+            ThemeChoice::GruvboxLight => Self::scheme(
+                0xfbf1c7,
+                0x3c3836,
+                0x3c3836,
+                0xd5c4a1,
+                [
+                    0xfbf1c7, 0xcc241d, 0x98971a, 0xd79921, 0x458588, 0xb16286, 0x689d6a, 0x7c6f64,
+                    0x928374, 0x9d0006, 0x79740e, 0xb57614, 0x076678, 0x8f3f71, 0x427b58, 0x3c3836,
+                ],
+            ),
+            ThemeChoice::OneLight => Self::scheme(
+                0xfafafa,
+                0x383a42,
+                0x526fff,
+                0xe5e5e6,
+                [
+                    0x383a42, 0xe45649, 0x50a14f, 0xc18401, 0x4078f2, 0xa626a4, 0x0184bc, 0xa0a1a7,
+                    0x4f525e, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xffffff,
+                ],
+            ),
+            ThemeChoice::GithubLight => Self::scheme(
+                0xffffff,
+                0x24292f,
+                0x0969da,
+                0xb6e3ff,
+                [
+                    0x24292f, 0xcf222e, 0x116329, 0x4d2d00, 0x0969da, 0x8250df, 0x1b7c83, 0x6e7781,
+                    0x57606a, 0xa40e26, 0x1a7f37, 0x633c01, 0x218bff, 0xa475f9, 0x3192aa, 0x8c959f,
+                ],
+            ),
         })
     }
 
@@ -250,6 +306,11 @@ impl Theme {
                 f64::from(c.blue()),
             )
         };
+        // A light scheme's red, green and cyan sit below AA on its background (Solarized's green
+        // is 2.9:1 on cream): its lines take the window's lifted success, danger and info.
+        let lifted = (choice.is_light() == Some(true))
+            .then(|| crate::palette::Chrome::for_choice(choice))
+            .flatten();
         let meta = rgb(&theme.palette[8])
             .readable_on(
                 rgb(&theme.background),
@@ -260,9 +321,15 @@ impl Theme {
         DiffColours {
             background: theme.background,
             text: theme.foreground,
-            added: theme.palette[2],
-            removed: theme.palette[1],
-            hunk: theme.palette[6],
+            added: lifted
+                .as_ref()
+                .map_or(theme.palette[2], |c| c.success.to_rgba()),
+            removed: lifted
+                .as_ref()
+                .map_or(theme.palette[1], |c| c.danger.to_rgba()),
+            hunk: lifted
+                .as_ref()
+                .map_or(theme.palette[6], |c| c.info.to_rgba()),
             meta,
             file: theme.bold,
         }
@@ -315,5 +382,71 @@ mod tests {
         // Solarized's bright black is its background: lifted.
         let diff = Theme::diff_colours(ThemeChoice::SolarizedDark);
         assert_ne!(rgb_of(&diff.meta).hex(), rgb_of(&diff.background).hex());
+    }
+
+    fn light_choices() -> impl Iterator<Item = ThemeChoice> {
+        ThemeChoice::ALL
+            .into_iter()
+            .filter(|c| c.is_light() == Some(true))
+    }
+
+    #[test]
+    fn every_light_theme_diff_lines_read() {
+        for choice in light_choices() {
+            let diff = Theme::diff_colours(choice);
+            let bg = rgb_of(&diff.background);
+            for (role, colour) in [
+                ("text", &diff.text),
+                ("added", &diff.added),
+                ("removed", &diff.removed),
+                ("hunk", &diff.hunk),
+                ("meta", &diff.meta),
+                ("file", &diff.file),
+            ] {
+                let ratio = rgb_of(colour).contrast(bg);
+                assert!(
+                    ratio >= MIN_TEXT_CONTRAST,
+                    "{choice:?}: {role} at {ratio:.2}:1"
+                );
+            }
+        }
+    }
+
+    /// A dark scheme's diff lines are its own palette slots, untouched by the light handling.
+    #[test]
+    fn dark_diff_colours_stay_the_palettes_own() {
+        for choice in ThemeChoice::ALL {
+            if choice.is_light() != Some(false) {
+                continue;
+            }
+            let theme = Theme::for_choice(choice).expect("bundled");
+            let diff = Theme::diff_colours(choice);
+            assert_eq!(diff.added, theme.palette[2], "{choice:?}");
+            assert_eq!(diff.removed, theme.palette[1], "{choice:?}");
+            assert_eq!(diff.hunk, theme.palette[6], "{choice:?}");
+        }
+    }
+
+    #[test]
+    fn light_terminal_text_reads() {
+        for choice in light_choices() {
+            let theme = Theme::for_choice(choice).expect("bundled");
+            let bg = rgb_of(&theme.background);
+            for (role, colour, ground) in [
+                ("text", &theme.foreground, bg),
+                ("bold", &theme.bold, bg),
+                (
+                    "selected text",
+                    &theme.highlight_fg,
+                    rgb_of(&theme.highlight_bg),
+                ),
+            ] {
+                let ratio = rgb_of(colour).contrast(ground);
+                assert!(
+                    ratio >= MIN_TEXT_CONTRAST,
+                    "{choice:?}: {role} at {ratio:.2}:1"
+                );
+            }
+        }
     }
 }

@@ -701,6 +701,11 @@ pub enum ThemeChoice {
     SolarizedDark,
     OneDark,
     Monokai,
+    AgentTerminalLight,
+    SolarizedLight,
+    GruvboxLight,
+    OneLight,
+    GithubLight,
 }
 
 impl std::fmt::Display for ThemeChoice {
@@ -714,6 +719,11 @@ impl std::fmt::Display for ThemeChoice {
             ThemeChoice::SolarizedDark => "Solarized Dark",
             ThemeChoice::OneDark => "One Dark",
             ThemeChoice::Monokai => "Monokai",
+            ThemeChoice::AgentTerminalLight => "Agent Terminal Light",
+            ThemeChoice::SolarizedLight => "Solarized Light",
+            ThemeChoice::GruvboxLight => "Gruvbox Light",
+            ThemeChoice::OneLight => "One Light",
+            ThemeChoice::GithubLight => "GitHub Light",
         };
         f.write_str(name)
     }
@@ -721,7 +731,7 @@ impl std::fmt::Display for ThemeChoice {
 
 impl ThemeChoice {
     /// All choices in display order; the index matches the settings dropdown.
-    pub const ALL: [ThemeChoice; 8] = [
+    pub const ALL: [ThemeChoice; 13] = [
         ThemeChoice::System,
         ThemeChoice::AgentTerminal,
         ThemeChoice::Dracula,
@@ -730,7 +740,33 @@ impl ThemeChoice {
         ThemeChoice::SolarizedDark,
         ThemeChoice::OneDark,
         ThemeChoice::Monokai,
+        ThemeChoice::AgentTerminalLight,
+        ThemeChoice::SolarizedLight,
+        ThemeChoice::GruvboxLight,
+        ThemeChoice::OneLight,
+        ThemeChoice::GithubLight,
     ];
+
+    /// Whether the bundled palette is light (`Some(true)`) or dark (`Some(false)`); `None` for
+    /// the system theme, whose polarity is the desktop's. The match is exhaustive, so a new
+    /// variant must be classified.
+    pub fn is_light(self) -> Option<bool> {
+        match self {
+            ThemeChoice::System => None,
+            ThemeChoice::AgentTerminal
+            | ThemeChoice::Dracula
+            | ThemeChoice::Nord
+            | ThemeChoice::GruvboxDark
+            | ThemeChoice::SolarizedDark
+            | ThemeChoice::OneDark
+            | ThemeChoice::Monokai => Some(false),
+            ThemeChoice::AgentTerminalLight
+            | ThemeChoice::SolarizedLight
+            | ThemeChoice::GruvboxLight
+            | ThemeChoice::OneLight
+            | ThemeChoice::GithubLight => Some(true),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -2073,10 +2109,15 @@ mod tests {
                 ThemeChoice::SolarizedDark => 5,
                 ThemeChoice::OneDark => 6,
                 ThemeChoice::Monokai => 7,
+                ThemeChoice::AgentTerminalLight => 8,
+                ThemeChoice::SolarizedLight => 9,
+                ThemeChoice::GruvboxLight => 10,
+                ThemeChoice::OneLight => 11,
+                ThemeChoice::GithubLight => 12,
             }
         }
 
-        assert_eq!(ThemeChoice::ALL.len(), 8);
+        assert_eq!(ThemeChoice::ALL.len(), 13);
         for theme in ThemeChoice::ALL {
             let index = expected_index(theme);
             assert_eq!(ThemeChoice::ALL[index], theme);
@@ -2098,6 +2139,52 @@ mod tests {
             serde_json::to_string(&old).expect("serialises"),
             "\"agent-terminal\""
         );
+    }
+
+    /// Every variant is classified, the system theme as neither, and the new schemes load and
+    /// save under their kebab-case names.
+    #[test]
+    fn is_light_classifies_every_variant() {
+        assert_eq!(ThemeChoice::System.is_light(), None);
+        let light: Vec<ThemeChoice> = ThemeChoice::ALL
+            .into_iter()
+            .filter(|t| t.is_light() == Some(true))
+            .collect();
+        assert_eq!(
+            light,
+            [
+                ThemeChoice::AgentTerminalLight,
+                ThemeChoice::SolarizedLight,
+                ThemeChoice::GruvboxLight,
+                ThemeChoice::OneLight,
+                ThemeChoice::GithubLight,
+            ]
+        );
+        for dark in [
+            ThemeChoice::AgentTerminal,
+            ThemeChoice::Dracula,
+            ThemeChoice::Nord,
+            ThemeChoice::GruvboxDark,
+            ThemeChoice::SolarizedDark,
+            ThemeChoice::OneDark,
+            ThemeChoice::Monokai,
+        ] {
+            assert_eq!(dark.is_light(), Some(false), "{dark}");
+        }
+        for (theme, name) in [
+            (ThemeChoice::AgentTerminalLight, "agent-terminal-light"),
+            (ThemeChoice::SolarizedLight, "solarized-light"),
+            (ThemeChoice::GruvboxLight, "gruvbox-light"),
+            (ThemeChoice::OneLight, "one-light"),
+            (ThemeChoice::GithubLight, "github-light"),
+        ] {
+            let json = format!("\"{name}\"");
+            assert_eq!(serde_json::to_string(&theme).expect("serialises"), json);
+            assert_eq!(
+                serde_json::from_str::<ThemeChoice>(&json).expect("loads"),
+                theme
+            );
+        }
     }
 
     #[test]

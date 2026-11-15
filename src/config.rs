@@ -708,6 +708,16 @@ pub enum ThemeChoice {
     GithubLight,
 }
 
+/// A `theme` this build does not know (a later version's scheme) loads as the default theme
+/// instead of failing the whole file, which would reset every setting.
+fn tolerant_theme<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ThemeChoice, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(value.clone()).unwrap_or_else(|_| {
+        warn!("unknown theme {value}; using the default theme");
+        ThemeChoice::default()
+    }))
+}
+
 impl std::fmt::Display for ThemeChoice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
@@ -792,6 +802,7 @@ pub struct TerminalConfig {
     /// config keeps its chosen client across the upgrade; see [`Self::normalize`].
     pub cli_client: CliClient,
     pub starting_directory: String,
+    #[serde(deserialize_with = "tolerant_theme")]
     pub theme: ThemeChoice,
     /// The sessions offered in Settings and the new-tab menu.
     pub profiles: Vec<Profile>,
@@ -2235,6 +2246,29 @@ mod tests {
             leftovers.is_empty(),
             "temp files left behind: {leftovers:?}"
         );
+    }
+
+    /// A theme a later build added must not reset every setting: it loads as the default theme
+    /// and the rest of the file is kept.
+    #[test]
+    fn an_unknown_theme_loads_as_the_default_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            br#"{"theme":"solarized-twilight","scrollback_lines":777}"#,
+        )
+        .unwrap();
+        let loaded = TerminalConfig::read_config(&path)
+            .expect("the file is valid")
+            .expect("it exists");
+        assert_eq!(loaded.theme, ThemeChoice::default());
+        assert_eq!(loaded.scrollback_lines, 777);
+        // A non-string value is tolerated the same way.
+        std::fs::write(&path, br#"{"theme":42,"scrollback_lines":778}"#).unwrap();
+        let loaded = TerminalConfig::read_config(&path).unwrap().unwrap();
+        assert_eq!(loaded.theme, ThemeChoice::default());
+        assert_eq!(loaded.scrollback_lines, 778);
     }
 
     #[test]

@@ -1041,8 +1041,8 @@ mod tests {
 
     #[test]
     fn gauge_bar_follows_state_and_popover_rows_wait_for_the_turn() {
-        gtk4::init().expect("GTK init");
-        adw::init().expect("adw init");
+        crate::testutil::gtk_init().expect("GTK init");
+        crate::testutil::adw_init().expect("adw init");
         super::super::load_style();
         let header = Header::new();
         let known = Gauge {

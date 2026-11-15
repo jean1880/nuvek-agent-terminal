@@ -104,6 +104,28 @@ agent switches, notices and carried-in context. Tool output over 20,000 characte
 
 Fields are only ever added within a version; removing or renaming one raises `version`.
 
+### Pinning threads
+
+A thread's context menu (right-click, the Menu key or `Shift+F10`) has, next to **Archive**:
+
+| Entry | Shown | Does |
+|---|---|---|
+| **Pin to Top** | an unpinned thread | adds it to the end of the **Pinned** section |
+| **Unpin** | a pinned thread | returns it to its folder (or **Active**) |
+| **Move Up**, **Move Down** | a pinned thread | moves it one place along **Pinned** |
+
+Each shows a toast with **Undo**; undoing an unpin puts the thread back in the place it had.
+The Pinned section lists threads in the order you set, not by recency, above **Active**.
+A pinned thread is listed once: a pinned thread that is also active stays under Pinned
+with its badge, and the **Active** header counts it. Archiving keeps the pin; an archived
+pinned thread shows only with **Show Archived**, or while it is open. Pinning and moving
+never change a thread's last-active time. Deleting a thread removes its pin.
+
+| Shortcut | Does |
+|---|---|
+| `Ctrl+Shift+P` | pins or unpins the shown thread |
+| `Alt+Shift+Up`, `Alt+Shift+Down` | moves the selected pinned row in the sidebar |
+
 ### Status indicators
 
 Optional header-bar lights driven by a file or a command. Empty by default.

@@ -378,6 +378,8 @@ pub struct SidebarRow {
     pub open: OpenState,
     /// Archived threads are hidden unless the sidebar's "Show Archived" toggle is on.
     pub archived: bool,
+    /// A pinned thread's place in the Pinned section (0 is first); `None` when not pinned.
+    pub pin_rank: Option<i64>,
 }
 
 /// Rows matching `query` (case-insensitive, on title and folder), grouped by folder. Groups are
@@ -420,31 +422,61 @@ pub fn is_active(row: &SidebarRow) -> bool {
     )
 }
 
-/// The sidebar's two sections: the active threads ([`is_active`]) on their own, most urgent
-/// first (an approval, a rate limit, then working, then background work) and newest within each;
-/// then every other thread grouped by folder as [`group_rows`] does, ordered by the newest of
-/// what is left. The same search and archive filter applies to both, and an active thread is
-/// listed once, in the active section only.
+/// The sidebar's three sections ([`sidebar_sections`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SidebarSections {
+    /// The pinned threads, in the order the user gave them. A pinned thread is listed here only,
+    /// whatever its badge, and leaves its folder group.
+    pub pinned: Vec<SidebarRow>,
+    /// The other active threads ([`is_active`]), most urgent first.
+    pub active: Vec<SidebarRow>,
+    /// Every remaining thread, grouped by folder.
+    pub groups: Vec<(String, Vec<SidebarRow>)>,
+}
+
+impl SidebarSections {
+    /// How many pinned threads are active: they are not in the active section, so its header
+    /// counts them.
+    pub fn pinned_active(&self) -> usize {
+        self.pinned.iter().filter(|r| is_active(r)).count()
+    }
+}
+
+/// The sidebar's three sections: the pinned threads in the user's order; then the active threads
+/// ([`is_active`]) on their own, most urgent first (an approval, a rate limit, then working, then
+/// background work) and newest within each; then every other thread grouped by folder as
+/// [`group_rows`] does, ordered by the newest of what is left. The same search and archive filter
+/// applies to all three (an archived pinned thread shows only with `show_archived` or while it is
+/// open), and a thread is listed once: pinned first, else active, else in its folder.
 pub fn sidebar_sections(
     rows: Vec<SidebarRow>,
     query: &str,
     show_archived: bool,
-) -> (Vec<SidebarRow>, Vec<(String, Vec<SidebarRow>)>) {
+) -> SidebarSections {
+    let mut pinned = Vec::new();
     let mut active = Vec::new();
     let mut groups: Vec<(String, Vec<SidebarRow>)> = group_rows(rows, query, show_archived)
         .into_iter()
         .filter_map(|(folder, list)| {
+            let (pins, list): (Vec<_>, Vec<_>) =
+                list.into_iter().partition(|r| r.pin_rank.is_some());
+            pinned.extend(pins);
             let (live, rest): (Vec<_>, Vec<_>) = list.into_iter().partition(is_active);
             active.extend(live);
             (!rest.is_empty()).then_some((folder, rest))
         })
         .collect();
-    // An active row that left a group may have been what put it on top.
+    // A row that left a group may have been what put it on top.
     groups.sort_by_key(|(_, list)| {
         std::cmp::Reverse(list.first().map_or(i64::MIN, |r| r.updated_ms))
     });
     active.sort_by(|a, b| a.badge.cmp(&b.badge).then(b.updated_ms.cmp(&a.updated_ms)));
-    (active, groups)
+    pinned.sort_by_key(|r| (r.pin_rank, std::cmp::Reverse(r.updated_ms)));
+    SidebarSections {
+        pinned,
+        active,
+        groups,
+    }
 }
 
 /// A folder group as the sidebar draws it: its header, and the rows under it.
@@ -493,6 +525,9 @@ pub fn fold_groups(
 /// shown, whether the window has focus (it decides which rows glow) and the search text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarModel {
+    pub pinned: Vec<SidebarRow>,
+    /// Pinned threads that are also active, counted in the active header.
+    pub pinned_active: usize,
     pub active: Vec<SidebarRow>,
     pub groups: Vec<FolderGroup>,
     pub selected: Option<RowKey>,
@@ -501,10 +536,12 @@ pub struct SidebarModel {
 }
 
 impl SidebarModel {
-    /// The rows in the order the list draws them: the active section, then each folder group.
+    /// The rows in the order the list draws them: the pinned section, the active section, then
+    /// each folder group.
     pub fn rows(&self) -> impl Iterator<Item = &SidebarRow> {
-        self.active
+        self.pinned
             .iter()
+            .chain(self.active.iter())
             .chain(self.groups.iter().flat_map(|g| g.rows.iter()))
     }
 }
@@ -527,7 +564,11 @@ pub fn redraw_for(drawn: Option<&SidebarModel>, next: &SidebarModel) -> Redraw {
     let Some(drawn) = drawn else {
         return Redraw::Rebuild;
     };
-    if drawn.active != next.active || drawn.groups != next.groups || drawn.query != next.query {
+    if drawn.pinned != next.pinned
+        || drawn.active != next.active
+        || drawn.groups != next.groups
+        || drawn.query != next.query
+    {
         Redraw::Rebuild
     } else if drawn.selected != next.selected || drawn.focused != next.focused {
         Redraw::Restyle
@@ -701,6 +742,11 @@ pub enum ThreadAction {
     Export(String),
     ReviewEnvironment(String),
     CopyId(String),
+    /// Pins the thread at the end of the Pinned section.
+    Pin(String),
+    Unpin(String),
+    /// Moves a pinned thread up (negative) or down (positive) the Pinned section.
+    PinMove(String, i8),
 }
 
 /// Separates the fields of an encoded [`ThreadAction`] (never part of an id, model or effort).
@@ -745,6 +791,9 @@ impl ThreadAction {
             Self::Export(t) => simple("export", t),
             Self::ReviewEnvironment(t) => simple("review-environment", t),
             Self::CopyId(t) => simple("copy-id", t),
+            Self::Pin(t) => simple("pin", t),
+            Self::Unpin(t) => simple("unpin", t),
+            Self::PinMove(t, delta) => format!("pin-move{SEP}{t}{SEP}{delta}"),
         }
     }
 
@@ -789,6 +838,12 @@ impl ThreadAction {
             "export" => simple(Self::Export(thread)),
             "review-environment" => simple(Self::ReviewEnvironment(thread)),
             "copy-id" => simple(Self::CopyId(thread)),
+            "pin" => simple(Self::Pin(thread)),
+            "unpin" => simple(Self::Unpin(thread)),
+            "pin-move" => match rest.as_slice() {
+                [delta] => delta.parse().ok().map(|d| Self::PinMove(thread, d)),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -823,6 +878,8 @@ pub struct MenuAgent {
 pub struct ThreadMenuInput {
     pub thread: String,
     pub archived: bool,
+    /// The thread is pinned: it offers Unpin, Move Up and Move Down instead of Pin to Top.
+    pub pinned: bool,
     /// The thread has at least one message to hand over ("Continue in a new thread with…" needs one).
     pub has_messages: bool,
     /// Only enabled (and installed) agents appear.
@@ -973,15 +1030,27 @@ pub fn thread_menu(input: &ThreadMenuInput) -> Vec<MenuEntry> {
                 enabled: input.has_messages,
             },
         ]),
-        MenuEntry::Section(vec![
-            item("Rename…", ThreadAction::Rename(thread.clone())),
-            if input.archived {
+        MenuEntry::Section({
+            let mut entries = vec![
+                item("Rename…", ThreadAction::Rename(thread.clone())),
+                if input.pinned {
+                    item("Unpin", ThreadAction::Unpin(thread.clone()))
+                } else {
+                    item("Pin to Top", ThreadAction::Pin(thread.clone()))
+                },
+            ];
+            if input.pinned {
+                entries.push(item("Move Up", ThreadAction::PinMove(thread.clone(), -1)));
+                entries.push(item("Move Down", ThreadAction::PinMove(thread.clone(), 1)));
+            }
+            entries.push(if input.archived {
                 item("Unarchive", ThreadAction::Unarchive(thread.clone()))
             } else {
                 item("Archive", ThreadAction::Archive(thread.clone()))
-            },
-            item("Delete…", ThreadAction::Delete(thread.clone())),
-        ]),
+            });
+            entries.push(item("Delete…", ThreadAction::Delete(thread.clone())));
+            entries
+        }),
         MenuEntry::Section(vec![
             item("Open folder", ThreadAction::OpenFolder(thread.clone())),
             MenuEntry::Item {
@@ -1058,6 +1127,7 @@ mod tests {
             background: Vec::new(),
             open: OpenState::Here,
             archived: false,
+            pin_rank: None,
         }
     }
 
@@ -1143,8 +1213,14 @@ mod tests {
     }
 
     fn model_of(rows: Vec<SidebarRow>, selected: Option<&str>, focused: bool) -> SidebarModel {
-        let (active, groups) = sidebar_sections(rows, "", false);
+        let SidebarSections {
+            pinned,
+            active,
+            groups,
+        } = sidebar_sections(rows, "", false);
         SidebarModel {
+            pinned_active: pinned.iter().filter(|r| is_active(r)).count(),
+            pinned,
             active,
             groups: fold_groups(groups, &Default::default(), true, None),
             selected: selected.map(|id| RowKey::Thread(id.into())),
@@ -1287,6 +1363,7 @@ mod tests {
             background: Vec::new(),
             open: OpenState::Closed,
             archived: false,
+            pin_rank: None,
         }
     }
 
@@ -1388,7 +1465,7 @@ mod tests {
             with(row("run-new", "/w/two", 40), Badge::Running),
             with(row("limited", "/w/four", 1), Badge::RateLimited),
         ];
-        let (active, groups) = sidebar_sections(rows.clone(), "", false);
+        let SidebarSections { active, groups, .. } = sidebar_sections(rows.clone(), "", false);
         assert_eq!(
             active.iter().map(id).collect::<Vec<_>>(),
             ["ask", "limited", "run-new", "run-old", "bg"],
@@ -1410,11 +1487,11 @@ mod tests {
         assert!(!is_active(&row("n", "/w", 1)));
 
         // The search filters the active section too; nothing active: no section.
-        let (active, groups) = sidebar_sections(rows, "thread ask", false);
+        let SidebarSections { active, groups, .. } = sidebar_sections(rows, "thread ask", false);
         assert_eq!(active.iter().map(id).collect::<Vec<_>>(), ["ask"]);
         assert!(groups.is_empty());
-        let (active, _) = sidebar_sections(vec![row("x", "/w", 1)], "", false);
-        assert!(active.is_empty());
+        let sections = sidebar_sections(vec![row("x", "/w", 1)], "", false);
+        assert!(sections.active.is_empty() && sections.pinned.is_empty());
     }
 
     #[test]
@@ -1503,6 +1580,7 @@ mod tests {
         ThreadMenuInput {
             thread: "t1".into(),
             archived,
+            pinned: false,
             has_messages,
             agents: vec![
                 MenuAgent {
@@ -1681,6 +1759,7 @@ mod tests {
                 "Fork thread",
                 "Compact into a new thread",
                 "Rename…",
+                "Pin to Top",
                 "Archive",
                 "Delete…",
                 "Open folder",
@@ -1695,6 +1774,7 @@ mod tests {
                 "Fork thread",
                 "Compact into a new thread",
                 "Rename…",
+                "Pin to Top",
                 "Unarchive",
                 "Delete…",
                 "Open folder",
@@ -1731,6 +1811,12 @@ mod tests {
             ThreadAction::ReviewEnvironment("t".into()),
             ThreadAction::CopyId("t".into()),
         ];
+        let actions = actions.into_iter().chain([
+            ThreadAction::Pin("t".into()),
+            ThreadAction::Unpin("t".into()),
+            ThreadAction::PinMove("t".into(), -1),
+            ThreadAction::PinMove("t".into(), 1),
+        ]);
         for a in actions {
             assert_eq!(ThreadAction::decode(&a.encode()), Some(a.clone()), "{a:?}");
         }
@@ -1746,6 +1832,185 @@ mod tests {
         ] {
             assert_eq!(ThreadAction::decode(bad), None, "{bad:?}");
         }
+    }
+
+    fn pinned_row(id: &str, folder: &str, at: i64, rank: i64) -> SidebarRow {
+        let mut r = row(id, folder, at);
+        r.pin_rank = Some(rank);
+        r
+    }
+
+    fn ids_of(rows: &[SidebarRow]) -> Vec<String> {
+        rows.iter()
+            .map(|r| match &r.key {
+                RowKey::Thread(id) => id.clone(),
+                RowKey::Terminal(_) => "t".into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pinned_rows_lead_in_user_order_and_leave_their_folder() {
+        let rows = vec![
+            row("a", "/w/one", 50),
+            pinned_row("p2", "/w/one", 10, 1),
+            pinned_row("p1", "/w/two", 90, 0),
+            row("b", "/w/two", 20),
+        ];
+        let sections = sidebar_sections(rows, "", false);
+        assert_eq!(
+            ids_of(&sections.pinned),
+            ["p1", "p2"],
+            "the user's order, not the newest first"
+        );
+        let grouped: Vec<(String, Vec<String>)> = sections
+            .groups
+            .iter()
+            .map(|(f, r)| (f.clone(), ids_of(r)))
+            .collect();
+        assert_eq!(
+            grouped,
+            [
+                ("/w/one".to_owned(), vec!["a".to_owned()]),
+                ("/w/two".to_owned(), vec!["b".to_owned()]),
+            ],
+            "a pinned row leaves its folder, and the folders keep their own recency order"
+        );
+        // Only pinned threads: their folders are gone.
+        let only = sidebar_sections(vec![pinned_row("p", "/w", 1, 0)], "", false);
+        assert!(only.groups.is_empty() && only.active.is_empty());
+    }
+
+    #[test]
+    fn pinned_active_row_is_listed_once_with_its_badge() {
+        let mut busy = pinned_row("busy", "/w", 5, 0);
+        busy.badge = Some(Badge::NeedsApproval);
+        let mut other = row("other", "/w", 4);
+        other.badge = Some(Badge::Running);
+        let sections = sidebar_sections(vec![busy, other], "", false);
+        assert_eq!(ids_of(&sections.pinned), ["busy"]);
+        assert_eq!(sections.pinned[0].badge, Some(Badge::NeedsApproval));
+        assert_eq!(
+            ids_of(&sections.active),
+            ["other"],
+            "listed once, in Pinned only"
+        );
+        assert_eq!(sections.pinned_active(), 1, "the Active header counts it");
+    }
+
+    #[test]
+    fn archived_pinned_hides_behind_toggle_unless_open() {
+        let mut archived = pinned_row("old", "/w", 5, 0);
+        archived.archived = true;
+        let mut open = pinned_row("open", "/w", 6, 1);
+        open.archived = true;
+        open.open = OpenState::Here;
+        let rows = vec![archived, open];
+        assert_eq!(
+            ids_of(&sidebar_sections(rows.clone(), "", false).pinned),
+            ["open"]
+        );
+        assert_eq!(
+            ids_of(&sidebar_sections(rows.clone(), "", true).pinned),
+            ["old", "open"]
+        );
+        // The search applies to the pinned rows too.
+        assert_eq!(
+            ids_of(&sidebar_sections(rows, "thread old", true).pinned),
+            ["old"]
+        );
+    }
+
+    #[test]
+    fn pin_actions_round_trip_encode_decode() {
+        for action in [
+            ThreadAction::Pin("t".into()),
+            ThreadAction::Unpin("t".into()),
+            ThreadAction::PinMove("t".into(), -1),
+            ThreadAction::PinMove("t".into(), 1),
+            ThreadAction::PinMove("t".into(), i8::MIN),
+        ] {
+            assert_eq!(
+                ThreadAction::decode(&action.encode()),
+                Some(action.clone()),
+                "{action:?}"
+            );
+        }
+        for bad in [
+            "pin",
+            "pin\u{1f}",
+            "pin\u{1f}t\u{1f}1",
+            "unpin\u{1f}t\u{1f}extra",
+            "pin-move\u{1f}t",
+            "pin-move\u{1f}t\u{1f}",
+            "pin-move\u{1f}t\u{1f}up",
+            "pin-move\u{1f}t\u{1f}999",
+            "pin-move\u{1f}t\u{1f}1\u{1f}2",
+        ] {
+            assert_eq!(ThreadAction::decode(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn menu_shows_pin_and_move_only_when_they_apply() {
+        let labels = |pinned: bool, archived: bool| -> Vec<String> {
+            let mut i = input(true, archived);
+            i.pinned = pinned;
+            items(&thread_menu(&i))
+                .into_iter()
+                .map(|(label, _, _)| label)
+                .filter(|l| {
+                    l.to_lowercase().contains("pin") || l.contains("Move") || l.contains("rchive")
+                })
+                .collect()
+        };
+        assert_eq!(labels(false, false), ["Pin to Top", "Archive"]);
+        assert_eq!(labels(false, true), ["Pin to Top", "Unarchive"]);
+        assert_eq!(
+            labels(true, false),
+            ["Unpin", "Move Up", "Move Down", "Archive"]
+        );
+        let mut i = input(true, false);
+        i.pinned = true;
+        let all = items(&thread_menu(&i));
+        let action = |label: &str| {
+            all.iter()
+                .find(|(l, _, _)| l == label)
+                .map(|(_, a, on)| (a.clone(), *on))
+        };
+        assert_eq!(
+            action("Move Up"),
+            Some((ThreadAction::PinMove("t1".into(), -1), true))
+        );
+        assert_eq!(
+            action("Move Down"),
+            Some((ThreadAction::PinMove("t1".into(), 1), true))
+        );
+        assert_eq!(
+            action("Unpin"),
+            Some((ThreadAction::Unpin("t1".into()), true))
+        );
+    }
+
+    #[test]
+    fn rows_order_puts_pinned_first_for_keyboard_navigation() {
+        let mut busy = row("busy", "/w/one", 5);
+        busy.badge = Some(Badge::Running);
+        let rows = vec![
+            row("a", "/w/one", 50),
+            busy,
+            pinned_row("p2", "/w/two", 1, 1),
+            pinned_row("p1", "/w/one", 2, 0),
+        ];
+        let model = model_of(rows, None, true);
+        let order: Vec<String> = model
+            .rows()
+            .map(|r| match &r.key {
+                RowKey::Thread(id) => id.clone(),
+                RowKey::Terminal(_) => "t".into(),
+            })
+            .collect();
+        assert_eq!(order, ["p1", "p2", "busy", "a"]);
     }
 
     #[test]

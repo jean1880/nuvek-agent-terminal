@@ -168,6 +168,7 @@ fn registered_theme_resolves_bundled_icons() {
         icons::THINKING_ICON,
         icons::APP_ICON,
         icons::APP_ICON_COLOUR,
+        icons::PIN_ICON,
         "at-chat-message-new-symbolic",
         "at-go-up-symbolic",
     ] {

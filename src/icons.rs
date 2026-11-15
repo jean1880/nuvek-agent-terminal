@@ -68,6 +68,7 @@ pub const EXTERNAL_ICON: &str = "agent-external-symbolic";
 pub const PULL_REQUEST_ICON: &str = "agent-pull-request-symbolic";
 pub const POP_OUT_ICON: &str = "agent-pop-out-symbolic";
 pub const GIT_ICON: &str = "agent-git-symbolic";
+pub const PIN_ICON: &str = "agent-pin-symbolic";
 
 /// The icons this app owns (brand marks and original glyphs). Code takes these names from
 /// the constants above; the test proves each has a file. Every other name is a plain literal
@@ -83,6 +84,7 @@ pub const ICONS: &[&str] = &[
     PULL_REQUEST_ICON,
     POP_OUT_ICON,
     GIT_ICON,
+    PIN_ICON,
     CLAUDE_ICON,
     AGY_ICON,
     CODEX_ICON,

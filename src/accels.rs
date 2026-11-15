@@ -39,6 +39,7 @@ const COMMON: &[Binding] = &[
     ("win.new-tab-folder", &["<Primary><Shift>O"]),
     ("win.checkpoint-now", &["<Primary><Shift>S"]),
     ("win.resume-session", &["<Primary><Shift>E"]),
+    ("win.toggle-pin", &["<Primary><Shift>P"]),
     ("win.toggle-drawer", &["<Ctrl>grave", "<Primary>J"]),
     ("win.preferences", &["<Primary>comma"]),
     ("win.shortcuts", &["<Primary>question"]),
@@ -147,6 +148,16 @@ const HAND_BOUND: &[HandBound] = &[
     ),
     hand(
         "Menu",
+        "sidebar thread row selected",
+        "window/imp/thread_menu.rs",
+    ),
+    hand(
+        "<Alt><Shift>Up",
+        "sidebar thread row selected",
+        "window/imp/thread_menu.rs",
+    ),
+    hand(
+        "<Alt><Shift>Down",
         "sidebar thread row selected",
         "window/imp/thread_menu.rs",
     ),

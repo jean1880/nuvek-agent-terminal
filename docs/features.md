@@ -59,9 +59,17 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
 
 ### Chat threads
 
-- **A sidebar of threads**, grouped by folder and searchable. Threads that are working,
-  waiting for an approval, rate limited or running background work sit above the rest in
-  an **Active** section, most urgent first, each naming its folder. Each row shows the
+- **A sidebar of threads**, grouped by folder and searchable. **Pin to Top** (or
+  `Ctrl+Shift+P` for the shown thread) lifts a thread into a **Pinned** section above
+  everything else, in the order you choose: **Move Up** and **Move Down**, or
+  `Alt+Shift+Up` and `Alt+Shift+Down` on the selected row. A pinned thread keeps its pin
+  when archived (it shows again with **Show Archived**, or while it is open), and pinning
+  never changes when a thread was last active, so the folder groups stay in place.
+  Threads that are working,
+  waiting for an approval, rate limited or running background work sit above the folders in
+  an **Active** section, most urgent first, each naming its folder; a pinned thread that is
+  also active is listed under Pinned only, keeps its badge, and is counted in the Active
+  header. Each row shows the
   agent, the title, how long ago it was active, and a badge: working, needs approval,
   rate limited or unread. `F9` or `Ctrl+Shift+B` shows or hides it. It overlays the
   thread when the window is narrow. When hidden, its toggle still signals unread

@@ -4975,6 +4975,160 @@ mod tests {
         assert!(all.contains("omitted_bytes"));
     }
 
+    /// A thread that holds every shape the transcript fold reads: inherited context, user,
+    /// assistant and tool items, reasoning, a notice, an agent switch, an assistant reply streamed
+    /// in pieces, and enough events to need several read batches. Returns the thread.
+    fn fold_fixture(s: &Store) -> String {
+        let t = s.create_thread("/", None).expect("t");
+        let claude = s.add_provider_thread(&t, "claude", "m1").expect("claude");
+        let agy = s.add_provider_thread(&t, "agy", "m2").expect("agy");
+        s.set_active_provider_thread(&t, &claude).expect("active");
+        let seed = Envelope::new(Event::HandoffSeeded {
+            summary: "earlier work".into(),
+            fence: "~~~".into(),
+            carried: 2,
+            total: 2,
+            acknowledged: false,
+        });
+        s.append_event(&t, None, &seed).expect("seed");
+        s.append_user_message(&t, Some(&claude), "hello agent")
+            .expect("user");
+        let reasoning = [
+            started("r1", ItemKind::Reasoning),
+            stream_delta("r1", StreamKind::Reasoning, "weighing it up"),
+            completed("r1", ItemStatus::Completed),
+        ];
+        let reply = [
+            started("a1", ItemKind::AssistantMessage),
+            delta("a1", "Hel"),
+            delta("a1", "lo th"),
+            delta("a1", "ere"),
+            completed("a1", ItemStatus::Completed),
+        ];
+        let command = [
+            Envelope::new(Event::ItemStarted {
+                kind: ItemKind::Command,
+                title: "cargo test".into(),
+                input: Some(serde_json::json!({"command": "cargo test"})),
+                parent: None,
+            })
+            .item("c1"),
+            Envelope::new(Event::ItemCompleted {
+                status: ItemStatus::Completed,
+                output: Some("ok".into()),
+                error: None,
+            })
+            .item("c1"),
+        ];
+        for e in reasoning.iter().chain(&reply).chain(&command) {
+            s.append_event(&t, Some(&claude), e).expect("append");
+        }
+        let notice = Envelope::new(Event::Notice {
+            text: "compacted".into(),
+        });
+        s.append_event(&t, Some(&claude), &notice).expect("notice");
+        // The switch: a later seed (ignored by the fold) and the new agent's own provider thread.
+        let reseed = Envelope::new(Event::HandoffSeeded {
+            summary: "the history so far".into(),
+            fence: "~~~".into(),
+            carried: 3,
+            total: 3,
+            acknowledged: false,
+        });
+        s.append_event(&t, Some(&agy), &reseed).expect("reseed");
+        s.set_active_provider_thread(&t, &agy).expect("switch");
+        s.append_user_message(&t, Some(&agy), "and now?")
+            .expect("user 2");
+        // Past one read batch (1,000 events), every item a start, a delta and a completion.
+        for i in 0..400 {
+            let item = format!("bulk-{i}");
+            for e in [
+                started(&item, ItemKind::AssistantMessage),
+                delta(&item, &format!("line {i}")),
+                completed(&item, ItemStatus::Completed),
+            ] {
+                s.append_event(&t, Some(&agy), &e).expect("bulk");
+            }
+        }
+        t
+    }
+
+    /// What a hand-off reads of [`fold_fixture`]: the inherited context first, reasoning, the
+    /// notice and the later seed left out, the streamed reply whole, the tool with its title.
+    /// Pins the fold's output before it is generalised.
+    #[test]
+    fn the_hand_off_transcript_of_a_mixed_thread_is_pinned() {
+        let s = store();
+        let t = fold_fixture(&s);
+        assert!(
+            s.events(&t, None, usize::MAX).expect("events").len() > 1000,
+            "the fixture must page"
+        );
+        let msg = |role: &str, kind: &str, text: &str, item: &str, status: &str, title: &str| {
+            TranscriptMessage {
+                role: role.into(),
+                kind: kind.into(),
+                text: text.into(),
+                item_id: item.into(),
+                status: status.into(),
+                title: title.into(),
+            }
+        };
+        let got = s.transcript_messages(&t).expect("msgs");
+        let user_id = |text: &str| {
+            got.iter()
+                .find(|m| m.role == "user" && m.text == text)
+                .map(|m| m.item_id.clone())
+                .expect("user message")
+        };
+        let mut expected = vec![
+            msg(
+                INHERITED_ROLE,
+                "inherited_context",
+                "earlier work",
+                "inherited:1",
+                "completed",
+                "",
+            ),
+            msg(
+                "user",
+                "user_message",
+                "hello agent",
+                &user_id("hello agent"),
+                "open",
+                "",
+            ),
+            msg(
+                "assistant",
+                "assistant_message",
+                "Hello there",
+                "a1",
+                "completed",
+                "",
+            ),
+            msg("tool", "command", "ok", "c1", "completed", "Run cargo test"),
+            msg(
+                "user",
+                "user_message",
+                "and now?",
+                &user_id("and now?"),
+                "open",
+                "",
+            ),
+        ];
+        for i in 0..400 {
+            expected.push(msg(
+                "assistant",
+                "assistant_message",
+                &format!("line {i}"),
+                &format!("bulk-{i}"),
+                "completed",
+                "",
+            ));
+        }
+        assert_eq!(got, expected);
+    }
+
     #[test]
     fn snapshot_replaces_deltas_and_later_deltas_append() {
         let s = store();

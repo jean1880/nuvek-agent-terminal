@@ -21,6 +21,7 @@ use super::payload;
 use super::permission;
 use crate::chat::DiffReply;
 use crate::diff_tool::{self, DiffTools};
+use crate::editor_tool::{self, EditorTools};
 
 /// What a row asks of the view (the view owns the model and the backend).
 pub enum RowEvent {
@@ -57,6 +58,10 @@ pub enum RowEvent {
     },
     /// A file-change card's "Open in ‹tool›".
     OpenDiff {
+        id: String,
+    },
+    /// A file-change card's "Open in ‹editor›".
+    OpenEditor {
         id: String,
     },
 }
@@ -1360,6 +1365,11 @@ struct FileDiffUi {
     open: gtk4::Button,
     #[cfg_attr(not(test), allow(dead_code))]
     open_label: gtk4::Label,
+    /// "Open in ‹editor›", or "Open" with the system's handler when none is configured.
+    #[cfg_attr(not(test), allow(dead_code))]
+    editor: gtk4::Button,
+    #[cfg_attr(not(test), allow(dead_code))]
+    editor_label: gtk4::Label,
     revealer: gtk4::Revealer,
     status: gtk4::Label,
     text: DiffText,
@@ -1382,6 +1392,21 @@ fn refresh_diff_tool(open: &gtk4::Button, label: &gtk4::Label, toggle: &gtk4::To
                 "Show this file's diff. {} to open it in an external viewer.",
                 diff_tool::NO_TOOL_HINT
             )));
+        }
+    }
+}
+
+/// Words "Open in ‹editor›" for the configured editor, or the plain "Open" and the hint that it
+/// cannot jump to a line when there is none. Cheap; run on build and whenever the editor changes.
+fn refresh_editor(button: &gtk4::Button, label: &gtk4::Label) {
+    match EditorTools::shared().get() {
+        Some(t) => {
+            label.set_text(&editor_tool::open_label(&t));
+            button.set_tooltip_text(Some(&format!("Open this file in {} at the change", t.name)));
+        }
+        None => {
+            label.set_text(editor_tool::DEFAULT_LABEL);
+            button.set_tooltip_text(Some(editor_tool::NO_EDITOR_HINT));
         }
     }
 }
@@ -1717,7 +1742,19 @@ impl ToolCard {
         let details = gtk4::ToggleButton::with_label("Raw Details");
         details.add_css_class("flat");
         details.set_visible(false);
+        let editor = gtk4::Button::new();
+        editor.add_css_class("flat");
+        editor.add_css_class("diff-open");
+        let editor_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        editor_row.append(&gtk4::Image::from_icon_name("at-document-edit-symbolic"));
+        editor.update_property(&[gtk4::accessible::Property::Label(
+            "Open the edited file in the editor",
+        )]);
+        let editor_label = label("", &[]);
+        editor_row.append(&editor_label);
+        editor.set_child(Some(&editor_row));
         bar.append(&details);
+        bar.append(&editor);
         bar.append(&open);
 
         let status = label("", &["diff-status", "dim-label"]);
@@ -1743,6 +1780,15 @@ impl ToolCard {
             move || refresh_diff_tool(&open, &open_label, &toggle)
         ));
         bar.connect_destroy(move |_| DiffTools::shared().disconnect(conn));
+        refresh_editor(&editor, &editor_label);
+        let conn = EditorTools::shared().connect_changed(glib::clone!(
+            #[weak]
+            editor,
+            #[weak]
+            editor_label,
+            move || refresh_editor(&editor, &editor_label)
+        ));
+        bar.connect_destroy(move |_| EditorTools::shared().disconnect(conn));
 
         let (item, load_sink) = (id.to_owned(), sink.clone());
         toggle.connect_toggled(glib::clone!(
@@ -1761,6 +1807,8 @@ impl ToolCard {
         ));
         let (item, open_sink) = (id.to_owned(), sink.clone());
         open.connect_clicked(move |_| open_sink(RowEvent::OpenDiff { id: item.clone() }));
+        let (item, editor_sink) = (id.to_owned(), sink.clone());
+        editor.connect_clicked(move |_| editor_sink(RowEvent::OpenEditor { id: item.clone() }));
 
         FileDiffUi {
             bar,
@@ -1768,6 +1816,8 @@ impl ToolCard {
             details,
             open,
             open_label,
+            editor,
+            editor_label,
             revealer,
             status,
             text,
@@ -1826,6 +1876,21 @@ impl ToolCard {
             self.diff.open.is_visible(),
             self.diff.open_label.text().to_string(),
         )
+    }
+
+    /// The editor button: its label and tooltip (tests).
+    #[cfg(test)]
+    pub(super) fn editor_button(&self) -> (String, Option<String>) {
+        (
+            self.diff.editor_label.text().to_string(),
+            self.diff.editor.tooltip_text().map(|t| t.to_string()),
+        )
+    }
+
+    /// Clicks "Open in ‹editor›" (tests).
+    #[cfg(test)]
+    pub(super) fn click_open_editor(&self) {
+        self.diff.editor.emit_clicked();
     }
 
     /// Clicks "View diff" (tests).

@@ -893,6 +893,30 @@ mod tests {
         }
     }
 
+    /// The external editor keeps its setting in the configuration file and writes nothing else:
+    /// no folder of its own, so the uninstall's folder list is the one it was before.
+    #[test]
+    fn the_editor_adds_no_new_folder() {
+        let mut i = inputs(Path::new("/h"));
+        i.xdg_config = Some("/x/config".into());
+        i.xdg_state = Some("/x/state".into());
+        i.xdg_cache = Some("/x/cache".into());
+        i.xdg_data = Some("/x/data".into());
+        i.xdg_runtime = Some("/run/user/1".into());
+        let folders = candidate_folders(&i);
+        for folder in &folders {
+            let name = folder.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            assert!(
+                matches!(name, APP_DIR | LEGACY_CONFIG_DIR | "delegation"),
+                "{folder:?}"
+            );
+            assert!(!folder.to_string_lossy().contains("editor"), "{folder:?}");
+        }
+        // Config (two names), state, cache and data, each with its home default, and the runtime
+        // folder: nothing for the editor.
+        assert_eq!(folders.len(), 11, "{folders:?}");
+    }
+
     #[test]
     fn candidates_cover_every_base_with_and_without_overrides() {
         let home = Path::new("/h");

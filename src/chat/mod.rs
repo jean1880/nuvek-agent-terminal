@@ -306,6 +306,10 @@ pub trait DiffSource {
     /// Opens the item's (first) file in the configured external tool. Failures are reported to
     /// the user by the implementation (a toast).
     fn open_external(&self, ask: DiffAsk);
+    /// Opens the item's (first) file in the configured editor at its first changed line, or in
+    /// the system's handler without a line when there is none. Failures are reported to the
+    /// user by the implementation (a toast).
+    fn open_in_editor(&self, ask: DiffAsk);
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -1293,6 +1293,12 @@ impl Inner {
                     source.open_external(ask);
                 }
             }
+            RowEvent::OpenEditor { id } => {
+                let source = self.diffs.borrow().clone();
+                if let (Some(source), Some(ask)) = (source, self.diff_ask(&id)) {
+                    source.open_in_editor(ask);
+                }
+            }
         }
     }
 
@@ -3846,6 +3852,7 @@ pub(crate) mod tests {
     struct FakeDiffs {
         asks: RefCell<Vec<DiffAsk>>,
         opened: RefCell<Vec<DiffAsk>>,
+        in_editor: RefCell<Vec<DiffAsk>>,
         reply: crate::chat::DiffReply,
     }
 
@@ -3856,6 +3863,9 @@ pub(crate) mod tests {
         }
         fn open_external(&self, ask: DiffAsk) {
             self.opened.borrow_mut().push(ask);
+        }
+        fn open_in_editor(&self, ask: DiffAsk) {
+            self.in_editor.borrow_mut().push(ask);
         }
     }
 
@@ -4841,6 +4851,7 @@ pub(crate) mod tests {
         let source = Rc::new(FakeDiffs {
             asks: RefCell::default(),
             opened: RefCell::default(),
+            in_editor: RefCell::default(),
             reply: Ok(Shown {
                 text: diff_text.to_owned(),
                 origin: Origin::Checkpoint,
@@ -4898,6 +4909,36 @@ pub(crate) mod tests {
             Some("Open in Kompare".to_owned())
         );
 
+        // "Open in ‹editor›" follows Settings: the configured editor's name, else the plain
+        // "Open" with the system handler and a tooltip saying it cannot jump to a line. It is
+        // on offer either way, and asks the source with the item's id and input.
+        let editors = crate::editor_tool::EditorTools::shared();
+        editors.set(None);
+        let editor_button = || {
+            inner.transcript.with_row("edit1", |row| match row {
+                cards::Row::Tool(card) => Some(card.editor_button()),
+                _ => None,
+            })
+        };
+        let (label, hint) = editor_button().flatten().expect("edit card");
+        assert_eq!(label, crate::editor_tool::DEFAULT_LABEL);
+        assert_eq!(hint.as_deref(), Some(crate::editor_tool::NO_EDITOR_HINT));
+        editors.set(Some(agent_kit::editor::PRESETS[1].tool()));
+        let (label, hint) = editor_button().flatten().expect("edit card");
+        assert_eq!(label, "Open in Zed");
+        assert!(hint.is_some_and(|h| h.contains("Zed")));
+        inner.transcript.with_row("edit1", |row| {
+            if let cards::Row::Tool(c) = row {
+                c.click_open_editor();
+            }
+        });
+        let asked = source.in_editor.borrow().clone();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].item, "edit1");
+        assert_eq!(asked[0].input, edit_input);
+        assert!(source.opened.borrow().is_empty(), "not the diff tool");
+        editors.set(None);
+
         // Toggling View diff asks the source with the item's id and input, and shows the answer.
         inner.transcript.with_row("edit1", |row| {
             if let cards::Row::Tool(c) = row {
@@ -4925,6 +4966,7 @@ pub(crate) mod tests {
         let failing = Rc::new(FakeDiffs {
             asks: RefCell::default(),
             opened: RefCell::default(),
+            in_editor: RefCell::default(),
             reply: Err("No diff is available for this edit.".to_owned()),
         });
         view.set_diff_source(failing);

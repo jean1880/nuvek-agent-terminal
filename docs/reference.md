@@ -136,6 +136,17 @@ and on its refresh button. It never polls. Git's external diff and textconv driv
 are not run. Diffs above 1 MiB or 20,000 lines are cut short. With a diff tool set
 (Settings → Git), **Open in…** launches it on any file.
 
+Each file row, and each file-change card in the chat, also has **Open in ‹editor›**. With an
+editor set (Settings → Git → Editor) it opens the file at the first changed line; with none
+set, the system's default app opens the file, which cannot jump to a line. The command is an
+argv, never run through a shell. Its placeholders are `{file}` (required, the absolute path),
+`{line}`, `{column}` and `{dir}`; a missing line or column is 1.
+
+**Containment.** Only a file inside the thread's folder opens. The path is resolved first, so
+a symlink that leads out of the folder counts as outside, and it must be a regular file. A file
+outside the folder, or one of the sensitive names an agent's edits always ask about (`.git`,
+`.vscode`, agent instruction files and the like), is refused with a message.
+
 ### Undoing a turn
 
 With the diff panel on **Last turn** or **This thread**, the undo arrow puts the

@@ -947,7 +947,10 @@ impl Inner {
             self.refresh_worker_inspector();
             return;
         }
-        if matches!(event, RowEvent::LoadDiff { .. } | RowEvent::OpenDiff { .. }) {
+        if matches!(
+            event,
+            RowEvent::LoadDiff { .. } | RowEvent::OpenDiff { .. } | RowEvent::OpenEditor { .. }
+        ) {
             self.worker_diff(&inspector, &scope, event);
             return;
         }
@@ -1058,9 +1061,10 @@ impl Inner {
     }
 
     fn worker_diff(self: &Rc<Self>, inspector: &Rc<Inspector>, scope: &Scope, event: RowEvent) {
-        let (id, external) = match event {
-            RowEvent::LoadDiff { id } => (id, false),
-            RowEvent::OpenDiff { id } => (id, true),
+        let (id, how) = match event {
+            RowEvent::LoadDiff { id } => (id, None),
+            RowEvent::OpenDiff { id } => (id, Some(false)),
+            RowEvent::OpenEditor { id } => (id, Some(true)),
             _ => return,
         };
         let ask = {
@@ -1095,9 +1099,10 @@ impl Inner {
             );
             return;
         };
-        if external {
-            source.open_external(ask);
-            return;
+        match how {
+            Some(false) => return source.open_external(ask),
+            Some(true) => return source.open_in_editor(ask),
+            None => {}
         }
         let weak: Weak<Inspector> = Rc::downgrade(inspector);
         let scope = scope.clone();

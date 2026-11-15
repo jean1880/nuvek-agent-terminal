@@ -863,6 +863,9 @@ mod tests {
         for table in crate::store::delegation::V4_TABLES {
             assert!(has_table(&s.conn, table), "{table} exists");
         }
+        for table in crate::store::schema_v11::V11_TABLES {
+            assert!(has_table(&s.conn, table), "{table} exists");
+        }
     }
 
     #[test]
@@ -949,6 +952,75 @@ mod tests {
             assert_eq!(journal, "delete", "a self-contained file");
             assert_eq!(has_table(&b, "delegation_roots"), version >= 4);
         }
+    }
+
+    /// A v10 store goes to v11 through the preflight: a verified v10 backup first, then a step
+    /// that only adds (every v10 object kept as it was), with the rows intact and the foreign
+    /// keys clean.
+    #[test]
+    fn a_v10_store_is_backed_up_and_upgraded_to_v11_adding_only() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let db = db_in(&dir);
+        fixture(&db, 10);
+        let objects = |c: &Connection| -> Vec<(String, String, Option<String>)> {
+            c.prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
+                .expect("prepare")
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .expect("query")
+                .collect::<rusqlite::Result<_>>()
+                .expect("rows")
+        };
+        let before = objects(&read_only(&db));
+
+        assert!(matches!(
+            run(&db, &Hooks::default()).expect("preflight"),
+            Outcome::Migrated { from: 10, .. }
+        ));
+        assert_preserved(&db);
+
+        let after = objects(&read_only(&db));
+        for object in &before {
+            if object.1 == "threads" {
+                // The one change to a v10 object: the added column.
+                let sql = after
+                    .iter()
+                    .find(|o| o.1 == "threads")
+                    .and_then(|o| o.2.clone())
+                    .expect("threads");
+                assert!(sql.contains("pin_rank"), "{sql}");
+                continue;
+            }
+            assert!(after.contains(object), "{object:?} is kept as it was");
+        }
+        let s = Store::open(&db).expect("open");
+        let recorded = s
+            .meta(PRE_V4_BACKUP_KEY)
+            .expect("meta")
+            .expect("the backup is recorded");
+        let b = read_only(Path::new(&recorded));
+        assert_eq!(read_version(&b).expect("v"), 10, "the preimage");
+        assert_eq!(counts(&b).expect("counts"), (2, 2, EVENTS));
+        assert!(!has_table(&b, "thread_tags"));
+        let ok: String = b
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .expect("integrity");
+        assert_eq!(ok, "ok");
+        for table in crate::store::schema_v11::V11_TABLES {
+            let rows: i64 = s
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .expect("count");
+            assert_eq!(rows, 0, "{table} starts empty");
+        }
+        let pinned: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM threads WHERE pin_rank IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .expect("pins");
+        assert_eq!(pinned, 0, "no thread is pinned by the upgrade");
     }
 
     #[test]

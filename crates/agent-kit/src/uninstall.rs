@@ -969,6 +969,42 @@ mod tests {
         assert!(hand.exists(), "a file the app did not write stays");
     }
 
+    /// The v11 store and its after-open objects (the search index, the spending index) live in
+    /// the store's own file: they add nothing the candidate folders do not already cover, and
+    /// the uninstall removes all of it.
+    #[test]
+    fn the_v11_store_and_its_after_open_objects_stay_inside_the_state_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let path = crate::store::default_path(None, home.to_str()).unwrap();
+        {
+            let store = crate::store::Store::open(&path).unwrap();
+            assert_eq!(
+                store.ensure_search_fts().unwrap(),
+                crate::store::SearchIndex::Ready
+            );
+            store.ensure_spend_index().unwrap();
+            store.create_thread("/w", None).unwrap();
+        }
+        let i = inputs(home);
+        let folders = candidate_folders(&i);
+        assert_eq!(store_files(&i), vec![path.clone()]);
+        let mut stack = vec![home.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap().flatten() {
+                let p = entry.path();
+                if entry.file_type().unwrap().is_dir() {
+                    stack.push(p);
+                } else {
+                    assert!(folders.iter().any(|f| p.starts_with(f)), "{p:?}");
+                }
+            }
+        }
+        let report = apply(&plan(&i), uid(), home);
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert!(!home.join(".local/state/agent-terminal").exists());
+    }
+
     #[test]
     fn the_attachment_store_goes_with_the_data_folder() {
         let home = Path::new("/h");

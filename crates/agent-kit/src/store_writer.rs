@@ -31,6 +31,9 @@
 //!   readers are still open, so closing would not) and closes the connection. No TRUNCATE: it
 //!   would wait for readers. It says whether the queue really drained ([`Shutdown`]).
 //!
+//! - **After open.** Before its first write the writer makes sure the full-text search index
+//!   exists ([`Store::ensure_search_fts`]): one read once it does.
+//!
 //! [`StoreHandle`] is what the app holds: the writer plus a read connection of the calling
 //! thread, or (memory-only store, tests) one store that runs writes in place.
 
@@ -51,7 +54,7 @@ use crate::store::delegation_typed::{
     Accept, Accepted, AckRequest, AckResult, Completed, Completion, DispatchFact, PublishEvent,
     Published, Reconciled, Reserved, Revoked, Verdict,
 };
-use crate::store::{Batch, ProviderThreadId, Result, Store, StoreError, SLOW_WRITE};
+use crate::store::{Batch, ProviderThreadId, Result, SearchIndex, Store, StoreError, SLOW_WRITE};
 
 /// Past this many bytes of WAL the writer reports an error and turns SQLite's own checkpoints
 /// back on.
@@ -278,6 +281,7 @@ impl StoreWriter {
                 match opened {
                     Ok(store) => {
                         let _ = ready_tx.send(Ok(()));
+                        ensure_search_index(&store);
                         run(store, rx, &thread_shared);
                     }
                     Err(e) => {
@@ -667,6 +671,23 @@ impl StoreWriter {
             Err(RecvTimeoutError::Timeout) => Shutdown::TimedOut,
             Err(RecvTimeoutError::Disconnected) => Shutdown::WriterGone,
         }
+    }
+}
+
+/// Makes sure the store's full-text index exists ([`Store::ensure_search_fts`]), first thing on
+/// the writer's own connection: off the main thread, after the caller was told the writer is
+/// ready, and before any queued write runs. Once it exists this is one read. Neither a SQLite
+/// without FTS5 nor a failure stops the writer: the store works on without search, and says so.
+fn ensure_search_index(store: &Store) {
+    match store.ensure_search_fts() {
+        Ok(SearchIndex::Ready) => {}
+        Ok(SearchIndex::Unavailable(why)) => {
+            tracing::warn!(
+                why,
+                "full-text search is unavailable: this SQLite has no FTS5"
+            );
+        }
+        Err(e) => tracing::error!(error = %e, "could not create the full-text search index"),
     }
 }
 
@@ -1324,6 +1345,33 @@ mod tests {
             })
             .expect("queued");
         t
+    }
+
+    /// The writer makes the search index before its first job; the spending index is left to
+    /// its first use.
+    #[test]
+    fn the_writer_makes_the_search_index_before_its_first_job() {
+        let (_dir, path, handle) = setup();
+        let writer = handle.writer().expect("writer").clone();
+        writer
+            .barrier()
+            .recv()
+            .expect("the writer has run its first job");
+        let conn = rusqlite::Connection::open(&path).expect("open");
+        let present = |name: &str| -> bool {
+            conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = ?1)",
+                [name],
+                |r| r.get(0),
+            )
+            .expect("sqlite_master")
+        };
+        assert!(present("search_fts"));
+        assert!(!present("events_turns"), "made on first use only");
+        assert_eq!(
+            handle.reader().ensure_search_fts().expect("a read"),
+            SearchIndex::Ready
+        );
     }
 
     #[test]

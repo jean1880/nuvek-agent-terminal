@@ -102,6 +102,12 @@ Architectural mandates, standards, and workflows for this codebase.
     Split-secret heals use the in-memory tails of `heal_tail` only when they can
     vouch for every row of the item, else the SQL scan; redaction must never be
     weaker than the scan's.
+    Schema v11 adds `threads.pin_rank` and the `thread_tags`, `search_items`, `search_state`,
+    `schedules`, `spend_ledger` and `review_drafts` tables (empty until their features fill them,
+    redacting text on write); two objects are made after open, never in a migration:
+    `Store::ensure_search_fts` (the FTS5 index, by the writer before its first job; no FTS5 is
+    `SearchIndex::Unavailable`, never a failed open) and `Store::ensure_spend_index`
+    (`events_turns`, on first use).
   - The app (`src/`): `config.rs` (persisted settings + migration, re-exporting
     `SessionFormat`; per-agent defaults live on the profiles), `theme.rs`
     (colour schemes, infallible `RGBA::new`), `utils.rs` (detection and

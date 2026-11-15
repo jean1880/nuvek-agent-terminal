@@ -13,6 +13,7 @@
 
 use crate::diff::{DiffBase, LineKind};
 use crate::diff_tool::DiffTools;
+use crate::editor_tool::EditorTools;
 use crate::git::{DiffOutcome, TabDiff};
 use crate::theme::DiffColours;
 use adw::prelude::*;
@@ -193,7 +194,17 @@ pub struct OpenFile {
     pub to_checkpoint: Option<String>,
 }
 
+/// A file the user asked to open in the editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditFile {
+    /// Repository-relative, as the diff named it.
+    pub path: String,
+    /// The first changed line in the new file, when the row's diff names one.
+    pub line: Option<u32>,
+}
+
 type OpenHandler = Rc<dyn Fn(OpenFile)>;
+type EditHandler = Rc<dyn Fn(EditFile)>;
 type PrHandler = Rc<dyn Fn(PrState)>;
 type PopHandler = Rc<dyn Fn()>;
 /// A popped-out panel's parent window and its destroy handler.
@@ -253,6 +264,8 @@ pub struct DiffPanel {
     generation: Rc<super::Generation>,
     /// Called with the file to open when a row's "Open in …" is clicked.
     open_handler: Rc<RefCell<Option<OpenHandler>>>,
+    /// Called with the file to open when a row's "Open in ‹editor›" is clicked.
+    edit_handler: Rc<RefCell<Option<EditHandler>>>,
     /// The diff on show, for the rows' open buttons.
     shown_sides: Rc<RefCell<Option<Sides>>>,
     /// Whether the saved width has been applied since the panel was last
@@ -448,6 +461,7 @@ impl DiffPanel {
             colours: Rc::new(RefCell::new(colours.clone())),
             generation: Rc::new(super::Generation::new()),
             open_handler: Rc::new(RefCell::new(None)),
+            edit_handler: Rc::new(RefCell::new(None)),
             shown_sides: Rc::new(RefCell::new(None)),
             placed: Rc::new(Cell::new(false)),
             placing: Rc::new(Cell::new(false)),
@@ -821,6 +835,47 @@ impl DiffPanel {
         *self.open_handler.borrow_mut() = Some(Rc::new(open));
     }
 
+    /// Calls `open` when a file row's "Open in ‹editor›" is clicked.
+    pub fn connect_open_in_editor(&self, open: impl Fn(EditFile) + 'static) {
+        *self.edit_handler.borrow_mut() = Some(Rc::new(open));
+    }
+
+    /// A row's "Open in ‹editor›" button. Always on offer: with no editor configured it opens
+    /// the system's handler, and the tooltip says that cannot jump to a line. It opens at the
+    /// row's first changed line (`line`).
+    fn editor_button(&self, path: String, line: Option<u32>) -> gtk4::Button {
+        let button = gtk4::Button::builder()
+            .icon_name("at-document-edit-symbolic")
+            .css_classes(["flat", "diff-open"])
+            .valign(gtk4::Align::Center)
+            .build();
+        button.update_property(&[gtk4::accessible::Property::Label(
+            "Open the file in the editor",
+        )]);
+        let refresh = |button: &gtk4::Button| match EditorTools::shared().get() {
+            Some(tool) => button.set_tooltip_text(Some(&crate::editor_tool::open_label(&tool))),
+            None => button.set_tooltip_text(Some(crate::editor_tool::NO_EDITOR_HINT)),
+        };
+        refresh(&button);
+        let conn = EditorTools::shared().connect_changed(glib::clone!(
+            #[weak]
+            button,
+            move || refresh(&button)
+        ));
+        button.connect_destroy(move |_| EditorTools::shared().disconnect(conn));
+
+        let handler = Rc::clone(&self.edit_handler);
+        button.connect_clicked(move |_| {
+            if let Some(handler) = handler.borrow().clone() {
+                handler(EditFile {
+                    path: path.clone(),
+                    line,
+                });
+            }
+        });
+        button
+    }
+
     /// A row's "Open in ‹tool›" button: hidden while no tool is configured, and following the
     /// setting when it changes. Renamed files open as the new path (the old side reads empty).
     fn open_button(&self, path: String) -> gtk4::Button {
@@ -990,6 +1045,7 @@ impl DiffPanel {
         title.append(&label);
         // Binary files open fine in a tool that knows them; the button is for every row.
         title.append(&self.open_button(stat.path.clone()));
+        title.append(&self.editor_button(stat.path.clone(), crate::diff::first_hunk_line(&text)));
         let expander = gtk4::Expander::builder()
             .label_widget(&title)
             .margin_start(8)

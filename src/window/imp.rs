@@ -5,6 +5,7 @@ mod animated_menu;
 mod closing;
 mod diff_prefs;
 mod diffs;
+mod editor_prefs;
 mod environment_review;
 mod pack_animation;
 mod setup;
@@ -1422,6 +1423,7 @@ impl ObjectImpl for AgentTerminalWindow {
         self.parent_constructed();
         // Before any card is built, so its "Open in …" button starts right.
         crate::diff_tool::DiffTools::shared().set(self.config.borrow().diff_tool.clone());
+        crate::editor_tool::EditorTools::shared().set(self.config.borrow().editor.clone());
         crate::diff_tool::DiffTools::shared()
             .set_expand_by_default(self.config.borrow().diffs_expanded);
         self.setup_ui();
@@ -1702,6 +1704,7 @@ impl AgentTerminalWindow {
         crate::config::mirror_quick_replies(self.config.borrow().suggest_quick_replies);
         crate::config::mirror_approval_policy(&self.config.borrow());
         crate::diff_tool::DiffTools::shared().set(self.config.borrow().diff_tool.clone());
+        crate::editor_tool::EditorTools::shared().set(self.config.borrow().editor.clone());
         crate::diff_tool::DiffTools::shared()
             .set_expand_by_default(self.config.borrow().diffs_expanded);
 
@@ -4946,6 +4949,7 @@ impl AgentTerminalWindow {
         history.add(&worktree_root_row);
         git.add(&history);
         self.add_diff_tool_group(&git);
+        self.add_editor_group(&git);
         dialog.add(&git);
 
         let terminal = adw::PreferencesPage::builder()
@@ -6100,6 +6104,15 @@ impl AgentTerminalWindow {
             obj.imp().open_panel_file(&root, file);
         });
 
+        // "Open in ‹editor›" on a file row.
+        let root = panel.root.clone();
+        panel.connect_open_in_editor(move |file| {
+            let Some(obj) = window_of(&root) else {
+                return;
+            };
+            obj.imp().open_panel_file_in_editor(&root, file);
+        });
+
         let root = panel.root.clone();
         let base_of = panel.clone();
         panel.connect_undo(move |target| {
@@ -6489,6 +6502,39 @@ impl AgentTerminalWindow {
             if let (Err(why), Some(obj)) = (result, obj.upgrade()) {
                 obj.imp().show_toast(&why);
             }
+        });
+    }
+
+    /// Opens a diff-panel file in the editor (or the system's handler) at its first changed line.
+    /// The panel names files from the repository's top, but only files inside the tab's own
+    /// folder open. Everything that touches the disk runs off the main thread; a failure is a
+    /// toast.
+    fn open_panel_file_in_editor(&self, panel_root: &gtk4::Box, file: super::diff_panel::EditFile) {
+        let Some((folder, repo)) = self.tab_by_panel(panel_root, |t| (t.dir.clone(), t.repo_dir()))
+        else {
+            return;
+        };
+        let obj = self.obj().downgrade();
+        glib::MainContext::default().spawn_local(async move {
+            let top = blocking_or(
+                {
+                    let (repo, path) = (repo.clone(), file.path.clone());
+                    move || diff_tool_working_dir(&repo, &path)
+                },
+                std::path::PathBuf::from(&repo),
+            )
+            .await;
+            let request = crate::editor_tool::OpenRequest {
+                folder: std::path::PathBuf::from(folder),
+                path: top.join(&file.path).to_string_lossy().into_owned(),
+                line: file.line,
+                column: None,
+            };
+            crate::editor_tool::open_with_toast(request, move |why| {
+                if let Some(obj) = obj.upgrade() {
+                    obj.imp().show_toast(why);
+                }
+            });
         });
     }
 
@@ -8615,6 +8661,7 @@ mod tests {
         thread_menu::tests::actions_carry_out_each_choice(window);
         threads::tests::a_thread_page_runs_a_real_session(window);
         diff_prefs::tests::the_diff_tool_group_saves_only_what_is_valid(window);
+        editor_prefs::tests::the_group_saves_only_what_is_valid_and_applies_live(window);
     }
 
     /// A folder outside any repository has nothing to diff: no Changes toggle, no shortcut.

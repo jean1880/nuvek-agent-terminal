@@ -119,6 +119,7 @@ until it is fixed.
 | `checkpoints` | `true` | Snapshot each turn in a git repository |
 | `worktree_root` | `""` | Where worktrees go (blank: a hidden folder beside the repository) |
 | `diff_tool` | none | The external diff tool for **Open in…** |
+| `editor` | none | The editor for **Open in ‹editor›**: a name and an argv with `{file}` (required), `{line}`, `{column}` and `{dir}` (none: the system's default app) |
 | `diffs_expanded` | `false` | Open a file-change card's diff as soon as the edit lands |
 | `notify_on_bell` | `false` | Notify when a background thread finishes |
 | `notify_on_quota` | `true` | Notify, with a hand-off button, when an agent runs out of quota |

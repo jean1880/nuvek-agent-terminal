@@ -184,6 +184,10 @@ impl DiffSource for ThreadDiffs {
         });
     }
 
+    fn open_in_editor(&self, ask: DiffAsk) {
+        self.open_first_file_in_editor(ask);
+    }
+
     fn open_external(&self, ask: DiffAsk) {
         let Some(me) = self.me.upgrade() else { return };
         let dir = self.dir.clone();
@@ -233,6 +237,59 @@ impl DiffSource for ThreadDiffs {
                 info!(tool = name, "the diff tool did not open: {why}");
                 (me.toast)(&why);
             }
+        });
+    }
+}
+
+impl ThreadDiffs {
+    /// The first file an edit names, as the agent named it.
+    fn first_path(input: &serde_json::Value) -> Option<String> {
+        agent_kit::editdiff::paths_from_input(input)
+            .into_iter()
+            .next()
+            .or_else(|| {
+                agent_kit::editdiff::preview_from_input(input)
+                    .into_iter()
+                    .next()
+                    .map(|e| e.path)
+            })
+    }
+}
+
+impl ThreadDiffs {
+    /// "Open in ‹editor›": the edit's first file at its first changed line. The line comes from
+    /// the same diff the card shows; with none known the file opens at its top. The file must be
+    /// inside the thread's folder.
+    fn open_first_file_in_editor(&self, ask: DiffAsk) {
+        let Some(me) = self.me.upgrade() else { return };
+        let Some(path) = Self::first_path(&ask.input) else {
+            (self.toast)("This edit names no file to open");
+            return;
+        };
+        let dir = self.dir.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let base = me.base_of(&ask.item).await;
+            let input = ask.input.clone();
+            let folder = dir.clone();
+            let line = off_main("finding the changed line", move || {
+                Ok(
+                    filediff::shown_for_item_in(base.as_ref(), &input, Some(Path::new(&folder)))
+                        .ok()
+                        .and_then(|shown| agent_kit::diff::first_hunk_line(&shown.text)),
+                )
+            })
+            .await
+            .unwrap_or(None);
+            let toast = Rc::clone(&me.toast);
+            crate::editor_tool::open_with_toast(
+                crate::editor_tool::OpenRequest {
+                    folder: PathBuf::from(dir),
+                    path,
+                    line,
+                    column: None,
+                },
+                move |why| toast(why),
+            );
         });
     }
 }

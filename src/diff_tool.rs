@@ -8,13 +8,13 @@
 //! or path.
 
 use std::cell::{Cell, RefCell};
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use agent_kit::difftool::{self, DiffTool, Values};
 use agent_kit::filediff::{self, Side};
-use tracing::{info, warn};
+use tracing::info;
 
+use crate::launch::{spawn_detached, Prepared};
 use crate::probe::ListenerSet;
 
 /// The configured tool, shared by every window.
@@ -101,14 +101,6 @@ pub struct OpenRequest {
     pub new_side: NewSide,
 }
 
-/// A process ready to start.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Prepared {
-    pub program: PathBuf,
-    pub args: Vec<OsString>,
-    pub cwd: PathBuf,
-}
-
 fn temp_from(root: &Path, rel: &Path, side: Side) -> Result<PathBuf, String> {
     let name = rel.file_name().ok_or("The file has no name")?;
     let content = match &side {
@@ -179,30 +171,6 @@ fn file_root(toplevel: &Path) -> Result<PathBuf, String> {
         .map_err(|e| format!("Could not resolve the repository: {e}"))
 }
 
-/// Starts `prepared` detached: no stdin, no output, its own process group, the user's
-/// environment. A thread waits for it so it does not linger as a zombie, and logs how it ended
-/// (the tool's name only).
-pub fn spawn_detached(name: &str, prepared: &Prepared) -> Result<(), String> {
-    use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new(&prepared.program)
-        .args(&prepared.args)
-        .current_dir(&prepared.cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .map_err(|e| format!("Could not start {name}: {e}"))?;
-    info!(tool = name, "opened the diff tool");
-    let name = name.to_owned();
-    std::thread::spawn(move || match child.wait() {
-        Ok(status) => info!(tool = name, %status, "the diff tool exited"),
-        Err(e) => warn!(tool = name, error = %e, "could not wait for the diff tool"),
-    });
-    Ok(())
-}
-
 /// The whole open, blocking: [`prepare`] then [`spawn_detached`].
 pub fn open_blocking(
     tool: &DiffTool,
@@ -211,7 +179,7 @@ pub fn open_blocking(
     runtime_dir: Option<&str>,
 ) -> Result<(), String> {
     let prepared = prepare(tool, req, locate, runtime_dir)?;
-    spawn_detached(&tool.name, &prepared)
+    spawn_detached("diff tool", &tool.name, &prepared)
 }
 
 /// [`open_blocking`] off the main thread, locating the program with the app's own probe.
@@ -303,6 +271,7 @@ pub fn remove_own() {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
 
     use agent_kit::test_support;
@@ -530,17 +499,6 @@ mod tests {
             "$(touch /tmp/pwned-by-diff-test)\nmy file.txt\na;b\n"
         );
         assert!(!Path::new("/tmp/pwned-by-diff-test").exists());
-    }
-
-    #[test]
-    fn a_program_that_cannot_start_is_an_error_not_a_crash() {
-        let prepared = Prepared {
-            program: "/nonexistent/diff-tool".into(),
-            args: Vec::new(),
-            cwd: "/".into(),
-        };
-        let err = spawn_detached("Ghost", &prepared).expect_err("no such file");
-        assert!(err.starts_with("Could not start Ghost"), "{err}");
     }
 
     #[test]

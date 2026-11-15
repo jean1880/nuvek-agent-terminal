@@ -99,6 +99,10 @@ impl DiffSource for DemoDiffs {
     fn open_external(&self, _ask: DiffAsk) {
         tracing::info!("chat demo: external diff requested; no process launched");
     }
+
+    fn open_in_editor(&self, _ask: DiffAsk) {
+        tracing::info!("chat demo: editor requested; no process launched");
+    }
 }
 
 /// Supplies in-memory diffs and optional deterministic review disclosures. A scene is part

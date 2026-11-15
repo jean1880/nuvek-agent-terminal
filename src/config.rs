@@ -1,6 +1,7 @@
 // How a profile's `session_store` is laid out; defined with the readers in
 // `agent-kit` and re-exported so config and the app keep their old path.
 pub use agent_kit::difftool::DiffTool;
+pub use agent_kit::editor::EditorTool;
 pub use agent_kit::sessions::SessionFormat;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -862,6 +863,11 @@ pub struct TerminalConfig {
     /// the buttons. See [`DiffTool`] for the argv template.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_tool: Option<DiffTool>,
+    /// The external editor the file-change cards' and the diff panel's "Open in …" buttons open
+    /// a file in, at a line. `None` (the default) opens the system's handler for the file, which
+    /// cannot jump to a line. See [`EditorTool`] for the argv template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor: Option<EditorTool>,
     /// 3.0: a file-change card opens its diff as soon as the edit completes, instead of
     /// waiting for "View diff". Off by default; cards replayed from history stay collapsed.
     pub diffs_expanded: bool,
@@ -1280,6 +1286,7 @@ impl Default for TerminalConfig {
             indicators: Vec::new(),
             turn_command: None,
             diff_tool: None,
+            editor: None,
             diffs_expanded: false,
             clear_env: default_clear_env(),
             default_agent: None,
@@ -2890,6 +2897,40 @@ mod tests {
         config.save_to(&path);
         let back = TerminalConfig::load_from(&path);
         assert_eq!(back.diff_tool, config.diff_tool);
+    }
+
+    #[test]
+    fn a_config_without_an_editor_loads_and_one_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"checkpoints":true,"theme":"dracula","default_agent":"claude"}"#)
+            .unwrap();
+        let old = TerminalConfig::load_from(&path);
+        assert_eq!(old.editor, None);
+        assert!(old.checkpoints, "the rest of the file still loads");
+        old.save_to(&path);
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("editor"));
+
+        let mut config = TerminalConfig::load_from(&path);
+        config.editor = Some(EditorTool {
+            name: "Zed".into(),
+            argv: vec!["zed".into(), "{file}:{line}:{column}".into()],
+            terminal: false,
+        });
+        config.save_to(&path);
+        let back = TerminalConfig::load_from(&path);
+        assert_eq!(back.editor, config.editor);
+
+        // A hand-written tool without `terminal` reads as a graphical one.
+        std::fs::write(
+            &path,
+            br#"{"editor":{"name":"Zed","argv":["zed","{file}"]}}"#,
+        )
+        .unwrap();
+        let hand = TerminalConfig::load_from(&path);
+        assert_eq!(hand.editor.map(|e| e.terminal), Some(false));
     }
 
     #[test]

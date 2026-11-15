@@ -164,7 +164,8 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   See [Turn checkpoints](reference.md#turn-checkpoints).
 - **Diff panel** (`Ctrl+Shift+D`): uncommitted work, the last turn, everything since
   the thread opened, or the target branch, with files grouped under their folder and each
-  file's diff on its own row. Open any file in your own diff tool. See [Diff panel](reference.md#diff-panel).
+  file's diff on its own row. Open any file in your own diff tool, or in your editor at the first changed line.
+  See [Diff panel](reference.md#diff-panel).
 - **Undo a turn**, which saves the current state first, so the undo can itself be undone.
   See [Undoing a turn](reference.md#undoing-a-turn).
 - **Worktrees** (`Ctrl+Shift+G`): a new branch in its own checkout, so an agent can

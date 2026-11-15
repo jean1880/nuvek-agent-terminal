@@ -149,6 +149,10 @@ Architectural mandates, standards, and workflows for this codebase.
   per-element placeholder substitution; never a shell). The app's `diff_tool.rs` launches it
   detached off the main thread. A file-change card compares the working file against the state
   recorded when its turn started (`window/imp/diffs.rs`), and falls back to the agent's own edit.
+- **External editor**: argv only (`agent-kit`'s `editor`, started by the app's `editor_tool.rs`
+  through the same detached launcher as the diff tool), contained to the thread's folder (a
+  symlink that leads out is outside; a sensitive file is refused), and a path outside it is
+  confirmed. With no editor set the file goes to `gtk::FileLauncher`, which cannot jump to a line.
 - **Undo is itself undoable, and only touches what it pinned**: a restore
   always pins the current working tree first (even if unchanged), refuses to
   run if the tree moved since that pin, never touches HEAD or the index, never

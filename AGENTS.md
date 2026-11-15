@@ -151,8 +151,8 @@ Architectural mandates, standards, and workflows for this codebase.
   recorded when its turn started (`window/imp/diffs.rs`), and falls back to the agent's own edit.
 - **External editor**: argv only (`agent-kit`'s `editor`, started by the app's `editor_tool.rs`
   through the same detached launcher as the diff tool), contained to the thread's folder (a
-  symlink that leads out is outside; a sensitive file is refused), and a path outside it is
-  confirmed. With no editor set the file goes to `gtk::FileLauncher`, which cannot jump to a line.
+  symlink that leads out is outside), and a path outside it, or a sensitive file, is refused
+  with a message. With no editor set the file goes to `gtk::FileLauncher`, which cannot jump to a line.
 - **Undo is itself undoable, and only touches what it pinned**: a restore
   always pins the current working tree first (even if unchanged), refuses to
   run if the tree moved since that pin, never touches HEAD or the index, never

@@ -39,6 +39,7 @@ pub mod sensitive;
 pub mod serde_name;
 pub mod shell_words;
 pub mod spend;
+pub mod terminal_excerpt;
 #[cfg(test)]
 mod test_support;
 pub mod text;

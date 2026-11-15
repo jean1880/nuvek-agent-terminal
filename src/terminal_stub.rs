@@ -149,6 +149,14 @@ impl Terminal {
         (None, glib::GString::from(""))
     }
 
+    pub fn has_selection(&self) -> bool {
+        false
+    }
+
+    pub fn text_selected(&self, _format: Format) -> Option<glib::GString> {
+        None
+    }
+
     pub fn write_contents_sync(
         &self,
         _stream: &gtk4::gio::MemoryOutputStream,

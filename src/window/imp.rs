@@ -1854,6 +1854,11 @@ impl AgentTerminalWindow {
             }
         });
 
+        // No accelerator: Ctrl+Shift+E is the resume chord. Enabled by `refresh_send_selection`
+        // as the terminal's menu opens.
+        self.add_win_action("send-selection", Self::send_selection_to_thread)
+            .set_enabled(false);
+
         // New Tab Action (bound to Ctrl+Shift+T in main.rs)
         self.add_win_action("new-tab", |imp| {
             debug!("Action: New Tab");
@@ -3536,7 +3541,7 @@ impl AgentTerminalWindow {
 
         self.configure_terminal(&terminal);
         self.wire_tab_signals(&terminal, &page);
-        self.wire_input_controllers(&terminal);
+        self.wire_input_controllers(&terminal, false);
 
         // Launch the CLI from the override (per-tab dir) or configured starting
         // directory, falling back to $HOME. Record it so "new tab in same
@@ -3951,8 +3956,23 @@ impl AgentTerminalWindow {
         tab_view.close_page(page);
     }
 
+    /// Opens a terminal's context menu, with the terminal focused (a right click does not
+    /// always move focus first) and the actions that depend on it brought up to date.
+    fn popup_terminal_menu(
+        win: &super::AgentTerminalWindow,
+        terminal: &Terminal,
+        popover: &gtk4::PopoverMenu,
+    ) {
+        terminal.grab_focus();
+        win.imp().refresh_send_selection();
+        popover.popup();
+    }
+
     /// Attaches the right-click menu and the ctrl-click hyperlink handler.
-    fn wire_input_controllers(&self, terminal: &Terminal) {
+    ///
+    /// `drawer` is whether the terminal is a thread's drawer rather than a terminal page.
+    fn wire_input_controllers(&self, terminal: &Terminal, drawer: bool) {
+        let win = self.obj().clone();
         // Context Menu (Right Click)
         let menu = gtk4::gio::Menu::new();
         menu.append(Some("New Thread"), Some("win.new-tab"));
@@ -3985,6 +4005,15 @@ impl AgentTerminalWindow {
         let section = gtk4::gio::Menu::new();
         section.append(Some("Copy"), Some("win.copy"));
         section.append(Some("Paste"), Some("win.paste"));
+        // A terminal page has no composer to send to; its entry says so, and stays disabled.
+        section.append(
+            Some(if drawer {
+                "Send Selection to Thread"
+            } else {
+                "Send Selection to Thread (open a thread first)"
+            }),
+            Some("win.send-selection"),
+        );
         menu.append_section(None, &section);
 
         let popover = gtk4::PopoverMenu::builder()
@@ -4005,11 +4034,15 @@ impl AgentTerminalWindow {
         click_gesture.connect_pressed(glib::clone!(
             #[weak]
             popover,
+            #[weak]
+            terminal,
+            #[weak]
+            win,
             move |gesture, _, x, y| {
                 gesture.set_state(gtk4::EventSequenceState::Claimed);
                 let rect = gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
                 popover.set_pointing_to(Some(&rect));
-                popover.popup();
+                Self::popup_terminal_menu(&win, &terminal, &popover);
             }
         ));
         terminal.add_controller(click_gesture);
@@ -4021,6 +4054,10 @@ impl AgentTerminalWindow {
         menu_keys.connect_key_pressed(glib::clone!(
             #[weak]
             popover,
+            #[weak]
+            terminal,
+            #[weak]
+            win,
             #[upgrade_or]
             glib::Propagation::Proceed,
             move |_, key, _, state| {
@@ -4030,7 +4067,7 @@ impl AgentTerminalWindow {
                     return glib::Propagation::Proceed;
                 }
                 popover.set_pointing_to(None);
-                popover.popup();
+                Self::popup_terminal_menu(&win, &terminal, &popover);
                 glib::Propagation::Stop
             }
         ));
@@ -4040,11 +4077,15 @@ impl AgentTerminalWindow {
         long_press.connect_pressed(glib::clone!(
             #[weak]
             popover,
+            #[weak]
+            terminal,
+            #[weak]
+            win,
             move |gesture, x, y| {
                 gesture.set_state(gtk4::EventSequenceState::Claimed);
                 let rect = gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
                 popover.set_pointing_to(Some(&rect));
-                popover.popup();
+                Self::popup_terminal_menu(&win, &terminal, &popover);
             }
         ));
         terminal.add_controller(long_press);
@@ -7108,6 +7149,68 @@ impl AgentTerminalWindow {
         ));
     }
 
+    /// The page in view as "Send Selection to Thread" sees it: its state, and when it is a thread
+    /// with a composer, that composer's view, its drawer terminal and the thread's title. Found
+    /// through the registry, never the widget tree.
+    fn send_selection_target(
+        &self,
+    ) -> (
+        SendSelection,
+        Option<(crate::chat::view::ChatView, Terminal, String)>,
+    ) {
+        let Some(page) = self.selected_page() else {
+            return (SendSelection::NoThread, None);
+        };
+        let found = self
+            .with_page_tab(&page, |t| {
+                let chat = t.chat.as_ref()?;
+                Some((chat.view.clone()?, t.terminal.clone(), chat.title.clone()))
+            })
+            .flatten();
+        let state = send_selection_state(
+            found.is_some(),
+            found.as_ref().is_some_and(|(_, term, _)| term.has_focus()),
+            found
+                .as_ref()
+                .is_some_and(|(_, term, _)| term.has_selection()),
+        );
+        (state, found)
+    }
+
+    /// Enables "Send Selection to Thread" only while the focused drawer terminal has a selection.
+    fn refresh_send_selection(&self) {
+        let enabled = self.send_selection_target().0 == SendSelection::Ready;
+        if let Some(action) = self
+            .obj()
+            .lookup_action("send-selection")
+            .and_then(|a| a.downcast::<gtk4::gio::SimpleAction>().ok())
+        {
+            action.set_enabled(enabled);
+        }
+    }
+
+    /// Puts the drawer terminal's selection in its own thread's draft: cleaned, redacted, capped
+    /// and fenced. The draft is never sent.
+    fn send_selection_to_thread(&self) {
+        let (state, found) = self.send_selection_target();
+        let (SendSelection::Ready, Some((view, terminal, title))) = (state, found) else {
+            return;
+        };
+        let selected = terminal.text_selected(Format::Text);
+        let excerpt = selected.and_then(|text| {
+            agent_core::terminal_excerpt::format_excerpt(
+                &text,
+                agent_core::terminal_excerpt::Caps::default(),
+            )
+        });
+        let Some(excerpt) = excerpt else {
+            self.show_toast("Nothing to send");
+            return;
+        };
+        view.insert_attachment_text(&excerpt.text);
+        self.show_toast(&excerpt_toast(&excerpt, &title));
+    }
+
     /// A short confirmation over the tab view. The text is data, not markup.
     fn show_toast(&self, text: &str) {
         self.add_toast(adw::Toast::builder().title(text).use_markup(false).build());
@@ -7491,9 +7594,103 @@ fn check_directory_entry(entry: &gtk4::Entry, row: &adw::ActionRow, help: &str) 
     }
 }
 
+/// Whether "Send Selection to Thread" can run for the terminal in view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendSelection {
+    /// The focused drawer terminal has a selection and its thread has a composer to take it.
+    Ready,
+    /// A terminal page, or a thread whose view is not built yet: no composer to send to.
+    NoThread,
+    /// The terminal does not have the keyboard, so the selection is not the one in play.
+    NotFocused,
+    /// The drawer is focused but nothing in it is selected.
+    NoSelection,
+}
+
+/// What the action does for a terminal, from facts read off the registry entry and the terminal:
+/// `thread_view` is whether the owning tab is a thread with a built composer.
+fn send_selection_state(thread_view: bool, focused: bool, has_selection: bool) -> SendSelection {
+    if !thread_view {
+        SendSelection::NoThread
+    } else if !focused {
+        SendSelection::NotFocused
+    } else if !has_selection {
+        SendSelection::NoSelection
+    } else {
+        SendSelection::Ready
+    }
+}
+
+/// The toast after a block went into `thread`'s draft: the lines, any masking and any cut.
+fn excerpt_toast(excerpt: &agent_core::terminal_excerpt::Excerpt, thread: &str) -> String {
+    let lines = if excerpt.lines == 1 {
+        "1 line".to_owned()
+    } else {
+        format!("{} lines", excerpt.lines)
+    };
+    let mut notes = Vec::new();
+    if excerpt.masked > 0 {
+        notes.push(if excerpt.masked == 1 {
+            "1 secret masked".to_owned()
+        } else {
+            format!("{} secrets masked", excerpt.masked)
+        });
+    }
+    if excerpt.truncated {
+        notes.push(format!(
+            "trimmed to the last {} lines",
+            agent_core::terminal_excerpt::EXCERPT_MAX_LINES
+        ));
+    }
+    let notes = if notes.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", notes.join(", "))
+    };
+    format!("Added {lines}{notes} to the draft of {thread}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn send_selection_resolves_by_owner_focus_and_selection() {
+        use SendSelection::*;
+        // A terminal page, or a thread not built yet, has no composer: whatever else is true.
+        assert_eq!(send_selection_state(false, true, true), NoThread);
+        assert_eq!(send_selection_state(true, false, true), NotFocused);
+        assert_eq!(send_selection_state(true, true, false), NoSelection);
+        assert_eq!(send_selection_state(true, true, true), Ready);
+    }
+
+    #[test]
+    fn the_send_toast_names_lines_masking_and_cut() {
+        use agent_core::terminal_excerpt::Excerpt;
+        let mut e = Excerpt {
+            text: String::new(),
+            lines: 42,
+            truncated: false,
+            masked: 0,
+        };
+        assert_eq!(
+            excerpt_toast(&e, "Fix build"),
+            "Added 42 lines to the draft of Fix build"
+        );
+        e.masked = 1;
+        e.truncated = true;
+        assert_eq!(
+            excerpt_toast(&e, "T"),
+            "Added 42 lines (1 secret masked, trimmed to the last 200 lines) to the draft of T"
+        );
+        e.lines = 1;
+        e.masked = 3;
+        e.truncated = false;
+        assert_eq!(
+            excerpt_toast(&e, "T"),
+            "Added 1 line (3 secrets masked) to the draft of T"
+        );
+    }
 
     #[test]
     fn settings_help_texts_are_valid_markup() {

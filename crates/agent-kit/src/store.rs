@@ -2623,8 +2623,9 @@ impl Store {
     /// spending history reads live threads' costs through. Idempotent: when it exists, this is
     /// one read of `sqlite_master` and takes no write lock. Building it parses every stored
     /// event once, so it is made on first use, through the store writer, off the main thread;
-    /// never in a migration. A query uses it only when it repeats the index's WHERE term with
-    /// the literal `'turn_completed'` (with a bound parameter the planner passes it over).
+    /// never in a migration. A query should repeat the index's WHERE term with the literal
+    /// `'turn_completed'`: with the type bound as a parameter, SQLite reaches the index only by
+    /// planning again for each bound value, so the plan is not fixed by the statement.
     pub fn ensure_spend_index(&self) -> Result<()> {
         if self.has_objects(&[schema_v11::SPEND_INDEX])? {
             return Ok(());

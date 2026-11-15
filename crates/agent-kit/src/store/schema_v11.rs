@@ -155,8 +155,8 @@ INSERT INTO search_fts (search_fts) VALUES ('rebuild');
 ";
 
 /// The partial index the spending history reads live threads' turns through
-/// ([`super::Store::ensure_spend_index`]). A query uses it only when it repeats the WHERE term
-/// with the literal `'turn_completed'`, never a bound parameter.
+/// ([`super::Store::ensure_spend_index`]). A query repeats the WHERE term with the literal
+/// `'turn_completed'`, so its plan uses the index whatever is bound.
 pub(crate) const SPEND_INDEX: &str = "events_turns";
 pub(crate) const SPEND_INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS events_turns ON events(at)
      WHERE json_extract(envelope_json, '$.event.type') = 'turn_completed'";
@@ -381,6 +381,35 @@ mod tests {
     }
 
     #[test]
+    fn updating_a_search_item_moves_its_text_in_the_index() {
+        let s = store();
+        assert_eq!(s.ensure_search_fts().expect("fts"), SearchIndex::Ready);
+        let t = s.create_thread("/w", None).expect("thread");
+        fill(&s, &t, "before");
+        let matches = |word: &str| {
+            count(
+                &s,
+                &format!("SELECT COUNT(*) FROM search_fts WHERE search_fts MATCH '{word}'"),
+            )
+        };
+        assert_eq!((matches("before"), matches("after")), (1, 0));
+        s.conn
+            .execute(
+                "UPDATE search_items SET text = 'after' WHERE thread_id = ?1",
+                params![t],
+            )
+            .expect("update");
+        assert_eq!(
+            (matches("before"), matches("after")),
+            (0, 1),
+            "the old text is gone from the index, the new one found"
+        );
+        s.conn
+            .execute_batch("INSERT INTO search_fts (search_fts) VALUES ('integrity-check')")
+            .expect("the index matches its content");
+    }
+
+    #[test]
     fn every_v11_check_refuses_its_bad_row() {
         let s = store();
         let t = s.create_thread("/w", None).expect("thread");
@@ -459,8 +488,40 @@ mod tests {
             format!("INSERT INTO thread_tags (thread_id, tag) VALUES ('{t}', '')"),
         );
         refused(
+            "a tag longer than 32 characters",
+            format!(
+                "INSERT INTO thread_tags (thread_id, tag) VALUES ('{t}', '{}')",
+                "x".repeat(33)
+            ),
+        );
+        refused(
             "a negative pin rank",
             format!("UPDATE threads SET pin_rank = -1 WHERE id = '{t}'"),
+        );
+        refused(
+            "an unknown pause reason",
+            "UPDATE schedules SET paused_reason = 'bored' WHERE id = 'ok1'".into(),
+        );
+        refused(
+            "an unknown search role",
+            format!(
+                "INSERT INTO search_items (thread_id, item_id, first_seq, role, at, text)
+                 VALUES ('{t}', 'i9', 1, 'system', 1, 'x')"
+            ),
+        );
+        refused(
+            "an unknown diff side",
+            format!(
+                "INSERT INTO review_drafts (thread_id, path, side, start_line, end_line, quoted,
+                     note, diff_base, created_at)
+                 VALUES ('{t}', 'a', 'middle', 1, 1, '', '', 'h', 1)"
+            ),
+        );
+        refused(
+            "a negative token count",
+            "INSERT INTO spend_ledger (day, driver, billing, output_tokens)
+                 VALUES ('2026-11-17', 'claude', 'metered', -1)"
+                .into(),
         );
         // A driver the reference table does not list is refused by its foreign key.
         assert!(s
@@ -575,11 +636,11 @@ mod tests {
             ),
             1
         );
-        let plan = |sql: &str| -> String {
+        let plan = |sql: &str, values: &[&dyn rusqlite::ToSql]| -> String {
             s.conn
                 .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
                 .expect("prepare")
-                .query_map(params![0], |r| r.get::<_, String>(3))
+                .query_map(values, |r| r.get::<_, String>(3))
                 .expect("query")
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .expect("plan")
@@ -588,12 +649,28 @@ mod tests {
         let used = plan(
             "SELECT at FROM events
              WHERE json_extract(envelope_json, '$.event.type') = 'turn_completed' AND at >= ?1",
+            &[&0],
         );
         assert!(used.contains("events_turns"), "{used}");
         let other = plan(
             "SELECT at FROM events
              WHERE json_extract(envelope_json, '$.event.type') = 'turn_started' AND at >= ?1",
+            &[&0],
         );
         assert!(!other.contains("events_turns"), "{other}");
+        // With the type bound as a parameter, the index is not part of the statement's own plan:
+        // SQLite picks it only by planning again for each bound value, so the plan follows the
+        // value (another type, no index). Only the literal makes the index certain.
+        let bound = |value: &str| {
+            plan(
+                "SELECT at FROM events
+                 WHERE json_extract(envelope_json, '$.event.type') = ?2 AND at >= ?1",
+                &[&0, &value],
+            )
+        };
+        let other_bound = bound("turn_started");
+        assert!(!other_bound.contains("events_turns"), "{other_bound}");
+        let same_bound = bound("turn_completed");
+        assert!(same_bound.contains("events_turns"), "{same_bound}");
     }
 }

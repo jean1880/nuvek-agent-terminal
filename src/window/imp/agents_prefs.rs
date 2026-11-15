@@ -1196,6 +1196,7 @@ impl AgentTerminalWindow {
         let on_change = validate.clone();
         sources_row.connect_changed(move |_| on_change(true, false));
         sources_row.set_show_apply_button(true);
+        crate::a11y::name_apply_button(&sources_row);
         let on_apply = validate.clone();
         sources_row.connect_apply(move |_| on_apply(false, true));
         let on_enter = validate.clone();
@@ -1455,6 +1456,25 @@ impl AgentTerminalWindow {
         );
     }
 
+    /// Opens the rules list over `rules` as it would open for a saved file at `path`.
+    #[cfg(test)]
+    pub(in crate::window::imp) fn present_rules_dialog_for_test(
+        &self,
+        parent: &gtk4::Widget,
+        path: std::path::PathBuf,
+        rules: crate::always_allow::AlwaysRules,
+    ) {
+        let status = rules.check_sync_status(None, &[], None);
+        let warning = rules.export_warning_for(None);
+        let view = RulesView {
+            rules,
+            blocked: None,
+            status,
+            warning,
+        };
+        self.present_rules_dialog(parent, path, view, None);
+    }
+
     fn present_rules_dialog(
         &self,
         parent: &gtk4::Widget,
@@ -1525,6 +1545,7 @@ impl AgentTerminalWindow {
                     .css_classes(["flat", "destructive-action"])
                     .tooltip_text("Delete this rule")
                     .build();
+                del_btn.update_property(&[gtk4::accessible::Property::Label("Delete this rule")]);
                 let obj = self.obj();
                 let p = path.clone();
                 let rule = r.clone();
@@ -2028,6 +2049,7 @@ impl AgentTerminalWindow {
         let obj = self.obj();
         let decide = Rc::new(decide);
         row.set_show_apply_button(true);
+        crate::a11y::name_apply_button(row);
         let commit = Rc::new(glib::clone!(
             #[weak]
             obj,
@@ -2470,6 +2492,9 @@ impl AgentTerminalWindow {
             .valign(Align::Center)
             .css_classes(["flat"])
             .build();
+        copy.update_property(&[gtk4::accessible::Property::Label(
+            "Copy the hooks.json entry",
+        )]);
         let to_copy = entry.clone();
         copy.connect_clicked(move |b| {
             b.clipboard().set_text(&to_copy);
@@ -2684,8 +2709,14 @@ fn open_rules_for_display(
 /// Antigravity's remembered "Always allow" rules, each with a Remove button. A removal is saved at once
 /// and applies to Antigravity sessions started after it (a running one keeps what it already allowed).
 fn always_allowed_rows() -> adw::ExpanderRow {
+    always_allowed_rows_at(crate::always_allow::path())
+}
+
+/// [`always_allowed_rows`] over the rules file at `path` (none: no file, so no rules).
+pub(in crate::window::imp) fn always_allowed_rows_at(
+    path: Option<std::path::PathBuf>,
+) -> adw::ExpanderRow {
     use crate::always_allow::{self, AlwaysRules};
-    let path = always_allow::path();
     let opened = path.as_deref().map(AlwaysRules::open);
     let subtitle = match (&opened, &path) {
         (Some(Err(e)), Some(p)) => always_allow::blocked_notice(p, e),
@@ -2713,6 +2744,7 @@ fn always_allowed_rows() -> adw::ExpanderRow {
             .valign(Align::Center)
             .css_classes(["flat"])
             .build();
+        remove.update_property(&[gtk4::accessible::Property::Label("Forget this rule")]);
         remove.connect_clicked(glib::clone!(
             #[weak]
             row,

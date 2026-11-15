@@ -254,6 +254,7 @@ impl AgentTerminalWindow {
             }
         ));
         command_row.set_show_apply_button(true);
+        crate::a11y::name_apply_button(&command_row);
         let on_apply = commit.clone();
         command_row.connect_apply(move |_| on_apply());
         let on_enter = commit.clone();

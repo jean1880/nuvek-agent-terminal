@@ -83,8 +83,7 @@ impl AgentTerminalWindow {
                         for server in &preview.servers {
                             let row=adw::SwitchRow::builder().title(format!("Import {}",server.id)).subtitle(format!("Executable name: {}; exact tools: {}; environment names: {}; {}",server.command_name,server.tools.join(", "),server.environment_names.join(", "),if server.reviewed{"Explicit allowlist; still no read-only declarations or approval exemptions"}else{"Disabled and unreviewed; discover and select tools before enabling"})).use_markup(false).active(false).build();
                             let refs:BTreeMap<_,_>=server.required_env_refs.iter().map(|name|(name.clone(),String::new())).collect();
-                            let entry=adw::EntryRow::builder().title(format!("{}: Environment Reference Names",server.id)).text(serde_json::to_string(&refs).unwrap_or_default()).build();
-                            let error=adw::ActionRow::builder().title("Reference Mapping").subtitle("Map each required exported name to a source variable name, never a credential value.").use_markup(false).subtitle_lines(0).build();
+                            let entry=adw::EntryRow::builder().title(format!("{}: Environment Reference Names",server.id)).text(serde_json::to_string(&refs).unwrap_or_default()).build();                            let error=adw::ActionRow::builder().title("Reference Mapping").subtitle("Map each required exported name to a source variable name, never a credential value.").use_markup(false).subtitle_lines(0).build();
                             parent.add_row(&row);parent.add_row(&entry);parent.add_row(&error);selections.borrow_mut().push((row,entry,error));
                         }
                         confirm.set_sensitive(!preview.servers.is_empty());*data.borrow_mut()=Some(preview);

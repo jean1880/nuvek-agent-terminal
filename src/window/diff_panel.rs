@@ -209,7 +209,7 @@ pub struct DiffPanel {
     /// while the panel is popped out (then it is hidden and empty).
     pub root: gtk4::Box,
     /// Everything the panel shows: in `root`, or in its own window when popped out.
-    content: gtk4::Box,
+    pub(in crate::window) content: gtk4::Box,
     /// The window the panel is popped out into, if it is.
     detached: Rc<RefCell<Option<adw::Window>>>,
     /// The parent window's destroy handler while popped out, to drop on docking.
@@ -280,6 +280,7 @@ impl DiffPanel {
             .tooltip_text("Refresh")
             .css_classes(["flat"])
             .build();
+        refresh.update_property(&[gtk4::accessible::Property::Label("Refresh changes")]);
         let header = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Horizontal)
             .spacing(6)
@@ -296,6 +297,7 @@ impl DiffPanel {
             .css_classes(["flat"])
             .visible(false)
             .build();
+        undo.update_property(&[gtk4::accessible::Property::Label("Undo these changes")]);
         let pop = gtk4::Button::builder()
             .icon_name(crate::icons::POP_OUT_ICON)
             .css_classes(["flat"])
@@ -830,11 +832,16 @@ impl DiffPanel {
         let refresh = |button: &gtk4::Button| match DiffTools::shared().get() {
             Some(tool) => {
                 button.set_visible(true);
-                button.set_tooltip_text(Some(&crate::diff_tool::open_label(&tool)));
+                let label = crate::diff_tool::open_label(&tool);
+                button.set_tooltip_text(Some(&label));
+                button.update_property(&[gtk4::accessible::Property::Label(&label)]);
             }
             None => {
                 button.set_visible(false);
                 button.set_tooltip_text(Some(crate::diff_tool::NO_TOOL_HINT));
+                button.update_property(&[gtk4::accessible::Property::Label(
+                    crate::diff_tool::NO_TOOL_HINT,
+                )]);
             }
         };
         refresh(&button);

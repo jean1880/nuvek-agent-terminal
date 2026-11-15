@@ -160,6 +160,7 @@ impl AgentTerminalWindow {
             .valign(gtk4::Align::Center)
             .css_classes(["flat"])
             .build();
+        add.update_property(&[gtk4::accessible::Property::Label("Add a server")]);
         let group = adw::PreferencesGroup::builder()
             .title("Local Model Servers")
             .description(LOCAL_GROUP_HELP)

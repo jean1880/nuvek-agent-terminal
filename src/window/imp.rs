@@ -913,19 +913,23 @@ fn build_search_bar(terminal: &Terminal) -> (gtk4::SearchBar, gtk4::SearchEntry)
         .icon_name("at-go-up-symbolic")
         .tooltip_text("Previous match (Shift+Enter)")
         .build();
+    previous.update_property(&[gtk4::accessible::Property::Label("Previous match")]);
     let next = Button::builder()
         .icon_name("at-go-down-symbolic")
         .tooltip_text("Next match (Enter)")
         .build();
+    next.update_property(&[gtk4::accessible::Property::Label("Next match")]);
 
     let case_sensitive = gtk4::ToggleButton::builder()
         .icon_name("at-format-text-italic-symbolic")
         .tooltip_text("Match case")
         .build();
+    case_sensitive.update_property(&[gtk4::accessible::Property::Label("Match case")]);
     let use_regex = gtk4::ToggleButton::builder()
         .icon_name("at-system-search-symbolic")
         .tooltip_text("Regular expression")
         .build();
+    use_regex.update_property(&[gtk4::accessible::Property::Label("Regular expression")]);
 
     let row = Box::builder()
         .orientation(Orientation::Horizontal)
@@ -2147,6 +2151,10 @@ impl AgentTerminalWindow {
                 .icon_name(&indicator.icon_unknown)
                 .tooltip_text(format!("{}: checking…", indicator.label))
                 .build();
+            button.update_property(&[gtk4::accessible::Property::Label(&format!(
+                "{}: checking…",
+                indicator.label
+            ))]);
             header.pack_end(&button);
             self.drive_indicator(button, indicator);
         }
@@ -2244,6 +2252,7 @@ impl AgentTerminalWindow {
                 }
                 button.set_icon_name(icon);
                 button.set_tooltip_text(Some(&tooltip));
+                button.update_property(&[gtk4::accessible::Property::Label(&tooltip)]);
                 for class in [
                     "success-indicator",
                     "warning-indicator",
@@ -2346,6 +2355,7 @@ impl AgentTerminalWindow {
             .icon_name("at-emblem-system-symbolic")
             .tooltip_text("Settings (Ctrl+,)")
             .build();
+        settings_btn.update_property(&[gtk4::accessible::Property::Label("Settings")]);
         settings_btn.connect_clicked(glib::clone!(
             #[weak]
             obj,
@@ -2601,6 +2611,7 @@ impl AgentTerminalWindow {
                 .icon_name("at-list-add-symbolic")
                 .tooltip_text("New Thread (Ctrl+Shift+T)")
                 .build();
+            new_btn.update_property(&[gtk4::accessible::Property::Label("New thread")]);
             new_btn.connect_clicked(glib::clone!(
                 #[weak]
                 obj,
@@ -2615,11 +2626,15 @@ impl AgentTerminalWindow {
                 .tooltip_text("Show or Hide Terminal Drawer (Ctrl+J)")
                 .action_name("win.toggle-drawer")
                 .build();
+            drawer_btn.update_property(&[gtk4::accessible::Property::Label(
+                "Show or hide the terminal drawer",
+            )]);
             let diff_btn = Button::builder()
                 .icon_name(crate::icons::GIT_ICON)
                 .tooltip_text("Show or Hide Changes (Ctrl+Shift+D)")
                 .action_name("win.toggle-diff")
                 .build();
+            diff_btn.update_property(&[gtk4::accessible::Property::Label("Show or hide changes")]);
             // No page is on show yet: `sync_diff_toggle` reveals it. The holder also follows the
             // button, which the narrow breakpoint hides, so an empty holder never takes the
             // header's spacing.
@@ -4621,6 +4636,7 @@ impl AgentTerminalWindow {
             .build();
         scrollback_row.add_suffix(&scroll_spin);
         scroll_spin.update_property(&[gtk4::accessible::Property::Label("Scrollback Lines")]);
+        crate::a11y::name_spin_buttons(&scroll_spin, "scrollback lines");
 
         let suspend_spin = gtk4::SpinButton::builder()
             .adjustment(&gtk4::Adjustment::new(
@@ -4644,6 +4660,7 @@ impl AgentTerminalWindow {
         suspend_spin.update_property(&[gtk4::accessible::Property::Label(
             "Pause Idle Agents After (Minutes)",
         )]);
+        crate::a11y::name_spin_buttons(&suspend_spin, "idle pause minutes");
 
         // Built from the configured profiles. Index 0 is auto-detection, so the
         // list is one longer than the profile list and every later index is
@@ -4672,6 +4689,7 @@ impl AgentTerminalWindow {
             .build();
         font_scale_row.add_suffix(&font_scale_spin);
         font_scale_spin.update_property(&[gtk4::accessible::Property::Label("Text Scale")]);
+        crate::a11y::name_spin_buttons(&font_scale_spin, "text scale");
         *self.font_scale_spin.borrow_mut() = font_scale_spin.downgrade();
 
         let cli_client_row = adw::ComboRow::builder()
@@ -8238,6 +8256,246 @@ mod tests {
             "layout changes must not change permission mode"
         );
         assert!(failures.is_empty(), "{}", failures.join("; "));
+    }
+
+    /// Every button in the window is named for assistive technology and is a usable target:
+    /// the sidebar, header, thread (header, shelves, composer, transcript), the diff panel (beside
+    /// the thread and popped out), every popover's contents and the Settings dialog with all its
+    /// pages. An icon with no text carries an explicit accessible label (a tooltip is no name).
+    /// This is a gate: it has no allowlist.
+    #[test]
+    #[ignore = "presents the window and Settings; run on a private display"]
+    fn every_button_in_the_window_is_named_and_sized() {
+        use agent_core::adapter::Driver;
+        init_gtk();
+        crate::testutil::adw_init().expect("adw init");
+        crate::icons::register();
+        crate::load_css();
+        let app = crate::window::imp::test_support::test_app("org.test.ButtonAudit", false);
+        let window = super::super::AgentTerminalWindow::new(&app);
+        let imp = window.imp();
+        for p in imp.config.borrow_mut().profiles.iter_mut() {
+            p.command = format!("/nonexistent/{}", p.command);
+        }
+        let ctx = glib::MainContext::default();
+        crate::testutil::pump_until(&ctx, 20, || !imp.detecting.get());
+        imp.finish_shell(None);
+        imp.reveal_shell();
+        let dir = tempfile::tempdir().unwrap();
+        // A diff tool, so each file row's "Open in" button is shown.
+        crate::diff_tool::DiffTools::shared().set(Some(agent_kit::difftool::DiffTool {
+            name: "Audit tool".into(),
+            argv: vec!["meld".into(), "{old}".into(), "{new}".into()],
+        }));
+        // A status indicator in the header.
+        let indicator_file = dir.path().join("indicator");
+        std::fs::write(&indicator_file, "").unwrap();
+        imp.config
+            .borrow_mut()
+            .indicators
+            .push(crate::config::Indicator {
+                label: "Audit indicator".into(),
+                source: crate::config::IndicatorSource::File {
+                    path: indicator_file.to_string_lossy().into_owned(),
+                },
+                refresh_secs: None,
+                icon_ok: "at-security-high-symbolic".into(),
+                icon_warn: "at-dialog-warning-symbolic".into(),
+                icon_unknown: "at-dialog-question-symbolic".into(),
+                action: Default::default(),
+            });
+        let header = imp.header.borrow().clone().expect("the header bar");
+        imp.add_status_indicators(&header);
+        // A repository with an edited file, so the diff panel has rows and controls to audit.
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let repo = run(&["init", "-q"]);
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
+        let _ = run(&["add", "."]) && run(&["commit", "-qm", "first"]);
+        std::fs::write(dir.path().join("a.txt"), "one\nthree\nfour\n").unwrap();
+        imp.new_chat_thread(
+            Some(Driver::Claude),
+            Some(dir.path().to_string_lossy().into_owned()),
+            None,
+        );
+        let built = crate::testutil::pump_until(&ctx, 30, || {
+            imp.tabs
+                .borrow()
+                .iter()
+                .any(|t| t.chat.as_ref().is_some_and(|c| c.view.is_some()))
+        });
+        assert!(built, "the thread's view was built");
+        let view = imp
+            .tabs
+            .borrow()
+            .iter()
+            .find_map(|t| t.chat.as_ref().and_then(|c| c.view.clone()))
+            .expect("a thread view");
+        view.replay(&crate::chat::view::demo::DemoBackend::script_envelopes());
+        let availability = crate::availability::AgentAvailability::shared();
+        crate::testutil::pump_until(&ctx, 20, || !availability.any_detecting());
+        for driver in [Driver::Claude, Driver::Agy] {
+            availability.set(
+                driver,
+                crate::availability::Availability::Ready("/bin/true".into()),
+            );
+        }
+        crate::chat::view::demo::observe_demo_quota(&crate::account_status::AccountStatus::shared());
+        window.set_default_size(1200, 800);
+        window.present();
+        imp.split_view
+            .borrow()
+            .as_ref()
+            .expect("the split view")
+            .set_show_sidebar(true);
+        imp.toggle_diff_panel();
+        if repo {
+            crate::testutil::pump_until(&ctx, 10, || false);
+        }
+        crate::testutil::settle(&ctx);
+
+        let mut problems = Vec::new();
+        let mut audit = |what: &str, root: &gtk4::Widget| {
+            let buttons = crate::testutil::audited_buttons(root).len();
+            eprintln!("{what}: {buttons} buttons audited");
+            for p in crate::testutil::button_problems(root, 24)
+                .into_iter()
+                .chain(crate::testutil::icon_only_without_label(root))
+            {
+                problems.push(format!("{what}: {p}"));
+            }
+            buttons
+        };
+        let root: gtk4::Widget = window.clone().upcast();
+        // The walk saw the surfaces it guards: a floor, so an emptied tree cannot pass.
+        assert!(
+            audit("window", &root) > 20,
+            "the window's buttons were walked"
+        );
+        // The states that hide a button by default are on: the diff tool's "Open in" buttons
+        // and the header's status indicator are audited, not skipped as hidden.
+        let tooltips: Vec<String> = crate::testutil::audited_buttons(&root)
+            .iter()
+            .filter_map(|b| b.tooltip_text().map(|t| t.to_string()))
+            .collect();
+        assert!(
+            tooltips.iter().any(|t| t.starts_with("Open in")),
+            "a file row's Open in button is audited: {tooltips:?}"
+        );
+        assert!(
+            tooltips.iter().any(|t| t.starts_with("Audit indicator")),
+            "the status indicator is audited: {tooltips:?}"
+        );
+
+        // The diff panel popped out into its own window, and docked again.
+        let panel = imp
+            .tabs
+            .borrow()
+            .iter()
+            .find_map(|t| t.chat.as_ref().map(|_| t.diff_panel.clone()))
+            .expect("a thread's diff panel");
+        panel.pop_out(window.upcast_ref(), "Button audit");
+        crate::testutil::settle(&ctx);
+        assert!(panel.is_detached(), "the panel is in its own window");
+        assert!(
+            audit("popped-out diff panel", panel.content.upcast_ref()) > 0,
+            "the popped-out panel's buttons were walked"
+        );
+        panel.dock();
+        crate::testutil::settle(&ctx);
+
+        // Settings, every page of it (pages that are not current are built too).
+        imp.show_preferences();
+        crate::testutil::pump_until(&ctx, 5, || window.visible_dialog().is_some());
+        crate::testutil::settle(&ctx);
+        let dialog = window.visible_dialog().expect("Settings is open");
+        // An entry row that offers Apply shows its button once its text has been edited, which
+        // libadwaita counts only while the row's text has focus: the focus-within flag stands in
+        // for a focused window, so no key event or wait is needed.
+        let rows = crate::testutil::find_all::<adw::EntryRow>(dialog.upcast_ref());
+        let row = rows
+            .iter()
+            .find(|r| r.shows_apply_button())
+            .expect("an entry row with an apply button");
+        let text = row
+            .delegate()
+            .and_then(|d| d.dynamic_cast::<gtk4::Widget>().ok())
+            .expect("the entry row's text");
+        text.set_state_flags(gtk4::StateFlags::FOCUS_WITHIN, false);
+        row.set_text("changed");
+        let settings_buttons = audit("settings", dialog.upcast_ref());
+        let applies = crate::testutil::audited_buttons(dialog.upcast_ref())
+            .iter()
+            .filter(|b| crate::a11y::is_apply_button(b))
+            .count();
+        eprintln!("settings: {applies} of them apply buttons");
+        assert!(
+            applies > 0,
+            "a shown apply button is audited (an apply button appears only once its row's text \
+             was edited)"
+        );
+        // No page goes unaudited: each is shown (a hidden one would be skipped), and what the
+        // pages hold apart from apply buttons does not depend on the libadwaita version.
+        for page in crate::testutil::find_all::<adw::PreferencesPage>(dialog.upcast_ref()) {
+            assert!(
+                crate::testutil::shown_or_in_popover(page.upcast_ref()),
+                "Settings page {:?} is hidden, so its buttons are not audited",
+                adw::prelude::PreferencesPageExt::title(&page)
+            );
+        }
+        assert!(
+            settings_buttons - applies > 30,
+            "Settings' buttons were walked ({settings_buttons}, {applies} of them apply buttons)"
+        );
+        dialog.close();
+        crate::testutil::settle(&ctx);
+
+        // Rules, seeded in the test home: the saved tool rules' list (a dialog) and the
+        // always-allowed rows (a Settings group), each with a delete button per rule.
+        let rules_path = dir.path().join("rules.json");
+        let rules = crate::always_allow::AlwaysRules {
+            rules: vec![crate::always_allow::Rule::new("*", "Bash", "ls*").expect("a rule")],
+        };
+        rules.save(&rules_path).expect("the rules file is saved");
+        let always = super::agents_prefs::always_allowed_rows_at(Some(rules_path.clone()));
+        assert!(
+            audit("always-allowed rows", always.upcast_ref()) > 0,
+            "the remove button of a remembered rule was walked"
+        );
+        imp.present_rules_dialog_for_test(window.upcast_ref(), rules_path, rules);
+        crate::testutil::pump_until(&ctx, 5, || window.visible_dialog().is_some());
+        crate::testutil::settle(&ctx);
+        let dialog = window.visible_dialog().expect("the rules list is open");
+        assert!(
+            audit("tool rules", dialog.upcast_ref()) > 0,
+            "the delete button of a saved rule was walked"
+        );
+        dialog.close();
+        crate::testutil::settle(&ctx);
+
+        // The set-up walkthrough, which Settings re-runs.
+        imp.show_setup();
+        crate::testutil::pump_until(&ctx, 5, || window.visible_dialog().is_some());
+        crate::testutil::settle(&ctx);
+        let dialog = window.visible_dialog().expect("the walkthrough is open");
+        assert!(
+            audit("set-up walkthrough", dialog.upcast_ref()) > 0,
+            "the walkthrough's buttons were walked"
+        );
+        dialog.close();
+        crate::testutil::settle(&ctx);
+
+        window.destroy();
+        problems.sort();
+        problems.dedup();
+        assert!(problems.is_empty(), "button problems: {problems:#?}");
     }
 
     /// The chat-first shell, without a main loop: nothing is resolved or spawned (the agent

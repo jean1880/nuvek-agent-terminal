@@ -428,10 +428,10 @@ mod tests {
                  VALUES ('{t}', 'a', 'old', {start}, {end}, '', '', 'h', 1)"
             )
         };
-        let ledger = |day: &str, billing: &str, cost: &str| {
+        let ledger = |day: &str, kind: &str, cost: &str| {
             format!(
                 "INSERT INTO spend_ledger (day, driver, billing, cost_usd)
-                 VALUES ('{day}', 'claude', '{billing}', {cost})"
+                 VALUES ('{day}', 'claude', '{kind}', {cost})"
             )
         };
         let thread = format!("'{t}'");

@@ -71,7 +71,9 @@ Architectural mandates, standards, and workflows for this codebase.
     whole-request budget planner) and `local_mcp` (its MCP server definitions, tool identity
     and aliases, the mode gate and the revision-bound approval card) and `sensitive` (the
     file and folder names an edit or read of always asks about, shared by agy's hook policy and
-    the Local agent's gate).
+    the Local agent's gate) and `export` (a thread as Markdown or JSON: agent labels and
+    dividers, capped fenced tool output, a final redaction pass; `agent-kit`'s `export` reads,
+    renders and writes it `0600` and atomically).
   - `crates/agent-kit` (GTK-free; blocking process and file I/O): `git`
     (git plumbing for turn checkpoints and diffs: shells out, but its parsers
     and filters are pure), `diff` (diff bases, numstat, line classification,

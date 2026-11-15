@@ -11,6 +11,7 @@ pub mod difftool;
 pub mod editdiff;
 pub mod editor;
 pub mod exec;
+pub mod export;
 pub mod filediff;
 pub mod fsutil;
 pub mod git;

@@ -64,6 +64,46 @@ record:
   "session_id_args": ["--session-id", "{id}"] }          // start under a chosen ID
 ```
 
+### Exporting a thread
+
+**Export…** in a thread's context menu (the third section, after **Open folder**; greyed out while
+the thread has no messages) asks for a format, whether to include the model's reasoning (off) and
+tool output (on), then where to save. The suggested name is `<title-slug>-<yyyy-mm-dd>.md` or
+`.json`. The file is `0600`, written through a temporary file beside it and renamed into place, so
+an existing file is replaced whole and a symbolic link at the name is replaced, never written
+through. The whole document is masked once more before writing.
+
+**Markdown** has a header (title, folder, last-active date, agents, app version, the masking
+note), then `### You` and `### <Agent>` blocks, a `**<kind>:** <title>` line per tool with its
+output fenced, `> **Reasoning**` quotes when asked, and `---` dividers with an italic line for
+agent switches, notices and carried-in context. Tool output over 20,000 characters is cut with
+`[… N more characters omitted]`.
+
+**JSON** (`"format": "agent-terminal-thread"`, `"version": 1`):
+
+```jsonc
+{
+  "format": "agent-terminal-thread",
+  "version": 1,
+  "app_version": "1.2.1",
+  "note": "Secrets matching known patterns are masked; one in another format may remain.",
+  "thread": { "id": "…", "title": "…", "folder": "…",
+              "last_active": "2026-11-15T12:00:00Z",   // omitted when unknown
+              "agents": ["claude", "codex"] },          // driver keys, in order of first use
+  "items": [
+    { "role": "user",          // user | assistant | tool | inherited | notice
+      "agent": "claude",       // driver key, or null
+      "kind": "user_message",  // assistant_message, reasoning, command, …
+      "title": "",             // a tool's one-line title
+      "text": "…",             // images as "[image: name]"; a tool's output, capped
+      "status": "completed",   // open | completed | failed | declined | interrupted
+      "omitted_chars": 0 }     // present only when a tool's output was cut
+  ]
+}
+```
+
+Fields are only ever added within a version; removing or renaming one raises `version`.
+
 ### Status indicators
 
 Optional header-bar lights driven by a file or a command. Empty by default.

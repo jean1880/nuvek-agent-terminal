@@ -272,11 +272,15 @@ pub fn app_running() -> bool {
 /// The plan's inputs from this process's environment and the saved profiles. Blocking: a
 /// profile's env file is sourced by a shell.
 pub fn inputs() -> uninstall::Inputs {
+    inputs_with(&crate::config::TerminalConfig::load())
+}
+
+/// [`inputs`] for the settings `config`. Blocking, as [`inputs`].
+fn inputs_with(config: &crate::config::TerminalConfig) -> uninstall::Inputs {
     let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
     let home = var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/"));
-    let config = crate::config::TerminalConfig::load();
     let process = crate::codex_home::process_env();
 
     let mut agy_homes = vec![home.clone()];
@@ -378,6 +382,22 @@ pub fn after_quit() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Remote machines put nothing on this machine beyond the settings file, and nothing on the
+    /// other machine at all, so listing some changes nothing an uninstall looks at.
+    #[test]
+    fn uninstall_plan_unchanged_by_remote_hosts() {
+        let plain = crate::config::TerminalConfig::default();
+        let mut with_hosts = crate::config::TerminalConfig::default();
+        with_hosts.add_remote_host("box", "Box").unwrap();
+        with_hosts.add_remote_host("me@192.0.2.7", "").unwrap();
+        let (a, b) = (inputs_with(&plain), inputs_with(&with_hosts));
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+        assert_eq!(
+            uninstall::candidate_folders(&a),
+            uninstall::candidate_folders(&b)
+        );
+    }
 
     #[test]
     fn sudo_pkexec_and_a_foreign_home_are_refused() {

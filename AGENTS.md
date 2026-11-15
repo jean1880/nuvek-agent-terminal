@@ -73,7 +73,9 @@ Architectural mandates, standards, and workflows for this codebase.
     file and folder names an edit or read of always asks about, shared by agy's hook policy and
     the Local agent's gate) and `export` (a thread as Markdown or JSON: agent labels and
     dividers, capped fenced tool output, a final redaction pass; `agent-kit`'s `export` reads,
-    renders and writes it `0600` and atomically).
+    renders and writes it `0600` and atomically) and `remote` (machines reached with the user's
+    `ssh`: host validation, the remote folder, POSIX quoting and the exact `ssh` argv of a
+    terminal page and of the reachability check).
   - `crates/agent-kit` (GTK-free; blocking process and file I/O): `git`
     (git plumbing for turn checkpoints and diffs: shells out, but its parsers
     and filters are pure), `diff` (diff bases, numstat, line classification,
@@ -124,7 +126,8 @@ Architectural mandates, standards, and workflows for this codebase.
     150 ms it shows the closing screen, drawn by `window/imp/pack_animation.rs`),
     `window/imp/agents_prefs.rs` (Settings → Agents; `agents_prefs/local_context.rs` and
     `local_mcp.rs` are the Local Instructions and Tools group: instruction files, budgets, MCP
-    server definitions, discovery and the Codex import),
+    server definitions, discovery and the Codex import), `window/imp/remote.rs` (Settings →
+    General → Remote Machines and the New Terminal Thread on Another Machine dialog),
     `window/sidebar_model.rs` (pure sidebar logic), `window/diff_panel.rs` (the
     diff panel's widgets and its "Open a PR" bar; it pops out into its own window, keeping its
     place, hidden, as its identity, and docks back when that window closes or its page leaves),
@@ -603,9 +606,25 @@ Architectural mandates, standards, and workflows for this codebase.
   events, the transcript and the store, before truncation. `tests/local_mcp.rs` proves these
   with fixture servers; `local_mcp_real_stdio` runs the official filesystem server when
   `LOCAL_MCP_TEST_COMMAND` names an installed copy.
-- **Localhost bound**: interacts only with the local shell; exposes no ports. MCP servers for
-  the Local agent are local child processes on pipes, never a network transport. The outbound
-  connections are three. The update check (`agent_kit::update`): a single HTTPS GET of the
+- **Localhost bound**: interacts with the local shell, and with other machines only through
+  the user's own `ssh`; exposes no ports. MCP servers for the Local agent are local child
+  processes on pipes, never a network transport. The outbound connections are four. The user's
+  `ssh` (`agent_core::remote`): only to a machine listed in Settings → General → Remote Machines
+  (`remote_hosts`, its alias validated: `[A-Za-z0-9._@:-]`, no leading `-`, after `--`),
+  started only by a user action (Check, opening a page or thread on that machine, Reconnect)
+  or by a page or thread the user created there, never at startup (remote pages are never
+  saved for Reopen Terminal Tabs), always as an argv with no local shell string, and always
+  with `ClearAllForwardings=yes`, `ForwardAgent=no`, `ForwardX11=no` and
+  `PermitLocalCommand=no`, so no `-L`/`-R`/`-D` forwarding from the user's ssh configuration
+  applies and nothing listens on either side. A terminal page runs `ssh -t` with `BatchMode=no`
+  (the user answers a host-key or password prompt in the page itself); anything without a
+  terminal (Check, and any chat process) runs with `BatchMode=yes`, so it never waits on a
+  prompt nobody sees. The remote command is one POSIX line, `cd -- '<folder>' && exec
+  <command>`, every user value single-quoted, writing nothing before `exec`. Nothing is ever
+  installed or written on the other machine, and nothing local but the config, so uninstall is
+  unchanged. A remote page has no checkpoints, diff panel, hand-off, session pickers, profile
+  env file or provider: they read or start things on this machine. The user's ssh
+  configuration (ProxyCommand, ControlMaster) runs as the user set it. The update check (`agent_kit::update`): a single HTTPS GET of the
   repository's latest GitHub release, off the main thread, with a timeout. It runs once per
   process a few seconds after startup unless Settings → "Check for Updates at Startup" is off
   (`check_updates_on_startup`), and when the user picks "Check for Updates…". Tests never reach

@@ -137,6 +137,7 @@ until it is fixed.
 | `indicators` | `[]` | Header status lights. See [Status indicators](reference.md#status-indicators) |
 | `turn_command` | none | A command run when a turn ends (`{id}`, `{dir}` are filled in) |
 | `clear_env` | session markers | Variables removed from a spawned agent's environment (`*` matches a prefix) |
+| `remote_hosts` | `[]` | Machines New Terminal Thread on Another Machine can open a terminal on, each `{"alias": "…", "label": "…"}`: the alias is what your own `ssh` is given (a `Host` from `~/.ssh/config`, a host name or `user@host`; letters, digits and `. _ @ : -`, not starting with `-`, at most 255 characters), the label is optional. An invalid or repeated entry is ignored. See [Remote machines](reference.md#remote-machines) |
 | `local_defaults` | see below | The Local agent's instruction files, request budget and MCP server definitions. See [Local instructions and tools](#local-instructions-and-tools) |
 
 ### Profiles

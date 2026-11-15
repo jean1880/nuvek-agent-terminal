@@ -3976,6 +3976,7 @@ impl AgentTerminalWindow {
                     },
                     archived: s.archived,
                     pin_rank: s.pin_rank,
+                    remote: false,
                 }
             })
             .collect();
@@ -3983,7 +3984,11 @@ impl AgentTerminalWindow {
             rows.push(SidebarRow {
                 key: RowKey::Terminal(tab.key),
                 title: tab.page.title().to_string(),
-                folder: tab.dir.clone(),
+                // A remote page groups under its machine and folder there, never a local one.
+                folder: tab
+                    .remote
+                    .as_ref()
+                    .map_or_else(|| tab.dir.clone(), super::RemoteTab::title),
                 updated_ms: tab
                     .started_at
                     .duration_since(std::time::UNIX_EPOCH)
@@ -3996,6 +4001,7 @@ impl AgentTerminalWindow {
                 open: OpenState::Here,
                 archived: false,
                 pin_rank: None,
+                remote: tab.remote.is_some(),
             });
         }
         rows
@@ -4436,21 +4442,39 @@ impl AgentTerminalWindow {
                 }
             }
         ));
+        // A remote page's group is `alias:folder`, not a local folder: its button opens another
+        // page there instead.
+        let remote = self
+            .tabs
+            .borrow()
+            .iter()
+            .filter_map(|t| t.remote.clone())
+            .find(|r| r.title() == folder);
+        let new_label = if remote.is_some() {
+            "New Terminal Thread in This Folder"
+        } else {
+            "New Thread in This Folder"
+        };
         let new = Button::builder()
             .icon_name("at-list-add-symbolic")
-            .tooltip_text("New Thread in This Folder")
+            .tooltip_text(new_label)
             .valign(Align::Center)
             .css_classes(["flat", "folder-new-thread"])
             .build();
-        new.update_property(&[gtk4::accessible::Property::Label(
-            "New thread in this folder",
-        )]);
+        new.update_property(&[gtk4::accessible::Property::Label(if remote.is_some() {
+            "New terminal thread in this folder"
+        } else {
+            "New thread in this folder"
+        })]);
         new.connect_clicked(glib::clone!(
             #[weak]
             obj,
             #[strong]
             folder,
-            move |_| obj.imp().new_chat_thread(None, Some(folder.clone()), None)
+            move |_| match &remote {
+                Some(remote) => obj.imp().add_remote_terminal_tab(remote.clone()),
+                None => obj.imp().new_chat_thread(None, Some(folder.clone()), None),
+            }
         ));
         line.append(&toggle);
         line.append(&new);
@@ -4520,6 +4544,12 @@ impl AgentTerminalWindow {
                 dot.add_css_class(&format!("dot-{}", driver.info().key));
                 dot.set_tooltip_text(Some(driver.info().label));
                 line.append(&dot);
+            }
+            None if row.remote => {
+                let icon = Image::from_icon_name(super::REMOTE_ICON);
+                icon.set_tooltip_text(Some("Terminal thread on another machine"));
+                icon.add_css_class("thread-term");
+                line.append(&icon);
             }
             None => {
                 let icon = Image::from_icon_name("at-utilities-terminal-symbolic");
@@ -5549,7 +5579,7 @@ impl AgentTerminalWindow {
         page.set_title(&title);
 
         self.configure_terminal(&terminal);
-        self.wire_input_controllers(&terminal, true);
+        self.wire_input_controllers(&terminal, true, false);
         // The drawer's shell exiting just closes the drawer; it never takes the thread.
         terminal.connect_child_exited(glib::clone!(
             #[weak]
@@ -5659,6 +5689,7 @@ impl AgentTerminalWindow {
             }),
             discovered_repo: None,
             in_repo: None,
+            remote: None,
         });
         if diff_panel.root.is_visible() {
             self.refresh_diff(&page);

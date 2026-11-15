@@ -205,6 +205,11 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   scrollback search (`Ctrl+Shift+F`), Sixel images and clickable links.
 - **A dead session keeps its page.** A CLI that exits with an error leaves its
   scrollback and the error in place, with **Restart** and **Close**.
+- **Remote machines**: list the machines you reach with `ssh` in Settings → General → Remote
+  Machines, then **+** → New Terminal Thread on Another Machine… opens a terminal page in a
+  folder there (`~` works), titled `machine:folder`. It is your own `ssh`, with your own
+  configuration and keys, never with port, agent or X11 forwarding, and nothing connects until
+  you ask. See [Remote machines](reference.md#remote-machines).
 
 ### Appearance and behaviour
 

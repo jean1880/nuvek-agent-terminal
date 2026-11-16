@@ -13,7 +13,7 @@
 //! is the user's own words and is kept exactly.
 
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -114,7 +114,7 @@ pub fn problems(
     builtins: &[Builtin],
     expand: impl Fn(&str) -> String,
 ) -> Vec<Option<String>> {
-    let mut seen: Vec<(String, Option<String>)> = Vec::new();
+    let mut seen: Vec<(String, Option<PathBuf>)> = Vec::new();
     prompts
         .iter()
         .enumerate()
@@ -131,7 +131,11 @@ pub fn problems(
             if let Err(why) = checked {
                 return Some(why);
             }
-            let key = (p.name.trim().to_ascii_lowercase(), folder);
+            // The folder by its path components, so `/a/b` and `/a/b/` are one folder.
+            let key = (
+                p.name.trim().to_ascii_lowercase(),
+                folder.map(|f| Path::new(&f).components().collect::<PathBuf>()),
+            );
             if seen.contains(&key) {
                 return Some(format!("/{} is already a saved prompt", key.0));
             }
@@ -315,6 +319,7 @@ pub struct Values {
     selection: Option<String>,
     folder: Option<String>,
     selection_cut: bool,
+    selection_dropped: bool,
 }
 
 impl Values {
@@ -336,8 +341,11 @@ impl Values {
     /// The selection, redacted and then cut to [`SELECTION_MAX_BYTES`] (see [`cap_selection`]).
     pub fn with_selection(mut self, raw: &str) -> Self {
         let (text, cut) = cap_selection(raw, SELECTION_MAX_BYTES);
-        self.selection_cut = cut && !text.is_empty();
-        self.selection = (!text.trim().is_empty()).then_some(text);
+        let kept = !text.trim().is_empty();
+        self.selection_cut = cut && kept;
+        // Cut to nothing (one unbroken run past the bound): not filled, but the caller is told.
+        self.selection_dropped = cut && !kept;
+        self.selection = kept.then_some(text);
         self
     }
 
@@ -375,6 +383,9 @@ pub struct Resolved {
     pub unresolved: Vec<Unresolved>,
     /// Whether a `{selection}` was filled with a selection cut to its cap.
     pub selection_cut: bool,
+    /// Whether a `{selection}` was left unfilled because nothing of the selection could be kept
+    /// whole: one run with no blank or line break, past four times the cap.
+    pub selection_dropped: bool,
 }
 
 /// Fills `segments` from `values`. A value goes in as it is: it is never scanned for
@@ -383,6 +394,7 @@ pub fn resolve(segments: &[Segment], values: &Values) -> Resolved {
     let mut text = String::new();
     let mut unresolved = Vec::new();
     let mut selection_cut = false;
+    let mut selection_dropped = false;
     for segment in segments {
         match segment {
             Segment::Text(t) => text.push_str(t),
@@ -392,6 +404,7 @@ pub fn resolve(segments: &[Segment], values: &Values) -> Resolved {
                     selection_cut |= *p == Placeholder::Selection && values.selection_cut;
                 }
                 None => {
+                    selection_dropped |= *p == Placeholder::Selection && values.selection_dropped;
                     let start = text.len();
                     text.push('{');
                     text.push_str(p.name());
@@ -410,6 +423,7 @@ pub fn resolve(segments: &[Segment], values: &Values) -> Resolved {
         cursor,
         unresolved,
         selection_cut,
+        selection_dropped,
     }
 }
 
@@ -622,6 +636,20 @@ mod tests {
         assert!(cut);
         assert!(text.len() <= SELECTION_MAX_BYTES && text.chars().all(|c| c == '日'));
 
+        // One unbroken run past the bound keeps nothing: left unfilled, and said to be.
+        let run = "x".repeat(SELECTION_MAX_BYTES * 4 + 1);
+        assert_eq!(
+            cap_selection(&run, SELECTION_MAX_BYTES),
+            (String::new(), true)
+        );
+        let r = expand("Q: {selection}", &Values::default().with_selection(&run));
+        assert_eq!(r.text, "Q: {selection}");
+        assert!(r.selection_dropped && !r.selection_cut);
+        let r = expand("{folder}", &Values::default().with_selection(&run));
+        assert!(!r.selection_dropped);
+        let r = expand("{selection}", &Values::default().with_selection(small));
+        assert!(!r.selection_dropped);
+
         // Not asked for: a cut selection is not reported.
         let r = expand("{folder}", &Values::default().with_selection(&big));
         assert!(!r.selection_cut);
@@ -692,6 +720,17 @@ mod tests {
             "{p:?}"
         );
         assert!(p[3].is_some() && p[4].is_some() && p[5].is_some(), "{p:?}");
+        // One folder however it is written: a trailing slash, a `.`, or `~/` once expanded.
+        let folders = [
+            prompt("fix", "a", Some("/a/b")),
+            prompt("fix", "b", Some("/a/b/")),
+            prompt("FIX", "c", Some("/a/./b")),
+            prompt("fix", "d", Some("~/b")),
+            prompt("fix", "e", Some("/a/bc")),
+        ];
+        let p = problems(&folders, b, |f| f.replacen('~', "/a", 1));
+        assert!(p[0].is_none() && p[4].is_none(), "{p:?}");
+        assert!(p[1..4].iter().all(Option::is_some), "{p:?}");
         assert!(validate_body(&"x".repeat(MAX_BODY_BYTES + 1)).is_err());
         // Past the count cap.
         let many: Vec<SavedPrompt> = (0..=MAX_PROMPTS)

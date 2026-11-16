@@ -359,7 +359,7 @@ saved. They are stored unencrypted, like every other setting, so keep secrets ou
 | Placeholder | What it becomes |
 |---|---|
 | `{file}` | The first `@path` already in the draft, else the file in focus in the thread's diff panel (the row you last expanded or moved to), while the panel is open |
-| `{selection}` | The text selected in the thread's transcript, else the text selected in the composer. At most its first 8 KB is used, and a toast says when it was cut |
+| `{selection}` | The text selected in the thread's transcript, else the text selected in the composer. At most its first 8 KB is used, and a toast says when it was cut. One run of text with no space or line break, too long to check for secrets whole, is left out, and a toast says so |
 | `{folder}` | The thread's folder |
 | `{branch}` | Not filled in yet: it stays in place for you to type |
 

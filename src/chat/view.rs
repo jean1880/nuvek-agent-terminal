@@ -1812,6 +1812,11 @@ impl ComposerHost for Inner {
                 "The selection was cut to its first {} KB",
                 saved_prompts::SELECTION_MAX_BYTES / 1024
             ));
+        } else if resolved.selection_dropped {
+            self.notify(
+                "The selection was left out: it is one long run of text with no space or line \
+                 break, too long to check for secrets",
+            );
         }
         Some(resolved)
     }
@@ -2072,6 +2077,12 @@ pub(crate) mod tests {
         let r = ComposerHost::expand_saved(&*inner, "review", "", Some(&big)).expect("expanded");
         assert!(r.selection_cut);
         assert!(r.text.len() < agent_core::saved_prompts::SELECTION_MAX_BYTES + 100);
+
+        // One unbroken run too long to keep: left to fill, and said to be.
+        let run = "x".repeat(agent_core::saved_prompts::SELECTION_MAX_BYTES * 4 + 1);
+        let r = ComposerHost::expand_saved(&*inner, "review", "", Some(&run)).expect("expanded");
+        assert!(r.selection_dropped && !r.selection_cut);
+        assert!(r.text.contains("{selection}"));
 
         // A name no prompt has any more.
         assert!(ComposerHost::expand_saved(&*inner, "gone", "", None).is_none());

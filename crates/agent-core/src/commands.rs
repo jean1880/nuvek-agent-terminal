@@ -378,7 +378,13 @@ pub fn completion_items_with(
                     {
                         continue;
                     }
-                    items.push(item.clone());
+                    // Pushed under the name it was compared by, so `Review` and `review` are
+                    // one row, and what it inserts follows.
+                    items.push(CompletionItem {
+                        insert_text: format!("/{name} "),
+                        name,
+                        ..item.clone()
+                    });
                 }
             }
         }
@@ -979,6 +985,16 @@ mod tests {
                 (CompletionKind::Saved, "tidy"),
             ]
         );
+        // Names differing only in case (or a leading slash) are one row, under the normal name.
+        let mixed = [saved("Tidy"), saved("tidy"), saved("/TIDY"), saved("MODEL")];
+        let items =
+            completion_items_with(builtins(), &[], &mixed, &Capabilities::claude(), &slash(""));
+        let tidy: Vec<(&str, &str)> = items
+            .iter()
+            .filter(|i| i.kind == CompletionKind::Saved)
+            .map(|i| (i.name.as_str(), i.insert_text.as_str()))
+            .collect();
+        assert_eq!(tidy, [("tidy", "/tidy ")]);
         // The built-in keeps its name: no saved row for /model.
         assert_eq!(names(&items).iter().filter(|n| **n == "model").count(), 1);
         // On a tie, the agent's command comes before the saved prompt of the same name.

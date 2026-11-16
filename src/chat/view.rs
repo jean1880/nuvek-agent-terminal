@@ -42,6 +42,8 @@ mod tray;
 mod typeahead;
 pub mod usage;
 
+pub(crate) use cards::guard_links;
+
 #[cfg(test)]
 mod gap_tests;
 #[cfg(test)]

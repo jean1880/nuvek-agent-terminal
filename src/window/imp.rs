@@ -3387,6 +3387,8 @@ impl AgentTerminalWindow {
                         .xalign(0.0)
                         .selectable(true)
                         .build();
+                    // Notes are markdown: a path in them is no file to open here.
+                    crate::chat::view::guard_links(&notes);
                     let scroll = gtk4::ScrolledWindow::builder()
                         .hscrollbar_policy(gtk4::PolicyType::Never)
                         .min_content_height(160)

@@ -270,21 +270,32 @@ fn percent_decode(text: &str) -> Option<String> {
 }
 
 /// The file a link names, when it names one: a path (`src/a.rs`, `/abs/a.rs`), with an optional
-/// line and column (`src/a.rs:12`, `src/a.rs:12:3`, `src/a.rs#L12`), or a `file://` URL on this
-/// machine (percent escapes decoded). A link with any other scheme (`https:`, `mailto:`), an
-/// in-page anchor (`#top`), a protocol-relative `//host` link, or text [`parse_location`] refuses
-/// is `None`, and so stays an ordinary link. The text is untrusted: it is only ever parsed into a
-/// [`Location`], which [`resolve_target`] then confines; it never reaches a command line whole.
+/// line and column (`src/a.rs:12`, `src/a.rs:12:3`, `src/a.rs#L12`), or a `file:` URL on this
+/// machine (`file:///p`, `file://localhost/p` or `file:/p`, scheme and host in any case, percent
+/// escapes decoded). A link with any other scheme, a `file:` URL of another host, an in-page
+/// anchor (`#top`), a protocol-relative `//host` link, or text [`parse_location`] refuses is
+/// `None`; [`link_action`] decides what such a link does. The text is untrusted: it is only ever
+/// parsed into a [`Location`], which [`resolve_target`] then confines; it never reaches a command
+/// line whole.
 pub fn file_link(href: &str) -> Option<Location> {
     let href = href.trim();
     if href.is_empty() || href.len() > MAX_LOCATION_BYTES || href.chars().any(char::is_control) {
         return None;
     }
-    if let Some(rest) = href.strip_prefix("file://") {
-        let path = rest.strip_prefix("localhost").unwrap_or(rest);
-        if !path.starts_with('/') {
-            return None; // another machine's file
-        }
+    if let Some(rest) = strip_scheme(href, "file") {
+        // `file:///p`, `file://localhost/p` (any case) or `file:/p`; any other host is another
+        // machine's file, and `file:p` is no path at all.
+        let path = match rest.strip_prefix("//") {
+            Some(after) => {
+                let (host, path) = after.split_at(after.find('/')?);
+                if !(host.is_empty() || host.eq_ignore_ascii_case("localhost")) {
+                    return None;
+                }
+                path
+            }
+            None if rest.starts_with('/') => rest,
+            None => return None,
+        };
         let decoded = percent_decode(path)?;
         let location = parse_location(&decoded)?;
         return Path::new(&location.path).is_absolute().then_some(location);
@@ -293,6 +304,43 @@ pub fn file_link(href: &str) -> Option<Location> {
         return None;
     }
     parse_location(href)
+}
+
+/// What follows `scheme:` at the start of `text`, the scheme matched in any case.
+fn strip_scheme<'a>(text: &'a str, scheme: &str) -> Option<&'a str> {
+    let head = text.get(..scheme.len())?;
+    let rest = text.get(scheme.len()..)?.strip_prefix(':')?;
+    head.eq_ignore_ascii_case(scheme).then_some(rest)
+}
+
+/// What a click on a link in the conversation does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkAction {
+    /// A file on this machine ([`file_link`]): opened in the editor, confined and confirmed.
+    Open(Location),
+    /// A web or mail link: left to the system's handler for it.
+    System,
+    /// Anything else (a `file:` URL that is not a local file, `resource:`, `ghelp:`, an anchor,
+    /// another app's scheme): opens nothing, so no other handler ever sees a local path.
+    Refuse,
+}
+
+/// Decides a link's [`LinkAction`]: only `http:`, `https:` and `mailto:` (any case) reach the
+/// system's handler.
+pub fn link_action(href: &str) -> LinkAction {
+    if let Some(location) = file_link(href) {
+        return LinkAction::Open(location);
+    }
+    let href = href.trim();
+    if !href.chars().any(char::is_control)
+        && ["http", "https", "mailto"]
+            .iter()
+            .any(|scheme| strip_scheme(href, scheme).is_some_and(|rest| !rest.is_empty()))
+    {
+        LinkAction::System
+    } else {
+        LinkAction::Refuse
+    }
 }
 
 /// Whether inline code text (`` `src/a.rs:12` ``) is a file location worth making a link of. It
@@ -605,6 +653,64 @@ mod tests {
             assert_eq!(file_link(not_a_file), None, "{not_a_file:?}");
         }
         assert_eq!(file_link(&"x".repeat(MAX_LOCATION_BYTES + 1)), None);
+    }
+
+    #[test]
+    fn every_local_file_url_is_a_file_and_only_web_and_mail_links_reach_the_system() {
+        // The scheme and the host in any case, and the one-slash form, are this machine's files.
+        for (href, path) in [
+            ("FILE:///etc/passwd", "/etc/passwd"),
+            ("File:///repo/.git/config", "/repo/.git/config"),
+            ("file://LOCALHOST/etc/passwd", "/etc/passwd"),
+            ("fIlE://LocalHost/etc/passwd", "/etc/passwd"),
+            ("file:/etc/passwd", "/etc/passwd"),
+            ("FILE:/etc/pass%77d", "/etc/passwd"),
+        ] {
+            assert_eq!(file_link(href), at(path, None, None), "{href}");
+            assert_eq!(
+                link_action(href),
+                LinkAction::Open(Location {
+                    path: path.to_owned(),
+                    line: None,
+                    column: None
+                }),
+                "{href}"
+            );
+        }
+        // A bare path is a file too, never the system's.
+        assert!(matches!(link_action("/etc/passwd"), LinkAction::Open(_)));
+        assert!(matches!(link_action("src/a.rs:3"), LinkAction::Open(_)));
+        // A file: URL that is not a local file, and every other scheme or anchor, opens nothing.
+        for href in [
+            "file://otherhost/etc/passwd",
+            "FILE://otherhost/etc/passwd",
+            "file:relative.rs",
+            "file:",
+            "file://",
+            "file:///w/%zz.rs",
+            "file:///w/%ff.rs",
+            "resource:///org/gtk/x",
+            "ghelp:gnome-help",
+            "help:gnome-help",
+            "smb://server/share",
+            "sftp://host/etc/passwd",
+            "javascript:alert(1)",
+            "data:text/html,x",
+            "vscode://file/etc/passwd",
+            "#section",
+            "//example.com/a.rs",
+            "https:",
+            "http://example.com/\u{7}",
+        ] {
+            assert_eq!(link_action(href), LinkAction::Refuse, "{href}");
+        }
+        for href in [
+            "https://example.com/a.rs:12",
+            "HTTP://example.com",
+            "mailto:someone@example.com",
+        ] {
+            assert_eq!(link_action(href), LinkAction::System, "{href}");
+        }
     }
 
     #[test]

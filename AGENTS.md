@@ -215,7 +215,11 @@ Architectural mandates, standards, and workflows for this codebase.
   through the same detached launcher as the diff tool), placeholders filled per element, the
   program fixed in config. A path from the conversation (a read's card, a reply's link or
   `path:line` code: `editor::file_link`, `code_location`, `read_location`) is only parsed into a
-  `Location`, never a command. It is resolved with every link followed (`resolve_target`) and
+  `Location`, never a command. Every transcript label's links go through
+  `editor::link_action`: a local file (a path, or a `file:` URL in any case and slash form) opens
+  in the editor, only `http(s)`/`mailto` reach the system's handler, and anything else is stopped,
+  so no local path ever reaches GIO; a label of markdown outside a thread (release notes) uses
+  `guard_links`. It is resolved with every link followed (`resolve_target`) and
   must be a regular file. A sensitive file is refused with a message, inside the folder or out.
   Inside the thread's folder it opens at once; outside it (a link leading out included) it opens
   only after an `adw::AlertDialog` naming the resolved file, Cancel the default, asked on every

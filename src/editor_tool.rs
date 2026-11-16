@@ -617,6 +617,32 @@ mod tests {
         );
         assert_eq!(asked.borrow().len(), asked_before, "never asked");
 
+        // A link judged inside the folder (so never asked about) that leads outside by the time
+        // the editor starts opens nothing.
+        let inner_link = f.work.path().join("inner");
+        std::os::unix::fs::symlink(f.work.path().join(HOSTILE), &inner_link).expect("link");
+        let asked_before = asked.borrow().len();
+        let err = ctx
+            .block_on(open_with(
+                request(&f, "inner"),
+                |_| std::future::ready(true),
+                |req, confirmed| {
+                    let (t, recorder) = (t.clone(), recorder.clone());
+                    let (inner_link, outside) = (inner_link.clone(), outside.clone());
+                    async move {
+                        assert_eq!(confirmed, None, "an inside file is never confirmed");
+                        std::fs::remove_file(&inner_link).expect("unlink");
+                        std::os::unix::fs::symlink(&outside, &inner_link).expect("relink");
+                        open_blocking(&t, &req, confirmed.as_deref(), |_| Some(recorder.clone()))
+                    }
+                },
+            ))
+            .expect_err("a link moved outside opens nothing");
+        assert_eq!(err, NOT_CONFIRMED);
+        assert_eq!(asked.borrow().len(), asked_before);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!f.log.exists(), "nothing was started");
+
         // The question names where the path led, not the link.
         let (heading, body) = outside_question(&outside);
         assert_eq!(heading, "Open a File Outside This Folder?");

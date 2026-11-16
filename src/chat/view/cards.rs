@@ -251,21 +251,32 @@ pub(super) fn mono(text: &str) -> gtk4::Label {
 /// Where a label's file links go: set once its row knows where to send them.
 pub(super) type LinkSink = Rc<RefCell<Option<Rc<dyn Fn(agent_kit::editor::Location)>>>>;
 
-/// Routes `label`'s links: one that names a file (`agent_kit::editor::file_link`: a path, a
-/// `path:line`, a `file://` URL) goes to `links`, to be opened in the editor, and never to the
-/// system's handler for URIs; with nowhere to go it opens nothing. Any other link is left to GTK.
+/// Routes `label`'s links by `agent_kit::editor::link_action`: one that names a file on this
+/// machine (a path, a `path:line`, a local `file:` URL) goes to `links`, to be opened in the
+/// editor (with nowhere to go it opens nothing); a web or mail link is left to GTK; anything else
+/// opens nothing. So no local path ever reaches the system's handler for URIs.
 pub(super) fn route_file_links(label: &gtk4::Label, links: &LinkSink) {
     let links = Rc::clone(links);
     label.connect_activate_link(move |_, uri| {
-        let Some(location) = agent_kit::editor::file_link(uri) else {
-            return glib::Propagation::Proceed;
-        };
-        let handler = links.borrow().clone();
-        if let Some(handler) = handler {
-            handler(location);
+        use agent_kit::editor::LinkAction;
+        match agent_kit::editor::link_action(uri) {
+            LinkAction::System => glib::Propagation::Proceed,
+            LinkAction::Refuse => glib::Propagation::Stop,
+            LinkAction::Open(location) => {
+                let handler = links.borrow().clone();
+                if let Some(handler) = handler {
+                    handler(location);
+                }
+                glib::Propagation::Stop
+            }
         }
-        glib::Propagation::Stop
     });
+}
+
+/// Guards a label whose markup came from [`super::markdown`] outside any thread (no file to
+/// open): its file links, and every link but a web or mail one, open nothing.
+pub fn guard_links(label: &gtk4::Label) {
+    route_file_links(label, &Rc::default());
 }
 
 /// Sends a file link to `sink` as [`RowEvent::OpenLocation`].
@@ -4095,6 +4106,7 @@ pub(crate) mod tests {
         rule_dialog_prefills_the_bare_w0_command();
         rule_dialog_validates_the_pattern_inline();
         approval_cards_show_the_command_and_cap_the_rest();
+        reasoning_file_links_open_in_the_editor();
     }
 
     /// `Rule::new` is a `Result`: the rule dialog shows why a pattern cannot be a rule as it is
@@ -4149,6 +4161,47 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    /// A reasoning paragraph's file links go to the row's sink; a link that is no local file and
+    /// no web link is stopped; and a guarded label (release notes) opens no file at all.
+    fn reasoning_file_links_open_in_the_editor() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let received = events.clone();
+        let sink: RowSink = Rc::new(move |event| received.borrow_mut().push(event));
+        let row = ReasoningRow::new("think", &sink);
+        row.show_text("Check `src/r.rs:5` and [x](file:/etc/hosts) or [y](resource:///x)");
+        let labels = row.reasoning_labels();
+        assert_eq!(labels.len(), 1);
+        for href in ["src/r.rs:5", "file:/etc/hosts", "resource:///x"] {
+            assert!(
+                labels[0].emit_by_name::<bool>("activate-link", &[&href]),
+                "{href} is handled"
+            );
+        }
+        let opened: Vec<_> = events
+            .borrow()
+            .iter()
+            .filter_map(|e| match e {
+                RowEvent::OpenLocation { location } => Some((location.path.clone(), location.line)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            opened,
+            [
+                ("src/r.rs".to_owned(), Some(5)),
+                ("/etc/hosts".to_owned(), None)
+            ]
+        );
+
+        let notes = gtk4::Label::new(None);
+        notes.set_markup(&super::super::markdown::passage_markup("See `src/a.rs:1`"));
+        guard_links(&notes);
+        assert!(
+            notes.emit_by_name::<bool>("activate-link", &[&"src/a.rs:1"]),
+            "a guarded label's file link is stopped"
+        );
     }
 
     /// A Codex command card shows the bare command and its folder,
@@ -4243,8 +4296,10 @@ pub(crate) mod tests {
         assert_eq!(full["binding"]["grant"]["server_id"], "example");
         assert_eq!(full["binding"]["grant"]["tool"], "read");
 
-        let plan = "# Ship the parity wave\n\n1. Deny sends decline\n2. Stop turn cancels\n";
-        let (card, _) = codex_card(
+        let plan = "# Ship the parity wave\n\n1. Deny sends decline\n2. Stop turn cancels\n\n\
+                    Start in `src/plan.rs:7`, see [this](FILE:///etc/passwd), \
+                    [that](file://otherhost/etc/passwd) and [help](ghelp:gnome-help).\n";
+        let (card, events) = codex_card(
             "ExitPlanMode",
             serde_json::json!({ "plan": plan }),
             options,
@@ -4262,6 +4317,27 @@ pub(crate) mod tests {
             "the plan renders as markdown"
         );
         assert!(blocks.len() >= 2);
+        drop(blocks);
+        // The plan's file links open in the editor; a remote file: URL and another app's scheme
+        // are stopped (handled, so GTK never passes them on) and open nothing.
+        events.borrow_mut().clear();
+        for href in [
+            "src/plan.rs:7",
+            "FILE:///etc/passwd",
+            "file://otherhost/etc/passwd",
+            "ghelp:gnome-help",
+        ] {
+            assert!(card.plan.activate_link(href), "{href} is handled");
+        }
+        let opened: Vec<_> = events
+            .borrow()
+            .iter()
+            .filter_map(|e| match e {
+                RowEvent::OpenLocation { location } => Some(location.path.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(opened, ["src/plan.rs", "/etc/passwd"]);
     }
 
     /// From the Codex frame: the rule dialog's entry holds the bare command,

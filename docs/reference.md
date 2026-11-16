@@ -362,7 +362,9 @@ Other places open a file in the editor the same way:
   ‹editor›** for the file it read, at the line it started from. A search's card has none.
 - **Links in a reply**: a link to a path (`[parser](src/parse.rs#L12)`), a `file://` link,
   and inline code that names a file and line (`` `src/parse.rs:12` ``, `` `a.rs:12:3` ``) or a
-  path with a folder (`` `src/parse.rs` ``). Web links still open in the browser.
+  path with a folder (`` `src/parse.rs` ``). Web (`http`, `https`) and `mailto` links still
+  open in their usual app; any other link (another machine's `file:` URL, `resource:`, `help:`,
+  another app's scheme) opens nothing.
 
 **Containment.** The path is resolved first, every symlink followed, and must lead to a
 regular file. A file inside the thread's folder opens at once. A file outside it is asked

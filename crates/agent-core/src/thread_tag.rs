@@ -241,16 +241,20 @@ mod tests {
         );
         // With a character a tag cannot have, before, inside or after it, it is still refused as
         // a secret, never as an invalid tag that would echo it.
-        for typed in [
+        for (case, typed) in [
             format!("{secret},"),
             format!("{secret}\u{7}"),
             format!("x {secret}"),
             format!("{secret}\u{1f}more"),
-        ] {
+        ]
+        .iter()
+        .enumerate()
+        {
+            // The message names the case, never the fixture.
             assert_eq!(
-                normalize_tag(&typed),
+                normalize_tag(typed),
                 Err(TagError::LooksLikeSecret),
-                "{typed:?}"
+                "case {case}"
             );
             assert!(tag_set(&[typed.as_str()])
                 .expect_err("refused")
@@ -263,7 +267,10 @@ mod tests {
             TagError::Invalid(format!("{secret}\u{7}")),
             TagError::TooLong(format!("{secret}{}", "x".repeat(40))),
         ] {
-            assert!(!error.to_string().contains(secret), "{error}");
+            assert!(
+                !error.to_string().contains(secret),
+                "an error message echoes the fixture"
+            );
         }
         // Plain words are kept.
         for word in ["review", "token", "password", "secret", "key"] {

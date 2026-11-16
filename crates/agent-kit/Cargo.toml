@@ -10,7 +10,7 @@ publish = false
 
 [dependencies]
 agent-core = { path = "../agent-core" }
-rusqlite = { version = "0.41", features = ["bundled", "backup"] }
+rusqlite = { version = "0.42", features = ["bundled", "backup"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = "=1.2.0"

@@ -334,7 +334,9 @@ impl AgentTerminalWindow {
         } else {
             PLACEHOLDER_THREADS
         }));
-        if !on || sidebar.search.text().trim().is_empty() {
+        // `#tag` terms filter the hits but are never searched for: words are needed.
+        let words = SearchQuery::parse(&sidebar.search.text()).text();
+        if !on || words.is_empty() {
             search.clear();
             return None;
         }

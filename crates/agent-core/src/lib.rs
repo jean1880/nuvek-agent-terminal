@@ -48,6 +48,7 @@ pub mod terminal_excerpt;
 #[cfg(test)]
 mod test_support;
 pub mod text;
+pub mod thread_tag;
 pub mod tool_title;
 pub mod transition;
 pub mod user_tags;

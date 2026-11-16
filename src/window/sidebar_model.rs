@@ -2,6 +2,8 @@
 //! and relative time. No GTK, so it is tested without a display.
 
 use agent_core::adapter::{Driver, Mode};
+pub use agent_core::search_query::SearchQuery;
+pub use agent_core::thread_tag::TagColour;
 
 /// What a sidebar row opens.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -230,13 +232,19 @@ pub fn reopen_offer(n: usize) -> Option<String> {
     }
 }
 
-/// What the sidebar says when it lists nothing: the title and hint for an empty list, or for a
-/// search that matched nothing.
-pub fn empty_sidebar_text(query: &str) -> (&'static str, &'static str) {
-    if query.trim().is_empty() {
+/// What the sidebar says when it lists nothing: the title and hint for an empty list, for a
+/// search that matched nothing, or for a `#tag` filter no thread passes.
+pub fn empty_sidebar_text(query: &SearchQuery) -> (&'static str, &'static str) {
+    if query.is_empty() {
         (
             "No Threads Yet",
             "Start one with Ctrl+Shift+T or the + button.",
+        )
+    } else if !query.tags.is_empty() {
+        (
+            "No Matching Threads",
+            "No thread holds every tag searched for. Tag one from its menu, or show archived \
+             threads.",
         )
     } else {
         (
@@ -244,6 +252,104 @@ pub fn empty_sidebar_text(query: &str) -> (&'static str, &'static str) {
             "Try other words, or show archived threads.",
         )
     }
+}
+
+/// Most tag chips a sidebar row shows; the rest are counted (`+N`).
+pub const MAX_CHIPS: usize = 2;
+
+/// A tag as a row shows it: its name and its colour, if it has one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowTag {
+    pub name: String,
+    pub colour: Option<TagColour>,
+}
+
+/// `tags` with their colours from `colours`, in the order given.
+pub fn row_tags(
+    tags: &[String],
+    colours: &std::collections::BTreeMap<String, TagColour>,
+) -> Vec<RowTag> {
+    tags.iter()
+        .map(|name| RowTag {
+            name: name.clone(),
+            colour: colours.get(name).copied(),
+        })
+        .collect()
+}
+
+/// The chips a row draws ([`MAX_CHIPS`] at most) and how many tags it leaves to `+N`.
+pub fn shown_chips(tags: &[RowTag]) -> (&[RowTag], usize) {
+    let shown = tags.len().min(MAX_CHIPS);
+    (&tags[..shown], tags.len() - shown)
+}
+
+/// Every tag of a row, for its tooltip and screen-reader description: `#a #b #c`.
+pub fn tags_text(tags: &[RowTag]) -> String {
+    tags.iter()
+        .map(|t| format!("#{}", t.name))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The search text after a click on the chip of `tag`: `#tag` added to what is typed, unless
+/// it is already one of its tag terms.
+pub fn with_tag_term(current: &str, tag: &str) -> String {
+    if SearchQuery::parse(current).tags.iter().any(|t| t == tag) {
+        return current.to_owned();
+    }
+    match current.trim_end() {
+        "" => format!("#{tag}"),
+        typed => format!("{typed} #{tag}"),
+    }
+}
+
+/// The Tags dialog's rows: every tag a thread holds (`known`, with how many hold it) and the
+/// thread's own (`current`), each once and sorted, ticked when the thread holds it.
+pub fn tag_choices(known: &[(String, usize)], current: &[String]) -> Vec<(String, bool)> {
+    let mut names: Vec<String> = known.iter().map(|(t, _)| t.clone()).collect();
+    names.extend(current.iter().cloned());
+    names.sort();
+    names.dedup();
+    names
+        .into_iter()
+        .map(|t| {
+            let held = current.contains(&t);
+            (t, held)
+        })
+        .collect()
+}
+
+/// What the Tags dialog's colour dropdown lists: "No colour", then every [`TagColour`].
+pub fn colour_choices() -> Vec<&'static str> {
+    std::iter::once("No colour")
+        .chain(TagColour::ALL.iter().map(|c| c.label()))
+        .collect()
+}
+
+/// The colour at dropdown position `index` ([`colour_choices`]); `None` for "No colour" or one
+/// out of range.
+pub fn colour_at(index: u32) -> Option<TagColour> {
+    (index as usize)
+        .checked_sub(1)
+        .and_then(|i| TagColour::ALL.get(i).copied())
+}
+
+/// The dropdown position of `colour` ([`colour_choices`]).
+pub fn colour_index(colour: Option<TagColour>) -> u32 {
+    colour
+        .and_then(|c| TagColour::ALL.iter().position(|x| *x == c))
+        .map_or(0, |i| i as u32 + 1)
+}
+
+/// The thread's tags once the Tags dialog is saved: the ticked rows and what is typed in its
+/// entry (commas, spaces or new lines between tags), checked as the store checks them.
+pub fn chosen_tags<'a>(
+    ticked: impl IntoIterator<Item = &'a str>,
+    typed: &str,
+) -> Result<Vec<String>, agent_core::thread_tag::TagError> {
+    let mut all: Vec<String> = ticked.into_iter().map(str::to_owned).collect();
+    all.extend(agent_core::thread_tag::parse_tags(typed)?);
+    agent_core::thread_tag::tag_set(&all)
 }
 
 /// Most message hits the sidebar asks the index for.
@@ -550,23 +656,36 @@ pub struct SidebarRow {
     pub pin_rank: Option<i64>,
     /// A terminal page on another machine; its `folder` is `alias:folder`.
     pub remote: bool,
+    /// The thread's tags, sorted, with their colours.
+    pub tags: Vec<RowTag>,
 }
 
-/// Rows matching `query` (case-insensitive, on title and folder), grouped by folder. Groups are
-/// ordered by their newest row and rows newest first, so the folder being worked in is on top.
-/// Archived rows are left out unless `show_archived` (or the thread is open in this window).
+/// Whether `row` passes `query`: its plain text (case-insensitive) is in the title, the folder
+/// or a tag, and the row holds every one of its `#tag` terms.
+fn row_matches(row: &SidebarRow, text: &str, tags: &[String]) -> bool {
+    let text_ok = text.is_empty()
+        || row.title.to_lowercase().contains(text)
+        || row.folder.to_lowercase().contains(text)
+        || row.tags.iter().any(|t| t.name.contains(text));
+    text_ok
+        && tags
+            .iter()
+            .all(|want| row.tags.iter().any(|t| t.name == *want))
+}
+
+/// Rows matching `query` ([`row_matches`]), grouped by folder. Groups are ordered by their
+/// newest row and rows newest first, so the folder being worked in is on top. Archived rows are
+/// left out unless `show_archived` (or the thread is open in this window).
 pub fn group_rows(
     rows: Vec<SidebarRow>,
-    query: &str,
+    query: &SearchQuery,
     show_archived: bool,
 ) -> Vec<(String, Vec<SidebarRow>)> {
-    let query = query.trim().to_lowercase();
+    let text = query.text().to_lowercase();
     let mut groups: Vec<(String, Vec<SidebarRow>)> = Vec::new();
     for row in rows.into_iter().filter(|r| {
         (show_archived || !r.archived || r.open != OpenState::Closed)
-            && (query.is_empty()
-                || r.title.to_lowercase().contains(&query)
-                || r.folder.to_lowercase().contains(&query))
+            && row_matches(r, &text, &query.tags)
     }) {
         match groups.iter_mut().find(|(f, _)| *f == row.folder) {
             Some((_, list)) => list.push(row),
@@ -620,7 +739,7 @@ impl SidebarSections {
 /// open), and a thread is listed once: pinned first, else active, else in its folder.
 pub fn sidebar_sections(
     rows: Vec<SidebarRow>,
-    query: &str,
+    query: &SearchQuery,
     show_archived: bool,
 ) -> SidebarSections {
     let mut pinned = Vec::new();
@@ -917,6 +1036,10 @@ pub enum ThreadAction {
     Unpin(String),
     /// Moves a pinned thread up (negative) or down (positive) the Pinned section.
     PinMove(String, i8),
+    /// Opens the Tags dialog.
+    EditTags(String),
+    /// Removes every tag of the thread (with Undo).
+    ClearTags(String),
 }
 
 /// Separates the fields of an encoded [`ThreadAction`] (never part of an id, model or effort).
@@ -964,6 +1087,8 @@ impl ThreadAction {
             Self::Pin(t) => simple("pin", t),
             Self::Unpin(t) => simple("unpin", t),
             Self::PinMove(t, delta) => format!("pin-move{SEP}{t}{SEP}{delta}"),
+            Self::EditTags(t) => simple("tags", t),
+            Self::ClearTags(t) => simple("clear-tags", t),
         }
     }
 
@@ -1014,6 +1139,8 @@ impl ThreadAction {
                 [delta] => delta.parse().ok().map(|d| Self::PinMove(thread, d)),
                 _ => None,
             },
+            "tags" => simple(Self::EditTags(thread)),
+            "clear-tags" => simple(Self::ClearTags(thread)),
             _ => None,
         }
     }
@@ -1050,6 +1177,8 @@ pub struct ThreadMenuInput {
     pub archived: bool,
     /// The thread is pinned: it offers Unpin, Move Up and Move Down instead of Pin to Top.
     pub pinned: bool,
+    /// The thread has tags: it offers Clear Tags.
+    pub tagged: bool,
     /// The thread has at least one message to hand over ("Continue in a new thread with…" needs one).
     pub has_messages: bool,
     /// Only enabled (and installed) agents appear.
@@ -1213,6 +1342,10 @@ pub fn thread_menu(input: &ThreadMenuInput) -> Vec<MenuEntry> {
                 entries.push(item("Move Up", ThreadAction::PinMove(thread.clone(), -1)));
                 entries.push(item("Move Down", ThreadAction::PinMove(thread.clone(), 1)));
             }
+            entries.push(item("Tags…", ThreadAction::EditTags(thread.clone())));
+            if input.tagged {
+                entries.push(item("Clear Tags", ThreadAction::ClearTags(thread.clone())));
+            }
             entries.push(if input.archived {
                 item("Unarchive", ThreadAction::Unarchive(thread.clone()))
             } else {
@@ -1246,11 +1379,21 @@ pub fn parse_driver(name: &str) -> Option<Driver> {
 mod tests {
     use super::*;
 
+    fn q(text: &str) -> SearchQuery {
+        SearchQuery::parse(text)
+    }
+
     #[test]
     fn an_empty_sidebar_says_why_by_whether_a_search_is_on() {
-        assert_eq!(empty_sidebar_text("").0, "No Threads Yet");
-        assert_eq!(empty_sidebar_text("   ").0, "No Threads Yet");
-        assert_eq!(empty_sidebar_text("deploy").0, "No Matching Threads");
+        assert_eq!(empty_sidebar_text(&q("")).0, "No Threads Yet");
+        assert_eq!(empty_sidebar_text(&q("   ")).0, "No Threads Yet");
+        assert_eq!(empty_sidebar_text(&q(" # ")).0, "No Threads Yet");
+        let words = empty_sidebar_text(&q("deploy"));
+        assert_eq!(words.0, "No Matching Threads");
+        assert!(words.1.contains("other words"));
+        let tags = empty_sidebar_text(&q("deploy #review"));
+        assert_eq!(tags.0, "No Matching Threads");
+        assert!(tags.1.contains("tag"), "{}", tags.1);
     }
 
     #[test]
@@ -1282,7 +1425,7 @@ mod tests {
         let mut elsewhere = row("t", "/r", 0);
         elsewhere.open = OpenState::Elsewhere;
         elsewhere.archived = true;
-        assert_eq!(group_rows(vec![elsewhere], "", false).len(), 1);
+        assert_eq!(group_rows(vec![elsewhere], &q(""), false).len(), 1);
     }
 
     fn model_row(id: &str, badge: Option<Badge>) -> SidebarRow {
@@ -1299,6 +1442,7 @@ mod tests {
             archived: false,
             pin_rank: None,
             remote: false,
+            tags: Vec::new(),
         }
     }
 
@@ -1388,7 +1532,7 @@ mod tests {
             pinned,
             active,
             groups,
-        } = sidebar_sections(rows, "", false);
+        } = sidebar_sections(rows, &q(""), false);
         SidebarModel {
             pinned_active: pinned.iter().filter(|r| is_active(r)).count(),
             pinned,
@@ -1536,6 +1680,7 @@ mod tests {
             archived: false,
             pin_rank: None,
             remote: false,
+            tags: Vec::new(),
         }
     }
 
@@ -1567,7 +1712,7 @@ mod tests {
                 row("b", "/w/one", 2),
                 row("c", "/w/two", 1),
             ],
-            "",
+            &q(""),
             false,
         );
         let shape = |folded: Vec<FolderGroup>| -> Vec<(String, bool, usize, Vec<String>)> {
@@ -1637,7 +1782,7 @@ mod tests {
             with(row("run-new", "/w/two", 40), Badge::Running),
             with(row("limited", "/w/four", 1), Badge::RateLimited),
         ];
-        let SidebarSections { active, groups, .. } = sidebar_sections(rows.clone(), "", false);
+        let SidebarSections { active, groups, .. } = sidebar_sections(rows.clone(), &q(""), false);
         assert_eq!(
             active.iter().map(id).collect::<Vec<_>>(),
             ["ask", "limited", "run-new", "run-old", "bg"],
@@ -1659,10 +1804,11 @@ mod tests {
         assert!(!is_active(&row("n", "/w", 1)));
 
         // The search filters the active section too; nothing active: no section.
-        let SidebarSections { active, groups, .. } = sidebar_sections(rows, "thread ask", false);
+        let SidebarSections { active, groups, .. } =
+            sidebar_sections(rows, &q("thread ask"), false);
         assert_eq!(active.iter().map(id).collect::<Vec<_>>(), ["ask"]);
         assert!(groups.is_empty());
-        let sections = sidebar_sections(vec![row("x", "/w", 1)], "", false);
+        let sections = sidebar_sections(vec![row("x", "/w", 1)], &q(""), false);
         assert!(sections.active.is_empty() && sections.pinned.is_empty());
     }
 
@@ -1684,13 +1830,13 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(ids(group_rows(rows.clone(), "", false)), ["a", "open"]);
+        assert_eq!(ids(group_rows(rows.clone(), &q(""), false)), ["a", "open"]);
         assert_eq!(
-            ids(group_rows(rows.clone(), "", true)),
+            ids(group_rows(rows.clone(), &q(""), true)),
             ["a", "open", "old"]
         );
         // The search still applies to what is shown.
-        assert_eq!(ids(group_rows(rows, "thread old", true)), ["old"]);
+        assert_eq!(ids(group_rows(rows, &q("thread old"), true)), ["old"]);
     }
 
     #[test]
@@ -1702,7 +1848,7 @@ mod tests {
                 row("c", "/w/one", 40),
                 row("d", "/w/two", 20),
             ],
-            "",
+            &q(""),
             false,
         );
         let shape: Vec<(&str, Vec<&str>)> = groups
@@ -1728,9 +1874,12 @@ mod tests {
     #[test]
     fn search_matches_title_or_folder_case_insensitively() {
         let rows = vec![row("a", "/w/One", 1), row("b", "/w/two", 2)];
-        assert_eq!(group_rows(rows.clone(), "one", false).len(), 1);
-        assert_eq!(group_rows(rows.clone(), "THREAD B", false)[0].0, "/w/two");
-        assert!(group_rows(rows, "nothing", false).is_empty());
+        assert_eq!(group_rows(rows.clone(), &q("one"), false).len(), 1);
+        assert_eq!(
+            group_rows(rows.clone(), &q("THREAD B"), false)[0].0,
+            "/w/two"
+        );
+        assert!(group_rows(rows, &q("nothing"), false).is_empty());
     }
 
     // ---- the thread menu ----
@@ -1753,6 +1902,7 @@ mod tests {
             thread: "t1".into(),
             archived,
             pinned: false,
+            tagged: false,
             has_messages,
             agents: vec![
                 MenuAgent {
@@ -1932,6 +2082,7 @@ mod tests {
                 "Compact into a new thread",
                 "Rename…",
                 "Pin to Top",
+                "Tags…",
                 "Archive",
                 "Delete…",
                 "Open folder",
@@ -1947,6 +2098,7 @@ mod tests {
                 "Compact into a new thread",
                 "Rename…",
                 "Pin to Top",
+                "Tags…",
                 "Unarchive",
                 "Delete…",
                 "Open folder",
@@ -1988,6 +2140,8 @@ mod tests {
             ThreadAction::Unpin("t".into()),
             ThreadAction::PinMove("t".into(), -1),
             ThreadAction::PinMove("t".into(), 1),
+            ThreadAction::EditTags("t".into()),
+            ThreadAction::ClearTags("t".into()),
         ]);
         for a in actions {
             assert_eq!(ThreadAction::decode(&a.encode()), Some(a.clone()), "{a:?}");
@@ -1995,6 +2149,10 @@ mod tests {
         // Garbage and malformed targets decode to nothing, never to a wrong action.
         for bad in [
             "",
+            "tags",
+            "tags\u{1f}",
+            "tags\u{1f}t\u{1f}extra",
+            "clear-tags\u{1f}t\u{1f}x",
             "delete",
             "delete\u{1f}",
             "bogus\u{1f}t",
@@ -2029,7 +2187,7 @@ mod tests {
             pinned_row("p1", "/w/two", 90, 0),
             row("b", "/w/two", 20),
         ];
-        let sections = sidebar_sections(rows, "", false);
+        let sections = sidebar_sections(rows, &q(""), false);
         assert_eq!(
             ids_of(&sections.pinned),
             ["p1", "p2"],
@@ -2049,7 +2207,7 @@ mod tests {
             "a pinned row leaves its folder, and the folders keep their own recency order"
         );
         // Only pinned threads: their folders are gone.
-        let only = sidebar_sections(vec![pinned_row("p", "/w", 1, 0)], "", false);
+        let only = sidebar_sections(vec![pinned_row("p", "/w", 1, 0)], &q(""), false);
         assert!(only.groups.is_empty() && only.active.is_empty());
     }
 
@@ -2059,7 +2217,7 @@ mod tests {
         busy.badge = Some(Badge::NeedsApproval);
         let mut other = row("other", "/w", 4);
         other.badge = Some(Badge::Running);
-        let sections = sidebar_sections(vec![busy, other], "", false);
+        let sections = sidebar_sections(vec![busy, other], &q(""), false);
         assert_eq!(ids_of(&sections.pinned), ["busy"]);
         assert_eq!(sections.pinned[0].badge, Some(Badge::NeedsApproval));
         assert_eq!(
@@ -2079,16 +2237,16 @@ mod tests {
         open.open = OpenState::Here;
         let rows = vec![archived, open];
         assert_eq!(
-            ids_of(&sidebar_sections(rows.clone(), "", false).pinned),
+            ids_of(&sidebar_sections(rows.clone(), &q(""), false).pinned),
             ["open"]
         );
         assert_eq!(
-            ids_of(&sidebar_sections(rows.clone(), "", true).pinned),
+            ids_of(&sidebar_sections(rows.clone(), &q(""), true).pinned),
             ["old", "open"]
         );
         // The search applies to the pinned rows too.
         assert_eq!(
-            ids_of(&sidebar_sections(rows, "thread old", true).pinned),
+            ids_of(&sidebar_sections(rows, &q("thread old"), true).pinned),
             ["old"]
         );
     }
@@ -2183,6 +2341,207 @@ mod tests {
             })
             .collect();
         assert_eq!(order, ["p1", "p2", "busy", "a"]);
+    }
+
+    fn tagged(id: &str, folder: &str, at: i64, tags: &[&str]) -> SidebarRow {
+        let mut r = row(id, folder, at);
+        r.tags = tags
+            .iter()
+            .map(|t| RowTag {
+                name: (*t).to_owned(),
+                colour: None,
+            })
+            .collect();
+        r
+    }
+
+    fn all_ids(sections: &SidebarSections) -> Vec<String> {
+        let mut ids = ids_of(&sections.pinned);
+        ids.extend(ids_of(&sections.active));
+        for (_, rows) in &sections.groups {
+            ids.extend(ids_of(rows));
+        }
+        ids
+    }
+
+    #[test]
+    fn hash_terms_filter_by_tag_and_and_together() {
+        let rows = vec![
+            tagged("both", "/w/one", 5, &["ops", "review"]),
+            tagged("review", "/w/two", 4, &["review"]),
+            tagged("none", "/w/one", 3, &[]),
+            tagged("prefix", "/w/two", 2, &["reviewer"]),
+        ];
+        let found = |query: &str| all_ids(&sidebar_sections(rows.clone(), &q(query), false));
+        assert_eq!(
+            found("#review"),
+            ["both", "review"],
+            "a whole tag, not a prefix"
+        );
+        assert_eq!(found("#REVIEW"), ["both", "review"]);
+        assert_eq!(found("#review #ops"), ["both"], "ANDed");
+        assert!(found("#review #missing").is_empty());
+        // Tag terms and words together: both must hold.
+        assert_eq!(found("#review thread r"), ["review"]);
+        assert_eq!(
+            found("#review one"),
+            ["both"],
+            "the folder still matches the words"
+        );
+        // A lone # is a tag still being typed: it filters nothing.
+        assert_eq!(found("#").len(), 4);
+        // The filter applies to the pinned and active sections too.
+        let mut pinned = tagged("pinned", "/w", 9, &["ops"]);
+        pinned.pin_rank = Some(0);
+        let mut busy = tagged("busy", "/w", 8, &[]);
+        busy.badge = Some(Badge::Running);
+        let sections = sidebar_sections(vec![pinned, busy], &q("#ops"), false);
+        assert_eq!(ids_of(&sections.pinned), ["pinned"]);
+        assert!(
+            sections.active.is_empty(),
+            "an untagged active row is filtered out"
+        );
+    }
+
+    #[test]
+    fn plain_search_also_matches_tags() {
+        let rows = vec![
+            tagged("a", "/w", 2, &["blocked"]),
+            tagged("b", "/w", 1, &["spike"]),
+        ];
+        let found = |query: &str| all_ids(&sidebar_sections(rows.clone(), &q(query), false));
+        assert_eq!(found("BLOCK"), ["a"], "a word matches inside a tag");
+        assert_eq!(found("thread b"), ["b"], "titles still match");
+        assert!(found("nothing").is_empty());
+        // A terminal page has no tags: a tag filter leaves it out.
+        let mut term = row("t", "/w", 3);
+        term.key = RowKey::Terminal(7);
+        assert_eq!(group_rows(vec![term.clone()], &q(""), false).len(), 1);
+        assert!(group_rows(vec![term], &q("#blocked"), false).is_empty());
+    }
+
+    #[test]
+    fn menu_shows_tags_and_clear_tags_only_when_they_apply() {
+        let labels = |tags: bool| -> Vec<(String, ThreadAction)> {
+            let mut i = input(true, false);
+            i.tagged = tags;
+            items(&thread_menu(&i))
+                .into_iter()
+                .filter(|(label, _, _)| label.contains("Tags"))
+                .map(|(label, action, _)| (label, action))
+                .collect()
+        };
+        assert_eq!(
+            labels(false),
+            [("Tags…".to_owned(), ThreadAction::EditTags("t1".into()))]
+        );
+        assert_eq!(
+            labels(true),
+            [
+                ("Tags…".to_owned(), ThreadAction::EditTags("t1".into())),
+                (
+                    "Clear Tags".to_owned(),
+                    ThreadAction::ClearTags("t1".into())
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_row_shows_two_chips_and_counts_the_rest() {
+        let row = tagged("t", "/w", 1, &["a", "b", "c", "d"]);
+        let (shown, more) = shown_chips(&row.tags);
+        assert_eq!(
+            shown.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert_eq!(more, 2);
+        assert_eq!(
+            tags_text(&row.tags),
+            "#a #b #c #d",
+            "the tooltip lists them all"
+        );
+        let one = tagged("t", "/w", 1, &["a"]);
+        assert_eq!(shown_chips(&one.tags).1, 0);
+        assert_eq!(shown_chips(&[]).0.len(), 0);
+    }
+
+    #[test]
+    fn tags_take_their_colours_and_colours_are_tokens() {
+        let colours: std::collections::BTreeMap<String, TagColour> =
+            [("review".to_owned(), TagColour::Warning)].into();
+        let tags = row_tags(&["ops".to_owned(), "review".to_owned()], &colours);
+        assert_eq!(
+            tags,
+            [
+                RowTag {
+                    name: "ops".into(),
+                    colour: None
+                },
+                RowTag {
+                    name: "review".into(),
+                    colour: Some(TagColour::Warning)
+                },
+            ]
+        );
+        // A colour change is a different row: the sidebar redraws it.
+        let mut a = tagged("t", "/w", 1, &["review"]);
+        let b = a.clone();
+        a.tags[0].colour = Some(TagColour::Danger);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn the_colour_dropdown_maps_both_ways() {
+        let choices = colour_choices();
+        assert_eq!(choices.len(), TagColour::ALL.len() + 1);
+        assert_eq!(choices[0], "No colour");
+        assert_eq!(colour_at(0), None);
+        assert_eq!(colour_index(None), 0);
+        for colour in TagColour::ALL {
+            let i = colour_index(Some(colour));
+            assert_eq!(colour_at(i), Some(colour));
+            assert_eq!(choices[i as usize], colour.label());
+        }
+        assert_eq!(colour_at(99), None);
+    }
+
+    #[test]
+    fn a_chip_adds_its_tag_term_once() {
+        assert_eq!(with_tag_term("", "review"), "#review");
+        assert_eq!(with_tag_term("  ", "review"), "#review");
+        assert_eq!(with_tag_term("deploy ", "review"), "deploy #review");
+        assert_eq!(with_tag_term("#ops", "review"), "#ops #review");
+        assert_eq!(
+            with_tag_term("#Review x", "review"),
+            "#Review x",
+            "already there"
+        );
+    }
+
+    #[test]
+    fn the_tags_dialog_offers_every_tag_and_ticks_the_threads_own() {
+        let known = [("ops".to_owned(), 2), ("spike".to_owned(), 1)];
+        assert_eq!(
+            tag_choices(&known, &["review".to_owned(), "ops".to_owned()]),
+            [
+                ("ops".to_owned(), true),
+                ("review".to_owned(), true),
+                ("spike".to_owned(), false),
+            ]
+        );
+        assert_eq!(
+            chosen_tags(["ops"], "Blocked, #spike ops").unwrap(),
+            ["blocked", "ops", "spike"]
+        );
+        assert_eq!(chosen_tags([], "").unwrap(), Vec::<String>::new());
+        assert!(chosen_tags(["ops"], "not,ok\u{7}").is_err());
+        let eight = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        assert!(chosen_tags(eight, "").is_ok());
+        assert_eq!(
+            chosen_tags(eight, "i"),
+            Err(agent_core::thread_tag::TagError::TooMany(9))
+        );
     }
 
     #[test]
@@ -2582,6 +2941,7 @@ mod message_search_tests {
             unread: false,
             archived: false,
             pin_rank: None,
+            tags: Vec::new(),
         }
     }
 

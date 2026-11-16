@@ -126,6 +126,51 @@ never change a thread's last-active time. Deleting a thread removes its pin.
 | `Ctrl+Shift+P` | pins or unpins the shown thread |
 | `Alt+Shift+Up`, `Alt+Shift+Down` | moves the selected pinned row in the sidebar |
 
+### Tagging threads
+
+Tags group threads across folders ("review", "spike", "blocked"). A thread's context menu has,
+after the pin entries:
+
+| Entry | Shown | Does |
+|---|---|---|
+| **Tags…** | always | opens the Tags dialog |
+| **Clear Tags** | a thread with tags | removes them all, with a toast offering **Undo** |
+
+The **Tags** dialog lists every tag any thread has, each with a box to tick for this thread
+and a colour, and an entry for new tags, separated by spaces, commas or new lines. **Save**
+writes them; **Cancel**, `Escape` or a press outside the dialog changes nothing.
+
+- **What a tag is:** one word of at most 32 characters, stored lowercased, with a leading
+  `#` dropped (`#Review` is `review`). Whitespace, commas and control characters are refused,
+  and so is anything that looks like a secret (a key or a token): a tag is shown on every row,
+  so it is never kept masked. A thread has at most 8 tags. What would be refused says why
+  under the entry, and **Save** stays off until it is fixed.
+- **Colours:** **No colour**, **Accent**, **Green**, **Yellow** or **Red**. A colour belongs to
+  the tag, on every thread that has it, and is drawn in the colour scheme's own shade of it
+  (the desktop's, with the **System** scheme), tinting the chip; its text stays readable in
+  every scheme. A colour is forgotten once no thread has its tag (the **Undo** of **Clear
+  Tags** brings it back).
+- **On a row:** up to two tags show as chips after the title, and `+N` counts the rest; its
+  tooltip lists them all, and a screen reader reads every tag in the row's description.
+  Clicking a chip adds `#tag` to the sidebar's search.
+- **Kept:** archiving keeps a thread's tags; deleting it removes them. Tagging never changes a
+  thread's last-active time, so the folder groups stay in place. Tags are never sent to an
+  agent or put in a hand-off.
+
+### Searching the sidebar
+
+The sidebar's search entry matches what you type, case-insensitively, in each thread's title,
+folder and tags. A word starting with `#` is a tag filter instead: `#review` keeps only the
+threads tagged `review` (the whole tag, in any case), and several are all required
+(`#review #blocked`). Words and tag filters combine: `#review deploy` lists the threads
+tagged `review` whose title, folder or tags hold "deploy". A lone `#` filters nothing yet.
+The filter applies to the **Pinned** and **Active** sections too; terminal pages have no tags,
+so a tag filter hides them.
+
+With **Also Search Messages** on, only the words are looked for in messages, and the tag
+filters keep the matches to the threads that have every one of those tags; tag filters alone
+search no message.
+
 ### The message index
 
 Every thread is indexed for searching inside threads, always, with no setting. The index
@@ -160,7 +205,9 @@ from the entry) adds what the threads said to the search. It has no shortcut of 
 
 - **What you type:** words, matched whole and in any order; the last word also matches as
   the start of a longer one (`deplo` finds "deploy"). Quotes, `*`, `-` and words such as
-  `NEAR` or `OR` are taken as plain text, never as search syntax.
+  `NEAR` or `OR` are taken as plain text, never as search syntax. A `#tag` word is never
+  looked for: it keeps the matches to threads with that tag
+  ([searching the sidebar](#searching-the-sidebar)).
 - **When it runs:** under half a second after you stop typing, off the main thread, so the
   window never waits on it. Only the newest search is shown.
 - **What it shows:** up to 50 matches, best first: the thread's title, "Archived" for an

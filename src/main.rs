@@ -627,6 +627,33 @@ fn load_css() {
             border-radius: 6px;
             padding: 0 5px;
         }
+        /* A thread's tags: small chips whose text keeps the row's colour; a tag's colour is a
+           theme token, tinting only the chip's ground and border. */
+        button.tag-chip {
+            min-height: 24px;
+            min-width: 24px;
+            padding: 0 6px;
+            border-radius: 12px;
+            font-size: 0.8em;
+            color: @at_fg_soft;
+            border: 1px solid alpha(@at_fg_soft, 0.35);
+        }
+        button.tag-chip.tag-accent {
+            background-color: alpha(@at_accent, 0.16);
+            border-color: alpha(@at_accent, 0.7);
+        }
+        button.tag-chip.tag-success {
+            background-color: alpha(@at_success, 0.16);
+            border-color: alpha(@at_success, 0.7);
+        }
+        button.tag-chip.tag-warning {
+            background-color: alpha(@at_warning, 0.16);
+            border-color: alpha(@at_warning, 0.7);
+        }
+        button.tag-chip.tag-danger {
+            background-color: alpha(@at_danger, 0.16);
+            border-color: alpha(@at_danger, 0.7);
+        }
         .thread-close, .thread-delete {
             min-width: 24px;
             min-height: 24px;

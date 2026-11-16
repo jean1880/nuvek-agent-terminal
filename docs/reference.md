@@ -351,12 +351,27 @@ Each file row, and each file-change card in the chat, also has **Open in ‹edit
 editor set (Settings → Git → Editor) it opens the file at the first changed line; with none
 set, the system's default app opens the file, which cannot jump to a line. The command is an
 argv, never run through a shell. Its placeholders are `{file}` (required, the absolute path),
-`{line}`, `{column}` and `{dir}`; a missing line or column is 1.
+`{line}`, `{column}` and `{dir}`; a missing line or column is 1. **Ctrl+click** a line of a
+file's diff to open the file at that line: an added or unchanged line is its own line, a
+removed line or a hunk header the nearest line of the new file. A plain click still selects
+text, and a line with no place in the new file (the file header, a deleted file) opens nothing.
 
-**Containment.** Only a file inside the thread's folder opens. The path is resolved first, so
-a symlink that leads out of the folder counts as outside, and it must be a regular file. A file
-outside the folder, or one of the sensitive names an agent's edits always ask about (`.git`,
-`.vscode`, agent instruction files and the like), is refused with a message.
+Other places open a file in the editor the same way:
+
+- A **read's card** (Read, `view_file`, the Local agent's `read_file`) has **Open in
+  ‹editor›** for the file it read, at the line it started from. A search's card has none.
+- **Links in a reply**: a link to a path (`[parser](src/parse.rs#L12)`), a `file://` link,
+  and inline code that names a file and line (`` `src/parse.rs:12` ``, `` `a.rs:12:3` ``) or a
+  path with a folder (`` `src/parse.rs` ``). Web links still open in the browser.
+
+**Containment.** The path is resolved first, every symlink followed, and must lead to a
+regular file. A file inside the thread's folder opens at once. A file outside it is asked
+about first, naming the file the path leads to, on every click: no answer is remembered, and
+Cancel is the default. If the path leads somewhere else by the time the editor starts, nothing
+opens. One of the sensitive names an agent's edits always ask about (`.git`, `.vscode`, agent
+instruction files and the like) is refused with a message, inside the folder or out. A path
+from the conversation is only ever read as a location: it never chooses the program or adds an
+argument.
 
 ### Committing
 

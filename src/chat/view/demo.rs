@@ -100,7 +100,11 @@ impl DiffSource for DemoDiffs {
         tracing::info!("chat demo: external diff requested; no process launched");
     }
 
-    fn open_in_editor(&self, _ask: DiffAsk) {
+    fn open_in_editor(&self, _ask: DiffAsk, _parent: gtk4::Widget) {
+        tracing::info!("chat demo: editor requested; no process launched");
+    }
+
+    fn open_location(&self, _location: agent_kit::editor::Location, _parent: gtk4::Widget) {
         tracing::info!("chat demo: editor requested; no process launched");
     }
 }

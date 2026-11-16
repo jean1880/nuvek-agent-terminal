@@ -949,7 +949,10 @@ impl Inner {
         }
         if matches!(
             event,
-            RowEvent::LoadDiff { .. } | RowEvent::OpenDiff { .. } | RowEvent::OpenEditor { .. }
+            RowEvent::LoadDiff { .. }
+                | RowEvent::OpenDiff { .. }
+                | RowEvent::OpenEditor { .. }
+                | RowEvent::OpenLocation { .. }
         ) {
             self.worker_diff(&inspector, &scope, event);
             return;
@@ -1061,10 +1064,18 @@ impl Inner {
     }
 
     fn worker_diff(self: &Rc<Self>, inspector: &Rc<Inspector>, scope: &Scope, event: RowEvent) {
+        let parent: gtk4::Widget = self.transcript.widget().clone().upcast();
         let (id, how) = match event {
             RowEvent::LoadDiff { id } => (id, None),
             RowEvent::OpenDiff { id } => (id, Some(false)),
             RowEvent::OpenEditor { id } => (id, Some(true)),
+            // A path the worker named is its own workspace's.
+            RowEvent::OpenLocation { location } => {
+                if let Some(source) = self.backend.worker_diff_source(scope) {
+                    source.open_location(location, parent);
+                }
+                return;
+            }
             _ => return,
         };
         let ask = {
@@ -1101,7 +1112,7 @@ impl Inner {
         };
         match how {
             Some(false) => return source.open_external(ask),
-            Some(true) => return source.open_in_editor(ask),
+            Some(true) => return source.open_in_editor(ask, parent),
             None => {}
         }
         let weak: Weak<Inspector> = Rc::downgrade(inspector);

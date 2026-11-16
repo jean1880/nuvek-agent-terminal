@@ -64,6 +64,10 @@ pub enum RowEvent {
     OpenEditor {
         id: String,
     },
+    /// A file a read's card or a reply's link named, to open in the editor at its line.
+    OpenLocation {
+        location: agent_kit::editor::Location,
+    },
 }
 
 pub type RowSink = Rc<dyn Fn(RowEvent)>;
@@ -244,6 +248,37 @@ pub(super) fn mono(text: &str) -> gtk4::Label {
 // Markdown blocks
 // ---------------------------------------------------------------------------------------------
 
+/// Where a label's file links go: set once its row knows where to send them.
+pub(super) type LinkSink = Rc<RefCell<Option<Rc<dyn Fn(agent_kit::editor::Location)>>>>;
+
+/// Routes `label`'s links: one that names a file (`agent_kit::editor::file_link`: a path, a
+/// `path:line`, a `file://` URL) goes to `links`, to be opened in the editor, and never to the
+/// system's handler for URIs; with nowhere to go it opens nothing. Any other link is left to GTK.
+pub(super) fn route_file_links(label: &gtk4::Label, links: &LinkSink) {
+    let links = Rc::clone(links);
+    label.connect_activate_link(move |_, uri| {
+        let Some(location) = agent_kit::editor::file_link(uri) else {
+            return glib::Propagation::Proceed;
+        };
+        let handler = links.borrow().clone();
+        if let Some(handler) = handler {
+            handler(location);
+        }
+        glib::Propagation::Stop
+    });
+}
+
+/// Sends a file link to `sink` as [`RowEvent::OpenLocation`].
+fn link_handler(sink: &RowSink) -> Rc<dyn Fn(agent_kit::editor::Location)> {
+    let sink = sink.clone();
+    Rc::new(move |location| sink(RowEvent::OpenLocation { location }))
+}
+
+/// A [`LinkSink`] that sends a file link to `sink` ([`link_handler`]).
+pub(super) fn links_to(sink: &RowSink) -> LinkSink {
+    Rc::new(RefCell::new(Some(link_handler(sink))))
+}
+
 enum BlockWidget {
     Text(gtk4::Label),
     Code {
@@ -263,10 +298,11 @@ impl BlockWidget {
         }
     }
 
-    fn build(block: &Block) -> Self {
+    fn build(block: &Block, links: &LinkSink) -> Self {
         match block {
             Block::Text { markup, kind } => {
                 let l = gtk4::Label::new(None);
+                route_file_links(&l, links);
                 l.set_xalign(0.0);
                 wrapping(&l);
                 l.set_selectable(true);
@@ -517,6 +553,8 @@ pub struct MarkdownInner {
     /// The palette generation the blocks were last parsed under: Pango markup carries its
     /// colours, so a newer palette makes them stale.
     generation: std::cell::Cell<u64>,
+    /// Where its file links go ([`route_file_links`]); nowhere until [`Self::send_links_to`].
+    links: LinkSink,
 }
 
 impl std::ops::Deref for MarkdownView {
@@ -536,6 +574,7 @@ impl MarkdownView {
             blocks: RefCell::new(Vec::new()),
             source: RefCell::new(String::new()),
             generation: std::cell::Cell::new(crate::palette::generation()),
+            links: Rc::default(),
         });
         MARKDOWN_VIEWS.with(|all| {
             let mut all = all.borrow_mut();
@@ -558,6 +597,37 @@ impl MarkdownView {
 impl MarkdownInner {
     pub fn widget(&self) -> &gtk4::Box {
         &self.root
+    }
+
+    /// Sends the file links of the text (a path, `path:line`, or such inline code) to `sink`, to
+    /// be opened in the editor. Applies to blocks built before the call too.
+    pub fn send_links_to(&self, sink: &RowSink) {
+        *self.links.borrow_mut() = Some(link_handler(sink));
+    }
+
+    /// Activates the first link of the text blocks whose href is `href`, as a click on it would
+    /// (tests). Whether a block had it.
+    #[cfg(test)]
+    pub fn activate_link(&self, href: &str) -> bool {
+        self.link_label(href)
+            .is_some_and(|label| label.emit_by_name::<bool>("activate-link", &[&href]))
+    }
+
+    /// The text block's label with a link to `href`, if one has (tests).
+    #[cfg(test)]
+    pub fn link_label(&self, href: &str) -> Option<gtk4::Label> {
+        let attribute = format!("href=\"{}\"", markdown::escape(href));
+        self.blocks
+            .borrow()
+            .iter()
+            .find_map(|(block, widget)| match (block, widget) {
+                (Block::Text { markup, .. }, BlockWidget::Text(label))
+                    if markup.contains(&attribute) =>
+                {
+                    Some(label.clone())
+                }
+                _ => None,
+            })
     }
 
     pub fn set_markdown(&self, text: &str) {
@@ -607,7 +677,7 @@ impl MarkdownInner {
                 let (_, widget) = blocks.remove(i);
                 self.root.remove(&widget.widget());
             }
-            let widget = BlockWidget::build(&new[i]);
+            let widget = BlockWidget::build(&new[i], &self.links);
             let w = widget.widget();
             match i.checked_sub(1).and_then(|p| blocks.get(p)) {
                 Some((_, prev)) => self.root.insert_child_after(&w, Some(&prev.widget())),
@@ -709,6 +779,7 @@ impl Row {
                 head.append(&label(driver.info().label, &["agent-name"]));
                 root.append(&head);
                 let md = MarkdownView::new();
+                md.send_links_to(sink);
                 root.append(md.widget());
                 let caret = label("▍", &["stream-caret"]);
                 caret.set_selectable(false);
@@ -1157,6 +1228,8 @@ pub struct ReasoningRow {
     paragraphs: RefCell<Vec<gtk4::Label>>,
     /// The markdown source each paragraph label shows, to re-render only what changed.
     sources: RefCell<Vec<String>>,
+    /// Where the paragraphs' file links go.
+    links: LinkSink,
 }
 
 impl ReasoningRow {
@@ -1183,6 +1256,7 @@ impl ReasoningRow {
         root.append(&revealer);
 
         let id = id.to_owned();
+        let links = links_to(sink);
         let sink = sink.clone();
         toggle.connect_clicked(glib::clone!(
             #[weak]
@@ -1203,6 +1277,7 @@ impl ReasoningRow {
             body,
             paragraphs: RefCell::new(Vec::new()),
             sources: RefCell::new(Vec::new()),
+            links,
         }
     }
 
@@ -1234,6 +1309,7 @@ impl ReasoningRow {
             let l = label("", &["reasoning-paragraph"]);
             wrapping(&l);
             l.set_selectable(true);
+            route_file_links(&l, &self.links);
             self.body.append(&l);
             labels.push(l);
         }
@@ -1353,6 +1429,97 @@ pub struct ToolCard {
     last_status: Cell<Option<ToolStatus>>,
     /// File-change cards only: "View diff" and "Open in ‹tool›", and the diff they reveal.
     diff: FileDiffUi,
+    /// Read cards only: "Open in ‹editor›" for the file the read named, at its line.
+    read: ReadOpenUi,
+}
+
+/// The "Open in ‹editor›" bar of a card for a read, shown when its input names a file.
+struct ReadOpenUi {
+    bar: gtk4::Box,
+    button: gtk4::Button,
+    label: gtk4::Label,
+    /// The file and line the read named, as the card last showed it.
+    at: Rc<RefCell<Option<agent_kit::editor::Location>>>,
+}
+
+impl ReadOpenUi {
+    fn new(sink: &RowSink) -> Self {
+        let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        bar.add_css_class("diff-bar");
+        bar.set_visible(false);
+        let button = gtk4::Button::new();
+        button.add_css_class("flat");
+        button.add_css_class("diff-open");
+        let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        row.append(&gtk4::Image::from_icon_name("at-document-edit-symbolic"));
+        let label = label("", &[]);
+        row.append(&label);
+        button.set_child(Some(&row));
+        bar.append(&button);
+        let at: Rc<RefCell<Option<agent_kit::editor::Location>>> = Rc::default();
+        let refresh = {
+            let at = Rc::clone(&at);
+            move |button: &gtk4::Button, label: &gtk4::Label| {
+                refresh_read_open(button, label, at.borrow().as_ref());
+            }
+        };
+        refresh(&button, &label);
+        let conn = EditorTools::shared().connect_changed(glib::clone!(
+            #[weak]
+            button,
+            #[weak]
+            label,
+            #[strong]
+            refresh,
+            move || refresh(&button, &label)
+        ));
+        bar.connect_destroy(move |_| EditorTools::shared().disconnect(conn));
+        let (sink, clicked) = (sink.clone(), Rc::clone(&at));
+        button.connect_clicked(move |_| {
+            let location = clicked.borrow().clone();
+            if let Some(location) = location {
+                sink(RowEvent::OpenLocation { location });
+            }
+        });
+        Self {
+            bar,
+            button,
+            label,
+            at,
+        }
+    }
+
+    /// Shows the bar for `location` (a read's file), or hides it when there is none.
+    fn show(&self, location: Option<agent_kit::editor::Location>) {
+        self.bar.set_visible(location.is_some());
+        *self.at.borrow_mut() = location;
+        refresh_read_open(&self.button, &self.label, self.at.borrow().as_ref());
+    }
+}
+
+/// Words a read card's "Open in ‹editor›" for the configured editor and the file it names.
+fn refresh_read_open(
+    button: &gtk4::Button,
+    label: &gtk4::Label,
+    at: Option<&agent_kit::editor::Location>,
+) {
+    let place = at.map_or_else(String::new, |at| match at.line {
+        Some(line) => format!("{}:{line}", at.path),
+        None => at.path.clone(),
+    });
+    match EditorTools::shared().get() {
+        Some(t) => {
+            label.set_text(&editor_tool::open_label(&t));
+            button.set_tooltip_text(Some(&format!("Open {place} in {}", t.name)));
+        }
+        None => {
+            label.set_text(editor_tool::DEFAULT_LABEL);
+            button.set_tooltip_text(Some(editor_tool::NO_EDITOR_HINT));
+        }
+    }
+    button.update_property(&[gtk4::accessible::Property::Label(&format!(
+        "Open {place} in the editor"
+    ))]);
 }
 
 /// The diff part of a file-change card.
@@ -1574,6 +1741,8 @@ impl ToolCard {
         let diff = Self::build_diff_ui(id, sink);
         root.append(&diff.bar);
         root.append(&diff.revealer);
+        let read = ReadOpenUi::new(sink);
+        root.append(&read.bar);
         header.update_relation(&[gtk4::accessible::Relation::Controls(&[diff
             .revealer
             .upcast_ref()])]);
@@ -1679,6 +1848,7 @@ impl ToolCard {
             children,
             last_status: Cell::new(None),
             diff,
+            read,
         }
     }
 
@@ -1893,6 +2063,23 @@ impl ToolCard {
         self.diff.editor.emit_clicked();
     }
 
+    /// A read card's "Open in ‹editor›": whether it shows, its label and its accessible name's
+    /// place (tests).
+    #[cfg(test)]
+    pub(super) fn read_open(&self) -> (bool, String, Option<String>) {
+        (
+            self.read.bar.is_visible(),
+            self.read.label.text().to_string(),
+            self.read.button.tooltip_text().map(|t| t.to_string()),
+        )
+    }
+
+    /// Clicks a read card's "Open in ‹editor›" (tests).
+    #[cfg(test)]
+    pub(super) fn click_read_open(&self) {
+        self.read.button.emit_clicked();
+    }
+
     /// Clicks "View diff" (tests).
     /// Whether the card shows its spinner (tests).
     #[cfg(test)]
@@ -1960,6 +2147,15 @@ impl ToolCard {
         self.title.set_text(&action_title);
         self.title
             .set_tooltip_text(Some(&format!("{action_title}: {target_summary}")));
+        let read_at = (tool.kind == ItemKind::FileRead)
+            .then(|| match &tool.input {
+                Some(input) if !input.is_null() => agent_kit::editor::read_location(input),
+                _ => serde_json::from_str::<serde_json::Value>(&tool.input_text)
+                    .ok()
+                    .and_then(|input| agent_kit::editor::read_location(&input)),
+            })
+            .flatten();
+        self.read.show(read_at);
         let mut paths = tool
             .input
             .as_ref()
@@ -2395,6 +2591,7 @@ impl ApprovalCard {
         diff.widget().set_visible(false);
         root.append(diff.widget());
         let plan = MarkdownView::new();
+        plan.send_links_to(sink);
         plan.widget().add_css_class("approval-plan");
         plan.widget().set_visible(false);
         root.append(plan.widget());

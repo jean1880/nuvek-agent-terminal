@@ -212,9 +212,18 @@ Architectural mandates, standards, and workflows for this codebase.
   detached off the main thread. A file-change card compares the working file against the state
   recorded when its turn started (`window/imp/diffs.rs`), and falls back to the agent's own edit.
 - **External editor**: argv only (`agent-kit`'s `editor`, started by the app's `editor_tool.rs`
-  through the same detached launcher as the diff tool), contained to the thread's folder (a
-  symlink that leads out is outside), and a path outside it, or a sensitive file, is refused
-  with a message. With no editor set the file goes to `gtk::FileLauncher`, which cannot jump to a line.
+  through the same detached launcher as the diff tool), placeholders filled per element, the
+  program fixed in config. A path from the conversation (a read's card, a reply's link or
+  `path:line` code: `editor::file_link`, `code_location`, `read_location`) is only parsed into a
+  `Location`, never a command. It is resolved with every link followed (`resolve_target`) and
+  must be a regular file. A sensitive file is refused with a message, inside the folder or out.
+  Inside the thread's folder it opens at once; outside it (a link leading out included) it opens
+  only after an `adw::AlertDialog` naming the resolved file, Cancel the default, asked on every
+  click and never remembered (`editor_tool::open_with`), and only if the path still resolves to
+  that file when the editor starts (`contain`'s `confirmed`). With no editor set the file goes to
+  `gtk::FileLauncher`, which cannot jump to a line. A diff-panel Ctrl+click opens the row's
+  new-side line (`diff::new_line_at`) and a row with none opens nothing. Terminal editors are
+  not offered (`EditorTool::terminal` stays unset).
 - **Undo is itself undoable, and only touches what it pinned**: a restore
   always pins the current working tree first (even if unchanged), refuses to
   run if the tree moved since that pin, never touches HEAD or the index, never

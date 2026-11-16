@@ -130,6 +130,62 @@ fn file_view(text: &str, colours: &DiffColours) -> gtk4::TextView {
     view
 }
 
+/// What a Ctrl+click on `row` of a file's diff opens: the file at the row's line in the new
+/// file ([`crate::diff::new_line_at`]: an added or context row is its own line, a removed row or
+/// a hunk header the nearest one). `None` for a row with no line in the new file (the file
+/// header, a deleted file, a row past what was shown): such a click opens nothing rather than
+/// guessing, and stays a plain click.
+fn ctrl_click_edit(text: &str, path: &str, row: usize) -> Option<EditFile> {
+    Some(EditFile {
+        path: path.to_owned(),
+        line: Some(crate::diff::new_line_at(text, row)?),
+    })
+}
+
+/// Ctrl+click on a row of `view` (the diff `text` of `path`) opens the file in the editor at
+/// that row's line; a plain click still selects text. A click on a row with no line is left to
+/// the view.
+fn open_at_ctrl_click(
+    view: &gtk4::TextView,
+    text: &str,
+    path: &str,
+    edit: &Rc<RefCell<Option<EditHandler>>>,
+) {
+    let click = gtk4::GestureClick::new();
+    click.set_button(gtk4::gdk::BUTTON_PRIMARY);
+    // Before the view's own gesture, so a claimed Ctrl+click never starts a selection.
+    click.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    let (text, path, edit) = (text.to_owned(), path.to_owned(), Rc::clone(edit));
+    click.connect_pressed(move |gesture, presses, x, y| {
+        if presses != 1
+            || !gesture
+                .current_event_state()
+                .contains(gtk4::gdk::ModifierType::CONTROL_MASK)
+        {
+            return;
+        }
+        let Some(view) = gesture.widget().and_downcast::<gtk4::TextView>() else {
+            return;
+        };
+        let (bx, by) =
+            view.window_to_buffer_coords(gtk4::TextWindowType::Widget, x as i32, y as i32);
+        let Some(row) = view
+            .iter_at_location(bx, by)
+            .and_then(|at| usize::try_from(at.line()).ok())
+        else {
+            return;
+        };
+        let (Some(file), Some(handler)) =
+            (ctrl_click_edit(&text, &path, row), edit.borrow().clone())
+        else {
+            return;
+        };
+        gesture.set_state(gtk4::EventSequenceState::Claimed);
+        handler(file);
+    });
+    view.add_controller(click);
+}
+
 /// What the "Open a PR" bar says and offers for a branch's state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrWords {
@@ -1350,7 +1406,10 @@ impl DiffPanel {
             "Open the file in the editor",
         )]);
         let refresh = |button: &gtk4::Button| match EditorTools::shared().get() {
-            Some(tool) => button.set_tooltip_text(Some(&crate::editor_tool::open_label(&tool))),
+            Some(tool) => button.set_tooltip_text(Some(&format!(
+                "{}. Ctrl+click a line of the diff to open the file at it",
+                crate::editor_tool::open_label(&tool)
+            ))),
             None => button.set_tooltip_text(Some(crate::editor_tool::NO_EDITOR_HINT)),
         };
         refresh(&button);
@@ -1620,6 +1679,7 @@ impl DiffPanel {
 
         let views = Rc::clone(&self.views);
         let colours = Rc::clone(&self.colours);
+        let (edit, path) = (Rc::clone(&self.edit_handler), stat.path.clone());
         expander.connect_expanded_notify(move |expander| {
             if !expander.is_expanded() || expander.child().is_some() {
                 return;
@@ -1635,6 +1695,7 @@ impl DiffPanel {
                     .upcast(),
                 None => {
                     let view = file_view(&text, &colours.borrow());
+                    open_at_ctrl_click(&view, &text, &path, &edit);
                     views.borrow_mut().push(view.clone());
                     view.upcast()
                 }
@@ -1668,6 +1729,36 @@ pub(crate) mod tests {
 
     fn words(state: PrState) -> PrWords {
         pr_words(&Ok(PrOutcome::Ready(state)))
+    }
+
+    #[test]
+    fn a_ctrl_click_opens_the_rows_new_line_and_never_guesses() {
+        // Two hunks, a deletion between: rows are the panel's text lines.
+        let text = "diff --git a/s.rs b/s.rs\n--- a/s.rs\n+++ b/s.rs\n\
+                    @@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n@@ -10,2 +10,1 @@\n x\n-y\n";
+        let line = |row| ctrl_click_edit(text, "s.rs", row).and_then(|f| f.line);
+        assert_eq!(line(4), Some(1), "context");
+        assert_eq!(line(5), Some(2), "a removed row: the line that replaced it");
+        assert_eq!(line(6), Some(2), "added");
+        assert_eq!(line(7), Some(3));
+        assert_eq!(line(8), Some(10), "a hunk header: its first line");
+        assert_eq!(line(10), Some(10), "a trailing removal: the line before it");
+        for row in [0, 1, 2, 11, 500] {
+            assert_eq!(ctrl_click_edit(text, "s.rs", row), None, "row {row}");
+        }
+        // A deleted file has no line to open.
+        assert_eq!(
+            ctrl_click_edit("@@ -1,2 +0,0 @@\n-a\n-b\n", "d.rs", 1),
+            None
+        );
+        // A diff cut short keeps the lines it shows.
+        assert_eq!(
+            ctrl_click_edit("@@ -5,9 +5,9 @@\n a\n+b\n", "c.rs", 2),
+            Some(EditFile {
+                path: "c.rs".into(),
+                line: Some(6)
+            })
+        );
     }
 
     #[test]

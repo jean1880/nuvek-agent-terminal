@@ -30,6 +30,7 @@ pub mod paths;
 pub mod provider_key;
 pub mod provider_models;
 pub mod restore;
+pub mod search_backfill;
 pub mod sessions;
 pub mod store;
 pub mod store_writer;

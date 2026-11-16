@@ -32,8 +32,12 @@ pub mod delegation_typed;
 mod preflight;
 mod schema_v11;
 mod schema_v8;
+mod search;
 
 pub use preflight::{BACKUP_DIR, PRE_V4_BACKUP_KEY};
+pub use search::{
+    IndexProgress, SearchHit, SearchResults, INDEX_BUDGET, ITEM_CAP, SNIPPET_CLOSE, SNIPPET_OPEN,
+};
 
 /// A store write (an append, a batch, a checkpoint) slower than this is logged as a warning with
 /// its kind and duration: one frame at 60 Hz.
@@ -3752,91 +3756,148 @@ impl Store {
         thread: &str,
         options: FoldOptions,
     ) -> Result<Vec<TranscriptItem>> {
-        let mut out: Vec<TranscriptItem> = Vec::new();
-        let mut index: HashMap<String, usize> = HashMap::new();
-        let mut tools: HashMap<String, ToolInput> = HashMap::new();
-        // The images each user message carried: a hand-off says they were there.
-        let mut images: HashMap<String, Vec<AttachmentRef>> = HashMap::new();
-        // Each item's id as stored, by its bounded form, and the items that completed.
-        let mut items: HashMap<String, String> = HashMap::new();
-        let mut completed: HashSet<String> = HashSet::new();
-        // Whether the inherited context is settled: taken, or a user message came first.
-        let mut seed_settled = false;
-        let mut after = 0;
+        let mut fold = TranscriptFold::new(options);
         loop {
-            let batch = self.events_by_agent(thread, Some(after), 1000)?;
-            let Some(last) = batch.last() else { break };
-            after = last.seq;
-            for StoredEvent {
-                seq,
-                driver,
-                envelope: env,
-            } in batch
-            {
-                match &env.event {
-                    Event::HandoffSeeded {
-                        summary, carried, ..
-                    } if *carried > 0 && !seed_settled => {
-                        seed_settled = true;
-                        out.push(TranscriptItem {
-                            message: TranscriptMessage {
-                                role: INHERITED_ROLE.to_owned(),
-                                kind: "inherited_context".to_owned(),
-                                text: summary.clone(),
-                                item_id: format!("inherited:{seq}"),
-                                status: "completed".to_owned(),
-                                title: String::new(),
-                            },
-                            agent: driver.clone(),
-                            first_seq: seq,
-                        });
-                    }
-                    Event::Notice { text } if options.keep_notices => {
-                        out.push(TranscriptItem {
-                            message: TranscriptMessage {
-                                role: NOTICE_ROLE.to_owned(),
-                                kind: NOTICE_ROLE.to_owned(),
-                                text: text.clone(),
-                                item_id: format!("notice:{seq}"),
-                                status: "completed".to_owned(),
-                                title: String::new(),
-                            },
-                            agent: driver.clone(),
-                            first_seq: seq,
-                        });
-                    }
-                    Event::ItemStarted {
-                        kind: ItemKind::UserMessage,
-                        input,
-                        ..
-                    } => {
-                        seed_settled = true;
-                        let refs = agent_core::attachment::refs_in(input.as_ref());
-                        if let (false, Some(item)) = (refs.is_empty(), &env.item) {
-                            images.insert(item.clone(), refs);
-                        }
-                    }
-                    _ => {}
-                }
-                if let Some(item) = &env.item {
-                    let key = bounded(item);
-                    if matches!(env.event, Event::ItemCompleted { .. }) {
-                        completed.insert(key.clone());
-                    }
-                    items.entry(key).or_insert_with(|| item.clone());
-                }
-                let origin = Origin { seq, agent: driver };
-                apply_to_transcript(&mut out, &mut index, &mut tools, options, origin, env);
+            let batch = self.events_by_agent(thread, Some(fold.after), 1000)?;
+            if batch.is_empty() {
+                break;
             }
+            fold.feed(batch);
         }
+        Ok(fold.finish(self.held_of(thread)))
+    }
+}
+
+/// The fold behind [`Store::transcript_items`], fed stored events in order, a batch at a time.
+/// The search index reads a thread through it too, from any point in the thread.
+pub(crate) struct TranscriptFold {
+    out: Vec<TranscriptItem>,
+    index: HashMap<String, usize>,
+    tools: HashMap<String, ToolInput>,
+    /// The images each user message carried: a hand-off says they were there.
+    images: HashMap<String, Vec<AttachmentRef>>,
+    /// Each item's id as stored, by its bounded form.
+    items: HashMap<String, String>,
+    /// The items that completed, by their bounded form.
+    completed: HashSet<String>,
+    /// Whether the inherited context is settled: taken, or a user message came first.
+    seed_settled: bool,
+    options: FoldOptions,
+    /// The sequence number of the last event fed (where the fold started, before any).
+    pub(crate) after: i64,
+}
+
+impl TranscriptFold {
+    pub(crate) fn new(options: FoldOptions) -> Self {
+        Self::after(options, 0)
+    }
+
+    /// A fold of the events after `after`.
+    pub(crate) fn after(options: FoldOptions, after: i64) -> Self {
+        Self {
+            out: Vec::new(),
+            index: HashMap::new(),
+            tools: HashMap::new(),
+            images: HashMap::new(),
+            items: HashMap::new(),
+            completed: HashSet::new(),
+            seed_settled: false,
+            options,
+            after,
+        }
+    }
+
+    /// The items folded so far, before [`TranscriptFold::finish`] gives tools their titles and
+    /// user messages their image placeholders.
+    pub(crate) fn items_so_far(&self) -> &[TranscriptItem] {
+        &self.out
+    }
+
+    /// Folds `batch`, the events that follow the ones fed so far, oldest first.
+    pub(crate) fn feed(&mut self, batch: Vec<StoredEvent>) {
+        let options = self.options;
+        for StoredEvent {
+            seq,
+            driver,
+            envelope: env,
+        } in batch
+        {
+            self.after = seq;
+            match &env.event {
+                Event::HandoffSeeded {
+                    summary, carried, ..
+                } if *carried > 0 && !self.seed_settled => {
+                    self.seed_settled = true;
+                    self.out.push(TranscriptItem {
+                        message: TranscriptMessage {
+                            role: INHERITED_ROLE.to_owned(),
+                            kind: "inherited_context".to_owned(),
+                            text: summary.clone(),
+                            item_id: format!("inherited:{seq}"),
+                            status: "completed".to_owned(),
+                            title: String::new(),
+                        },
+                        agent: driver.clone(),
+                        first_seq: seq,
+                    });
+                }
+                Event::Notice { text } if options.keep_notices => {
+                    self.out.push(TranscriptItem {
+                        message: TranscriptMessage {
+                            role: NOTICE_ROLE.to_owned(),
+                            kind: NOTICE_ROLE.to_owned(),
+                            text: text.clone(),
+                            item_id: format!("notice:{seq}"),
+                            status: "completed".to_owned(),
+                            title: String::new(),
+                        },
+                        agent: driver.clone(),
+                        first_seq: seq,
+                    });
+                }
+                Event::ItemStarted {
+                    kind: ItemKind::UserMessage,
+                    input,
+                    ..
+                } => {
+                    self.seed_settled = true;
+                    let refs = agent_core::attachment::refs_in(input.as_ref());
+                    if let (false, Some(item)) = (refs.is_empty(), &env.item) {
+                        self.images.insert(item.clone(), refs);
+                    }
+                }
+                _ => {}
+            }
+            if let Some(item) = &env.item {
+                let key = bounded(item);
+                if matches!(env.event, Event::ItemCompleted { .. }) {
+                    self.completed.insert(key.clone());
+                }
+                self.items.entry(key).or_insert_with(|| item.clone());
+            }
+            let origin = Origin { seq, agent: driver };
+            apply_to_transcript(
+                &mut self.out,
+                &mut self.index,
+                &mut self.tools,
+                options,
+                origin,
+                env,
+            );
+        }
+    }
+
+    /// The finished items. `held` names the streams holding text not yet published.
+    pub(crate) fn finish(mut self, held: Vec<HeldText>) -> Vec<TranscriptItem> {
+        let options = self.options;
         // A turn still running: an open stream that holds text not yet published shows
         // `HELD_PLACEHOLDER` after its stored text (a hand-off made now must not take the line
         // in progress for finished), never that text. Not once its item has completed.
-        for held in self.held_of(thread) {
-            if completed.contains(&held.item) {
+        for held in held {
+            if self.completed.contains(&held.item) {
                 continue;
             }
-            let item = items.get(&held.item).cloned().unwrap_or(held.item);
+            let item = self.items.get(&held.item).cloned().unwrap_or(held.item);
             let env = Envelope::new(Event::ContentDelta {
                 stream: held.kind,
                 text: HELD_PLACEHOLDER.to_owned(),
@@ -3844,11 +3905,19 @@ impl Store {
             .item(item);
             // An item the stored events never named: no event made it, so no agent either.
             let origin = Origin {
-                seq: after,
+                seq: self.after,
                 agent: None,
             };
-            apply_to_transcript(&mut out, &mut index, &mut tools, options, origin, env);
+            apply_to_transcript(
+                &mut self.out,
+                &mut self.index,
+                &mut self.tools,
+                options,
+                origin,
+                env,
+            );
         }
+        let mut out = self.out;
         // A hand-off replays this; the model's private thinking must not travel with it.
         if !options.keep_reasoning {
             out.retain(|i| i.message.kind != "reasoning");
@@ -3856,20 +3925,20 @@ impl Store {
         for message in out.iter_mut().map(|i| &mut i.message) {
             match message.role.as_str() {
                 "user" => {
-                    if let Some(refs) = images.get(&message.item_id) {
+                    if let Some(refs) = self.images.get(&message.item_id) {
                         message.text =
                             agent_core::attachment::text_with_placeholders(&message.text, refs);
                     }
                 }
                 "tool" => {
-                    if let Some(tool) = tools.get(&message.item_id) {
+                    if let Some(tool) = self.tools.get(&message.item_id) {
                         message.title = tool.title();
                     }
                 }
                 _ => {}
             }
         }
-        Ok(out)
+        out
     }
 }
 

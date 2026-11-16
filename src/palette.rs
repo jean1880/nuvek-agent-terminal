@@ -595,6 +595,15 @@ impl Chrome {
             ("headerbar_bg_color", self.bg_deep),
             ("headerbar_fg_color", self.fg),
             ("sidebar_bg_color", self.bg_deep),
+            ("sidebar_fg_color", self.fg),
+            ("sidebar_backdrop_color", self.bg_deep),
+            ("sidebar_shade_color", self.bg_sunken),
+            ("sidebar_border_color", self.border),
+            ("secondary_sidebar_bg_color", self.bg_deep),
+            ("secondary_sidebar_fg_color", self.fg),
+            ("secondary_sidebar_backdrop_color", self.bg_deep),
+            ("secondary_sidebar_shade_color", self.bg_sunken),
+            ("secondary_sidebar_border_color", self.border),
             ("dialog_bg_color", self.surface),
             ("dialog_fg_color", self.fg),
             ("popover_bg_color", self.surface),
@@ -828,6 +837,60 @@ mod tests {
                 css.contains("--window-bg-color:"),
                 "{choice}: libadwaita variables"
             );
+            for name in LIBADWAITA_SIDEBAR_NAMES {
+                assert!(
+                    css.contains(&format!("@define-color {name} #")),
+                    "{choice}: {name}"
+                );
+                assert!(
+                    css.contains(&format!("--{}:", name.replace('_', "-"))),
+                    "{choice}: --{name}"
+                );
+            }
+        }
+    }
+
+    /// The sidebar colours libadwaita 1.5 and later read. Libadwaita's `.sidebar-pane` sets
+    /// its text to `sidebar_fg_color`, so a theme that leaves it undefined draws every widget
+    /// without a colour of its own in libadwaita's dark default.
+    const LIBADWAITA_SIDEBAR_NAMES: [&str; 10] = [
+        "sidebar_bg_color",
+        "sidebar_fg_color",
+        "sidebar_backdrop_color",
+        "sidebar_shade_color",
+        "sidebar_border_color",
+        "secondary_sidebar_bg_color",
+        "secondary_sidebar_fg_color",
+        "secondary_sidebar_backdrop_color",
+        "secondary_sidebar_shade_color",
+        "secondary_sidebar_border_color",
+    ];
+
+    /// The sidebar's text (libadwaita's `sidebar_fg_color`) reads on its background, in every
+    /// bundled scheme.
+    #[test]
+    fn every_themes_sidebar_text_reads_on_its_background() {
+        for choice in ThemeChoice::ALL {
+            let Some(chrome) = Chrome::for_choice(choice) else {
+                continue;
+            };
+            let css = chrome.css();
+            let colour = |name: &str| {
+                let key = format!("@define-color {name} #");
+                let at = css.find(&key).expect(name) + key.len();
+                Rgb::from_hex(u32::from_str_radix(&css[at..at + 6], 16).expect(name))
+            };
+            for (fg, bg) in [
+                ("sidebar_fg_color", "sidebar_bg_color"),
+                ("sidebar_fg_color", "sidebar_backdrop_color"),
+                ("secondary_sidebar_fg_color", "secondary_sidebar_bg_color"),
+            ] {
+                let ratio = colour(fg).contrast(colour(bg));
+                assert!(
+                    ratio >= MIN_TEXT_CONTRAST,
+                    "{choice}: {fg} on {bg} at {ratio:.2}:1"
+                );
+            }
         }
     }
 

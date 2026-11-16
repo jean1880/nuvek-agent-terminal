@@ -488,8 +488,9 @@ impl TranscriptView {
         let pending = self.jump_to.borrow().clone();
         if let Some(id) = pending {
             let row = self.rows.borrow().get(&id).map(Row::widget);
-            // In a card still opening: placed once it has opened. Gone meanwhile (evicted,
-            // removed), or hidden (never allocated): nothing to jump to, whatever the layout.
+            // In a card still opening: placed once it has opened. Built but not on screen:
+            // placed once it is. Gone meanwhile (evicted, removed): nothing to jump to,
+            // whatever the layout.
             let waiting = match &row {
                 // Opening takes its own time (a revealer's transition): the wait for a layout
                 // only starts once it has opened, so no display rate cuts it short.
@@ -504,13 +505,26 @@ impl TranscriptView {
                     // layout after it places the row.
                     !self.laid_out_at_value(&adj) || w.height() == 0
                 }
-                _ => {
+                // Built but not on screen yet: the page it is on is not shown, or the row came
+                // after the last layout. Placed once it is mapped; on a shown transcript the
+                // wait still ends with `jump_gives_up`, so a row that stays hidden holds nothing.
+                Some(_) => true,
+                None => {
                     self.clear_jump();
                     self.reveal_after_jump.set(false);
                     false
                 }
             };
             if waiting {
+                // While the window is still filling in (older rows prepended in idle steps,
+                // each moving the value), its layout is not the one the jump waits for: the
+                // wait starts once the fill is done, so a slow display never gives it up early.
+                // Nor while the transcript is off screen (its page not shown): only a layout on
+                // screen can place the row, so the wait is not counted until there is one.
+                if self.fill.borrow().is_some() || !self.scroller.is_mapped() {
+                    self.jump_since.set(None);
+                    return;
+                }
                 if !self.jump_gives_up(&id) {
                     return;
                 }
@@ -518,9 +532,20 @@ impl TranscriptView {
                 self.clear_jump();
                 let reveal = self.reveal_after_jump.replace(false);
                 if let Some(bounds) = w.compute_bounds(&self.scroller) {
+                    // The jump's place wins over a "keep my place" older rows prepended while
+                    // it waited left behind (read off a layout from before, or none at all, it
+                    // would throw the view back to where it was: the end, for a thread just
+                    // built out of sight).
+                    self.anchor.set(None);
+                    self.restore_to.set(None);
                     self.move_to(self.jump_target(&adj, bounds.y(), reveal));
                     return;
                 }
+            }
+            // The jump ended without moving (it gave up, or its row went): asking for it left
+            // following, so a view still at the end follows again.
+            if adj.value() >= adj.upper() - adj.page_size() - 0.5 {
+                self.stick.set(true);
             }
         }
         let end = adj.upper() - adj.page_size();
@@ -882,13 +907,10 @@ impl TranscriptView {
             }
         }
         // Built already: placed by `settle`, once, from bounds read after a layout (bounds read
-        // now can predate the layout the last change of content or scroll position queued).
-        let placed = self
-            .rows
-            .borrow()
-            .get(id)
-            .is_some_and(|row| row.widget().compute_bounds(&self.scroller).is_some());
-        if placed {
+        // now can predate the layout the last change of content or scroll position queued). A
+        // row built a moment ago (a thread just replayed, or one whose page is not on screen)
+        // has no allocation yet: the jump waits for it, never falling back to the end.
+        if self.rows.borrow().contains_key(id) {
             self.stick.set(false);
             self.anchor.set(None);
             self.restore_to.set(None);
@@ -2012,10 +2034,33 @@ impl TranscriptView {
         self.settle();
     }
 
-    /// Whether a jump is waiting to be placed (tests).
-    #[cfg(test)]
+    /// Whether a jump is waiting to be placed.
     pub fn jump_pending(&self) -> bool {
         self.jump_to.borrow().is_some()
+    }
+
+    /// Whether the row for `id` is built and its top is within the visible area (tests).
+    #[cfg(test)]
+    pub fn row_in_view(&self, id: &str) -> bool {
+        let page = self.scroller.vadjustment().page_size();
+        self.rows
+            .borrow()
+            .get(id)
+            .and_then(|row| row.widget().compute_bounds(&self.scroller))
+            .is_some_and(|b| f64::from(b.y()) >= -1.0 && f64::from(b.y()) < page)
+    }
+
+    /// Whether the view is at the newest end of the transcript (tests).
+    #[cfg(test)]
+    pub fn at_end(&self) -> bool {
+        let adj = self.scroller.vadjustment();
+        adj.value() >= adj.upper() - adj.page_size() - 1.0
+    }
+
+    /// The item a jump waiting to be placed goes to (tests).
+    #[cfg(test)]
+    pub fn pending_jump_id(&self) -> Option<String> {
+        self.jump_to.borrow().clone()
     }
 
     /// Whether the pending jump's row sits in a card that is still opening (tests).

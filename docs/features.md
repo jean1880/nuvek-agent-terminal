@@ -74,6 +74,15 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   rate limited or unread. `F9` or `Ctrl+Shift+B` shows or hides it. It overlays the
   thread when the window is narrow. When hidden, its toggle still signals unread
   activity or a thread needing your attention.
+- **Search inside threads.** The speech-bubble toggle beside the sidebar's search entry
+  (**Also Search Messages**) looks for what you type in what the threads said too: below the
+  matching threads, an **In Messages** section lists up to 50 matches, best first, each with
+  its thread's title, who said it, how long ago and the words around the match. Pick one to
+  open its thread at that message. Archived threads' matches show only with **Show
+  Archived**, tagged "Archived". While earlier threads are still being indexed it says so,
+  and the list fills in as they are. A message older than what a thread shows when opened
+  opens the thread, with a note that it is further back. See
+  [searching messages](reference.md#searching-messages).
 - **What every thread said is indexed** for searching inside threads: your messages, the
   agents' replies and tool titles, redacted, never a tool's output or the model's reasoning.
   Threads from before are indexed in the background after start-up. See

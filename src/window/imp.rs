@@ -8587,6 +8587,31 @@ mod tests {
     /// and is not a layout anyone works in.
     const LARGE_TEXT_MIN_WIDTH: i32 = 600;
 
+    /// A message-search hit opens its thread scrolled to that message, on a shown window (a
+    /// jump is placed only once its row is laid out).
+    #[test]
+    #[ignore = "lays out a shown window; run on a private display"]
+    fn a_message_hit_opens_its_thread_at_the_message() {
+        init_gtk();
+        crate::testutil::adw_init().expect("adw init");
+        crate::icons::register();
+        let app = crate::window::imp::test_support::test_app("org.test.MessageHit", false);
+        let window = super::super::AgentTerminalWindow::new(&app);
+        let imp = window.imp();
+        for p in imp.config.borrow_mut().profiles.iter_mut() {
+            p.command = format!("/nonexistent/{}", p.command);
+        }
+        let ctx = glib::MainContext::default();
+        crate::testutil::pump_until(&ctx, 20, || !imp.detecting.get());
+        imp.finish_shell(None);
+        imp.reveal_shell();
+        window.set_default_size(1000, 700);
+        window.present();
+        while ctx.iteration(false) {}
+        threads::message_search::tests::hits_open_at_their_message(&window);
+        window.destroy();
+    }
+
     /// The window, with a thread open and full of history and the sidebar shown, fits itself at
     /// every size from [`MIN_WINDOW`] up: in whichever layout the breakpoints pick, nothing
     /// (header buttons, composer, transcript) is pushed out of view. Prints what holds it open
@@ -9210,6 +9235,7 @@ mod tests {
         diff_prefs::tests::the_diff_tool_group_saves_only_what_is_valid(window);
         editor_prefs::tests::the_group_saves_only_what_is_valid_and_applies_live(window);
         remote::tests::the_remote_machines_group_saves_only_valid_aliases(window);
+        threads::message_search::tests::message_search_finds_and_opens_a_hit(window);
     }
 
     /// A folder outside any repository has nothing to diff: no Changes toggle, no shortcut.

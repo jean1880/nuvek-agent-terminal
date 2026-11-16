@@ -110,6 +110,21 @@ where
     run_command(command(dir, args, env), "git", timeout_secs)
 }
 
+/// [`git_output`] in a process group of its own, killed whole on timeout, for a git that runs
+/// the user's hooks or signing helpers (`git commit`).
+pub fn git_output_in_group<I, S>(
+    dir: &Path,
+    args: I,
+    env: &[(&str, &OsStr)],
+    timeout_secs: u64,
+) -> Result<std::process::Output, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    crate::exec::run_command_in_group(command(dir, args, env), "git", timeout_secs)
+}
+
 /// Runs git in `dir` and returns its raw stdout. A non-zero exit is an `Err`
 /// carrying git's own message.
 pub fn git_raw<I, S>(
@@ -130,7 +145,7 @@ where
     }
 }
 
-fn failure_message(stderr: &[u8]) -> String {
+pub(crate) fn failure_message(stderr: &[u8]) -> String {
     let message = String::from_utf8_lossy(stderr).trim().to_string();
     if message.is_empty() {
         "git failed without saying why".to_string()

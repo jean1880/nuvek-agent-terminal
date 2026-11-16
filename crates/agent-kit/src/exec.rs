@@ -7,12 +7,34 @@ use tracing::debug;
 ///
 /// Blocking: call it off the main thread.
 pub fn run_command(
-    mut cmd: std::process::Command,
+    cmd: std::process::Command,
     name: &str,
     timeout_secs: u64,
 ) -> Result<std::process::Output, String> {
+    run(cmd, name, timeout_secs, false)
+}
+
+/// [`run_command`] for a command whose own children must not outlive a timeout (the hooks and
+/// signing helpers `git commit` starts): it runs in a process group of its own, and on timeout
+/// the whole group is killed before the command is reaped, so the group id cannot yet belong to
+/// anything else.
+pub fn run_command_in_group(
+    cmd: std::process::Command,
+    name: &str,
+    timeout_secs: u64,
+) -> Result<std::process::Output, String> {
+    run(cmd, name, timeout_secs, true)
+}
+
+fn run(
+    mut cmd: std::process::Command,
+    name: &str,
+    timeout_secs: u64,
+    group: bool,
+) -> Result<std::process::Output, String> {
     use std::io::Read;
     use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -21,6 +43,9 @@ pub fn run_command(
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    if group {
+        cmd.process_group(0);
+    }
     let mut child = cmd
         .spawn()
         .map_err(|err| format!("Could not run {command}: {err}"))?;
@@ -116,6 +141,13 @@ pub fn run_command(
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() >= deadline => {
+                if group {
+                    if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
+                        // SAFETY: plain syscall. The leader is not reaped yet, so `pgid` is
+                        // still this command's group.
+                        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+                    }
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(format!("{command} did not finish within {timeout_secs}s"));

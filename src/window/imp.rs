@@ -3,6 +3,7 @@
 mod agents_prefs;
 mod animated_menu;
 mod closing;
+mod commit;
 mod diff_prefs;
 mod diffs;
 mod editor_prefs;
@@ -6427,6 +6428,14 @@ impl AgentTerminalWindow {
             }
         });
 
+        // "Commit…": the ticked files, after showing the command.
+        let root = panel.root.clone();
+        panel.connect_commit(move |ask| {
+            if let Some(obj) = window_of(&root) {
+                obj.imp().commit_from_panel(&root, ask);
+            }
+        });
+
         // "Open in …" on a file row.
         let root = panel.root.clone();
         panel.connect_open(move |file| {
@@ -6578,21 +6587,28 @@ impl AgentTerminalWindow {
             if let Some(obj) = obj.upgrade() {
                 obj.imp().record_repo_presence(&page, presence);
             }
-            // The "Open a PR" bar follows the same repository, read after the diff (reads
-            // only; it never fetches).
-            let pr = if in_repo {
-                Some(
-                    off_main("reading the branch", move || {
-                        agent_kit::github::pr_state(&repo_dir)
-                    })
-                    .await,
+            // The "Commit…" and "Open a PR" bars follow the same repository, read after the diff
+            // (reads only; nothing is fetched).
+            let (pr, op) = if in_repo {
+                let read = repo_dir.clone();
+                let (pr, op) = blocking_or(
+                    move || {
+                        (
+                            agent_kit::github::pr_state(&read),
+                            agent_kit::commit::in_progress(&read).ok().flatten(),
+                        )
+                    },
+                    (Err("reading the branch panicked".to_owned()), None),
                 )
+                .await;
+                (Some(pr), op)
             } else {
-                None
+                (None, None)
             };
             if let Some(obj) = obj.upgrade() {
                 obj.imp().show_branch(&page, pr.as_ref());
             }
+            panel.show_commit(generation, in_repo.then_some(repo_dir), op);
             panel.show_pr(generation, pr);
         });
     }
@@ -8471,6 +8487,8 @@ mod tests {
         super::super::diff_panel::tests::the_panel_pops_out_docks_and_offers_a_pr(
             window.upcast_ref(),
         );
+        super::super::diff_panel::tests::the_commit_bar_follows_the_view_and_the_ticks();
+        commit::tests::the_commit_dialog_follows_its_message();
         crate::chat::view::tests::ui_checks();
         crate::chat::view::tests::diff_ui_checks();
         crate::chat::view::tests::reasoning_ui_checks();

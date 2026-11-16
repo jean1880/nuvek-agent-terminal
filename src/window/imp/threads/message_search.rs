@@ -338,6 +338,9 @@ impl AgentTerminalWindow {
             search.clear();
             return None;
         }
+        if self.is_closing() {
+            return None;
+        }
         let obj = self.obj().downgrade();
         let timer =
             glib::timeout_add_local_once(std::time::Duration::from_millis(delay_ms), move || {
@@ -357,7 +360,8 @@ impl AgentTerminalWindow {
         };
         // It fired: a once source removes itself, so there is nothing left to cancel.
         sidebar.messages.timer.borrow_mut().take();
-        if sidebar.messages.generation.get() != generation {
+        // A closing window reads nothing more from the store.
+        if self.is_closing() || sidebar.messages.generation.get() != generation {
             return;
         }
         let query = sidebar.search.text().trim().to_owned();
@@ -521,9 +525,44 @@ pub(in crate::window::imp) mod tests {
         }
     }
 
+    /// Runs the main loop until `done`, for at most `frames` frames of `widget`'s frame clock
+    /// (kept ticking meanwhile, so a slow display only makes it take longer, never cuts it
+    /// short); whether `done` came. Also bounded by a generous wall-clock limit, so a widget
+    /// that is never drawn cannot hang the test.
+    fn frames_until(
+        widget: &impl IsA<gtk4::Widget>,
+        frames: u32,
+        mut done: impl FnMut() -> bool,
+    ) -> bool {
+        let ctx = glib::MainContext::default();
+        let count = Rc::new(Cell::new(0u32));
+        let seen = count.clone();
+        let tick = widget.add_tick_callback(move |_, _| {
+            seen.set(seen.get() + 1);
+            glib::ControlFlow::Continue
+        });
+        // Wakes the loop even when no frame comes (an unmapped widget).
+        let wake = glib::timeout_add_local(std::time::Duration::from_millis(50), || {
+            glib::ControlFlow::Continue
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        let met = loop {
+            if done() {
+                break true;
+            }
+            if count.get() >= frames || std::time::Instant::now() > deadline {
+                break false;
+            }
+            ctx.iteration(true);
+        };
+        tick.remove();
+        wake.remove();
+        met
+    }
+
     fn pump_until(what: &str, done: impl Fn() -> bool) {
         assert!(
-            crate::testutil::pump_until(&glib::MainContext::default(), 10, done),
+            crate::testutil::pump_until(&glib::MainContext::default(), 60, done),
             "{what}"
         );
     }
@@ -748,7 +787,7 @@ pub(in crate::window::imp) mod tests {
 
         let lands = |item: &str| {
             let item = item.to_owned();
-            let landed = crate::testutil::pump_until(&ctx, 10, || {
+            let landed = frames_until(window, 600, || {
                 let Some(view) = imp
                     .page_of_thread(&thread)
                     .and_then(|p| imp.with_page_chat(&p, |c| c.view.clone()))
@@ -758,18 +797,22 @@ pub(in crate::window::imp) mod tests {
                 };
                 view.pending_jump_id().is_none() && view.item_in_view(&item).0
             });
-            // A few more frames: nothing (a late move to the end) takes it away again.
-            for _ in 0..20 {
-                ctx.iteration(false);
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
+            // More frames, with everything queued meanwhile run: nothing (a late move to the
+            // end) takes it away again.
+            frames_until(window, 30, || false);
+            while ctx.iteration(false) {}
             let view = imp
                 .page_of_thread(&thread)
                 .and_then(|p| imp.with_page_chat(&p, |c| c.view.clone()))
                 .flatten()
                 .expect("the thread's view");
             let (shown, at_end) = view.item_in_view(&item);
-            assert!(landed && shown, "{item} is on screen");
+            assert!(
+                landed && shown,
+                "{item} is on screen (landed {landed}, still shown {shown}, at the end {at_end}, \
+                 jump {:?})",
+                view.pending_jump_id()
+            );
             at_end
         };
 
@@ -790,10 +833,19 @@ pub(in crate::window::imp) mod tests {
                 .and_then(|p| imp.with_page_chat(&p, |c| c.view.is_some()))
                 .unwrap_or(false)
         });
-        for _ in 0..20 {
-            ctx.iteration(false);
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        // Frames go by for the shown thread; nothing lays the hidden one out.
+        frames_until(window, 30, || false);
+        let view_of = || {
+            imp.page_of_thread(&thread)
+                .and_then(|p| imp.with_page_chat(&p, |c| c.view.clone()))
+                .flatten()
+                .expect("the thread's view")
+        };
+        assert_eq!(
+            view_of().pending_jump_id().as_deref(),
+            Some(recent.as_str()),
+            "out of sight, the jump waits for its row"
+        );
         imp.open_thread(&thread, true);
         assert!(
             !lands(&recent),
@@ -819,6 +871,21 @@ pub(in crate::window::imp) mod tests {
             !lands("r5"),
             "an early hit on a built thread is not at the bottom"
         );
+
+        // A jump asked of a built thread's view while its page is out of sight, with nothing
+        // pending on the page: showing the page keeps it, rather than moving to the end.
+        imp.open_thread(&other, true);
+        pump_until("the other thread is shown", || {
+            imp.selected_row_key() == Some(RowKey::Thread(other.clone()))
+        });
+        assert!(view_of().show_item("r2"));
+        assert_eq!(
+            imp.page_of_thread(&thread)
+                .and_then(|p| imp.with_page_chat(&p, |c| c.pending_jump.clone())),
+            Some(None)
+        );
+        imp.open_thread(&thread, true);
+        assert!(!lands("r2"), "showing the page kept the waiting jump");
 
         // An item the view does not hold (older than it replays) is said to be so.
         LAST_NOTE.with(|n| n.borrow_mut().take());

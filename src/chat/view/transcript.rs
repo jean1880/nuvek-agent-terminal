@@ -488,8 +488,9 @@ impl TranscriptView {
         let pending = self.jump_to.borrow().clone();
         if let Some(id) = pending {
             let row = self.rows.borrow().get(&id).map(Row::widget);
-            // In a card still opening: placed once it has opened. Gone meanwhile (evicted,
-            // removed), or hidden (never allocated): nothing to jump to, whatever the layout.
+            // In a card still opening: placed once it has opened. Built but not on screen:
+            // placed once it is. Gone meanwhile (evicted, removed): nothing to jump to,
+            // whatever the layout.
             let waiting = match &row {
                 // Opening takes its own time (a revealer's transition): the wait for a layout
                 // only starts once it has opened, so no display rate cuts it short.
@@ -515,6 +516,15 @@ impl TranscriptView {
                 }
             };
             if waiting {
+                // While the window is still filling in (older rows prepended in idle steps,
+                // each moving the value), its layout is not the one the jump waits for: the
+                // wait starts once the fill is done, so a slow display never gives it up early.
+                // Nor while the transcript is off screen (its page not shown): only a layout on
+                // screen can place the row, so the wait is not counted until there is one.
+                if self.fill.borrow().is_some() || !self.scroller.is_mapped() {
+                    self.jump_since.set(None);
+                    return;
+                }
                 if !self.jump_gives_up(&id) {
                     return;
                 }
@@ -522,9 +532,20 @@ impl TranscriptView {
                 self.clear_jump();
                 let reveal = self.reveal_after_jump.replace(false);
                 if let Some(bounds) = w.compute_bounds(&self.scroller) {
+                    // The jump's place wins over a "keep my place" older rows prepended while
+                    // it waited left behind (read off a layout from before, or none at all, it
+                    // would throw the view back to where it was: the end, for a thread just
+                    // built out of sight).
+                    self.anchor.set(None);
+                    self.restore_to.set(None);
                     self.move_to(self.jump_target(&adj, bounds.y(), reveal));
                     return;
                 }
+            }
+            // The jump ended without moving (it gave up, or its row went): asking for it left
+            // following, so a view still at the end follows again.
+            if adj.value() >= adj.upper() - adj.page_size() - 0.5 {
+                self.stick.set(true);
             }
         }
         let end = adj.upper() - adj.page_size();

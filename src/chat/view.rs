@@ -3969,6 +3969,73 @@ pub(crate) mod tests {
         window.destroy();
     }
 
+    /// A jump asked for before the transcript was ever laid out (a thread just replayed, its
+    /// page not on screen yet) waits for its row and lands on it, never at the end; and one
+    /// whose transcript is hidden meanwhile is kept until it shows again.
+    pub(crate) fn a_jump_before_any_layout_waits_for_its_row() {
+        use agent_core::event::{ItemKind, ItemStatus};
+        let ctx = glib::MainContext::default();
+        let view = ChatView::new(StubBackend::new(Driver::Claude));
+        let mut history = Vec::new();
+        for i in 0..80 {
+            let id = format!("s{i}");
+            history.push(Envelope::item_started(
+                &id,
+                ItemKind::Command,
+                format!("echo {id}"),
+                None,
+                None,
+            ));
+            history.push(Envelope::item_completed(
+                &id,
+                ItemStatus::Completed,
+                Some("ok"),
+                None,
+            ));
+        }
+        view.replay(&history);
+        let inner = view.inner().expect("view");
+        let t = &inner.transcript;
+        // Among the rows the first paint built, well above the end; nothing laid out yet.
+        t.scroll_to_card("s55");
+        assert!(t.jump_pending(), "the jump waits: {}", t.scroll_debug());
+        assert_eq!(t.pending_jump_id().as_deref(), Some("s55"));
+
+        let window = gtk4::Window::new();
+        window.set_default_size(700, 600);
+        window.set_child(Some(&view));
+        window.present();
+        assert!(
+            crate::testutil::pump_until(&ctx, 10, || !t.jump_pending()),
+            "the jump ended: {}",
+            t.scroll_debug()
+        );
+        assert!(
+            t.row_in_view("s55") && !t.at_end(),
+            "it landed on its row, not the end: {}",
+            t.scroll_debug()
+        );
+
+        // Hidden while it waits (its page left the screen): kept, and placed once shown.
+        t.scroll_to_card("s20");
+        t.widget().set_visible(false);
+        t.settle_now();
+        assert!(t.jump_pending(), "a hidden row keeps its jump");
+        assert_eq!(t.pending_jump_id().as_deref(), Some("s20"));
+        t.widget().set_visible(true);
+        assert!(
+            crate::testutil::pump_until(&ctx, 10, || !t.jump_pending()),
+            "the jump ended once shown: {}",
+            t.scroll_debug()
+        );
+        assert!(
+            t.row_in_view("s20") && !t.at_end(),
+            "it landed on its row once shown: {}",
+            t.scroll_debug()
+        );
+        window.destroy();
+    }
+
     /// A jump into a card still opening is never given up while it opens, however long the
     /// revealer's transition runs against the display's frame rate.
     pub(crate) fn a_jump_into_an_opening_card_waits_for_it() {
@@ -4029,6 +4096,7 @@ pub(crate) mod tests {
     pub(crate) fn ui_checks() {
         replay_fills_the_window_in_steps();
         a_pending_jump_lands_or_ends();
+        a_jump_before_any_layout_waits_for_its_row();
         a_jump_into_an_opening_card_waits_for_it();
         a_jump_to_a_built_row_moves_once_onto_it();
         a_focused_later_steps_button_hands_focus_on_back_at_the_end();

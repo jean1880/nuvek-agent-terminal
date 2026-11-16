@@ -5849,13 +5849,15 @@ impl AgentTerminalWindow {
                     let view = view.clone();
                     // A message-search hit being opened goes to its message instead.
                     let jump = chat.pending_jump.take();
+                    // A jump asked for while the page was out of sight is still waiting for its
+                    // row: it, not the newest messages, is shown. Read now, as the page shows:
+                    // by the time the idle runs, its layout may have placed it already.
+                    let waiting = view.jump_pending();
                     // Selecting a thread shows its newest messages, wherever it was left.
                     glib::idle_add_local_once(move || {
                         match jump {
                             Some(item) => message_search::jump_to_hit(&view, &item),
-                            // A hit's jump asked for while the page was out of sight is still
-                            // waiting for its row: it, not the newest messages, is shown.
-                            None if view.jump_pending() => {}
+                            None if waiting => {}
                             None => view.scroll_to_end(),
                         }
                         view.focus_composer();

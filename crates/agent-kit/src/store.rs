@@ -4814,6 +4814,7 @@ mod tests {
                 used: 1,
                 max: None,
                 auto_compact_at: None,
+                estimated: false,
             },
         ];
         let blank = s.create_thread("/w", None).unwrap();

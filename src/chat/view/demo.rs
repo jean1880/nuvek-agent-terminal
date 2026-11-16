@@ -785,6 +785,7 @@ fn script() -> Vec<Step> {
             used: 18_400,
             max: Some(200_000),
             auto_compact_at: Some(160_000),
+            estimated: false,
         })),
         Step::Emit(started("u1", ItemKind::UserMessage, "", None, None)),
         Step::Emit(snapshot(
@@ -1015,6 +1016,7 @@ fn script() -> Vec<Step> {
         used: 64_210,
         max: Some(200_000),
         auto_compact_at: Some(160_000),
+        estimated: false,
     })));
     s.push(Step::Wait(300));
     s.push(Step::Emit(Envelope::new(Event::Compacted {

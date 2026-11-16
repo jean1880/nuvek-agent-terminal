@@ -17,6 +17,7 @@
 mod background;
 mod cards;
 mod composer;
+mod context_offer;
 mod delegation;
 pub mod demo;
 mod difftext;
@@ -56,7 +57,7 @@ use std::rc::{Rc, Weak};
 use adw::subclass::prelude::*;
 use agent_core::adapter::{Control, Driver, Mode};
 use agent_core::commands::{builtins, compact_text, BuiltinAction, Trigger};
-use agent_core::context_meter::MeterAction;
+use agent_core::context_meter::{ContextState, ContextWarning, MeterAction, WarnLatch};
 use agent_core::event::Event;
 use agent_core::event::{BackgroundTask, BackgroundTaskKind, Envelope, PlanStep, StepStatus};
 use agent_core::saved_prompts;
@@ -198,6 +199,12 @@ pub(crate) struct Inner {
         RefCell<std::collections::HashSet<(agent_core::delegation::scope::Scope, String)>>,
     /// The bouncing dots above the composer while the agent works.
     thinking: thinking::ThinkingStrip,
+    /// The offer to compact or continue, above the composer, when the context runs low.
+    context_offer: context_offer::ContextOffer,
+    /// When the offer is made (Settings → General → Threads), set by the window.
+    context_warning: Cell<ContextWarning>,
+    /// Whether this crossing of the warning point was already offered. In memory only.
+    warn_latch: Cell<WarnLatch>,
     requests: Rc<Requests>,
     /// Both agents' model lists for the picker (`None`: the backend's `ListModels`).
     models: RefCell<Option<Rc<dyn ModelSource>>>,
@@ -253,6 +260,66 @@ impl Inner {
         let source = self.prompts.borrow().clone();
         let dir = self.workspace.borrow().clone();
         source.map_or_else(Vec::new, |s| s.saved_prompts(dir.as_deref()))
+    }
+
+    /// The gauge's reading judged against the warning setting.
+    fn meter_of(
+        &self,
+        gauge: Option<&model::Gauge>,
+    ) -> Option<agent_core::context_meter::ContextMeter> {
+        gauge.map(|g| g.meter().with_warning(self.context_warning.get()))
+    }
+
+    /// A new live reading: offers to compact the first time it passes the warning point (once
+    /// per crossing), keeps a shown offer's figures current, and takes the offer down once the
+    /// reading is back under the point or the gauge is cleared. A reading with no window leaves
+    /// it as it is.
+    fn offer_if_low(&self, gauge: Option<&model::Gauge>) {
+        let meter = self.meter_of(gauge);
+        let mut latch = self.warn_latch.get();
+        let offer = latch.observe(meter.as_ref());
+        self.warn_latch.set(latch);
+        match meter.as_ref().and_then(|m| m.offer_text()) {
+            Some(text) if offer => {
+                tracing::info!("chat view: context running low, offering to compact");
+                self.context_offer.show(&text);
+            }
+            Some(text) => self.context_offer.refresh(&text),
+            None if meter.is_some_and(|m| m.state() == ContextState::Unknown) => {}
+            None => self.context_offer.hide(),
+        }
+    }
+
+    /// The warning setting changed: the bar is drawn against it at once, and the crossing is
+    /// judged again without offering (a lower point never pops an offer by itself).
+    fn apply_context_warning(&self, warning: ContextWarning) {
+        self.context_warning.set(warning);
+        let gauge = self.model.borrow().gauge;
+        self.header.set_warning(warning, gauge.as_ref());
+        let meter = self.meter_of(gauge.as_ref());
+        let mut latch = self.warn_latch.get();
+        latch.prime(meter.as_ref());
+        self.warn_latch.set(latch);
+        match meter.as_ref().and_then(|m| m.offer_text()) {
+            Some(text) if warning.enabled() => self.context_offer.refresh(&text),
+            _ => self.context_offer.hide(),
+        }
+    }
+
+    /// Runs what the gauge's popover or the low-context offer picked. Compact and Continue wait
+    /// for the turn to end (both are off while one runs, and one can have started since they
+    /// were drawn); the breakdown only reads.
+    fn run_meter_action(self: &Rc<Self>, action: MeterAction) {
+        let status = self.backend.status();
+        let busy = status.running_turn || self.model.borrow().running;
+        match meter_dispatch(action) {
+            MeterDispatch::Builtin(BuiltinAction::OpenContext) => {
+                self.run_action(BuiltinAction::OpenContext, "")
+            }
+            _ if busy => {}
+            MeterDispatch::Builtin(b) => self.run_action(b, ""),
+            MeterDispatch::View(v) => self.emit(v),
+        }
     }
 }
 
@@ -361,6 +428,9 @@ impl ChatView {
                 interruption_scope: RefCell::new(None),
                 worker_auto_allowed: RefCell::default(),
                 thinking: thinking::ThinkingStrip::new(),
+                context_offer: context_offer::ContextOffer::new(),
+                context_warning: Cell::new(ContextWarning::default()),
+                warn_latch: Cell::new(WarnLatch::default()),
                 requests: Rc::new(Requests::default()),
                 models: RefCell::new(None),
                 model_conn: Cell::new(None),
@@ -411,6 +481,7 @@ impl ChatView {
         column.append(&inner.plan.revealer);
         column.append(&inner.shelves.widget);
         column.append(&inner.interruption.revealer);
+        column.append(&inner.context_offer.revealer);
         // Right above where the reply is typed: the one place the eye already is.
         column.append(&inner.thinking.revealer);
         column.append(inner.composer.widget());
@@ -494,6 +565,11 @@ impl ChatView {
         let model = inner.model.borrow();
         inner.plan.set(&model.plan);
         inner.header.set_gauge(model.gauge.as_ref());
+        // Reopening is not a crossing: history already past the point is taken as offered.
+        let mut latch = WarnLatch::default();
+        latch.prime(inner.meter_of(model.gauge.as_ref()).as_ref());
+        inner.warn_latch.set(latch);
+        inner.context_offer.hide();
         inner.header.set_extra_access(model.extra_access());
         inner.composer.set_history(model.user_messages());
         drop(model);
@@ -687,6 +763,29 @@ impl ChatView {
         }
     }
 
+    /// When this thread offers to compact as its context runs low (Settings → General →
+    /// Threads). Applies at once: the gauge is drawn against it, and an offer shown under the
+    /// old setting goes when the new one says the context is not low (or never to offer).
+    pub fn set_context_warning(&self, warning: ContextWarning) {
+        if let Some(inner) = self.inner() {
+            inner.apply_context_warning(warning);
+        }
+    }
+
+    /// What the low-context offer says while shown, and its buttons (tests).
+    #[cfg(test)]
+    pub(crate) fn context_offer(&self) -> Option<(String, Vec<(String, bool)>)> {
+        self.inner().and_then(|inner| inner.context_offer.shown())
+    }
+
+    /// Presses a button of the low-context offer (`None`: Dismiss), as a click would (tests).
+    #[cfg(test)]
+    pub(crate) fn press_context_offer(&self, action: Option<MeterAction>) {
+        if let Some(inner) = self.inner() {
+            inner.context_offer.press(action);
+        }
+    }
+
     /// Scale chat content and controls without changing the desktop theme or other windows.
     pub fn set_text_scale(&self, scale: f64) {
         let scale = if scale.is_finite() {
@@ -835,7 +934,11 @@ impl Inner {
                     self.transcript.removed(&self.model.borrow(), &id);
                 }
                 Change::Plan => self.plan.set(&self.model.borrow().plan),
-                Change::Gauge => self.header.set_gauge(self.model.borrow().gauge.as_ref()),
+                Change::Gauge => {
+                    let gauge = self.model.borrow().gauge;
+                    self.header.set_gauge(gauge.as_ref());
+                    self.offer_if_low(gauge.as_ref());
+                }
                 Change::Mode => {
                     let mode = self.model.borrow().mode;
                     // Entering dangerous permissive mode answers the workers already waiting.
@@ -1217,6 +1320,12 @@ impl Inner {
             running,
             status.capabilities.context_usage,
         );
+        self.context_offer
+            .set_actions(&agent_core::context_meter::offer_actions(
+                status.capabilities.compact_command.as_deref(),
+                status.driver.info().label,
+                running,
+            ));
         self.refresh_interruption();
         self.composer.refresh_placeholder();
     }
@@ -1274,20 +1383,30 @@ impl Inner {
         self.header.connect_meter_action({
             let weak = weak.clone();
             move |action| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.run_meter_action(action);
+                }
+            }
+        });
+        // The low-context offer: only a press acts, through the popover's own path. A press that
+        // a running turn holds back leaves the offer up; Dismiss takes it down until the next
+        // crossing.
+        self.context_offer.connect_pick({
+            let weak = weak.clone();
+            move |pick| {
                 let Some(inner) = weak.upgrade() else {
                     return;
                 };
-                let status = inner.backend.status();
-                // The popover turns Compact and Continue off while a turn runs; one can have
-                // started since it was drawn.
-                let busy = status.running_turn || inner.model.borrow().running;
-                match meter_dispatch(action) {
-                    MeterDispatch::Builtin(BuiltinAction::OpenContext) => {
-                        inner.run_action(BuiltinAction::OpenContext, "")
+                match pick {
+                    None => inner.context_offer.hide(),
+                    Some(action) => {
+                        let status = inner.backend.status();
+                        if status.running_turn || inner.model.borrow().running {
+                            return;
+                        }
+                        inner.context_offer.hide();
+                        inner.run_meter_action(action);
                     }
-                    _ if busy => {}
-                    MeterDispatch::Builtin(b) => inner.run_action(b, ""),
-                    MeterDispatch::View(v) => inner.emit(v),
                 }
             }
         });
@@ -1577,9 +1696,10 @@ impl Inner {
 
 /// Whether the host must ask for the context gauge itself after each turn. Codex pushes its
 /// occupancy (`thread/tokenUsage/updated`); Claude and agy report it only when asked
-/// (`get_context_usage`, agy's running token count), which left Claude's gauge empty.
+/// (`get_context_usage`, agy's running token count), which left Claude's gauge empty. The Local
+/// agent's runner sends its own after every request.
 fn polls_context(driver: Driver) -> bool {
-    !matches!(driver, Driver::Codex)
+    !matches!(driver, Driver::Codex | Driver::Local)
 }
 
 /// Images dropped anywhere on the thread (its transcript or its composer) are attached to the
@@ -2925,6 +3045,160 @@ pub(crate) mod tests {
         );
     }
 
+    /// The low-context offer: shown once when a reading first passes the warning point, never
+    /// again for the same crossing, and again after a compaction brings it back under. It acts
+    /// only on a press, through the popover's path, and never while a turn runs. The threshold
+    /// applies as it is set; a reopened thread is not offered for history; the Local agent's
+    /// offer says it is an estimate; agy (tokens used, no window) is never offered.
+    fn context_offer_warns_once_and_acts_only_on_click() {
+        use agent_core::context_meter::ContextWarning;
+        let usage = |used: u64, max: Option<u64>, estimated: bool| {
+            Envelope::new(Event::UsageUpdated {
+                used,
+                max,
+                auto_compact_at: None,
+                estimated,
+            })
+        };
+        let claude = |used| usage(used, Some(200_000), false);
+        let backend = StubBackend::new(Driver::Claude);
+        let view = ChatView::new(backend.clone());
+        let emitted = Rc::new(RefCell::new(Vec::<ViewAction>::new()));
+        view.connect_action({
+            let emitted = emitted.clone();
+            move |a| emitted.borrow_mut().push(a.clone())
+        });
+
+        view.apply(&claude(100_000));
+        assert_eq!(view.context_offer(), None, "half full is not low");
+        view.apply(&claude(160_000));
+        let (text, buttons) = view.context_offer().expect("offered at the first crossing");
+        assert!(text.contains("20% of the context window is left"), "{text}");
+        assert!(text.contains("Nothing is sent until you choose."));
+        assert_eq!(
+            buttons,
+            [
+                ("Compact (Claude's /compact)".to_owned(), true),
+                ("Continue in a new thread".to_owned(), true),
+            ]
+        );
+        // Offering sends nothing and asks the window for nothing.
+        assert!(backend.sent.borrow().is_empty());
+        assert!(emitted.borrow().is_empty());
+        // Further readings in the same crossing keep it current, never offer it again.
+        view.apply(&claude(170_000));
+        let (text, _) = view.context_offer().expect("still shown");
+        assert!(text.contains("15% of the context window is left"), "{text}");
+        view.press_context_offer(None);
+        assert_eq!(view.context_offer(), None, "dismissed");
+        view.apply(&claude(180_000));
+        assert_eq!(view.context_offer(), None, "never twice for one crossing");
+        assert!(backend.sent.borrow().is_empty());
+
+        // A compaction brings it back under: the next crossing offers again.
+        view.apply(&Envelope::new(Event::Compacted {
+            manual: true,
+            before: 180_000,
+            after: Some(20_000),
+        }));
+        assert_eq!(view.context_offer(), None);
+        view.apply(&claude(165_000));
+        assert!(view.context_offer().is_some(), "a new crossing is offered");
+
+        // While a turn runs both buttons are off and a press does nothing.
+        backend.status.borrow_mut().running_turn = true;
+        view.refresh_status();
+        let (_, buttons) = view.context_offer().expect("still shown");
+        assert!(buttons.iter().all(|(_, on)| !on), "{buttons:?}");
+        view.press_context_offer(Some(MeterAction::Compact));
+        view.press_context_offer(Some(MeterAction::Continue));
+        assert!(backend.sent.borrow().is_empty());
+        assert!(emitted.borrow().is_empty());
+        assert!(view.context_offer().is_some(), "held, not lost");
+        backend.status.borrow_mut().running_turn = false;
+        view.refresh_status();
+        // Compact is the agent's own command, sent only now that it was pressed.
+        view.press_context_offer(Some(MeterAction::Compact));
+        assert_eq!(*backend.sent.borrow(), ["/compact"]);
+        assert_eq!(view.context_offer(), None);
+
+        // Continue is the hand-off fork the popover's Continue asks for.
+        view.apply(&Envelope::new(Event::Compacted {
+            manual: true,
+            before: 165_000,
+            after: Some(10_000),
+        }));
+        view.apply(&claude(190_000));
+        view.press_context_offer(Some(MeterAction::Continue));
+        assert_eq!(*emitted.borrow(), [ViewAction::CompactByHandoff]);
+        assert_eq!(backend.sent.borrow().len(), 1, "Continue sends no prompt");
+
+        // The threshold applies as it is set: 90% takes down an offer at 82%, and the bar
+        // follows; a reading past 90% is then a new crossing. "Never" takes the offer down.
+        view.apply(&Envelope::new(Event::Compacted {
+            manual: true,
+            before: 190_000,
+            after: Some(1_000),
+        }));
+        view.apply(&claude(164_000));
+        assert!(view.context_offer().is_some());
+        view.set_context_warning(ContextWarning::At90);
+        assert_eq!(view.context_offer(), None, "82% is not low at 90%");
+        let inner = view.inner().expect("a built view");
+        assert_eq!(inner.header.level_warn_offset(), Some(0.9));
+        view.apply(&claude(185_000));
+        assert!(view.context_offer().is_some(), "crossed the new point");
+        view.set_context_warning(ContextWarning::Off);
+        assert_eq!(view.context_offer(), None, "off takes it down");
+        view.apply(&Envelope::new(Event::Compacted {
+            manual: true,
+            before: 185_000,
+            after: Some(1_000),
+        }));
+        view.apply(&claude(195_000));
+        assert_eq!(view.context_offer(), None, "off never offers");
+        // Turned back on past the point: the crossing it missed is not offered late.
+        view.set_context_warning(ContextWarning::At60);
+        assert_eq!(view.context_offer(), None);
+        view.apply(&claude(196_000));
+        assert_eq!(view.context_offer(), None);
+
+        // A reopened thread is primed from its history, not offered for it.
+        let reopened = ChatView::new(StubBackend::new(Driver::Claude));
+        reopened.replay(&[claude(150_000), claude(170_000)]);
+        assert_eq!(reopened.context_offer(), None);
+        reopened.apply(&claude(175_000));
+        assert_eq!(
+            reopened.context_offer(),
+            None,
+            "history's crossing was its own"
+        );
+
+        // The Local agent: its window is the profile's budget, and its offer says so. It has
+        // no native command, so the offer is Continue alone.
+        let local = ChatView::new(StubBackend::new(Driver::Local));
+        local.apply(&usage(28_000, Some(32_768), true));
+        let (text, buttons) = local.context_offer().expect("offered");
+        assert!(text.contains("this profile's context budget"), "{text}");
+        assert!(text.contains("an estimate"), "{text}");
+        assert_eq!(buttons, [("Continue in a new thread".to_owned(), true)]);
+        let header = &local.inner().expect("a built view").header;
+        assert!(header.gauge_text_shown().starts_with('~'));
+
+        // agy: tokens used and no window. No percentage, so never an offer.
+        let agy_backend = StubBackend::new(Driver::Agy);
+        let agy = ChatView::new(agy_backend.clone());
+        for used in [100_000, 900_000, 2_000_000] {
+            agy.apply(&usage(used, None, false));
+            assert_eq!(agy.context_offer(), None);
+        }
+        assert_eq!(
+            agy.inner().expect("a built view").header.gauge_text_shown(),
+            "context ?"
+        );
+        assert!(agy_backend.sent.borrow().is_empty());
+    }
+
     /// The dots above the composer show while a turn runs, name the agent, and go when it ends.
     fn thinking_strip_follows_the_turn() {
         use agent_core::event::{Event, TurnState};
@@ -4112,6 +4386,7 @@ pub(crate) mod tests {
         interruption::tests::the_shelf_holds_requests_it_must_not_grant_unseen();
         requests_ui_checks();
         thinking_strip_follows_the_turn();
+        context_offer_warns_once_and_acts_only_on_click();
         follow::tests::a_followed_scroller_tracks_its_end_until_the_user_scrolls_up();
         composer::tests::stop_preserves_a_draft_and_completions_stay_in_the_field();
         panels::tests::changing_effort_does_not_switch_until_row_activation();

@@ -531,6 +531,16 @@ button.flat.quick-reply-action:hover { color: @at_fg_soft; text-decoration: unde
     100% { transform: none; }
 }
 .thinking-strip { padding: 2px 6px 0 6px; min-height: 22px; }
+/* The low-context offer: said in words and with its icon, the tint only underlines it. */
+.context-offer {
+    padding: 8px 12px;
+    border-radius: 12px;
+    background-color: @at_surface_raised;
+    border: 1px solid alpha(@at_warning, 0.45);
+}
+.context-offer-icon { color: @at_warning; }
+.context-offer-text { color: @at_fg_strong; font-size: 0.92em; }
+.context-offer-reason { font-size: 0.88em; }
 /* The app icon's dots (brand.rs `dots`): each in its agent's colour; `set_lead` lights the agent
    at work and dims the others, easing between the two so a switch reads as the light moving. */
 .brand-dot {

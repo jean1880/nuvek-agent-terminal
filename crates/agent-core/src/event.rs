@@ -268,6 +268,11 @@ pub enum Event {
         max: Option<u64>,
         #[serde(default)]
         auto_compact_at: Option<u64>,
+        /// The app worked the figures out rather than the agent reporting them (the Local
+        /// agent: `max` is the profile's configured budget, and `used` the server's prompt
+        /// tokens or the planner's estimate). An older stored event reads as reported.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        estimated: bool,
     },
     Compacted {
         manual: bool,

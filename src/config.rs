@@ -719,6 +719,30 @@ fn tolerant_theme<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ThemeChoice,
     }))
 }
 
+/// The context warning as its percentage (0 for never), the shape the file keeps.
+fn serialize_context_warning<S: serde::Serializer>(
+    warning: &agent_core::context_meter::ContextWarning,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    s.serialize_u8(warning.percent())
+}
+
+/// A `context_warning` that is not one of the offered choices (a hand-edited 42, a string)
+/// loads as the default instead of failing the whole file; the next save writes the default.
+fn tolerant_context_warning<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<agent_core::context_meter::ContextWarning, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    let chosen = value
+        .as_u64()
+        .and_then(|n| u8::try_from(n).ok())
+        .and_then(agent_core::context_meter::ContextWarning::from_percent);
+    Ok(chosen.unwrap_or_else(|| {
+        warn!("context_warning {value} is not 0, 60, 75 or 90; using the default (75)");
+        agent_core::context_meter::ContextWarning::default()
+    }))
+}
+
 impl std::fmt::Display for ThemeChoice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
@@ -834,6 +858,14 @@ pub struct TerminalConfig {
     /// process is started again if needed and the app asks it to carry on. On by default (an
     /// older config opts in); a thread's "Don't continue" cancels one wait.
     pub continue_after_limit: bool,
+    /// When a thread offers to compact or continue in a new thread: the percentage of its
+    /// context used (60, 75 or 90; 0 never offers). Once per thread each time it crosses it;
+    /// the header's bar turns amber at the same point. 75 by default (an older config opts in).
+    #[serde(
+        serialize_with = "serialize_context_warning",
+        deserialize_with = "tolerant_context_warning"
+    )]
+    pub context_warning: agent_core::context_meter::ContextWarning,
     /// Reopen the previous window's tabs on launch. Off by default: a restored
     /// tab gets its directory and profile back but starts a fresh conversation,
     /// so by default it only multiplies blank sessions.
@@ -1287,6 +1319,7 @@ impl Default for TerminalConfig {
             check_updates_on_startup: true,
             idle_suspend_minutes: 15,
             continue_after_limit: true,
+            context_warning: agent_core::context_meter::ContextWarning::default(),
             restore_session: false,
             checkpoints: true,
             diff_panel_visible: false,
@@ -3004,6 +3037,51 @@ mod tests {
             .write_all(br#"{"continue_after_limit":false}"#)
             .unwrap();
         assert!(!TerminalConfig::load_from(&path).continue_after_limit);
+    }
+
+    #[test]
+    fn context_warning_keeps_only_an_offered_choice() {
+        use agent_core::context_meter::ContextWarning;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let load = |body: &str| {
+            std::fs::write(&path, body).unwrap();
+            TerminalConfig::load_from(&path)
+        };
+        // An older config, with no such key, warns at 75%.
+        assert_eq!(
+            load(r#"{"notify_on_bell":false}"#).context_warning,
+            ContextWarning::At75
+        );
+        for (stored, chosen) in [
+            ("0", ContextWarning::Off),
+            ("60", ContextWarning::At60),
+            ("75", ContextWarning::At75),
+            ("90", ContextWarning::At90),
+        ] {
+            let config = load(&format!(r#"{{"context_warning":{stored}}}"#));
+            assert_eq!(config.context_warning, chosen, "{stored}");
+        }
+        // Anything else is refused for the default, and the rest of the file is kept.
+        for bad in ["42", "100", "300", "-5", "7.5", "\"75\"", "null", "true"] {
+            let config = load(&format!(
+                r#"{{"context_warning":{bad},"continue_after_limit":false}}"#
+            ));
+            assert_eq!(config.context_warning, ContextWarning::At75, "{bad}");
+            assert!(!config.continue_after_limit, "{bad} reset the file");
+        }
+        // Saved as the percentage, and read back the same.
+        let config = TerminalConfig {
+            context_warning: ContextWarning::At90,
+            ..TerminalConfig::default()
+        };
+        assert!(config.save_to(&path));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""context_warning": 90"#), "{text}");
+        assert_eq!(
+            TerminalConfig::load_from(&path).context_warning,
+            ContextWarning::At90
+        );
     }
 
     #[test]

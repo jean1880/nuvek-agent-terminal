@@ -1255,6 +1255,7 @@ pub fn context_panel(ctx: &PanelCtx, fallback: Option<Gauge>) {
                         used,
                         max: c.max,
                         auto_compact_at: c.auto_compact_at,
+                        estimated: c.estimated,
                     }),
                     (None, g) => g,
                 };
@@ -1263,6 +1264,15 @@ pub fn context_panel(ctx: &PanelCtx, fallback: Option<Gauge>) {
                     let big = label(&gauge_used_text(&g), &["context-big"]);
                     big.set_halign(gtk4::Align::Center);
                     content.append(&big);
+                    if g.estimated {
+                        let note = wrapped_text(
+                            "An estimate against the context budget set for this profile in \
+                             Settings, not the model's own window.",
+                            &["dim-label"],
+                        );
+                        note.set_justify(gtk4::Justification::Center);
+                        content.append(&note);
+                    }
                     if let Some((fill, _)) = super::header::gauge_fraction(&g) {
                         let level = gtk4::LevelBar::new();
                         level.set_value(fill);

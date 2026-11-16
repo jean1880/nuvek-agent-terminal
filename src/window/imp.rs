@@ -4404,6 +4404,15 @@ impl AgentTerminalWindow {
     }
 
     /// Turns quick replies on or off: the setting, the copy chat sessions read, and the file.
+    /// Gives every open thread view of this window the context warning setting, as it is made.
+    fn apply_context_warning(&self, warning: agent_core::context_meter::ContextWarning) {
+        for tab in self.tabs.borrow().iter() {
+            if let Some(view) = tab.chat.as_ref().and_then(|chat| chat.view.as_ref()) {
+                view.set_context_warning(warning);
+            }
+        }
+    }
+
     fn set_quick_replies(&self, on: bool) {
         if self.config.borrow().suggest_quick_replies != on {
             self.config.borrow_mut().suggest_quick_replies = on;
@@ -5216,6 +5225,31 @@ impl AgentTerminalWindow {
             },
         );
         threads.add(&continue_row);
+        let context_row = self.choice_row(
+            "Offer to Compact When Context Runs Low",
+            "When a thread has used this much of its context, a note above the message box \
+             offers to compact it or continue in a new thread, once each time it gets there. \
+             Nothing is sent until you choose; the note is not saved with the thread. The \
+             header's context bar turns amber at the same point",
+            agent_core::context_meter::ContextWarning::ALL
+                .iter()
+                .map(|w| (*w, w.label().to_owned()))
+                .collect(),
+            config.context_warning,
+            |imp, choice| {
+                let Some(warning) = choice else {
+                    return;
+                };
+                if imp.config.borrow().context_warning == warning {
+                    return;
+                }
+                imp.config.borrow_mut().context_warning = warning;
+                imp.for_each_window(|window| window.apply_context_warning(warning));
+                imp.schedule_config_save();
+            },
+        );
+        Self::keep_value_whole(&context_row);
+        threads.add(&context_row);
         let outside_row = self.config_switch(
             "Show Sessions Started Outside Agent Terminal",
             "List the agents' own recent sessions (started in a terminal or another tool) as \

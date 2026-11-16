@@ -227,6 +227,33 @@ Click the gauge for a popover with the numbers and three things to do:
 Compact and Continue are off, with the reason shown, while a turn runs. `/compact` and
 `/context` also work from the composer.
 
+**The offer when context runs low.** When a reading first passes the warning point (75% used
+by default), a note above the message box says how much is left and offers the same
+**Compact** (where the agent has its own command) and **Continue in a New Thread**, with a
+close button to dismiss it. It only offers: nothing is sent and no thread is made until you
+press a button, and while a turn runs both buttons wait for it to end. It is shown once per
+crossing: further readings past the point only update its figures, and it is offered again
+only after a reading below the point (a compaction, a switch of agent or model) followed by
+another crossing. Reopening a thread whose history is already past the point does not offer
+it. Nothing about the offer is saved: it lives in the open thread only.
+
+Settings → General → Threads → **Offer to Compact When Context Runs Low** sets the point for
+every thread: At 60%, 75% or 90% Used, or Never. It applies at once to every open thread: the
+gauge's amber point moves with it, and an offer showing under the old point goes when the new
+one says the context is not low. A crossing made while it was set to Never is not offered
+later. An agent's own earlier auto-compact point still turns the bar amber first.
+
+**The Local agent.** Its gauge measures each request against the profile's **Context
+Tokens** budget (Settings → Agents → the Local profile), not the model's own window, which the
+app does not read from the server. The figure is the server's reported prompt tokens when it
+sends them, else the app's own estimate of the request. The gauge reads "~N% left", its
+tooltip and popover say "Context budget" and "estimate", and `/context` lists the last
+request's figure beside the budget's parts (input allowance, the reply's reserve, the safety
+margin). It has no compaction command, so Compact is Continue.
+
+**Antigravity** reports tokens used only, so its gauge stays "context ?" with the count in
+its tooltip, and it is never offered: with no window there is nothing to measure against.
+
 ### Turn checkpoints
 
 In a thread whose folder is inside a git repository, the working tree is snapshotted

@@ -131,6 +131,7 @@ until it is fixed.
 | `permission_sources` | `[]` | Extra `permissions.toml`-style files that import reads and export writes (absolute or `~/`) |
 | `suggest_quick_replies` | `true` | Offer quick replies under a Codex or Antigravity reply that ends with a question |
 | `check_updates_on_startup` | `true` | Ask GitHub for the latest release once, a few seconds after startup |
+| `context_warning` | `75` | Percent of a thread's context used at which it offers to compact or continue in a new thread, once per crossing, and the gauge turns amber: `60`, `75` or `90`, or `0` for never. Any other value loads as `75` (the rest of the file is kept). See [The context gauge](reference.md#the-context-gauge) |
 | `font`, `font_scale` | JetBrains Mono 11, `1.0` | Terminal font and zoom |
 | `cursor_shape`, `cursor_blink` | `block`, `true` | Terminal cursor |
 | `scrollback_lines` | `10000` | Terminal scrollback |
@@ -309,7 +310,9 @@ Context Cap** bounds the instructions and schemas in bytes. Built-in tools fit f
 MCP tools in their priority order (the profile's server order, then each server's tool
 order); a whole tool that does not fit is left out, and the thread says which. A request whose current
 exchange alone does not fit stops before it is sent; a batch of tool calls runs only when
-there is room for every result.
+there is room for every result. The thread header's context gauge measures each request
+against **Context Tokens**, as an estimate ("~N% left"), so a Local thread is offered a
+compaction before it runs out of budget too.
 
 **MCP servers.** A definition is an executable with an argument list (run directly, no shell
 expansion, and no `$WORKSPACE` substitution: a relative path is resolved by the server in

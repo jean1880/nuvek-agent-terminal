@@ -6002,6 +6002,8 @@ impl AgentTerminalWindow {
         };
         let view = ChatView::new(backend);
         view.set_text_scale(self.config.borrow().font_scale);
+        // Before the history replays, so a reopened thread is judged against the same point.
+        view.set_context_warning(self.config.borrow().context_warning);
         view.set_vexpand(true);
         // The thread's own profile decides each agent's list (its model server or the vendor),
         // read at every look: a reopened thread gets its stored profile after this, and a switch

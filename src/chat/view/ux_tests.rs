@@ -930,6 +930,47 @@ fn native_toasts_clear_the_composer() {
     }
 }
 
+/// The low-context offer fits the thread at its narrowest and widest, shown or not: it never
+/// widens the window, and its buttons stay inside it.
+#[test]
+#[ignore = "native GTK layout; run alone in an isolated display"]
+fn native_the_context_offer_fits_at_every_width() {
+    let ctx = crate::testutil::native_init();
+    for width in [360, 900] {
+        let (window, view) = shown_view(width, &demo::queue_envelopes(), &ctx);
+        assert!(
+            window.width() <= width,
+            "the hidden offer widened the window"
+        );
+        view.apply(&Envelope::new(Event::UsageUpdated {
+            used: 180_000,
+            max: Some(200_000),
+            auto_compact_at: None,
+            estimated: false,
+        }));
+        assert!(view.context_offer().is_some(), "offered at {width}px");
+        let mapped = || {
+            crate::testutil::descendants(view.upcast_ref())
+                .into_iter()
+                .any(|w| w.has_css_class("context-offer") && w.is_mapped() && w.width() > 0)
+        };
+        assert!(
+            crate::testutil::pump_until(&ctx, 5, mapped),
+            "the offer never appeared at {width}px"
+        );
+        crate::testutil::settle(&ctx);
+        let card: gtk4::Box = find_with_class(&view, "context-offer");
+        assert!(window.width() <= width, "the offer widened the window");
+        let bounds = card.compute_bounds(&window).expect("offer bounds");
+        assert!(
+            bounds.x() >= 0.0 && bounds.x() + bounds.width() <= width as f32 + 1.0,
+            "the offer {bounds:?} spills out of {width}px"
+        );
+        crate::testutil::capture_window(&window, &format!("context-offer-{width}"));
+        window.destroy();
+    }
+}
+
 /// The queue scene: prompts waiting behind a running
 /// turn stay pinned under the growing reply, can be selected for copying, and stay inside the
 /// viewport at every width.

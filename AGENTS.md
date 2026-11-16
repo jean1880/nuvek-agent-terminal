@@ -80,7 +80,9 @@ Architectural mandates, standards, and workflows for this codebase.
     and `saved_prompts` (the user's saved prompts: name, body and folder rules, the typeahead's
     items, and the one placeholder resolver, `parse`/`resolve`/`Values`, which redacts every
     value before it caps it) and `commit_message` (a diff-panel commit's message check, its
-    draft prompt and the shown command line).
+    draft prompt and the shown command line) and `context_meter` (the header gauge's three
+    states and wording, the `ContextWarning` threshold setting, the `WarnLatch` that offers
+    once per crossing, and the popover's and the offer's actions).
   - `crates/agent-kit` (GTK-free; blocking process and file I/O): `git`
     (git plumbing for turn checkpoints and diffs: shells out, but its parsers
     and filters are pure), `diff` (diff bases, numstat, line classification,
@@ -432,6 +434,22 @@ Architectural mandates, standards, and workflows for this codebase.
   stopped by its limit) switches and then continues the work in the new agent with the handoff,
   as a busy switch does. `limit_wait::tests`, the session tests
   `a_thread_continues_after_its_limit_*` and `continuation_tests` prove these.
+- **The low-context offer only offers, once per crossing, and keeps nothing**: when a live
+  reading first passes `context_warning` (Settings → General → Threads: 60, 75 or 90% used,
+  or never; any other stored value loads as 75), the view shows a note above the composer
+  (`chat/view/context_offer.rs`) with Compact (only where the agent has its own command) and
+  Continue in a New Thread. A press goes through the gauge popover's own path
+  (`Inner::run_meter_action`: `/compact`, else `ViewAction::CompactByHandoff`, which already
+  redacts and budgets the hand-off), never while a turn runs, and nothing is sent unpressed.
+  `context_meter::WarnLatch` re-arms only on a reading under the point or a cleared gauge (a
+  reading with no window changes nothing); replayed history primes it without offering, as
+  does a changed threshold, and a crossing made while set to never is not offered later. The
+  latch and the note live in the open view only, never in the store. The Local agent's gauge
+  is the runner's `UsageUpdated` after each request (`estimated: true`): the server's prompt
+  tokens when reported, else the planner's estimate, against the profile's `context_tokens`
+  budget, labelled an estimate; its `/context` answers from memory. agy reports no window, so
+  it shows tokens used and is never offered. `context_offer_warns_once_and_acts_only_on_click`
+  and `context_meter::tests` prove these.
 - **Agent processes get a cleaned environment**: `clear_env` and any inherited
   approval-socket variables are removed (`SpawnSpec::unset`), then the profile's
   env file, then its model provider's variables, then the approval socket.

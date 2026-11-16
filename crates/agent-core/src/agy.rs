@@ -710,6 +710,7 @@ impl Adapter for AgyAdapter {
                                 used: self.context_tokens,
                                 max: None,
                                 auto_compact_at: None,
+                                estimated: false,
                             }));
                             Event::ControlResult {
                                 ok: Some(json!({"used": self.context_tokens, "max": null})),

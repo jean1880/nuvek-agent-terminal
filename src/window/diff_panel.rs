@@ -819,22 +819,18 @@ impl DiffPanel {
         content.append(&header);
         content.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
         content.append(&stack);
-        let (review_bar, review_status, review_send, review_discard) = review::bar();
+        let review_bar = review::bar();
         let review_separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
         review_bar
+            .region
             .bind_property("visible", &review_separator, "visible")
             .sync_create()
             .build();
         content.append(&review_separator);
-        content.append(&review_bar);
+        content.append(&review_bar.region);
         let shared_colours = Rc::new(RefCell::new(colours.clone()));
-        let review = review::Review::new(
-            &review_bar,
-            &review_status,
-            &review_send,
-            &review_discard,
-            Rc::clone(&shared_colours),
-        );
+        let review = review::Review::new(&review_bar, Rc::clone(&shared_colours));
+        let (review_send, review_discard) = (review_bar.send.clone(), review_bar.discard.clone());
         let commit = CommitBar::new();
         let commit_separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
         commit
@@ -2222,10 +2218,21 @@ pub(crate) mod tests {
             "a caret, for choosing lines by keyboard"
         );
         assert!(!button(&panel).is_sensitive(), "nothing selected yet");
+        assert!(crate::testutil::pump_until(&ctx, 5, || view.is_mapped()));
 
         // Header lines alone are refused, with the reason.
         let buffer = view.buffer();
         let line = |n: i32| buffer.iter_at_line(n).expect("line");
+        buffer.select_range(&line(0), &line(3));
+        assert!(button(&panel).is_sensitive());
+
+        // A collapsed row's view is off screen: Comment is off and opens nothing.
+        panel.file_expanders()[0].set_expanded(false);
+        assert!(crate::testutil::pump_until(&ctx, 5, || !view.is_mapped()));
+        assert!(!button(&panel).is_sensitive());
+        assert!(panel.review.comment_on("a.rs").is_none());
+        panel.file_expanders()[0].set_expanded(true);
+        assert!(crate::testutil::pump_until(&ctx, 5, || view.is_mapped()));
         buffer.select_range(&line(0), &line(3));
         assert!(button(&panel).is_sensitive());
         let refused = panel.review.comment_on("a.rs").expect("a popover");
@@ -2315,25 +2322,333 @@ pub(crate) mod tests {
         assert_eq!(saved.borrow().last().map(|(_, d)| d.len()), Some(0));
         assert_eq!(panel.review.bar_view(), None);
 
-        // Discard: one comment goes without asking.
+        // Ctrl+Alt+M on the caret's line, with nothing selected, opens the editor there; in it
+        // Shift+Enter adds a line, Enter saves.
         let view = panel.review.view_of("a.rs").expect("view");
+        assert!(crate::testutil::pump_until(&ctx, 5, || view.is_mapped()));
         let buffer = view.buffer();
-        buffer.select_range(
-            &buffer.iter_at_line(9).expect("tail"),
-            &buffer.iter_at_line(9).expect("tail"),
+        let tail = buffer.iter_at_line(9).expect("tail");
+        buffer.select_range(&tail, &tail);
+        let ctrl_alt = gtk4::gdk::ModifierType::CONTROL_MASK | gtk4::gdk::ModifierType::ALT_MASK;
+        assert!(press(&view, gtk4::gdk::Key::m, ctrl_alt));
+        let editor = open_popover(&view).expect("Ctrl+Alt+M opened the editor");
+        let entry: gtk4::TextView =
+            crate::testutil::find_first(editor.upcast_ref()).expect("entry");
+        entry.buffer().set_text("Tail");
+        assert!(!press(
+            &entry,
+            gtk4::gdk::Key::Return,
+            gtk4::gdk::ModifierType::SHIFT_MASK
+        ));
+        assert!(
+            panel.review.drafts().is_empty(),
+            "Shift+Enter does not save"
         );
-        // The caret's line, with nothing selected (what Ctrl+Alt+M comments on).
-        let editor = panel.review.comment_on("a.rs").expect("the editor");
-        save_note(&editor, "Tail");
+        assert!(press(
+            &entry,
+            gtk4::gdk::Key::Return,
+            gtk4::gdk::ModifierType::empty()
+        ));
         assert_eq!(panel.review.drafts().len(), 1);
-        crate::testutil::find_by_class::<gtk4::Button>(
+        assert_eq!(panel.review.drafts()[0].note, "Tail");
+        assert_eq!(panel.review.drafts()[0].start_line, 15);
+
+        // Discard: one comment goes without asking.
+        let discard = crate::testutil::find_by_class::<gtk4::Button>(
             panel.content.upcast_ref(),
             "diff-discard-review",
         )
-        .expect("Discard")
-        .emit_clicked();
+        .expect("Discard");
+        discard.emit_clicked();
         assert!(panel.review.drafts().is_empty());
+        assert!(window.visible_dialog().is_none());
+
+        // Two or more: it asks, and Cancel keeps them.
+        for (from, to) in [(5, 6), (8, 9)] {
+            buffer.select_range(&line_of(&buffer, from), &line_of(&buffer, to));
+            let editor = panel.review.comment_on("a.rs").expect("the editor");
+            save_note(&editor, "n");
+        }
+        assert_eq!(panel.review.drafts().len(), 2);
+        discard.emit_clicked();
+        let dialog = window.visible_dialog().expect("Discard asks first");
+        // Closing it (Escape, a press outside) answers Cancel.
+        dialog.close();
+        assert!(crate::testutil::pump_until(&ctx, 5, || window
+            .visible_dialog()
+            .is_none()));
+        assert_eq!(panel.review.drafts().len(), 2);
+        discard.emit_clicked();
+        let dialog = window.visible_dialog().expect("asked again");
+        dialog.emit_by_name::<()>("response", &[&"discard"]);
+        assert!(panel.review.drafts().is_empty());
+        dialog.force_close();
         window.close();
+    }
+
+    /// The popover open on `view`'s file box, if any.
+    fn open_popover(view: &gtk4::TextView) -> Option<gtk4::Popover> {
+        let column = view.parent()?;
+        crate::testutil::find_all::<gtk4::Popover>(&column)
+            .into_iter()
+            .find(|p| p.is_visible())
+    }
+
+    /// The start of line `n` of `buffer`.
+    fn line_of(buffer: &gtk4::TextBuffer, n: i32) -> gtk4::TextIter {
+        buffer.iter_at_line(n).expect("line")
+    }
+
+    /// Delivers a key press to the review's own key controller on `widget`; whether it was
+    /// handled.
+    fn press(
+        widget: &impl IsA<gtk4::Widget>,
+        key: gtk4::gdk::Key,
+        state: gtk4::gdk::ModifierType,
+    ) -> bool {
+        use gtk4::glib::translate::IntoGlib;
+        let controllers = widget.observe_controllers();
+        let keys = (0..controllers.n_items())
+            .filter_map(|i| {
+                controllers
+                    .item(i)
+                    .and_downcast::<gtk4::EventControllerKey>()
+            })
+            .find(|k| k.name().as_deref() == Some(review::KEYS_NAME))
+            .expect("the review's key controller");
+        keys.emit_by_name::<bool>("key-pressed", &[&key.into_glib(), &0u32, &state])
+    }
+
+    /// A panel bound to `thread`, in a shown window, with `a.rs` expanded and on screen, whose
+    /// writes and sends are logged.
+    struct Rig {
+        window: adw::Window,
+        panel: DiffPanel,
+        saved: Rc<RefCell<Vec<Vec<agent_kit::store::ReviewDraft>>>>,
+        sent: Rc<RefCell<Vec<String>>>,
+    }
+
+    /// GTK. A review `send` refuses (a thread with no session yet) is kept whole, saved as it
+    /// was, and the bar says why.
+    pub(crate) fn a_refused_review_is_kept(send: impl Fn(String) -> Result<(), String> + 'static) {
+        let rig = Rig::new("t1", one_file("a.rs", 10, "new one"));
+        rig.panel.restore_review("t1", Vec::new());
+        let why = Rc::new(RefCell::new(None));
+        let seen = Rc::clone(&why);
+        rig.panel.connect_send_review(move |text| {
+            let answer = send(text);
+            *seen.borrow_mut() = answer.clone().err();
+            answer
+        });
+        rig.comment(5, 5, "Kept");
+        let writes = rig.saved.borrow().len();
+        rig.panel.review.send_now();
+        let why = why.borrow().clone().expect("the send was refused");
+        assert_eq!(rig.panel.review.drafts().len(), 1, "nothing is lost");
+        assert_eq!(rig.saved.borrow().len(), writes, "and nothing is written");
+        assert_eq!(
+            rig.panel.review.bar_view().map(|v| v.0),
+            Some(format!("1 comment · Could not send the review: {why}"))
+        );
+        rig.window.close();
+    }
+
+    impl Rig {
+        fn new(thread: &str, diff: Result<DiffOutcome, String>) -> Self {
+            let ctx = glib::MainContext::default();
+            let panel = DiffPanel::new(&crate::theme::Theme::diff_colours(Default::default()));
+            let window = adw::Window::builder()
+                .default_width(700)
+                .default_height(700)
+                .content(&panel.root)
+                .build();
+            panel.set_shown(true);
+            window.present();
+            let saved: Rc<RefCell<Vec<Vec<agent_kit::store::ReviewDraft>>>> = Rc::default();
+            let log = Rc::clone(&saved);
+            panel.connect_review_persist(move |_, drafts| log.borrow_mut().push(drafts));
+            let sent: Rc<RefCell<Vec<String>>> = Rc::default();
+            let log = Rc::clone(&sent);
+            panel.connect_send_review(move |text| {
+                log.borrow_mut().push(text);
+                Ok(())
+            });
+            assert!(panel.bind_review(thread));
+            let generation = panel.begin();
+            panel.show(generation, diff);
+            panel.file_expanders()[0].set_expanded(true);
+            let view = panel.review.view_of("a.rs").expect("view");
+            assert!(crate::testutil::pump_until(&ctx, 5, || view.is_mapped()));
+            Self {
+                window,
+                panel,
+                saved,
+                sent,
+            }
+        }
+
+        /// Comments on rows `from..=to` of `a.rs` with `note`.
+        fn comment(&self, from: i32, to: i32, note: &str) {
+            let view = self.panel.review.view_of("a.rs").expect("view");
+            let buffer = view.buffer();
+            let end = buffer
+                .iter_at_line(to + 1)
+                .unwrap_or_else(|| buffer.end_iter());
+            buffer.select_range(&line_of(&buffer, from), &end);
+            let editor = self.panel.review.comment_on("a.rs").expect("the editor");
+            save_note(&editor, note);
+        }
+    }
+
+    /// GTK: run from the window's construction test. A comment's Edit and Delete; a comment on a
+    /// file not in the diff is listed in the bar with its own Delete; comments past the message
+    /// budget stay, and the bar says so; comments made before the stored ones arrive are kept
+    /// with them; after a failed read nothing is written, and the bar keeps saying so.
+    pub(crate) fn review_rows_budget_and_loading() {
+        let ctx = glib::MainContext::default();
+
+        // Edit and Delete under the file's diff.
+        let rig = Rig::new("t1", one_file("a.rs", 10, "new one"));
+        rig.panel.restore_review("t1", Vec::new());
+        rig.comment(5, 5, "First");
+        rig.comment(9, 9, "Second");
+        let content = rig.panel.content.clone().upcast::<gtk4::Widget>();
+        let edit = crate::testutil::find_by_class::<gtk4::Button>(&content, "diff-comment-edit")
+            .expect("Edit");
+        edit.emit_clicked();
+        let column = rig
+            .panel
+            .review
+            .view_of("a.rs")
+            .and_then(|v| v.parent())
+            .expect("the file's box");
+        let editor = crate::testutil::find_all::<gtk4::Popover>(&column)
+            .into_iter()
+            .find(|p| p.is_visible())
+            .expect("the editor");
+        let entry: gtk4::TextView =
+            crate::testutil::find_first(editor.upcast_ref()).expect("entry");
+        let shown = entry.buffer();
+        assert_eq!(
+            shown.text(&shown.start_iter(), &shown.end_iter(), false),
+            "First",
+            "the editor starts from the note"
+        );
+        save_note(&editor, "First, edited");
+        let notes: Vec<String> = rig
+            .panel
+            .review
+            .drafts()
+            .into_iter()
+            .map(|d| d.note)
+            .collect();
+        assert_eq!(notes, ["First, edited", "Second"]);
+        assert_eq!(
+            rig.saved.borrow().last().map(|d| d[0].note.clone()),
+            Some("First, edited".to_owned())
+        );
+        crate::testutil::find_by_class::<gtk4::Button>(&content, "diff-comment-delete")
+            .expect("Delete")
+            .emit_clicked();
+        assert!(crate::testutil::pump_until(&ctx, 5, || rig
+            .panel
+            .review
+            .drafts()
+            .len()
+            == 1));
+        assert_eq!(rig.panel.review.drafts()[0].note, "Second");
+
+        // A diff without a.rs: its comment is listed in the bar, with its own Delete.
+        let generation = rig.panel.begin();
+        rig.panel.show(generation, one_file("b.rs", 1, "x"));
+        let orphan = crate::testutil::find_by_class::<gtk4::Box>(&content, "diff-review-bar")
+            .expect("the bar");
+        let texts = crate::testutil::label_texts(orphan.upcast_ref());
+        assert!(
+            texts
+                .iter()
+                .any(|t| t == "a.rs · Line 12 · not in this diff"),
+            "{texts:?}"
+        );
+        crate::testutil::find_by_class::<gtk4::Button>(orphan.upcast_ref(), "diff-comment-delete")
+            .expect("its Delete")
+            .emit_clicked();
+        assert!(crate::testutil::pump_until(&ctx, 5, || rig
+            .panel
+            .review
+            .drafts()
+            .is_empty()));
+        assert_eq!(rig.saved.borrow().last().map(Vec::len), Some(0));
+        rig.window.close();
+
+        // Past the budget: what fits goes, the rest stays, and the bar says so.
+        let rig = Rig::new("t2", one_file("a.rs", 10, "new one"));
+        rig.panel.restore_review("t2", Vec::new());
+        let long = "n".repeat(agent_core::review::NOTE_MAX_BYTES);
+        for _ in 0..5 {
+            rig.comment(5, 5, &long);
+        }
+        rig.panel.review.send_now();
+        let text = rig.sent.borrow().last().cloned().expect("sent");
+        assert!(text.len() <= agent_core::review::REVIEW_BUDGET);
+        let left = rig.panel.review.drafts().len();
+        assert!(left > 0 && left < 5, "{left} left");
+        let (words, _) = rig.panel.review.bar_view().expect("the bar stays");
+        assert!(
+            words.contains(&format!(
+                "did not fit in one message and {}",
+                if left == 1 { "is" } else { "are" }
+            )),
+            "{words}"
+        );
+        assert!(text.starts_with(&format!("Review comments on your changes ({}).", 5 - left)));
+        rig.window.close();
+
+        // Made before the stored ones arrive: nothing is written until they do, then both.
+        let rig = Rig::new("t3", one_file("a.rs", 10, "new one"));
+        rig.comment(5, 5, "Early");
+        assert!(
+            rig.saved.borrow().is_empty(),
+            "nothing written before the read"
+        );
+        let stored = agent_kit::store::ReviewDraft {
+            path: "a.rs".into(),
+            side: crate::diff::Side::New,
+            start_line: 12,
+            end_line: 12,
+            quoted: vec![" tail".into()],
+            note: "Stored".into(),
+            diff_base: "uncommitted".into(),
+            created_at: 1,
+        };
+        rig.panel.restore_review("t3", vec![stored]);
+        let written: Vec<String> = rig
+            .saved
+            .borrow()
+            .last()
+            .expect("the merged list is written")
+            .iter()
+            .map(|d| d.note.clone())
+            .collect();
+        assert_eq!(written, ["Early", "Stored"]);
+        rig.window.close();
+
+        // The read failed: comments are kept here, never written, and the bar keeps saying so.
+        let rig = Rig::new("t4", one_file("a.rs", 10, "new one"));
+        rig.panel.review_load_failed("t4");
+        assert_eq!(
+            rig.panel.review.bar_view().map(|v| v.0),
+            Some(review::LOAD_FAILED.to_owned())
+        );
+        rig.comment(5, 5, "Unsaved");
+        assert!(rig.saved.borrow().is_empty());
+        assert_eq!(
+            rig.panel.review.bar_view().map(|v| v.0),
+            Some(format!("1 comment · {}", review::LOAD_FAILED))
+        );
+        rig.panel.restore_review("t4", Vec::new());
+        assert!(rig.saved.borrow().is_empty(), "a late read is not taken");
+        rig.window.close();
     }
 
     /// GTK: run from the window's construction test. The panel pops out into its own window,

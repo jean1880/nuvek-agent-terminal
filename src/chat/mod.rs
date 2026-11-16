@@ -97,6 +97,12 @@ pub trait ChatBackend {
         None
     }
     fn send_prompt(&self, text: &str);
+    /// Why a prompt sent now would go nowhere (no session runs the thread yet, so it would be
+    /// dropped with an error), or `None` when it would be sent or kept in the queue. What the
+    /// caller of a prompt it must not lose (a review) asks first.
+    fn send_refusal(&self) -> Option<String> {
+        None
+    }
     fn queue_prompt(&self, text: &str) {
         self.send_prompt(text);
     }

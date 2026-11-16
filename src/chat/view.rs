@@ -690,14 +690,18 @@ impl ChatView {
     /// turn (shown as queued, where the composer can take it back to edit), never steered into
     /// it; sent at once otherwise, which starts a stopped agent as any message does. The draft
     /// in the composer is left alone. `text` is the composed review, already redacted (the
-    /// session redacts it again); it is refused, and false returned, when empty or when it would
-    /// read as a slash command.
-    pub fn submit_review(&self, text: &str) -> bool {
+    /// session redacts it again). `Err` says why it was not taken: empty, read as a slash
+    /// command, or no session runs the thread to send or queue it (the backend's
+    /// [`ChatBackend::send_refusal`]); nothing is sent then, so the caller keeps the review.
+    pub fn submit_review(&self, text: &str) -> Result<(), String> {
         let Some(inner) = self.inner() else {
-            return false;
+            return Err("the thread is not open".to_owned());
         };
         if text.trim().is_empty() || text.trim_start().starts_with('/') {
-            return false;
+            return Err("it is not a review".to_owned());
+        }
+        if let Some(why) = inner.backend.send_refusal() {
+            return Err(why);
         }
         let running = inner.backend.status().running_turn;
         inner.transcript.scroll_to_end();
@@ -709,7 +713,7 @@ impl ChatView {
             inner.backend.send_prompt(text);
         }
         inner.refresh_status();
-        true
+        Ok(())
     }
 
     /// Whether the composer holds unsent text (a thread with one is not blank).
@@ -2445,14 +2449,14 @@ pub(crate) mod tests {
             let backend = StubBackend::fixed(driver);
             let view = ChatView::new(backend.clone());
             view.set_draft("half a message");
-            assert!(view.submit_review(&review));
+            assert_eq!(view.submit_review(&review), Ok(()));
             for live in [false, true] {
                 {
                     let mut status = backend.status.borrow_mut();
                     status.running_turn = true;
                     status.capabilities.live_input = live;
                 }
-                assert!(view.submit_review(&review));
+                assert_eq!(view.submit_review(&review), Ok(()));
             }
             assert_eq!(
                 *backend.routes.borrow(),
@@ -2464,8 +2468,8 @@ pub(crate) mod tests {
                 "{driver:?}: one message each time, never steered"
             );
             assert!(view.has_draft(), "the composer's own draft is left alone");
-            assert!(!view.submit_review("/model x"));
-            assert!(!view.submit_review("  "));
+            assert!(view.submit_review("/model x").is_err());
+            assert!(view.submit_review("  ").is_err());
             assert_eq!(backend.routes.borrow().len(), 3);
         }
     }

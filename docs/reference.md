@@ -476,14 +476,18 @@ selected, `Ctrl+Alt+M` comments on the caret's line. Write a note: `Enter` saves
   change of base. Each diff shown looks for a comment's quoted lines again: at the same lines,
   or moved (once, elsewhere in the file: the comment takes the new line numbers). A comment
   whose lines are no longer there, or appear more than once, is kept and flagged "not in this
-  diff".
+  diff". Comments on a file the diff on show does not list at all are listed in the review
+  bar, with their own **Edit** and **Delete**.
 - **They are kept for the thread** until they are sent or discarded, across restarts.
   The quoted lines and notes are stored with secrets masked, like everything else the app
   keeps; deleting the thread deletes them.
 - **Send Review** sends one message to this panel's own thread, popped out or not. While the
   agent is working it waits in the queue as one message (you can take it back to edit, as any
   queued message), never folded into the running turn; otherwise it is sent at once, starting
-  a stopped agent. A sent review leaves the panel. Diffs of sub-agents in the inspector take
+  a stopped agent. A sent review leaves the panel. When the thread has no agent running it yet
+  (the agent not set up, or its start failed), nothing is sent, every comment is kept, and the
+  bar says why. If the saved comments cannot be read, the bar says so, and comments you make
+  are kept in the panel but not saved. Diffs of sub-agents in the inspector take
   no comments.
 
 The message looks like this, with each quote in a code fence its text cannot close:

@@ -1014,6 +1014,14 @@ impl ChatBackend for SessionSlot {
     fn send_prompt(&self, text: &str) {
         self.send_input(&crate::chat::PromptInput::text(text));
     }
+    fn send_refusal(&self) -> Option<String> {
+        self.get().is_none().then(|| {
+            format!(
+                "{} is not running for this thread yet",
+                self.driver.get().info().label
+            )
+        })
+    }
     fn send_input(&self, input: &crate::chat::PromptInput) {
         match self.get() {
             Some(s) => {
@@ -11184,6 +11192,39 @@ pub(super) mod tests {
         };
         assert_eq!(codex.status().driver, Driver::Codex);
         assert!(codex.status().capabilities.live_approvals);
+    }
+
+    /// A thread whose session has not started (its agent not ready, its start still waiting or
+    /// failed) would drop a prompt with an error: a review sent to it is refused before that,
+    /// through the real slot and view, and the diff panel keeps every comment.
+    #[test]
+    #[ignore = "constructs GTK widgets; run on a private display"]
+    fn a_review_to_a_thread_with_no_session_keeps_its_comments() {
+        crate::testutil::gtk_init().expect("GTK init");
+        crate::testutil::adw_init().expect("adw init");
+        let slot = Rc::new(SessionSlot {
+            thread: Some("t1".into()),
+            switch_serial: Rc::new(std::cell::Cell::new(0)),
+            start_attempt: std::cell::Cell::new(0),
+            worker_subscriber: RefCell::new(None),
+            worker_diffs: RefCell::new(HashMap::new()),
+            session: RefCell::new(None),
+            view: RefCell::new(None),
+            driver: std::cell::Cell::new(Driver::Claude),
+            model: None,
+            mode: Mode::Ask,
+        });
+        assert_eq!(
+            slot.send_refusal().as_deref(),
+            Some("Claude is not running for this thread yet")
+        );
+        let view = ChatView::new(slot.clone());
+        *slot.view.borrow_mut() = Some(view.downgrade());
+        let refused = view.clone();
+        crate::window::diff_panel::tests::a_refused_review_is_kept(move |text| {
+            refused.submit_review(&text)
+        });
+        assert!(slot.get().is_none(), "nothing started a session");
     }
 
     #[test]

@@ -6509,19 +6509,18 @@ impl AgentTerminalWindow {
         });
 
         // "Send Review": one message to the panel's own thread, queued behind a running turn.
-        let root = panel.root.clone();
+        // Weak: the handler is owned by a widget inside the panel.
+        let weak_root = panel.root.downgrade();
         panel.connect_send_review(move |text| {
-            let obj = window_of(&root).ok_or_else(|| "the thread is not open".to_owned())?;
+            let closed = || "the thread is not open".to_owned();
+            let root = weak_root.upgrade().ok_or_else(closed)?;
+            let obj = window_of(&root).ok_or_else(closed)?;
             let view = obj
                 .imp()
                 .tab_by_panel(&root, |t| t.chat.as_ref().and_then(|c| c.view.clone()))
                 .flatten()
-                .ok_or_else(|| "the thread is not open".to_owned())?;
-            if view.submit_review(&text) {
-                Ok(())
-            } else {
-                Err("the thread did not take it".to_owned())
-            }
+                .ok_or_else(closed)?;
+            view.submit_review(&text)
         });
 
         // "Open in …" on a file row.
@@ -8595,6 +8594,7 @@ mod tests {
         );
         super::super::diff_panel::tests::the_commit_bar_follows_the_view_and_the_ticks();
         super::super::diff_panel::tests::comments_are_kept_anchored_and_sent_as_one_review();
+        super::super::diff_panel::tests::review_rows_budget_and_loading();
         commit::tests::the_commit_dialog_follows_its_message();
         crate::chat::view::tests::ui_checks();
         crate::chat::view::tests::diff_ui_checks();

@@ -35,19 +35,21 @@ impl ReviewDraft {
     /// whole there), then split back into lines, and its note redacted.
     pub fn redacted(&self) -> ReviewDraft {
         ReviewDraft {
-            quoted: split_lines(&redact(&self.quoted.join("\n"))),
+            quoted: if self.quoted.is_empty() {
+                Vec::new()
+            } else {
+                split_lines(&redact(&self.quoted.join("\n")))
+            },
             note: redact(&self.note),
             ..self.clone()
         }
     }
 }
 
+/// The quote's lines from its stored text. A quote is never empty (a draft with none is refused
+/// on write), so an empty text is one empty line, as a blank context line is.
 fn split_lines(text: &str) -> Vec<String> {
-    if text.is_empty() {
-        Vec::new()
-    } else {
-        text.split('\n').map(str::to_owned).collect()
-    }
+    text.split('\n').map(str::to_owned).collect()
 }
 
 impl Store {
@@ -96,11 +98,12 @@ impl Store {
 
     /// Makes `drafts` the whole of `thread`'s unsent review, in one transaction: an empty list
     /// deletes it (a review sent or discarded). Each draft is redacted before it is written. A
-    /// draft with no line (a start of 0, or an end before its start) refuses the whole write.
+    /// draft with no line (a start of 0, an end before its start, or no quoted line) refuses the
+    /// whole write.
     pub fn replace_review_drafts(&self, thread: &str, drafts: &[ReviewDraft]) -> Result<()> {
         if let Some(bad) = drafts
             .iter()
-            .find(|d| d.start_line == 0 || d.end_line < d.start_line)
+            .find(|d| d.start_line == 0 || d.end_line < d.start_line || d.quoted.is_empty())
         {
             return Err(StoreError::Failed(format!(
                 "a review comment on {} names no line",
@@ -235,6 +238,27 @@ mod tests {
             assert!(s.replace_review_drafts(&t, &[good.clone(), bad]).is_err());
             assert_eq!(s.review_drafts(&t).expect("read"), vec![good.clone()]);
         }
+    }
+
+    #[test]
+    fn a_blank_quoted_line_stays_one_line_and_an_empty_quote_is_refused() {
+        let s = Store::open_in_memory().expect("store");
+        let t = s.create_thread("/repo", None).expect("thread");
+        for blank in ["", " "] {
+            let one = draft("a.rs", 4, &[blank], "n");
+            assert_eq!(one.redacted().quoted, vec![blank.to_owned()]);
+            s.replace_review_drafts(&t, std::slice::from_ref(&one))
+                .expect("write");
+            assert_eq!(s.review_drafts(&t).expect("read")[0].quoted, vec![blank]);
+            // And so it is still found in the diff it was made on.
+            let chunk = format!("@@ -4 +4 @@\n{blank}\n");
+            let found = crate::diff::anchor(&chunk, Side::New, 4, 4, &one.redacted().quoted);
+            assert_eq!(found.located, agent_core::review::Located::Exact);
+        }
+        let mut empty = draft("a.rs", 1, &["+a"], "n");
+        empty.quoted.clear();
+        assert!(empty.redacted().quoted.is_empty());
+        assert!(s.replace_review_drafts(&t, &[empty]).is_err());
     }
 
     #[test]

@@ -31,6 +31,12 @@ const COMMENTED_INDENT: i32 = 14;
 /// How opaque the commented lines' background is.
 const COMMENTED_ALPHA: f32 = 0.22;
 
+/// What the bar says, for as long as the panel lives, when the stored drafts could not be read.
+pub(super) const LOAD_FAILED: &str = "Saved comments could not be read; new ones are not saved";
+
+/// The name of the review's own key controllers (a file's view, the note editor).
+pub(super) const KEYS_NAME: &str = "diff-review-keys";
+
 /// What "Comment" says while it cannot be pressed.
 pub(super) const SELECT_FIRST: &str = "Select lines in this file's diff to comment on them";
 
@@ -83,8 +89,12 @@ pub(super) struct Review {
     notice: Rc<RefCell<Option<String>>>,
     persist: Rc<RefCell<Option<PersistHandler>>>,
     send: Rc<RefCell<Option<SendHandler>>>,
+    /// The stored drafts could not be read: nothing is saved for the rest of the panel's life,
+    /// and the bar says so for as long.
+    load_failed: Rc<Cell<bool>>,
     colours: Rc<RefCell<DiffColours>>,
     bar: glib::WeakRef<gtk4::Box>,
+    orphans: glib::WeakRef<gtk4::Box>,
     status: glib::WeakRef<gtk4::Label>,
     send_button: glib::WeakRef<gtk4::Button>,
     discard_button: glib::WeakRef<gtk4::Button>,
@@ -129,8 +139,20 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// The review bar: the count, "Send Review" and "Discard". Returns the bar and its parts.
-pub(super) fn bar() -> (gtk4::Box, gtk4::Label, gtk4::Button, gtk4::Button) {
+/// The review bar's widgets.
+pub(super) struct Bar {
+    /// The whole region under the diff: the comments on files not in it, then the bar's row.
+    pub(super) region: gtk4::Box,
+    /// Comments on files the diff on show does not list, each with Edit and Delete.
+    pub(super) orphans: gtk4::Box,
+    pub(super) status: gtk4::Label,
+    pub(super) send: gtk4::Button,
+    pub(super) discard: gtk4::Button,
+}
+
+/// The review bar: the comments on files not in the diff, the count, "Send Review" and
+/// "Discard".
+pub(super) fn bar() -> Bar {
     let status = gtk4::Label::builder()
         .xalign(0.0)
         .hexpand(true)
@@ -158,30 +180,45 @@ pub(super) fn bar() -> (gtk4::Box, gtk4::Label, gtk4::Button, gtk4::Button) {
         .tooltip_text("Delete every comment of this review")
         .css_classes(["flat", "diff-discard-review"])
         .build();
-    let bar = gtk4::Box::builder()
+    let row = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .spacing(8)
+        .build();
+    row.append(&status);
+    row.append(&discard);
+    row.append(&send);
+    let orphans = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(4)
+        .visible(false)
+        .build();
+    orphans.add_css_class("diff-comments");
+    orphans.update_property(&[gtk4::accessible::Property::Label(
+        "Comments on files not in this diff",
+    )]);
+    let region = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(6)
         .margin_top(6)
         .margin_bottom(6)
         .margin_start(8)
         .margin_end(8)
         .visible(false)
         .build();
-    bar.add_css_class("diff-review-bar");
-    bar.append(&status);
-    bar.append(&discard);
-    bar.append(&send);
-    (bar, status, send, discard)
+    region.add_css_class("diff-review-bar");
+    region.append(&orphans);
+    region.append(&row);
+    Bar {
+        region,
+        orphans,
+        status,
+        send,
+        discard,
+    }
 }
 
 impl Review {
-    pub(super) fn new(
-        bar: &gtk4::Box,
-        status: &gtk4::Label,
-        send: &gtk4::Button,
-        discard: &gtk4::Button,
-        colours: Rc<RefCell<DiffColours>>,
-    ) -> Self {
+    pub(super) fn new(bar: &Bar, colours: Rc<RefCell<DiffColours>>) -> Self {
         Self {
             thread: Rc::new(RefCell::new(None)),
             loaded: Rc::new(Cell::new(false)),
@@ -194,11 +231,13 @@ impl Review {
             notice: Rc::new(RefCell::new(None)),
             persist: Rc::new(RefCell::new(None)),
             send: Rc::new(RefCell::new(None)),
+            load_failed: Rc::new(Cell::new(false)),
             colours,
-            bar: bar.downgrade(),
-            status: status.downgrade(),
-            send_button: send.downgrade(),
-            discard_button: discard.downgrade(),
+            bar: bar.region.downgrade(),
+            orphans: bar.orphans.downgrade(),
+            status: bar.status.downgrade(),
+            send_button: bar.send.downgrade(),
+            discard_button: bar.discard.downgrade(),
         }
     }
 
@@ -238,7 +277,12 @@ impl Review {
     /// Takes the drafts the store holds for `thread`. Comments made before they arrived are
     /// kept with them, and the merged list is written back.
     pub(super) fn restore(&self, thread: &str, stored: Vec<ReviewDraft>) {
-        if self.thread.borrow().as_deref() != Some(thread) || self.loaded.get() {
+        // After a failed read nothing is written for the panel's life, as the bar says, so a
+        // late answer is not taken either.
+        if self.thread.borrow().as_deref() != Some(thread)
+            || self.loaded.get()
+            || self.load_failed.get()
+        {
             return;
         }
         self.loaded.set(true);
@@ -261,9 +305,8 @@ impl Review {
     /// The store could not be read: the drafts it holds are left alone (nothing is written over
     /// them), and comments made now stay in this panel only.
     pub(super) fn load_failed(&self, thread: &str) {
-        if self.thread.borrow().as_deref() == Some(thread) {
-            *self.notice.borrow_mut() =
-                Some("Saved comments could not be read; new ones are not saved".to_owned());
+        if self.thread.borrow().as_deref() == Some(thread) && !self.loaded.get() {
+            self.load_failed.set(true);
             self.sync_bar();
         }
     }
@@ -445,21 +488,56 @@ impl Review {
         };
         let total = self.entries.borrow().len();
         let notice = self.notice.borrow().clone();
-        bar.set_visible(self.thread.borrow().is_some() && (total > 0 || notice.is_some()));
+        let failed = self.load_failed.get();
+        bar.set_visible(
+            self.thread.borrow().is_some() && (total > 0 || notice.is_some() || failed),
+        );
         let gone = self
             .entries
             .borrow()
             .iter()
             .filter(|e| self.anchor(&e.draft).located == Located::Gone)
             .count();
-        let words = match (notice, total) {
-            (Some(notice), 0) => notice,
-            (Some(notice), _) => format!("{} · {notice}", bar_words(total, gone)),
-            (None, _) => bar_words(total, gone),
-        };
-        status.set_text(&words);
+        let mut parts = Vec::new();
+        if total > 0 {
+            parts.push(bar_words(total, gone));
+        }
+        parts.extend(notice);
+        if failed {
+            parts.push(LOAD_FAILED.to_owned());
+        }
+        status.set_text(&parts.join(" · "));
         send.set_sensitive(total > 0 && self.send.borrow().is_some());
         discard.set_visible(total > 0);
+        self.render_orphans();
+    }
+
+    /// Lists, in the bar, the comments on files the diff on show does not list, so each can be
+    /// edited or deleted there.
+    fn render_orphans(&self) {
+        let Some(orphans) = self.orphans.upgrade() else {
+            return;
+        };
+        while let Some(child) = orphans.first_child() {
+            orphans.remove(&child);
+        }
+        let mine: Vec<Entry> = {
+            let chunks = self.chunks.borrow();
+            self.entries
+                .borrow()
+                .iter()
+                .filter(|e| !chunks.contains_key(&e.draft.path))
+                .cloned()
+                .collect()
+        };
+        orphans.set_visible(!mine.is_empty());
+        let gone = Anchor {
+            located: Located::Gone,
+            span: None,
+        };
+        for entry in &mine {
+            orphans.append(&self.comment_row(entry, &gone, &orphans, true));
+        }
     }
 
     /// Shows every row's Comment button while there is a thread.
@@ -531,12 +609,19 @@ impl Review {
         }
         list.set_visible(!mine.is_empty());
         for (entry, anchor) in mine.iter().zip(&anchors) {
-            list.append(&self.comment_row(entry, anchor, &column));
+            list.append(&self.comment_row(entry, anchor, &column, false));
         }
     }
 
-    /// One comment under its file's diff: where it is, its note, Edit and Delete.
-    fn comment_row(&self, entry: &Entry, anchor: &Anchor, column: &gtk4::Box) -> gtk4::Box {
+    /// One comment under its file's diff (or, `with_path`, in the bar for a file not in it):
+    /// where it is, its note, Edit and Delete.
+    fn comment_row(
+        &self,
+        entry: &Entry,
+        anchor: &Anchor,
+        column: &gtk4::Box,
+        with_path: bool,
+    ) -> gtk4::Box {
         let d = &entry.draft;
         let place = match (&anchor.located, &anchor.span) {
             (Located::Moved, Some(s)) => place_words(s.side, s.start, s.end),
@@ -546,9 +631,16 @@ impl Review {
             ),
             _ => place_words(d.side, d.start_line, d.end_line),
         };
+        let place = if with_path {
+            format!("{} · {place}", d.path)
+        } else {
+            place
+        };
         let heading = gtk4::Label::builder()
             .label(&place)
             .xalign(0.0)
+            .wrap(true)
+            .wrap_mode(gtk4::pango::WrapMode::WordChar)
             .css_classes(["caption-heading"])
             .build();
         let note = gtk4::Label::builder()
@@ -694,20 +786,34 @@ impl Review {
 
         // A caret, so lines can be chosen by keyboard (Shift+arrows) in the read-only view.
         view.set_cursor_visible(true);
-        let review = self.clone();
-        let owned = path.to_owned();
-        buffer.connect_has_selection_notify(move |buffer| {
-            let on = buffer.has_selection();
-            for button in review.buttons_of(&owned) {
-                button.set_sensitive(on);
-                button.set_tooltip_text(Some(if on {
-                    "Comment on the selected lines"
-                } else {
-                    SELECT_FIRST
-                }));
+        // On only while the view is on screen (its row expanded) and has a selection: a popover
+        // needs a mapped parent.
+        let sync = {
+            let review = self.clone();
+            let owned = path.to_owned();
+            move |view: &gtk4::TextView| {
+                let on = view.is_mapped() && view.buffer().has_selection();
+                for button in review.buttons_of(&owned) {
+                    button.set_sensitive(on);
+                    button.set_tooltip_text(Some(if on {
+                        "Comment on the selected lines"
+                    } else {
+                        SELECT_FIRST
+                    }));
+                }
             }
-        });
+        };
+        let on_select = sync.clone();
+        buffer.connect_has_selection_notify(glib::clone!(
+            #[weak]
+            view,
+            move |_| on_select(&view)
+        ));
+        let on_map = sync.clone();
+        view.connect_map(move |view| on_map(view));
+        view.connect_unmap(move |view| sync(view));
         let keys = gtk4::EventControllerKey::new();
+        keys.set_name(Some(KEYS_NAME));
         let review = self.clone();
         let owned = path.to_owned();
         keys.connect_key_pressed(move |_, key, _, state| {
@@ -726,7 +832,7 @@ impl Review {
 
     /// Starts a comment on `path`'s selected lines (or the caret's line): refused with the reason
     /// when they are only headers or too many, else the note editor at the selection. Returns
-    /// the popover it opened.
+    /// the popover it opened; nothing while the file's view is not on screen.
     pub(super) fn comment_on(&self, path: &str) -> Option<gtk4::Popover> {
         self.thread.borrow().as_ref()?;
         let (chunk, view, column) = self
@@ -738,6 +844,10 @@ impl Review {
                     .then(|| (Rc::clone(&f.chunk), f.view.upgrade(), f.column.upgrade()))
             })
             .and_then(|(c, v, b)| Some((c, v?, b?)))?;
+        // A collapsed row's view is off screen: nothing to anchor a popover to.
+        if !view.is_mapped() {
+            return None;
+        }
         let buffer = view.buffer();
         let (from, to) = buffer.selection_bounds().unwrap_or_else(|| {
             let caret = buffer.iter_at_mark(&buffer.get_insert());
@@ -989,6 +1099,7 @@ fn note_editor(
         }
     ));
     let keys = gtk4::EventControllerKey::new();
+    keys.set_name(Some(KEYS_NAME));
     keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
     let on_enter = Rc::clone(&commit);
     keys.connect_key_pressed(move |_, key, _, state| {

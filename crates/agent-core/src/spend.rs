@@ -442,6 +442,37 @@ pub fn format_usd(usd: f64) -> String {
     }
 }
 
+/// An amount in `currency`: "$1.23" in US dollars, "1.23 CAD" in another, a bare "1.23" when
+/// the currency was not reported (never assumed to be dollars).
+pub fn format_money(amount: f64, currency: Option<&str>) -> String {
+    let plain = if amount.is_finite() {
+        amount.max(0.0)
+    } else {
+        0.0
+    };
+    match currency {
+        Some("USD") => format_usd(amount),
+        Some(code) => format!("{plain:.2} {code}"),
+        None => format!("{plain:.2}"),
+    }
+}
+
+/// "Extra usage: $2.50 of $40.00 this month", "Extra usage: off".
+pub fn extra_usage_text(extra: &crate::event::ExtraUsage) -> String {
+    let currency = extra.currency.as_deref();
+    if !extra.enabled && extra.used <= 0.0 {
+        return "Extra usage: off".to_owned();
+    }
+    let used = format_money(extra.used, currency);
+    match extra.limit {
+        Some(limit) => format!(
+            "Extra usage: {used} of {} this month",
+            format_money(limit, currency)
+        ),
+        None => format!("Extra usage: {used} this month"),
+    }
+}
+
 /// "950", "12.3k", "4.5M".
 pub fn format_tokens(n: u64) -> String {
     let short = |value: f64, unit: &str| {
@@ -951,6 +982,34 @@ mod report_tests {
         assert_eq!(bar_fractions([&a, &b, &tokens_only]), [1.0, 0.5, 0.0]);
         assert_eq!(bar_fractions([&tokens_only]), [1.0]);
         assert_eq!(bar_fractions([&Total::default()]), [0.0]);
+    }
+
+    #[test]
+    fn extra_usage_is_shown_in_its_own_currency() {
+        use crate::event::ExtraUsage;
+        let extra = |enabled, used, limit, currency: Option<&str>| ExtraUsage {
+            enabled,
+            used,
+            limit,
+            currency: currency.map(str::to_owned),
+        };
+        assert_eq!(
+            extra_usage_text(&extra(true, 2.5, Some(40.0), Some("USD"))),
+            "Extra usage: $2.50 of $40.00 this month"
+        );
+        assert_eq!(
+            extra_usage_text(&extra(true, 2.5, None, Some("CAD"))),
+            "Extra usage: 2.50 CAD this month"
+        );
+        assert_eq!(
+            extra_usage_text(&extra(false, 0.0, Some(40.0), Some("CAD"))),
+            "Extra usage: off"
+        );
+        // Switched off after spending: what was spent still shows.
+        assert_eq!(
+            extra_usage_text(&extra(false, 1.0, None, None)),
+            "Extra usage: 1.00 this month"
+        );
     }
 
     #[test]

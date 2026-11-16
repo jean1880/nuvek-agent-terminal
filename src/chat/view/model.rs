@@ -2483,7 +2483,7 @@ impl Transcript {
                 out.push(Change::Running);
             }
             // Quota feeds the usage indicator (app-wide service), not the transcript.
-            Event::QuotaUpdated { .. } | Event::Unknown => {}
+            Event::QuotaUpdated { .. } | Event::ExtraUsageUpdated { .. } | Event::Unknown => {}
             // Never delivered to the view: the session stores it and sends refs instead.
             Event::ToolImage { .. } => {}
             Event::Attachments { refs } => {

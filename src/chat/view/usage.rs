@@ -544,6 +544,15 @@ fn detail_form(driver: Driver, snap: &Snapshot, now: i64) -> gtk4::Box {
         }
         section.append(&row);
     }
+    // A plan's extra usage is real money, shown beside its windows.
+    if let Some(extra) = &snap.extra {
+        let l = wrapped_text(
+            &agent_core::spend::extra_usage_text(extra),
+            &["usage-window", "usage-extra"],
+        );
+        l.set_halign(gtk4::Align::Start);
+        section.append(&l);
+    }
     section
 }
 

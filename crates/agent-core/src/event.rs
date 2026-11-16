@@ -299,6 +299,11 @@ pub enum Event {
         account: Option<Account>,
         windows: Vec<QuotaWindow>,
     },
+    /// What a plan's extra usage (credits bought past the plan's windows: real money) stands at
+    /// this month, as Claude reports it (`rate_limits.extra_usage`).
+    ExtraUsageUpdated {
+        extra: ExtraUsage,
+    },
     /// Provider quota refusal. `resets_at` is epoch seconds (Claude) or RFC 3339 (agy).
     RateLimited {
         #[serde(default)]
@@ -579,6 +584,22 @@ pub struct QuotaWindow {
     /// RFC 3339 reset time, when known.
     #[serde(default)]
     pub resets_at: Option<String>,
+}
+
+/// A plan's extra usage this month ([`Event::ExtraUsageUpdated`]), in the account's currency's
+/// major units (dollars, not cents).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExtraUsage {
+    /// Extra usage is switched on for the account: turns past the plan's windows are billed.
+    pub enabled: bool,
+    /// What was spent on it this month.
+    pub used: f64,
+    /// The monthly cap the account set, when it has one.
+    #[serde(default)]
+    pub limit: Option<f64>,
+    /// ISO 4217 code ("USD", "CAD"); `None` when not reported.
+    #[serde(default)]
+    pub currency: Option<String>,
 }
 
 /// One running background task ([`Event::BackgroundTasks`]).

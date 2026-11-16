@@ -153,6 +153,8 @@ pub struct ClaudeAdapter {
     api_key_source: Option<String>,
     api_provider: Option<String>,
     plan: Option<String>,
+    /// The extra usage last reported ([`Event::ExtraUsageUpdated`]), so a repeat says nothing.
+    extra_usage: Option<crate::event::ExtraUsage>,
 }
 
 impl Default for ClaudeAdapter {
@@ -208,6 +210,7 @@ impl ClaudeAdapter {
             api_key_source: None,
             api_provider: None,
             plan: None,
+            extra_usage: None,
         }
     }
 
@@ -556,13 +559,29 @@ impl ClaudeAdapter {
         self.commands_event()
     }
 
+    /// [`Event::ExtraUsageUpdated`] when `v` (an assistant frame's `usage_report`, or a
+    /// `get_usage` reply) says what the plan's extra usage stands at, and it changed since the
+    /// last one: the assistant frames repeat it.
+    fn extra_usage(&mut self, v: &Value) -> Option<Envelope> {
+        let extra = crate::quota::claude_extra_usage(v)?;
+        if self.extra_usage.as_ref() == Some(&extra) {
+            return None;
+        }
+        self.extra_usage = Some(extra.clone());
+        Some(Envelope::new(Event::ExtraUsageUpdated { extra }))
+    }
+
     // ----- frame mapping -----
 
     fn map_frame(&mut self, v: &Value) -> Vec<Envelope> {
         match str_of(v, "type").unwrap_or("") {
             "system" => self.system(v),
             "stream_event" => self.stream_event(v),
-            "assistant" => self.assistant(v),
+            "assistant" => {
+                let mut out = self.assistant(v);
+                out.extend(self.extra_usage(v));
+                out
+            }
             "user" => self.user(v),
             "control_request" => self.control_request(v),
             "control_response" => self.control_response(v),
@@ -1187,6 +1206,7 @@ impl ClaudeAdapter {
                     windows,
                 }));
             }
+            out.extend(self.extra_usage(&body));
         }
         if self.context_requests.remove(id) {
             if let Some(used) = u64_of(&body, "totalTokens") {
@@ -2515,6 +2535,40 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The assistant frames' usage report names the plan's extra usage: said once, and again
+    /// only when it changes; a `get_usage` reply says it too.
+    #[test]
+    fn extra_usage_is_reported_once_and_on_change() {
+        let (mut a, out) = replay(CONTROLS);
+        let extras: Vec<crate::event::ExtraUsage> = out
+            .iter()
+            .filter_map(|e| match &e.event {
+                Event::ExtraUsageUpdated { extra } => Some(extra.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(extras.len(), 1, "{extras:?}");
+        assert_eq!(extras[0].limit, Some(40.0));
+        a.encode(Command::Control {
+            id: "usage-9".into(),
+            control: Control::Usage,
+        })
+        .expect("encode");
+        let reply = json!({"type": "control_response", "response": {
+            "subtype": "success", "request_id": "usage-9",
+            "response": {"rate_limits": {"extra_usage": {"is_enabled": true,
+                "used_credits": 250, "monthly_limit": 4000, "currency": "CAD"}}}}});
+        let out = a.feed(&reply.to_string());
+        let used: Vec<f64> = out
+            .iter()
+            .filter_map(|e| match &e.event {
+                Event::ExtraUsageUpdated { extra } => Some(extra.used),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(used, [2.5]);
     }
 
     /// The recording is a plan account signed in with no key: its turns are at list price. A

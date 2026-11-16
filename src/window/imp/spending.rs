@@ -307,11 +307,20 @@ fn show_report(content: &gtk4::Box, report: &Report, names: &Names, plan_lines: 
     }
 }
 
-/// The live plan windows of every agent that has some, one line each.
+/// The live plan windows of every agent that has some, one line each, each followed by its
+/// extra usage when it reported one.
 fn plan_lines(status: &AccountStatus) -> Vec<String> {
     Driver::ALL
         .into_iter()
-        .filter_map(|d| plan_usage_line(d.info().label, &status.snapshot(d).windows))
+        .flat_map(|d| {
+            let snap = status.snapshot(d);
+            let agent = d.info().label;
+            plan_usage_line(agent, &snap.windows).into_iter().chain(
+                snap.extra
+                    .as_ref()
+                    .map(|e| format!("{agent}: {}", spend::extra_usage_text(e))),
+            )
+        })
         .collect()
 }
 

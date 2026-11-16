@@ -442,7 +442,9 @@ Architectural mandates, standards, and workflows for this codebase.
   (`Inner::run_meter_action`: `/compact`, else `ViewAction::CompactByHandoff`, which already
   redacts and budgets the hand-off), never while a turn runs, and nothing is sent unpressed.
   `context_meter::WarnLatch` re-arms only on a reading under the point or a cleared gauge (a
-  reading with no window changes nothing); replayed history primes it without offering, as
+  reading with no window changes nothing). A process started on another profile or model
+  server, even on the same agent and model id (`ChatBackend::launch_source`), clears the
+  gauge. A press on an offer already taken down does nothing. Replayed history primes it without offering, as
   does a changed threshold, and a crossing made while set to never is not offered later. The
   latch and the note live in the open view only, never in the store. The Local agent's gauge
   is the runner's `UsageUpdated` after each request (`estimated: true`): the server's prompt

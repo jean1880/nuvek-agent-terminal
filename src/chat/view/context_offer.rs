@@ -135,6 +135,7 @@ impl ContextOffer {
     pub fn show(&self, text: &str) {
         self.text.set_text(text);
         self.revealer.set_visible(true);
+        self.revealer.set_sensitive(true);
         self.revealer.set_reveal_child(true);
     }
 
@@ -145,7 +146,10 @@ impl ContextOffer {
         }
     }
 
+    /// Takes the offer down. Its buttons go dead at once, not when it has slid away, so a
+    /// second press during the slide never acts again.
     pub fn hide(&self) {
+        self.revealer.set_sensitive(false);
         self.revealer.set_reveal_child(false);
     }
 

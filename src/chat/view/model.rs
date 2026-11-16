@@ -2510,6 +2510,16 @@ impl Transcript {
         out
     }
 
+    /// Forgets the context reading: the process now runs where it means nothing (another
+    /// profile or model server on the same agent and model).
+    pub fn clear_gauge(&mut self) -> Vec<Change> {
+        if self.gauge.take().is_some() {
+            vec![Change::Gauge]
+        } else {
+            Vec::new()
+        }
+    }
+
     /// The thread is on `driver` now.
     fn on_driver(&mut self, driver: Driver) {
         self.last_driver = Some(driver);

@@ -1800,9 +1800,14 @@ impl AgentTerminalWindow {
         crate::diff_tool::DiffTools::shared()
             .set_expand_by_default(self.config.borrow().diffs_expanded);
 
-        let (theme, scrollback, scale) = {
+        let (theme, scrollback, scale, warning) = {
             let config = self.config.borrow();
-            (config.theme, config.scrollback_lines, config.font_scale)
+            (
+                config.theme,
+                config.scrollback_lines,
+                config.font_scale,
+                config.context_warning,
+            )
         };
         self.apply_appearance_to_all();
         self.for_each_terminal_everywhere(|term| {
@@ -1817,6 +1822,7 @@ impl AgentTerminalWindow {
             for tab in window.tabs.borrow().iter() {
                 if let Some(view) = tab.chat.as_ref().and_then(|chat| chat.view.as_ref()) {
                     view.set_text_scale(scale);
+                    view.set_context_warning(warning);
                 }
             }
             if let Some(spin) = window.font_scale_spin.borrow().upgrade() {
@@ -4403,7 +4409,6 @@ impl AgentTerminalWindow {
         self.pending_save.replace(Some(source));
     }
 
-    /// Turns quick replies on or off: the setting, the copy chat sessions read, and the file.
     /// Gives every open thread view of this window the context warning setting, as it is made.
     fn apply_context_warning(&self, warning: agent_core::context_meter::ContextWarning) {
         for tab in self.tabs.borrow().iter() {
@@ -4413,6 +4418,7 @@ impl AgentTerminalWindow {
         }
     }
 
+    /// Turns quick replies on or off: the setting, the copy chat sessions read, and the file.
     fn set_quick_replies(&self, on: bool) {
         if self.config.borrow().suggest_quick_replies != on {
             self.config.borrow_mut().suggest_quick_replies = on;

@@ -385,6 +385,8 @@ pub struct Runner<C: ChatClient, W: Write> {
     last_mcp_status: Value,
     /// The prompt tokens the server reported for the request under way, if it did.
     request_prompt_tokens: Option<u64>,
+    /// The planner's estimate of the request under way (the retried one's, after a retry).
+    request_estimate: usize,
     /// What the last request held: the server's prompt tokens, else the planner's estimate.
     context_used: Option<u64>,
     turn_instructions: agent_core::local_context::InstructionSnapshot,
@@ -460,6 +462,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             last_excluded: Vec::new(),
             last_mcp_status: serde_json::json!({"mcpServers":[]}),
             request_prompt_tokens: None,
+            request_estimate: 0,
             context_used: None,
             mode: args.mode,
             args,
@@ -1505,9 +1508,14 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         self.report_budget(&plan);
         let body = plan.body;
         self.request_prompt_tokens = None;
+        self.request_estimate = plan.input_tokens;
         let streamed = self.stream(model, &body, commands, usage);
         drop(body);
-        self.report_context(plan.input_tokens, streamed.is_ok());
+        // Only a reply the server actually gave says anything of what the request held: a Stop
+        // or a failure before its first word reports nothing.
+        let answered = matches!(&streamed, Ok((reply, ..))
+            if !reply.text.is_empty() || !reply.reasoning.is_empty() || !reply.tool_calls.is_empty());
+        self.report_context(answered);
         if streamed.is_err() && std::mem::take(&mut self.replan) {
             // Refused for earlier images only: the next request sends their placeholders.
             return Ok(StepEnd::Continue);
@@ -1741,6 +1749,9 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 );
                 let retry = self.plan(model, &system, &[]).map_err(StepError::Failed)?;
                 self.report_budget(&retry);
+                // The request that is answered now carries no tool schemas.
+                self.request_estimate = retry.input_tokens;
+                self.request_prompt_tokens = None;
                 return self.stream(model, &retry.body, commands, usage);
             }
             if !self.no_images && sends_images(body) && refuses_images(&why) {
@@ -1769,13 +1780,14 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
 
     /// After each request: how much of the profile's context budget it held, for the header's
     /// gauge. The server's own prompt tokens when it reported them, else the planner's estimate
-    /// (`estimate`) for a request it answered; a request that failed with no figure says
-    /// nothing. Always marked as an estimate, since the window is the budget set in Settings,
-    /// not the model's own size.
-    fn report_context(&mut self, estimate: usize, answered: bool) {
+    /// of the request actually answered (the retry without tools, when there was one) for a
+    /// request the server answered; a request stopped or failed before any reply says nothing.
+    /// Always marked as an estimate, since the window is the budget set in Settings, not the
+    /// model's own size.
+    fn report_context(&mut self, answered: bool) {
         let used = match self.request_prompt_tokens.take() {
             Some(reported) => reported,
-            None if answered => estimate as u64,
+            None if answered => self.request_estimate as u64,
             None => return,
         };
         self.context_used = Some(used);
@@ -3503,6 +3515,91 @@ mod tests {
             .as_array()
             .is_some_and(|c| c.iter().any(|row| row["name"] == "Input allowance")));
         run.finish();
+    }
+
+    /// A server that answers with text and reports no usage.
+    fn silent_reply() -> Vec<String> {
+        vec![
+            r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#.to_owned(),
+            "data: [DONE]".to_owned(),
+        ]
+    }
+
+    /// Runs one prompt to the end of its turn; every context reading it gave.
+    fn readings_of_one_turn(run: &Run, text: &str) -> Vec<u64> {
+        run.send(prompt(text));
+        let mut readings = Vec::new();
+        run.wait_for(|env| {
+            if let Some((used, ..)) = context_reading(env) {
+                readings.push(used);
+            }
+            completed(env)
+        });
+        readings
+    }
+
+    #[test]
+    fn local_reports_no_context_for_a_request_stopped_before_any_reply() {
+        let work = tempfile::tempdir().unwrap();
+        let run = start(
+            args(work.path(), Mode::Ask),
+            Script::new(vec![Ok(vec![STALL_MARK.to_owned()])]),
+            work.path().join("state"),
+        );
+        run.send(prompt("hello"));
+        // The request is planned and sent (its budget is said) before the server goes quiet.
+        run.wait_for(|env| {
+            matches!(&env.event, Event::Notice { text } if text.starts_with("Local request:"))
+                .then_some(())
+        });
+        run.send(Command::Interrupt);
+        let mut readings = 0;
+        let state = run.wait_for(|env| {
+            if context_reading(env).is_some() {
+                readings += 1;
+            }
+            completed(env).map(|(state, ..)| state)
+        });
+        assert_eq!(state, TurnState::Interrupted);
+        assert_eq!(readings, 0, "nothing answered, so nothing to report");
+        run.finish();
+    }
+
+    #[test]
+    fn local_reports_the_retried_request_after_a_model_refuses_tools() {
+        let message = "the same question, asked the same way";
+        // The same first request, answered at once: what a request with the tool schemas holds.
+        let work = tempfile::tempdir().unwrap();
+        let with_tools = start(
+            args(work.path(), Mode::Ask),
+            Script::new(vec![Ok(silent_reply())]),
+            work.path().join("state"),
+        );
+        let first = readings_of_one_turn(&with_tools, message);
+        with_tools.finish();
+        // Refused for its tools: the retry goes without them, and that is what was answered.
+        let retried_work = tempfile::tempdir().unwrap();
+        let script = Script::new(vec![
+            Err("does not support tools".into()),
+            Ok(silent_reply()),
+        ]);
+        let retried = start(
+            args(retried_work.path(), Mode::Ask),
+            script.clone(),
+            retried_work.path().join("state"),
+        );
+        let second = readings_of_one_turn(&retried, message);
+        retried.finish();
+        assert!(script.bodies()[0].get("tools").is_some());
+        assert!(script.bodies()[1].get("tools").is_none());
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1, "one reading for the one answered request");
+        assert!(
+            second[0] < first[0],
+            "the retry's estimate leaves out the schemas it no longer sends: {} vs {}",
+            second[0],
+            first[0]
+        );
     }
 
     #[test]

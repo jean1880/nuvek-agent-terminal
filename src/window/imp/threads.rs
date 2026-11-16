@@ -989,6 +989,9 @@ impl SessionSlot {
 }
 
 impl ChatBackend for SessionSlot {
+    fn launch_source(&self) -> Option<String> {
+        self.get().and_then(|s| s.launch_source())
+    }
     fn worker_scope(
         &self,
         worker: &agent_core::delegation::WorkerId,

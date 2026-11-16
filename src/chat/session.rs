@@ -7345,6 +7345,19 @@ pub(crate) fn build_handoff(messages: &[TranscriptMessage], source: &str) -> Han
 }
 
 impl ChatBackend for ChatSession {
+    /// The profile a switch launched the process on and the model server it runs on (its kind
+    /// and address, never its key's variable).
+    fn launch_source(&self) -> Option<String> {
+        let server = self
+            .launched_server()
+            .map(|s| format!("{:?} {}", s.kind, s.base_url.unwrap_or_default()));
+        Some(format!(
+            "{}|{}",
+            self.launched_profile().unwrap_or_default(),
+            server.unwrap_or_default()
+        ))
+    }
+
     fn send_prompt(&self, text: &str) {
         self.inner.user_spoke();
         self.inner.send_prompt(text);

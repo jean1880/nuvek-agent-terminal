@@ -205,6 +205,9 @@ pub(crate) struct Inner {
     context_warning: Cell<ContextWarning>,
     /// Whether this crossing of the warning point was already offered. In memory only.
     warn_latch: Cell<WarnLatch>,
+    /// Where the agent process ran when it last started ([`ChatBackend::launch_source`]);
+    /// `None` before the first live start.
+    shown_source: RefCell<Option<Option<String>>>,
     requests: Rc<Requests>,
     /// Both agents' model lists for the picker (`None`: the backend's `ListModels`).
     models: RefCell<Option<Rc<dyn ModelSource>>>,
@@ -431,6 +434,7 @@ impl ChatView {
                 context_offer: context_offer::ContextOffer::new(),
                 context_warning: Cell::new(ContextWarning::default()),
                 warn_latch: Cell::new(WarnLatch::default()),
+                shown_source: RefCell::new(None),
                 requests: Rc::new(Requests::default()),
                 models: RefCell::new(None),
                 model_conn: Cell::new(None),
@@ -856,7 +860,17 @@ impl Inner {
         if let Some(account) = account {
             account.observe(driver, env);
         }
-        let changes = self.model.borrow_mut().apply(env, driver);
+        let mut changes = self.model.borrow_mut().apply(env, driver);
+        // A process on another profile or model server has another window, even on the same
+        // agent and model id: its predecessor's reading (and crossing) means nothing now. The
+        // first start only records where it runs.
+        if matches!(env.event, Event::SessionStarted { .. }) {
+            let source = self.backend.launch_source();
+            let previous = self.shown_source.replace(Some(source.clone()));
+            if previous.is_some_and(|p| p != source) {
+                changes.extend(self.model.borrow_mut().clear_gauge());
+            }
+        }
         self.handle(changes);
         if matches!(env.event, Event::TurnCompleted { .. }) && polls_context(driver) {
             self.poll_context_soon();
@@ -1397,6 +1411,10 @@ impl Inner {
                 let Some(inner) = weak.upgrade() else {
                     return;
                 };
+                // A press on an offer already taken down (still sliding away) does nothing.
+                if !inner.context_offer.is_shown() {
+                    return;
+                }
                 match pick {
                     None => inner.context_offer.hide(),
                     Some(action) => {
@@ -2630,6 +2648,8 @@ pub(crate) mod tests {
         pub(super) switch_updates_status: Cell<bool>,
         /// Fail the test if questions are answered over the protocol.
         pub(super) panic_on_answer: Cell<bool>,
+        /// What [`ChatBackend::launch_source`] says: the profile the process runs on.
+        pub(super) source: RefCell<Option<String>>,
     }
 
     impl StubBackend {
@@ -2650,6 +2670,7 @@ pub(crate) mod tests {
                 refuse_form: Cell::new(false),
                 switch_updates_status: Cell::new(true),
                 panic_on_answer: Cell::new(false),
+                source: RefCell::new(None),
             })
         }
 
@@ -2671,6 +2692,9 @@ pub(crate) mod tests {
     }
 
     impl ChatBackend for StubBackend {
+        fn launch_source(&self) -> Option<String> {
+            self.source.borrow().clone()
+        }
         fn send_prompt(&self, text: &str) {
             self.sent.borrow_mut().push(text.to_owned());
         }
@@ -3119,8 +3143,16 @@ pub(crate) mod tests {
         view.refresh_status();
         // Compact is the agent's own command, sent only now that it was pressed.
         view.press_context_offer(Some(MeterAction::Compact));
-        assert_eq!(*backend.sent.borrow(), ["/compact"]);
+        view.press_context_offer(Some(MeterAction::Compact));
+        assert_eq!(
+            *backend.sent.borrow(),
+            ["/compact"],
+            "one press, one /compact"
+        );
         assert_eq!(view.context_offer(), None);
+        assert!(!view
+            .inner()
+            .is_some_and(|i| i.context_offer.revealer.is_sensitive()));
 
         // Continue is the hand-off fork the popover's Continue asks for.
         view.apply(&Envelope::new(Event::Compacted {
@@ -3129,6 +3161,8 @@ pub(crate) mod tests {
             after: Some(10_000),
         }));
         view.apply(&claude(190_000));
+        // Two presses in a row (the second while it slides away) are one hand-off.
+        view.press_context_offer(Some(MeterAction::Continue));
         view.press_context_offer(Some(MeterAction::Continue));
         assert_eq!(*emitted.borrow(), [ViewAction::CompactByHandoff]);
         assert_eq!(backend.sent.borrow().len(), 1, "Continue sends no prompt");
@@ -3184,6 +3218,46 @@ pub(crate) mod tests {
         assert_eq!(buttons, [("Continue in a new thread".to_owned(), true)]);
         let header = &local.inner().expect("a built view").header;
         assert!(header.gauge_text_shown().starts_with('~'));
+
+        // Another profile on the same agent and model id (Local server A's 32k budget, then
+        // server B's 8k): the old reading and its crossing go with the old process.
+        let started = || {
+            Envelope::new(Event::SessionStarted {
+                native_id: "n".into(),
+                model: Some("qwen3".into()),
+                cwd: None,
+            })
+        };
+        let moving_backend = StubBackend::new(Driver::Local);
+        *moving_backend.source.borrow_mut() = Some("server-a".into());
+        let moving = ChatView::new(moving_backend.clone());
+        moving.apply(&started());
+        moving.apply(&usage(28_000, Some(32_768), true));
+        assert!(moving.context_offer().is_some(), "offered on server A");
+        // The same process starting again (a resume) keeps it.
+        moving.apply(&started());
+        assert!(
+            moving.context_offer().is_some(),
+            "a restart on A keeps the reading"
+        );
+        assert!(moving
+            .inner()
+            .is_some_and(|i| i.model.borrow().gauge.is_some()));
+        *moving_backend.source.borrow_mut() = Some("server-b".into());
+        moving.apply(&started());
+        assert!(
+            moving
+                .inner()
+                .is_some_and(|i| i.model.borrow().gauge.is_none()),
+            "server A's reading is gone"
+        );
+        assert_eq!(moving.context_offer(), None);
+        // Re-armed: B's first crossing is offered.
+        moving.apply(&usage(7_500, Some(8_192), true));
+        assert!(
+            moving.context_offer().is_some(),
+            "server B's crossing is its own"
+        );
 
         // agy: tokens used and no window. No percentage, so never an offer.
         let agy_backend = StubBackend::new(Driver::Agy);

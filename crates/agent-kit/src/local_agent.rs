@@ -3326,6 +3326,16 @@ mod tests {
             (self.events.try_iter().collect(), code)
         }
 
+        /// For a runner given a frame it must refuse: it ends by itself, dropping its stdin, so
+        /// the close may find nobody listening (that race is the expected exit, not a failure).
+        /// Should it wrongly still be running, the close ends it with 0, which the caller's
+        /// exit-code check catches.
+        fn refused(self) -> (Vec<Envelope>, i32) {
+            let _ = self.commands.send(RunnerInput::Closed);
+            let code = self.done.join().unwrap();
+            (self.events.try_iter().collect(), code)
+        }
+
         fn invalid_input(self) -> (Vec<Envelope>, i32) {
             self.commands
                 .send(RunnerInput::Invalid("Malformed Local command JSON."))
@@ -4156,7 +4166,7 @@ mod tests {
                     state.path().into(),
                     bad,
                 );
-                let (events, code) = run.finish();
+                let (events, code) = run.refused();
                 assert_eq!(code, 1);
                 assert!(!events
                     .iter()

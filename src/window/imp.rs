@@ -11,6 +11,7 @@ mod environment_review;
 mod pack_animation;
 mod remote;
 mod setup;
+mod spending;
 mod thread_menu;
 mod threads;
 mod uninstall_prefs;
@@ -2199,6 +2200,10 @@ impl AgentTerminalWindow {
             debug!("Action: Preferences");
             imp.show_preferences();
         });
+        self.add_win_action("spending", |imp| {
+            debug!("Action: Spending");
+            imp.show_spending();
+        });
         self.add_win_action("shortcuts", |imp| {
             debug!("Action: Keyboard Shortcuts");
             imp.show_shortcuts();
@@ -3138,6 +3143,7 @@ impl AgentTerminalWindow {
         menu.append_section(None, &support);
         let app = gtk4::gio::Menu::new();
         app.append(Some(&update_menu_label()), Some("win.check-updates"));
+        app.append(Some("Spending…"), Some("win.spending"));
         app.append(Some("Settings"), Some("win.preferences"));
         app.append(Some("Keyboard Shortcuts"), Some("win.shortcuts"));
         app.append(Some("About Agent Terminal"), Some("win.about"));
@@ -8515,12 +8521,13 @@ mod tests {
             app_actions,
             [
                 "win.check-updates",
+                "win.spending",
                 "win.preferences",
                 "win.shortcuts",
                 "win.about"
             ]
             .map(|a| Some(a.to_owned())),
-            "the app section offers updates, Settings, Keyboard Shortcuts and About"
+            "the app section offers updates, Spending, Settings, Keyboard Shortcuts and About"
         );
         assert!(window.lookup_action("about").is_some());
         let action_of = |section: i32| {
@@ -9126,6 +9133,19 @@ mod tests {
         dialog.close();
         crate::testutil::settle(&ctx);
 
+        // Spending…, once its report is read.
+        let dialog = imp.show_spending();
+        crate::testutil::pump_until(&ctx, 20, || {
+            crate::testutil::find_first::<gtk4::ScrolledWindow>(dialog.upcast_ref())
+                .is_some_and(|s| s.is_mapped())
+        });
+        assert!(
+            audit("spending", dialog.upcast_ref()) > 0,
+            "the spending dialog's period buttons were walked"
+        );
+        dialog.force_close();
+        crate::testutil::settle(&ctx);
+
         window.destroy();
         problems.sort();
         problems.dedup();
@@ -9254,6 +9274,7 @@ mod tests {
         editor_prefs::tests::the_group_saves_only_what_is_valid_and_applies_live(window);
         remote::tests::the_remote_machines_group_saves_only_valid_aliases(window);
         threads::message_search::tests::message_search_finds_and_opens_a_hit(window);
+        spending::tests::the_spending_dialog_shows_and_keeps_what_turns_cost(window);
     }
 
     /// A folder outside any repository has nothing to diff: no Changes toggle, no shortcut.

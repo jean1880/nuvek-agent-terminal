@@ -207,6 +207,33 @@ as healthy. Commands run off the UI thread and are killed at their timeout.
 `"action": "send-to-terminal"` adds a button that types the detail into the running
 session, behind a preview.
 
+### Spending
+
+**Spending…** (header menu) sums the completed turns stored on this computer. Pick **Day**,
+**Week** or **Month** for the last 30 days, 12 weeks or 12 months, and **Group by** folder,
+agent, profile or model. Each row shows its amount, a bar against the largest row, and its
+tokens and turns; below the groups, the same totals by day, week or month. **Plan usage**
+repeats the quota windows the agents last reported.
+
+What each agent reports:
+
+- **Claude** reports what each turn cost. On an API key or a metered model server that is real
+  money; on a plan it is the list price of the turn, not a charge. Until the app records how a
+  turn was billed, a cost reads as "reported".
+- **Codex, Antigravity and the Local agent** report tokens only. Their rows say "Not
+  reported" and show their tokens. The app never estimates dollars from a price list of its
+  own.
+
+The kinds of spend are never added into one number, and "Not reported" is never shown as $0.
+A sub-agent's turns count under the thread that started it, in that thread's folder, and the
+notes give their share. A deleted thread's turns are kept, summed by day, so totals never drop
+when you delete a thread. Claude's turns stored before costs were recorded per turn carried
+the process's running total, so their cost is left out (their tokens still count) and a note
+says how many there were.
+
+The first time the dialog opens it builds an index over completed turns, once, in the
+background. Nothing here makes a request or leaves this computer.
+
 ### The context gauge
 
 The thread header's gauge reads "N% left". It has three states: a known window (a bar and a

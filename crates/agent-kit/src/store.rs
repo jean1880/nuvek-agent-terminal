@@ -33,11 +33,13 @@ mod preflight;
 mod schema_v11;
 mod schema_v8;
 mod search;
+mod spend;
 
 pub use preflight::{BACKUP_DIR, PRE_V4_BACKUP_KEY};
 pub use search::{
     IndexProgress, SearchHit, SearchResults, INDEX_BUDGET, ITEM_CAP, SNIPPET_CLOSE, SNIPPET_OPEN,
 };
+pub use spend::{local_day, SpendData, SPEND_COST_FROM_KEY};
 
 /// A store write (an append, a batch, a checkpoint) slower than this is logged as a warning with
 /// its kind and duration: one frame at 60 Hz.
@@ -1445,6 +1447,10 @@ pub struct Store {
     /// build without FTS5 would meet.
     #[cfg(test)]
     fts5_missing: Cell<bool>,
+    /// Test hook: runs once in [`Store::spend_rows`], between its read of the live turns and
+    /// its read of the ledger.
+    #[cfg(test)]
+    between_spend_reads: RefCell<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// A unit of work that commits or rolls back as one: a transaction, or inside a
@@ -1705,9 +1711,13 @@ impl Store {
         Ok(store)
     }
 
-    /// An in-memory store for tests.
+    /// An in-memory store for tests. It is always new, so every cost it will hold is per turn:
+    /// it records where trusted costs begin ([`Store::ensure_spend_cost_marker`]) at once, as
+    /// no writer ever starts on it.
     pub fn open_in_memory() -> Result<Self> {
-        Self::init(Connection::open_in_memory()?, true)
+        let store = Self::init(Connection::open_in_memory()?, true)?;
+        store.ensure_spend_cost_marker()?;
+        Ok(store)
     }
 
     fn init(conn: Connection, allow_upgrade: bool) -> Result<Self> {
@@ -1739,6 +1749,8 @@ impl Store {
             fail_next_txn_commit: Cell::new(false),
             #[cfg(test)]
             fts5_missing: Cell::new(false),
+            #[cfg(test)]
+            between_spend_reads: RefCell::new(None),
         })
     }
 
@@ -2305,12 +2317,19 @@ impl Store {
     /// delegated worker it would take is live; close them first
     /// ([`Store::close_and_revoke_for_delete`]). Its delegation rows then go with it, and so do the
     /// hidden threads of its descendants (their native sessions dismissed too).
+    ///
+    /// Its completed turns, and its hidden threads', are first folded into `spend_ledger` by
+    /// their own local day, so the spending history keeps what they cost.
     pub fn delete_thread(&self, thread: &str) -> Result<()> {
         let tx = self.write_txn()?;
+        // Read before the release removes the rows that name a worker's root.
+        let delegated = self.spend_delegated_before_delete(thread)?;
         let hidden = self.release_delegation_for_delete(thread)?;
         let all: Vec<&str> = std::iter::once(thread)
             .chain(hidden.iter().map(String::as_str))
             .collect();
+        // Before the per-thread metadata (the profile) and the events go.
+        self.fold_spend_for_delete(&all, &delegated, &local_day)?;
         let mut folders: Vec<String> = Vec::new();
         for t in &all {
             let cwd: Option<String> = self

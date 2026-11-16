@@ -87,6 +87,11 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   agents' replies and tool titles, redacted, never a tool's output or the model's reasoning.
   Threads from before are indexed in the background after start-up. See
   [the message index](reference.md#the-message-index).
+- **Spending history.** **Spending…** in the header menu shows what the agents' completed
+  turns cost, by day (the last 30), week (the last 12) or month (the last 12), grouped by
+  folder, agent, profile or model, with each group's tokens. A turn that reported no cost
+  says "Not reported", never $0, and sub-agents' turns count under the thread that started
+  them. Deleted threads keep counting. See [spending](reference.md#spending).
 - **Your existing sessions.** Recent Claude and agy sessions appear as threads.
   Opening one imports its history and resumes it. A Codex thread resumes its own Codex
   thread; if Codex no longer has it, the next prompt continues in a new Codex thread with

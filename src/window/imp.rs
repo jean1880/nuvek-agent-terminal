@@ -1803,9 +1803,14 @@ impl AgentTerminalWindow {
         crate::diff_tool::DiffTools::shared()
             .set_expand_by_default(self.config.borrow().diffs_expanded);
 
-        let (theme, scrollback, scale) = {
+        let (theme, scrollback, scale, warning) = {
             let config = self.config.borrow();
-            (config.theme, config.scrollback_lines, config.font_scale)
+            (
+                config.theme,
+                config.scrollback_lines,
+                config.font_scale,
+                config.context_warning,
+            )
         };
         self.apply_appearance_to_all();
         self.for_each_terminal_everywhere(|term| {
@@ -1820,6 +1825,7 @@ impl AgentTerminalWindow {
             for tab in window.tabs.borrow().iter() {
                 if let Some(view) = tab.chat.as_ref().and_then(|chat| chat.view.as_ref()) {
                     view.set_text_scale(scale);
+                    view.set_context_warning(warning);
                 }
             }
             if let Some(spin) = window.font_scale_spin.borrow().upgrade() {
@@ -4411,6 +4417,15 @@ impl AgentTerminalWindow {
         self.pending_save.replace(Some(source));
     }
 
+    /// Gives every open thread view of this window the context warning setting, as it is made.
+    fn apply_context_warning(&self, warning: agent_core::context_meter::ContextWarning) {
+        for tab in self.tabs.borrow().iter() {
+            if let Some(view) = tab.chat.as_ref().and_then(|chat| chat.view.as_ref()) {
+                view.set_context_warning(warning);
+            }
+        }
+    }
+
     /// Turns quick replies on or off: the setting, the copy chat sessions read, and the file.
     fn set_quick_replies(&self, on: bool) {
         if self.config.borrow().suggest_quick_replies != on {
@@ -5224,6 +5239,31 @@ impl AgentTerminalWindow {
             },
         );
         threads.add(&continue_row);
+        let context_row = self.choice_row(
+            "Offer to Compact When Context Runs Low",
+            "When a thread has used this much of its context, a note above the message box \
+             offers to compact it or continue in a new thread, once each time it gets there. \
+             Nothing is sent until you choose; the note is not saved with the thread. The \
+             header's context bar turns amber at the same point",
+            agent_core::context_meter::ContextWarning::ALL
+                .iter()
+                .map(|w| (*w, w.label().to_owned()))
+                .collect(),
+            config.context_warning,
+            |imp, choice| {
+                let Some(warning) = choice else {
+                    return;
+                };
+                if imp.config.borrow().context_warning == warning {
+                    return;
+                }
+                imp.config.borrow_mut().context_warning = warning;
+                imp.for_each_window(|window| window.apply_context_warning(warning));
+                imp.schedule_config_save();
+            },
+        );
+        Self::keep_value_whole(&context_row);
+        threads.add(&context_row);
         let outside_row = self.config_switch(
             "Show Sessions Started Outside Agent Terminal",
             "List the agents' own recent sessions (started in a terminal or another tool) as \

@@ -1438,6 +1438,7 @@ impl CodexAdapter {
             used,
             max,
             auto_compact_at: None,
+            estimated: false,
         }));
     }
 

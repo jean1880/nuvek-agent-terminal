@@ -188,6 +188,13 @@ pub trait ChatBackend {
     fn lifecycle(&self) -> Lifecycle {
         Lifecycle::default()
     }
+    /// What the running agent process was launched on beyond its agent and model: the profile
+    /// and model server, as an opaque key. Another key is another context window (a Local
+    /// server with another budget, the vendor or a server), so the view clears its gauge when
+    /// it changes. `None` for a backend that knows no profiles.
+    fn launch_source(&self) -> Option<String> {
+        None
+    }
     /// Pops the most recent queued user prompt if sitting in queue, returning (item_id, prompt_text).
     fn pop_queued_prompt(&self) -> Option<(String, String)> {
         None

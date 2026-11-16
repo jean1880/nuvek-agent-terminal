@@ -1348,7 +1348,8 @@ impl Adapter for LocalAdapter {
                 control:
                     crate::adapter::Control::McpStatus
                     | crate::adapter::Control::McpToggle { .. }
-                    | crate::adapter::Control::McpReconnect { .. },
+                    | crate::adapter::Control::McpReconnect { .. }
+                    | crate::adapter::Control::ContextUsage,
                 ..
             } => Self::write(&command),
             Command::Control { .. } => Err(AdapterError::Unsupported("this control")),

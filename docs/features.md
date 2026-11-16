@@ -148,10 +148,18 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   foot of the sidebar, and update every turn.
 - **Context left at a glance.** The header's gauge shows how much of the context window
   remains ("37% left"), with the tokens used and left in its tooltip. The bar turns amber at
-  75% used (sooner if the agent auto-compacts earlier) and red at 90%. An agent that has not
-  reported its window size shows a dim "context ?" instead of a guess. Click the gauge to
-  compact, continue in a new thread, or open the `/context` breakdown; see the
-  [reference](reference.md#the-context-gauge).
+  the warning point (75% used unless you change it; sooner if the agent auto-compacts
+  earlier) and red at 90%. An agent that has not reported its window size shows a dim
+  "context ?" instead of a guess. Click the gauge to compact, continue in a new thread, or
+  open the `/context` breakdown; see the [reference](reference.md#the-context-gauge).
+- **An offer before the context fills.** The first time a thread passes the warning point, a
+  note above the message box offers to compact it or continue in a new thread. Nothing is sent
+  until you press one; it does not come back until the context drops below the point (after a
+  compaction, say) and crosses it again. Set the point, or turn the offer off, in Settings →
+  General → Threads.
+- **The Local agent's gauge.** A Local thread's gauge measures against the context budget
+  set for its profile, not the model's own window, so it reads "~37% left" and says it is an
+  estimate.
 - `/rewind` undoes the last turn's changes.
 - **Export a thread.** Right-click a thread and pick **Export…** to save the whole conversation
   as a Markdown or JSON file, wherever you choose. Each message carries the agent that wrote it, a

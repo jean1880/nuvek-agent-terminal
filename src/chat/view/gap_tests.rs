@@ -98,7 +98,8 @@ fn native_the_context_gauge_is_polled_after_a_turn_for_agents_that_do_not_push_i
                 .is_some()
         };
         if matches!(driver, Driver::Codex | Driver::Local) {
-            // Codex pushes `thread/tokenUsage/updated` itself; Local has no gauge to fill.
+            // Codex pushes `thread/tokenUsage/updated` itself; the Local agent's runner sends
+            // its estimate after every request.
             for _ in 0..50 {
                 ctx.iteration(false);
             }

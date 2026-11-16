@@ -179,7 +179,9 @@ impl Capabilities {
             mcp_panel: true,
             settings_panel: false,
             model_list: true,
-            context_usage: false,
+            // The runner sends its estimate against the profile's budget after each request,
+            // and answers `/context` with the budget's parts.
+            context_usage: true,
             usage: false,
             compact_command: None,
             streams_text: true,
@@ -378,6 +380,13 @@ mod tests {
         } = Capabilities::claude();
         let mut seen = std::collections::HashSet::new();
         assert!(Feature::ALL.iter().all(|f| seen.insert(*f)));
+    }
+
+    #[test]
+    fn local_reports_context_but_compacts_by_handoff() {
+        let local = Capabilities::local();
+        assert!(local.supports(Feature::ContextUsage));
+        assert_eq!(local.compact_command, None);
     }
 
     /// `Feature::ALL` is hand-maintained. `next` has no wildcard, so a new variant does not

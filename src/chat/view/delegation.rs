@@ -1198,6 +1198,7 @@ pub(crate) mod tests {
                 used: 42,
                 max: Some(100),
                 auto_compact_at: None,
+                estimated: false,
             }),
             Driver::Claude,
         );
@@ -1234,6 +1235,7 @@ pub(crate) mod tests {
                     used: 999,
                     max: Some(1000),
                     auto_compact_at: None,
+                    estimated: false,
                 }),
             );
             feed(

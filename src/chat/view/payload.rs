@@ -183,11 +183,13 @@ pub struct ContextBreakdown {
     pub used: Option<u64>,
     pub max: Option<u64>,
     pub auto_compact_at: Option<u64>,
+    /// The figures are the app's own estimate against a configured budget (the Local agent).
+    pub estimated: bool,
     pub categories: Vec<(String, u64)>,
 }
 
 /// `get_context_usage` (Claude: `totalTokens`, `maxTokens`, `autoCompactThreshold`,
-/// `categories:[{name, tokens}]`).
+/// `categories:[{name, tokens}]`; the Local agent adds `estimated: true`).
 pub fn context_breakdown(v: &Value) -> ContextBreakdown {
     let categories = list(v, &["categories"])
         .iter()
@@ -202,6 +204,7 @@ pub fn context_breakdown(v: &Value) -> ContextBreakdown {
         used: u64_field(v, &["totalTokens", "used", "tokens"]),
         max: u64_field(v, &["maxTokens", "max", "contextWindow"]),
         auto_compact_at: u64_field(v, &["autoCompactThreshold", "autoCompactAt"]),
+        estimated: v.get("estimated").and_then(Value::as_bool) == Some(true),
         categories,
     }
 }
@@ -554,6 +557,13 @@ mod tests {
         assert_eq!(c.max, Some(200_000));
         assert_eq!(c.auto_compact_at, Some(160_000));
         assert_eq!(c.categories, [("System prompt".to_owned(), 3_000)]);
+        assert!(!c.estimated);
+        // The Local agent's answer says its figures are an estimate.
+        let local = context_breakdown(&json!({
+            "totalTokens": 9000, "maxTokens": 32768, "estimated": true, "categories": []
+        }));
+        assert!(local.estimated);
+        assert_eq!(local.max, Some(32_768));
     }
 
     #[test]

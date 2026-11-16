@@ -383,6 +383,12 @@ pub struct Runner<C: ChatClient, W: Write> {
     last_budget: Option<String>,
     last_excluded: Vec<Value>,
     last_mcp_status: Value,
+    /// The prompt tokens the server reported for the request under way, if it did.
+    request_prompt_tokens: Option<u64>,
+    /// The planner's estimate of the request under way (the retried one's, after a retry).
+    request_estimate: usize,
+    /// What the last request held: the server's prompt tokens, else the planner's estimate.
+    context_used: Option<u64>,
     turn_instructions: agent_core::local_context::InstructionSnapshot,
     context: agent_core::local_context::LocalLaunchContext,
     /// The servers Settings had enabled when this generation was configured: the ceiling a
@@ -455,6 +461,9 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             last_budget: None,
             last_excluded: Vec::new(),
             last_mcp_status: serde_json::json!({"mcpServers":[]}),
+            request_prompt_tokens: None,
+            request_estimate: 0,
+            context_used: None,
             mode: args.mode,
             args,
             client: Some(client),
@@ -876,6 +885,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
     ) {
         use agent_core::adapter::Control;
         let result: Result<Value, String> = match control {
+            Control::ContextUsage => Ok(self.context_usage()),
             Control::McpStatus => self.mcp_status(commands),
             Control::McpToggle { server, enabled } => {
                 match self.context.mcp_servers.iter().position(|c| c.id == server) {
@@ -1053,6 +1063,7 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             return false;
         }
         let result = match control {
+            Control::ContextUsage => Some(Ok(self.context_usage())),
             Control::McpStatus => Some(Ok(self.cached_mcp_status())),
             Control::McpReconnect { .. } | Control::McpToggle { .. } => Some(Err(
                 "The agent is busy; retry this MCP change after the turn finishes.".to_owned(),
@@ -1496,8 +1507,15 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
         })?;
         self.report_budget(&plan);
         let body = plan.body;
+        self.request_prompt_tokens = None;
+        self.request_estimate = plan.input_tokens;
         let streamed = self.stream(model, &body, commands, usage);
         drop(body);
+        // Only a reply the server actually gave says anything of what the request held: a Stop
+        // or a failure before its first word reports nothing.
+        let answered = matches!(&streamed, Ok((reply, ..))
+            if !reply.text.is_empty() || !reply.reasoning.is_empty() || !reply.tool_calls.is_empty());
+        self.report_context(answered);
         if streamed.is_err() && std::mem::take(&mut self.replan) {
             // Refused for earlier images only: the next request sends their placeholders.
             return Ok(StepEnd::Continue);
@@ -1731,6 +1749,9 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
                 );
                 let retry = self.plan(model, &system, &[]).map_err(StepError::Failed)?;
                 self.report_budget(&retry);
+                // The request that is answered now carries no tool schemas.
+                self.request_estimate = retry.input_tokens;
+                self.request_prompt_tokens = None;
                 return self.stream(model, &retry.body, commands, usage);
             }
             if !self.no_images && sends_images(body) && refuses_images(&why) {
@@ -1755,6 +1776,53 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             )));
         }
         Ok((reply, ended, None))
+    }
+
+    /// After each request: how much of the profile's context budget it held, for the header's
+    /// gauge. The server's own prompt tokens when it reported them, else the planner's estimate
+    /// of the request actually answered (the retry without tools, when there was one) for a
+    /// request the server answered; a request stopped or failed before any reply says nothing.
+    /// Always marked as an estimate, since the window is the budget set in Settings, not the
+    /// model's own size.
+    fn report_context(&mut self, answered: bool) {
+        let used = match self.request_prompt_tokens.take() {
+            Some(reported) => reported,
+            None if answered => self.request_estimate as u64,
+            None => return,
+        };
+        self.context_used = Some(used);
+        self.emit(Envelope::new(Event::UsageUpdated {
+            used,
+            max: Some(self.context.budget.context_tokens as u64),
+            auto_compact_at: None,
+            estimated: true,
+        }));
+    }
+
+    /// The `/context` answer: the last request's figure against the budget, and the budget's
+    /// parts. Read from memory only; no request is made.
+    fn context_usage(&self) -> Value {
+        let budget = &self.context.budget;
+        let mut categories = vec![
+            serde_json::json!({"name": "Input allowance", "tokens": budget.input_allowance()}),
+            serde_json::json!({"name": "Reserved for the reply", "tokens": budget.response_tokens}),
+            serde_json::json!({"name": "Safety margin", "tokens": budget.safety_tokens}),
+        ];
+        if let Some(used) = self.context_used {
+            categories.insert(
+                0,
+                serde_json::json!({"name": "Last request (estimated)", "tokens": used}),
+            );
+        }
+        let mut reply = serde_json::json!({
+            "maxTokens": budget.context_tokens,
+            "estimated": true,
+            "categories": categories,
+        });
+        if let Some(used) = self.context_used {
+            reply["totalTokens"] = Value::from(used);
+        }
+        reply
     }
 
     fn report_budget(&mut self, plan: &RequestPlan) {
@@ -1847,6 +1915,9 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             StreamEvent::Usage(prompt, completion) => {
                 usage.input_tokens += prompt;
                 usage.output_tokens += completion;
+                if prompt > 0 {
+                    self.request_prompt_tokens = Some(prompt);
+                }
             }
             StreamEvent::Error(_) => {}
         }
@@ -3255,6 +3326,16 @@ mod tests {
             (self.events.try_iter().collect(), code)
         }
 
+        /// For a runner given a frame it must refuse: it ends by itself, dropping its stdin, so
+        /// the close may find nobody listening (that race is the expected exit, not a failure).
+        /// Should it wrongly still be running, the close ends it with 0, which the caller's
+        /// exit-code check catches.
+        fn refused(self) -> (Vec<Envelope>, i32) {
+            let _ = self.commands.send(RunnerInput::Closed);
+            let code = self.done.join().unwrap();
+            (self.events.try_iter().collect(), code)
+        }
+
         fn invalid_input(self) -> (Vec<Envelope>, i32) {
             self.commands
                 .send(RunnerInput::Invalid("Malformed Local command JSON."))
@@ -3369,6 +3450,185 @@ mod tests {
             bodies[2]["messages"][1]["content"][0],
             json!({"type": "text", "text": "[image: shot.png]"})
         );
+    }
+
+    /// The figures of a context reading: used, window, whether an estimate.
+    fn context_reading(env: &Envelope) -> Option<(u64, Option<u64>, bool)> {
+        match &env.event {
+            Event::UsageUpdated {
+                used,
+                max,
+                estimated,
+                ..
+            } => Some((*used, *max, *estimated)),
+            _ => None,
+        }
+    }
+
+    /// The answer to the control request `id`.
+    fn control_reply(run: &Run, id: &str) -> Value {
+        run.wait_for(|env| match &env.event {
+            Event::ControlResult { ok: Some(v), .. } if env.request.as_deref() == Some(id) => {
+                Some(v.clone())
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn local_emits_usage_after_each_request_and_marks_it_estimated() {
+        let work = tempfile::tempdir().unwrap();
+        // A server that reports no usage: the planner's estimate stands in.
+        let silent = vec![
+            r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#.to_owned(),
+            "data: [DONE]".to_owned(),
+        ];
+        let run = start(
+            args(work.path(), Mode::Ask),
+            Script::new(vec![Ok(silent.clone()), Ok(silent)]),
+            work.path().join("state"),
+        );
+        let budget = agent_core::local_context::ContextBudget::default().context_tokens as u64;
+        // Nothing to say before the first request: no figure, only the budget.
+        run.send(Command::Control {
+            id: "before".into(),
+            control: agent_core::adapter::Control::ContextUsage,
+        });
+        let before = control_reply(&run, "before");
+        assert_eq!(before["maxTokens"], budget);
+        assert_eq!(before["estimated"], true);
+        assert!(before.get("totalTokens").is_none());
+        let mut seen = Vec::new();
+        for text in ["hello", "and again, with a longer message this time"] {
+            run.send(prompt(text));
+            seen.push(run.wait_for(context_reading));
+            assert_eq!(turn_end(&run).0, TurnState::Completed);
+        }
+        for (used, max, estimated) in &seen {
+            assert!(*used > 0, "an estimate of what was sent");
+            assert_eq!(*max, Some(budget), "the window is the profile's budget");
+            assert!(*estimated);
+        }
+        assert!(
+            seen[1].0 > seen[0].0,
+            "the second request holds the first exchange too"
+        );
+        // `/context` answers from the last request, with the budget's parts.
+        run.send(Command::Control {
+            id: "after".into(),
+            control: agent_core::adapter::Control::ContextUsage,
+        });
+        let after = control_reply(&run, "after");
+        assert_eq!(after["totalTokens"], seen[1].0);
+        assert_eq!(after["estimated"], true);
+        assert!(after["categories"]
+            .as_array()
+            .is_some_and(|c| c.iter().any(|row| row["name"] == "Input allowance")));
+        run.finish();
+    }
+
+    /// A server that answers with text and reports no usage.
+    fn silent_reply() -> Vec<String> {
+        vec![
+            r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#.to_owned(),
+            "data: [DONE]".to_owned(),
+        ]
+    }
+
+    /// Runs one prompt to the end of its turn; every context reading it gave.
+    fn readings_of_one_turn(run: &Run, text: &str) -> Vec<u64> {
+        run.send(prompt(text));
+        let mut readings = Vec::new();
+        run.wait_for(|env| {
+            if let Some((used, ..)) = context_reading(env) {
+                readings.push(used);
+            }
+            completed(env)
+        });
+        readings
+    }
+
+    #[test]
+    fn local_reports_no_context_for_a_request_stopped_before_any_reply() {
+        let work = tempfile::tempdir().unwrap();
+        let run = start(
+            args(work.path(), Mode::Ask),
+            Script::new(vec![Ok(vec![STALL_MARK.to_owned()])]),
+            work.path().join("state"),
+        );
+        run.send(prompt("hello"));
+        // The request is planned and sent (its budget is said) before the server goes quiet.
+        run.wait_for(|env| {
+            matches!(&env.event, Event::Notice { text } if text.starts_with("Local request:"))
+                .then_some(())
+        });
+        run.send(Command::Interrupt);
+        let mut readings = 0;
+        let state = run.wait_for(|env| {
+            if context_reading(env).is_some() {
+                readings += 1;
+            }
+            completed(env).map(|(state, ..)| state)
+        });
+        assert_eq!(state, TurnState::Interrupted);
+        assert_eq!(readings, 0, "nothing answered, so nothing to report");
+        run.finish();
+    }
+
+    #[test]
+    fn local_reports_the_retried_request_after_a_model_refuses_tools() {
+        let message = "the same question, asked the same way";
+        // The same first request, answered at once: what a request with the tool schemas holds.
+        let work = tempfile::tempdir().unwrap();
+        let with_tools = start(
+            args(work.path(), Mode::Ask),
+            Script::new(vec![Ok(silent_reply())]),
+            work.path().join("state"),
+        );
+        let first = readings_of_one_turn(&with_tools, message);
+        with_tools.finish();
+        // Refused for its tools: the retry goes without them, and that is what was answered.
+        let retried_work = tempfile::tempdir().unwrap();
+        let script = Script::new(vec![
+            Err("does not support tools".into()),
+            Ok(silent_reply()),
+        ]);
+        let retried = start(
+            args(retried_work.path(), Mode::Ask),
+            script.clone(),
+            retried_work.path().join("state"),
+        );
+        let second = readings_of_one_turn(&retried, message);
+        retried.finish();
+        assert!(script.bodies()[0].get("tools").is_some());
+        assert!(script.bodies()[1].get("tools").is_none());
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1, "one reading for the one answered request");
+        assert!(
+            second[0] < first[0],
+            "the retry's estimate leaves out the schemas it no longer sends: {} vs {}",
+            second[0],
+            first[0]
+        );
+    }
+
+    #[test]
+    fn local_prefers_server_prompt_tokens_over_the_estimate() {
+        let work = tempfile::tempdir().unwrap();
+        // `text` ends with the server's usage: 10 prompt tokens.
+        let run = start(
+            args(work.path(), Mode::Ask),
+            Script::new(vec![Ok(text(&["hi"]))]),
+            work.path().join("state"),
+        );
+        run.send(prompt(
+            "a message much longer than ten tokens would be estimated at all",
+        ));
+        let (used, _, estimated) = run.wait_for(context_reading);
+        assert_eq!(used, 10);
+        assert!(estimated, "still against the budget, so still an estimate");
+        assert_eq!(turn_end(&run).0, TurnState::Completed);
+        run.finish();
     }
 
     #[test]
@@ -3906,7 +4166,7 @@ mod tests {
                     state.path().into(),
                     bad,
                 );
-                let (events, code) = run.finish();
+                let (events, code) = run.refused();
                 assert_eq!(code, 1);
                 assert!(!events
                     .iter()

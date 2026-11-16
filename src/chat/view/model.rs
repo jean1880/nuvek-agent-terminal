@@ -621,12 +621,15 @@ pub struct Gauge {
     pub used: u64,
     pub max: Option<u64>,
     pub auto_compact_at: Option<u64>,
+    /// Worked out by the app (the Local agent's budget and estimate), not reported.
+    pub estimated: bool,
 }
 
 impl Gauge {
     /// The pure reading the header, the popover and the `/context` panel share.
     pub fn meter(&self) -> agent_core::context_meter::ContextMeter {
         agent_core::context_meter::ContextMeter::new(self.used, self.max, self.auto_compact_at)
+            .estimated(self.estimated)
     }
 }
 
@@ -2324,11 +2327,13 @@ impl Transcript {
                 used,
                 max,
                 auto_compact_at,
+                estimated,
             } => {
                 self.gauge = Some(Gauge {
                     used: *used,
                     max: *max,
                     auto_compact_at: *auto_compact_at,
+                    estimated: *estimated,
                 });
                 out.push(Change::Gauge);
             }
@@ -2503,6 +2508,16 @@ impl Transcript {
             Event::DelegatedMessage { .. } | Event::WorkerLinked { .. } => {}
         }
         out
+    }
+
+    /// Forgets the context reading: the process now runs where it means nothing (another
+    /// profile or model server on the same agent and model).
+    pub fn clear_gauge(&mut self) -> Vec<Change> {
+        if self.gauge.take().is_some() {
+            vec![Change::Gauge]
+        } else {
+            Vec::new()
+        }
     }
 
     /// The thread is on `driver` now.
@@ -2764,6 +2779,7 @@ mod tests {
                 used: 42_000,
                 max: Some(200_000),
                 auto_compact_at: Some(160_000),
+                estimated: false,
             }),
             Driver::Codex,
         );
@@ -2998,6 +3014,7 @@ mod tests {
                     used: 42_000,
                     max: Some(200_000),
                     auto_compact_at: None,
+                    estimated: false,
                 }),
                 Driver::Claude,
             );
@@ -3059,6 +3076,7 @@ mod tests {
                 used: 42_000,
                 max: Some(200_000),
                 auto_compact_at: None,
+                estimated: false,
             }),
             Driver::Codex,
         );
@@ -5632,6 +5650,7 @@ mod tests {
                 used: 21_478,
                 max: Some(200_000),
                 auto_compact_at: Some(160_000),
+                estimated: false,
             }),
             Driver::Claude,
         );
@@ -5645,6 +5664,55 @@ mod tests {
         );
         assert!(c.contains(&Change::Gauge));
         assert_eq!(t.gauge.map(|g| g.used), Some(2_082));
+    }
+
+    #[test]
+    fn compaction_resets_warn_latch() {
+        use agent_core::context_meter::WarnLatch;
+        let usage = |used| {
+            ev(Event::UsageUpdated {
+                used,
+                max: Some(200_000),
+                auto_compact_at: None,
+                estimated: false,
+            })
+        };
+        let mut t = Transcript::new();
+        let mut latch = WarnLatch::default();
+        let seen = |t: &Transcript, latch: &mut WarnLatch| {
+            latch.observe(t.gauge.map(|g| g.meter()).as_ref())
+        };
+        t.apply(&usage(170_000), Driver::Claude);
+        assert!(seen(&t, &mut latch), "the first crossing offers");
+        t.apply(&usage(180_000), Driver::Claude);
+        assert!(!seen(&t, &mut latch), "never twice for one crossing");
+        t.apply(
+            &ev(Event::Compacted {
+                manual: true,
+                before: 180_000,
+                after: Some(20_000),
+            }),
+            Driver::Claude,
+        );
+        assert!(!seen(&t, &mut latch));
+        assert!(!latch.warned(), "the compaction re-armed it");
+        t.apply(&usage(175_000), Driver::Claude);
+        assert!(seen(&t, &mut latch), "the next crossing offers again");
+        // A Local reading is an estimate all the way to the meter.
+        t.apply(
+            &ev(Event::UsageUpdated {
+                used: 1_000,
+                max: Some(32_768),
+                auto_compact_at: None,
+                estimated: true,
+            }),
+            Driver::Local,
+        );
+        assert!(t.gauge.is_some_and(|g| g.estimated));
+        assert_eq!(
+            t.gauge.map(|g| g.meter().source),
+            Some(agent_core::context_meter::Source::Estimated)
+        );
     }
 
     #[test]

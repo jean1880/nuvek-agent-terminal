@@ -10,7 +10,8 @@ use agent_core::adapter::{Driver, Mode};
 use super::cards::{accent_class, label, wrapped_text};
 use super::model::{Activity, Gauge};
 use agent_core::context_meter::{
-    actions as meter_actions, ActionRow, ContextState, Level, MeterAction,
+    actions as meter_actions, ActionRow, ContextMeter, ContextState, ContextWarning, Level,
+    MeterAction,
 };
 
 /// Hookless agy cannot enforce a new policy mid-turn without interrupting it.
@@ -121,6 +122,7 @@ pub fn gauge_fraction(g: &Gauge) -> Option<(f64, Option<f64>)> {
 }
 
 /// The button's text: "N% left", or a dim "context ?" when the window is not known.
+#[cfg(test)]
 pub fn gauge_text(g: &Gauge) -> String {
     g.meter().text()
 }
@@ -132,6 +134,7 @@ pub fn gauge_used_text(g: &Gauge) -> String {
 
 /// The gauge's tooltip. With no known window it says so, so a tooltip from an earlier reading
 /// never outlives the bar it described.
+#[cfg(test)]
 pub fn gauge_tooltip(g: &Gauge) -> String {
     g.meter().tooltip()
 }
@@ -216,18 +219,14 @@ impl GaugePopover {
         }
     }
 
-    fn show(&self, g: &Gauge) {
-        let m = g.meter();
+    fn show(&self, m: &ContextMeter) {
+        self.summary.set_text(&m.summary());
         match m.state() {
             ContextState::Known { level, .. } => {
-                self.summary.set_text(&m.text());
                 self.detail
                     .set_text(&format!("{}\n{}", m.tooltip(), level.phrase()));
             }
-            ContextState::Unknown => {
-                self.summary.set_text("Context size not reported");
-                self.detail.set_text(&m.tooltip());
-            }
+            ContextState::Unknown => self.detail.set_text(&m.tooltip()),
         }
     }
 
@@ -288,6 +287,8 @@ pub struct Header {
     level: gtk4::LevelBar,
     gauge_label: gtk4::Label,
     gauge_pop: GaugePopover,
+    /// The warning threshold the bar is drawn against.
+    warning: Cell<ContextWarning>,
     last_driver: Cell<Option<Driver>>,
     steady_height: Rc<Cell<i32>>,
 }
@@ -604,6 +605,7 @@ impl Header {
             level,
             gauge_label,
             gauge_pop,
+            warning: Cell::new(ContextWarning::default()),
             last_driver: Cell::new(None),
             steady_height,
         }
@@ -901,14 +903,21 @@ impl Header {
         *self.gauge_pop.handler.borrow_mut() = Some(Rc::new(f));
     }
 
+    /// The warning threshold the bar turns amber at (Settings → General → Threads); the gauge
+    /// is drawn again against it.
+    pub fn set_warning(&self, warning: ContextWarning, gauge: Option<&Gauge>) {
+        self.warning.set(warning);
+        self.set_gauge(gauge);
+    }
+
     fn show_gauge(&self, gauge: Option<&Gauge>) {
         let Some(g) = gauge else {
             self.gauge.set_visible(false);
             return;
         };
         self.gauge.set_visible(true);
-        let meter = g.meter();
-        self.gauge_label.set_text(&gauge_text(g));
+        let meter = g.meter().with_warning(self.warning.get());
+        self.gauge_label.set_text(&meter.text());
         if meter.state() == ContextState::Unknown {
             self.gauge_label.add_css_class("gauge-unknown");
         } else {
@@ -931,13 +940,25 @@ impl Header {
             }
             None => self.level.set_visible(false),
         }
-        self.gauge.set_tooltip_text(Some(&gauge_tooltip(g)));
+        self.gauge.set_tooltip_text(Some(&meter.tooltip()));
         self.gauge
             .update_property(&[gtk4::accessible::Property::Label(&format!(
                 "Context window: {}",
-                meter.text()
+                meter.summary()
             ))]);
-        self.gauge_pop.show(g);
+        self.gauge_pop.show(&meter);
+    }
+
+    /// The gauge button's text as drawn (tests).
+    #[cfg(test)]
+    pub(super) fn gauge_text_shown(&self) -> String {
+        self.gauge_label.text().to_string()
+    }
+
+    /// The bar's warning point as drawn (tests).
+    #[cfg(test)]
+    pub(super) fn level_warn_offset(&self) -> Option<f64> {
+        self.level.offset_value(Some("ok"))
     }
 }
 
@@ -983,6 +1004,7 @@ mod tests {
             used: 50_000,
             max: Some(200_000),
             auto_compact_at: Some(160_000),
+            estimated: false,
         };
         assert_eq!(gauge_fraction(&g), Some((0.25, Some(0.8))));
         assert_eq!(gauge_text(&g), "75% left");
@@ -991,15 +1013,15 @@ mod tests {
             used: 1_234,
             max: None,
             auto_compact_at: None,
+            estimated: false,
         };
         assert_eq!(gauge_fraction(&unknown), None);
         assert_eq!(gauge_text(&unknown), "context ?");
         assert_eq!(gauge_used_text(&unknown), "1.2k tokens");
         // A zero window is as unknown as a missing one: no bar, never a full or empty one.
         let zero = Gauge {
-            used: 1_234,
             max: Some(0),
-            auto_compact_at: None,
+            ..unknown
         };
         assert_eq!(gauge_fraction(&zero), None);
         assert_eq!(gauge_text(&zero), "context ?");
@@ -1022,15 +1044,11 @@ mod tests {
         let over = Gauge {
             used: 300,
             max: Some(200),
-            auto_compact_at: None,
+            ..unknown
         };
         assert_eq!(gauge_fraction(&over), Some((1.0, None)));
         // Codex's "no figure": used 0 and no window reads as unknown, not as an empty window.
-        let codex_blank = Gauge {
-            used: 0,
-            max: None,
-            auto_compact_at: None,
-        };
+        let codex_blank = Gauge { used: 0, ..unknown };
         assert_eq!(gauge_fraction(&codex_blank), None);
         assert_eq!(gauge_text(&codex_blank), "context ?");
         assert_eq!(
@@ -1049,18 +1067,52 @@ mod tests {
             used: 50_000,
             max: Some(200_000),
             auto_compact_at: None,
+            estimated: false,
         };
         header.set_gauge(Some(&known));
         assert!(header.gauge.is_visible() && header.level.is_visible());
+        // The threshold setting moves the bar's warning point as it is made.
+        assert_eq!(header.level_warn_offset(), Some(0.75));
+        header.set_warning(ContextWarning::At60, Some(&known));
+        assert_eq!(header.level_warn_offset(), Some(0.6));
+        header.set_warning(ContextWarning::Off, Some(&known));
+        assert_eq!(header.level_warn_offset(), Some(0.75));
+        // The Local agent's estimate says so on the button and in the popover.
+        let local = Gauge {
+            used: 8_192,
+            max: Some(32_768),
+            auto_compact_at: None,
+            estimated: true,
+        };
+        header.set_gauge(Some(&local));
+        assert_eq!(header.gauge_label.text(), "~75% left");
+        assert_eq!(header.gauge_pop.summary.text(), "~75% left (estimate)");
+        assert!(header
+            .gauge
+            .tooltip_text()
+            .is_some_and(|t| t.starts_with("Context budget: ") && t.contains("An estimate")));
         let unknown = Gauge {
             used: 0,
             max: None,
             auto_compact_at: None,
+            estimated: false,
         };
         header.set_gauge(Some(&unknown));
         assert!(header.gauge.is_visible());
         assert!(!header.level.is_visible());
         assert_eq!(header.gauge_label.text(), "context ?");
+        // agy: tokens used, no window, so no bar and no percentage.
+        let agy = Gauge {
+            used: 120_000,
+            ..unknown
+        };
+        header.set_gauge(Some(&agy));
+        assert!(!header.level.is_visible());
+        assert_eq!(header.gauge_label.text(), "context ?");
+        assert!(header
+            .gauge
+            .tooltip_text()
+            .is_some_and(|t| t.contains("120k tokens used so far")));
 
         header.set_meter_actions(Some("/compact"), "Claude", true, true);
         for (action, button, reason) in &header.gauge_pop.rows {

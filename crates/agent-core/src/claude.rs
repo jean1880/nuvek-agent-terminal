@@ -1176,6 +1176,7 @@ impl ClaudeAdapter {
                     used,
                     max: u64_of(&body, "maxTokens"),
                     auto_compact_at: u64_of(&body, "autoCompactThreshold"),
+                    estimated: false,
                 }));
             }
         }
@@ -2586,7 +2587,8 @@ mod tests {
             Event::UsageUpdated {
                 used: 17_859,
                 max: Some(200_000),
-                auto_compact_at: Some(167_000)
+                auto_compact_at: Some(167_000),
+                estimated: false,
             }
         )));
     }

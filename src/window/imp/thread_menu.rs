@@ -22,8 +22,8 @@ use crate::chat::session::build_handoff;
 use crate::chat::ChatBackend;
 use crate::model_catalog::ModelCatalog;
 use crate::window::sidebar_model::{
-    display_title, menu_agents, thread_menu, MenuAgent, MenuEntry, RowKey, ThreadAction,
-    ThreadMenuInput,
+    chosen_tags, colour_at, colour_choices, colour_index, display_title, menu_agents, tag_choices,
+    thread_menu, MenuAgent, MenuEntry, RowKey, TagColour, ThreadAction, ThreadMenuInput,
 };
 
 /// The action every enabled menu item activates, with the encoded [`ThreadAction`] as target.
@@ -265,6 +265,7 @@ impl AgentTerminalWindow {
                 thread,
                 archived: summary.archived,
                 pinned: summary.pin_rank.is_some(),
+                tagged: !summary.tags.is_empty(),
                 has_messages,
                 agents: imp.menu_agents(),
             };
@@ -313,6 +314,8 @@ impl AgentTerminalWindow {
             ThreadAction::PinMove(thread, delta) => {
                 self.change_pin(&thread, PinChange::Move(delta));
             }
+            ThreadAction::EditTags(thread) => self.prompt_tags(&thread),
+            ThreadAction::ClearTags(thread) => self.clear_tags(&thread),
             ThreadAction::Archive(thread) => self.set_thread_archived(&thread, true),
             ThreadAction::Unarchive(thread) => self.set_thread_archived(&thread, false),
             ThreadAction::Delete(thread) => self.confirm_delete(&thread),
@@ -533,6 +536,238 @@ impl AgentTerminalWindow {
                         &imp.obj(),
                         "Could Not Change the Pin",
                         &format!("The thread could not be {}: {error}", change.past()),
+                    );
+                }
+            },
+        );
+    }
+
+    // ---- tags ----
+
+    /// Opens the Tags dialog for `thread` once its tags, every tag a thread holds and their
+    /// colours are read, together and off the main thread. A thread gone meanwhile opens none.
+    fn prompt_tags(&self, thread: &str) {
+        let obj = self.obj().downgrade();
+        let thread = thread.to_owned();
+        glib::MainContext::default().spawn_local(async move {
+            let read = store_job({
+                let thread = thread.clone();
+                move |store| -> agent_kit::store::Result<_> {
+                    let Some(summary) = store.thread_summary(&thread)? else {
+                        return Ok(None);
+                    };
+                    Ok(Some((summary, store.list_tags()?, store.tag_colours()?)))
+                }
+            })
+            .await;
+            let Some(obj) = obj.upgrade() else { return };
+            match read {
+                Some(Ok(Some((summary, known, colours)))) => {
+                    obj.imp()
+                        .show_tags_dialog(thread, summary, &known, &colours);
+                }
+                Some(Ok(None)) => {} // deleted meanwhile
+                Some(Err(e)) => {
+                    warn!("Cannot read the tags: {e}");
+                    obj.imp().show_toast("Cannot read the tags");
+                }
+                None => obj.imp().show_toast("Cannot read the tags"),
+            }
+        });
+    }
+
+    /// The Tags dialog: every tag offered as a row to tick, with its colour, and an entry for new
+    /// ones. What would be refused (a bad tag, too many) says why inline and keeps Save off.
+    /// Saving writes only the colours whose dropdown was changed, so a colour set meanwhile
+    /// elsewhere is kept.
+    fn show_tags_dialog(
+        &self,
+        thread: String,
+        summary: agent_kit::store::ThreadSummary,
+        known: &[(String, usize)],
+        colours: &std::collections::BTreeMap<String, TagColour>,
+    ) {
+        let current = summary.tags;
+        let title = self
+            .with_chat(&thread, |c| c.title.clone())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| display_title(&summary.title).to_owned());
+        let dialog = confirm_dialog(
+            "Thread Tags",
+            &format!(
+                "Tick the tags of “{title}”, or type new ones separated by spaces or commas. A \
+                 thread has at most {} tags.",
+                agent_core::thread_tag::MAX_TAGS
+            ),
+            ("cancel", "Cancel"),
+            ("save", "Save"),
+            adw::ResponseAppearance::Suggested,
+            true,
+        );
+        let content = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .spacing(12)
+            .build();
+        let entry = gtk4::Entry::builder()
+            .placeholder_text("New tags")
+            .activates_default(true)
+            .build();
+        entry.update_property(&[gtk4::accessible::Property::Label("New tags")]);
+        content.append(&entry);
+        let problem = gtk4::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .visible(false)
+            .css_classes(["error", "caption"])
+            .build();
+        content.append(&problem);
+        let choices = colour_choices();
+        // Each row: its tag, its box, its colour dropdown and the colour it was opened with.
+        let mut rows: Vec<(String, gtk4::CheckButton, gtk4::DropDown, u32)> = Vec::new();
+        let list = gtk4::ListBox::builder()
+            .selection_mode(gtk4::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+        for (tag, held) in tag_choices(known, &current) {
+            let check = gtk4::CheckButton::builder()
+                .active(held)
+                .valign(gtk4::Align::Center)
+                .build();
+            check.update_property(&[gtk4::accessible::Property::Label(&format!("#{tag}"))]);
+            let colour = gtk4::DropDown::from_strings(&choices);
+            let opened_with = colour_index(colours.get(&tag).copied());
+            colour.set_selected(opened_with);
+            colour.set_valign(gtk4::Align::Center);
+            colour.set_tooltip_text(Some("The tag's colour, from the colour scheme"));
+            colour.update_property(&[gtk4::accessible::Property::Label(&format!(
+                "Colour of #{tag}"
+            ))]);
+            let count = known.iter().find(|(t, _)| *t == tag).map_or(0, |(_, n)| *n);
+            let row = adw::ActionRow::builder()
+                .title(format!("#{tag}"))
+                .use_markup(false)
+                .subtitle(match count {
+                    0 | 1 => "1 thread".to_owned(),
+                    n => format!("{n} threads"),
+                })
+                .activatable_widget(&check)
+                .build();
+            row.add_prefix(&check);
+            row.add_suffix(&colour);
+            list.append(&row);
+            rows.push((tag, check, colour, opened_with));
+        }
+        if !rows.is_empty() {
+            let scroller = gtk4::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk4::PolicyType::Never)
+                .propagate_natural_height(true)
+                .max_content_height(320)
+                .child(&list)
+                .build();
+            content.append(&scroller);
+        }
+        dialog.set_extra_child(Some(&content));
+        let rows = Rc::new(rows);
+        let chosen = {
+            let (rows, entry) = (rows.clone(), entry.clone());
+            move || {
+                chosen_tags(
+                    rows.iter()
+                        .filter(|(_, check, _, _)| check.is_active())
+                        .map(|(tag, _, _, _)| tag.as_str()),
+                    &entry.text(),
+                )
+            }
+        };
+        let chosen = Rc::new(chosen);
+        let validate = {
+            let (chosen, dialog, problem) = (chosen.clone(), dialog.clone(), problem.clone());
+            move || {
+                let outcome = chosen();
+                if let Err(why) = &outcome {
+                    problem.set_text(&why.to_string());
+                }
+                problem.set_visible(outcome.is_err());
+                dialog.set_response_enabled("save", outcome.is_ok());
+            }
+        };
+        let validate = Rc::new(validate);
+        entry.connect_changed({
+            let validate = validate.clone();
+            move |_| validate()
+        });
+        for (_, check, _, _) in rows.iter() {
+            let validate = validate.clone();
+            check.connect_toggled(move |_| validate());
+        }
+        validate();
+        self.ask(dialog, "save", move |imp, save| {
+            if !save {
+                return;
+            }
+            // Save is off while the tags would be refused; a refusal here is nothing to save.
+            let Ok(tags) = chosen() else {
+                return;
+            };
+            let colours = ColourWrite::Set(
+                rows.iter()
+                    .filter(|(_, _, colour, opened_with)| colour.selected() != *opened_with)
+                    .map(|(tag, _, colour, _)| (tag.clone(), colour_at(colour.selected())))
+                    .collect(),
+            );
+            imp.save_tags(&thread, tags, colours, false);
+        });
+    }
+
+    /// Removes every tag of `thread`, with an Undo that puts them back, with the colours they had
+    /// (a tag no other thread has loses its colour with it).
+    fn clear_tags(&self, thread: &str) {
+        self.save_tags(thread, Vec::new(), ColourWrite::Set(Vec::new()), true);
+    }
+
+    /// Writes `thread`'s tags and `colours` through the store writer, in one write. What the
+    /// thread had (its tags and their colours) is read in that same write; with `undoable`, a
+    /// change from some tags says so with an Undo that writes them back.
+    pub(super) fn save_tags(
+        &self,
+        thread: &str,
+        tags: Vec<String>,
+        colours: ColourWrite,
+        undoable: bool,
+    ) {
+        let id = thread.to_owned();
+        let undo_id = thread.to_owned();
+        self.write_store_then(
+            "save the thread's tags",
+            move |s| s.atomically(|s| colours.write_with_tags(s, &id, &tags)),
+            move |imp, outcome| match outcome {
+                Some(Ok((before, had))) => {
+                    if undoable && !before.is_empty() {
+                        imp.action_toast(
+                            "Tags cleared",
+                            "Undo",
+                            10,
+                            adw::ToastPriority::Normal,
+                            move |imp| {
+                                imp.save_tags(
+                                    &undo_id,
+                                    before.clone(),
+                                    ColourWrite::RestoreUnset(had.clone()),
+                                    false,
+                                );
+                            },
+                        );
+                    }
+                }
+                failed => {
+                    let error = failed.and_then(Result::err).map_or_else(
+                        || "the thread store did not answer in time".to_owned(),
+                        |e| e.to_string(),
+                    );
+                    present_message(
+                        &imp.obj(),
+                        "Could Not Save the Tags",
+                        &format!("The thread's tags were not changed: {error}"),
                     );
                 }
             },
@@ -833,6 +1068,56 @@ async fn export_to(
     .await
 }
 
+/// Tags with their colours.
+pub(in crate::window) type TagColours = Vec<(String, TagColour)>;
+
+/// The tag colours a tags write sets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::window) enum ColourWrite {
+    /// Each of these, as given (`None` clears it): the dropdowns the user changed.
+    Set(Vec<(String, Option<TagColour>)>),
+    /// Each of these only where its tag has no colour when the write runs: an Undo puts back
+    /// what was lost, never over a colour chosen since.
+    RestoreUnset(Vec<(String, TagColour)>),
+}
+
+impl ColourWrite {
+    /// On the writer: sets `thread`'s tags to `tags`, then these colours. Returns the tags the
+    /// thread had and the colours those tags had, read in the same write.
+    pub(in crate::window) fn write_with_tags(
+        &self,
+        store: &agent_kit::store::Store,
+        thread: &str,
+        tags: &[String],
+    ) -> agent_kit::store::Result<(Vec<String>, TagColours)> {
+        let before = store
+            .thread_summary(thread)?
+            .ok_or_else(|| agent_kit::store::StoreError::NotFound(thread.to_owned()))?
+            .tags;
+        let now = store.tag_colours()?;
+        let had: Vec<(String, TagColour)> = before
+            .iter()
+            .filter_map(|t| now.get(t).map(|c| (t.clone(), *c)))
+            .collect();
+        store.set_tags(thread, tags)?;
+        let wanted: Vec<(String, Option<TagColour>)> = match self {
+            Self::Set(colours) => colours.clone(),
+            Self::RestoreUnset(colours) => {
+                let now = store.tag_colours()?;
+                colours
+                    .iter()
+                    .filter(|(t, _)| !now.contains_key(t))
+                    .map(|(t, c)| (t.clone(), Some(*c)))
+                    .collect()
+            }
+        };
+        if !wanted.is_empty() {
+            store.set_tag_colours(&wanted)?;
+        }
+        Ok((before, had))
+    }
+}
+
 /// What a pin action does to the Pinned section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::window) enum PinChange {
@@ -954,6 +1239,63 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn a_tags_write_never_reverts_a_colour_set_meanwhile() {
+        let store = agent_kit::store::Store::open_in_memory().expect("open");
+        let a = store.create_thread("/w", Some("a")).expect("a");
+        let b = store.create_thread("/w", Some("b")).expect("b");
+        let tags = |v: &[&str]| v.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>();
+        store.set_tags(&a, &["review", "ops"]).expect("tag");
+        store.set_tags(&b, &["review"]).expect("tag");
+        store
+            .set_tag_colours(&[
+                ("review", Some(TagColour::Warning)),
+                ("ops", Some(TagColour::Accent)),
+            ])
+            .expect("colour");
+
+        // Clear Tags on a reads what it had in the same write.
+        let (before, had) = ColourWrite::Set(Vec::new())
+            .write_with_tags(&store, &a, &[])
+            .expect("clear");
+        assert_eq!(before, ["ops", "review"]);
+        assert_eq!(
+            had,
+            [
+                ("ops".to_owned(), TagColour::Accent),
+                ("review".to_owned(), TagColour::Warning)
+            ]
+        );
+        // Meanwhile another thread's dialog recolours review (b still holds it).
+        store
+            .set_tag_colours(&[("review", Some(TagColour::Danger))])
+            .expect("recolour");
+        // The Undo puts back ops (which lost its colour) but never over review's new one.
+        ColourWrite::RestoreUnset(had)
+            .write_with_tags(&store, &a, &before)
+            .expect("undo");
+        let colours = store.tag_colours().expect("colours");
+        assert_eq!(colours.get("ops"), Some(&TagColour::Accent));
+        assert_eq!(colours.get("review"), Some(&TagColour::Danger));
+        assert_eq!(store.thread_summary(&a).unwrap().unwrap().tags, before);
+
+        // A dialog's Save writes only the colours it changed.
+        ColourWrite::Set(vec![("ops".into(), None)])
+            .write_with_tags(&store, &b, &tags(&["review", "ops"]))
+            .expect("save");
+        let colours = store.tag_colours().expect("colours");
+        assert_eq!(colours.get("ops"), None, "the one changed");
+        assert_eq!(
+            colours.get("review"),
+            Some(&TagColour::Danger),
+            "left alone"
+        );
+        assert!(matches!(
+            ColourWrite::Set(Vec::new()).write_with_tags(&store, "gone", &[]),
+            Err(agent_kit::store::StoreError::NotFound(_))
+        ));
+    }
+
+    #[test]
     fn a_continued_thread_is_titled_after_its_source_and_the_agent() {
         assert_eq!(
             continued_title("Fix the build", Driver::Codex),
@@ -992,6 +1334,7 @@ pub(super) mod tests {
             thread: "t".into(),
             archived: false,
             pinned: false,
+            tagged: false,
             has_messages: false,
             agents: vec![MenuAgent {
                 driver: Driver::Claude,
@@ -1017,7 +1360,7 @@ pub(super) mod tests {
         let housekeeping = model.item_link(1, "section").expect("second section");
         assert_eq!(
             gio_menu_labels_of(&housekeeping),
-            ["Rename…", "Pin to Top", "Archive", "Delete…"]
+            ["Rename…", "Pin to Top", "Tags…", "Archive", "Delete…"]
         );
         let links = model.item_link(2, "section").expect("third section");
         assert_eq!(

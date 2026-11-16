@@ -10,7 +10,7 @@
 //! own SQLite and needs no runtime library.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -22,6 +22,7 @@ use agent_core::redact::stream::{
     Limits, StreamKey, StreamSanitiser, DEFAULT_MAX_STREAMS, DEFAULT_PER_STREAM_BYTES,
     KEEP_CAPACITY, KEY_FIELD_PREFIX_BYTES, MAX_KEY_FIELD_BYTES,
 };
+pub use agent_core::thread_tag::TagColour;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 
@@ -262,7 +263,13 @@ pub struct ThreadSummary {
     pub archived: bool,
     /// A pinned thread's place among the pinned (0 is first); `None` when not pinned.
     pub pin_rank: Option<i64>,
+    /// The user's tags for the thread, sorted ([`Store::set_tags`]).
+    pub tags: Vec<String>,
 }
+
+/// [`Store::meta`] key of the tags' colours: a JSON object from tag to colour token
+/// ([`agent_core::thread_tag::TagColour::key`]).
+pub const TAG_COLOURS_KEY: &str = "tag_colours";
 
 /// What [`Store::ensure_search_fts`] found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2358,6 +2365,8 @@ impl Store {
         self.remember_folders(&folders)?;
         // A deleted pinned thread leaves no gap in the ranks.
         self.renumber_pins()?;
+        // Nor a colour for a tag no thread holds now.
+        self.prune_tag_colours()?;
         tx.commit()?;
         for t in &all {
             self.tails.borrow_mut().clear_thread(t);
@@ -2573,16 +2582,7 @@ impl Store {
     /// ([`StoreError::NotFound`]): it is never listed, so it is never pinned.
     pub fn set_pinned(&self, thread: &str, pinned: bool) -> Result<()> {
         let tx = self.write_txn()?;
-        let visible: bool = self.conn.query_row(
-            &format!(
-                "SELECT EXISTS (SELECT 1 FROM threads t WHERE t.id = ?1 AND {NOT_HIDDEN_CHILD})"
-            ),
-            params![thread],
-            |r| r.get(0),
-        )?;
-        if !visible {
-            return Err(StoreError::NotFound(thread.to_string()));
-        }
+        self.require_listed(thread)?;
         if pinned {
             self.conn.execute(
                 "UPDATE threads SET pin_rank =
@@ -2626,6 +2626,134 @@ impl Store {
             )?;
         }
         tx.commit()
+    }
+
+    /// Refuses (as [`StoreError::NotFound`]) a thread that is missing or is the hidden backing
+    /// thread of a supervised child, which is never listed.
+    fn require_listed(&self, thread: &str) -> Result<()> {
+        let listed: bool = self.conn.query_row(
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM threads t WHERE t.id = ?1 AND {NOT_HIDDEN_CHILD})"
+            ),
+            params![thread],
+            |r| r.get(0),
+        )?;
+        if listed {
+            Ok(())
+        } else {
+            Err(StoreError::NotFound(thread.to_string()))
+        }
+    }
+
+    /// Replaces a thread's tags with `tags`, as one write. Each is checked again here
+    /// ([`agent_core::thread_tag::tag_set`]: one word of at most 32 characters, lowercased, at
+    /// most 8 a thread, and never one that redaction would change), so a refused set
+    /// ([`StoreError::Failed`], saying why) leaves the old one as it was. `updated_at` is never
+    /// touched, so tagging does not reorder folders. A hidden backing thread is refused
+    /// ([`StoreError::NotFound`]). Deleting the thread deletes its tags.
+    pub fn set_tags<S: AsRef<str>>(&self, thread: &str, tags: &[S]) -> Result<()> {
+        let set =
+            agent_core::thread_tag::tag_set(tags).map_err(|e| StoreError::Failed(e.to_string()))?;
+        let tx = self.write_txn()?;
+        self.require_listed(thread)?;
+        self.conn.execute(
+            "DELETE FROM thread_tags WHERE thread_id = ?1",
+            params![thread],
+        )?;
+        for tag in &set {
+            self.conn.execute(
+                "INSERT INTO thread_tags (thread_id, tag) VALUES (?1, ?2)",
+                params![thread, tag],
+            )?;
+        }
+        self.prune_tag_colours()?;
+        tx.commit()
+    }
+
+    /// Every tag a listed thread holds, archived ones included, each once and sorted, with how
+    /// many threads hold it: what the Tags dialog offers.
+    pub fn list_tags(&self) -> Result<Vec<(String, usize)>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT g.tag, COUNT(*) FROM thread_tags g JOIN threads t ON t.id = g.thread_id
+             WHERE {NOT_HIDDEN_CHILD} GROUP BY g.tag ORDER BY g.tag"
+        ))?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as usize))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The tags' colours ([`TAG_COLOURS_KEY`]). An entry whose tag or colour is not one this
+    /// build knows is left out; an unreadable value reads as no colours (they are cosmetic, and
+    /// the next [`Store::set_tag_colours`] writes them afresh).
+    pub fn tag_colours(&self) -> Result<BTreeMap<String, TagColour>> {
+        let Some(raw) = self.meta(TAG_COLOURS_KEY)? else {
+            return Ok(BTreeMap::new());
+        };
+        let parsed: BTreeMap<String, String> = match serde_json::from_str(&raw) {
+            Ok(map) => map,
+            Err(e) => {
+                tracing::warn!(error = %e, "the tag colours were unreadable; none are shown");
+                return Ok(BTreeMap::new());
+            }
+        };
+        Ok(parsed
+            .into_iter()
+            .filter(|(tag, _)| {
+                agent_core::thread_tag::normalize_tag(tag).is_ok_and(|norm| norm == *tag)
+            })
+            .filter_map(|(tag, key)| Some((tag, TagColour::from_key(&key)?)))
+            .collect())
+    }
+
+    /// Sets (or, with `None`, clears) the colour of each tag in `colours`, as one write, and drops
+    /// the colours of tags no thread holds any more. A tag is checked as [`Store::set_tags`]
+    /// checks one ([`StoreError::Failed`] when refused, changing nothing).
+    pub fn set_tag_colours<S: AsRef<str>>(&self, colours: &[(S, Option<TagColour>)]) -> Result<()> {
+        let mut changes = Vec::with_capacity(colours.len());
+        for (tag, colour) in colours {
+            let tag = agent_core::thread_tag::normalize_tag(tag.as_ref())
+                .map_err(|e| StoreError::Failed(e.to_string()))?;
+            changes.push((tag, *colour));
+        }
+        let tx = self.write_txn()?;
+        let mut map = self.tag_colours()?;
+        for (tag, colour) in changes {
+            match colour {
+                Some(colour) => map.insert(tag, colour),
+                None => map.remove(&tag),
+            };
+        }
+        self.write_tag_colours(map)?;
+        tx.commit()
+    }
+
+    /// Stores `map` as the tags' colours, keeping only the tags a thread holds. Inside the
+    /// caller's write transaction.
+    fn write_tag_colours(&self, mut map: BTreeMap<String, TagColour>) -> Result<()> {
+        let held: HashSet<String> = self.list_tags()?.into_iter().map(|(t, _)| t).collect();
+        map.retain(|tag, _| held.contains(tag));
+        if map.is_empty() {
+            self.delete_meta(TAG_COLOURS_KEY)
+        } else {
+            let stored: BTreeMap<&str, &str> =
+                map.iter().map(|(t, c)| (t.as_str(), c.key())).collect();
+            self.set_meta(TAG_COLOURS_KEY, &serde_json::to_string(&stored)?)
+        }
+    }
+
+    /// Drops the colours of tags no thread holds any more (a write only when one goes). Inside
+    /// the caller's write transaction.
+    fn prune_tag_colours(&self) -> Result<()> {
+        if self.meta(TAG_COLOURS_KEY)?.is_none() {
+            return Ok(());
+        }
+        let map = self.tag_colours()?;
+        let held: HashSet<String> = self.list_tags()?.into_iter().map(|(t, _)| t).collect();
+        if map.keys().all(|t| held.contains(t)) && !map.is_empty() {
+            return Ok(());
+        }
+        self.write_tag_colours(map)
     }
 
     /// Renumbers the pinned threads 0..n, keeping their order.
@@ -4190,7 +4318,8 @@ fn status_name(status: ItemStatus) -> &'static str {
 const SUMMARY_SQL: &str = "SELECT t.id, t.title, t.cwd, t.updated_at,
             p.driver, p.model,
             EXISTS (SELECT 1 FROM events e WHERE e.thread_id = t.id AND e.seq > t.read_seq),
-            t.archived, t.pin_rank
+            t.archived, t.pin_rank,
+            (SELECT group_concat(g.tag, char(31)) FROM thread_tags g WHERE g.thread_id = t.id)
      FROM threads t
      LEFT JOIN provider_threads p ON p.id = COALESCE(
          t.active_provider_thread,
@@ -4213,6 +4342,15 @@ fn summary_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadSummary> {
         unread: r.get(6)?,
         archived: r.get(7)?,
         pin_rank: r.get(8)?,
+        tags: {
+            // Tags hold no control character, so the separator never splits one.
+            let joined: Option<String> = r.get(9)?;
+            let mut tags: Vec<String> = joined
+                .map(|j| j.split('\u{1f}').map(str::to_owned).collect())
+                .unwrap_or_default();
+            tags.sort();
+            tags
+        },
     })
 }
 
@@ -5048,6 +5186,206 @@ mod tests {
             s.set_pinned("missing", true),
             Err(StoreError::NotFound(_))
         ));
+    }
+
+    fn tags_of(s: &Store, thread: &str) -> Vec<String> {
+        s.thread_summary(thread).expect("read").expect("there").tags
+    }
+
+    fn tag_rows(s: &Store) -> i64 {
+        s.conn
+            .query_row("SELECT COUNT(*) FROM thread_tags", [], |r| r.get(0))
+            .expect("count")
+    }
+
+    #[test]
+    fn set_tags_is_atomic_and_enforces_caps() {
+        let s = store();
+        let a = s.create_thread("/a", Some("a")).expect("a");
+        let before = s.thread_summary(&a).expect("read").expect("a").updated_at;
+        s.set_tags(&a, &["Review", "#spike", "review"])
+            .expect("tag");
+        assert_eq!(
+            tags_of(&s, &a),
+            ["review", "spike"],
+            "normalised, once each"
+        );
+
+        // A refused set leaves the old one whole.
+        let nine: Vec<String> = (0..9).map(|i| format!("t{i}")).collect();
+        assert!(matches!(s.set_tags(&a, &nine), Err(StoreError::Failed(_))));
+        assert!(matches!(
+            s.set_tags(&a, &["fine", "not fine"]),
+            Err(StoreError::Failed(_))
+        ));
+        assert!(matches!(
+            s.set_tags(&a, &["x".repeat(33)]),
+            Err(StoreError::Failed(_))
+        ));
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        match s.set_tags(&a, &["ok", secret]) {
+            Err(StoreError::Failed(why)) => assert!(!why.contains(secret), "{why}"),
+            other => panic!("a secret-looking tag is refused, not masked: {other:?}"),
+        }
+        assert_eq!(tags_of(&s, &a), ["review", "spike"]);
+        let stored: Vec<String> = s
+            .conn
+            .prepare("SELECT tag FROM thread_tags")
+            .expect("prepare")
+            .query_map([], |r| r.get(0))
+            .expect("query")
+            .collect::<rusqlite::Result<_>>()
+            .expect("rows");
+        assert!(stored.iter().all(|t| redact(t) == *t));
+
+        s.set_tags(&a, &nine[..8]).expect("eight is the cap");
+        assert_eq!(tags_of(&s, &a).len(), 8);
+        s.set_tags::<&str>(&a, &[]).expect("clear");
+        assert!(tags_of(&s, &a).is_empty());
+        assert_eq!(
+            s.thread_summary(&a).expect("read").expect("a").updated_at,
+            before,
+            "tags never touch updated_at"
+        );
+        assert!(matches!(
+            s.set_tags("missing", &["x"]),
+            Err(StoreError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn tags_cascade_on_thread_delete_and_archiving_keeps_them() {
+        let s = store();
+        let a = s.create_thread("/a", Some("a")).expect("a");
+        let b = s.create_thread("/b", Some("b")).expect("b");
+        s.set_tags(&a, &["review"]).expect("tag");
+        s.set_tags(&b, &["review", "ops"]).expect("tag");
+        s.set_archived(&b, true).expect("archive");
+        assert_eq!(
+            tags_of(&s, &b),
+            ["ops", "review"],
+            "archiving keeps the tags"
+        );
+        assert_eq!(
+            s.list_tags().expect("tags"),
+            [("ops".to_owned(), 1), ("review".to_owned(), 2)],
+            "archived threads' tags are offered too"
+        );
+        s.delete_thread(&b).expect("delete");
+        assert_eq!(tag_rows(&s), 1, "only the other thread's tag is left");
+        assert_eq!(s.list_tags().expect("tags"), [("review".to_owned(), 1)]);
+        s.delete_thread(&a).expect("delete");
+        assert_eq!(tag_rows(&s), 0);
+    }
+
+    #[test]
+    fn summaries_carry_tags_in_one_query() {
+        let s = store();
+        let a = s.create_thread("/a", Some("a")).expect("a");
+        let b = s.create_thread("/b", Some("b")).expect("b");
+        s.set_tags(&a, &["zeta", "alpha", "c#"]).expect("tag");
+        let listed = s.list_threads(true).expect("list");
+        let of = |id: &str| listed.iter().find(|t| t.id == id).map(|t| t.tags.clone());
+        assert_eq!(
+            of(&a),
+            Some(vec!["alpha".to_owned(), "c#".to_owned(), "zeta".to_owned()]),
+            "sorted"
+        );
+        assert_eq!(of(&b), Some(Vec::new()));
+        assert_eq!(tags_of(&s, &a), ["alpha", "c#", "zeta"]);
+    }
+
+    #[test]
+    fn a_hidden_backing_thread_is_never_tagged() {
+        let s = store();
+        let root = s.create_thread("/w", Some("root")).expect("root");
+        let backing = s.create_thread("/w", Some("child")).expect("child");
+        s.conn
+            .execute_batch(&format!(
+                "BEGIN;
+                 INSERT INTO delegation_roots (id, root_thread_id, root_worker_id, task_state,
+                     policy_json, continuation_budget, created_at, updated_at)
+                     VALUES ('r1', '{root}', 'w_root', 'active', '{{}}', 3, 1, 2);
+                 INSERT INTO delegation_workers (id, root_id, parent_id, origin, depth, name,
+                     driver, profile_id, launch_json, backing_thread_id, state, workspace_json,
+                     delegation_status, created_at, updated_at)
+                     VALUES ('w_root', 'r1', NULL, 'root', 0, 'root', 'local', 'p', '{{}}', NULL,
+                             'running', '{{}}', 'available', 1, 2),
+                            ('w_kid', 'r1', 'w_root', 'supervised', 1, 'kid', 'codex', 'p', '{{}}',
+                             '{backing}', 'closed', '{{}}', 'available', 1, 2);
+                 COMMIT;"
+            ))
+            .expect("a supervised child");
+        assert!(matches!(
+            s.set_tags(&backing, &["x"]),
+            Err(StoreError::NotFound(_))
+        ));
+        assert_eq!(tag_rows(&s), 0);
+    }
+
+    #[test]
+    fn tag_colours_are_tokens_and_follow_the_tags_held() {
+        let s = store();
+        let a = s.create_thread("/a", Some("a")).expect("a");
+        s.set_tags(&a, &["review", "ops"]).expect("tag");
+        assert!(s.tag_colours().expect("colours").is_empty());
+        s.set_tag_colours(&[
+            ("#Review", Some(TagColour::Warning)),
+            ("ops", Some(TagColour::Accent)),
+        ])
+        .expect("colour");
+        let colours = s.tag_colours().expect("colours");
+        assert_eq!(colours.get("review"), Some(&TagColour::Warning));
+        assert_eq!(colours.get("ops"), Some(&TagColour::Accent));
+        assert_eq!(
+            s.meta(TAG_COLOURS_KEY).expect("meta").as_deref(),
+            Some(r#"{"ops":"accent","review":"warning"}"#),
+            "token names, never a literal colour"
+        );
+        s.set_tag_colours(&[("ops", None)]).expect("clear one");
+        assert_eq!(s.tag_colours().expect("colours").len(), 1);
+        // A tag no thread holds keeps no colour: dropped when its last thread loses it, and
+        // never kept for one no thread has.
+        s.set_tags(&a, &["ops"]).expect("retag");
+        assert!(s.tag_colours().expect("colours").is_empty());
+        assert_eq!(s.meta(TAG_COLOURS_KEY).expect("meta"), None);
+        s.set_tag_colours(&[("unheld", Some(TagColour::Danger))])
+            .expect("write");
+        assert!(s.tag_colours().expect("colours").is_empty());
+        // Nor once the thread holding it is deleted.
+        let b = s.create_thread("/b", Some("b")).expect("b");
+        s.set_tags(&b, &["gone"]).expect("tag");
+        s.set_tag_colours(&[("gone", Some(TagColour::Danger))])
+            .expect("colour");
+        assert_eq!(s.tag_colours().expect("colours").len(), 1);
+        s.delete_thread(&b).expect("delete");
+        assert!(s.tag_colours().expect("colours").is_empty());
+        assert_eq!(s.meta(TAG_COLOURS_KEY).expect("meta"), None);
+        assert!(matches!(
+            s.set_tag_colours(&[("not ok", Some(TagColour::Danger))]),
+            Err(StoreError::Failed(_))
+        ));
+        // Unknown colours or tags this build cannot read are left out; garbage reads as none.
+        s.set_meta(
+            TAG_COLOURS_KEY,
+            r##"{"ops":"#ff0000","Bad Tag":"accent","x":"danger"}"##,
+        )
+        .expect("meta");
+        assert_eq!(
+            s.tag_colours()
+                .expect("colours")
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [("x".to_owned(), TagColour::Danger)]
+        );
+        s.set_meta(TAG_COLOURS_KEY, "not json").expect("meta");
+        assert!(s
+            .tag_colours()
+            .expect("unreadable reads as none")
+            .is_empty());
+        s.set_tag_colours(&[("ops", Some(TagColour::Success))])
+            .expect("written afresh");
+        assert_eq!(s.tag_colours().expect("colours").len(), 1);
     }
 
     #[test]

@@ -934,6 +934,23 @@ mod tests {
         );
     }
 
+    /// Pins, tags and tag colours live in the thread store, which goes with the state folder:
+    /// they add no folder or file of their own to remove.
+    #[test]
+    fn pins_and_tags_add_no_new_folder() {
+        let mut i = inputs(Path::new("/h"));
+        i.xdg_state = Some("/x/state".into());
+        let folders = candidate_folders(&i);
+        assert!(folders.contains(&PathBuf::from("/x/state").join(APP_DIR)));
+        assert!(
+            folders
+                .iter()
+                .all(|f| !f.to_string_lossy().contains("tag")
+                    && !f.to_string_lossy().contains("pin")),
+            "{folders:?}"
+        );
+    }
+
     #[test]
     fn candidates_cover_every_base_with_and_without_overrides() {
         let home = Path::new("/h");

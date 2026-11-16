@@ -65,6 +65,10 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   `Alt+Shift+Up` and `Alt+Shift+Down` on the selected row. A pinned thread keeps its pin
   when archived (it shows again with **Show Archived**, or while it is open), and pinning
   never changes when a thread was last active, so the folder groups stay in place.
+  **Tags…** gives a thread tags ("review", "spike"), each with an optional colour from the
+  colour scheme; up to two show as chips on its row, and clicking one filters the sidebar by
+  it. `#review` in the search keeps only the threads tagged `review`, and several `#` words
+  must all match. See [tagging threads](reference.md#tagging-threads).
   Threads that are working,
   waiting for an approval, rate limited or running background work sit above the folders in
   an **Active** section, most urgent first, each naming its folder; a pinned thread that is

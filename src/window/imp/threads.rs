@@ -46,8 +46,8 @@ use crate::window::sidebar_model::{
     OpenState, Redraw, ResumeAs, RowKey, SidebarModel, SidebarRow, SidebarSections,
 };
 use crate::window::sidebar_model::{
-    empty_sidebar_text, image_title, limit_wait_text, reopen_offer, sessions_added_toast,
-    thread_activity, ThreadActivity,
+    empty_sidebar_text, image_title, limit_wait_text, reopen_offer, row_tags, sessions_added_toast,
+    shown_chips, tags_text, thread_activity, with_tag_term, SearchQuery, ThreadActivity,
 };
 use agent_core::limit_wait::{LimitRecord, LimitWait, Step, Window as LimitWindow};
 
@@ -4034,6 +4034,7 @@ impl AgentTerminalWindow {
     pub(super) fn sidebar_rows(&self) -> Vec<SidebarRow> {
         // From the last load: the sidebar never reads the store on the main thread.
         let summaries = self.summaries.borrow().clone().unwrap_or_default();
+        let colours = self.tag_colours.borrow();
         let tabs = self.tabs.borrow();
         // Looked up once per summary, not scanned for: the first open tab of a thread wins.
         let mut open: HashMap<&str, &TabState> = HashMap::new();
@@ -4092,6 +4093,7 @@ impl AgentTerminalWindow {
                     archived: s.archived,
                     pin_rank: s.pin_rank,
                     remote: false,
+                    tags: row_tags(&s.tags, &colours),
                 }
             })
             .collect();
@@ -4117,6 +4119,7 @@ impl AgentTerminalWindow {
                 archived: false,
                 pin_rank: None,
                 remote: tab.remote.is_some(),
+                tags: Vec::new(),
             });
         }
         rows
@@ -4127,9 +4130,14 @@ impl AgentTerminalWindow {
     /// coalesce into one more load. With no file store (memory, tests) it loads in place.
     pub(super) fn reload_summaries(&self) {
         if !store_is_async() {
-            let list = app_store().list_threads(true).unwrap_or_else(|e| {
+            let store = app_store();
+            let list = store.list_threads(true).unwrap_or_else(|e| {
                 warn!("Cannot list threads: {e}");
                 Vec::new()
+            });
+            *self.tag_colours.borrow_mut() = store.tag_colours().unwrap_or_else(|e| {
+                warn!("Cannot read the tag colours: {e}");
+                Default::default()
             });
             *self.summaries.borrow_mut() = Some(list);
             self.refresh_sidebar();
@@ -4143,11 +4151,23 @@ impl AgentTerminalWindow {
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
             loop {
-                let loaded = store_job(|store| store.list_threads(true)).await;
+                let loaded = store_job(|store| -> agent_kit::store::Result<_> {
+                    let list = store.list_threads(true)?;
+                    // Cosmetic: an unreadable value draws every tag plain, never fails the list.
+                    let colours = store.tag_colours().unwrap_or_else(|e| {
+                        warn!("Cannot read the tag colours: {e}");
+                        Default::default()
+                    });
+                    Ok((list, colours))
+                })
+                .await;
                 let Some(obj) = obj.upgrade() else { return };
                 let imp = obj.imp();
                 match loaded {
-                    Some(Ok(list)) => *imp.summaries.borrow_mut() = Some(list),
+                    Some(Ok((list, colours))) => {
+                        *imp.tag_colours.borrow_mut() = colours;
+                        *imp.summaries.borrow_mut() = Some(list);
+                    }
                     Some(Err(e)) => {
                         warn!("Cannot list threads: {e}");
                         // Nothing is on its way: the skeleton rows hold still.
@@ -4262,10 +4282,11 @@ impl AgentTerminalWindow {
         let selected = self.selected_row_key();
         let focused = self.obj().is_active();
         let query = sidebar.search.text().to_string();
-        let (title, hint) = empty_sidebar_text(&query);
+        let parsed = SearchQuery::parse(&query);
+        let (title, hint) = empty_sidebar_text(&parsed);
         sidebar.empty_title.set_text(title);
         sidebar.empty_hint.set_text(hint);
-        let sections = sidebar_sections(rows, &query, self.show_archived.get());
+        let sections = sidebar_sections(rows, &parsed, self.show_archived.get());
         let pinned_active = sections.pinned_active();
         let SidebarSections {
             pinned,
@@ -4275,7 +4296,7 @@ impl AgentTerminalWindow {
         let groups = fold_groups(
             groups,
             &sidebar.expanded.borrow(),
-            !query.trim().is_empty(),
+            !parsed.is_empty(),
             selected.as_ref(),
         );
         let model = SidebarModel {
@@ -4697,6 +4718,18 @@ impl AgentTerminalWindow {
             pin.update_property(&[gtk4::accessible::Property::Label("Pinned")]);
             line.append(&pin);
         }
+        let (chips, more) = shown_chips(&row.tags);
+        for tag in chips {
+            line.append(&self.tag_chip(tag));
+        }
+        if more > 0 {
+            let rest = Label::builder()
+                .label(format!("+{more}"))
+                .css_classes(["tag-more", "dim-label", "caption"])
+                .tooltip_text(tags_text(&row.tags))
+                .build();
+            line.append(&rest);
+        }
         if row.open == OpenState::Elsewhere {
             let mark = Label::builder()
                 .label("↗")
@@ -4794,11 +4827,58 @@ impl AgentTerminalWindow {
         {
             state = format!("{state}, {}", activity.tooltip());
         }
+        if !row.tags.is_empty() {
+            state = format!("{state}, tagged {}", tags_text(&row.tags));
+        }
         widget.update_property(&[
             gtk4::accessible::Property::Label(&row.title),
             gtk4::accessible::Property::Description(&format!("{}, {state}", row.folder)),
         ]);
         widget
+    }
+
+    /// A row's chip for `tag`: its name, in its colour (a theme token's class, never a literal
+    /// colour), and a click that filters the sidebar by it.
+    fn tag_chip(&self, tag: &crate::window::sidebar_model::RowTag) -> Button {
+        let mut classes = vec!["flat".to_owned(), "tag-chip".to_owned()];
+        if let Some(colour) = tag.colour {
+            classes.push(format!("tag-{}", colour.key()));
+        }
+        let chip = Button::builder()
+            .label(&tag.name)
+            .valign(Align::Center)
+            .tooltip_text(format!("Show threads tagged #{}", tag.name))
+            .css_classes(classes)
+            .build();
+        chip.update_property(&[gtk4::accessible::Property::Label(&format!(
+            "Filter by tag {}",
+            tag.name
+        ))]);
+        let obj = self.obj();
+        let name = tag.name.clone();
+        chip.connect_clicked(glib::clone!(
+            #[weak]
+            obj,
+            move |_| obj.imp().filter_by_tag(&name)
+        ));
+        chip
+    }
+
+    /// Adds `#tag` to the sidebar's search ([`with_tag_term`]), which filters the list by it,
+    /// and moves the keyboard there, its cursor at the end: the chip pressed goes away with the
+    /// list's rebuild, and the search now holds the filter to read, change or clear.
+    pub(super) fn filter_by_tag(&self, tag: &str) {
+        let Some(sidebar) = self.sidebar.borrow().clone() else {
+            return;
+        };
+        let text = with_tag_term(&sidebar.search.text(), tag);
+        if text != sidebar.search.text().as_str() {
+            sidebar.search.set_text(&text);
+        }
+        sidebar.search.grab_focus();
+        // Focusing selects the text; typing then would replace the filter.
+        sidebar.search.select_region(-1, -1);
+        sidebar.search.set_position(-1);
     }
 
     /// Whether closing `key` would cut a turn short: a thread running or awaiting an answer.
@@ -10829,6 +10909,7 @@ pub(super) mod tests {
                 unread: i % 7 == 0,
                 archived: false,
                 pin_rank: None,
+                tags: Vec::new(),
             })
             .collect();
         *imp.summaries.borrow_mut() = Some(list);
@@ -12595,14 +12676,18 @@ pub(super) mod tests {
 
     /// The thread ids in the Pinned section, in order.
     fn pinned_ids(imp: &AgentTerminalWindow) -> Vec<String> {
-        crate::window::sidebar_model::sidebar_sections(imp.sidebar_rows(), "", true)
-            .pinned
-            .into_iter()
-            .map(|r| match r.key {
-                RowKey::Thread(id) => id,
-                RowKey::Terminal(_) => String::new(),
-            })
-            .collect()
+        crate::window::sidebar_model::sidebar_sections(
+            imp.sidebar_rows(),
+            &SearchQuery::default(),
+            true,
+        )
+        .pinned
+        .into_iter()
+        .map(|r| match r.key {
+            RowKey::Thread(id) => id,
+            RowKey::Terminal(_) => String::new(),
+        })
+        .collect()
     }
 
     /// Pin, move and unpin go through the store writer, list the thread under Pinned, and each
@@ -12685,7 +12770,7 @@ pub(super) mod tests {
                 .collect()
         };
         let folders = || -> Vec<String> {
-            sidebar_sections(imp.sidebar_rows(), "", true)
+            sidebar_sections(imp.sidebar_rows(), &SearchQuery::default(), true)
                 .groups
                 .into_iter()
                 .map(|(folder, _)| folder)
@@ -12715,6 +12800,207 @@ pub(super) mod tests {
         assert_eq!(folders(), before_folders);
     }
 
+    /// Tags through the store writer and the Tags dialog: chips in their colour on the row, a
+    /// chip's click filtering the sidebar by `#tag`, Clear Tags with an Undo, and archiving
+    /// keeping them. `a` and `b` are two stored threads, neither tagged.
+    fn tags_round_trip_through_the_writer(
+        imp: &AgentTerminalWindow,
+        ctx: &glib::MainContext,
+        reader: &Store,
+        a: &str,
+        b: &str,
+    ) {
+        use crate::testutil::{find_all_by_class, find_first, pump_until, settle};
+        use crate::window::sidebar_model::{TagColour, ThreadAction};
+        let window = imp.obj();
+        let tags_of = |id: &str| reader.thread_summary(id).unwrap().unwrap().tags;
+        let last_is = |text: &str| toast_titles(imp).last().map(String::as_str) == Some(text);
+        let sidebar = imp.sidebar.borrow().clone().unwrap();
+        let chips = || find_all_by_class::<gtk4::Button>(sidebar.list.upcast_ref(), "tag-chip");
+        let shown = || {
+            sidebar_sections(
+                imp.sidebar_rows(),
+                &SearchQuery::parse(&sidebar.search.text()),
+                true,
+            )
+        };
+        let listed = |id: &str| {
+            let s = shown();
+            s.pinned
+                .iter()
+                .chain(s.active.iter())
+                .chain(s.groups.iter().flat_map(|(_, rows)| rows.iter()))
+                .any(|r| r.key == RowKey::Thread(id.to_owned()))
+        };
+
+        // Saved with a colour: the row draws its chips, the coloured one by its token's class.
+        imp.save_tags(
+            a,
+            vec!["review".into(), "ops".into()],
+            crate::window::imp::thread_menu::ColourWrite::Set(vec![(
+                "review".into(),
+                Some(TagColour::Warning),
+            )]),
+            false,
+        );
+        assert!(pump_until(ctx, 10, || tags_of(a) == ["ops", "review"]));
+        assert_eq!(
+            reader.tag_colours().unwrap().get("review"),
+            Some(&TagColour::Warning)
+        );
+        // A `#tag` search lists only the threads holding it, with their folders open.
+        assert!(listed(b));
+        sidebar.search.set_text("#ops");
+        assert!(pump_until(ctx, 5, || listed(a) && !listed(b)));
+        assert!(pump_until(ctx, 10, || chips().len() == 2));
+        let review = chips()
+            .into_iter()
+            .find(|c| c.label().as_deref() == Some("review"))
+            .expect("a review chip");
+        assert!(review.has_css_class("tag-warning"));
+        let plain = chips()
+            .into_iter()
+            .find(|c| c.label().as_deref() == Some("ops"))
+            .expect("an ops chip");
+        assert!(
+            TagColour::ALL
+                .iter()
+                .all(|c| !plain.has_css_class(&format!("tag-{}", c.key()))),
+            "a tag with no colour has no colour class"
+        );
+        for chip in chips() {
+            let problems = crate::testutil::button_problems(chip.upcast_ref(), 24);
+            assert!(problems.is_empty(), "{problems:?}");
+        }
+
+        // Its text takes the chip's own colour, not the app-wide label rule's, nor what the
+        // sidebar pane hands down (libadwaita 1.5's `@sidebar_fg_color`).
+        let text: gtk4::Label = find_first(review.upcast_ref()).expect("the chip's label");
+        let want = crate::palette::current().fg_strong;
+        assert!(
+            pump_until(ctx, 5, || {
+                let got = text.color();
+                (f64::from(got.red()) - want.0).abs() < 0.01
+                    && (f64::from(got.green()) - want.1).abs() < 0.01
+                    && (f64::from(got.blue()) - want.2).abs() < 0.01
+            }),
+            "chip text is {:?}, not {}",
+            text.color(),
+            want.hex()
+        );
+
+        // A chip activated from the keyboard adds its tag to the search, and the keyboard moves
+        // to the search, which now holds the filter, with nothing selected.
+        assert!(pump_until(ctx, 5, || review.grab_focus()));
+        let focus_now = || {
+            gtk4::prelude::GtkWindowExt::focus(&*window).map(|w| {
+                format!(
+                    "{} {:?} {}",
+                    w.type_().name(),
+                    w.css_classes(),
+                    w.widget_name()
+                )
+            })
+        };
+        assert!(
+            pump_until(ctx, 5, || review.has_focus()),
+            "the chip takes the focus: {:?}",
+            focus_now()
+        );
+        let in_search = || {
+            gtk4::prelude::GtkWindowExt::focus(&*window).is_some_and(|w| {
+                w.is_ancestor(&sidebar.search)
+                    || w == sidebar.search.clone().upcast::<gtk4::Widget>()
+            })
+        };
+        review.emit_clicked();
+        assert_eq!(sidebar.search.text().as_str(), "#ops #review");
+        assert!(pump_until(ctx, 5, || listed(a) && !listed(b)));
+        assert!(
+            pump_until(ctx, 5, || in_search()
+                && sidebar.list.first_child().is_some()),
+            "focus is on the search, not {:?}",
+            focus_now()
+        );
+        // Settled past the list's rebuild, the keyboard is still there.
+        settle(ctx);
+        assert!(in_search(), "{:?}", focus_now());
+        assert_eq!(sidebar.search.selection_bounds(), None, "nothing selected");
+        assert_eq!(
+            sidebar.search.position(),
+            "#ops #review".chars().count() as i32
+        );
+        sidebar.search.set_text("");
+        assert!(pump_until(ctx, 5, || listed(b)));
+
+        // Archiving keeps the tags.
+        imp.set_thread_archived(a, true);
+        assert!(pump_until(ctx, 10, || reader
+            .thread_summary(a)
+            .unwrap()
+            .is_some_and(|t| t.archived)));
+        assert_eq!(tags_of(a), ["ops", "review"]);
+        imp.set_thread_archived(a, false);
+        assert!(pump_until(ctx, 10, || !reader
+            .thread_summary(a)
+            .unwrap()
+            .unwrap()
+            .archived));
+
+        // Clear Tags, then Undo.
+        imp.run_thread_action(ThreadAction::ClearTags(a.to_owned()));
+        assert!(pump_until(ctx, 10, || tags_of(a).is_empty() && last_is("Tags cleared")));
+        assert!(
+            reader.tag_colours().unwrap().is_empty(),
+            "no thread has the tag: its colour goes"
+        );
+        let toast = imp.test_toasts.borrow().last().cloned().unwrap();
+        toast.emit_by_name::<()>("button-clicked", &[]);
+        assert!(pump_until(ctx, 10, || tags_of(a) == ["ops", "review"]));
+        assert_eq!(
+            reader.tag_colours().unwrap().get("review"),
+            Some(&TagColour::Warning),
+            "Undo brings the colour back too"
+        );
+
+        // The dialog: what would be refused keeps Save off and says why; a new tag is saved.
+        imp.run_thread_action(ThreadAction::EditTags(b.to_owned()));
+        let open = || {
+            adw::prelude::AdwApplicationWindowExt::visible_dialog(&*window)
+                .and_then(|d| d.downcast::<adw::AlertDialog>().ok())
+                .filter(|d| d.heading().as_deref() == Some("Thread Tags"))
+        };
+        assert!(pump_until(ctx, 5, || open().is_some()), "the Tags dialog");
+        let dialog = open().unwrap();
+        let entry: gtk4::Entry = find_first(dialog.upcast_ref()).expect("the entry");
+        let checks: Vec<gtk4::CheckButton> =
+            crate::testutil::find_all(dialog.upcast_ref::<gtk4::Widget>());
+        assert_eq!(checks.len(), 2, "every known tag is offered");
+        assert!(checks.iter().all(|c| !c.is_active()), "none is b's yet");
+        entry.set_text("fine, not\u{7}fine");
+        assert!(!dialog.is_response_enabled("save"));
+        entry.set_text("AKIAIOSFODNN7EXAMPLE");
+        assert!(!dialog.is_response_enabled("save"), "a secret is refused");
+        entry.set_text("Spike");
+        assert!(dialog.is_response_enabled("save"));
+        let save = crate::window::imp::test_support::button_labelled(dialog.upcast_ref(), "Save")
+            .expect("Save");
+        assert!(pump_until(ctx, 10, || save.is_mapped() && save.is_sensitive()));
+        settle(ctx);
+        save.emit_clicked();
+        assert!(pump_until(ctx, 10, || tags_of(b) == ["spike"]));
+        assert_eq!(
+            tags_of(a),
+            ["ops", "review"],
+            "the other thread is untouched"
+        );
+
+        // Clean up for what follows.
+        imp.run_thread_action(ThreadAction::ClearTags(a.to_owned()));
+        imp.run_thread_action(ThreadAction::ClearTags(b.to_owned()));
+        assert!(pump_until(ctx, 10, || tags_of(a).is_empty() && tags_of(b).is_empty()));
+    }
+
     /// Through the store writer: an unsent message makes closing ask; a blank thread left is
     /// discarded with a toast whose Undo makes it again as it was (two toasts at once each undo
     /// their own); an archive's toast comes after the write and its Undo brings the thread back;
@@ -12726,6 +13012,9 @@ pub(super) mod tests {
         crate::testutil::gtk_init().unwrap();
         crate::testutil::adw_init().unwrap();
         crate::icons::register();
+        // The app's stylesheet, as the app loads it before any window: the tag chips are checked
+        // for the colour it gives them.
+        crate::load_css();
         let config_home = tempfile::tempdir().unwrap();
         std::env::set_var("XDG_CONFIG_HOME", config_home.path());
         let state = tempfile::tempdir().unwrap();
@@ -12936,6 +13225,7 @@ pub(super) mod tests {
         // Pins, between two threads that are stored and not open.
         pinning_does_not_reorder_folder_groups(imp, &ctx, &reader, &named);
         pin_unpin_round_trip_through_the_writer(imp, &ctx, &reader, &named, &kept);
+        tags_round_trip_through_the_writer(imp, &ctx, &reader, &named, &kept);
 
         // A page closed before it was ever built: Undo still gets back what the store held.
         let tree = tempfile::tempdir().unwrap();

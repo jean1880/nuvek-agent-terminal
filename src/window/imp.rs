@@ -1439,6 +1439,8 @@ pub struct AgentTerminalWindow {
     /// The stored threads as of the last load (archived included): the sidebar draws from this
     /// and never reads the store itself. Reloaded off the main thread when the store changes.
     summaries: RefCell<Option<Vec<agent_kit::store::ThreadSummary>>>,
+    /// The tags' colours, loaded with `summaries`.
+    tag_colours: RefCell<std::collections::BTreeMap<String, agent_core::thread_tag::TagColour>>,
     summaries_loading: std::cell::Cell<bool>,
     /// The "stop running threads and close?" question is on screen.
     close_prompt_open: std::cell::Cell<bool>,
@@ -9254,7 +9256,8 @@ mod tests {
         imp.reload_summaries();
         let rows = imp.sidebar_rows();
         assert_eq!(rows.iter().filter(|r| r.archived).count(), 1);
-        let hidden = crate::window::sidebar_model::group_rows(rows.clone(), "", false);
+        let hidden =
+            crate::window::sidebar_model::group_rows(rows.clone(), &Default::default(), false);
         assert_eq!(
             hidden.iter().map(|(_, r)| r.len()).sum::<usize>(),
             2,

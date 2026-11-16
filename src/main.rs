@@ -455,7 +455,7 @@ fn load_css() {
     // The agents' colours (`@brand_claude`…), which no theme changes.
     brand::install();
     let provider = CssProvider::new();
-    provider.load_from_data(
+    provider.load_from_data(&[
         "
         window {
             background-color: @at_bg;
@@ -678,6 +678,9 @@ fn load_css() {
             color: @at_fg;
         }
         ",
+        &palette::tag_chip_css(),
+    ]
+    .concat()
     );
     gtk4::style_context_add_provider_for_display(
         &gdk::Display::default().expect("Could not connect to a display."),

@@ -75,8 +75,12 @@ Architectural mandates, standards, and workflows for this codebase.
     dividers, capped fenced tool output, a final redaction pass; `agent-kit`'s `export` reads,
     renders and writes it `0600` and atomically) and `remote` (machines reached with the user's
     `ssh`: host validation, the remote folder, POSIX quoting and the exact `ssh` argv of a
-    terminal page and of the reachability check) and `search_query` (what the user types into
-    message search as an FTS5 query: quoted phrases, the last a prefix, never a syntax error)
+    terminal page and of the reachability check) and `search_query` (the sidebar search's one
+    grammar, `SearchQuery`: plain words, and `#tag` words that filter by tag, ANDed; `compile`
+    makes only the plain words an FTS5 query: quoted phrases, the last a prefix, never a syntax
+    error) and `thread_tag` (a thread's tags: one lowercased word of at most 32 characters, at
+    most 8 a thread, refused, never masked, when redaction would change it; and `TagColour`, a
+    tag's optional colour as a theme token)
     and `saved_prompts` (the user's saved prompts: name, body and folder rules, the typeahead's
     items, and the one placeholder resolver, `parse`/`resolve`/`Values`, which redacts every
     value before it caps it) and `commit_message` (a diff-panel commit's message check, its
@@ -127,7 +131,17 @@ Architectural mandates, standards, and workflows for this codebase.
     indexes, from start-up, every thread `Store::search_pending` names, one writer job at a
     time, and is stopped before the writer shuts down (`close_store_writer`). A delegated
     worker's hidden backing thread is never indexed, listed as pending or found. `Store::search` (queries compiled by `agent_core::search_query`, which no input can
-    make fail) is a read, run only through `store_job`.
+    make fail; its `#tag` terms never reach the `MATCH`, they keep the threads holding every
+    one) is a read, run only through `store_job`.
+    Pins and tags never touch `updated_at`, and a hidden backing thread is never pinned or
+    tagged. `Store::set_tags` replaces a thread's tags in one write, checked again by
+    `thread_tag::tag_set` (a refused set leaves the old one); `ThreadSummary::tags` comes in the
+    same summary query. Tag colours are the `meta` key `tag_colours` (tag to `TagColour` token,
+    never a literal colour; `set_tag_colours`), pruned of tags no thread holds whenever tags
+    are set or a thread deleted. The sidebar draws a tag's colour only as a `tag-<token>` class
+    over the `@at_*` names (`palette::tag_chip_css`), so `ThemeChoice::System` brings the
+    desktop's; chip text is `@at_fg_strong` on the label itself, and `TAG_CHIP_TINT` is what
+    `tag_chip_text_reads_on_every_tint` lets every scheme read at AA on every row state.
     `store/spend.rs` is the spending history: `Store::spend_rows` reads live threads' completed
     turns through `events_turns` (the query repeats its WHERE term with the literal
     `'turn_completed'`) plus `spend_ledger`, attributing a delegated worker's turns to its root
@@ -168,9 +182,11 @@ Architectural mandates, standards, and workflows for this codebase.
     messages) or its build takes and passes to `ChatView::show_item`; a jump waits for its row
     to be laid out, never falling back to the end; its snippets go through
     `sidebar_model::snippet_markup`, which escapes every character and makes only the match
-    markers bold), `window/sidebar_model.rs` (pure sidebar logic), `window/imp/commit.rs` (the
-    diff panel's commit dialog and flow), `window/diff_panel.rs` (the diff panel's widgets, its
-    file tick boxes, "Commit…" and "Open a PR" bars; it pops out into its own window, keeping its
+    markers bold), `window/sidebar_model.rs` (pure sidebar logic: sections, the `SearchQuery`
+    filter on titles, folders and tags, tag chips and the Tags dialog's choices),
+    `window/imp/commit.rs` (the diff panel's commit dialog and flow), `window/diff_panel.rs` (the
+    diff panel's widgets, its file tick boxes, "Commit…" and "Open a PR" bars; it pops out into
+    its own window, keeping its
     place, hidden, as its identity, and docks back when that window closes or its page leaves),
     `main.rs` (app setup + logging, and the `agent_kit`
     imports that keep `crate::git::…` paths).
@@ -291,6 +307,9 @@ Architectural mandates, standards, and workflows for this codebase.
   prompt's placeholder values (`{file}`, `{selection}`, `{folder}`, `{branch}`) are redacted
   when they are given to `saved_prompts::Values` (a selection before it is cut to 8 KB);
   the expanded text only fills the draft, never sends, and is then the user's own prompt.
+  A thread's tag is shown on every row, so one that redaction would change is refused (by the
+  Tags dialog and again by `Store::set_tags`), never stored masked; tags are never injected
+  into a prompt or a hand-off.
 - **Images are kept by ref, decoded under bounds, and never redacted, so never sent unasked**:
   an image a user attaches (picked, pasted, dropped) or an agent's tool returns is decoded under
   `agent_kit::attachments::normalise`'s limits (20 MB, 16 384 px a side, bounded allocation),

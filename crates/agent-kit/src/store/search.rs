@@ -316,7 +316,8 @@ impl Store {
 
     /// Finds `query` (what the user typed: [`agent_core::search_query::compile`]) in the indexed
     /// items of every visible thread, archived ones only with `include_archived`, the best
-    /// `limit` first. A read: it takes no lock, and runs on any connection.
+    /// `limit` first. Its `#tag` terms are never searched for: they keep only the threads that
+    /// hold every one of those tags. A read: it takes no lock, and runs on any connection.
     pub fn search(
         &self,
         query: &str,
@@ -329,6 +330,11 @@ impl Store {
         let Some(matching) = agent_core::search_query::compile(query) else {
             return Ok(SearchResults::Hits(Vec::new()));
         };
+        // `#tag` terms never reach the MATCH: they keep the hits of threads holding every one.
+        let tags = agent_core::search_query::SearchQuery::parse(query).tags;
+        if tags.len() > agent_core::thread_tag::MAX_TAGS {
+            return Ok(SearchResults::Hits(Vec::new())); // no thread holds that many
+        }
         let sql = format!(
             "SELECT i.thread_id, i.item_id, i.first_seq, i.role, i.at,
                     snippet(search_fts, 0, ?2, ?3, '…', 16), search_fts.rank, t.archived
@@ -336,6 +342,9 @@ impl Store {
              JOIN search_items i ON i.id = search_fts.rowid
              JOIN threads t ON t.id = i.thread_id
              WHERE search_fts MATCH ?1 AND (?4 OR t.archived = 0) AND {NOT_HIDDEN_CHILD}
+               AND (SELECT COUNT(*) FROM thread_tags g
+                    WHERE g.thread_id = i.thread_id
+                      AND g.tag IN (SELECT value FROM json_each(?6))) = ?7
              ORDER BY search_fts.rank, i.id LIMIT ?5"
         );
         let mut stmt = self.conn.prepare_cached(&sql)?;
@@ -345,7 +354,9 @@ impl Store {
                 SNIPPET_OPEN.to_string(),
                 SNIPPET_CLOSE.to_string(),
                 include_archived,
-                limit.min(i64::MAX as usize) as i64
+                limit.min(i64::MAX as usize) as i64,
+                serde_json::to_string(&tags)?,
+                tags.len() as i64
             ],
             |r| {
                 Ok(SearchHit {
@@ -780,6 +791,40 @@ mod tests {
         assert!(all.iter().any(|h| h.thread_id == two && h.archived));
         // Nothing to look for is no hit, never an error.
         assert!(hits(&s, "  \"*  ").is_empty());
+    }
+
+    #[test]
+    fn tag_terms_filter_the_hits_and_are_never_searched_for() {
+        let s = store();
+        let one = s.create_thread("/w", Some("one")).expect("thread");
+        let two = s.create_thread("/w", Some("two")).expect("thread");
+        append(&s, &one, reply("r", "deploy the review build"));
+        append(&s, &two, reply("r", "deploy notes"));
+        index_all(&s, &one);
+        index_all(&s, &two);
+        s.set_tags(&one, &["review", "ops"]).expect("tag");
+        s.set_tags(&two, &["ops"]).expect("tag");
+        let threads = |query: &str| -> Vec<String> {
+            let mut t: Vec<String> = hits(&s, query).into_iter().map(|h| h.thread_id).collect();
+            t.sort();
+            t
+        };
+        let mut both = vec![one.clone(), two.clone()];
+        both.sort();
+        assert_eq!(threads("deploy"), both);
+        assert_eq!(threads("deploy #review"), std::slice::from_ref(&one));
+        assert_eq!(threads("#OPS deploy"), both, "tags match lowercased");
+        assert_eq!(
+            threads("deploy #ops #review"),
+            std::slice::from_ref(&one),
+            "ANDed"
+        );
+        assert!(threads("deploy #nothing").is_empty());
+        // `#review` is a filter, never a word: "review" alone finds the first thread's text,
+        // but a tag term on its own searches no message.
+        assert_eq!(threads("review"), std::slice::from_ref(&one));
+        assert!(threads("#review").is_empty());
+        assert!(threads("#ops #review #a #b #c #d #e #f #g deploy").is_empty());
     }
 
     fn image(name: &str) -> agent_core::attachment::AttachmentRef {

@@ -226,6 +226,60 @@ pub const SYSTEM_COLOURS: [(&str, &str); 27] = [
     ("at_info", "@accent_color"),
 ];
 
+/// How much of a tag's colour tints its chip's ground (the rest is the row beneath). The chip
+/// text contrast test decides it: low enough that the strong text colour still reads at AA on
+/// every scheme, on a plain, hovered, selected or glowing row.
+pub const TAG_CHIP_TINT: f64 = 0.12;
+/// How much of its colour a tinted chip's border takes.
+const TAG_CHIP_BORDER: f64 = 0.7;
+
+/// The sidebar's tag chips: their shape, a text colour of their own (`@at_fg_strong`, set on
+/// the label itself, since the app-wide `label` rule would otherwise win), and for each
+/// [`agent_core::thread_tag::TagColour`] a tint and a border from its palette name (`tag-<key>`
+/// draws `@at_<key>`), never a literal colour, so the system theme draws the desktop's.
+/// Pointing at or pressing a chip changes only its border: the flat button's own wash, toward
+/// the text colour, would take the text below AA on a tinted ground.
+pub fn tag_chip_css() -> String {
+    let mut css = String::from(
+        "button.tag-chip {
+            min-height: 24px;
+            min-width: 24px;
+            padding: 0 6px;
+            border-radius: 12px;
+            font-size: 0.8em;
+            color: @at_fg_strong;
+            border: 1px solid alpha(@at_fg_soft, 0.35);
+        }
+        button.tag-chip label {
+            color: @at_fg_strong;
+        }
+        button.tag-chip:hover,
+        button.tag-chip:active,
+        button.tag-chip:checked {
+            background-color: transparent;
+            border-color: @at_fg_soft;
+        }
+",
+    );
+    for colour in agent_core::thread_tag::TagColour::ALL {
+        let key = colour.key();
+        css.push_str(&format!(
+            "        button.tag-chip.tag-{key} {{
+            background-color: alpha(@at_{key}, {TAG_CHIP_TINT});
+            border-color: alpha(@at_{key}, {TAG_CHIP_BORDER});
+        }}
+        button.tag-chip.tag-{key}:hover,
+        button.tag-chip.tag-{key}:active,
+        button.tag-chip.tag-{key}:checked {{
+            background-color: alpha(@at_{key}, {TAG_CHIP_TINT});
+            border-color: @at_{key};
+        }}
+"
+        ));
+    }
+    css
+}
+
 /// The shadow under floating chrome (the interruption shelf). Translucent, so it stays apart
 /// from [`Chrome::named`] (opaque colours, read back by probes): a bundled palette draws a
 /// neutral black, the system theme libadwaita's own shade, so the desktop decides.
@@ -936,6 +990,88 @@ mod tests {
                 let ratio = text.contrast(bg);
                 assert!(ratio >= MIN_TEXT_CONTRAST, "{mode}: {name} at {ratio:.2}:1");
             }
+        }
+    }
+
+    /// A tag chip's text (`@at_fg_strong`) reads at AA in every bundled scheme, for every tag
+    /// colour and an uncoloured chip, over the chip's own ground: the sidebar, as a row draws it
+    /// (plain, hovered, selected, glowing for attention), tinted by the tag's colour. A pointed
+    /// at or pressed chip keeps that ground ([`tag_chip_css`]), so it is the same.
+    #[test]
+    fn tag_chip_text_reads_on_every_tint() {
+        use agent_core::thread_tag::TagColour;
+        for choice in ThemeChoice::ALL {
+            let Some(c) = Chrome::for_choice(choice) else {
+                continue; // the desktop's own colours: nothing bundled to measure
+            };
+            // `.thread-sidebar`: mix(@at_bg_deep, @at_bg, 0.35).
+            let sidebar = c.bg_deep.mix(c.bg, 0.35);
+            let rows = [
+                ("plain", sidebar),
+                ("hovered", sidebar.mix(c.fg, 0.04)),
+                ("selected", sidebar.mix(c.fg, 0.10)),
+                ("selected and hovered", sidebar.mix(c.fg, 0.14)),
+                ("selected by accent", sidebar.mix(c.accent, 0.25)),
+                ("glowing", sidebar.mix(c.warning, 0.22)),
+            ];
+            let tints: Vec<(&str, Option<Rgb>)> = std::iter::once(("none", None))
+                .chain(TagColour::ALL.into_iter().map(|t| {
+                    let tone = match t {
+                        TagColour::Accent => c.accent,
+                        TagColour::Success => c.success,
+                        TagColour::Warning => c.warning,
+                        TagColour::Danger => c.danger,
+                    };
+                    (t.key(), Some(tone))
+                }))
+                .collect();
+            for (row, ground) in rows {
+                for (tag, tone) in &tints {
+                    // Hovered or pressed, a chip keeps this ground: only its border changes.
+                    let chip = tone.map_or(ground, |t| ground.mix(t, TAG_CHIP_TINT));
+                    let ratio = c.fg_strong.contrast(chip);
+                    assert!(
+                        ratio >= MIN_TEXT_CONTRAST,
+                        "{choice}: chip tinted {tag} on a {row} row at {ratio:.2}:1"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The chips' stylesheet has a rule for every tag colour, names only palette colours, and
+    /// sets the label's own colour (the app-wide `label` rule would otherwise beat the button's).
+    #[test]
+    fn the_tag_chip_stylesheet_names_only_palette_colours() {
+        let css = tag_chip_css();
+        for colour in agent_core::thread_tag::TagColour::ALL {
+            assert!(css.contains(&format!("button.tag-chip.tag-{} {{", colour.key())));
+            assert!(css.contains(&format!("alpha(@at_{}, {TAG_CHIP_TINT})", colour.key())));
+            // Pointing or pressing keeps the tint, never the flat button's wash.
+            let key = colour.key();
+            assert!(css.contains(&format!(
+                "button.tag-chip.tag-{key}:checked {{\n            background-color: \
+                 alpha(@at_{key}, {TAG_CHIP_TINT});"
+            )));
+        }
+        assert!(
+            css.contains("button.tag-chip:checked {\n            background-color: transparent;")
+        );
+        assert!(css.contains("button.tag-chip label {\n            color: @at_fg_strong;"));
+        let defined: Vec<&str> = Chrome::agent_terminal()
+            .named()
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        for (at, _) in css.match_indices("@at_") {
+            let name: String = css[at + 1..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            assert!(defined.contains(&name.as_str()), "@{name}");
+        }
+        for literal in ["#", "rgb(", "rgba("] {
+            assert!(!css.contains(literal), "{literal}");
         }
     }
 

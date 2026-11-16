@@ -686,6 +686,32 @@ impl ChatView {
         }
     }
 
+    /// Sends a review from the diff panel as one message of the user's: queued behind a running
+    /// turn (shown as queued, where the composer can take it back to edit), never steered into
+    /// it; sent at once otherwise, which starts a stopped agent as any message does. The draft
+    /// in the composer is left alone. `text` is the composed review, already redacted (the
+    /// session redacts it again); it is refused, and false returned, when empty or when it would
+    /// read as a slash command.
+    pub fn submit_review(&self, text: &str) -> bool {
+        let Some(inner) = self.inner() else {
+            return false;
+        };
+        if text.trim().is_empty() || text.trim_start().starts_with('/') {
+            return false;
+        }
+        let running = inner.backend.status().running_turn;
+        inner.transcript.scroll_to_end();
+        if running {
+            inner.backend.queue_prompt(text);
+        } else {
+            inner.subagent_shelf.clear_finished();
+            inner.refresh_subagents(&[]);
+            inner.backend.send_prompt(text);
+        }
+        inner.refresh_status();
+        true
+    }
+
     /// Whether the composer holds unsent text (a thread with one is not blank).
     pub fn has_draft(&self) -> bool {
         self.inner()
@@ -2398,6 +2424,52 @@ pub(crate) mod tests {
         window.close();
     }
 
+    /// A review goes as one message: sent when the agent is idle, queued behind a running turn
+    /// even for an agent that takes input mid-turn, and never read as a command.
+    #[test]
+    #[ignore = "constructs GTK widgets; run on a private display"]
+    fn a_review_is_queued_behind_a_running_turn_and_never_steered() {
+        crate::testutil::gtk_init().expect("GTK init");
+        crate::testutil::adw_init().expect("adw init");
+        let review = agent_core::review::compose(&[agent_core::review::ReviewComment {
+            path: "src/a.rs".into(),
+            side: agent_core::review::Side::New,
+            start: 3,
+            end: 4,
+            quoted: vec!["+a".into(), "+b".into()],
+            note: "Split this.".into(),
+            located: agent_core::review::Located::Exact,
+        }])
+        .text;
+        for driver in Driver::ALL {
+            let backend = StubBackend::fixed(driver);
+            let view = ChatView::new(backend.clone());
+            view.set_draft("half a message");
+            assert!(view.submit_review(&review));
+            for live in [false, true] {
+                {
+                    let mut status = backend.status.borrow_mut();
+                    status.running_turn = true;
+                    status.capabilities.live_input = live;
+                }
+                assert!(view.submit_review(&review));
+            }
+            assert_eq!(
+                *backend.routes.borrow(),
+                vec![
+                    ("send", review.clone()),
+                    ("queue", review.clone()),
+                    ("queue", review.clone()),
+                ],
+                "{driver:?}: one message each time, never steered"
+            );
+            assert!(view.has_draft(), "the composer's own draft is left alone");
+            assert!(!view.submit_review("/model x"));
+            assert!(!view.submit_review("  "));
+            assert_eq!(backend.routes.borrow().len(), 3);
+        }
+    }
+
     /// Transitions ease colour and opacity only: a transitioned size or spacing would relayout the
     /// transcript every frame and fight its stick-to-bottom. Every animation names a keyframes
     /// block that exists.
@@ -2640,6 +2712,8 @@ pub(crate) mod tests {
         pub(super) status: RefCell<SessionStatus>,
         /// Prompts sent, queued or steered.
         pub(super) sent: RefCell<Vec<String>>,
+        /// How each prompt went: `send`, `queue` or `steer`, with its text.
+        pub(super) routes: RefCell<Vec<(&'static str, String)>>,
         pub(super) controls: RefCell<Vec<(String, Control)>>,
         pub(super) approvals: RefCell<Vec<(String, Decision)>>,
         pub(super) forms: RefCell<
@@ -2671,6 +2745,7 @@ pub(crate) mod tests {
             Rc::new(Self {
                 status: RefCell::new(status),
                 sent: RefCell::default(),
+                routes: RefCell::default(),
                 controls: RefCell::default(),
                 approvals: RefCell::default(),
                 forms: RefCell::default(),
@@ -2705,6 +2780,15 @@ pub(crate) mod tests {
         }
         fn send_prompt(&self, text: &str) {
             self.sent.borrow_mut().push(text.to_owned());
+            self.routes.borrow_mut().push(("send", text.to_owned()));
+        }
+        fn queue_prompt(&self, text: &str) {
+            self.sent.borrow_mut().push(text.to_owned());
+            self.routes.borrow_mut().push(("queue", text.to_owned()));
+        }
+        fn steer_prompt(&self, text: &str) {
+            self.sent.borrow_mut().push(text.to_owned());
+            self.routes.borrow_mut().push(("steer", text.to_owned()));
         }
         fn interrupt(&self) {}
         fn respond_approval(&self, request: &str, decision: Decision) {

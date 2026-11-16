@@ -189,6 +189,26 @@ const HAND_BOUND: &[HandBound] = &[
     hand("Left", "image viewer open", "chat/view/images.rs"),
     hand("Right", "image viewer open", "chat/view/images.rs"),
     hand("z", "image viewer open", "chat/view/images.rs"),
+    hand(
+        "<Control><Alt>m",
+        "diff panel file view focused",
+        "window/diff_panel/review.rs",
+    ),
+    hand(
+        "Return",
+        "diff comment editor focused",
+        "window/diff_panel/review.rs",
+    ),
+    hand(
+        "KP_Enter",
+        "diff comment editor focused",
+        "window/diff_panel/review.rs",
+    ),
+    hand(
+        "ISO_Enter",
+        "diff comment editor focused",
+        "window/diff_panel/review.rs",
+    ),
 ];
 
 /// A hand-matched key that is allowed to equal an application accelerator, with the reason

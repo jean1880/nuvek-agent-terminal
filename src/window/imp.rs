@@ -192,6 +192,12 @@ const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
             </child>
             <child>
               <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;&lt;Alt&gt;M</property>
+                <property name="title">Comment on the Selected Diff Lines (in the Changes Panel)</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
                 <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;F</property>
                 <property name="title">Search</property>
               </object>
@@ -6486,6 +6492,38 @@ impl AgentTerminalWindow {
             }
         });
 
+        // Review comments: every change is written whole, redacted, through the store writer.
+        panel.connect_review_persist(|thread, drafts| {
+            let what = if drafts.is_empty() {
+                "delete review comments"
+            } else {
+                "save review comments"
+            };
+            let handle = threads::app_handle();
+            let owned = thread.clone();
+            if let Err(e) = handle.write(what, Some(&thread), move |s| {
+                s.replace_review_drafts(&owned, &drafts)
+            }) {
+                warn!("Could not save the review comments: {e}");
+            }
+        });
+
+        // "Send Review": one message to the panel's own thread, queued behind a running turn.
+        let root = panel.root.clone();
+        panel.connect_send_review(move |text| {
+            let obj = window_of(&root).ok_or_else(|| "the thread is not open".to_owned())?;
+            let view = obj
+                .imp()
+                .tab_by_panel(&root, |t| t.chat.as_ref().and_then(|c| c.view.clone()))
+                .flatten()
+                .ok_or_else(|| "the thread is not open".to_owned())?;
+            if view.submit_review(&text) {
+                Ok(())
+            } else {
+                Err("the thread did not take it".to_owned())
+            }
+        });
+
         // "Open in …" on a file row.
         let root = panel.root.clone();
         panel.connect_open(move |file| {
@@ -6604,6 +6642,23 @@ impl AgentTerminalWindow {
             // No panel to read it for, but the subtitle still follows the branch.
             self.refresh_branch(page);
             return;
+        }
+        // A thread's panel takes comments; its saved ones are read once, off the main thread.
+        if let Some(thread) = thread_id.clone() {
+            if panel.bind_review(&thread) {
+                let loader = panel.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let owned = thread.clone();
+                    match threads::store_job(move |s| s.review_drafts(&owned)).await {
+                        Some(Ok(drafts)) => loader.restore_review(&thread, drafts),
+                        Some(Err(e)) => {
+                            warn!("Could not read the review comments: {e}");
+                            loader.review_load_failed(&thread);
+                        }
+                        None => loader.review_load_failed(&thread),
+                    }
+                });
+            }
         }
         let base = panel.base();
         let generation = panel.begin();
@@ -8539,6 +8594,7 @@ mod tests {
             window.upcast_ref(),
         );
         super::super::diff_panel::tests::the_commit_bar_follows_the_view_and_the_ticks();
+        super::super::diff_panel::tests::comments_are_kept_anchored_and_sent_as_one_review();
         commit::tests::the_commit_dialog_follows_its_message();
         crate::chat::view::tests::ui_checks();
         crate::chat::view::tests::diff_ui_checks();
@@ -9473,9 +9529,10 @@ mod tests {
             .all(|f| !f.is_expanded() && f.child().is_none()));
         // Order under the headers: README.md, then src/a.rs, src/b.rs.
         files[1].set_expanded(true);
+        // The view, above the list of its comments.
         let view = files[1]
             .child()
-            .and_then(|c| c.downcast::<gtk4::TextView>().ok())
+            .and_then(|c| crate::testutil::find_first::<gtk4::TextView>(&c))
             .expect("a.rs's diff view");
         let buffer = view.buffer();
         let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);

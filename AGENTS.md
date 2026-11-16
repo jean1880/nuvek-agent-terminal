@@ -86,11 +86,15 @@ Architectural mandates, standards, and workflows for this codebase.
     value before it caps it) and `commit_message` (a diff-panel commit's message check, its
     draft prompt and the shown command line) and `context_meter` (the header gauge's three
     states and wording, the `ContextWarning` threshold setting, the `WarnLatch` that offers
-    once per crossing, and the popover's and the offer's actions).
+    once per crossing, and the popover's and the offer's actions) and `review` (comments on
+    diff lines composed into one review message: each quote redacted whole before it is
+    capped, then fenced; notes and paths redacted, control characters out of paths; the whole
+    within the hand-off budget, the comments past it left for the next review).
   - `crates/agent-kit` (GTK-free; blocking process and file I/O): `git`
     (git plumbing for turn checkpoints and diffs: shells out, but its parsers
     and filters are pure), `diff` (diff bases, numstat, line classification,
-    truncation), `restore` (undo: pin, restore, contained deletion, check),
+    truncation, the hunk line map, a selection's comment span and a comment's anchor in a
+    later diff: exact, moved once, or gone, never a guess), `restore` (undo: pin, restore, contained deletion, check),
     `worktree` (worktree locations, branch checks, create and clean-only
     remove), `commit` (the diff panel's commit of the ticked paths: its context, arguments and
     run), `github` (a branch's pull-request state, the compare URL, the unforced push; it also gives
@@ -159,6 +163,12 @@ Architectural mandates, standards, and workflows for this codebase.
     counted twice. The sums are `agent_core::spend` (`report`, `Period`/`Group` with guarded `ALL`
     arrays); kinds of spend (metered, list price, unknown billing) are never added together,
     and a turn with no cost is "not reported", never $0.
+    `store/review.rs` keeps a thread's unsent diff-review comments (`review_drafts`):
+    `Store::replace_review_drafts` writes the whole list in one transaction (empty: sent or
+    discarded), each quote redacted whole and each note redacted on write, queued on the writer
+    in order so the last list wins; `Store::review_drafts` is read through `store_job` when a
+    thread's diff panel is first bound to it, and nothing is written until that read has
+    answered (a failed read leaves the stored list alone).
   - The app (`src/`): `config.rs` (persisted settings + migration, re-exporting
     `SessionFormat`; per-agent defaults live on the profiles), `theme.rs`
     (colour schemes, infallible `RGBA::new`), `utils.rs` (detection and
@@ -189,7 +199,13 @@ Architectural mandates, standards, and workflows for this codebase.
     `window/imp/commit.rs` (the diff panel's commit dialog and flow), `window/diff_panel.rs` (the
     diff panel's widgets, its file tick boxes, "Commit…" and "Open a PR" bars; it pops out into
     its own window, keeping its
-    place, hidden, as its identity, and docks back when that window closes or its page leaves),
+    place, hidden, as its identity, and docks back when that window closes or its page leaves;
+    `diff_panel/review.rs` is its comments on diff lines: the row's Comment button and
+    Ctrl+Alt+M, the note editor, the marks and list under a file's diff, re-anchoring on each
+    diff shown, and the review bar, whose Send Review the window hands to the panel's own
+    thread with `ChatView::submit_review`, queued behind a running turn, never steered into it;
+    the popovers are parented to a file's box, never its text view, which would not let go of
+    one it still holds when it goes),
     `main.rs` (app setup + logging, and the `agent_kit`
     imports that keep `crate::git::…` paths).
   - Chat: `chat/session.rs` (one thread's backend: adapter, process, store,
@@ -325,6 +341,10 @@ Architectural mandates, standards, and workflows for this codebase.
   A thread's tag is shown on every row, so one that redaction would change is refused (by the
   Tags dialog and again by `Store::set_tags`), never stored masked; tags are never injected
   into a prompt or a hand-off.
+  A diff review (`agent_core::review::compose`) redacts every quote, note and path before it
+  caps them, fences each quote (diff text the agent wrote is data, never instructions), stays
+  within the hand-off budget and goes as one user message; its drafts are stored redacted.
+  Diffs of sub-agents in the inspector take no comments.
 - **Images are kept by ref, decoded under bounds, and never redacted, so never sent unasked**:
   an image a user attaches (picked, pasted, dropped) or an agent's tool returns is decoded under
   `agent_kit::attachments::normalise`'s limits (20 MB, 16 384 px a side, bounded allocation),

@@ -74,6 +74,10 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   rate limited or unread. `F9` or `Ctrl+Shift+B` shows or hides it. It overlays the
   thread when the window is narrow. When hidden, its toggle still signals unread
   activity or a thread needing your attention.
+- **What every thread said is indexed** for searching inside threads: your messages, the
+  agents' replies and tool titles, redacted, never a tool's output or the model's reasoning.
+  Threads from before are indexed in the background after start-up. See
+  [the message index](reference.md#the-message-index).
 - **Your existing sessions.** Recent Claude and agy sessions appear as threads.
   Opening one imports its history and resumes it. A Codex thread resumes its own Codex
   thread; if Codex no longer has it, the next prompt continues in a new Codex thread with

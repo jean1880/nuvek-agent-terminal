@@ -75,7 +75,8 @@ Architectural mandates, standards, and workflows for this codebase.
     dividers, capped fenced tool output, a final redaction pass; `agent-kit`'s `export` reads,
     renders and writes it `0600` and atomically) and `remote` (machines reached with the user's
     `ssh`: host validation, the remote folder, POSIX quoting and the exact `ssh` argv of a
-    terminal page and of the reachability check).
+    terminal page and of the reachability check) and `search_query` (what the user types into
+    message search as an FTS5 query: quoted phrases, the last a prefix, never a syntax error).
   - `crates/agent-kit` (GTK-free; blocking process and file I/O): `git`
     (git plumbing for turn checkpoints and diffs: shells out, but its parsers
     and filters are pure), `diff` (diff bases, numstat, line classification,
@@ -112,6 +113,15 @@ Architectural mandates, standards, and workflows for this codebase.
     `Store::ensure_search_fts` (the FTS5 index, by the writer before its first job; no FTS5 is
     `SearchIndex::Unavailable`, never a failed open) and `Store::ensure_spend_index`
     (`events_turns`, on first use).
+    `store/search.rs` fills the search tables: `Store::index_thread` is the only way in (queued
+    on the writer after a turn's or session's end, a user message and an import; in place on an
+    inline store), folding the stored, scrubbed rows after the thread's watermark with the
+    transcript fold (`TranscriptFold`) into user messages, replies and tool titles (never tool
+    output, reasoning, notices or `raw`), redacted whole before the upsert (`ON CONFLICT DO
+    UPDATE`); the watermark never passes an item that may still change. `search_backfill`
+    indexes, from start-up, every thread `Store::search_pending` names, one writer job at a
+    time. `Store::search` (queries compiled by `agent_core::search_query`, which no input can
+    make fail) is a read, run only through `store_job`.
   - The app (`src/`): `config.rs` (persisted settings + migration, re-exporting
     `SessionFormat`; per-agent defaults live on the profiles), `theme.rs`
     (colour schemes, infallible `RGBA::new`), `utils.rs` (detection and

@@ -1337,6 +1337,22 @@ pub(super) fn sweep_images() {
     });
 }
 
+/// How long after start-up the search backfill waits, so it never competes with opening threads.
+#[cfg_attr(test, allow(dead_code))]
+const SEARCH_BACKFILL_DELAY_S: u32 = 10;
+
+/// Indexes for search, on a thread of its own and through the store writer, every thread the
+/// index has not taken yet (`agent_kit::search_backfill`). Only with a file store and its writer.
+#[cfg_attr(test, allow(dead_code))]
+fn start_search_backfill() {
+    let Some(writer) = WRITER.with(|w| w.borrow().clone()) else {
+        return;
+    };
+    if let Err(e) = agent_kit::search_backfill::spawn(writer) {
+        warn!("Could not start indexing threads for search: {e}");
+    }
+}
+
 /// [`app_store`], reporting the one failure it cannot recover from: no SQLite at all.
 pub(super) fn try_app_store() -> Result<Rc<Store>, String> {
     if let Some(store) = STORE.with(|s| s.borrow().clone()) {
@@ -1375,6 +1391,10 @@ fn open_store() -> Result<Rc<Store>, String> {
                     Ok(writer) => {
                         let _ = PANIC_WRITER.set(writer.clone());
                         WRITER.with(|w| *w.borrow_mut() = Some(writer));
+                        glib::timeout_add_seconds_local_once(
+                            SEARCH_BACKFILL_DELAY_S,
+                            start_search_backfill,
+                        );
                     }
                     Err(e) => {
                         error!("Cannot start the store writer; saving on the main thread: {e}");
@@ -2107,6 +2127,15 @@ fn load_thread_with(
             };
             if imported {
                 history = read_history(store, thread)?;
+                // What the earlier conversation said is searchable too.
+                match writer {
+                    Some(writer) => writer.index_for_search(thread),
+                    None => {
+                        if let Err(e) = store.index_thread(thread, agent_kit::store::INDEX_BUDGET) {
+                            warn!("Could not index an imported history for search: {e}");
+                        }
+                    }
+                }
             }
         }
     }

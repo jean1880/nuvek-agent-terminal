@@ -54,7 +54,9 @@ use crate::store::delegation_typed::{
     Accept, Accepted, AckRequest, AckResult, Completed, Completion, DispatchFact, PublishEvent,
     Published, Reconciled, Reserved, Revoked, Verdict,
 };
-use crate::store::{Batch, ProviderThreadId, Result, SearchIndex, Store, StoreError, SLOW_WRITE};
+use crate::store::{
+    Batch, ProviderThreadId, Result, SearchIndex, Store, StoreError, INDEX_BUDGET, SLOW_WRITE,
+};
 
 /// Past this many bytes of WAL the writer reports an error and turns SQLite's own checkpoints
 /// back on.
@@ -598,9 +600,30 @@ impl StoreWriter {
     /// Publishes one event with its links ([`Store::publish_delegation_event`]): an ordinary
     /// (batched) write whose seq is handed back only once its batch committed.
     pub fn delegation_publish(&self, event: PublishEvent) -> Receiver<Result<Published>> {
-        self.call_result("publish a delegated event", move |s| {
+        let ends = ends_items(&event.envelope).then(|| event.thread.clone());
+        let answer = self.call_result("publish a delegated event", move |s| {
             s.publish_delegation_event(&event)
-        })
+        });
+        if let Some(thread) = ends {
+            self.index_for_search(&thread);
+        }
+        answer
+    }
+
+    /// Queues indexing `thread` for search ([`Store::index_thread`], at most [`INDEX_BUDGET`]
+    /// events) after everything queued before it. A write of its own, never forced: refused when
+    /// the queue is full (counted and shown like any refusal), and its failure never touches the
+    /// events it indexes.
+    pub fn index_for_search(&self, thread: &str) {
+        let t = thread.to_owned();
+        let _ = self.write("index a thread for search", Some(thread), move |s| {
+            s.index_thread(&t, INDEX_BUDGET).map(drop)
+        });
+    }
+
+    /// Whether the writer has stopped taking writes (it was shut down, or died).
+    pub fn is_closed(&self) -> bool {
+        self.shared.closed.lock().map_or(true, |closed| *closed)
     }
 
     /// Queues one event. An event of an item, or a turn's or session's end, is never refused:
@@ -622,12 +645,13 @@ impl StoreWriter {
         // Never refused, full queue or not: any event of an item (refusing part of one could
         // leave half a secret stored, never healed) and a turn's or session's end. Only events
         // of no item that end nothing follow the bound.
-        let force = env.item.is_some()
-            || matches!(
-                env.event,
-                Event::TurnCompleted { .. } | Event::SessionExited { .. }
-            );
-        self.write_sized("store an event", Some(thread), cost, force, job)
+        let force = env.item.is_some() || ends_items(env);
+        self.write_sized("store an event", Some(thread), cost, force, job)?;
+        // What the turn or session said is searchable once it has ended.
+        if ends_items(env) {
+            self.index_for_search(thread);
+        }
+        Ok(())
     }
 
     /// Answers once everything queued before it is committed (or has failed). Errors at once
@@ -672,6 +696,14 @@ impl StoreWriter {
             Err(RecvTimeoutError::Disconnected) => Shutdown::WriterGone,
         }
     }
+}
+
+/// A turn's or a session's end: after it, the thread is indexed for search.
+fn ends_items(env: &Envelope) -> bool {
+    matches!(
+        env.event,
+        Event::TurnCompleted { .. } | Event::SessionExited { .. }
+    )
 }
 
 /// Makes sure the store's full-text index exists ([`Store::ensure_search_fts`]), first thing on
@@ -1093,11 +1125,29 @@ impl StoreHandle {
     ) -> Result<()> {
         let writer = match self {
             Self::Inline(store) => {
-                return store.append_event(thread, provider_thread, env).map(drop)
+                store.append_event(thread, provider_thread, env)?;
+                if ends_items(env) {
+                    self.index_for_search(thread);
+                }
+                return Ok(());
             }
             Self::Queued { writer, .. } => writer,
         };
         writer.append_event(thread, provider_thread, env)
+    }
+
+    /// Indexes `thread` for search: queued after its writes ([`StoreWriter::index_for_search`]),
+    /// or in place on an inline store, where a failure is only logged (the index is never worth
+    /// failing a write for).
+    pub fn index_for_search(&self, thread: &str) {
+        match self {
+            Self::Inline(store) => {
+                if let Err(e) = store.index_thread(thread, INDEX_BUDGET) {
+                    tracing::warn!(thread, error = %e, "could not index a thread for search");
+                }
+            }
+            Self::Queued { writer, .. } => writer.index_for_search(thread),
+        }
     }
 
     /// Stores a user prompt; returns its item id (made here, so it is known before the write).
@@ -1108,7 +1158,9 @@ impl StoreHandle {
         text: &str,
     ) -> Result<String> {
         if let Self::Inline(store) = self {
-            return store.append_user_message(thread, provider_thread, text);
+            let item = store.append_user_message(thread, provider_thread, text)?;
+            self.index_for_search(thread);
+            return Ok(item);
         }
         let item = self.new_id()?;
         // Handed back only once the write is admitted.
@@ -1132,7 +1184,9 @@ impl StoreHandle {
         );
         self.write("store a message", Some(thread), move |s| {
             s.append_user_message_with_id(&t, pt.as_deref(), &i, &text)
-        })
+        })?;
+        self.index_for_search(thread);
+        Ok(())
     }
 
     /// [`Self::append_user_message`] with the refs of the images sent with it.
@@ -1144,7 +1198,9 @@ impl StoreHandle {
         refs: &[agent_core::attachment::AttachmentRef],
     ) -> Result<String> {
         if let Self::Inline(store) = self {
-            return store.append_user_input(thread, provider_thread, text, refs);
+            let item = store.append_user_input(thread, provider_thread, text, refs)?;
+            self.index_for_search(thread);
+            return Ok(item);
         }
         let item = self.new_id()?;
         // Handed back only once the write is admitted.
@@ -1170,7 +1226,9 @@ impl StoreHandle {
         );
         self.write("store a message", Some(thread), move |s| {
             s.append_user_input_with_id(&t, pt.as_deref(), &i, &text, &refs)
-        })
+        })?;
+        self.index_for_search(thread);
+        Ok(())
     }
 
     pub fn mark_read(&self, thread: &str) -> Result<()> {

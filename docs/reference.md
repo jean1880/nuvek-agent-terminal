@@ -126,6 +126,32 @@ never change a thread's last-active time. Deleting a thread removes its pin.
 | `Ctrl+Shift+P` | pins or unpins the shown thread |
 | `Alt+Shift+Up`, `Alt+Shift+Down` | moves the selected pinned row in the sidebar |
 
+### The message index
+
+Every thread is indexed for searching inside threads, always, with no setting. The index
+lives in the thread store (`threads.db`, readable only by you) next to the conversation it
+comes from, and grows the store by roughly the size of the text it holds.
+
+- **Indexed:** your messages (an attached image as `[image: name]`), the agents' replies, and
+  each tool's title as its card shows it (`Run cargo test`, `Edit src/lib.rs`).
+- **Never indexed:** a tool's output, the model's reasoning, the app's notices, the raw
+  frames an agent sent, and images themselves.
+- **Redacted:** the text is taken from what the store already holds (masked when it was
+  saved), and each item is masked again as a whole before it is indexed, so a secret that
+  arrived split across two pieces of a reply is caught there too. Each item keeps at most
+  32 KB.
+- **When:** a reply is indexed once its turn (or its agent) ends, your message as soon as it
+  is sent. An imported history is indexed when it is imported.
+- **Earlier threads:** a few seconds after start-up, threads not indexed yet (those from
+  before this version, say) are indexed in the background, the most recently active first,
+  one at a time so the app's own saving never waits. A run cut short by quitting carries on
+  at the next start, from where it stopped.
+- **Without full-text search:** a build whose SQLite lacks FTS5 still opens every thread;
+  only search is unavailable.
+
+Deleting a thread removes its part of the index. Uninstalling removes the index with the
+store.
+
 ### Status indicators
 
 Optional header-bar lights driven by a file or a command. Empty by default.

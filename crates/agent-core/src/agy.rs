@@ -554,6 +554,8 @@ impl AgyAdapter {
             usage: result.usage.as_ref().map(Usage::from),
             cost_usd: None,
             error,
+            model: None,
+            billing: None,
         }));
     }
 }
@@ -858,6 +860,8 @@ impl Adapter for AgyAdapter {
                 usage: None,
                 cost_usd: None,
                 error: (!expected).then(|| format!("agy exited unexpectedly (code {code:?})")),
+                model: None,
+                billing: None,
             }));
         }
         // An unexpected exit right after a turn in which agy denied actions: say which, and that

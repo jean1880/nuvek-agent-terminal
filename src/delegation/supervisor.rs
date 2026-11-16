@@ -325,6 +325,7 @@ mod tests {
                         default_model: Some("fixture-model".into()),
                         default_effort: None,
                         source: None,
+                        free: false,
                         local_context: Some(Default::default()),
                     });
                 }
@@ -350,6 +351,7 @@ mod tests {
                     default_model: Some("synthetic-model".into()),
                     default_effort: None,
                     source: None,
+                    free: false,
                     local_context: None,
                 })
             }),
@@ -866,6 +868,8 @@ mod tests {
                     usage: None,
                     error: None,
                     cost_usd: None,
+                    model: None,
+                    billing: None,
                 }),
                 (999, None),
                 false,

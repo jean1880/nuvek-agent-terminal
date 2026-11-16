@@ -86,6 +86,9 @@ pub struct AgentLaunch {
     /// The model server the profile this was built from runs the agent on (`None`: its vendor),
     /// as it was at launch ([`ChatSession::launched_server`]): whose usage limit the process hits.
     pub server: Option<agent_core::provider::ModelProvider>,
+    /// The profile this was built from is free to run (`config::profile_is_free`), as it was at
+    /// launch: the process's turns are stamped free.
+    pub free: bool,
 }
 
 /// `Continued on <new model> (<old> was retired)`.
@@ -344,6 +347,9 @@ struct Inner {
     /// The model server the installed agent was launched on ([`AgentLaunch::server`]); replaced
     /// at every install, rollbacks included.
     launched_server: RefCell<Option<agent_core::provider::ModelProvider>>,
+    /// The profile the installed agent was launched on is free to run ([`AgentLaunch::free`]):
+    /// its turns are stamped free. Replaced at every install, rollbacks included.
+    launched_free: Cell<bool>,
     /// Whether a switch to agy now would get its approval hook (the window's cached proof). Only
     /// says so before the switch; the launch itself proves the hook as always.
     agy_can_ask: RefCell<Option<Rc<dyn Fn() -> bool>>>,
@@ -1015,6 +1021,7 @@ impl ChatSession {
             switch_target: RefCell::new(None),
             launched_profile: RefCell::new(None),
             launched_server: RefCell::new(None),
+            launched_free: Cell::new(false),
             agy_can_ask: RefCell::new(None),
             launch_env: RefCell::new(env),
             proc: RefCell::new(None),
@@ -1165,6 +1172,12 @@ impl ChatSession {
     /// switch's [`AgentLaunch`]): see [`Self::launched_server`].
     pub fn set_launched_server(&self, server: Option<agent_core::provider::ModelProvider>) {
         *self.inner.launched_server.borrow_mut() = server;
+    }
+
+    /// Whether the profile the first process was launched on is free to run (the window's own
+    /// start, or a delegated worker's): see [`AgentLaunch::free`].
+    pub fn set_launched_free(&self, free: bool) {
+        self.inner.launched_free.set(free);
     }
 
     pub fn stage_local_context(
@@ -1523,6 +1536,7 @@ impl Inner {
             self.store_tool_image(env.item, image);
             return;
         }
+        let env = self.stamp_turn(env);
         if matches!(env.event, Event::TurnStarted { .. }) {
             self.turn_images.set(0);
         }
@@ -1575,6 +1589,23 @@ impl Inner {
         // An exit, a failed spawn: whatever the envelope changed of the lifecycle.
         self.notify_lifecycle();
         self.flush_queued_dispatch();
+    }
+
+    /// A completed turn carries the model it ran on and how it was paid for, from the agent's
+    /// own word and the profile its process was launched on (`spend::turn_billing`), so that
+    /// a profile changed later does not relabel it. Every other event passes as it is.
+    fn stamp_turn(&self, mut env: Envelope) -> Envelope {
+        if let Event::TurnCompleted { model, billing, .. } = &mut env.event {
+            if model.is_none() {
+                model.clone_from(&self.state.borrow().model);
+            }
+            *billing = agent_core::spend::turn_billing(
+                *billing,
+                self.launched_free.get(),
+                self.launched_server.borrow().is_some(),
+            );
+        }
+        env
     }
 
     /// Delivers without persisting, including transient queued-item state.
@@ -5978,6 +6009,7 @@ impl Inner {
         *self.provider_thread.borrow_mut() = pt;
         *self.launched_profile.borrow_mut() = launch.profile.clone();
         *self.launched_server.borrow_mut() = launch.server.clone();
+        self.launched_free.set(launch.free);
         self.pending_local_context.borrow_mut().take();
         *self.adapter.borrow_mut() = launch.adapter;
         self.adapter_epoch.set(self.adapter_epoch.get() + 1);
@@ -8217,6 +8249,65 @@ mod tests {
         )
     }
 
+    /// Every completed turn is stored with the model it ran on and how it was paid for: what
+    /// Claude says of its key, then the profile it was launched on (free to run costs nothing).
+    #[test]
+    fn a_completed_turn_is_stamped_with_its_model_and_billing() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, &tmp.path().to_string_lossy());
+            let init = "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\
+                        \"model\":\"claude-m\",\"apiKeySource\":\"ANTHROPIC_API_KEY\"}";
+            let result = "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\
+                          \"total_cost_usd\":0.25}";
+            let open = scripted(
+                tmp.path(),
+                &format!(
+                    "IFS= read -r handshake\n\
+                     echo '{init}'\n\
+                     echo '{result}'\n\
+                     while IFS= read -r line; do \
+                     case \"$line\" in *'\"type\":\"user\"'*) \
+                     echo '{init}'; echo '{result}';; esac; done"
+                ),
+            );
+            let (session, _seen) = harness(
+                Box::new(agent_core::claude::ClaudeAdapter::new()),
+                open,
+                &store,
+                &thread,
+            );
+            let stamps = || -> Vec<(Option<String>, Option<agent_core::spend::Billing>)> {
+                store
+                    .events(&thread, None, 1000)
+                    .expect("events")
+                    .into_iter()
+                    .filter_map(|(_, e)| match e.event {
+                        Event::TurnCompleted { model, billing, .. } => Some((model, billing)),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            assert!(pump_until(ctx, 10, || stamps().len() == 1), "no first turn");
+            session.set_launched_free(true);
+            session.send_prompt("next");
+            assert!(
+                pump_until(ctx, 10, || stamps().len() == 2),
+                "no second turn"
+            );
+            use agent_core::spend::Billing;
+            assert_eq!(
+                stamps(),
+                [
+                    (Some("claude-m".to_owned()), Some(Billing::Metered)),
+                    (Some("claude-m".to_owned()), Some(Billing::Free)),
+                ]
+            );
+            session.shutdown(true);
+        });
+    }
+
     /// Idle suspension stops the agent process without a word to the view or the store, and
     /// the next prompt starts it again resuming the same native session.
     #[test]
@@ -9726,6 +9817,8 @@ mod tests {
                     usage: None,
                     cost_usd: None,
                     error: Some("the agent exited mid-turn".into()),
+                    model: None,
+                    billing: None,
                 }));
             }
             out.push(Envelope::new(Event::SessionExited {
@@ -9893,6 +9986,7 @@ mod tests {
     fn launch_of(adapter: Box<dyn Adapter>) -> Result<AgentLaunch, String> {
         Ok(AgentLaunch {
             server: None,
+            free: false,
             profile: None,
             adapter,
             program: "unused".into(),
@@ -9927,6 +10021,7 @@ mod tests {
                 .unwrap();
                 Ok(AgentLaunch {
                     server: None,
+                    free: false,
                     profile: None,
                     adapter: FakeAdapter::boxed(d, &codex_log),
                     program: "/bin/true".into(),
@@ -9969,6 +10064,7 @@ mod tests {
                 count.set(count.get() + 1);
                 Ok(AgentLaunch {
                     server: None,
+                    free: false,
                     profile: None,
                     adapter: match d {
                         Driver::Claude => Box::new(agent_core::claude::ClaudeAdapter::new()),
@@ -10242,6 +10338,8 @@ mod tests {
                     usage: None,
                     cost_usd: None,
                     error: None,
+                    model: None,
+                    billing: None,
                 }));
             };
             // The turn that carried it failed (the agent died reading it): it goes out again.
@@ -10683,6 +10781,8 @@ mod tests {
                 usage: None,
                 cost_usd: None,
                 error: None,
+                model: None,
+                billing: None,
             })
         };
         let pending = |events: &[Envelope]| undelivered_handoff(events).map(|h| h.fence);
@@ -11006,6 +11106,8 @@ mod tests {
                 error: None,
                 usage: None,
                 cost_usd: None,
+                model: None,
+                billing: None,
             }));
             assert_eq!(
                 session.inner.generation.get(),
@@ -11040,6 +11142,8 @@ mod tests {
                 error: None,
                 usage: None,
                 cost_usd: None,
+                model: None,
+                billing: None,
             }));
             assert_eq!(session.inner.generation.get(), generation + 2);
             assert_eq!(session.inner.deferred_mode.get(), None);
@@ -11095,6 +11199,8 @@ mod tests {
                     error: None,
                     usage: None,
                     cost_usd: None,
+                    model: None,
+                    billing: None,
                 }));
             }
             assert!(pump_until(ctx, 5, || stdin_log(tmp.path()).contains("plain after")));
@@ -11133,6 +11239,8 @@ mod tests {
                 error: None,
                 usage: None,
                 cost_usd: None,
+                model: None,
+                billing: None,
             }));
             assert_eq!(
                 session.inner.generation.get(),
@@ -11174,6 +11282,7 @@ mod tests {
                 .expect("bind");
                 Ok(AgentLaunch {
                     server: None,
+                    free: false,
                     profile: None,
                     adapter: Box::new(AgyAdapter::new("agy")),
                     program: "/bin/sh".into(),
@@ -12733,6 +12842,8 @@ mod tests {
                     usage: None,
                     cost_usd: None,
                     error: Some(leak.clone()),
+                    model: None,
+                    billing: None,
                 },
             ] {
                 session.inner.emit(Envelope::new(event).item("i1"));
@@ -12844,6 +12955,8 @@ mod tests {
                 usage: None,
                 cost_usd: None,
                 error: None,
+                model: None,
+                billing: None,
             }));
             assert!(session.show_agent_images(None, vec![image(7)]).is_err());
         });

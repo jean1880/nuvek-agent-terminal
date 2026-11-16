@@ -1338,6 +1338,8 @@ fn items_released_at_the_turns_end_keep_their_order() {
             usage: None,
             cost_usd: None,
             error: None,
+            model: None,
+            billing: None,
         });
         let _ = publisher.publish(generation, end);
         assert_eq!(publisher.result_so_far(), "alpha one\n\nbeta");

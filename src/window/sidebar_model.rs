@@ -2764,6 +2764,8 @@ mod tests {
             }),
             cost_usd: None,
             error: None,
+            model: None,
+            billing: None,
         };
         let started = |kind| Event::ItemStarted {
             kind,
@@ -2779,6 +2781,8 @@ mod tests {
                 usage: None,
                 cost_usd: None,
                 error: Some("You've hit your session limit".into()),
+                model: None,
+                billing: None,
             },
             started(ItemKind::UserMessage),
             Event::Notice {

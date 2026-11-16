@@ -2933,6 +2933,7 @@ fn agent_launch_with(
     Ok(AgentLaunch {
         profile: None,
         server: launch_source(&profile, driver).map(|source| source.provider),
+        free: crate::config::profile_is_free(&profile, driver),
         adapter,
         program,
         extra_args,
@@ -6487,6 +6488,8 @@ impl AgentTerminalWindow {
         }
         // Whose usage limit it hits: the server of the profile it was launched with.
         session.set_launched_server(source.map(|source| source.provider));
+        // How its turns are paid for: a profile free to run costs nothing.
+        session.set_launched_free(crate::config::profile_is_free(profile, driver));
         let (thread_for, dir_for) = (thread.to_owned(), dir.to_owned());
         session.set_adapter_factory(Rc::new(move |d, profile| {
             agent_launch(d, &thread_for, &dir_for, profile)
@@ -9019,6 +9022,8 @@ pub(super) mod tests {
                 usage: None,
                 cost_usd: None,
                 error: None,
+                model: None,
+                billing: None,
             },
             Event::SessionExited {
                 code: Some(0),
@@ -9498,6 +9503,8 @@ pub(super) mod tests {
             usage: None,
             cost_usd: None,
             error: Some(error.into()),
+            model: None,
+            billing: None,
         };
         assert!(limit_refused(&failed("You've hit your session limit")));
         assert!(limit_refused(&failed("You have exhausted your quota")));

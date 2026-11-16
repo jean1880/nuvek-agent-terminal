@@ -600,6 +600,8 @@ pub(super) mod tests {
                 }),
                 cost_usd: cost,
                 error: None,
+                model: None,
+                billing: None,
             });
             store.append_event(thread, Some(pt), &env).expect("turn");
         };

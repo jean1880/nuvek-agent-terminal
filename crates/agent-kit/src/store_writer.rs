@@ -1777,6 +1777,8 @@ mod tests {
             usage: None,
             cost_usd: None,
             error: None,
+            model: None,
+            billing: None,
         });
         handle
             .append_event(&t, None, &turn)

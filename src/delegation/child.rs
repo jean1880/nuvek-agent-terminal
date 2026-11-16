@@ -750,6 +750,9 @@ impl Supervisor {
             },
         );
         session.set_delegation_worker(worker.clone());
+        // How its turns are paid for: its profile's server bills them, unless free to run.
+        session.set_launched_server(resolved.source.clone().map(|source| source.provider));
+        session.set_launched_free(resolved.free);
         if let Some(w) = self.state.borrow_mut().workers.get_mut(&worker) {
             w.session = Some(session.clone());
         }

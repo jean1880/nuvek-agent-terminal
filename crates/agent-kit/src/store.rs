@@ -5657,6 +5657,8 @@ mod tests {
                 usage: None,
                 cost_usd: Some(0.5),
                 error: None,
+                model: None,
+                billing: None,
             }),
         ];
         let seqs: Vec<i64> = sent
@@ -5710,6 +5712,8 @@ mod tests {
                 usage: None,
                 cost_usd: None,
                 error: None,
+                model: None,
+                billing: None,
             }),
         )
         .expect("turn");
@@ -6379,6 +6383,8 @@ mod tests {
                 usage: Some(usage.clone()),
                 cost_usd: None,
                 error: None,
+                model: None,
+                billing: None,
             })
             .raw(serde_json::json!({"key_present":true,"token_enabled":false})),
         )
@@ -7876,6 +7882,8 @@ mod tests {
                         usage: None,
                         cost_usd: None,
                         error: None,
+                        model: None,
+                        billing: None,
                     }),
                 ),
                 17 => Step::Fail,
@@ -8994,6 +9002,8 @@ mod tests {
             usage: None,
             cost_usd: None,
             error: None,
+            model: None,
+            billing: None,
         });
         s.append_event(&t, None, &started("x", ItemKind::AssistantMessage))
             .expect("start");

@@ -9,6 +9,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use crate::event::Usage;
 
 /// The running total to measure the next turn from, once a turn reported `now`.
@@ -209,6 +211,64 @@ impl Billing {
     }
 }
 
+/// Stored as its name ([`Billing::as_str`]).
+impl Serialize for Billing {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+/// Read leniently: a name a newer build wrote, or anything that is not a string, is
+/// [`Billing::Unknown`], so the turn it belongs to still reads.
+impl<'de> Deserialize<'de> for Billing {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(d)?;
+        Ok(value.as_str().map_or(Billing::Unknown, Billing::parse))
+    }
+}
+
+/// How a Claude process is paid for, from what it said of itself: its `init` frame's
+/// `apiKeySource` and its `initialize` reply's account (`apiProvider`, `subscriptionType`).
+///
+/// An API key (any source but `none`) is metered whatever the account says, as is a cloud
+/// provider other than Anthropic's own (Bedrock, Vertex). Signed in with no key, an account on
+/// Anthropic's own service, or one that names a plan, is a plan: its reported cost is the list
+/// price. Anything less is not known, and never counted as real money.
+pub fn claude_billing(
+    api_key_source: Option<&str>,
+    api_provider: Option<&str>,
+    plan: Option<&str>,
+) -> Option<Billing> {
+    let api_key_source = api_key_source.map(str::trim).filter(|s| !s.is_empty());
+    let api_provider = api_provider.map(str::trim).filter(|s| !s.is_empty());
+    let has_plan = plan.is_some_and(|p| !p.trim().is_empty());
+    if api_key_source.is_some_and(|s| s != "none") {
+        return Some(Billing::Metered);
+    }
+    if api_provider.is_some_and(|p| p != "firstParty") {
+        return Some(Billing::Metered);
+    }
+    let signed_in_without_key = api_key_source == Some("none");
+    if has_plan || (signed_in_without_key && api_provider == Some("firstParty")) {
+        return Some(Billing::Plan);
+    }
+    None
+}
+
+/// How a turn was paid for, from what the agent said (`reported`, [`claude_billing`] for
+/// Claude) and the profile it was launched on: a profile marked free to run costs nothing, and
+/// one on a model server is metered there (the server bills it, whatever the agent thinks of
+/// its account). Otherwise the agent's own word stands.
+pub fn turn_billing(reported: Option<Billing>, free: bool, on_server: bool) -> Option<Billing> {
+    if free {
+        Some(Billing::Free)
+    } else if on_server {
+        Some(Billing::Metered)
+    } else {
+        reported
+    }
+}
+
 /// One turn, or (from the ledger of deleted threads) one day's sum of turns with the same
 /// attribution. Numbers and ids only.
 #[derive(Debug, Clone, PartialEq)]
@@ -249,7 +309,8 @@ impl Costs {
         match billing {
             Billing::Metered => self.metered += usd,
             Billing::Plan => self.list_price += usd,
-            Billing::Free | Billing::Unknown => self.reported += usd,
+            Billing::Free => {}
+            Billing::Unknown => self.reported += usd,
         }
     }
 
@@ -330,11 +391,13 @@ impl Total {
         } else {
             0.0
         };
-        self.costs.add(row.billing, usd);
         self.turns += row.turns;
-        self.cost_turns += row.cost_turns;
         if row.billing == Billing::Free {
+            // What an agent reports of a free profile's turn prices nothing anyone pays.
             self.free_turns += row.turns;
+        } else {
+            self.costs.add(row.billing, usd);
+            self.cost_turns += row.cost_turns;
         }
         self.withheld_turns += row.withheld_turns;
         self.tokens.input_tokens += row.tokens.input_tokens;
@@ -905,8 +968,89 @@ mod report_tests {
     fn billing_names_round_trip() {
         for b in Billing::ALL {
             assert_eq!(Billing::parse(b.as_str()), b);
+            let json = serde_json::to_string(&b).expect("encode");
+            assert_eq!(json, format!("\"{}\"", b.as_str()));
+            assert_eq!(serde_json::from_str::<Billing>(&json).expect("decode"), b);
         }
         assert_eq!(Billing::parse("invoice"), Billing::Unknown);
+        // A name a newer build wrote, or a value of another type, still reads.
+        assert_eq!(
+            serde_json::from_str::<Billing>("\"invoice\"").expect("decode"),
+            Billing::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<Billing>("7").expect("decode"),
+            Billing::Unknown
+        );
+    }
+
+    #[test]
+    fn plan_turns_are_list_price_not_metered() {
+        // What Claude says of itself.
+        let key = claude_billing(Some("ANTHROPIC_API_KEY"), Some("firstParty"), Some("max"));
+        assert_eq!(key, Some(Billing::Metered), "a key is metered, plan or not");
+        assert_eq!(
+            claude_billing(Some("apiKeyHelper"), None, None),
+            Some(Billing::Metered)
+        );
+        assert_eq!(
+            claude_billing(Some("none"), Some("bedrock"), None),
+            Some(Billing::Metered),
+            "another cloud bills it"
+        );
+        assert_eq!(
+            claude_billing(Some("none"), Some("firstParty"), None),
+            Some(Billing::Plan)
+        );
+        assert_eq!(
+            claude_billing(None, None, Some("Claude Pro")),
+            Some(Billing::Plan)
+        );
+        assert_eq!(claude_billing(Some("none"), None, None), None);
+        assert_eq!(claude_billing(None, Some("firstParty"), None), None);
+        assert_eq!(claude_billing(None, None, None), None);
+        assert_eq!(claude_billing(Some(" "), None, Some(" ")), None);
+
+        // Then the profile it ran on.
+        assert_eq!(
+            turn_billing(Some(Billing::Plan), true, true),
+            Some(Billing::Free)
+        );
+        assert_eq!(
+            turn_billing(Some(Billing::Plan), false, true),
+            Some(Billing::Metered),
+            "a model server bills its turns"
+        );
+        assert_eq!(turn_billing(None, false, true), Some(Billing::Metered));
+        assert_eq!(
+            turn_billing(Some(Billing::Plan), false, false),
+            Some(Billing::Plan)
+        );
+        assert_eq!(turn_billing(None, false, false), None);
+
+        // The sums keep them apart, and a free turn's reported price is no spend.
+        let today = day("2026-11-15");
+        let mut plan = row("2026-11-15", "claude", "/a", Some(2.0), 1);
+        plan.billing = Billing::Plan;
+        let mut metered = row("2026-11-15", "claude", "/a", Some(0.5), 1);
+        metered.billing = Billing::Metered;
+        let mut free = row("2026-11-15", "claude", "/a", Some(9.0), 1);
+        free.billing = Billing::Free;
+        let r = report(
+            &[plan, metered, free.clone()],
+            Period::Day,
+            Group::Folder,
+            today,
+        );
+        assert_eq!(r.total.costs.metered, 0.5);
+        assert_eq!(r.total.costs.list_price, 2.0);
+        assert_eq!(r.total.costs.reported, 0.0);
+        assert_eq!(
+            (r.total.turns, r.total.cost_turns, r.total.free_turns),
+            (3, 2, 1)
+        );
+        let r = report(&[free], Period::Day, Group::Folder, today);
+        assert_eq!(r.total.amount(), Amount::Free);
     }
 
     /// The selectors drive dropdowns by index: a new variant fails to compile here until its

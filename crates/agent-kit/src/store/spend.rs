@@ -406,6 +406,8 @@ mod tests {
             }),
             cost_usd: cost,
             error: None,
+            model: None,
+            billing: None,
         });
         let seq = s.append_event(thread, Some(pt), &env).expect("append");
         s.conn
@@ -485,6 +487,58 @@ mod tests {
             ]
         );
         assert!(data.rows.iter().all(|r| r.billing == Billing::Unknown));
+    }
+
+    /// A turn stamped with its model and billing is read with them (its own model over the
+    /// provider thread's current one); one stored before the stamp reads as unknown billing.
+    #[test]
+    fn a_stamped_turn_keeps_its_model_and_billing_and_an_old_one_reads_unknown() {
+        let s = store();
+        let (t, pt) = thread(&s, "/a", "claude", "sonnet");
+        turn(&s, &t, &pt, Some(0.25), 1, NOON);
+        for (model, billing) in [("opus", Billing::Metered), ("haiku", Billing::Plan)] {
+            let env = Envelope::new(Event::TurnCompleted {
+                state: TurnState::Completed,
+                usage: None,
+                cost_usd: Some(1.0),
+                error: None,
+                model: Some(model.into()),
+                billing: Some(billing),
+            });
+            s.append_event(&t, Some(&pt), &env).expect("append");
+        }
+        let data = s.spend_rows(0, &utc).expect("rows");
+        let got: Vec<(String, Billing)> = data
+            .rows
+            .iter()
+            .map(|r| (r.model.clone(), r.billing))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("sonnet".into(), Billing::Unknown),
+                ("opus".into(), Billing::Metered),
+                ("haiku".into(), Billing::Plan),
+            ]
+        );
+        // Deleted, they keep it in the ledger.
+        s.delete_thread(&t).expect("delete");
+        let mut kept: Vec<(String, Billing)> = s
+            .spend_rows(0, &utc)
+            .expect("rows")
+            .rows
+            .iter()
+            .map(|r| (r.model.clone(), r.billing))
+            .collect();
+        kept.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            kept,
+            [
+                ("haiku".into(), Billing::Plan),
+                ("opus".into(), Billing::Metered),
+                ("sonnet".into(), Billing::Unknown),
+            ]
+        );
     }
 
     /// The adapter stores each turn's own cost (the running total 0.0173, 0.0259, 0.0553 becomes
@@ -720,6 +774,8 @@ mod tests {
             usage: None,
             cost_usd: Some(1.0),
             error: None,
+            model: None,
+            billing: None,
         });
         s.append_event(&t, None, &env).expect("append");
         s.conn

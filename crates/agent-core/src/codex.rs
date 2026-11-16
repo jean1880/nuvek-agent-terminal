@@ -611,6 +611,8 @@ impl CodexAdapter {
                 usage: None,
                 cost_usd: None,
                 error: Some(message),
+                model: None,
+                billing: None,
             }));
         }
         self.finish_effective_mode(out);
@@ -1355,6 +1357,8 @@ impl CodexAdapter {
             usage,
             cost_usd: None,
             error,
+            model: None,
+            billing: None,
         }));
         self.finish_effective_mode(out);
     }
@@ -2222,6 +2226,8 @@ impl CodexAdapter {
                         usage: None,
                         cost_usd: None,
                         error: Some(message),
+                        model: None,
+                        billing: None,
                     }));
                     self.finish_effective_mode(out);
                 }
@@ -2870,6 +2876,8 @@ impl Adapter for CodexAdapter {
                 usage: None,
                 cost_usd: None,
                 error: (!expected).then(|| format!("codex exited unexpectedly (code {code:?})")),
+                model: None,
+                billing: None,
             }));
         }
         self.thread_id = None;

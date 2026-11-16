@@ -119,6 +119,9 @@ pub(crate) struct ResolvedChild {
     /// The model server the profile runs the agent on (`None`: the vendor): the model list a
     /// requested effort is checked against.
     pub source: Option<crate::model_catalog::ServerSource>,
+    /// The profile is free to run (`config::profile_is_free`): the worker's turns are stamped
+    /// free.
+    pub free: bool,
     /// A Local profile's instructions and budget (its MCP servers are dropped for a child).
     pub local_context: Option<agent_core::local_context::LocalLaunchContext>,
 }

@@ -691,6 +691,7 @@ impl AgentTerminalWindow {
                     },
                     default_effort: profile.default_effort.clone(),
                     source,
+                    free: crate::config::profile_is_free(profile, driver),
                 })
             }),
             make_adapter: Rc::new(make_adapter),

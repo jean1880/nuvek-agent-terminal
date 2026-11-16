@@ -109,6 +109,8 @@ impl Envelope {
             usage: None,
             cost_usd: None,
             error: error.map(str::to_owned),
+            model: None,
+            billing: None,
         })
     }
 }
@@ -146,6 +148,15 @@ pub enum Event {
         cost_usd: Option<f64>,
         #[serde(default)]
         error: Option<String>,
+        /// The model the turn ran on, stamped by the session when the turn ends; `None` in a
+        /// turn stored before turns carried it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// How the turn was paid for, stamped by the session from the profile and account it ran
+        /// on, so a profile changed later does not relabel it; `None` when it is not known (and
+        /// in a turn stored before turns carried it).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        billing: Option<crate::spend::Billing>,
     },
     /// A transcript item opened (`Envelope::item` is its id).
     ItemStarted {
@@ -811,7 +822,45 @@ mod tests {
                 usage: None,
                 cost_usd: None,
                 error: None,
+                model: None,
+                billing: None,
             })
+        );
+    }
+
+    /// A turn stored before turns carried their model and billing still reads (as not known),
+    /// and a turn without them is written as it always was.
+    #[test]
+    fn a_turn_stored_before_its_billing_stamp_still_reads() {
+        let old = r#"{"type":"turn_completed","state":"completed","cost_usd":0.25}"#;
+        let event: Event = serde_json::from_str(old).expect("decode");
+        let Event::TurnCompleted {
+            cost_usd,
+            model,
+            billing,
+            ..
+        } = &event
+        else {
+            panic!("not a turn: {event:?}");
+        };
+        assert_eq!((*cost_usd, model, billing), (Some(0.25), &None, &None));
+        assert!(!serde_json::to_string(&event)
+            .expect("encode")
+            .contains("billing"));
+
+        let stamped = Event::TurnCompleted {
+            state: TurnState::Completed,
+            usage: None,
+            cost_usd: Some(0.5),
+            error: None,
+            model: Some("opus".into()),
+            billing: Some(crate::spend::Billing::Plan),
+        };
+        let json = serde_json::to_string(&stamped).expect("encode");
+        assert!(json.contains(r#""model":"opus""#) && json.contains(r#""billing":"plan""#));
+        assert_eq!(
+            serde_json::from_str::<Event>(&json).expect("decode"),
+            stamped
         );
     }
 

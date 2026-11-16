@@ -4062,8 +4062,28 @@ mod tests {
             let fake = FakeDelegation::start(sock.path(), answer_ok());
             let work = tempfile::tempdir().unwrap();
             let state = tempfile::tempdir().unwrap();
+            // The runner here is a thread of the test process, so its command inherits the
+            // caller's environment, which may already hold delegation variables (when the
+            // tests run inside a delegated agent). The command drops those from its own
+            // environment first, so the output shows only what the runner itself passes.
+            let inherited: Vec<String> = std::env::vars_os()
+                .filter_map(|(name, _)| name.into_string().ok())
+                .filter(|name| {
+                    name.starts_with("AGENT_TERMINAL_DELEGATION")
+                        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                })
+                .collect();
+            let command = if inherited.is_empty() {
+                "env".to_owned()
+            } else {
+                format!("unset {}; env", inherited.join(" "))
+            };
             let script = Script::new(vec![
-                Ok(tool_call("c1", "run_command", json!({"command": "env"}))),
+                Ok(tool_call(
+                    "c1",
+                    "run_command",
+                    json!({ "command": command }),
+                )),
                 Ok(text(&["Ok"])),
             ]);
             let run = start_with_frame(

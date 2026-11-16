@@ -75,6 +75,8 @@ struct Builder {
     /// Table cells collected as plain text, rendered as an aligned monospace block.
     table: Option<Vec<Vec<String>>>,
     cell: Option<String>,
+    /// How many links are open: Pango cannot nest one in another.
+    link_depth: usize,
 }
 
 impl Builder {
@@ -173,6 +175,17 @@ pub fn parse(markdown: &str) -> Vec<Block> {
             Event::Code(code) => {
                 if let Some(cell) = b.cell.as_mut() {
                     cell.push_str(&code);
+                } else if b.link_depth == 0 && agent_kit::editor::code_location(&code).is_some() {
+                    // A file location in code (`src/a.rs:12`) is a link that opens it in the
+                    // editor (`agent_kit::editor::file_link` reads the href back); never inside
+                    // another link.
+                    let (bg, _) = inline_code_colours();
+                    b.push_markup(&format!(
+                        "<a href=\"{}\"><span font_family=\"monospace\" bgcolor=\"{bg}\" fgcolor=\"{}\">\u{2009}{}\u{2009}</span></a>",
+                        escape(&code),
+                        link_colour(),
+                        escape(&code)
+                    ));
                 } else {
                     let (bg, fg) = inline_code_colours();
                     b.push_markup(&format!(
@@ -293,6 +306,7 @@ fn start(b: &mut Builder, tag: Tag) {
         Tag::Strong => b.push_markup("<b>"),
         Tag::Strikethrough => b.push_markup("<s>"),
         Tag::Link { dest_url, .. } => {
+            b.link_depth += 1;
             b.push_markup(&format!(
                 "<a href=\"{}\"><span fgcolor=\"{}\">",
                 escape(&dest_url),
@@ -356,7 +370,10 @@ fn end(b: &mut Builder, tag: TagEnd) {
         TagEnd::Emphasis => b.push_markup("</i>"),
         TagEnd::Strong => b.push_markup("</b>"),
         TagEnd::Strikethrough => b.push_markup("</s>"),
-        TagEnd::Link => b.push_markup("</span></a>"),
+        TagEnd::Link => {
+            b.link_depth = b.link_depth.saturating_sub(1);
+            b.push_markup("</span></a>");
+        }
         TagEnd::Image => b.push_markup("]</i>"),
         TagEnd::TableCell => {
             if let (Some(cell), Some(row)) =
@@ -558,6 +575,37 @@ mod tests {
         assert_eq!(*kind, TextKind::Quote);
         assert!(markup.starts_with("quoted <a href=\"https://x.test/?a=1&amp;b=2\">"));
         assert!(markup.ends_with("site</span></a>"));
+    }
+
+    #[test]
+    fn path_line_links_become_editor_links_and_urls_do_not() {
+        let markup = |md: &str| match parse(md).as_slice() {
+            [Block::Text { markup, .. }] => markup.clone(),
+            other => panic!("expected one text block: {other:?}"),
+        };
+        // Code naming a file and line is a link whose href reads back as that location.
+        let m = markup("see `src/a.rs:12` here");
+        assert!(m.contains("<a href=\"src/a.rs:12\">"), "{m}");
+        assert!(m.ends_with("</span></a> here"), "{m}");
+        // Code that names no file stays code; so does a URL in code.
+        for code in [
+            "`x = 1`",
+            "`localhost:8080`",
+            "`https://example.com/a.rs:1`",
+        ] {
+            assert!(!markup(code).contains("<a "), "{code}");
+        }
+        // Escaped like the rest: a hostile name cannot close the attribute.
+        let m = markup("`a\"><b>x.rs:1`");
+        assert!(!m.contains("\"><b>"), "{m}");
+        // Never a link inside a link.
+        let m = markup("[`src/a.rs:1`](https://example.com)");
+        assert_eq!(m.matches("<a ").count(), 1, "{m}");
+        // Links keep their href: a path one is read as a file, a web one is not.
+        let m = markup("[x](src/b.rs#L9) [y](https://example.com/b.rs:9)");
+        assert!(m.contains("href=\"src/b.rs#L9\""), "{m}");
+        assert!(agent_kit::editor::file_link("src/b.rs#L9").is_some());
+        assert!(agent_kit::editor::file_link("https://example.com/b.rs:9").is_none());
     }
 
     #[test]

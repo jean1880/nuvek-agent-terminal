@@ -314,9 +314,13 @@ pub trait DiffSource {
     /// the user by the implementation (a toast).
     fn open_external(&self, ask: DiffAsk);
     /// Opens the item's (first) file in the configured editor at its first changed line, or in
-    /// the system's handler without a line when there is none. Failures are reported to the
-    /// user by the implementation (a toast).
-    fn open_in_editor(&self, ask: DiffAsk);
+    /// the system's handler without a line when there is none. A file outside the thread's
+    /// folder is asked about first, over `parent`. Failures are reported to the user by the
+    /// implementation (a toast).
+    fn open_in_editor(&self, ask: DiffAsk, parent: gtk4::Widget);
+    /// Opens a file a card or a reply's link named (relative to the thread's folder) in the
+    /// editor at its line, as [`Self::open_in_editor`] does.
+    fn open_location(&self, location: agent_kit::editor::Location, parent: gtk4::Widget);
 }
 
 /// Where a thread's composer gets the user's saved prompts and what its `{file}` placeholder

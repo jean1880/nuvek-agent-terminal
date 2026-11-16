@@ -233,6 +233,160 @@ pub fn parse_location(text: &str) -> Option<Location> {
     location(text, None, None)
 }
 
+/// Whether `text` starts with a URI scheme (`https:`, `mailto:`) rather than a path with a line
+/// (`a.rs:12`, `a.rs:12:3`): a scheme is a letter then letters, digits, `+`, `.` or `-`, and
+/// what follows its colon is not all line and column numbers. One letter is a Windows drive.
+fn has_scheme(text: &str) -> bool {
+    let Some((scheme, rest)) = text.split_once(':') else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    let is_scheme = scheme.len() > 1
+        && chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'));
+    let numbers = !rest.is_empty()
+        && rest
+            .split(':')
+            .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    is_scheme && !numbers
+}
+
+/// Decodes `%XX` escapes. `None` for a bad escape or text that is not UTF-8 once decoded.
+fn percent_decode(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = text.get(i + 1..i + 3)?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// The file a link names, when it names one: a path (`src/a.rs`, `/abs/a.rs`), with an optional
+/// line and column (`src/a.rs:12`, `src/a.rs:12:3`, `src/a.rs#L12`), or a `file:` URL on this
+/// machine (`file:///p`, `file://localhost/p` or `file:/p`, scheme and host in any case, percent
+/// escapes decoded). A link with any other scheme, a `file:` URL of another host, an in-page
+/// anchor (`#top`), a protocol-relative `//host` link, or text [`parse_location`] refuses is
+/// `None`; [`link_action`] decides what such a link does. The text is untrusted: it is only ever
+/// parsed into a [`Location`], which [`resolve_target`] then confines; it never reaches a command
+/// line whole.
+pub fn file_link(href: &str) -> Option<Location> {
+    let href = href.trim();
+    if href.is_empty() || href.len() > MAX_LOCATION_BYTES || href.chars().any(char::is_control) {
+        return None;
+    }
+    if let Some(rest) = strip_scheme(href, "file") {
+        // `file:///p`, `file://localhost/p` (any case) or `file:/p`; any other host is another
+        // machine's file, and `file:p` is no path at all.
+        let path = match rest.strip_prefix("//") {
+            Some(after) => {
+                let (host, path) = after.split_at(after.find('/')?);
+                if !(host.is_empty() || host.eq_ignore_ascii_case("localhost")) {
+                    return None;
+                }
+                path
+            }
+            None if rest.starts_with('/') => rest,
+            None => return None,
+        };
+        let decoded = percent_decode(path)?;
+        let location = parse_location(&decoded)?;
+        return Path::new(&location.path).is_absolute().then_some(location);
+    }
+    if href.starts_with('#') || href.starts_with("//") || has_scheme(href) {
+        return None;
+    }
+    parse_location(href)
+}
+
+/// What follows `scheme:` at the start of `text`, the scheme matched in any case.
+fn strip_scheme<'a>(text: &'a str, scheme: &str) -> Option<&'a str> {
+    let head = text.get(..scheme.len())?;
+    let rest = text.get(scheme.len()..)?.strip_prefix(':')?;
+    head.eq_ignore_ascii_case(scheme).then_some(rest)
+}
+
+/// What a click on a link in the conversation does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkAction {
+    /// A file on this machine ([`file_link`]): opened in the editor, confined and confirmed.
+    Open(Location),
+    /// A web or mail link: left to the system's handler for it.
+    System,
+    /// Anything else (a `file:` URL that is not a local file, `resource:`, `ghelp:`, an anchor,
+    /// another app's scheme): opens nothing, so no other handler ever sees a local path.
+    Refuse,
+}
+
+/// Decides a link's [`LinkAction`]: only `http:`, `https:` and `mailto:` (any case) reach the
+/// system's handler.
+pub fn link_action(href: &str) -> LinkAction {
+    if let Some(location) = file_link(href) {
+        return LinkAction::Open(location);
+    }
+    let href = href.trim();
+    if !href.chars().any(char::is_control)
+        && ["http", "https", "mailto"]
+            .iter()
+            .any(|scheme| strip_scheme(href, scheme).is_some_and(|rest| !rest.is_empty()))
+    {
+        LinkAction::System
+    } else {
+        LinkAction::Refuse
+    }
+}
+
+/// Whether inline code text (`` `src/a.rs:12` ``) is a file location worth making a link of. It
+/// is stricter than [`file_link`], since code spans hold every kind of text: no spaces, and
+/// either a line number or a `/` in the path, and a last component with an extension that has a
+/// letter in it (so `a.rs:12` and `src/lib.rs` are files, `localhost:8080` and `and/or` are not).
+pub fn code_location(text: &str) -> Option<Location> {
+    if text.chars().any(char::is_whitespace) || text.contains("://") {
+        return None;
+    }
+    let location = file_link(text)?;
+    let name = location.path.rsplit('/').next().unwrap_or_default();
+    let has_extension = name.rsplit_once('.').is_some_and(|(stem, ext)| {
+        !stem.is_empty() && ext.chars().any(|c| c.is_ascii_alphabetic())
+    });
+    (has_extension && (location.line.is_some() || location.path.contains('/'))).then_some(location)
+}
+
+/// The file and line a read's tool input names, for the card's "Open" button: the path from
+/// `file_path`, `AbsolutePath` or `Path`, and the line from `line`, `offset`, `StartLine` or
+/// `start_line`. A line of 0 is 1; a huge one is clamped. `None` when no file is named: a bare
+/// `path` is where a search or a listing looked, a folder more often than a file.
+pub fn read_location(input: &serde_json::Value) -> Option<Location> {
+    let text = |key: &str| {
+        input
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+    };
+    let path = ["file_path", "AbsolutePath", "Path"]
+        .into_iter()
+        .find_map(text)?;
+    if path.len() > MAX_LOCATION_BYTES || path.chars().any(char::is_control) {
+        return None;
+    }
+    let line = ["line", "offset", "StartLine", "start_line"]
+        .into_iter()
+        .find_map(|key| input.get(key).and_then(serde_json::Value::as_u64))
+        .map(|n| n.clamp(1, u64::from(MAX_LINE)) as u32);
+    Some(Location {
+        path: path.to_owned(),
+        line,
+        column: None,
+    })
+}
+
 /// The file to open, resolved and judged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
@@ -456,6 +610,155 @@ mod tests {
         }
         assert_eq!(parse_location(&"x".repeat(MAX_LOCATION_BYTES + 1)), None);
         assert!(parse_location(&"x".repeat(MAX_LOCATION_BYTES)).is_some());
+    }
+
+    fn at(path: &str, line: Option<u32>, column: Option<u32>) -> Option<Location> {
+        Some(Location {
+            path: path.to_owned(),
+            line,
+            column,
+        })
+    }
+
+    #[test]
+    fn file_links_are_paths_and_file_urls_and_every_other_scheme_is_not() {
+        assert_eq!(file_link("src/a.rs"), at("src/a.rs", None, None));
+        assert_eq!(file_link("src/a.rs:12"), at("src/a.rs", Some(12), None));
+        assert_eq!(file_link("a.rs:12:3"), at("a.rs", Some(12), Some(3)));
+        assert_eq!(file_link("/w/a.rs#L7"), at("/w/a.rs", Some(7), None));
+        assert_eq!(file_link("../up.rs"), at("../up.rs", None, None));
+        assert_eq!(
+            file_link("file:///w/my%20dir/a.rs:4"),
+            at("/w/my dir/a.rs", Some(4), None)
+        );
+        assert_eq!(
+            file_link("file://localhost/w/a.rs"),
+            at("/w/a.rs", None, None)
+        );
+        for not_a_file in [
+            "https://example.com/a.rs:12",
+            "http://example.com",
+            "mailto:someone@example.com",
+            "javascript:alert(1)",
+            "ssh:host",
+            "#section",
+            "//example.com/a.rs",
+            "file://example.com/w/a.rs",
+            "file:relative.rs",
+            "file:///w/%zz.rs",
+            "file:///w/%ff.rs",
+            "",
+            "a\nb.rs",
+        ] {
+            assert_eq!(file_link(not_a_file), None, "{not_a_file:?}");
+        }
+        assert_eq!(file_link(&"x".repeat(MAX_LOCATION_BYTES + 1)), None);
+    }
+
+    #[test]
+    fn every_local_file_url_is_a_file_and_only_web_and_mail_links_reach_the_system() {
+        // The scheme and the host in any case, and the one-slash form, are this machine's files.
+        for (href, path) in [
+            ("FILE:///etc/passwd", "/etc/passwd"),
+            ("File:///repo/.git/config", "/repo/.git/config"),
+            ("file://LOCALHOST/etc/passwd", "/etc/passwd"),
+            ("fIlE://LocalHost/etc/passwd", "/etc/passwd"),
+            ("file:/etc/passwd", "/etc/passwd"),
+            ("FILE:/etc/pass%77d", "/etc/passwd"),
+        ] {
+            assert_eq!(file_link(href), at(path, None, None), "{href}");
+            assert_eq!(
+                link_action(href),
+                LinkAction::Open(Location {
+                    path: path.to_owned(),
+                    line: None,
+                    column: None
+                }),
+                "{href}"
+            );
+        }
+        // A bare path is a file too, never the system's.
+        assert!(matches!(link_action("/etc/passwd"), LinkAction::Open(_)));
+        assert!(matches!(link_action("src/a.rs:3"), LinkAction::Open(_)));
+        // A file: URL that is not a local file, and every other scheme or anchor, opens nothing.
+        for href in [
+            "file://otherhost/etc/passwd",
+            "FILE://otherhost/etc/passwd",
+            "file:relative.rs",
+            "file:",
+            "file://",
+            "file:///w/%zz.rs",
+            "file:///w/%ff.rs",
+            "resource:///org/gtk/x",
+            "ghelp:gnome-help",
+            "help:gnome-help",
+            "smb://server/share",
+            "sftp://host/etc/passwd",
+            "javascript:alert(1)",
+            "data:text/html,x",
+            "vscode://file/etc/passwd",
+            "#section",
+            "//example.com/a.rs",
+            "https:",
+            "http://example.com/\u{7}",
+        ] {
+            assert_eq!(link_action(href), LinkAction::Refuse, "{href}");
+        }
+        for href in [
+            "https://example.com/a.rs:12",
+            "HTTP://example.com",
+            "mailto:someone@example.com",
+        ] {
+            assert_eq!(link_action(href), LinkAction::System, "{href}");
+        }
+    }
+
+    #[test]
+    fn only_code_that_names_a_file_becomes_a_link() {
+        assert_eq!(code_location("src/a.rs:12"), at("src/a.rs", Some(12), None));
+        assert_eq!(code_location("a.rs:12:3"), at("a.rs", Some(12), Some(3)));
+        assert_eq!(code_location("src/lib.rs"), at("src/lib.rs", None, None));
+        assert_eq!(
+            code_location("Makefile.am:3"),
+            at("Makefile.am", Some(3), None)
+        );
+        for not_a_file in [
+            "Cargo.toml",
+            "localhost:8080",
+            "127.0.0.1:8080",
+            "and/or",
+            "a.rs:12 b.rs",
+            "https://example.com/a.rs",
+            ".gitignore:2",
+            "foo()",
+            "x = 1",
+        ] {
+            assert_eq!(code_location(not_a_file), None, "{not_a_file:?}");
+        }
+    }
+
+    #[test]
+    fn a_reads_input_names_its_file_and_line() {
+        use serde_json::json;
+        assert_eq!(
+            read_location(&json!({"file_path": "src/a.rs", "offset": 40, "limit": 10})),
+            at("src/a.rs", Some(40), None)
+        );
+        assert_eq!(
+            read_location(&json!({"AbsolutePath": "/w/a.rs", "StartLine": 0})),
+            at("/w/a.rs", Some(1), None)
+        );
+        assert_eq!(
+            read_location(&json!({"Path": "/w/a.rs", "start_line": 99_999_999_999u64})),
+            at("/w/a.rs", Some(MAX_LINE), None)
+        );
+        // A search's or a listing's `path` is where it looked, not a file to open.
+        assert_eq!(read_location(&json!({"path": "src"})), None);
+        assert_eq!(read_location(&json!({"pattern": "x", "path": "src"})), None);
+        assert_eq!(read_location(&json!({"file_path": ""})), None);
+        assert_eq!(read_location(&json!({"file_path": 3})), None);
+        assert_eq!(read_location(&json!({"file_path": "a\u{0}b"})), None);
+        assert_eq!(read_location(&serde_json::Value::Null), None);
     }
 
     #[test]

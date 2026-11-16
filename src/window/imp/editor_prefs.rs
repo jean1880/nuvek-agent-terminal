@@ -66,10 +66,12 @@ impl AgentTerminalWindow {
         let group = adw::PreferencesGroup::builder()
             .title("Editor")
             .description(
-                "Opened from a file edit's “Open in …” button and the diff panel, at the first \
-                 changed line. Placeholders: {file} (required), {line}, {column}, {dir}. Never \
-                 run through a shell. Only files inside the thread's folder open. With no editor \
-                 set, the system's default app opens the file, which cannot jump to a line.",
+                "Opened from a file edit's or a read's “Open in …” button, the diff panel \
+                 (Ctrl+click a line), and file links in replies, at the line named. \
+                 Placeholders: {file} (required), {line}, {column}, {dir}. Never run through a \
+                 shell. A file outside the thread's folder is asked about first, every time; \
+                 sensitive files never open. With no editor set, the system's default app opens \
+                 the file, which cannot jump to a line.",
             )
             .build();
 

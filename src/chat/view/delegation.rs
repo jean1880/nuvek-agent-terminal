@@ -4,6 +4,16 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::rc::{Rc, Weak};
 
+/// What a worker's file link or Read button says when the worker's files are not reachable (a
+/// run replayed from history, with no workspace to resolve its paths in).
+const NO_WORKER_FILES: &str = "This worker's files are not available, so nothing is opened.";
+
+#[cfg(test)]
+thread_local! {
+    /// The last worker notice shown (tests).
+    static LAST_WORKER_NOTICE: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
 use agent_core::adapter::{Driver, Mode};
 use agent_core::delegation::scope::{Scope, ScopedEnvelope};
 use agent_core::delegation::wire::WorkerSummary;
@@ -740,6 +750,8 @@ impl Inner {
     }
 
     fn worker_notice(&self, message: &str) {
+        #[cfg(test)]
+        LAST_WORKER_NOTICE.with(|last| *last.borrow_mut() = Some(message.to_owned()));
         if let Some(overlay) = self.widget.upgrade().and_then(|view| view.toast_overlay()) {
             overlay.add_toast(adw::Toast::new(message));
         }
@@ -949,7 +961,10 @@ impl Inner {
         }
         if matches!(
             event,
-            RowEvent::LoadDiff { .. } | RowEvent::OpenDiff { .. } | RowEvent::OpenEditor { .. }
+            RowEvent::LoadDiff { .. }
+                | RowEvent::OpenDiff { .. }
+                | RowEvent::OpenEditor { .. }
+                | RowEvent::OpenLocation { .. }
         ) {
             self.worker_diff(&inspector, &scope, event);
             return;
@@ -1061,10 +1076,19 @@ impl Inner {
     }
 
     fn worker_diff(self: &Rc<Self>, inspector: &Rc<Inspector>, scope: &Scope, event: RowEvent) {
+        let parent: gtk4::Widget = self.transcript.widget().clone().upcast();
         let (id, how) = match event {
             RowEvent::LoadDiff { id } => (id, None),
             RowEvent::OpenDiff { id } => (id, Some(false)),
             RowEvent::OpenEditor { id } => (id, Some(true)),
+            // A path the worker named is its own workspace's.
+            RowEvent::OpenLocation { location } => {
+                match self.backend.worker_diff_source(scope) {
+                    Some(source) => source.open_location(location, parent),
+                    None => self.worker_notice(NO_WORKER_FILES),
+                }
+                return;
+            }
             _ => return,
         };
         let ask = {
@@ -1101,7 +1125,7 @@ impl Inner {
         };
         match how {
             Some(false) => return source.open_external(ask),
-            Some(true) => return source.open_in_editor(ask),
+            Some(true) => return source.open_in_editor(ask, parent),
             None => {}
         }
         let weak: Weak<Inspector> = Rc::downgrade(inspector);
@@ -1530,6 +1554,28 @@ pub(crate) mod tests {
         assert_eq!(
             backend.diff_scopes.borrow().as_slice(),
             std::slice::from_ref(&scope1)
+        );
+        // A worker's file link asks for that worker's files; with none reachable it says so.
+        LAST_WORKER_NOTICE.with(|last| *last.borrow_mut() = None);
+        inner.worker_row(
+            "w_workerAA",
+            RowEvent::OpenLocation {
+                location: agent_kit::editor::Location {
+                    path: "child.rs".into(),
+                    line: Some(3),
+                    column: None,
+                },
+            },
+        );
+        assert_eq!(
+            backend.diff_scopes.borrow().as_slice(),
+            [scope1.clone(), scope1.clone()]
+        );
+        assert_eq!(
+            LAST_WORKER_NOTICE
+                .with(|last| last.borrow().clone())
+                .as_deref(),
+            Some(NO_WORKER_FILES)
         );
         inspector.entry.set_text("Continue the child task");
         inspector.send.emit_clicked();

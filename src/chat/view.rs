@@ -43,6 +43,8 @@ mod tray;
 mod typeahead;
 pub mod usage;
 
+pub(crate) use cards::guard_links;
+
 #[cfg(test)]
 mod gap_tests;
 #[cfg(test)]
@@ -1579,7 +1581,13 @@ impl Inner {
             RowEvent::OpenEditor { id } => {
                 let source = self.diffs.borrow().clone();
                 if let (Some(source), Some(ask)) = (source, self.diff_ask(&id)) {
-                    source.open_in_editor(ask);
+                    source.open_in_editor(ask, self.transcript.widget().clone().upcast());
+                }
+            }
+            RowEvent::OpenLocation { location } => {
+                let source = self.diffs.borrow().clone();
+                if let Some(source) = source {
+                    source.open_location(location, self.transcript.widget().clone().upcast());
                 }
             }
         }
@@ -4621,6 +4629,7 @@ pub(crate) mod tests {
         asks: RefCell<Vec<DiffAsk>>,
         opened: RefCell<Vec<DiffAsk>>,
         in_editor: RefCell<Vec<DiffAsk>>,
+        locations: RefCell<Vec<agent_kit::editor::Location>>,
         reply: crate::chat::DiffReply,
     }
 
@@ -4632,8 +4641,11 @@ pub(crate) mod tests {
         fn open_external(&self, ask: DiffAsk) {
             self.opened.borrow_mut().push(ask);
         }
-        fn open_in_editor(&self, ask: DiffAsk) {
+        fn open_in_editor(&self, ask: DiffAsk, _parent: gtk4::Widget) {
             self.in_editor.borrow_mut().push(ask);
+        }
+        fn open_location(&self, location: agent_kit::editor::Location, _parent: gtk4::Widget) {
+            self.locations.borrow_mut().push(location);
         }
     }
 
@@ -5620,6 +5632,7 @@ pub(crate) mod tests {
             asks: RefCell::default(),
             opened: RefCell::default(),
             in_editor: RefCell::default(),
+            locations: RefCell::default(),
             reply: Ok(Shown {
                 text: diff_text.to_owned(),
                 origin: Origin::Checkpoint,
@@ -5705,7 +5718,114 @@ pub(crate) mod tests {
         assert_eq!(asked[0].item, "edit1");
         assert_eq!(asked[0].input, edit_input);
         assert!(source.opened.borrow().is_empty(), "not the diff tool");
+
+        // A read's card offers "Open in ‹editor›" for the file and line it read, and asks the
+        // source with them; a search (a pattern) and an edit card offer no such button.
+        sink(&Envelope::item_started(
+            "read1",
+            ItemKind::FileRead,
+            "Read",
+            Some(json!({"file_path": "src/a.rs", "offset": 40, "limit": 5})),
+            None,
+        ));
+        sink(&Envelope::item_started(
+            "grep1",
+            ItemKind::FileRead,
+            "Grep",
+            Some(json!({"pattern": "fn main", "path": "src"})),
+            None,
+        ));
+        let read = |id: &str| {
+            inner
+                .transcript
+                .with_row(id, |row| match row {
+                    cards::Row::Tool(card) => Some(card.read_open()),
+                    _ => None,
+                })
+                .flatten()
+                .expect("tool card")
+        };
+        let (shown, label, tip) = read("read1");
+        assert!(shown);
+        assert_eq!(label, "Open in Zed");
+        assert_eq!(tip.as_deref(), Some("Open src/a.rs:40 in Zed"));
+        assert!(!read("grep1").0, "a search names no file");
+        assert!(!read("edit1").0, "an edit has its own button");
+        inner.transcript.with_row("read1", |row| {
+            if let cards::Row::Tool(c) = row {
+                c.click_read_open();
+            }
+        });
+        let at = |path: &str, line: Option<u32>, column: Option<u32>| agent_kit::editor::Location {
+            path: path.to_owned(),
+            line,
+            column,
+        };
+        assert_eq!(*source.locations.borrow(), [at("src/a.rs", Some(40), None)]);
         editors.set(None);
+        let (_, label, tip) = read("read1");
+        assert_eq!(label, crate::editor_tool::DEFAULT_LABEL);
+        assert_eq!(tip.as_deref(), Some(crate::editor_tool::NO_EDITOR_HINT));
+
+        // A reply's file links open in the editor: a link to a path, `path:line` in code, a
+        // `file://` URL; a web link is left to GTK and code that is no file is no link.
+        sink(&Envelope::item_started(
+            "msg1",
+            ItemKind::AssistantMessage,
+            "",
+            None,
+            None,
+        ));
+        sink(
+            &Envelope::new(Event::ContentDelta {
+                stream: agent_core::event::StreamKind::Assistant,
+                text: "See [the parser](src/b.rs#L9), `src/c.rs:3:2` and \
+                       [docs](https://example.com/a.rs:4), not `x = 1`.\n\n\
+                       Also [this](file:///w/d.rs)."
+                    .into(),
+            })
+            .item("msg1"),
+        );
+        let activate = |href: &str| {
+            inner
+                .transcript
+                .with_row("msg1", |row| match row {
+                    cards::Row::Assistant { md, .. } => Some(md.activate_link(href)),
+                    _ => None,
+                })
+                .flatten()
+                .unwrap_or(false)
+        };
+        // Streamed text is drawn on the next frame's flush.
+        let drawn = crate::testutil::pump_until(&glib::MainContext::default(), 5, || {
+            inner
+                .transcript
+                .with_row("msg1", |row| match row {
+                    cards::Row::Assistant { md, .. } => md.link_label("file:///w/d.rs"),
+                    _ => None,
+                })
+                .flatten()
+                .is_some()
+        });
+        assert!(drawn, "the reply was drawn");
+        source.locations.borrow_mut().clear();
+        assert!(activate("src/b.rs#L9"), "a path link is handled");
+        assert!(activate("src/c.rs:3:2"), "a location in code is a link");
+        assert!(activate("file:///w/d.rs"));
+        // Not activated here: GTK would hand it to the system's browser.
+        assert!(
+            agent_kit::editor::file_link("https://example.com/a.rs:4").is_none(),
+            "a web link is GTK's"
+        );
+        assert!(!activate("x = 1"), "code that names no file is no link");
+        assert_eq!(
+            *source.locations.borrow(),
+            [
+                at("src/b.rs", Some(9), None),
+                at("src/c.rs", Some(3), Some(2)),
+                at("/w/d.rs", None, None),
+            ]
+        );
 
         // Toggling View diff asks the source with the item's id and input, and shows the answer.
         inner.transcript.with_row("edit1", |row| {
@@ -5735,6 +5855,7 @@ pub(crate) mod tests {
             asks: RefCell::default(),
             opened: RefCell::default(),
             in_editor: RefCell::default(),
+            locations: RefCell::default(),
             reply: Err("No diff is available for this edit.".to_owned()),
         });
         view.set_diff_source(failing);

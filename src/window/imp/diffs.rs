@@ -184,8 +184,17 @@ impl DiffSource for ThreadDiffs {
         });
     }
 
-    fn open_in_editor(&self, ask: DiffAsk) {
-        self.open_first_file_in_editor(ask);
+    fn open_in_editor(&self, ask: DiffAsk, parent: gtk4::Widget) {
+        self.open_first_file_in_editor(ask, parent);
+    }
+
+    fn open_location(&self, location: agent_kit::editor::Location, parent: gtk4::Widget) {
+        let toast = Rc::clone(&self.toast);
+        crate::editor_tool::open_with_toast(
+            crate::editor_tool::OpenRequest::at(PathBuf::from(&self.dir), location),
+            Some(parent),
+            move |why| toast(why),
+        );
     }
 
     fn open_external(&self, ask: DiffAsk) {
@@ -258,9 +267,9 @@ impl ThreadDiffs {
 
 impl ThreadDiffs {
     /// "Open in ‹editor›": the edit's first file at its first changed line. The line comes from
-    /// the same diff the card shows; with none known the file opens at its top. The file must be
-    /// inside the thread's folder.
-    fn open_first_file_in_editor(&self, ask: DiffAsk) {
+    /// the same diff the card shows; with none known the file opens at its top. A file outside
+    /// the thread's folder is asked about first, over `parent`.
+    fn open_first_file_in_editor(&self, ask: DiffAsk, parent: gtk4::Widget) {
         let Some(me) = self.me.upgrade() else { return };
         let Some(path) = Self::first_path(&ask.input) else {
             (self.toast)("This edit names no file to open");
@@ -288,6 +297,7 @@ impl ThreadDiffs {
                     line,
                     column: None,
                 },
+                Some(parent),
                 move |why| toast(why),
             );
         });

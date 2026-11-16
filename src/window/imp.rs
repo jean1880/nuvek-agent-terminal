@@ -3393,6 +3393,8 @@ impl AgentTerminalWindow {
                         .xalign(0.0)
                         .selectable(true)
                         .build();
+                    // Notes are markdown: a path in them is no file to open here.
+                    crate::chat::view::guard_links(&notes);
                     let scroll = gtk4::ScrolledWindow::builder()
                         .hscrollbar_policy(gtk4::PolicyType::Never)
                         .min_content_height(160)
@@ -6918,13 +6920,14 @@ impl AgentTerminalWindow {
         });
     }
 
-    /// Opens a diff-panel file in the editor (or the system's handler) at its first changed line.
-    /// The panel names files from the repository's top, but only files inside the tab's own
-    /// folder open. Everything that touches the disk runs off the main thread; a failure is a
-    /// toast.
+    /// Opens a diff-panel file in the editor (or the system's handler) at its line. The panel
+    /// names files from the repository's top; one outside the tab's own folder is asked about
+    /// first, over the panel (in whichever window it is in). Everything that touches the disk
+    /// runs off the main thread; a failure is a toast.
     fn open_panel_file_in_editor(&self, panel_root: &gtk4::Box, file: super::diff_panel::EditFile) {
-        let Some((folder, repo)) = self.tab_by_panel(panel_root, |t| (t.dir.clone(), t.repo_dir()))
-        else {
+        let Some((folder, repo, parent)) = self.tab_by_panel(panel_root, |t| {
+            (t.dir.clone(), t.repo_dir(), t.diff_panel.dialog_parent())
+        }) else {
             return;
         };
         let obj = self.obj().downgrade();
@@ -6943,7 +6946,7 @@ impl AgentTerminalWindow {
                 line: file.line,
                 column: None,
             };
-            crate::editor_tool::open_with_toast(request, move |why| {
+            crate::editor_tool::open_with_toast(request, Some(parent), move |why| {
                 if let Some(obj) = obj.upgrade() {
                     obj.imp().show_toast(why);
                 }

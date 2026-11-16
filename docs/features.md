@@ -222,7 +222,10 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   See [Turn checkpoints](reference.md#turn-checkpoints).
 - **Diff panel** (`Ctrl+Shift+D`): uncommitted work, the last turn, everything since
   the thread opened, or the target branch, with files grouped under their folder and each
-  file's diff on its own row. Open any file in your own diff tool, or in your editor at the first changed line.
+  file's diff on its own row. Open any file in your own diff tool, or in your editor at the
+  first changed line or, with Ctrl+click, at any line of its diff. A read's card and the file
+  links in a reply (`src/a.rs:12`) open in the editor too; a file outside the thread's folder
+  is asked about first, every time.
   Tick the files you want and **Commit…** them through your own git, hooks and signing
   included, after seeing the exact commands. See [Diff panel](reference.md#diff-panel)
   and [Committing](reference.md#committing).

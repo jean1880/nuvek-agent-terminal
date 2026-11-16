@@ -5354,6 +5354,7 @@ impl AgentTerminalWindow {
         let replies = adw::PreferencesGroup::builder().title("Replies").build();
         replies.add(&quick_replies_row);
         general.add(&replies);
+        general.add(&self.spending_group());
         general.add(&self.remote_machines_group());
         general.add(&self.uninstall_group());
         dialog.add(&general);
@@ -9551,6 +9552,7 @@ mod tests {
         remote::tests::the_remote_machines_group_saves_only_valid_aliases(window);
         threads::message_search::tests::message_search_finds_and_opens_a_hit(window);
         spending::tests::the_spending_dialog_shows_and_keeps_what_turns_cost(window);
+        spending::tests::the_spending_group_saves_only_valid_amounts(window);
     }
 
     /// A folder outside any repository has nothing to diff: no Changes toggle, no shortcut.

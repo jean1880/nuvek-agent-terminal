@@ -34,6 +34,30 @@ const READ_BACK_DAYS: i64 = 400;
 pub(super) struct Loaded {
     /// `Period::ALL` × `Group::ALL`, in that order ([`Loaded::report`]).
     reports: Vec<Report>,
+    /// Real money spent today and this month (metered turns), for the warning banner.
+    real_today: f64,
+    real_month: f64,
+}
+
+/// The banner's text when a warning amount is reached, worst first; `None` below 80 % of every
+/// amount set. `extra_usd` is this month's extra usage in US dollars.
+pub(super) fn budget_banner(
+    budget: &spend::Budget,
+    real_today: f64,
+    real_month: f64,
+    extra_usd: Option<f64>,
+) -> Option<String> {
+    use spend::BudgetPeriod;
+    let month = real_month + extra_usd.unwrap_or(0.0);
+    let mut due: Vec<spend::BudgetWarning> = [
+        (BudgetPeriod::Day, real_today),
+        (BudgetPeriod::Month, month),
+    ]
+    .into_iter()
+    .filter_map(|(period, spent)| spend::warning_due(period, spent, budget, None))
+    .collect();
+    due.sort_by_key(|w| std::cmp::Reverse(w.level));
+    due.first().map(spend::BudgetWarning::text)
 }
 
 impl Loaded {
@@ -55,7 +79,11 @@ pub(super) fn load(store: &Store, now_ms: i64) -> Result<Loaded, String> {
             reports.push(spend::report(&data.rows, period, group, today));
         }
     }
-    Ok(Loaded { reports })
+    Ok(Loaded {
+        reports,
+        real_today: spend::real_money(&data.rows, spend::BudgetPeriod::Day.first_day(today)),
+        real_month: spend::real_money(&data.rows, spend::BudgetPeriod::Month.first_day(today)),
+    })
 }
 
 /// What the dialog calls a group's raw key: a profile by its name, an agent by its own.
@@ -328,6 +356,220 @@ fn now_ms() -> i64 {
     glib::real_time() / 1000
 }
 
+/// Whether `event` may have moved the real money spent: a metered turn that reported a cost, or
+/// a new reading of a plan's extra usage. Only these start a budget check.
+pub(super) fn moves_real_money(event: &agent_core::event::Event) -> bool {
+    use agent_core::event::Event;
+    match event {
+        Event::TurnCompleted {
+            billing: Some(spend::Billing::Metered),
+            cost_usd: Some(cost),
+            ..
+        } => *cost > 0.0,
+        Event::ExtraUsageUpdated { extra } => extra.used > 0.0,
+        _ => false,
+    }
+}
+
+/// How a warning amount is shown in its entry: "25", "12.5"; blank for none.
+pub(super) fn budget_text(amount: Option<f64>) -> String {
+    amount.map(|n| n.to_string()).unwrap_or_default()
+}
+
+thread_local! {
+    /// A budget check is running; a second one asked for meanwhile runs once it ends.
+    static BUDGET_CHECK: Cell<(bool, bool)> = const { Cell::new((false, false)) };
+}
+
+const BUDGET_HELP_DAILY: &str =
+    "Warn when today's real money spent reaches 80% and then all of this amount, in US dollars. \
+     Blank: no daily warning";
+const BUDGET_HELP_MONTHLY: &str =
+    "Warn when this month's real money spent, Claude's extra usage in US dollars included, \
+     reaches 80% and then all of this amount. Blank: no monthly warning";
+
+/// Shows on a warning amount's row whether its entry holds an amount Settings can keep: the
+/// reason in the subtitle and the entry marked invalid. Returns the amount when it can.
+fn check_budget_entry(
+    entry: &gtk4::Entry,
+    row: &adw::ActionRow,
+    help: &str,
+) -> Option<Option<f64>> {
+    match spend::parse_budget(&entry.text()) {
+        Ok(amount) => {
+            entry.remove_css_class("error");
+            row.set_subtitle(help);
+            entry.set_tooltip_text(None);
+            entry.update_property(&[gtk4::accessible::Property::Description("")]);
+            entry.update_state(&[gtk4::accessible::State::Invalid(
+                gtk4::AccessibleInvalidState::False,
+            )]);
+            Some(amount)
+        }
+        Err(problem) => {
+            let problem = format!("{problem} The previous amount is still in use.");
+            entry.add_css_class("error");
+            row.set_subtitle(&glib::markup_escape_text(&problem));
+            entry.set_tooltip_text(Some(&problem));
+            entry.update_property(&[gtk4::accessible::Property::Description(&problem)]);
+            entry.update_state(&[gtk4::accessible::State::Invalid(
+                gtk4::AccessibleInvalidState::True,
+            )]);
+            None
+        }
+    }
+}
+
+impl AgentTerminalWindow {
+    /// Settings → General → Spending: the warning switch and its two amounts. Each applies as
+    /// it is made (the switch at once, an amount when Enter is pressed or the entry loses
+    /// focus); an amount that is not one is refused inline, never saved.
+    pub(super) fn spending_group(&self) -> adw::PreferencesGroup {
+        let group = adw::PreferencesGroup::builder()
+            .title("Spending")
+            .description(
+                "A warning counts real money only: turns on an API key or a metered model \
+                 server, and Claude's extra usage. A plan's list price is never counted. It \
+                 warns once a day or month at each level, and never stops a turn.",
+            )
+            .build();
+        let switch = self.config_switch(
+            "Warn About Spending",
+            "Show a notice when spending nears or passes the amounts below",
+            |c| c.spend_warn_enabled,
+            super::SaveWhen::Debounced(|c, on| c.spend_warn_enabled = on),
+            |imp, on| {
+                if on {
+                    imp.check_spending_budget();
+                }
+            },
+        );
+        group.add(&switch);
+        group.add(&self.budget_row(
+            "Daily Warning",
+            BUDGET_HELP_DAILY,
+            |c| c.spend_warn_daily,
+            |c, v| c.spend_warn_daily = v,
+        ));
+        group.add(&self.budget_row(
+            "Monthly Warning",
+            BUDGET_HELP_MONTHLY,
+            |c| c.spend_warn_monthly,
+            |c, v| c.spend_warn_monthly = v,
+        ));
+        group
+    }
+
+    fn budget_row(
+        &self,
+        title: &str,
+        help: &'static str,
+        get: fn(&TerminalConfig) -> Option<f64>,
+        set: fn(&mut TerminalConfig, Option<f64>),
+    ) -> adw::ActionRow {
+        let obj = self.obj();
+        let entry = gtk4::Entry::builder()
+            .text(budget_text(get(&self.config.borrow())))
+            .valign(gtk4::Align::Center)
+            .placeholder_text("No warning")
+            .input_purpose(gtk4::InputPurpose::Number)
+            .width_chars(10)
+            .build();
+        entry.update_property(&[gtk4::accessible::Property::Label(title)]);
+        let row = adw::ActionRow::builder()
+            .title(title)
+            .subtitle(help)
+            .build();
+        row.add_css_class("spending-budget");
+        row.add_suffix(&entry);
+        entry.connect_changed(glib::clone!(
+            #[weak]
+            row,
+            move |entry| {
+                check_budget_entry(entry, &row, help);
+            }
+        ));
+        let commit = Rc::new(glib::clone!(
+            #[weak]
+            obj,
+            #[weak]
+            row,
+            #[weak]
+            entry,
+            move || {
+                let Some(amount) = check_budget_entry(&entry, &row, help) else {
+                    return;
+                };
+                let imp = obj.imp();
+                if get(&imp.config.borrow()) == amount {
+                    return;
+                }
+                set(&mut imp.config.borrow_mut(), amount);
+                imp.schedule_config_save();
+                imp.check_spending_budget();
+            }
+        ));
+        entry.connect_activate(glib::clone!(
+            #[strong]
+            commit,
+            move |_| commit()
+        ));
+        let focus = gtk4::EventControllerFocus::new();
+        focus.connect_leave(move |_| commit());
+        entry.add_controller(focus);
+        row
+    }
+
+    /// Checks the spending warnings now, off the main thread, through the store writer (which
+    /// records each warning given, so it is given once a period, across windows and restarts),
+    /// and shows a toast for each one due. Asked again while one runs, it runs once more after.
+    pub(super) fn check_spending_budget(&self) {
+        let budget = self.config.borrow().spend_budget();
+        if budget == spend::Budget::default() {
+            return;
+        }
+        let (running, _) = BUDGET_CHECK.with(Cell::get);
+        if running {
+            BUDGET_CHECK.with(|c| c.set((true, true)));
+            return;
+        }
+        BUDGET_CHECK.with(|c| c.set((true, false)));
+        let extra = AccountStatus::shared()
+            .snapshot(Driver::Claude)
+            .extra
+            .as_ref()
+            .and_then(spend::extra_usage_usd);
+        let now = now_ms();
+        let weak = self.obj().downgrade();
+        glib::spawn_future_local(async move {
+            let result = write_job("check the spending warnings", move |s| {
+                s.ensure_spend_index()?;
+                s.spend_budget_check(now, &local_day, &budget, extra)
+            })
+            .await;
+            let obj = weak.upgrade();
+            match result {
+                Some(Ok(warnings)) => {
+                    if let Some(obj) = &obj {
+                        for warning in warnings {
+                            obj.imp().show_toast(&warning.text());
+                        }
+                    }
+                }
+                Some(Err(e)) => tracing::warn!(error = %e, "could not check the spending warnings"),
+                None => tracing::warn!("the spending warnings were not checked"),
+            }
+            let (_, again) = BUDGET_CHECK.with(Cell::get);
+            BUDGET_CHECK.with(|c| c.set((false, false)));
+            if again {
+                if let Some(obj) = obj {
+                    obj.imp().check_spending_budget();
+                }
+            }
+        });
+    }
+}
+
 impl AgentTerminalWindow {
     /// Spending…: opens the dialog at once (loading), then reads the store off the main thread.
     pub(super) fn show_spending(&self) -> adw::Dialog {
@@ -354,6 +596,12 @@ impl AgentTerminalWindow {
 
         let names = Rc::new(Names::new(&self.config.borrow(), glib::home_dir().into()));
         let plan = Rc::new(plan_lines(&AccountStatus::shared()));
+        let budget = self.config.borrow().spend_budget();
+        let extra = AccountStatus::shared()
+            .snapshot(Driver::Claude)
+            .extra
+            .as_ref()
+            .and_then(spend::extra_usage_usd);
         let now = now_ms();
         glib::spawn_future_local(glib::clone!(
             #[weak]
@@ -378,7 +626,8 @@ impl AgentTerminalWindow {
                     Some(Err(why)) => return show_error(&stack, &why),
                     None => return show_error(&stack, "The thread store could not be read."),
                 };
-                show_loaded(&stack, Rc::new(loaded), names, plan);
+                let banner = budget_banner(&budget, loaded.real_today, loaded.real_month, extra);
+                show_loaded(&stack, Rc::new(loaded), names, plan, banner);
             }
         ));
         dialog
@@ -395,7 +644,22 @@ fn show_error(stack: &gtk4::Stack, why: &str) {
     stack.set_visible_child_name("error");
 }
 
-fn show_loaded(stack: &gtk4::Stack, loaded: Rc<Loaded>, names: Rc<Names>, plan: Rc<Vec<String>>) {
+fn show_loaded(
+    stack: &gtk4::Stack,
+    loaded: Rc<Loaded>,
+    names: Rc<Names>,
+    plan: Rc<Vec<String>>,
+    banner: Option<String>,
+) {
+    let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    if let Some(text) = banner {
+        let banner = adw::Banner::builder()
+            .title(glib::markup_escape_text(&text).as_str())
+            .revealed(true)
+            .build();
+        banner.add_css_class("spending-banner");
+        outer.append(&banner);
+    }
     let page = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     page.set_margin_top(12);
     page.set_margin_bottom(18);
@@ -465,7 +729,8 @@ fn show_loaded(stack: &gtk4::Stack, loaded: Rc<Loaded>, names: Rc<Names>, plan: 
         .vexpand(true)
         .child(&page)
         .build();
-    stack.add_named(&scrolled, Some("report"));
+    outer.append(&scrolled);
+    stack.add_named(&outer, Some("report"));
     stack.set_visible_child_name("report");
 }
 
@@ -587,6 +852,139 @@ pub(super) mod tests {
             "The agent's default model"
         );
         assert_eq!(names.label(Group::Model, "opus"), "opus");
+    }
+
+    #[test]
+    fn only_real_money_starts_a_budget_check() {
+        use agent_core::event::{Event, ExtraUsage, TurnState};
+        let turn = |billing, cost| Event::TurnCompleted {
+            state: TurnState::Completed,
+            usage: None,
+            cost_usd: cost,
+            error: None,
+            model: None,
+            billing,
+        };
+        assert!(moves_real_money(&turn(Some(Billing::Metered), Some(0.2))));
+        assert!(!moves_real_money(&turn(Some(Billing::Metered), Some(0.0))));
+        assert!(!moves_real_money(&turn(Some(Billing::Metered), None)));
+        assert!(!moves_real_money(&turn(Some(Billing::Plan), Some(5.0))));
+        assert!(!moves_real_money(&turn(None, Some(5.0))));
+        let extra = |used| Event::ExtraUsageUpdated {
+            extra: ExtraUsage {
+                enabled: true,
+                used,
+                limit: None,
+                currency: Some("USD".into()),
+            },
+        };
+        assert!(moves_real_money(&extra(1.0)));
+        assert!(!moves_real_money(&extra(0.0)));
+    }
+
+    #[test]
+    fn the_banner_names_the_worst_warning_reached() {
+        let budget = spend::Budget {
+            daily: Some(10.0),
+            monthly: Some(100.0),
+        };
+        assert_eq!(budget_banner(&budget, 1.0, 10.0, None), None);
+        assert_eq!(
+            budget_banner(&budget, 8.0, 10.0, None).as_deref(),
+            Some("Spending today is $8.00, near your $10.00 warning")
+        );
+        // The month passed through its extra usage outranks a day only near.
+        assert_eq!(
+            budget_banner(&budget, 8.0, 10.0, Some(95.0)).as_deref(),
+            Some("Spending this month is $105.00, past your $100.00 warning")
+        );
+        assert_eq!(
+            budget_banner(&spend::Budget::default(), 1e6, 1e6, None),
+            None
+        );
+        assert_eq!(budget_text(Some(12.5)), "12.5");
+        assert_eq!(budget_text(None), "");
+    }
+
+    /// The Spending group saves only amounts it can keep: typing saves nothing, a refused
+    /// amount is shown as wrong and keeps the previous one, blank clears it. Run from the
+    /// window test.
+    pub(in crate::window) fn the_spending_group_saves_only_valid_amounts(
+        window: &crate::window::AgentTerminalWindow,
+    ) {
+        let imp = window.imp();
+        let before = {
+            let c = imp.config.borrow();
+            (
+                c.spend_warn_enabled,
+                c.spend_warn_daily,
+                c.spend_warn_monthly,
+            )
+        };
+        {
+            let mut c = imp.config.borrow_mut();
+            c.spend_warn_enabled = false;
+            c.spend_warn_daily = None;
+            c.spend_warn_monthly = Some(50.0);
+        }
+        let group = imp.spending_group();
+        let ctx = glib::MainContext::default();
+        let entry_of = |title: &str| -> gtk4::Entry {
+            crate::testutil::descendants(group.upcast_ref())
+                .into_iter()
+                .filter_map(|w| w.downcast::<adw::ActionRow>().ok())
+                .find(|r| r.title() == title)
+                .and_then(|r| crate::testutil::find_first::<gtk4::Entry>(r.upcast_ref()))
+                .unwrap_or_else(|| panic!("no {title} entry"))
+        };
+        let (daily, monthly) = (&entry_of("Daily Warning"), &entry_of("Monthly Warning"));
+        assert_eq!(monthly.text(), "50");
+        let saved = || {
+            let c = imp.config.borrow();
+            (c.spend_warn_daily, c.spend_warn_monthly)
+        };
+        let commit = |entry: &gtk4::Entry, text: &str| {
+            entry.set_text(text);
+            entry.emit_by_name::<()>("activate", &[]);
+            crate::testutil::settle(&ctx);
+        };
+
+        daily.set_text("12");
+        crate::testutil::settle(&ctx);
+        assert_eq!(saved(), (None, Some(50.0)), "typing saves nothing");
+        for bad in ["-5", "0", "twelve", "nan"] {
+            commit(daily, bad);
+            assert_eq!(saved(), (None, Some(50.0)), "{bad:?} was saved");
+            assert!(
+                daily.has_css_class("error"),
+                "{bad:?} is not shown as wrong"
+            );
+        }
+        commit(daily, "$12.50");
+        assert_eq!(saved(), (Some(12.5), Some(50.0)));
+        assert!(!daily.has_css_class("error"));
+        commit(monthly, "abc");
+        assert_eq!(
+            saved().1,
+            Some(50.0),
+            "a refused amount keeps the saved one"
+        );
+        commit(monthly, "");
+        assert_eq!(saved(), (Some(12.5), None), "blank is no warning");
+
+        let switch =
+            crate::testutil::find_first::<adw::SwitchRow>(group.upcast_ref()).expect("the switch");
+        assert!(!switch.is_active());
+        switch.set_active(true);
+        crate::testutil::settle(&ctx);
+        assert!(imp.config.borrow().spend_warn_enabled);
+
+        let mut c = imp.config.borrow_mut();
+        (
+            c.spend_warn_enabled,
+            c.spend_warn_daily,
+            c.spend_warn_monthly,
+        ) = before;
     }
 
     /// The dialog, driven as a user drives it, on the window's store: the totals of a priced

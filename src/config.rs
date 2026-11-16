@@ -943,6 +943,14 @@ pub struct TerminalConfig {
         deserialize_with = "tolerant_context_warning"
     )]
     pub context_warning: agent_core::context_meter::ContextWarning,
+    /// Warn (a toast, once a period and level) when the real money spent today or this month
+    /// reaches 80 % and then all of its warning amount: metered turns and a plan's extra usage
+    /// in US dollars, never a plan's list price. Off by default. Nothing is ever stopped.
+    pub spend_warn_enabled: bool,
+    /// Today's warning amount in US dollars; `None` warns of nothing for the day.
+    pub spend_warn_daily: Option<f64>,
+    /// This month's warning amount in US dollars; `None` warns of nothing for the month.
+    pub spend_warn_monthly: Option<f64>,
     /// Reopen the previous window's tabs on launch. Off by default: a restored
     /// tab gets its directory and profile back but starts a fresh conversation,
     /// so by default it only multiplies blank sessions.
@@ -1407,6 +1415,9 @@ impl Default for TerminalConfig {
             idle_suspend_minutes: 15,
             continue_after_limit: true,
             context_warning: agent_core::context_meter::ContextWarning::default(),
+            spend_warn_enabled: false,
+            spend_warn_daily: None,
+            spend_warn_monthly: None,
             restore_session: false,
             checkpoints: true,
             diff_panel_visible: false,
@@ -1514,6 +1525,20 @@ impl SessionState {
 }
 
 impl TerminalConfig {
+    /// The spending warning amounts in force: none while the warning is off. An amount a
+    /// hand-edited file holds that the Settings row would refuse (not a positive number) warns
+    /// of nothing, never of everything.
+    pub fn spend_budget(&self) -> agent_core::spend::Budget {
+        let valid = |v: Option<f64>| v.filter(|n| n.is_finite() && *n > 0.0);
+        if !self.spend_warn_enabled {
+            return agent_core::spend::Budget::default();
+        }
+        agent_core::spend::Budget {
+            daily: valid(self.spend_warn_daily),
+            monthly: valid(self.spend_warn_monthly),
+        }
+    }
+
     /// The base directory for user configuration.
     ///
     /// Honours `XDG_CONFIG_HOME` per the XDG Base Directory specification, which
@@ -3231,6 +3256,42 @@ mod tests {
             .write_all(br#"{"continue_after_limit":false}"#)
             .unwrap();
         assert!(!TerminalConfig::load_from(&path).continue_after_limit);
+    }
+
+    /// The spending warning is off until turned on, round-trips its amounts, and an amount a
+    /// hand-edited file holds that Settings would refuse warns of nothing.
+    #[test]
+    fn spending_warnings_are_off_by_default_and_round_trip() {
+        use agent_core::spend::Budget;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(br#"{"notify_on_bell":false}"#)
+            .unwrap();
+        let loaded = TerminalConfig::load_from(&path);
+        assert!(!loaded.spend_warn_enabled);
+        assert_eq!(loaded.spend_budget(), Budget::default());
+
+        let mut config = TerminalConfig {
+            spend_warn_enabled: true,
+            spend_warn_daily: Some(5.0),
+            spend_warn_monthly: Some(120.5),
+            ..TerminalConfig::default()
+        };
+        assert!(config.save_to(&path), "saved");
+        let loaded = TerminalConfig::load_from(&path);
+        assert_eq!(
+            loaded.spend_budget(),
+            Budget {
+                daily: Some(5.0),
+                monthly: Some(120.5)
+            }
+        );
+        config.spend_warn_daily = Some(-3.0);
+        assert_eq!(config.spend_budget().daily, None);
+        config.spend_warn_enabled = false;
+        assert_eq!(config.spend_budget(), Budget::default());
     }
 
     #[test]

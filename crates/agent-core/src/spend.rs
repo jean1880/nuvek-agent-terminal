@@ -661,6 +661,196 @@ pub fn bar_fractions<'a>(totals: impl IntoIterator<Item = &'a Total>) -> Vec<f64
         .collect()
 }
 
+// ---------------------------------------------------------------------------------------------
+// Budget warning: real money only (metered turns, and a plan's extra usage), never a plan's
+// list price, never a cost whose billing was not recorded.
+// ---------------------------------------------------------------------------------------------
+
+/// The share of a budget at which the first warning is given.
+pub const NEAR_SHARE: f64 = 0.8;
+
+/// How far a period's spending has gone into its budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BudgetLevel {
+    /// At or past [`NEAR_SHARE`] of it.
+    Near,
+    /// At or past all of it.
+    Over,
+}
+
+impl BudgetLevel {
+    /// As kept in the store's `meta` ([`BudgetPeriod::meta_key`]).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BudgetLevel::Near => "near",
+            BudgetLevel::Over => "over",
+        }
+    }
+
+    /// A kept level; `None` for anything else.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim() {
+            "near" => Some(BudgetLevel::Near),
+            "over" => Some(BudgetLevel::Over),
+            _ => None,
+        }
+    }
+}
+
+/// How far `spent` has gone into `limit`; `None` below [`NEAR_SHARE`] of it, or for a limit
+/// that is not a positive number.
+pub fn budget_level(spent: f64, limit: f64) -> Option<BudgetLevel> {
+    if !limit.is_finite() || limit <= 0.0 || !spent.is_finite() {
+        return None;
+    }
+    if spent >= limit {
+        Some(BudgetLevel::Over)
+    } else if spent >= limit * NEAR_SHARE {
+        Some(BudgetLevel::Near)
+    } else {
+        None
+    }
+}
+
+/// A period a budget covers: the user's own calendar day or month.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetPeriod {
+    Day,
+    Month,
+}
+
+impl BudgetPeriod {
+    pub const ALL: [BudgetPeriod; 2] = [BudgetPeriod::Day, BudgetPeriod::Month];
+
+    /// The first day of the period `today` is in.
+    pub fn first_day(self, today: DayKey) -> DayKey {
+        match self {
+            BudgetPeriod::Day => today,
+            BudgetPeriod::Month => today.month_start(),
+        }
+    }
+
+    /// The `meta` key that keeps the highest level warned of in the period `today` is in:
+    /// `spend_warned:day:2026-11-16`, `spend_warned:month:2026-11`. A new period has a new
+    /// key, so its warnings are given again.
+    pub fn meta_key(self, today: DayKey) -> String {
+        match self {
+            BudgetPeriod::Day => format!("spend_warned:day:{today}"),
+            BudgetPeriod::Month => {
+                format!("spend_warned:month:{:04}-{:02}", today.year, today.month)
+            }
+        }
+    }
+
+    /// "today", "this month".
+    pub fn label(self) -> &'static str {
+        match self {
+            BudgetPeriod::Day => "today",
+            BudgetPeriod::Month => "this month",
+        }
+    }
+}
+
+/// The warning budgets, in US dollars; `None` warns of nothing for that period.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Budget {
+    pub daily: Option<f64>,
+    pub monthly: Option<f64>,
+}
+
+impl Budget {
+    pub fn limit(&self, period: BudgetPeriod) -> Option<f64> {
+        match period {
+            BudgetPeriod::Day => self.daily,
+            BudgetPeriod::Month => self.monthly,
+        }
+        .filter(|l| l.is_finite() && *l > 0.0)
+    }
+}
+
+/// The real money `rows` spent from `first` on, in US dollars: metered turns only (a delegated
+/// worker's included). A plan's list price, a free profile's turns and a cost whose billing was
+/// not recorded are never real money here.
+pub fn real_money(rows: &[SpendRow], first: DayKey) -> f64 {
+    rows.iter()
+        .filter(|r| r.day >= first && r.billing == Billing::Metered)
+        .map(|r| {
+            if r.cost_usd.is_finite() {
+                r.cost_usd.max(0.0)
+            } else {
+                0.0
+            }
+        })
+        .sum()
+}
+
+/// A plan's extra usage as real US dollars spent this month: what it says it used when it is
+/// in US dollars; `None` in another currency or none named (it is never converted or guessed).
+pub fn extra_usage_usd(extra: &crate::event::ExtraUsage) -> Option<f64> {
+    (extra.currency.as_deref() == Some("USD") && extra.used.is_finite())
+        .then_some(extra.used.max(0.0))
+}
+
+/// A warning to give: the period, how far it went, what it spent and its budget.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BudgetWarning {
+    pub period: BudgetPeriod,
+    pub level: BudgetLevel,
+    pub spent: f64,
+    pub limit: f64,
+}
+
+impl BudgetWarning {
+    /// "Spending today has reached $8.12 of your $10.00 warning." The amount is real money.
+    pub fn text(&self) -> String {
+        let (spent, limit) = (format_usd(self.spent), format_usd(self.limit));
+        match self.level {
+            BudgetLevel::Near => format!(
+                "Spending {} is {spent}, near your {limit} warning",
+                self.period.label()
+            ),
+            BudgetLevel::Over => format!(
+                "Spending {} is {spent}, past your {limit} warning",
+                self.period.label()
+            ),
+        }
+    }
+}
+
+/// The warning due for `period`, given what it spent, its budget and the highest level already
+/// warned of in it (`warned`, from `meta`): only a level above that one, so each level is
+/// warned of once a period, and a jump straight past the budget warns once, as over.
+pub fn warning_due(
+    period: BudgetPeriod,
+    spent: f64,
+    budget: &Budget,
+    warned: Option<BudgetLevel>,
+) -> Option<BudgetWarning> {
+    let limit = budget.limit(period)?;
+    let level = budget_level(spent, limit)?;
+    (Some(level) > warned).then_some(BudgetWarning {
+        period,
+        level,
+        spent,
+        limit,
+    })
+}
+
+/// A warning budget as typed: blank is none; otherwise a positive number of dollars (a leading
+/// `$` allowed). Anything else is refused with the reason, never read as none.
+pub fn parse_budget(text: &str) -> Result<Option<f64>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let number = text.strip_prefix('$').unwrap_or(text).trim();
+    match number.parse::<f64>() {
+        Ok(n) if n.is_finite() && n > 0.0 && n <= 1e9 => Ok(Some(n)),
+        Ok(_) => Err("Enter an amount above $0, or leave it blank for no warning.".to_owned()),
+        Err(_) => Err("Enter an amount in dollars, such as 25 or 12.50.".to_owned()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -982,6 +1172,103 @@ mod report_tests {
         assert_eq!(bar_fractions([&a, &b, &tokens_only]), [1.0, 0.5, 0.0]);
         assert_eq!(bar_fractions([&tokens_only]), [1.0]);
         assert_eq!(bar_fractions([&Total::default()]), [0.0]);
+    }
+
+    #[test]
+    fn budget_counts_real_money_only() {
+        let today = day("2026-11-16");
+        let with = |on: &str, billing, cost: f64, delegated| {
+            let mut r = row(on, "claude", "/a", Some(cost), 1);
+            r.billing = billing;
+            r.delegated = delegated;
+            r
+        };
+        let rows = [
+            with("2026-11-16", Billing::Metered, 1.0, false),
+            with("2026-11-16", Billing::Metered, 0.5, true),
+            with("2026-11-16", Billing::Plan, 50.0, false),
+            with("2026-11-16", Billing::Unknown, 70.0, false),
+            with("2026-11-16", Billing::Free, 90.0, false),
+            with("2026-11-02", Billing::Metered, 2.0, false),
+            with("2026-10-31", Billing::Metered, 4.0, false),
+        ];
+        assert_eq!(real_money(&rows, BudgetPeriod::Day.first_day(today)), 1.5);
+        assert_eq!(real_money(&rows, BudgetPeriod::Month.first_day(today)), 3.5);
+
+        use crate::event::ExtraUsage;
+        let extra = |currency: Option<&str>| ExtraUsage {
+            enabled: true,
+            used: 4.25,
+            limit: None,
+            currency: currency.map(str::to_owned),
+        };
+        assert_eq!(extra_usage_usd(&extra(Some("USD"))), Some(4.25));
+        assert_eq!(
+            extra_usage_usd(&extra(Some("CAD"))),
+            None,
+            "never converted"
+        );
+        assert_eq!(extra_usage_usd(&extra(None)), None, "never assumed");
+    }
+
+    #[test]
+    fn budget_state_thresholds_fire_once_per_period() {
+        assert_eq!(budget_level(7.9, 10.0), None);
+        assert_eq!(budget_level(8.0, 10.0), Some(BudgetLevel::Near));
+        assert_eq!(budget_level(10.0, 10.0), Some(BudgetLevel::Over));
+        assert_eq!(budget_level(5.0, 0.0), None);
+        assert_eq!(budget_level(f64::NAN, 10.0), None);
+
+        let budget = Budget {
+            daily: Some(10.0),
+            monthly: None,
+        };
+        let day = BudgetPeriod::Day;
+        let near = warning_due(day, 8.5, &budget, None).expect("near");
+        assert_eq!(near.level, BudgetLevel::Near);
+        assert_eq!(
+            near.text(),
+            "Spending today is $8.50, near your $10.00 warning"
+        );
+        assert_eq!(
+            warning_due(day, 9.0, &budget, Some(BudgetLevel::Near)),
+            None
+        );
+        let over = warning_due(day, 12.0, &budget, Some(BudgetLevel::Near)).expect("over");
+        assert_eq!(over.level, BudgetLevel::Over);
+        assert_eq!(
+            warning_due(day, 50.0, &budget, Some(BudgetLevel::Over)),
+            None
+        );
+        // Straight past the budget: one warning, as over.
+        assert_eq!(
+            warning_due(day, 12.0, &budget, None).map(|w| w.level),
+            Some(BudgetLevel::Over)
+        );
+        assert_eq!(warning_due(BudgetPeriod::Month, 1e6, &budget, None), None);
+
+        let today = DayKey::parse("2026-11-16").expect("day");
+        assert_eq!(day.meta_key(today), "spend_warned:day:2026-11-16");
+        assert_eq!(
+            BudgetPeriod::Month.meta_key(today),
+            "spend_warned:month:2026-11"
+        );
+        assert_ne!(day.meta_key(today), day.meta_key(today.add_days(1)));
+        for level in [BudgetLevel::Near, BudgetLevel::Over] {
+            assert_eq!(BudgetLevel::parse(level.as_str()), Some(level));
+        }
+        assert_eq!(BudgetLevel::parse("garbage"), None);
+    }
+
+    #[test]
+    fn budget_entry_rejects_non_numbers_and_negative() {
+        assert_eq!(parse_budget(""), Ok(None));
+        assert_eq!(parse_budget("  "), Ok(None));
+        assert_eq!(parse_budget("25"), Ok(Some(25.0)));
+        assert_eq!(parse_budget(" $12.50 "), Ok(Some(12.5)));
+        for bad in ["-5", "0", "abc", "nan", "inf", "12,50", "$", "1e12"] {
+            assert!(parse_budget(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

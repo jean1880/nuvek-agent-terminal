@@ -6583,6 +6583,9 @@ impl AgentTerminalWindow {
     }
 
     fn on_thread_envelope(&self, thread: &str, driver: Driver, env: &Envelope) {
+        if super::spending::moves_real_money(&env.event) {
+            self.check_spending_budget();
+        }
         if matches!(env.event, Event::TurnCompleted { .. }) {
             if let Some(supervisor) = crate::delegation::supervisor() {
                 supervisor.on_root_turn_end(thread);

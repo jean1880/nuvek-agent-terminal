@@ -4,7 +4,8 @@
 //! (`AND`, `OR`, `NOT`, `NEAR`, `*`, `^`, `-`, parentheses, a `column:` filter) is only text. The
 //! phrases are joined by spaces, which FTS5 reads as AND, and the last one is a prefix, so a word
 //! still being typed matches. A word with no letter or digit in it is dropped: the tokenizer would
-//! find nothing in it to look for.
+//! find nothing in it to look for. A NUL separates words like a space: FTS5's query parser stops
+//! at one, so a NUL inside a phrase would leave it unterminated.
 
 /// Most words a query keeps; the rest are ignored.
 pub const MAX_TERMS: usize = 16;
@@ -14,7 +15,8 @@ pub const MAX_TERM_CHARS: usize = 64;
 /// `input` as an FTS5 `MATCH` expression; `None` when it holds nothing to look for.
 pub fn compile(input: &str) -> Option<String> {
     let terms: Vec<String> = input
-        .split_whitespace()
+        .split(|c: char| c.is_whitespace() || c == '\0')
+        .filter(|word| !word.is_empty())
         .map(|word| word.chars().take(MAX_TERM_CHARS).collect::<String>())
         .filter(|word| word.chars().any(char::is_alphanumeric))
         .take(MAX_TERMS)
@@ -57,9 +59,16 @@ mod tests {
 
     #[test]
     fn nothing_to_look_for_is_none() {
-        for input in ["", "   ", "* - \" ( ) ^", "\u{2122} ..."] {
+        for input in ["", "   ", "* - \" ( ) ^", "\u{2122} ...", "\0", "\0\0 \0"] {
             assert_eq!(compile(input), None, "{input:?}");
         }
+    }
+
+    #[test]
+    fn a_nul_separates_words_and_never_reaches_the_query() {
+        assert_eq!(compile("ab\0cd").as_deref(), Some("\"ab\" \"cd\"*"));
+        assert_eq!(compile("\"x\0").as_deref(), Some("\"\"\"x\"*"));
+        assert!(!compile("a\0\"b\0").expect("words").contains('\0'));
     }
 
     #[test]

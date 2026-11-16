@@ -1225,6 +1225,11 @@ thread_local! {
     /// The store writer, once a file store opened: every write of the app goes through it, and
     /// `STORE` is then only read. `None` (memory only, tests): writes run in place.
     static WRITER: RefCell<Option<StoreWriter>> = const { RefCell::new(None) };
+    /// The search backfill's delayed start, until it fires.
+    static SEARCH_BACKFILL_TIMER: RefCell<Option<glib::SourceId>> = const { RefCell::new(None) };
+    /// The search backfill, once started: stopped before the writer shuts down.
+    static SEARCH_BACKFILL: RefCell<Option<agent_kit::search_backfill::Backfill>> =
+        const { RefCell::new(None) };
     /// Store write failures already shown to the user (the writer's count).
     static FAILURES_SHOWN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Why the store writer could not start, until a window has said so.
@@ -1345,11 +1350,31 @@ const SEARCH_BACKFILL_DELAY_S: u32 = 10;
 /// index has not taken yet (`agent_kit::search_backfill`). Only with a file store and its writer.
 #[cfg_attr(test, allow(dead_code))]
 fn start_search_backfill() {
+    // It has fired: a once source removes itself, so there is nothing left to cancel.
+    SEARCH_BACKFILL_TIMER.with(|t| t.borrow_mut().take());
     let Some(writer) = WRITER.with(|w| w.borrow().clone()) else {
         return;
     };
-    if let Err(e) = agent_kit::search_backfill::spawn(writer) {
-        warn!("Could not start indexing threads for search: {e}");
+    match agent_kit::search_backfill::spawn(writer) {
+        Ok(backfill) => SEARCH_BACKFILL.with(|b| *b.borrow_mut() = Some(backfill)),
+        Err(e) => warn!("Could not start indexing threads for search: {e}"),
+    }
+}
+
+/// How long quitting waits for the search backfill to finish the job it has queued.
+const SEARCH_BACKFILL_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Cancels the search backfill's delayed start and stops a running backfill, waiting for the
+/// job it has queued: called before the writer shuts down, so it never queues a job the closed
+/// writer would refuse.
+fn stop_search_backfill() {
+    if let Some(timer) = SEARCH_BACKFILL_TIMER.with(|t| t.borrow_mut().take()) {
+        timer.remove();
+    }
+    if let Some(backfill) = SEARCH_BACKFILL.with(|b| b.borrow_mut().take()) {
+        if !backfill.stop_and_wait(SEARCH_BACKFILL_STOP_WAIT) {
+            warn!("shutdown: the search backfill did not stop in time");
+        }
     }
 }
 
@@ -1391,10 +1416,11 @@ fn open_store() -> Result<Rc<Store>, String> {
                     Ok(writer) => {
                         let _ = PANIC_WRITER.set(writer.clone());
                         WRITER.with(|w| *w.borrow_mut() = Some(writer));
-                        glib::timeout_add_seconds_local_once(
+                        let timer = glib::timeout_add_seconds_local_once(
                             SEARCH_BACKFILL_DELAY_S,
                             start_search_backfill,
                         );
+                        SEARCH_BACKFILL_TIMER.with(|t| *t.borrow_mut() = Some(timer));
                     }
                     Err(e) => {
                         error!("Cannot start the store writer; saving on the main thread: {e}");
@@ -1578,6 +1604,7 @@ pub(super) fn store_writes_pending() -> usize {
 /// Drains the store writer and closes its connection, waiting at most `wait` (the app is
 /// quitting: the windows are gone, so nothing is left on screen to freeze).
 pub(crate) fn close_store_writer(wait: std::time::Duration) {
+    stop_search_backfill();
     let Some(writer) = WRITER.with(|w| w.borrow_mut().take()) else {
         return;
     };

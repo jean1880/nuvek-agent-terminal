@@ -9,7 +9,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::store::{Store, INDEX_BUDGET};
 use crate::store_writer::StoreWriter;
@@ -42,6 +42,21 @@ impl Backfill {
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
     }
+
+    /// [`Backfill::stop`], then waits at most `wait` for it to end (a job it already queued is
+    /// answered first, so the writer must still be running); whether it did. Call it before the
+    /// writer shuts down, so the backfill never queues a job the closed writer refuses.
+    pub fn stop_and_wait(&self, wait: Duration) -> bool {
+        self.stop();
+        let started = Instant::now();
+        while !self.finished() {
+            if started.elapsed() >= wait {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
 }
 
 /// Starts the backfill on a new thread.
@@ -66,8 +81,20 @@ fn ending(writer: &StoreWriter, backfill: &Backfill) -> bool {
     backfill.stop.load(Ordering::SeqCst) || writer.is_closed()
 }
 
+/// Waits while the writer has more than [`YIELD_AT`] writes waiting; whether the backfill may
+/// queue its next job (false: it should end).
+fn may_queue(writer: &StoreWriter, backfill: &Backfill) -> bool {
+    while writer.pending() > YIELD_AT {
+        if ending(writer, backfill) {
+            return false;
+        }
+        std::thread::sleep(YIELD_FOR);
+    }
+    !ending(writer, backfill)
+}
+
 fn run(writer: &StoreWriter, backfill: &Backfill) {
-    if ending(writer, backfill) {
+    if !may_queue(writer, backfill) {
         return;
     }
     let pending = match writer
@@ -91,13 +118,7 @@ fn run(writer: &StoreWriter, backfill: &Backfill) {
     backfill.remaining.store(pending.len(), Ordering::SeqCst);
     for thread in pending {
         loop {
-            while writer.pending() > YIELD_AT {
-                if ending(writer, backfill) {
-                    return;
-                }
-                std::thread::sleep(YIELD_FOR);
-            }
-            if ending(writer, backfill) {
+            if !may_queue(writer, backfill) {
                 return;
             }
             let t = thread.clone();
@@ -127,7 +148,6 @@ mod tests {
     use super::*;
     use crate::store::SearchResults;
     use agent_core::event::{Envelope, Event, ItemKind, ItemStatus, StreamKind, TurnState};
-    use std::time::Instant;
 
     fn reply(store: &Store, thread: &str, item: &str, text: &str) {
         let events = [
@@ -222,5 +242,122 @@ mod tests {
         let backfill = spawn(writer.clone()).expect("spawn");
         wait_for(&backfill);
         assert!(writer.is_closed());
+    }
+
+    /// `n` threads, each with one reply, in a file store with no writer yet.
+    fn threads_at(path: &std::path::Path, n: usize) -> Vec<String> {
+        let store = Store::open(path).expect("open");
+        (0..n)
+            .map(|i| {
+                let t = store.create_thread("/w", None).expect("thread");
+                reply(&store, &t, "a", &format!("reply number{i}"));
+                t
+            })
+            .collect()
+    }
+
+    /// Holds the writer inside a job until the returned sender is dropped or sent to.
+    fn hold(writer: &StoreWriter) -> std::sync::mpsc::Sender<()> {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        writer
+            .write("hold the writer", None, move |_| {
+                let _ = held.recv();
+                Ok(())
+            })
+            .expect("queued");
+        release
+    }
+
+    #[test]
+    fn stop_ends_the_backfill_and_a_writer_closed_after_it_counts_no_failure() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("threads.db");
+        threads_at(&path, 20);
+        let writer = StoreWriter::spawn(&path).expect("writer");
+        let release = hold(&writer);
+        let backfill = spawn(writer.clone()).expect("spawn");
+        // Its first job (the list) is queued behind the held one; stopped meanwhile, it ends
+        // once that job is answered, before it queues another.
+        let started = Instant::now();
+        while writer.pending() < 2 {
+            assert!(started.elapsed() < Duration::from_secs(10), "no list job");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        backfill.stop();
+        drop(release);
+        assert!(backfill.stop_and_wait(Duration::from_secs(10)));
+        assert_eq!(
+            backfill.remaining(),
+            20,
+            "no thread was indexed after the stop"
+        );
+        assert_eq!(
+            writer.shutdown(Duration::from_secs(5)),
+            crate::store_writer::Shutdown::Drained
+        );
+        assert_eq!(writer.failures().0, 0);
+        let reader = Store::open(&path).expect("reader");
+        assert_eq!(reader.search_pending().expect("pending").len(), 20);
+    }
+
+    #[test]
+    fn the_backfill_waits_while_the_writer_is_busy() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("threads.db");
+        threads_at(&path, 2);
+        let writer = StoreWriter::spawn(&path).expect("writer");
+        let release = hold(&writer);
+        for _ in 0..YIELD_AT + 10 {
+            writer
+                .write("a queued write", None, |_| Ok(()))
+                .expect("queued");
+        }
+        let queued = writer.pending();
+        assert!(queued > YIELD_AT);
+        let backfill = spawn(writer.clone()).expect("spawn");
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            writer.pending(),
+            queued,
+            "it queued nothing while the writer was busy"
+        );
+        assert!(!backfill.finished());
+        drop(release);
+        wait_for(&backfill);
+        let reader = Store::open(&path).expect("reader");
+        assert!(reader.search_pending().expect("pending").is_empty());
+        assert_eq!(writer.failures().0, 0);
+    }
+
+    #[test]
+    fn a_thread_longer_than_one_budget_is_finished_by_later_calls() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("threads.db");
+        let turns = 1_600;
+        {
+            let store = Store::open(&path).expect("open");
+            let t = store.create_thread("/w", None).expect("thread");
+            for n in 0..turns {
+                reply(&store, &t, &format!("r{n}"), &format!("reply number{n}"));
+            }
+        }
+        // Four events a turn: more than one call's budget, by more than a batch.
+        assert!(turns * 4 > INDEX_BUDGET + 1_000);
+        let writer = StoreWriter::spawn(&path).expect("writer");
+        let backfill = spawn(writer.clone()).expect("spawn");
+        wait_for(&backfill);
+        let reader = Store::open(&path).expect("reader");
+        assert!(reader.search_pending().expect("pending").is_empty());
+        let found = |word: &str| match reader.search(word, 5, true).expect("search") {
+            SearchResults::Hits(hits) => hits.len(),
+            SearchResults::Unavailable => panic!("the index exists"),
+        };
+        assert_eq!(found("number0"), 1);
+        assert_eq!(
+            found(&format!("number{}", turns - 1)),
+            1,
+            "the last turn too"
+        );
+        assert_eq!(writer.failures().0, 0);
     }
 }

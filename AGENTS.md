@@ -120,7 +120,8 @@ Architectural mandates, standards, and workflows for this codebase.
     output, reasoning, notices or `raw`), redacted whole before the upsert (`ON CONFLICT DO
     UPDATE`); the watermark never passes an item that may still change. `search_backfill`
     indexes, from start-up, every thread `Store::search_pending` names, one writer job at a
-    time. `Store::search` (queries compiled by `agent_core::search_query`, which no input can
+    time, and is stopped before the writer shuts down (`close_store_writer`). A delegated
+    worker's hidden backing thread is never indexed, listed as pending or found. `Store::search` (queries compiled by `agent_core::search_query`, which no input can
     make fail) is a read, run only through `store_job`.
   - The app (`src/`): `config.rs` (persisted settings + migration, re-exporting
     `SessionFormat`; per-agent defaults live on the profiles), `theme.rs`

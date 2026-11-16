@@ -108,14 +108,14 @@ fn index_text(text: &str) -> String {
 }
 
 /// Whether `item` may still change, so the watermark must not pass it: an item the index keeps,
-/// still open, with no turn's or session's end after its start. A user message is whole once it
-/// has text (it is stored in one piece and never completes).
+/// still open, with no turn's or session's end after its start. A user message never holds it:
+/// it is stored whole, in one write, and never completes.
 fn still_open(item: &TranscriptItem, last_boundary: i64) -> bool {
     let m = &item.message;
-    if m.status != "open" || item.first_seq < last_boundary || searchable(item).is_none() {
-        return false;
-    }
-    !(m.kind == "user_message" && !m.text.is_empty())
+    m.status == "open"
+        && item.first_seq >= last_boundary
+        && m.kind != "user_message"
+        && searchable(item).is_some()
 }
 
 /// Ends what was open: after one, no earlier item gets more of its events.
@@ -189,8 +189,11 @@ impl Store {
     /// It opens a transaction of its own for its writes, so it must not run inside another
     /// (on the store writer it becomes a savepoint).
     pub fn index_thread(&self, thread: &str, budget: usize) -> Result<IndexProgress> {
+        // A delegated worker's hidden backing thread is never searched, so never indexed.
         let exists: bool = self.conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM threads WHERE id = ?1)",
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM threads t WHERE t.id = ?1 AND {NOT_HIDDEN_CHILD})"
+            ),
             params![thread],
             |r| r.get(0),
         )?;
@@ -297,14 +300,16 @@ impl Store {
     /// The threads with events the index has not taken for good yet, the most recently
     /// updated first: what the start-up backfill indexes. A thread whose last item never
     /// finished (its agent stopped mid-reply) stays here, so it is read again from that item.
+    /// A delegated worker's hidden backing thread is never listed.
     pub fn search_pending(&self) -> Result<Vec<ThreadId>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT t.id FROM threads t
              LEFT JOIN search_state s ON s.thread_id = t.id
              WHERE COALESCE(s.indexed_seq, 0) <
                    COALESCE((SELECT MAX(e.seq) FROM events e WHERE e.thread_id = t.id), 0)
-             ORDER BY t.updated_at DESC, t.rowid DESC",
-        )?;
+               AND {NOT_HIDDEN_CHILD}
+             ORDER BY t.updated_at DESC, t.rowid DESC"
+        ))?;
         let rows = stmt.query_map([], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -777,6 +782,135 @@ mod tests {
         assert!(hits(&s, "  \"*  ").is_empty());
     }
 
+    fn image(name: &str) -> agent_core::attachment::AttachmentRef {
+        agent_core::attachment::AttachmentRef {
+            id: "b".repeat(64),
+            kind: Default::default(),
+            mime: "image/png".to_owned(),
+            width: 1,
+            height: 1,
+            bytes: 3,
+            name: Some(name.to_owned()),
+            origin: Default::default(),
+        }
+    }
+
+    fn max_seq(s: &Store) -> i64 {
+        s.conn
+            .query_row("SELECT MAX(seq) FROM events", [], |r| r.get(0))
+            .expect("max")
+    }
+
+    #[test]
+    fn an_image_only_message_never_holds_the_watermark() {
+        let s = store();
+        let t = s.create_thread("/w", None).expect("thread");
+        s.append_user_input(&t, None, "", &[image("diagram.png")])
+            .expect("message");
+        // No turn has ended: only the message itself says it is whole.
+        let progress = index_all(&s, &t);
+        assert_eq!(progress.indexed_seq, max_seq(&s));
+        assert!(s.search_pending().expect("pending").is_empty());
+        let texts: Vec<_> = rows(&s, &t).into_iter().map(|r| r.4).collect();
+        assert_eq!(texts.len(), 1);
+        assert!(texts[0].contains("[image: diagram.png]"), "{texts:?}");
+    }
+
+    #[test]
+    fn the_inherited_hand_off_is_never_indexed() {
+        let s = store();
+        let t = s.create_thread("/w", None).expect("thread");
+        append(
+            &s,
+            &t,
+            [Envelope::new(Event::HandoffSeeded {
+                summary: "inheritedsummaryword".to_owned(),
+                fence: "```".to_owned(),
+                carried: 1,
+                total: 1,
+                acknowledged: true,
+            })],
+        );
+        s.append_user_message(&t, None, "carry on")
+            .expect("message");
+        append(&s, &t, reply("r", "carrying on"));
+        index_all(&s, &t);
+        assert_eq!(fts_matches(&s, "inheritedsummaryword"), 0);
+        let roles: Vec<_> = rows(&s, &t).into_iter().map(|r| r.2).collect();
+        assert_eq!(roles, ["user", "assistant"]);
+    }
+
+    #[test]
+    fn an_item_is_cut_at_the_cap_on_a_character_boundary() {
+        let text = format!("{}é tail", "a".repeat(ITEM_CAP - 1));
+        let kept = index_text(&text);
+        assert_eq!(
+            kept.len(),
+            ITEM_CAP - 1,
+            "the two-byte é does not fit whole"
+        );
+        assert!(kept.chars().all(|c| c == 'a'));
+        let short = "short and whole";
+        assert_eq!(index_text(short), short);
+        assert_eq!(
+            index_text(&format!("x{SNIPPET_OPEN}y{SNIPPET_CLOSE}z")),
+            "xyz"
+        );
+    }
+
+    #[test]
+    fn a_secret_across_the_cap_is_masked_before_the_cut() {
+        // The token starts a few bytes before the cap: cut first, its head would survive whole.
+        let text = format!("{} {TOKEN} after", "a".repeat(ITEM_CAP - 12));
+        let kept = index_text(&text);
+        assert!(kept.len() <= ITEM_CAP);
+        assert!(!kept.contains("ghp_"), "{}", &kept[kept.len() - 20..]);
+        assert!(!kept.contains(&TOKEN[..8]));
+        // And through the index itself.
+        let s = store();
+        let t = s.create_thread("/w", None).expect("thread");
+        s.append_user_message(&t, None, &text).expect("message");
+        index_all(&s, &t);
+        let stored = rows(&s, &t).remove(0).4;
+        assert!(stored.len() <= ITEM_CAP && !stored.contains("ghp_"));
+    }
+
+    #[test]
+    fn a_hidden_worker_thread_is_neither_indexed_nor_pending() {
+        let s = store();
+        let root = s.create_thread("/w", Some("root")).expect("root");
+        let backing = s.create_thread("/w", Some("child")).expect("child");
+        append(&s, &root, reply("r", "rootword"));
+        append(&s, &backing, reply("r", "workerword"));
+        s.conn
+            .execute_batch(&format!(
+                "BEGIN;
+                 INSERT INTO delegation_roots (id, root_thread_id, root_worker_id, task_state,
+                     policy_json, continuation_budget, created_at, updated_at)
+                     VALUES ('r1', '{root}', 'w_root', 'active', '{{}}', 3, 1, 2);
+                 INSERT INTO delegation_workers (id, root_id, parent_id, origin, depth, name,
+                     driver, profile_id, launch_json, backing_thread_id, state, workspace_json,
+                     delegation_status, created_at, updated_at)
+                     VALUES ('w_root', 'r1', NULL, 'root', 0, 'root', 'local', 'p', '{{}}', NULL,
+                             'running', '{{}}', 'available', 1, 2),
+                            ('w_kid', 'r1', 'w_root', 'supervised', 1, 'kid', 'codex', 'p', '{{}}',
+                             '{backing}', 'closed', '{{}}', 'available', 1, 2);
+                 COMMIT;"
+            ))
+            .expect("a supervised child");
+        assert_eq!(
+            s.search_pending().expect("pending"),
+            std::slice::from_ref(&root)
+        );
+        index_all(&s, &backing);
+        index_all(&s, &root);
+        assert!(rows(&s, &backing).is_empty());
+        assert_eq!(fts_matches(&s, "workerword"), 0);
+        assert!(hits(&s, "workerword").is_empty());
+        assert_eq!(hits(&s, "rootword").len(), 1);
+        assert!(s.search_pending().expect("pending").is_empty());
+    }
+
     #[test]
     fn without_the_full_text_index_search_says_unavailable() {
         let s = Store::open_in_memory().expect("open");
@@ -806,7 +940,7 @@ mod tests {
         append(&s, &t, reply("r", "some ordinary text"));
         index_all(&s, &t);
         let alphabet: Vec<char> =
-            "aZ09 \"*-^:()NEAROR AND NOT{}[],.;'\\/\t\u{e9}\u{6771}\u{2122}\u{E000}\u{301}_+"
+            "aZ09 \"*-^:()NEAROR AND NOT{}[],.;'\\/\t\u{e9}\u{6771}\u{2122}\u{E000}\u{301}_+\0"
                 .chars()
                 .collect();
         // A small deterministic generator: the same strings every run.
@@ -820,6 +954,9 @@ mod tests {
         let mut inputs: Vec<String> = [
             "\"",
             "\"\"",
+            "\0",
+            "a\0b",
+            "\"x\0y",
             "*",
             "-x",
             "NEAR",

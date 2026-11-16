@@ -79,13 +79,15 @@ Architectural mandates, standards, and workflows for this codebase.
     message search as an FTS5 query: quoted phrases, the last a prefix, never a syntax error)
     and `saved_prompts` (the user's saved prompts: name, body and folder rules, the typeahead's
     items, and the one placeholder resolver, `parse`/`resolve`/`Values`, which redacts every
-    value before it caps it).
+    value before it caps it) and `commit_message` (a diff-panel commit's message check, its
+    draft prompt and the shown command line).
   - `crates/agent-kit` (GTK-free; blocking process and file I/O): `git`
     (git plumbing for turn checkpoints and diffs: shells out, but its parsers
     and filters are pure), `diff` (diff bases, numstat, line classification,
     truncation), `restore` (undo: pin, restore, contained deletion, check),
     `worktree` (worktree locations, branch checks, create and clean-only
-    remove), `github` (a branch's pull-request state, the compare URL, the unforced push; it also gives
+    remove), `commit` (the diff panel's commit of the ticked paths: its context, arguments and
+    run), `github` (a branch's pull-request state, the compare URL, the unforced push; it also gives
     a thread's subtitle its branch, shown only for a repository on GitHub),
     `handoff` (hand-off briefs, session readers, quota detection),
     `sessions` (`SessionFormat`, session IDs, transcript lookup and listing),
@@ -150,8 +152,9 @@ Architectural mandates, standards, and workflows for this codebase.
     messages) or its build takes and passes to `ChatView::show_item`; a jump waits for its row
     to be laid out, never falling back to the end; its snippets go through
     `sidebar_model::snippet_markup`, which escapes every character and makes only the match
-    markers bold), `window/sidebar_model.rs` (pure sidebar logic), `window/diff_panel.rs` (the
-    diff panel's widgets and its "Open a PR" bar; it pops out into its own window, keeping its
+    markers bold), `window/sidebar_model.rs` (pure sidebar logic), `window/imp/commit.rs` (the
+    diff panel's commit dialog and flow), `window/diff_panel.rs` (the diff panel's widgets, its
+    file tick boxes, "Commit…" and "Open a PR" bars; it pops out into its own window, keeping its
     place, hidden, as its identity, and docks back when that window closes or its page leaves),
     `main.rs` (app setup + logging, and the `agent_kit`
     imports that keep `crate::git::…` paths).
@@ -207,8 +210,19 @@ Architectural mandates, standards, and workflows for this codebase.
   private index file under the git dir, and are recorded only as refs under
   `refs/agent-terminal/`, created with an empty old value so none is
   overwritten. The user's index, HEAD, working tree and stash are left
-  exactly as they were; `agent-kit`'s `git::tests::repo` proves it, including with a split
-  index and in a linked worktree. Every git call strips inherited
+  exactly as they were, except a commit the user confirms in the diff panel;
+  `agent-kit`'s `git::tests::repo` proves it, including with a split
+  index and in a linked worktree. That commit (`agent-kit`'s `commit`, the one place the app
+  writes the user's index or HEAD) shares no code path with checkpoints and never uses a
+  private index: on an explicit click, after a dialog showing the exact commands, it stages and
+  commits only the ticked paths (`git --literal-pathspecs add -A -- <paths>`, then `commit -m
+  <message> -- <paths>`), so what the user staged elsewhere stays staged. Hooks, signing and
+  the user's identity run as at any `git commit`: its arguments never carry `--no-verify`,
+  `-n`, `--amend`, `--allow-empty`, `-a` or `--no-gpg-sign`, and the checkpoint identity is
+  never substituted. It refuses during a merge, rebase, cherry-pick or revert, warns (never
+  refuses) on the default branch or a detached HEAD, and asks again before a message that
+  looks like a secret; failure text is redacted. `commit::tests` prove these, and that
+  `refs/agent-terminal/*` is untouched. Every git call strips inherited
   `GIT_DIR`-style variables and sets `GIT_OPTIONAL_LOCKS=0`. Untracked files
   whose names look like secrets are never captured.
 - **Hand-off briefs are the terminal's, not the CLI's**: a CLI out of quota

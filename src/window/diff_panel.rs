@@ -1,5 +1,7 @@
-//! The per-tab diff panel: a read-only view of what changed in the tab's
-//! repository — uncommitted, over the last turn, or since the tab opened.
+//! The per-tab diff panel: a view of what changed in the tab's repository — uncommitted, over
+//! the last turn, or since the tab opened. It writes nothing itself: on Uncommitted its rows have
+//! tick boxes and its "Commit…" bar hands the ticked files to the window, which commits them
+//! after the user confirms.
 //!
 //! The changed files are listed under a header per folder, each file a
 //! collapsed row (name and `+3 −1`) that expands to its own diff, so the diffs
@@ -17,9 +19,12 @@ use crate::editor_tool::EditorTools;
 use crate::git::{DiffOutcome, TabDiff};
 use crate::theme::DiffColours;
 use adw::prelude::*;
+use agent_kit::commit::InProgress;
 use agent_kit::github::{PrOutcome, PrState, PushState};
 use gtk4::glib;
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 /// Narrowest width the panel remembers being dragged to.
@@ -203,15 +208,312 @@ pub struct EditFile {
     pub line: Option<u32>,
 }
 
+/// A file a commit from the panel would include.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitFile {
+    /// Repository-relative, as the diff named it.
+    pub path: String,
+    /// The path it was renamed from: committed with it, so the rename is whole.
+    pub old_path: Option<String>,
+}
+
+impl CommitFile {
+    /// Every path the commit must name for this file.
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.path.as_str()).chain(self.old_path.as_deref())
+    }
+}
+
+/// What "Commit…" hands the window: the repository whose diff is on show, the files chosen in
+/// it, and how many were listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitAsk {
+    pub repo: PathBuf,
+    pub files: Vec<CommitFile>,
+    pub listed: usize,
+}
+
+/// Why the panel offers no commit right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitOff {
+    /// The diff compares checkpoints or a target branch, not the working tree: no bar.
+    OtherBase,
+    /// Nothing uncommitted is listed (clean, not a repository, or not read yet): no bar.
+    NoChanges,
+    /// A merge, rebase, cherry-pick or revert is half done.
+    InProgress(InProgress),
+    /// The push behind "Push & Open PR" is running.
+    Pushing,
+    /// Every file is unticked.
+    NothingChosen,
+}
+
+impl CommitOff {
+    /// Whether the bar is hidden altogether, rather than shown with its reason.
+    pub fn hides_bar(self) -> bool {
+        match self {
+            CommitOff::OtherBase | CommitOff::NoChanges => true,
+            CommitOff::InProgress(_) | CommitOff::Pushing | CommitOff::NothingChosen => false,
+        }
+    }
+
+    /// The sentence beside the disabled button.
+    pub fn reason(self) -> &'static str {
+        match self {
+            CommitOff::OtherBase => "Commits are made from the Uncommitted view",
+            CommitOff::NoChanges => "Nothing to commit",
+            CommitOff::InProgress(op) => op.reason(),
+            CommitOff::Pushing => "Wait for the push to finish",
+            CommitOff::NothingChosen => "Tick the files to commit",
+        }
+    }
+}
+
+/// Why no commit is offered, if one is not: the view on show, how many files it lists and how
+/// many are ticked, the operation git has half done, and whether a push runs.
+pub fn commit_off(
+    uncommitted: bool,
+    listed: usize,
+    chosen: usize,
+    op: Option<InProgress>,
+    pushing: bool,
+) -> Option<CommitOff> {
+    if !uncommitted {
+        Some(CommitOff::OtherBase)
+    } else if listed == 0 {
+        Some(CommitOff::NoChanges)
+    } else if let Some(op) = op {
+        Some(CommitOff::InProgress(op))
+    } else if pushing {
+        Some(CommitOff::Pushing)
+    } else if chosen == 0 {
+        Some(CommitOff::NothingChosen)
+    } else {
+        None
+    }
+}
+
+/// The words beside a usable Commit button.
+pub fn chosen_words(chosen: usize, listed: usize) -> String {
+    match (chosen, listed) {
+        (1, 1) => "1 file to commit".to_owned(),
+        (c, l) if c == l => format!("All {l} files to commit"),
+        (c, l) => format!("{c} of {l} files to commit"),
+    }
+}
+
 type OpenHandler = Rc<dyn Fn(OpenFile)>;
 type EditHandler = Rc<dyn Fn(EditFile)>;
 type PrHandler = Rc<dyn Fn(PrState)>;
+type CommitHandler = Rc<dyn Fn(CommitAsk)>;
+/// A row's tick box, held weakly (its row owns it), with the row's path.
+type Tick = (glib::WeakRef<gtk4::CheckButton>, String);
 type PopHandler = Rc<dyn Fn()>;
 /// A popped-out panel's parent window and its destroy handler.
 type ParentWatch = (glib::WeakRef<gtk4::Window>, glib::SignalHandlerId);
 
 /// The diff on show: its left side, and its right side when that is a checkpoint.
 type Sides = (String, Option<String>);
+
+/// The "Commit…" bar and the files it would commit. Cheap to clone: every field is a reference.
+#[derive(Clone)]
+struct CommitBar {
+    bar: gtk4::Box,
+    /// Ticks or unticks every file.
+    all: gtk4::CheckButton,
+    status: gtk4::Label,
+    button: gtk4::Button,
+    face: gtk4::Stack,
+    spinner: gtk4::Spinner,
+    data: CommitData,
+}
+
+/// The commit bar's state, shared by the panel and the bar's handlers. Cheap to clone: every
+/// field is a reference.
+#[derive(Clone)]
+struct CommitData {
+    /// A commit is running (`set_committing`).
+    committing: Rc<Cell<bool>>,
+    /// The files the Uncommitted diff on show lists (empty for another base, or none).
+    listed: Rc<RefCell<Vec<CommitFile>>>,
+    /// Paths the user unticked. Kept across refreshes, so a file that appears starts ticked
+    /// and one the user left out stays out.
+    unticked: Rc<RefCell<BTreeSet<String>>>,
+    /// Each listed row's tick box (held weakly: its row owns it), with its path.
+    ticks: Rc<RefCell<Vec<Tick>>>,
+    /// The repository the diff on show was read from.
+    repo: Rc<RefCell<Option<PathBuf>>>,
+    /// The operation git has half done there, as the last refresh read it.
+    op: Rc<Cell<Option<InProgress>>>,
+    /// The diff on show is the Uncommitted one.
+    uncommitted: Rc<Cell<bool>>,
+    /// Set while code moves the tick boxes, so that is not taken for the user's choice.
+    syncing: Rc<Cell<bool>>,
+    handler: Rc<RefCell<Option<CommitHandler>>>,
+    /// The message being written, kept while the dialog is closed; cleared by a commit. Never
+    /// stored anywhere else: it goes with the tab.
+    draft: Rc<RefCell<String>>,
+}
+
+impl CommitData {
+    /// The listed files still ticked, in the diff's order.
+    fn chosen(&self) -> Vec<CommitFile> {
+        let unticked = self.unticked.borrow();
+        self.listed
+            .borrow()
+            .iter()
+            .filter(|f| !unticked.contains(&f.path))
+            .cloned()
+            .collect()
+    }
+}
+
+impl std::ops::Deref for CommitBar {
+    type Target = CommitData;
+    fn deref(&self) -> &CommitData {
+        &self.data
+    }
+}
+
+/// A [`CommitBar`] for its own widgets' handlers: the widgets held weakly, so no handler keeps
+/// the widget it is connected to alive.
+struct WeakCommitBar {
+    bar: glib::WeakRef<gtk4::Box>,
+    all: glib::WeakRef<gtk4::CheckButton>,
+    status: glib::WeakRef<gtk4::Label>,
+    button: glib::WeakRef<gtk4::Button>,
+    face: glib::WeakRef<gtk4::Stack>,
+    spinner: glib::WeakRef<gtk4::Spinner>,
+    data: CommitData,
+}
+
+impl WeakCommitBar {
+    fn upgrade(&self) -> Option<CommitBar> {
+        Some(CommitBar {
+            bar: self.bar.upgrade()?,
+            all: self.all.upgrade()?,
+            status: self.status.upgrade()?,
+            button: self.button.upgrade()?,
+            face: self.face.upgrade()?,
+            spinner: self.spinner.upgrade()?,
+            data: self.data.clone(),
+        })
+    }
+}
+
+impl CommitBar {
+    fn new() -> Self {
+        let all = gtk4::CheckButton::builder()
+            .valign(gtk4::Align::Center)
+            .tooltip_text("Tick or untick every file")
+            .build();
+        all.update_property(&[gtk4::accessible::Property::Label("Commit every file")]);
+        let status = gtk4::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .wrap(true)
+            .wrap_mode(gtk4::pango::WrapMode::WordChar)
+            .css_classes(["dim-label", "caption"])
+            .build();
+        let content = adw::ButtonContent::builder()
+            .icon_name("at-object-select-symbolic")
+            .label("Commit…")
+            .build();
+        let busy = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(6)
+            .halign(gtk4::Align::Center)
+            .build();
+        let spinner = gtk4::Spinner::new();
+        busy.append(&spinner);
+        busy.append(&gtk4::Label::new(Some("Committing…")));
+        let face = gtk4::Stack::builder()
+            .transition_type(gtk4::StackTransitionType::Crossfade)
+            .build();
+        face.add_named(&content, Some("idle"));
+        face.add_named(&busy, Some("busy"));
+        let button = gtk4::Button::builder()
+            .child(&face)
+            .valign(gtk4::Align::Center)
+            .tooltip_text("Commit the ticked files, after showing the command")
+            .css_classes(["pill", "diff-commit"])
+            .sensitive(false)
+            .build();
+        let bar = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(8)
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(8)
+            .margin_end(8)
+            .visible(false)
+            .build();
+        bar.append(&all);
+        bar.append(&status);
+        bar.append(&button);
+        Self {
+            bar,
+            all,
+            status,
+            button,
+            face,
+            spinner,
+            data: CommitData {
+                committing: Rc::new(Cell::new(false)),
+                listed: Rc::new(RefCell::new(Vec::new())),
+                unticked: Rc::new(RefCell::new(BTreeSet::new())),
+                ticks: Rc::new(RefCell::new(Vec::new())),
+                repo: Rc::new(RefCell::new(None)),
+                op: Rc::new(Cell::new(None)),
+                uncommitted: Rc::new(Cell::new(false)),
+                syncing: Rc::new(Cell::new(false)),
+                handler: Rc::new(RefCell::new(None)),
+                draft: Rc::new(RefCell::new(String::new())),
+            },
+        }
+    }
+
+    /// The bar for the bar's own signal handlers: its widgets held weakly, so no handler keeps
+    /// the widget it is connected to alive.
+    fn downgrade(&self) -> WeakCommitBar {
+        WeakCommitBar {
+            bar: self.bar.downgrade(),
+            all: self.all.downgrade(),
+            status: self.status.downgrade(),
+            button: self.button.downgrade(),
+            face: self.face.downgrade(),
+            spinner: self.spinner.downgrade(),
+            data: self.data.clone(),
+        }
+    }
+
+    /// Redraws the bar for the diff on show, the ticks and what is running.
+    fn sync(&self, pushing: bool) {
+        let listed = self.listed.borrow().len();
+        let chosen = self.chosen().len();
+        let off = commit_off(
+            self.uncommitted.get() && self.repo.borrow().is_some(),
+            listed,
+            chosen,
+            self.op.get(),
+            pushing,
+        );
+        self.bar.set_visible(!off.is_some_and(CommitOff::hides_bar));
+        let words = match off {
+            Some(off) => off.reason().to_owned(),
+            None => chosen_words(chosen, listed),
+        };
+        self.status.set_text(&words);
+        self.button
+            .set_sensitive(off.is_none() && !self.committing.get());
+        self.syncing.set(true);
+        self.all
+            .set_visible(!matches!(off, Some(CommitOff::InProgress(_))));
+        self.all.set_active(listed > 0 && chosen == listed);
+        self.all.set_inconsistent(chosen > 0 && chosen < listed);
+        self.syncing.set(false);
+    }
+}
 
 /// The panel's widgets. Cheap to clone: every field is a reference.
 #[derive(Clone)]
@@ -238,7 +540,11 @@ pub struct DiffPanel {
     pr_pushing: Rc<Cell<bool>>,
     pr_state: Rc<RefCell<Option<PrState>>>,
     pr_handler: Rc<RefCell<Option<PrHandler>>>,
+    /// The "Commit…" bar under the diff, above the PR bar.
+    commit: CommitBar,
     base: gtk4::DropDown,
+    /// The base the refresh in flight was started with.
+    begun_base: Rc<Cell<DiffBase>>,
     summary: gtk4::Label,
     refresh: gtk4::Button,
     undo: gtk4::Button,
@@ -418,6 +724,15 @@ impl DiffPanel {
         content.append(&header);
         content.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
         content.append(&stack);
+        let commit = CommitBar::new();
+        let commit_separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        commit
+            .bar
+            .bind_property("visible", &commit_separator, "visible")
+            .sync_create()
+            .build();
+        content.append(&commit_separator);
+        content.append(&commit.bar);
         let pr_separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
         pr_bar
             .bind_property("visible", &pr_separator, "visible")
@@ -448,7 +763,9 @@ impl DiffPanel {
             pr_pushing: Rc::new(Cell::new(false)),
             pr_state: Rc::new(RefCell::new(None)),
             pr_handler: Rc::new(RefCell::new(None)),
+            commit,
             base,
+            begun_base: Rc::new(Cell::new(DiffBase::default())),
             summary,
             refresh,
             undo,
@@ -481,6 +798,55 @@ impl DiffPanel {
                 return;
             };
             handler(state);
+        });
+        let bar = panel.commit.data.clone();
+        panel.commit.button.connect_clicked(move |_| {
+            let (Some(handler), Some(repo)) =
+                (bar.handler.borrow().clone(), bar.repo.borrow().clone())
+            else {
+                return;
+            };
+            let files = bar.chosen();
+            if files.is_empty() || bar.committing.get() {
+                return;
+            }
+            let listed = bar.listed.borrow().len();
+            handler(CommitAsk {
+                repo,
+                files,
+                listed,
+            });
+        });
+        let weak = panel.commit.downgrade();
+        let pushing = Rc::clone(&panel.pr_pushing);
+        panel.commit.all.connect_toggled(move |all| {
+            let Some(bar) = weak.upgrade() else {
+                return;
+            };
+            if bar.syncing.get() {
+                return;
+            }
+            // A partly ticked box shows as unticked, so a click on it ticks everything; a click
+            // on a fully ticked one unticks everything.
+            let tick = all.is_active();
+            {
+                let mut unticked = bar.unticked.borrow_mut();
+                for file in bar.listed.borrow().iter() {
+                    if tick {
+                        unticked.remove(&file.path);
+                    } else {
+                        unticked.insert(file.path.clone());
+                    }
+                }
+            }
+            bar.syncing.set(true);
+            for (check, _) in bar.ticks.borrow().iter() {
+                if let Some(check) = check.upgrade() {
+                    check.set_active(tick);
+                }
+            }
+            bar.syncing.set(false);
+            bar.sync(pushing.get());
         });
         let handler = Rc::clone(&panel.pop_handler);
         panel.pop.connect_clicked(move |_| {
@@ -637,9 +1003,11 @@ impl DiffPanel {
         self.pr_status.set_text(&words.status);
         self.pr_status.set_tooltip_text(Some(&words.status));
         self.pr_content.set_label(words.button);
-        // A refresh landing mid-push keeps the button busy: only the push's end frees it.
-        self.pr_button
-            .set_sensitive(words.enabled && !self.pr_pushing.get());
+        // A refresh landing mid-push (or mid-commit) keeps the button busy: only the end of
+        // what runs frees it.
+        self.pr_button.set_sensitive(
+            words.enabled && !self.pr_pushing.get() && !self.commit.committing.get(),
+        );
         self.pr_button.set_tooltip_text(Some(if words.enabled {
             "Open this branch's pull request page on GitHub in the browser"
         } else {
@@ -665,8 +1033,66 @@ impl DiffPanel {
         } else {
             self.pr_spinner.stop();
             self.pr_button
-                .set_sensitive(self.pr_state.borrow().is_some());
+                .set_sensitive(self.pr_state.borrow().is_some() && !self.commit.committing.get());
         }
+        self.commit.sync(pushing);
+    }
+
+    /// Calls `commit` with the chosen files when "Commit…" is clicked.
+    pub fn connect_commit(&self, commit: impl Fn(CommitAsk) + 'static) {
+        *self.commit.handler.borrow_mut() = Some(Rc::new(commit));
+    }
+
+    /// Shows, from a refresh, the repository its diff came from (`None`: none) and the operation
+    /// git has half done there, unless a newer refresh has started.
+    pub fn show_commit(&self, generation: u64, repo: Option<PathBuf>, op: Option<InProgress>) {
+        if !self.generation.is_current(generation) {
+            return;
+        }
+        *self.commit.repo.borrow_mut() = repo;
+        self.commit.op.set(op);
+        self.commit.sync(self.pr_pushing.get());
+    }
+
+    /// While a commit runs, its button spins and says so, and neither it nor the PR button can
+    /// be pressed, whatever refreshes land meanwhile.
+    pub fn set_committing(&self, committing: bool) {
+        self.commit.committing.set(committing);
+        self.commit
+            .face
+            .set_visible_child_name(if committing { "busy" } else { "idle" });
+        if committing {
+            self.commit.spinner.start();
+            self.pr_button.set_sensitive(false);
+        } else {
+            self.commit.spinner.stop();
+            self.pr_button
+                .set_sensitive(self.pr_state.borrow().is_some() && !self.pr_pushing.get());
+        }
+        self.commit.sync(self.pr_pushing.get());
+    }
+
+    /// The commit message being written in this tab, kept while its dialog is closed.
+    pub fn commit_draft(&self) -> String {
+        self.commit.draft.borrow().clone()
+    }
+
+    /// Keeps (or, with an empty text, clears) the commit message being written.
+    pub fn set_commit_draft(&self, text: &str) {
+        *self.commit.draft.borrow_mut() = text.to_owned();
+    }
+
+    /// The commit bar's words, whether it can be pressed and whether a commit is running, when
+    /// it is shown (tests).
+    #[cfg(test)]
+    pub fn commit_view(&self) -> Option<(String, bool, bool)> {
+        self.commit.bar.is_visible().then(|| {
+            (
+                self.commit.status.text().to_string(),
+                self.commit.button.is_sensitive(),
+                self.commit.face.visible_child_name().as_deref() == Some("busy"),
+            )
+        })
     }
 
     /// Whether the PR button shows a push in flight (tests).
@@ -801,6 +1227,7 @@ impl DiffPanel {
     /// [`Self::show`] must be given back.
     pub fn begin(&self) -> u64 {
         let generation = self.generation.next();
+        self.begun_base.set(self.base());
         self.summary.set_text("Loading…");
         generation
     }
@@ -810,6 +1237,12 @@ impl DiffPanel {
         if !self.generation.is_current(generation) {
             return;
         }
+        // Only the working tree's own diff can be committed from; the rows say so with a tick.
+        self.commit
+            .uncommitted
+            .set(self.begun_base.get() == DiffBase::Uncommitted);
+        self.commit.listed.borrow_mut().clear();
+        self.commit.ticks.borrow_mut().clear();
         match result {
             Err(err) => self.show_status("at-dialog-warning-symbolic", "Git failed", &err, true),
             Ok(DiffOutcome::NotRepo) => self.show_status(
@@ -829,6 +1262,7 @@ impl DiffPanel {
             }
             Ok(DiffOutcome::Ready(diff)) => self.show_diff(&diff),
         }
+        self.commit.sync(self.pr_pushing.get());
     }
 
     fn show_status(&self, icon: &str, title: &str, description: &str, retry: bool) {
@@ -938,6 +1372,41 @@ impl DiffPanel {
         button
     }
 
+    /// A row's "include in the commit" tick box: ticked unless the user unticked this path.
+    fn commit_tick(&self, path: &str) -> gtk4::CheckButton {
+        let check = gtk4::CheckButton::builder()
+            .valign(gtk4::Align::Center)
+            .active(!self.commit.unticked.borrow().contains(path))
+            .tooltip_text("Include in the commit")
+            .build();
+        check.add_css_class("diff-commit-tick");
+        check.update_property(&[gtk4::accessible::Property::Label(&format!(
+            "Include {path} in the commit"
+        ))]);
+        let weak = self.commit.downgrade();
+        let pushing = Rc::clone(&self.pr_pushing);
+        let owned = path.to_owned();
+        check.connect_toggled(move |check| {
+            let Some(bar) = weak.upgrade() else {
+                return;
+            };
+            if bar.syncing.get() {
+                return;
+            }
+            if check.is_active() {
+                bar.unticked.borrow_mut().remove(&owned);
+            } else {
+                bar.unticked.borrow_mut().insert(owned.clone());
+            }
+            bar.sync(pushing.get());
+        });
+        self.commit
+            .ticks
+            .borrow_mut()
+            .push((check.downgrade(), path.to_owned()));
+        check
+    }
+
     fn set_undo(&self, to: Option<String>) {
         self.undo.set_visible(to.is_some());
         *self.undo_to.borrow_mut() = to;
@@ -1014,6 +1483,12 @@ impl DiffPanel {
             self.files.append(&header);
             for index in files {
                 let stat = &diff.stats[index];
+                if self.commit.uncommitted.get() {
+                    self.commit.listed.borrow_mut().push(CommitFile {
+                        path: stat.path.clone(),
+                        old_path: stat.old_path.clone(),
+                    });
+                }
                 let text = by_stat[index].clone();
                 let why_hidden = if diff.too_large {
                     Some("Not shown: the diff is too large. Open it in your diff tool.")
@@ -1066,6 +1541,9 @@ impl DiffPanel {
             .tooltip_text(stat.path.as_str())
             .build();
         let title = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+        if self.commit.uncommitted.get() {
+            title.append(&self.commit_tick(&stat.path));
+        }
         title.append(&label);
         // Binary files open fine in a tool that knows them; the button is for every row.
         title.append(&self.open_button(stat.path.clone()));
@@ -1187,6 +1665,178 @@ pub(crate) mod tests {
         let unread = pr_words(&Err("git timed out".into()));
         assert!(!unread.enabled);
         assert_eq!(unread.status, "Could not read the branch: git timed out");
+    }
+
+    #[test]
+    fn commit_off_names_why_and_which_reasons_hide_the_bar() {
+        assert_eq!(commit_off(true, 2, 2, None, false), None);
+        assert_eq!(
+            commit_off(false, 2, 2, None, false),
+            Some(CommitOff::OtherBase)
+        );
+        assert_eq!(
+            commit_off(true, 0, 0, None, false),
+            Some(CommitOff::NoChanges)
+        );
+        assert_eq!(
+            commit_off(true, 2, 2, Some(InProgress::Rebase), true),
+            Some(CommitOff::InProgress(InProgress::Rebase))
+        );
+        assert_eq!(commit_off(true, 2, 2, None, true), Some(CommitOff::Pushing));
+        assert_eq!(
+            commit_off(true, 2, 0, None, false),
+            Some(CommitOff::NothingChosen)
+        );
+        let every = [
+            CommitOff::OtherBase,
+            CommitOff::NoChanges,
+            CommitOff::InProgress(InProgress::Merge),
+            CommitOff::Pushing,
+            CommitOff::NothingChosen,
+        ];
+        for off in every {
+            // Exhaustive: a new reason fails to compile until it is placed here.
+            let hides = match off {
+                CommitOff::OtherBase | CommitOff::NoChanges => true,
+                CommitOff::InProgress(_) | CommitOff::Pushing | CommitOff::NothingChosen => false,
+            };
+            assert_eq!(off.hides_bar(), hides, "{off:?}");
+            assert!(!off.reason().is_empty());
+        }
+        assert_eq!(chosen_words(1, 1), "1 file to commit");
+        assert_eq!(chosen_words(3, 3), "All 3 files to commit");
+        assert_eq!(chosen_words(2, 3), "2 of 3 files to commit");
+    }
+
+    fn ready(paths: &[&str]) -> Result<DiffOutcome, String> {
+        let numstat: Vec<u8> = paths
+            .iter()
+            .flat_map(|p| format!("1\t0\t{p}\0").into_bytes())
+            .collect();
+        Ok(DiffOutcome::Ready(TabDiff {
+            stats: crate::diff::parse_numstat(&numstat),
+            text: String::new(),
+            omitted_lines: 0,
+            too_large: false,
+            undo_to: None,
+            from: "HEAD".into(),
+            to_checkpoint: None,
+        }))
+    }
+
+    /// The tick boxes of the rows on show, with their states.
+    fn ticks(panel: &DiffPanel) -> Vec<(String, bool)> {
+        panel
+            .commit
+            .ticks
+            .borrow()
+            .iter()
+            .filter_map(|(check, path)| check.upgrade().map(|c| (path.clone(), c.is_active())))
+            .collect()
+    }
+
+    /// GTK: run from the window's construction test. The commit bar shows only for the
+    /// Uncommitted view of a repository with changes, the ticks survive a refresh, untick-all
+    /// turns Commit off, a merge or a push in flight turns it off with the reason, a refresh
+    /// mid-commit keeps it busy, and Commit hands over the ticked files.
+    pub(crate) fn the_commit_bar_follows_the_view_and_the_ticks() {
+        let panel = DiffPanel::new(&crate::theme::Theme::diff_colours(Default::default()));
+        let asked = Rc::new(RefCell::new(None));
+        let seen = Rc::clone(&asked);
+        panel.connect_commit(move |ask| *seen.borrow_mut() = Some(ask));
+        let repo = PathBuf::from("/repo");
+
+        let generation = panel.begin();
+        panel.show(generation, ready(&["a.rs", "b.rs", "c.rs"]));
+        assert_eq!(panel.commit_view(), None, "no repository known yet");
+        panel.show_commit(generation, Some(repo.clone()), None);
+        assert_eq!(
+            panel.commit_view(),
+            Some(("All 3 files to commit".to_owned(), true, false))
+        );
+        assert_eq!(ticks(&panel).len(), 3);
+
+        // Untick one: the count follows, and the choice survives a refresh.
+        if let Some(check) = panel.commit.ticks.borrow()[1].0.upgrade() {
+            check.set_active(false);
+        }
+        assert_eq!(
+            panel.commit_view().map(|v| v.0),
+            Some("2 of 3 files to commit".to_owned())
+        );
+        let generation = panel.begin();
+        panel.show(generation, ready(&["a.rs", "b.rs", "c.rs", "d.rs"]));
+        panel.show_commit(generation, Some(repo.clone()), None);
+        assert_eq!(
+            ticks(&panel),
+            vec![
+                ("a.rs".to_owned(), true),
+                ("b.rs".to_owned(), false),
+                ("c.rs".to_owned(), true),
+                ("d.rs".to_owned(), true),
+            ],
+            "a new file starts ticked; the one left out stays out"
+        );
+        panel.commit.button.emit_clicked();
+        let ask = asked
+            .borrow_mut()
+            .take()
+            .expect("Commit hands the files over");
+        assert_eq!(ask.repo, repo);
+        assert_eq!(ask.listed, 4);
+        let paths: Vec<&str> = ask.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["a.rs", "c.rs", "d.rs"]);
+
+        // Untick everything with the bar's own box: Commit is off, and says why.
+        panel.commit.all.set_active(true);
+        panel.commit.all.set_active(false);
+        assert_eq!(
+            panel.commit_view(),
+            Some((CommitOff::NothingChosen.reason().to_owned(), false, false))
+        );
+        panel.commit.all.set_active(true);
+        assert_eq!(panel.commit_view().map(|v| v.1), Some(true));
+
+        // A merge half done, or a push in flight: shown, but off, with the reason.
+        panel.show_commit(generation, Some(repo.clone()), Some(InProgress::Merge));
+        assert_eq!(
+            panel.commit_view(),
+            Some((InProgress::Merge.reason().to_owned(), false, false))
+        );
+        panel.show_commit(generation, Some(repo.clone()), None);
+        panel.set_pushing(true);
+        assert_eq!(panel.commit_view().map(|v| v.1), Some(false));
+        panel.set_pushing(false);
+
+        // A commit running: busy, and a refresh landing meanwhile keeps it so.
+        panel.set_committing(true);
+        let generation = panel.begin();
+        panel.show(generation, ready(&["a.rs"]));
+        panel.show_commit(generation, Some(repo.clone()), None);
+        assert_eq!(panel.commit_view().map(|v| (v.1, v.2)), Some((false, true)));
+        panel.commit.button.emit_clicked();
+        assert!(asked.borrow().is_none(), "no second commit while one runs");
+        panel.set_committing(false);
+        assert_eq!(panel.commit_view().map(|v| (v.1, v.2)), Some((true, false)));
+
+        // Clean, or another view: no bar.
+        let generation = panel.begin();
+        panel.show(generation, ready(&[]));
+        panel.show_commit(generation, Some(repo.clone()), None);
+        assert_eq!(panel.commit_view(), None);
+        panel.base.set_selected(2);
+        let generation = panel.begin();
+        panel.show(generation, ready(&["a.rs"]));
+        panel.show_commit(generation, Some(repo), None);
+        assert_eq!(panel.commit_view(), None);
+        assert!(
+            ticks(&panel).is_empty(),
+            "no tick boxes outside Uncommitted"
+        );
+
+        // The message draft is kept for the tab.
+        panel.set_commit_draft("Half written");
+        assert_eq!(panel.commit_draft(), "Half written");
     }
 
     /// GTK: run from the window's construction test. The panel pops out into its own window,

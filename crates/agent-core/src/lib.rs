@@ -17,6 +17,7 @@ pub mod claude;
 pub mod codex;
 pub mod codex_rules;
 pub mod commands;
+pub mod commit_message;
 pub mod context_meter;
 pub mod delegation;
 pub mod event;

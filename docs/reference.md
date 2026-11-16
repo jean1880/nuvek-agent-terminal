@@ -254,8 +254,9 @@ git for-each-ref --format='delete %(refname)' refs/agent-terminal | git update-r
 
 ### Diff panel
 
-`Ctrl+Shift+D` opens a read-only panel listing the changed files under a header for each
-folder (the repository root first). Each file is a collapsed row with its line counts and
+`Ctrl+Shift+D` opens a panel listing the changed files under a header for each
+folder (the repository root first). It only reads, except for the commit you confirm from
+it ([Committing](#committing)). Each file is a collapsed row with its line counts and
 **Open in…**; expanding it shows that file's coloured unified diff, built when first opened.
 The dropdown picks what to compare against:
 
@@ -281,6 +282,49 @@ argv, never run through a shell. Its placeholders are `{file}` (required, the ab
 a symlink that leads out of the folder counts as outside, and it must be a regular file. A file
 outside the folder, or one of the sensitive names an agent's edits always ask about (`.git`,
 `.vscode`, agent instruction files and the like), is refused with a message.
+
+### Committing
+
+On **Uncommitted**, each file row has a tick box, all ticked at first, and the **Commit…**
+bar under the diff counts them; its own box ticks or unticks every file. What you untick
+stays unticked across refreshes, and a file that appears later starts ticked. The bar is
+hidden on the other bases and when there is nothing to commit, and is shown but off, with
+the reason, while a merge, rebase, cherry-pick or revert is half done or the PR bar's push
+runs.
+
+**Commit…** opens a dialog with the branch, the files, a box for the message (a subject
+line, a blank line, then the body) and the exact commands it runs:
+
+```
+git --literal-pathspecs add -A -- <files>
+git --literal-pathspecs commit -m '<message>' -- <files>
+```
+
+- **Only the ticked files are committed.** Anything else you had staged yourself stays
+  staged and is not part of the commit; the dialog says how many such files there are.
+  Pathspecs are literal, so a file named `*` names only itself. A rename commits both its
+  old and its new path.
+- **Your hooks and signing run, and nothing is skipped or amended.** The app never passes
+  `--no-verify`, `--amend`, `--allow-empty`, `-a` or `--no-gpg-sign`. Your own `user.name`
+  and `user.email` are used; when one is missing git's message is shown and nothing is
+  committed. A hook or signing step that waits for input cannot be answered from here and
+  fails (after two minutes at most); commit in the drawer's terminal instead.
+- **A failing hook** leaves HEAD where it was, with git's and the hook's own words shown
+  (anything secret-shaped in them masked). The ticked files stay staged.
+- **On the default branch or a detached HEAD** the dialog warns you, and the commit is
+  still yours to make.
+- **A message that looks like it holds a key or token** is committed exactly as typed, but
+  only after a second confirmation.
+- **Files the panel does not list** (ignored, secret-looking names, untracked files over
+  5 MiB) are never part of a commit made here.
+- **Draft Message** (in a thread) closes the dialog and puts a prompt in the composer asking
+  the agent for a message for the ticked files. It names the files and sends no diff; you
+  review it and send it like any message. Paste the reply into the dialog when you reopen it.
+  The message you were writing is kept for the thread while it is open, and cleared by a
+  commit.
+
+After a commit the panel refreshes, and the PR bar counts the new commit to push. Undo
+never touches commits ([Undoing a turn](#undoing-a-turn)).
 
 ### Undoing a turn
 

@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 mod delegation;
+pub(super) mod message_search;
 
 use agent_core::adapter::{Adapter, Control, Driver, Mode, OpenSession};
 use agent_core::catalog::{model_notice, ModelNotice};
@@ -820,6 +821,9 @@ pub(super) struct ChatTab {
     /// Sent once the session exists (Continue In from a terminal page); also saved as redacted
     /// unsent metadata so closing during a build does not lose it.
     pending_prompt: Option<String>,
+    /// A message-search hit opened before the thread was built: the item its build brings into
+    /// view once the history is replayed.
+    pending_jump: Option<String>,
     /// The thread was created carrying a handoff (fork, compact-by-handoff) its session has not
     /// started with yet. The handoff itself is stored with the thread and re-armed from history
     /// (`stored_handoff`); this only keeps an unstarted fork from looking blank.
@@ -2521,9 +2525,17 @@ fn open_store() -> Result<Rc<Store>, String> {
 
 fn in_memory_store() -> Result<Rc<Store>, String> {
     // An in-memory SQLite that cannot open means no SQLite at all.
-    Store::open_in_memory()
-        .map(Rc::new)
-        .map_err(|e| e.to_string())
+    let store = Store::open_in_memory().map_err(|e| e.to_string())?;
+    // With no writer to make it, the full-text index is made here, so message search works on
+    // this store too; without it, search says it is unavailable.
+    match store.ensure_search_fts() {
+        Ok(agent_kit::store::SearchIndex::Ready) => {}
+        Ok(agent_kit::store::SearchIndex::Unavailable(why)) => {
+            warn!("Message search is unavailable: {why}");
+        }
+        Err(e) => warn!("Could not make the message search index: {e}"),
+    }
+    Ok(Rc::new(store))
 }
 
 /// The cached resolution of `profile`'s command and env file, if done.
@@ -3214,6 +3226,8 @@ pub(super) struct Sidebar {
     empty: gtk4::Box,
     empty_title: Label,
     empty_hint: Label,
+    /// The "In Messages" section and its toggle beside the search entry.
+    messages: message_search::MessageSearch,
     /// Held for the sidebar's lifetime: the footer's usage indicator.
     _usage: Rc<UsageIndicator>,
 }
@@ -3878,6 +3892,8 @@ impl AgentTerminalWindow {
             .build();
         // New Thread is the header's "+", visible whether or not the sidebar is.
         top.append(&search);
+        let messages = message_search::MessageSearch::new();
+        top.append(&messages.toggle);
         root.append(&top);
 
         let list = gtk4::ListBox::builder()
@@ -3887,10 +3903,14 @@ impl AgentTerminalWindow {
         // Until the first load lands (`refresh_sidebar`), rows in the shape of the real ones.
         let placeholder = loading::sidebar_rows();
         list.set_placeholder(Some(&placeholder));
+        // The thread rows, then (while messages are searched too) the hits in what was said.
+        let content = Box::builder().orientation(Orientation::Vertical).build();
+        content.append(&list);
+        content.append(&messages.section);
         let scrolled = ScrolledWindow::builder()
             .hscrollbar_policy(gtk4::PolicyType::Never)
             .vexpand(true)
-            .child(&list)
+            .child(&content)
             .build();
         root.append(&scrolled);
 
@@ -3911,6 +3931,7 @@ impl AgentTerminalWindow {
                 let imp = obj.imp();
                 imp.show_archived.set(button.is_active());
                 imp.refresh_sidebar();
+                imp.message_search_changed();
             }
         ));
         footer.append(&archived);
@@ -3954,12 +3975,18 @@ impl AgentTerminalWindow {
             empty,
             empty_title,
             empty_hint,
+            messages,
             _usage: usage,
         });
+        self.connect_message_search(&sidebar.messages);
         search.connect_search_changed(glib::clone!(
             #[weak]
             obj,
-            move |_| obj.imp().refresh_sidebar()
+            move |_| {
+                let imp = obj.imp();
+                imp.refresh_sidebar();
+                imp.message_search_changed();
+            }
         ));
         let weak_sidebar = Rc::downgrade(&sidebar);
         list.connect_row_activated(glib::clone!(
@@ -5774,6 +5801,7 @@ impl AgentTerminalWindow {
                 title_item: None,
                 title_provisional: false,
                 pending_prompt: None,
+                pending_jump: None,
                 pending_handoff: false,
                 profile_id: None,
                 stored_handoff: None,
@@ -6017,6 +6045,13 @@ impl AgentTerminalWindow {
         holder.append(&view);
         *slot.view.borrow_mut() = Some(view.downgrade());
         self.attach_worker_view(&thread, &slot, &view);
+        // A message-search hit opened while the thread was being built.
+        if let Some(item) = self
+            .with_page_chat_mut(page, |c| c.pending_jump.take())
+            .flatten()
+        {
+            message_search::jump_to_hit(&view, &item);
+        }
 
         let thread_id = thread.clone();
         view.connect_action(move |action| {

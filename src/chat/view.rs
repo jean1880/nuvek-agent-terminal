@@ -634,6 +634,30 @@ impl ChatView {
         }
     }
 
+    /// Brings the transcript item `id` (a stored item id, as message search names it) into view,
+    /// opening any card it sits in. False when the view does not hold it: older than the history
+    /// the thread replays, or no longer there.
+    pub fn show_item(&self, id: &str) -> bool {
+        let Some(inner) = self.inner() else {
+            return false;
+        };
+        let held = inner
+            .model
+            .try_borrow()
+            .is_ok_and(|model| model.get(id).is_some());
+        if held {
+            inner.transcript.scroll_to_card(id);
+        }
+        held
+    }
+
+    /// The item a jump the transcript has not placed yet goes to (tests).
+    #[cfg(test)]
+    pub(crate) fn pending_jump_id(&self) -> Option<String> {
+        self.inner()
+            .and_then(|inner| inner.transcript.pending_jump_id())
+    }
+
     /// The thread's mode as its replayed history last set it (what the picker shows), so a
     /// reopened thread's session starts in it; `None` when the history never changed it.
     pub fn replayed_mode(&self) -> Option<Mode> {

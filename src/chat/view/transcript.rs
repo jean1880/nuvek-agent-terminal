@@ -2018,6 +2018,12 @@ impl TranscriptView {
         self.jump_to.borrow().is_some()
     }
 
+    /// The item a jump waiting to be placed goes to (tests).
+    #[cfg(test)]
+    pub fn pending_jump_id(&self) -> Option<String> {
+        self.jump_to.borrow().clone()
+    }
+
     /// Whether the pending jump's row sits in a card that is still opening (tests).
     #[cfg(test)]
     pub fn jump_opening(&self) -> bool {

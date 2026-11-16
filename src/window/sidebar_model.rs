@@ -246,6 +246,170 @@ pub fn empty_sidebar_text(query: &str) -> (&'static str, &'static str) {
     }
 }
 
+/// Most message hits the sidebar asks the index for.
+pub const MESSAGE_HITS: usize = 50;
+/// How long typing must pause before the message search runs (ms).
+pub const MESSAGE_SEARCH_DEBOUNCE_MS: u64 = 250;
+/// How often a search shown while threads are still being indexed runs again (ms), so what the
+/// index takes in meanwhile shows up.
+pub const MESSAGE_SEARCH_REFRESH_MS: u64 = 3_000;
+
+/// What the last message search found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageSearch {
+    /// The index could not be read (no full-text search in this SQLite, or the read failed):
+    /// never shown as "no match".
+    Unavailable,
+    /// This many hits (0: no match).
+    Found(usize),
+}
+
+/// "1 thread", "3 threads".
+fn threads_count(n: usize) -> String {
+    match n {
+        1 => "1 thread".to_owned(),
+        n => format!("{n} threads"),
+    }
+}
+
+/// The line under "In Messages": why there is nothing to show, or that the index is still being
+/// built (`indexing` threads to go), so the hits may be partial. `None` when the hits say it all.
+pub fn message_status(found: MessageSearch, indexing: usize) -> Option<String> {
+    let building = (indexing > 0).then(|| format!("Indexing {}…", threads_count(indexing)));
+    match (found, building) {
+        (MessageSearch::Unavailable, _) => {
+            Some("Search is unavailable: the message index could not be read.".to_owned())
+        }
+        (MessageSearch::Found(0), None) => Some("No messages match.".to_owned()),
+        (MessageSearch::Found(0), Some(building)) => {
+            Some(format!("No messages match yet. {building}"))
+        }
+        (MessageSearch::Found(_), Some(building)) => {
+            Some(format!("{building} These results may be partial."))
+        }
+        (MessageSearch::Found(_), None) => None,
+    }
+}
+
+/// Who said what a hit found, as its row names them.
+pub fn hit_role_label(role: &str) -> &'static str {
+    match role {
+        "user" => "You",
+        "assistant" => "Agent",
+        "tool" => "Tool",
+        _ => "Message",
+    }
+}
+
+/// A snippet character as it is shown: line breaks and other control characters as spaces (a
+/// snippet is one run of text, and some control characters are not valid in markup).
+fn shown_char(c: char) -> char {
+    if c.is_control() {
+        ' '
+    } else {
+        c
+    }
+}
+
+/// A hit's snippet as plain text: the match markers dropped.
+pub fn snippet_plain(snippet: &str) -> String {
+    use agent_kit::store::{SNIPPET_CLOSE, SNIPPET_OPEN};
+    snippet
+        .chars()
+        .filter(|c| *c != SNIPPET_OPEN && *c != SNIPPET_CLOSE)
+        .map(shown_char)
+        .collect()
+}
+
+/// A hit's snippet as Pango markup: every character of the text escaped, so nothing the thread
+/// said is read as markup, and only the match markers made emphasis. A stray close marker is
+/// dropped and an open one left unclosed is closed at the end, so the markup always parses.
+pub fn snippet_markup(snippet: &str) -> String {
+    use agent_kit::store::{SNIPPET_CLOSE, SNIPPET_OPEN};
+    let mut out = String::with_capacity(snippet.len() + 16);
+    let mut open = false;
+    for c in snippet.chars() {
+        match c {
+            SNIPPET_OPEN if !open => {
+                out.push_str("<b>");
+                open = true;
+            }
+            SNIPPET_CLOSE if open => {
+                out.push_str("</b>");
+                open = false;
+            }
+            SNIPPET_OPEN | SNIPPET_CLOSE => {}
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(shown_char(c)),
+        }
+    }
+    if open {
+        out.push_str("</b>");
+    }
+    out
+}
+
+/// One row of the sidebar's "In Messages" section.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MessageHitRow {
+    pub thread: String,
+    /// The transcript item the hit is in: what opening it brings into view.
+    pub item: String,
+    pub title: String,
+    pub folder: String,
+    /// `user`, `assistant` or `tool`.
+    pub role: String,
+    /// When the item began (epoch milliseconds).
+    pub at: i64,
+    /// With the match markers ([`snippet_markup`], [`snippet_plain`]).
+    pub snippet: String,
+    pub archived: bool,
+}
+
+impl MessageHitRow {
+    /// What a screen reader says for the row: who, in which thread, when, and the text.
+    pub fn accessible_label(&self, now_ms: i64) -> String {
+        let age = match relative_time(now_ms, self.at) {
+            now if now == "now" => "just now".to_owned(),
+            age => format!("{age} ago"),
+        };
+        let archived = if self.archived { ", archived" } else { "" };
+        format!(
+            "{} in {}{archived}, {age}: {}",
+            hit_role_label(&self.role),
+            self.title,
+            snippet_plain(&self.snippet).trim()
+        )
+    }
+}
+
+/// The rows for `hits`, in the order the index ranked them, titled from the loaded thread list
+/// `threads`. A hit whose thread is not in it (deleted since) is left out.
+pub fn message_hit_rows(
+    hits: Vec<agent_kit::store::SearchHit>,
+    threads: &[agent_kit::store::ThreadSummary],
+) -> Vec<MessageHitRow> {
+    hits.into_iter()
+        .filter_map(|hit| {
+            let summary = threads.iter().find(|t| t.id == hit.thread_id)?;
+            Some(MessageHitRow {
+                title: display_title(&summary.title).to_owned(),
+                folder: summary.cwd.clone(),
+                thread: hit.thread_id,
+                item: hit.item_id,
+                role: hit.role,
+                at: hit.at,
+                snippet: hit.snippet,
+                archived: hit.archived,
+            })
+        })
+        .collect()
+}
+
 /// The toast after the agents' own recent sessions were listed as threads: how many, and from
 /// which agents (each named once, in the order first met). `None` when none were added.
 pub fn sessions_added_toast(drivers: &[Driver]) -> Option<String> {
@@ -2333,5 +2497,133 @@ mod tests {
             limit_wait_text(Claude, None),
             format!("Continues here once {label} has usage again")
         );
+    }
+}
+
+#[cfg(test)]
+mod message_search_tests {
+    use super::*;
+    use agent_kit::store::{SearchHit, ThreadSummary, SNIPPET_CLOSE, SNIPPET_OPEN};
+
+    fn marked(s: &str) -> String {
+        s.replace('[', &SNIPPET_OPEN.to_string())
+            .replace(']', &SNIPPET_CLOSE.to_string())
+    }
+
+    #[test]
+    fn a_snippet_is_escaped_text_with_only_its_matches_emphasised() {
+        let snippet = marked("run <b>&amp; [cargo] \"x\" 'y' > [test]");
+        assert_eq!(
+            snippet_markup(&snippet),
+            "run &lt;b&gt;&amp;amp; <b>cargo</b> &quot;x&quot; &#39;y&#39; &gt; <b>test</b>"
+        );
+        assert_eq!(
+            snippet_plain(&snippet),
+            "run <b>&amp; cargo \"x\" 'y' > test"
+        );
+    }
+
+    #[test]
+    fn markup_that_a_thread_wrote_never_becomes_markup() {
+        let snippet = marked("<span foreground=\"red\">[hi]</span>\n\u{1}<i>");
+        let markup = snippet_markup(&snippet);
+        assert!(!markup.contains("<span") && !markup.contains("<i>"));
+        assert!(!markup.contains('\n') && !markup.contains('\u{1}'));
+        assert_eq!(markup.matches("<b>").count(), 1);
+        assert_eq!(markup.matches("</b>").count(), 1);
+    }
+
+    #[test]
+    fn unbalanced_markers_still_make_balanced_markup() {
+        assert_eq!(snippet_markup(&marked("a] [b")), "a <b>b</b>");
+        assert_eq!(snippet_markup(&marked("[[a]]")), "<b>a</b>");
+        assert_eq!(snippet_markup(""), "");
+    }
+
+    #[test]
+    fn the_status_line_never_calls_an_unreadable_index_no_match() {
+        let unavailable = message_status(MessageSearch::Unavailable, 0).expect("said");
+        assert!(unavailable.starts_with("Search is unavailable"));
+        assert_eq!(
+            message_status(MessageSearch::Unavailable, 4).as_deref(),
+            Some(unavailable.as_str())
+        );
+        assert_eq!(
+            message_status(MessageSearch::Found(0), 0).as_deref(),
+            Some("No messages match.")
+        );
+        assert_eq!(
+            message_status(MessageSearch::Found(0), 1).as_deref(),
+            Some("No messages match yet. Indexing 1 thread…")
+        );
+        assert_eq!(
+            message_status(MessageSearch::Found(3), 12).as_deref(),
+            Some("Indexing 12 threads… These results may be partial.")
+        );
+        assert_eq!(message_status(MessageSearch::Found(3), 0), None);
+    }
+
+    fn summary(id: &str, title: &str) -> ThreadSummary {
+        ThreadSummary {
+            id: id.into(),
+            title: title.into(),
+            cwd: "/w".into(),
+            updated_at: 0,
+            driver: None,
+            model: None,
+            unread: false,
+            archived: false,
+            pin_rank: None,
+        }
+    }
+
+    fn hit(thread: &str, item: &str, archived: bool) -> SearchHit {
+        SearchHit {
+            thread_id: thread.into(),
+            item_id: item.into(),
+            first_seq: 1,
+            role: "assistant".into(),
+            at: 0,
+            snippet: marked("the [deploy] step"),
+            rank: -1.0,
+            archived,
+        }
+    }
+
+    #[test]
+    fn hit_rows_keep_the_rank_order_and_drop_threads_that_are_gone() {
+        let threads = [summary("t1", "Deploy notes"), summary("t2", "")];
+        let rows = message_hit_rows(
+            vec![
+                hit("t2", "b", true),
+                hit("gone", "x", false),
+                hit("t1", "a", false),
+            ],
+            &threads,
+        );
+        let keys: Vec<_> = rows
+            .iter()
+            .map(|r| (r.thread.as_str(), r.item.as_str()))
+            .collect();
+        assert_eq!(keys, [("t2", "b"), ("t1", "a")]);
+        assert_eq!(rows[0].title, "New thread");
+        assert!(rows[0].archived);
+        assert_eq!(rows[1].folder, "/w");
+        assert_eq!(
+            rows[0].accessible_label(30_000),
+            "Agent in New thread, archived, just now: the deploy step"
+        );
+        assert_eq!(
+            rows[1].accessible_label(3_600_000),
+            "Agent in Deploy notes, 1h ago: the deploy step"
+        );
+    }
+
+    #[test]
+    fn every_role_has_a_name() {
+        assert_eq!(hit_role_label("user"), "You");
+        assert_eq!(hit_role_label("assistant"), "Agent");
+        assert_eq!(hit_role_label("tool"), "Tool");
+        assert_eq!(hit_role_label("other"), "Message");
     }
 }

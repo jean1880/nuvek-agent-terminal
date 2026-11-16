@@ -9210,6 +9210,7 @@ mod tests {
         diff_prefs::tests::the_diff_tool_group_saves_only_what_is_valid(window);
         editor_prefs::tests::the_group_saves_only_what_is_valid_and_applies_live(window);
         remote::tests::the_remote_machines_group_saves_only_valid_aliases(window);
+        threads::message_search::tests::message_search_finds_and_opens_a_hit(window);
     }
 
     /// A folder outside any repository has nothing to diff: no Changes toggle, no shortcut.

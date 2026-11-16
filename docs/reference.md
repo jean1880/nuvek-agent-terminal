@@ -152,7 +152,8 @@ writes them; **Cancel**, `Escape` or a press outside the dialog changes nothing.
   Tags** brings it back).
 - **On a row:** up to two tags show as chips after the title, and `+N` counts the rest; its
   tooltip lists them all, and a screen reader reads every tag in the row's description.
-  Clicking a chip adds `#tag` to the sidebar's search.
+  Clicking a chip (or `Enter` on it) adds `#tag` to the sidebar's search and moves the
+  keyboard there, at the end of what it holds.
 - **Kept:** archiving keeps a thread's tags; deleting it removes them. Tagging never changes a
   thread's last-active time, so the folder groups stay in place. Tags are never sent to an
   agent or put in a hand-off.

@@ -4864,7 +4864,9 @@ impl AgentTerminalWindow {
         chip
     }
 
-    /// Adds `#tag` to the sidebar's search ([`with_tag_term`]), which filters the list by it.
+    /// Adds `#tag` to the sidebar's search ([`with_tag_term`]), which filters the list by it,
+    /// and moves the keyboard there, its cursor at the end: the chip pressed goes away with the
+    /// list's rebuild, and the search now holds the filter to read, change or clear.
     pub(super) fn filter_by_tag(&self, tag: &str) {
         let Some(sidebar) = self.sidebar.borrow().clone() else {
             return;
@@ -4872,8 +4874,11 @@ impl AgentTerminalWindow {
         let text = with_tag_term(&sidebar.search.text(), tag);
         if text != sidebar.search.text().as_str() {
             sidebar.search.set_text(&text);
-            sidebar.search.set_position(-1);
         }
+        sidebar.search.grab_focus();
+        // Focusing selects the text; typing then would replace the filter.
+        sidebar.search.select_region(-1, -1);
+        sidebar.search.set_position(-1);
     }
 
     /// Whether closing `key` would cut a turn short: a thread running or awaiting an answer.
@@ -12832,8 +12837,11 @@ pub(super) mod tests {
         imp.save_tags(
             a,
             vec!["review".into(), "ops".into()],
-            vec![("review".into(), Some(TagColour::Warning))],
-            None,
+            crate::window::imp::thread_menu::ColourWrite::Set(vec![(
+                "review".into(),
+                Some(TagColour::Warning),
+            )]),
+            false,
         );
         assert!(pump_until(ctx, 10, || tags_of(a) == ["ops", "review"]));
         assert_eq!(
@@ -12865,10 +12873,63 @@ pub(super) mod tests {
             assert!(problems.is_empty(), "{problems:?}");
         }
 
-        // A chip's click adds its tag to the search.
+        // Its text takes the chip's own colour, not the app-wide label rule's.
+        crate::load_css();
+        let text: gtk4::Label = find_first(review.upcast_ref()).expect("the chip's label");
+        let want = crate::palette::current().fg_strong;
+        assert!(
+            pump_until(ctx, 5, || {
+                let got = text.color();
+                (f64::from(got.red()) - want.0).abs() < 0.01
+                    && (f64::from(got.green()) - want.1).abs() < 0.01
+                    && (f64::from(got.blue()) - want.2).abs() < 0.01
+            }),
+            "chip text is {:?}, not {}",
+            text.color(),
+            want.hex()
+        );
+
+        // A chip activated from the keyboard adds its tag to the search, and the keyboard moves
+        // to the search, which now holds the filter, with nothing selected.
+        assert!(pump_until(ctx, 5, || review.grab_focus()));
+        let focus_now = || {
+            gtk4::prelude::GtkWindowExt::focus(&*window).map(|w| {
+                format!(
+                    "{} {:?} {}",
+                    w.type_().name(),
+                    w.css_classes(),
+                    w.widget_name()
+                )
+            })
+        };
+        assert!(
+            pump_until(ctx, 5, || review.has_focus()),
+            "the chip takes the focus: {:?}",
+            focus_now()
+        );
+        let in_search = || {
+            gtk4::prelude::GtkWindowExt::focus(&*window).is_some_and(|w| {
+                w.is_ancestor(&sidebar.search)
+                    || w == sidebar.search.clone().upcast::<gtk4::Widget>()
+            })
+        };
         review.emit_clicked();
         assert_eq!(sidebar.search.text().as_str(), "#ops #review");
         assert!(pump_until(ctx, 5, || listed(a) && !listed(b)));
+        assert!(
+            pump_until(ctx, 5, || in_search()
+                && sidebar.list.first_child().is_some()),
+            "focus is on the search, not {:?}",
+            focus_now()
+        );
+        // Settled past the list's rebuild, the keyboard is still there.
+        settle(ctx);
+        assert!(in_search(), "{:?}", focus_now());
+        assert_eq!(sidebar.search.selection_bounds(), None, "nothing selected");
+        assert_eq!(
+            sidebar.search.position(),
+            "#ops #review".chars().count() as i32
+        );
         sidebar.search.set_text("");
         assert!(pump_until(ctx, 5, || listed(b)));
 
@@ -12934,11 +12995,7 @@ pub(super) mod tests {
             "the other thread is untouched"
         );
 
-        // Clean up for what follows, once the list has loaded what was saved (Clear Tags goes by
-        // the loaded list, as its menu entry does).
-        assert!(pump_until(ctx, 10, || imp
-            .summary_of(b)
-            .is_some_and(|s| s.tags == ["spike"])));
+        // Clean up for what follows.
         imp.run_thread_action(ThreadAction::ClearTags(a.to_owned()));
         imp.run_thread_action(ThreadAction::ClearTags(b.to_owned()));
         assert!(pump_until(ctx, 10, || tags_of(a).is_empty() && tags_of(b).is_empty()));

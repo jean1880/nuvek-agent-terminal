@@ -36,13 +36,19 @@ impl fmt::Display for TagError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => write!(f, "A tag needs at least one character."),
+            // The text is masked again here: a message never shows what redaction would hide.
             Self::TooLong(tag) => {
-                write!(f, "“{tag}” is longer than {MAX_TAG_CHARS} characters.")
+                write!(
+                    f,
+                    "“{}” is longer than {MAX_TAG_CHARS} characters.",
+                    redact(tag)
+                )
             }
             Self::Invalid(tag) => write!(
                 f,
                 "“{}” holds a character a tag cannot have.",
-                tag.chars()
+                redact(tag)
+                    .chars()
                     .map(|c| if c.is_control() { ' ' } else { c })
                     .collect::<String>()
             ),
@@ -61,21 +67,34 @@ fn forbidden(c: char) -> bool {
     c.is_whitespace() || c.is_control() || c == ','
 }
 
+/// Whether redaction would change `typed`: whole, lowercased, or any run of it between the
+/// characters a tag cannot have (a secret with a stray comma or control character in it).
+fn looks_like_secret(typed: &str) -> bool {
+    let changes = |s: &str| redact(s) != s;
+    changes(typed)
+        || changes(&typed.to_lowercase())
+        || typed
+            .split(forbidden)
+            .filter(|part| !part.is_empty())
+            .any(|part| changes(part) || changes(&part.to_lowercase()))
+}
+
 /// `input` as a stored tag: trimmed, any leading `#` dropped, lowercased. Refused when nothing
-/// is left, when it is too long, when it holds whitespace, a comma or a control character, or
-/// when redaction would change it (as typed or as lowercased).
+/// is left, when redaction would change it ([`TagError::LooksLikeSecret`], checked first, so no
+/// other refusal ever echoes a secret), when it holds whitespace, a comma or a control
+/// character, or when it is too long.
 pub fn normalize_tag(input: &str) -> Result<String, TagError> {
     let typed = input.trim().trim_start_matches('#');
     if typed.is_empty() {
         return Err(TagError::Empty);
     }
+    if looks_like_secret(typed) {
+        return Err(TagError::LooksLikeSecret);
+    }
     if typed.chars().any(forbidden) {
         return Err(TagError::Invalid(typed.to_owned()));
     }
     let tag = typed.to_lowercase();
-    if redact(typed) != typed || redact(&tag) != tag {
-        return Err(TagError::LooksLikeSecret);
-    }
     if tag.chars().count() > MAX_TAG_CHARS {
         return Err(TagError::TooLong(typed.to_owned()));
     }
@@ -220,6 +239,32 @@ mod tests {
             !TagError::LooksLikeSecret.to_string().contains(secret),
             "the message never echoes it"
         );
+        // With a character a tag cannot have, before, inside or after it, it is still refused as
+        // a secret, never as an invalid tag that would echo it.
+        for typed in [
+            format!("{secret},"),
+            format!("{secret}\u{7}"),
+            format!("x {secret}"),
+            format!("{secret}\u{1f}more"),
+        ] {
+            assert_eq!(
+                normalize_tag(&typed),
+                Err(TagError::LooksLikeSecret),
+                "{typed:?}"
+            );
+            assert!(tag_set(&[typed.as_str()])
+                .expect_err("refused")
+                .to_string()
+                .find(secret)
+                .is_none());
+        }
+        // Every message is masked, whatever reaches it.
+        for error in [
+            TagError::Invalid(format!("{secret}\u{7}")),
+            TagError::TooLong(format!("{secret}{}", "x".repeat(40))),
+        ] {
+            assert!(!error.to_string().contains(secret), "{error}");
+        }
         // Plain words are kept.
         for word in ["review", "token", "password", "secret", "key"] {
             assert_eq!(normalize_tag(word).as_deref(), Ok(word));

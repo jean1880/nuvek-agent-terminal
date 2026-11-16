@@ -139,7 +139,9 @@ Architectural mandates, standards, and workflows for this codebase.
     same summary query. Tag colours are the `meta` key `tag_colours` (tag to `TagColour` token,
     never a literal colour; `set_tag_colours`), pruned of tags no thread holds whenever tags
     are set or a thread deleted. The sidebar draws a tag's colour only as a `tag-<token>` class
-    over the `@at_*` names, so `ThemeChoice::System` brings the desktop's.
+    over the `@at_*` names (`palette::tag_chip_css`), so `ThemeChoice::System` brings the
+    desktop's; chip text is `@at_fg_strong` on the label itself, and `TAG_CHIP_TINT` is what
+    `tag_chip_text_reads_on_every_tint` lets every scheme read at AA on every row state.
     `store/spend.rs` is the spending history: `Store::spend_rows` reads live threads' completed
     turns through `events_turns` (the query repeats its WHERE term with the literal
     `'turn_completed'`) plus `spend_ledger`, attributing a delegated worker's turns to its root

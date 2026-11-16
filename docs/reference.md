@@ -334,6 +334,56 @@ page has no thread of its own, so its menu shows the item disabled.
 - Terminal output can carry instructions aimed at the agent. The label and fence help, but the
   draft is yours to check.
 
+### Saved prompts
+
+A saved prompt is a named piece of text the composer can put in your draft. Type `/` at the
+start of the prompt: saved prompts are listed after the app's own commands and the agent's,
+with a *prompt* badge, their name and the first line of their text. Choose one (`Enter`,
+`Tab` or a click) and its `/name` is replaced by its text. Nothing is sent: read it, edit it,
+then press Enter. The text you send is your own, so it goes through the usual path, history,
+queueing and redaction of the stored thread included.
+
+**Adding one.** For now saved prompts are kept in the settings file, under `saved_prompts`
+(see [Configuration](configuration.md)); a change to the file applies as soon as it is
+saved. They are stored unencrypted, like every other setting, so keep secrets out of them.
+
+```json
+"saved_prompts": [
+  { "name": "review", "body": "Review {file} for race conditions." },
+  { "name": "explain", "body": "Explain this, step by step:\n\n{selection}", "folder": "~/work/app" }
+]
+```
+
+**Placeholders.** These are filled in when you choose the prompt:
+
+| Placeholder | What it becomes |
+|---|---|
+| `{file}` | The first `@path` already in the draft, else the file in focus in the thread's diff panel (the row you last expanded or moved to), while the panel is open |
+| `{selection}` | The text selected in the thread's transcript, else the text selected in the composer. At most its first 8 KB is used, and a toast says when it was cut |
+| `{folder}` | The thread's folder |
+| `{branch}` | Not filled in yet: it stays in place for you to type |
+
+- Every value is redacted before it goes in, and a selection is redacted before it is cut, so
+  a secret is never left half masked. Masking is best-effort: read the draft before sending.
+- A placeholder with nothing to fill it stays as written (`{file}`) and the first one is
+  selected, so typing replaces it. Nothing is silently left blank.
+- `{{` and `}}` are literal braces, and any other `{word}` stays as it is. A value is put in
+  as it is: a `{branch}` inside a selection is not filled in.
+
+**Names.** Letters, digits, `-` and `_`, starting with a letter or digit, at most 48
+characters, compared without regard to case. A name the app uses for its own commands or
+their aliases (`model`, `compress`, `new`, …) is refused. A name an agent also uses is
+allowed: both rows are listed, each with its own badge, the agent's first. A saved
+prompt never runs a command and is never sent as `/name`.
+
+**Limits.** The text is at most 16 KB, and only the first 200 saved prompts are used. A prompt
+that breaks a rule (an empty name or text, a repeated name, a folder that is not an absolute
+path or `~/…`) stays in the file but is not listed; the log says why.
+
+**Folders.** A prompt with a `folder` is listed only in threads in that folder or inside it
+(`/a/b` covers `/a/b/c`, not `/a/bc`). A folder's prompt is listed before the others, and takes
+the place of a prompt of the same name without one; the deepest folder wins.
+
 ### Remote machines
 
 A terminal page can run on another machine through your own `ssh`. Agent Terminal installs

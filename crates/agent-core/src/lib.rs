@@ -37,6 +37,7 @@ pub mod question_extract;
 pub mod quota;
 pub mod redact;
 pub mod remote;
+pub mod saved_prompts;
 pub mod search_query;
 pub mod sensitive;
 pub mod serde_name;

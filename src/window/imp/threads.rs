@@ -173,6 +173,38 @@ fn registry_owner<W, O>(
     owner
 }
 
+/// A thread's saved prompts, read from the settings at every look (so a hand edit of the file
+/// applies at once), and its diff panel's focused file.
+struct ThreadPrompts {
+    thread: String,
+}
+
+impl crate::chat::PromptSource for ThreadPrompts {
+    fn saved_prompts(
+        &self,
+        dir: Option<&std::path::Path>,
+    ) -> Vec<agent_core::saved_prompts::SavedPrompt> {
+        let config = SharedConfig::default();
+        let config = config.borrow();
+        agent_core::saved_prompts::offered(
+            &config.saved_prompts,
+            agent_core::commands::builtins(),
+            dir,
+            crate::utils::expand_tilde,
+        )
+        .into_iter()
+        .cloned()
+        .collect()
+    }
+
+    fn focused_file(&self) -> Option<String> {
+        thread_owner(&self.thread)?
+            .imp()
+            .with_thread_tab(&self.thread, |tab| tab.diff_panel.focused_file())
+            .flatten()
+    }
+}
+
 pub(super) fn thread_owner(thread: &str) -> Option<super::super::AgentTerminalWindow> {
     OPEN_THREADS.with(|registry| {
         registry_owner(&mut registry.borrow_mut(), thread, |weak| {
@@ -5969,6 +6001,9 @@ impl AgentTerminalWindow {
         ));
         view.set_account_status(AccountStatus::shared());
         view.set_diff_source(diffs);
+        view.set_prompt_source(Rc::new(ThreadPrompts {
+            thread: thread.clone(),
+        }));
         view.set_workspace(std::path::Path::new(&dir));
         if demo.is_some() {
             crate::chat::view::demo::configure_demo_view(&view);

@@ -76,7 +76,10 @@ Architectural mandates, standards, and workflows for this codebase.
     renders and writes it `0600` and atomically) and `remote` (machines reached with the user's
     `ssh`: host validation, the remote folder, POSIX quoting and the exact `ssh` argv of a
     terminal page and of the reachability check) and `search_query` (what the user types into
-    message search as an FTS5 query: quoted phrases, the last a prefix, never a syntax error).
+    message search as an FTS5 query: quoted phrases, the last a prefix, never a syntax error)
+    and `saved_prompts` (the user's saved prompts: name, body and folder rules, the typeahead's
+    items, and the one placeholder resolver, `parse`/`resolve`/`Values`, which redacts every
+    value before it caps it).
   - `crates/agent-kit` (GTK-free; blocking process and file I/O): `git`
     (git plumbing for turn checkpoints and diffs: shells out, but its parsers
     and filters are pure), `diff` (diff bases, numstat, line classification,
@@ -242,7 +245,10 @@ Architectural mandates, standards, and workflows for this codebase.
 - **Every persisted or injected text is redacted**: the store scrubs every
   event (`scrub_envelope`) and title, and every handoff (cross-agent switch,
   fork, compact-by-handoff, brief) goes through `agent_core::redact` and the
-  handoff budget. A new store write or injected prompt must take the same path.
+  handoff budget. A new store write or injected prompt must take the same path. A saved
+  prompt's placeholder values (`{file}`, `{selection}`, `{folder}`, `{branch}`) are redacted
+  when they are given to `saved_prompts::Values` (a selection before it is cut to 8 KB);
+  the expanded text only fills the draft, never sends, and is then the user's own prompt.
 - **Images are kept by ref, decoded under bounds, and never redacted, so never sent unasked**:
   an image a user attaches (picked, pasted, dropped) or an agent's tool returns is decoded under
   `agent_kit::attachments::normalise`'s limits (20 MB, 16 384 px a side, bounded allocation),

@@ -917,6 +917,23 @@ mod tests {
         assert_eq!(folders.len(), 11, "{folders:?}");
     }
 
+    /// Saved prompts live in the configuration file, which goes with the configuration folder:
+    /// they add no folder or file of their own to remove.
+    #[test]
+    fn saved_prompts_add_no_new_folder() {
+        let mut i = inputs(Path::new("/h"));
+        i.xdg_config = Some("/x/config".into());
+        let folders = candidate_folders(&i);
+        assert!(folders.contains(&PathBuf::from("/x/config").join(APP_DIR)));
+        assert!(folders.contains(&PathBuf::from("/h/.config").join(APP_DIR)));
+        assert!(
+            folders
+                .iter()
+                .all(|f| !f.to_string_lossy().contains("prompt")),
+            "{folders:?}"
+        );
+    }
+
     #[test]
     fn candidates_cover_every_base_with_and_without_overrides() {
         let home = Path::new("/h");

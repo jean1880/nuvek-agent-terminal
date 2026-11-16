@@ -9370,7 +9370,10 @@ mod tests {
         let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
         assert_eq!(format!("{text}\n"), a, "only a.rs's own diff");
         assert!(files[0].child().is_none(), "README.md stays unbuilt");
+        // The row last expanded is the file in focus (a saved prompt's {file}).
+        assert_eq!(panel.focused_file().as_deref(), Some("src/a.rs"));
         files[2].set_expanded(true);
+        assert_eq!(panel.focused_file().as_deref(), Some("src/b.rs"));
         let hidden = files[2]
             .child()
             .and_then(|c| c.downcast::<gtk4::Label>().ok())
@@ -9383,7 +9386,14 @@ mod tests {
             .orientation(Orientation::Horizontal)
             .end_child(&panel.root)
             .build();
+        panel.set_shown(false);
+        assert_eq!(
+            panel.focused_file(),
+            None,
+            "a hidden panel has no file in focus"
+        );
         panel.set_shown(true);
+        assert_eq!(panel.focused_file().as_deref(), Some("src/b.rs"));
         panel.place(&paned, 400);
         assert_eq!(panel.dragged_width(&paned), None);
 
@@ -9394,5 +9404,6 @@ mod tests {
         assert_eq!(panel.visible_state().0, "diff");
         panel.show(current, Ok(DiffOutcome::NotRepo));
         assert_eq!(panel.visible_state().0, "status");
+        assert_eq!(panel.focused_file(), None, "no diff, no file in focus");
     }
 }

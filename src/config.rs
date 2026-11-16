@@ -923,6 +923,12 @@ pub struct TerminalConfig {
     /// The machines New Terminal Thread on Another Machine offers, reached with the user's own
     /// `ssh` (Settings → General → Remote Machines). Empty by default (and in older files).
     pub remote_hosts: Vec<agent_core::remote::RemoteHost>,
+    /// The user's saved prompts, offered after `/` in a thread's composer and expanded into the
+    /// draft (`agent_core::saved_prompts`). Empty by default (and in older files), and not
+    /// written while empty. Kept as the user wrote them: one that is not valid stays in the
+    /// file, only not offered.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub saved_prompts: Vec<agent_core::saved_prompts::SavedPrompt>,
     /// Set when this process found no settings file at all (none from a pre-rename release
     /// either): a first start, which offers the setup walkthrough. Not persisted.
     #[serde(skip)]
@@ -1304,6 +1310,7 @@ impl Default for TerminalConfig {
             model_tags_path: None,
             user_model_tags_path: None,
             remote_hosts: Vec::new(),
+            saved_prompts: Vec::new(),
             first_run: std::cell::Cell::default(),
             disk_stamp: std::cell::Cell::default(),
             save_blocked: std::cell::Cell::default(),
@@ -1593,6 +1600,22 @@ impl TerminalConfig {
             if !self.profiles.iter().any(|p| &p.name == name) {
                 warn!("Configured default profile '{name}' does not exist; using auto-detection");
                 self.default_profile = None;
+            }
+        }
+
+        // A saved prompt that is not valid stays in the file (it is the user's text) but is not
+        // offered; say which, once per load.
+        let problems = agent_core::saved_prompts::problems(
+            &self.saved_prompts,
+            agent_core::commands::builtins(),
+            crate::utils::expand_tilde,
+        );
+        for (prompt, problem) in self.saved_prompts.iter().zip(problems) {
+            if let Some(problem) = problem {
+                warn!(
+                    "Saved prompt '{}' is not offered: {problem}",
+                    agent_core::redact::redact(prompt.name.trim())
+                );
             }
         }
 
@@ -2057,6 +2080,39 @@ mod tests {
         assert_eq!(loaded.cli_client, cfg.cli_client);
         assert_eq!(loaded.starting_directory, cfg.starting_directory);
         assert_eq!(loaded.theme, cfg.theme);
+    }
+
+    #[test]
+    fn saved_prompts_round_trip_and_older_files_load_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        // An older file, with no such key, loads with none; and none is not written.
+        std::fs::write(&path, br#"{"theme":"dracula"}"#).unwrap();
+        let cfg = TerminalConfig::load_from(&path);
+        assert!(cfg.saved_prompts.is_empty());
+        let text = serde_json::to_string(&cfg).unwrap();
+        assert!(!text.contains("saved_prompts"), "{text}");
+
+        let mut cfg = TerminalConfig::default();
+        cfg.saved_prompts.extend([
+            agent_core::saved_prompts::SavedPrompt {
+                id: "a1".into(),
+                name: "review".into(),
+                body: "Review {file} for races".into(),
+                folder: None,
+            },
+            agent_core::saved_prompts::SavedPrompt {
+                id: String::new(),
+                name: "model".into(),
+                body: "A built-in's name: kept in the file, never offered".into(),
+                folder: Some("~/work".into()),
+            },
+        ]);
+        assert!(cfg.save_to(&path));
+        let loaded = TerminalConfig::load_from(&path);
+        assert_eq!(loaded.saved_prompts, cfg.saved_prompts);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"saved_prompts\""), "{text}");
     }
 
     #[test]

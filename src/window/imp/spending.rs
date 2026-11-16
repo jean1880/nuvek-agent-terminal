@@ -34,8 +34,6 @@ const READ_BACK_DAYS: i64 = 400;
 pub(super) struct Loaded {
     /// `Period::ALL` × `Group::ALL`, in that order ([`Loaded::report`]).
     reports: Vec<Report>,
-    /// Turns stored before costs were per turn, counted for tokens only.
-    withheld_turns: u64,
 }
 
 impl Loaded {
@@ -57,10 +55,7 @@ pub(super) fn load(store: &Store, now_ms: i64) -> Result<Loaded, String> {
             reports.push(spend::report(&data.rows, period, group, today));
         }
     }
-    Ok(Loaded {
-        reports,
-        withheld_turns: data.withheld_turns,
-    })
+    Ok(Loaded { reports })
 }
 
 /// What the dialog calls a group's raw key: a profile by its name, an agent by its own.
@@ -163,20 +158,23 @@ pub(super) fn plan_usage_line(agent: &str, windows: &[QuotaWindow]) -> Option<St
 }
 
 /// The notes under the totals: sub-agents' share, withheld costs, and what the numbers are.
-pub(super) fn notes(report: &Report, withheld_turns: u64) -> Vec<String> {
+pub(super) fn notes(report: &Report) -> Vec<String> {
     let mut out = Vec::new();
-    if report.total.delegated_turns > 0 {
+    let delegated = report.total.delegated_total();
+    if delegated.turns > 0 {
         out.push(format!(
             "From sub-agents, counted under the thread that started them: {} ({}).",
-            amount_text_of_costs(&report.total.delegated, report.total.delegated_turns),
-            turns(report.total.delegated_turns)
+            amount_text(&delegated),
+            turns(delegated.turns)
         ));
     }
-    if withheld_turns > 0 {
+    let withheld = report.total.withheld_turns;
+    if withheld > 0 {
         out.push(format!(
-            "{} stored before each turn's own cost was recorded {} counted for tokens only.",
-            turns(withheld_turns),
-            if withheld_turns == 1 { "is" } else { "are" }
+            "{} stored before each turn's own cost was recorded {} counted for tokens only \
+             (deleted threads' such turns are not counted here).",
+            turns(withheld),
+            if withheld == 1 { "is" } else { "are" }
         ));
     }
     out.push(
@@ -186,13 +184,6 @@ pub(super) fn notes(report: &Report, withheld_turns: u64) -> Vec<String> {
             .to_owned(),
     );
     out
-}
-
-fn amount_text_of_costs(costs: &spend::Costs, delegated_turns: u64) -> String {
-    if delegated_turns == 0 {
-        return "nothing".to_owned();
-    }
-    costs.describe()
 }
 
 fn label(text: &str, classes: &[&str]) -> gtk4::Label {
@@ -259,13 +250,7 @@ fn list(rows: impl IntoIterator<Item = gtk4::ListBoxRow>) -> gtk4::ListBox {
 }
 
 /// Fills `content` with `report`: the total, the groups, the buckets and the notes.
-fn show_report(
-    content: &gtk4::Box,
-    report: &Report,
-    withheld_turns: u64,
-    names: &Names,
-    plan_lines: &[String],
-) {
+fn show_report(content: &gtk4::Box, report: &Report, names: &Names, plan_lines: &[String]) {
     while let Some(child) = content.first_child() {
         content.remove(&child);
     }
@@ -317,7 +302,7 @@ fn show_report(
             content.append(&label(line, &["dim-label"]));
         }
     }
-    for note in notes(report, withheld_turns) {
+    for note in notes(report) {
         content.append(&label(&note, &["dim-label", "caption"]));
     }
 }
@@ -366,7 +351,15 @@ impl AgentTerminalWindow {
             stack,
             async move {
                 // Made once, through the writer; a failure leaves the read slower, never wrong.
-                match write_job("make the spending index", |s| s.ensure_spend_index()).await {
+                // The cost marker again too, in case the writer could not record it at start.
+                let prepared = write_job("make the spending index", |s| {
+                    s.ensure_spend_index()?;
+                    if let Err(e) = s.ensure_spend_cost_marker() {
+                        tracing::warn!(error = %e, "could not record where per-turn costs begin");
+                    }
+                    Ok(())
+                });
+                match prepared.await {
                     Some(Ok(())) => {}
                     Some(Err(e)) => tracing::warn!(error = %e, "no spending index"),
                     None => tracing::warn!("the spending index was not made"),
@@ -411,7 +404,7 @@ fn show_loaded(stack: &gtk4::Stack, loaded: Rc<Loaded>, names: Rc<Names>, plan: 
         let (period, group) = (period.clone(), group.clone());
         Rc::new(move || {
             if let Some(report) = loaded.report(period.get(), group.get()) {
-                show_report(&content, report, loaded.withheld_turns, &names, &plan);
+                show_report(&content, report, &names, &plan);
             }
         })
     };
@@ -484,6 +477,7 @@ pub(super) mod tests {
             cost_usd: cost.unwrap_or(0.0),
             cost_turns: u64::from(cost.is_some()),
             turns: 1,
+            withheld_turns: 0,
             tokens: agent_core::event::Usage {
                 input_tokens: 600,
                 output_tokens: 600,
@@ -516,15 +510,31 @@ pub(super) mod tests {
 
     #[test]
     fn notes_name_the_sub_agents_share_and_withheld_turns() {
+        let mut withheld = row("claude", None, false);
+        withheld.withheld_turns = 2;
+        withheld.turns = 2;
         let r = report(&[
             row("claude", Some(1.0), false),
             row("claude", Some(0.25), true),
+            withheld,
         ]);
-        let n = notes(&r, 2);
+        let n = notes(&r);
         assert!(n[0].contains("$0.25 reported (1 turn)"), "{n:?}");
         assert!(n[1].starts_with("2 turns stored before"), "{n:?}");
+        assert!(n[1].contains("deleted threads"), "{n:?}");
         assert!(n.last().is_some_and(|l| l.contains("list price")));
-        assert_eq!(notes(&report(&[]), 0).len(), 1);
+        assert_eq!(notes(&report(&[])).len(), 1);
+
+        // Sub-agents that report tokens only are not reported, never $0.00.
+        let r = report(&[row("codex", None, true), row("agy", None, true)]);
+        let n = notes(&r);
+        assert!(n[0].contains(": Not reported (2 turns)"), "{n:?}");
+        let r = report(&[row("codex", None, true), row("claude", Some(0.5), true)]);
+        let n = notes(&r);
+        assert!(
+            n[0].contains("$0.50 reported · 1 turn not reported (2 turns)"),
+            "{n:?}"
+        );
     }
 
     #[test]

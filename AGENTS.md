@@ -135,7 +135,10 @@ Architectural mandates, standards, and workflows for this codebase.
     day (`local_day`), inside the delete, so totals never drop and no turn is counted twice. The
     writer records `spend_cost_from_seq` once at its start (`ensure_spend_cost_marker`): a cost
     stored at or below it was Claude's running total, so it is withheld (tokens only), never
-    summed. The sums are `agent_core::spend` (`report`, `Period`/`Group` with guarded `ALL`
+    summed; until the marker exists no cost is trusted (an in-memory store records it when made,
+    and the Spending dialog's first write tries again). `spend_rows` reads the marker, the live
+    turns and the ledger in one read transaction, so a delete committed meanwhile is never
+    counted twice. The sums are `agent_core::spend` (`report`, `Period`/`Group` with guarded `ALL`
     arrays); kinds of spend (metered, list price, unknown billing) are never added together,
     and a turn with no cost is "not reported", never $0.
   - The app (`src/`): `config.rs` (persisted settings + migration, re-exporting

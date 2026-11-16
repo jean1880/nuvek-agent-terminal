@@ -4985,6 +4985,8 @@ mod tests {
     fn a_deleted_root_keeps_its_workers_cost_under_its_folder() {
         use agent_core::event::{Envelope, Event, TurnState};
         let f = fx();
+        // No writer starts on this store: mark where trusted costs begin, as one would.
+        f.s.ensure_spend_cost_marker().expect("marker");
         let child = spawn(&f.s, &f.root.worker, "k1").worker.expect("w");
         let backing =
             f.s.delegation_worker(child.as_str())

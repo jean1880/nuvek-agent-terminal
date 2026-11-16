@@ -10,8 +10,9 @@
 //! Claude stored its process's running total as a turn's cost before it stored each turn's own.
 //! The two cannot be told apart in the events, so the store remembers where its trusted turns
 //! begin ([`SPEND_COST_FROM_KEY`], written once by the store writer when it first starts on a
-//! store): a cost recorded before that is withheld (its turn counts tokens only, and is counted
-//! in [`SpendData::withheld_turns`]), never summed.
+//! store, and by an in-memory store when it is made): a cost recorded before that is withheld
+//! (its turn counts tokens only, and in [`SpendRow::withheld_turns`]), never summed. Until the
+//! marker exists no cost is trusted.
 
 use std::collections::HashMap;
 
@@ -29,9 +30,6 @@ pub const SPEND_COST_FROM_KEY: &str = "spend_cost_from_seq";
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SpendData {
     pub rows: Vec<SpendRow>,
-    /// Turns stored before costs were per turn that did report a cost: counted for their
-    /// tokens, their cost withheld.
-    pub withheld_turns: u64,
 }
 
 /// The local calendar day of `at_ms` (epoch milliseconds), from the C library's local time (the
@@ -126,7 +124,8 @@ fn count(value: Option<i64>) -> u64 {
 
 impl Store {
     /// Records where trusted turn costs begin ([`SPEND_COST_FROM_KEY`]), once: the store writer
-    /// calls it first thing. When the key exists this is one read and takes no write lock.
+    /// calls it first thing, and the Spending dialog's first write again in case that failed.
+    /// When the key exists this is one read and takes no write lock.
     pub fn ensure_spend_cost_marker(&self) -> Result<()> {
         if self.meta(SPEND_COST_FROM_KEY)?.is_some() {
             return Ok(());
@@ -142,11 +141,14 @@ impl Store {
         tx.commit()
     }
 
-    /// The `seq` above which a turn's cost is trusted. With no key (a store no writer has
-    /// started on) every cost is; an unreadable one trusts none.
+    /// The `seq` above which a turn's cost is trusted. With no key yet (the writer could not
+    /// record it) or an unreadable one, none is: a running total is never summed.
     fn spend_cost_from(&self) -> Result<i64> {
         Ok(match self.meta(SPEND_COST_FROM_KEY)? {
-            None => 0,
+            None => {
+                tracing::debug!("no spending marker yet; stored costs are withheld");
+                i64::MAX
+            }
             Some(v) => v.trim().parse().unwrap_or_else(|_| {
                 tracing::warn!("unreadable spending marker; earlier costs are withheld");
                 i64::MAX
@@ -165,13 +167,28 @@ impl Store {
     /// `day_of` names a time's local day ([`local_day`]; a test passes a fixed offset). A
     /// delegated worker's turns are counted under its root thread's folder. A read only: make
     /// sure of the index first ([`Store::ensure_spend_index`], a write, through the writer).
+    ///
+    /// The marker, the live turns and the ledger are read in one read transaction (one WAL
+    /// snapshot), so a delete committed meanwhile is seen whole or not at all: never both as
+    /// events and as its ledger rows.
     pub fn spend_rows(&self, since_ms: i64, day_of: &dyn Fn(i64) -> DayKey) -> Result<SpendData> {
+        let snapshot = self.scope(rusqlite::TransactionBehavior::Deferred)?;
+        let data = self.spend_rows_in(since_ms, day_of)?;
+        snapshot.commit()?;
+        Ok(data)
+    }
+
+    fn spend_rows_in(&self, since_ms: i64, day_of: &dyn Fn(i64) -> DayKey) -> Result<SpendData> {
         let cost_from = self.spend_cost_from()?;
         let mut data = SpendData::default();
         for t in self.turns(&live_turns_sql(), &since_ms)? {
-            if let Some(row) = spend_row(t, cost_from, day_of, None, &mut data.withheld_turns) {
+            if let Some(row) = spend_row(t, cost_from, day_of, None) {
                 data.rows.push(row);
             }
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.between_spend_reads.borrow_mut().take() {
+            hook();
         }
         let since_day = day_of(since_ms).to_string();
         let mut stmt = self.conn.prepare(
@@ -194,6 +211,8 @@ impl Store {
                     cost_usd: r.get(7)?,
                     cost_turns: count(r.get(8)?),
                     turns: count(r.get(9)?),
+                    // The ledger keeps no count of them.
+                    withheld_turns: 0,
                     tokens: Usage {
                         input_tokens: count(r.get(10)?),
                         cached_input_tokens: count(r.get(11)?),
@@ -249,7 +268,6 @@ impl Store {
             "{filter}",
             "e.thread_id IN (SELECT value FROM json_each(?1))",
         );
-        let mut withheld = 0;
         let mut stmt = self.conn.prepare(
             "INSERT INTO spend_ledger (day, driver, profile_id, model, folder, billing, delegated,
                  cost_usd, cost_turns, turns, input_tokens, cached_input_tokens, output_tokens,
@@ -270,7 +288,7 @@ impl Store {
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         for t in self.turns(&sql, &ids)? {
-            let Some(row) = spend_row(t, cost_from, day_of, Some(delegated), &mut withheld) else {
+            let Some(row) = spend_row(t, cost_from, day_of, Some(delegated)) else {
                 continue;
             };
             if !known.contains(&row.driver) {
@@ -309,7 +327,6 @@ fn spend_row(
     cost_from: i64,
     day_of: &dyn Fn(i64) -> DayKey,
     delegated: Option<&Delegated>,
-    withheld: &mut u64,
 ) -> Option<SpendRow> {
     let Some(driver) = t.driver else {
         tracing::debug!(
@@ -319,8 +336,9 @@ fn spend_row(
         return None;
     };
     let mut cost = t.cost.filter(|c| c.is_finite() && *c >= 0.0);
+    let mut withheld_turns = 0;
     if cost.is_some() && t.seq <= cost_from {
-        *withheld += 1;
+        withheld_turns = 1;
         cost = None;
     }
     let (folder, profile_id, is_delegated) = match delegated.and_then(|d| d.get(&t.thread)) {
@@ -343,6 +361,7 @@ fn spend_row(
         cost_usd: cost.unwrap_or(0.0),
         cost_turns: u64::from(cost.is_some()),
         turns: 1,
+        withheld_turns,
         tokens: Usage {
             input_tokens: input,
             cached_input_tokens: cached,
@@ -401,6 +420,10 @@ mod tests {
         (t, pt)
     }
 
+    fn withheld(data: &SpendData) -> u64 {
+        data.rows.iter().map(|r| r.withheld_turns).sum()
+    }
+
     fn total_cost(data: &SpendData) -> f64 {
         data.rows.iter().map(|r| r.cost_usd).sum()
     }
@@ -422,7 +445,7 @@ mod tests {
         // Before the window: not read.
         turn(&s, &a, &apt, Some(9.0), 10, NOON - 40 * DAY_MS);
         let data = s.spend_rows(NOON - 30 * DAY_MS, &utc).expect("rows");
-        assert_eq!(data.withheld_turns, 0);
+        assert_eq!(withheld(&data), 0);
         let got: Vec<(String, String, String, String, f64, u64, u64)> = data
             .rows
             .iter()
@@ -483,9 +506,15 @@ mod tests {
     #[test]
     fn costs_stored_before_the_marker_are_withheld_never_summed() {
         let s = store();
+        // A store from before per-turn costs: no marker yet.
+        s.delete_meta(SPEND_COST_FROM_KEY).expect("unmark");
         let (t, pt) = thread(&s, "/a", "claude", "sonnet");
         turn(&s, &t, &pt, Some(0.0173), 1, NOON);
         turn(&s, &t, &pt, Some(0.0259), 1, NOON + 1);
+        // Until the marker is recorded, no cost is trusted.
+        let data = s.spend_rows(NOON - DAY_MS, &utc).expect("rows");
+        assert_eq!(withheld(&data), 2);
+        assert_eq!(total_cost(&data), 0.0);
         s.ensure_spend_cost_marker().expect("marker");
         let marked = s.meta(SPEND_COST_FROM_KEY).expect("read");
         s.ensure_spend_cost_marker().expect("again");
@@ -496,7 +525,7 @@ mod tests {
         );
         turn(&s, &t, &pt, Some(0.03), 1, NOON + 2);
         let data = s.spend_rows(NOON - DAY_MS, &utc).expect("rows");
-        assert_eq!(data.withheld_turns, 2);
+        assert_eq!(withheld(&data), 2);
         assert_eq!(data.rows.len(), 3, "their tokens still count");
         assert_eq!(data.rows.iter().map(|r| r.cost_turns).sum::<u64>(), 1);
         assert!((total_cost(&data) - 0.03).abs() < 1e-12);
@@ -504,7 +533,7 @@ mod tests {
         // An unreadable marker trusts no cost.
         s.set_meta(SPEND_COST_FROM_KEY, "garbage").expect("spoil");
         let data = s.spend_rows(NOON - DAY_MS, &utc).expect("rows");
-        assert_eq!(data.withheld_turns, 3);
+        assert_eq!(withheld(&data), 3);
         assert_eq!(total_cost(&data), 0.0);
     }
 
@@ -569,6 +598,54 @@ mod tests {
         assert!(late.rows.is_empty());
     }
 
+    /// A delete committed by another connection between the read of the live turns and the
+    /// read of the ledger is not seen by either: the reads share one snapshot.
+    #[test]
+    fn a_delete_between_the_reads_is_never_counted_twice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("threads.db");
+        let s = Store::open(&path).expect("open");
+        s.ensure_spend_cost_marker().expect("marker");
+        s.ensure_spend_index().expect("index");
+        let (t, pt) = thread(&s, "/a", "claude", "opus");
+        turn(&s, &t, &pt, Some(1.0), 1, NOON);
+        let other = path.clone();
+        *s.between_spend_reads.borrow_mut() = Some(Box::new(move || {
+            let writer = Store::open(&other).expect("second connection");
+            writer.delete_thread(&t).expect("delete meanwhile");
+            let ledger: i64 = writer
+                .conn
+                .query_row("SELECT COUNT(*) FROM spend_ledger", [], |r| r.get(0))
+                .expect("count");
+            assert_eq!(ledger, 1, "the delete committed its ledger row");
+        }));
+        let data = s.spend_rows(NOON - DAY_MS, &local_day).expect("rows");
+        assert!(s.between_spend_reads.borrow().is_none(), "the hook ran");
+        assert_eq!(data.rows.len(), 1, "{:?}", data.rows);
+        assert!((total_cost(&data) - 1.0).abs() < 1e-12);
+        // Read again, the turn is the ledger's alone.
+        let data = s.spend_rows(NOON - DAY_MS, &local_day).expect("rows");
+        assert_eq!(data.rows.len(), 1);
+        assert!((total_cost(&data) - 1.0).abs() < 1e-12);
+    }
+
+    /// A file store no writer has marked trusts no cost until it is marked.
+    #[test]
+    fn a_store_without_its_marker_trusts_no_cost() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let s = Store::open(&dir.path().join("threads.db")).expect("open");
+        assert_eq!(s.meta(SPEND_COST_FROM_KEY).expect("read"), None);
+        let (t, pt) = thread(&s, "/a", "claude", "opus");
+        turn(&s, &t, &pt, Some(1.0), 1, NOON);
+        let data = s.spend_rows(NOON - DAY_MS, &utc).expect("rows");
+        assert_eq!((total_cost(&data), withheld(&data)), (0.0, 1));
+        // Nor does a delete fold one into the ledger.
+        s.delete_thread(&t).expect("delete");
+        let data = s.spend_rows(NOON - DAY_MS, &utc).expect("rows");
+        assert_eq!(total_cost(&data), 0.0);
+        assert_eq!(data.rows.iter().map(|r| r.turns).sum::<u64>(), 1);
+    }
+
     #[test]
     fn a_blank_thread_deleted_leaves_no_ledger_row() {
         let s = store();
@@ -629,7 +706,7 @@ mod tests {
             .expect("rows");
         assert!(
             plan.iter()
-                .any(|step| step.contains("USING INDEX events_turns")),
+                .any(|step| step == "SEARCH e USING INDEX events_turns (at>?)"),
             "{plan:?}"
         );
     }

@@ -1447,6 +1447,10 @@ pub struct Store {
     /// build without FTS5 would meet.
     #[cfg(test)]
     fts5_missing: Cell<bool>,
+    /// Test hook: runs once in [`Store::spend_rows`], between its read of the live turns and
+    /// its read of the ledger.
+    #[cfg(test)]
+    between_spend_reads: RefCell<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// A unit of work that commits or rolls back as one: a transaction, or inside a
@@ -1707,9 +1711,13 @@ impl Store {
         Ok(store)
     }
 
-    /// An in-memory store for tests.
+    /// An in-memory store for tests. It is always new, so every cost it will hold is per turn:
+    /// it records where trusted costs begin ([`Store::ensure_spend_cost_marker`]) at once, as
+    /// no writer ever starts on it.
     pub fn open_in_memory() -> Result<Self> {
-        Self::init(Connection::open_in_memory()?, true)
+        let store = Self::init(Connection::open_in_memory()?, true)?;
+        store.ensure_spend_cost_marker()?;
+        Ok(store)
     }
 
     fn init(conn: Connection, allow_upgrade: bool) -> Result<Self> {
@@ -1741,6 +1749,8 @@ impl Store {
             fail_next_txn_commit: Cell::new(false),
             #[cfg(test)]
             fts5_missing: Cell::new(false),
+            #[cfg(test)]
+            between_spend_reads: RefCell::new(None),
         })
     }
 

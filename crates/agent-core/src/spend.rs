@@ -229,6 +229,9 @@ pub struct SpendRow {
     pub cost_usd: f64,
     pub cost_turns: u64,
     pub turns: u64,
+    /// Turns whose stored cost was a running total, not their own: counted for their tokens,
+    /// their cost withheld.
+    pub withheld_turns: u64,
     pub tokens: Usage,
 }
 
@@ -283,14 +286,16 @@ impl Costs {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Total {
     pub costs: Costs,
-    /// The part of `costs` that came from delegated workers.
-    pub delegated: Costs,
+    /// The part of this total that came from delegated workers, summed the same way (so its
+    /// turns that reported no cost read as not reported); `None` when none did.
+    pub delegated: Option<Box<Total>>,
     pub turns: u64,
     /// Turns that reported a cost.
     pub cost_turns: u64,
     /// Turns on a free profile.
     pub free_turns: u64,
-    pub delegated_turns: u64,
+    /// Turns whose cost was withheld ([`SpendRow::withheld_turns`]).
+    pub withheld_turns: u64,
     pub tokens: Usage,
 }
 
@@ -308,6 +313,18 @@ pub enum Amount {
 
 impl Total {
     pub fn add(&mut self, row: &SpendRow) {
+        self.add_own(row);
+        if row.delegated {
+            self.delegated.get_or_insert_with(Box::default).add_own(row);
+        }
+    }
+
+    /// The delegated workers' part ([`Total::delegated`]); empty when there is none.
+    pub fn delegated_total(&self) -> Total {
+        self.delegated.as_deref().cloned().unwrap_or_default()
+    }
+
+    fn add_own(&mut self, row: &SpendRow) {
         let usd = if row.cost_usd.is_finite() {
             row.cost_usd.max(0.0)
         } else {
@@ -319,10 +336,7 @@ impl Total {
         if row.billing == Billing::Free {
             self.free_turns += row.turns;
         }
-        if row.delegated {
-            self.delegated.add(row.billing, usd);
-            self.delegated_turns += row.turns;
-        }
+        self.withheld_turns += row.withheld_turns;
         self.tokens.input_tokens += row.tokens.input_tokens;
         self.tokens.output_tokens += row.tokens.output_tokens;
         self.tokens.cached_input_tokens += row.tokens.cached_input_tokens;
@@ -628,6 +642,7 @@ mod report_tests {
             cost_usd: cost.unwrap_or(0.0),
             cost_turns: u64::from(cost.is_some()),
             turns: 1,
+            withheld_turns: 0,
             tokens: Usage {
                 input_tokens: tokens,
                 output_tokens: tokens,
@@ -800,8 +815,46 @@ mod report_tests {
             r.total.costs.describe(),
             "$1.25 metered · $3.40 at list price · <$0.01 reported"
         );
-        assert_eq!(r.total.delegated.describe(), "$3.40 at list price");
-        assert_eq!(r.total.delegated_turns, 1);
+        let delegated = r.total.delegated_total();
+        assert_eq!(delegated.costs.describe(), "$3.40 at list price");
+        assert_eq!(delegated.turns, 1);
+        assert_eq!(delegated.cost_turns, 1);
+
+        // A worker that reports tokens only is not reported, never $0, beside a priced one.
+        let mut codex = row("2026-11-15", "codex", "/a", None, 1);
+        codex.delegated = true;
+        let r = report(&[codex.clone()], Period::Day, Group::Folder, today);
+        assert_eq!(r.total.delegated_total().amount(), Amount::NotReported);
+        let mut priced = row("2026-11-15", "claude", "/a", Some(0.5), 1);
+        priced.delegated = true;
+        let r = report(&[codex, priced], Period::Day, Group::Folder, today);
+        let delegated = r.total.delegated_total();
+        assert_eq!(delegated.turns, 2);
+        assert_eq!(delegated.not_reported_turns(), 1);
+        assert!(matches!(delegated.amount(), Amount::Cost(_)));
+        assert_eq!(Total::default().delegated_total(), Total::default());
+    }
+
+    #[test]
+    fn withheld_turns_count_only_inside_the_period() {
+        let today = day("2026-11-15");
+        let mut recent = row("2026-11-14", "claude", "/a", None, 1);
+        recent.withheld_turns = 1;
+        let mut old = row("2026-09-01", "claude", "/a", None, 1);
+        old.withheld_turns = 1;
+        let rows = [recent, old];
+        assert_eq!(
+            report(&rows, Period::Day, Group::Folder, today)
+                .total
+                .withheld_turns,
+            1
+        );
+        assert_eq!(
+            report(&rows, Period::Month, Group::Folder, today)
+                .total
+                .withheld_turns,
+            2
+        );
     }
 
     #[test]

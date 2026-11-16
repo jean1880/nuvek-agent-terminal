@@ -312,6 +312,19 @@ pub trait DiffSource {
     fn open_in_editor(&self, ask: DiffAsk);
 }
 
+/// Where a thread's composer gets the user's saved prompts and what its `{file}` placeholder
+/// falls back to. Implemented by the window (it holds the settings and the diff panel).
+pub trait PromptSource {
+    /// The saved prompts offered in a thread in `dir`, in the order the typeahead lists them
+    /// ([`agent_core::saved_prompts::offered`]).
+    fn saved_prompts(
+        &self,
+        dir: Option<&std::path::Path>,
+    ) -> Vec<agent_core::saved_prompts::SavedPrompt>;
+    /// The file in focus in the thread's diff panel, while the panel shows; `None` otherwise.
+    fn focused_file(&self) -> Option<String>;
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionStatus {
     pub driver: Driver,

@@ -59,11 +59,14 @@ use agent_core::commands::{builtins, compact_text, BuiltinAction, Trigger};
 use agent_core::context_meter::MeterAction;
 use agent_core::event::Event;
 use agent_core::event::{BackgroundTask, BackgroundTaskKind, Envelope, PlanStep, StepStatus};
+use agent_core::saved_prompts;
 use gtk4::prelude::*;
 use gtk4::{gdk, glib};
 
 use super::workspace_files;
-use super::{ChatBackend, DiffAsk, DiffSource, EnvelopeSink, ModelSource, SessionStatus};
+use super::{
+    ChatBackend, DiffAsk, DiffSource, EnvelopeSink, ModelSource, PromptSource, SessionStatus,
+};
 use crate::account_status::AccountStatus;
 use cards::{RowEvent, RowSink};
 use composer::{Composer, ComposerHost};
@@ -208,6 +211,8 @@ pub(crate) struct Inner {
     actions: RefCell<Vec<ActionHandler>>,
     /// Where file-change cards get their diff and open it in the external tool.
     diffs: RefCell<Option<Rc<dyn DiffSource>>>,
+    /// The user's saved prompts and the diff panel's focused file (the `/` typeahead).
+    prompts: RefCell<Option<Rc<dyn PromptSource>>>,
     /// Items changed since the last flush (streaming deltas are coalesced per frame).
     dirty: RefCell<Vec<String>>,
     flush_queued: Cell<bool>,
@@ -240,6 +245,52 @@ pub(crate) struct Inner {
     /// The agent process's [`crate::chat::Lifecycle`] as the header last showed it: an envelope
     /// that moves it (the agent answering, exiting) refreshes the header.
     shown_lifecycle: Cell<crate::chat::Lifecycle>,
+}
+
+impl Inner {
+    /// The saved prompts offered in this thread, in typeahead order.
+    fn saved_prompts(&self) -> Vec<agent_core::saved_prompts::SavedPrompt> {
+        let source = self.prompts.borrow().clone();
+        let dir = self.workspace.borrow().clone();
+        source.map_or_else(Vec::new, |s| s.saved_prompts(dir.as_deref()))
+    }
+}
+
+/// The text selected in the transcript under `root`: the first selectable label or text view
+/// (a code block) holding a selection. An in-memory read of the rows on show.
+fn transcript_selection(root: &gtk4::Widget) -> Option<String> {
+    if let Some(label) = root.downcast_ref::<gtk4::Label>() {
+        if label.is_selectable() {
+            if let Some((a, b)) = label.selection_bounds() {
+                let (start, end) = (a.min(b), a.max(b));
+                let picked: String = label
+                    .text()
+                    .chars()
+                    .skip(usize::try_from(start).unwrap_or(0))
+                    .take(usize::try_from(end - start).unwrap_or(0))
+                    .collect();
+                if !picked.trim().is_empty() {
+                    return Some(picked);
+                }
+            }
+        }
+    }
+    if let Some(view) = root.downcast_ref::<gtk4::TextView>() {
+        if let Some((start, end)) = view.buffer().selection_bounds() {
+            let picked = view.buffer().text(&start, &end, false).to_string();
+            if !picked.trim().is_empty() {
+                return Some(picked);
+            }
+        }
+    }
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        if let Some(found) = transcript_selection(&widget) {
+            return Some(found);
+        }
+        child = widget.next_sibling();
+    }
+    None
 }
 
 /// A callback that runs `f` on the view's state while the view lives. It holds the state weakly,
@@ -318,6 +369,7 @@ impl ChatView {
                 model_listener: ModelListener::default(),
                 actions: RefCell::new(Vec::new()),
                 diffs: RefCell::new(None),
+                prompts: RefCell::new(None),
                 dirty: RefCell::new(Vec::new()),
                 flush_queued: Cell::new(false),
                 widget: view.downgrade(),
@@ -476,6 +528,14 @@ impl ChatView {
     pub fn set_workspace(&self, dir: &std::path::Path) {
         if let Some(inner) = self.inner() {
             *inner.workspace.borrow_mut() = Some(dir.to_path_buf());
+        }
+    }
+
+    /// Gives the composer the user's saved prompts (listed after `/`) and the diff panel's focused
+    /// file. Without one (the demo, tests) no saved prompt is offered.
+    pub fn set_prompt_source(&self, source: Rc<dyn PromptSource>) {
+        if let Some(inner) = self.inner() {
+            *inner.prompts.borrow_mut() = Some(source);
         }
     }
 
@@ -1704,7 +1764,61 @@ impl ComposerHost for Inner {
 
     fn command_items(&self, trigger: &Trigger) -> Vec<agent_core::commands::CompletionItem> {
         let status = self.backend.status();
-        composer::items_for(trigger, &status.commands, &status.capabilities)
+        let saved: Vec<_> = match trigger.kind {
+            agent_core::commands::TriggerKind::Slash => self
+                .saved_prompts()
+                .iter()
+                .map(saved_prompts::completion_item)
+                .collect(),
+            _ => Vec::new(),
+        };
+        composer::items_for(trigger, &status.commands, &saved, &status.capabilities)
+    }
+
+    fn expand_saved(
+        &self,
+        name: &str,
+        draft: &str,
+        selection: Option<&str>,
+    ) -> Option<saved_prompts::Resolved> {
+        let prompt = self
+            .saved_prompts()
+            .into_iter()
+            .find(|p| p.name.trim().eq_ignore_ascii_case(name))?;
+        let mut values = saved_prompts::Values::default();
+        if let Some(dir) = self.workspace.borrow().as_deref() {
+            values = values.with_folder(&dir.to_string_lossy());
+        }
+        let file = saved_prompts::first_file_mention(draft).or_else(|| {
+            self.prompts
+                .borrow()
+                .as_ref()
+                .and_then(|source| source.focused_file())
+        });
+        if let Some(file) = file {
+            values = values.with_file(&file);
+        }
+        // The transcript's selection, else the composer's: read only when the body asks.
+        if saved_prompts::uses(&prompt.body, saved_prompts::Placeholder::Selection) {
+            let picked = transcript_selection(self.transcript.widget().upcast_ref())
+                .or_else(|| selection.map(str::to_owned));
+            if let Some(picked) = picked {
+                values = values.with_selection(&picked);
+            }
+        }
+        let resolved = saved_prompts::expand(&prompt.body, &values);
+        if resolved.selection_cut {
+            self.notify(&format!(
+                "The selection was cut to its first {} KB",
+                saved_prompts::SELECTION_MAX_BYTES / 1024
+            ));
+        } else if resolved.selection_dropped {
+            self.notify(
+                "The selection was left out: it is one long run of text with no space or line \
+                 break, too long to check for secrets",
+            );
+        }
+        Some(resolved)
     }
 
     fn request_files(&self, query: &str) -> Option<String> {
@@ -1875,6 +1989,138 @@ pub(crate) mod tests {
     use agent_core::event::Decision;
 
     pub(super) use crate::testutil::native_init;
+
+    /// Saved prompts and a focused file, as the window would give them.
+    struct StubPrompts {
+        prompts: Vec<agent_core::saved_prompts::SavedPrompt>,
+        focused: Option<String>,
+    }
+
+    impl PromptSource for StubPrompts {
+        fn saved_prompts(
+            &self,
+            dir: Option<&std::path::Path>,
+        ) -> Vec<agent_core::saved_prompts::SavedPrompt> {
+            saved_prompts::offered(&self.prompts, builtins(), dir, str::to_owned)
+                .into_iter()
+                .cloned()
+                .collect()
+        }
+        fn focused_file(&self) -> Option<String> {
+            self.focused.clone()
+        }
+    }
+
+    #[test]
+    #[ignore = "constructs GTK widgets; run on a private display"]
+    fn a_saved_prompt_fills_its_placeholders_from_the_thread() {
+        crate::testutil::gtk_init().expect("GTK init");
+        crate::testutil::adw_init().expect("adw init");
+        let view = ChatView::new(StubBackend::new(Driver::Claude));
+        let inner = view.inner().expect("inner");
+        let prompt =
+            |name: &str, body: &str, folder: Option<&str>| agent_core::saved_prompts::SavedPrompt {
+                id: String::new(),
+                name: name.into(),
+                body: body.into(),
+                folder: folder.map(str::to_owned),
+            };
+        view.set_prompt_source(Rc::new(StubPrompts {
+            prompts: vec![
+                prompt(
+                    "review",
+                    "Review {file} in {folder}: {selection} ({branch})",
+                    None,
+                ),
+                prompt("here", "only in /w/app", Some("/w/app")),
+                prompt("model", "never offered", None),
+            ],
+            focused: Some("src/lib.rs".into()),
+        }));
+        view.set_workspace(std::path::Path::new("/w/app"));
+
+        // The typeahead lists them after `/`, under their own badge, never as a built-in.
+        let trigger = agent_core::commands::detect_trigger("/", 1).expect("trigger");
+        let items = ComposerHost::command_items(&*inner, &trigger);
+        let saved: Vec<&str> = items
+            .iter()
+            .filter(|i| i.kind == agent_core::commands::CompletionKind::Saved)
+            .map(|i| i.name.as_str())
+            .collect();
+        assert_eq!(saved, ["here", "review"]);
+
+        // No `@path` in the draft: `{file}` is the diff panel's focused file. No transcript
+        // selection: the composer's. `{branch}` has no value and stays to be filled.
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let r = ComposerHost::expand_saved(
+            &*inner,
+            "REVIEW",
+            " and more",
+            Some(&format!("the token {secret}")),
+        )
+        .expect("expanded");
+        assert_eq!(
+            r.text,
+            "Review src/lib.rs in /w/app: the token ****6789 ({branch})"
+        );
+        assert_eq!(&r.text[r.unresolved[0].range.clone()], "{branch}");
+
+        // An `@path` already in the draft wins over the panel's file.
+        let r = ComposerHost::expand_saved(&*inner, "review", " see @src/main.rs", None)
+            .expect("expanded");
+        assert!(r
+            .text
+            .starts_with("Review src/main.rs in /w/app: {selection}"));
+
+        // A selection over the cap is cut and said to be.
+        let big = "line of text\n".repeat(2_000);
+        let r = ComposerHost::expand_saved(&*inner, "review", "", Some(&big)).expect("expanded");
+        assert!(r.selection_cut);
+        assert!(r.text.len() < agent_core::saved_prompts::SELECTION_MAX_BYTES + 100);
+
+        // One unbroken run too long to keep: left to fill, and said to be.
+        let run = "x".repeat(agent_core::saved_prompts::SELECTION_MAX_BYTES * 4 + 1);
+        let r = ComposerHost::expand_saved(&*inner, "review", "", Some(&run)).expect("expanded");
+        assert!(r.selection_dropped && !r.selection_cut);
+        assert!(r.text.contains("{selection}"));
+
+        // A name no prompt has any more.
+        assert!(ComposerHost::expand_saved(&*inner, "gone", "", None).is_none());
+        assert!(ComposerHost::expand_saved(&*inner, "model", "", None).is_none());
+    }
+
+    #[test]
+    #[ignore = "constructs GTK widgets; run on a private display"]
+    fn the_transcript_selection_is_read_from_its_labels_and_code_blocks() {
+        crate::testutil::gtk_init().expect("GTK init");
+        let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let plain = gtk4::Label::new(Some("not selectable"));
+        root.append(&plain);
+        let nested = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let reply = gtk4::Label::new(Some("héllo wörld"));
+        reply.set_selectable(true);
+        nested.append(&reply);
+        root.append(&nested);
+        assert_eq!(transcript_selection(root.upcast_ref()), None);
+        reply.select_region(6, 11);
+        assert_eq!(
+            transcript_selection(root.upcast_ref()).as_deref(),
+            Some("wörld")
+        );
+        reply.select_region(0, 0);
+        let code = gtk4::TextView::new();
+        code.buffer().set_text("let x = 1;");
+        let (start, end) = (
+            code.buffer().iter_at_offset(4),
+            code.buffer().iter_at_offset(5),
+        );
+        code.buffer().select_range(&start, &end);
+        root.append(&code);
+        assert_eq!(
+            transcript_selection(root.upcast_ref()).as_deref(),
+            Some("x")
+        );
+    }
 
     #[test]
     fn gauge_popover_actions_map_to_their_commands() {

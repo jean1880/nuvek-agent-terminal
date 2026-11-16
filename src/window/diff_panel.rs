@@ -274,6 +274,9 @@ pub struct DiffPanel {
     placed: Rc<Cell<bool>>,
     /// Set while code moves the divider, so that move is not taken for a drag.
     placing: Rc<Cell<bool>>,
+    /// The file row the user last expanded or moved focus to: what a saved prompt's `{file}`
+    /// falls back to. Kept across a refresh while the file is still listed.
+    focused: Rc<RefCell<Option<String>>>,
 }
 
 impl DiffPanel {
@@ -465,6 +468,7 @@ impl DiffPanel {
             shown_sides: Rc::new(RefCell::new(None)),
             placed: Rc::new(Cell::new(false)),
             placing: Rc::new(Cell::new(false)),
+            focused: Rc::new(RefCell::new(None)),
         };
         panel.set_colours(colours);
         panel.show_pop_state();
@@ -512,6 +516,15 @@ impl DiffPanel {
         self.pop.set_tooltip_text(Some(words));
         self.pop
             .update_property(&[gtk4::accessible::Property::Label(words)]);
+    }
+
+    /// The file in focus in the panel (the row last expanded or focused), while the panel is on
+    /// show and lists it; its path as the panel shows it, from the repository's top.
+    pub fn focused_file(&self) -> Option<String> {
+        if !self.is_shown() {
+            return None;
+        }
+        self.focused.borrow().clone()
     }
 
     /// Whether the panel is in its own window.
@@ -819,6 +832,7 @@ impl DiffPanel {
     }
 
     fn show_status(&self, icon: &str, title: &str, description: &str, retry: bool) {
+        self.focused.borrow_mut().take();
         self.set_undo(None);
         self.summary.set_text("");
         crate::icons::set_status_icon(&self.status, icon);
@@ -955,6 +969,16 @@ impl DiffPanel {
             self.files.remove(&child);
         }
         self.views.borrow_mut().clear();
+        // A file no longer listed is no longer in focus.
+        {
+            let mut focused = self.focused.borrow_mut();
+            if focused
+                .as_ref()
+                .is_some_and(|f| !diff.stats.iter().any(|s| &s.path == f))
+            {
+                *focused = None;
+            }
+        }
 
         // Chunk `i` is `stats[i]`'s: git writes `--numstat` and the patch in the same order. A
         // diff cut short has fewer chunks than files; a too-large one has none.
@@ -1051,6 +1075,17 @@ impl DiffPanel {
             .margin_start(8)
             .build();
         expander.add_css_class("diff-file");
+        // Expanding a row, or moving focus to it, makes its file the one in focus.
+        let focus = gtk4::EventControllerFocus::new();
+        let (focused, path) = (Rc::clone(&self.focused), stat.path.clone());
+        focus.connect_enter(move |_| *focused.borrow_mut() = Some(path.clone()));
+        expander.add_controller(focus);
+        let (focused, path) = (Rc::clone(&self.focused), stat.path.clone());
+        expander.connect_expanded_notify(move |expander| {
+            if expander.is_expanded() {
+                *focused.borrow_mut() = Some(path.clone());
+            }
+        });
 
         let views = Rc::clone(&self.views);
         let colours = Rc::clone(&self.colours);

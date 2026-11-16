@@ -21,9 +21,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use agent_core::commands::{
-    builtins, completion_items, detect_trigger, CompletionItem, CompletionKind, Trigger,
+    builtins, completion_items_with, detect_trigger, CompletionItem, CompletionKind, Trigger,
     TriggerKind,
 };
+use agent_core::saved_prompts::Resolved;
 use gtk4::prelude::*;
 use gtk4::{gdk, glib};
 use sourceview5::prelude::*;
@@ -188,6 +189,18 @@ pub trait ComposerHost {
     }
     /// A sentence for the user about the composer's images (a toast).
     fn notify(&self, _text: &str) {}
+    /// A saved prompt was chosen: its text for this thread, placeholders filled, or `None` when
+    /// there is no such prompt any more. `draft` is the rest of the draft (where `{file}` looks
+    /// for an `@path`) and `selection` the text selected in the composer, if any. Nothing is
+    /// sent: the composer puts the text in the draft.
+    fn expand_saved(
+        &self,
+        _name: &str,
+        _draft: &str,
+        _selection: Option<&str>,
+    ) -> Option<Resolved> {
+        None
+    }
 }
 
 pub struct Composer {
@@ -1086,6 +1099,9 @@ impl Composer {
                     }
                 }
             }
+            Entry::Command(item) if item.kind == CompletionKind::Saved => {
+                self.expand_saved(&item.name, &text, trigger.range.clone());
+            }
             Entry::Command(item) => {
                 let (new, cursor) =
                     apply_completion(&text, trigger.range.clone(), &item.insert_text);
@@ -1097,6 +1113,50 @@ impl Composer {
                 self.replace(&new, cursor);
             }
         }
+    }
+
+    /// Puts saved prompt `name`'s text where its `/name` was typed (`range` of `text`), with the
+    /// first placeholder left to fill selected, else the cursor after the text. Never submits.
+    fn expand_saved(&self, name: &str, text: &str, range: std::ops::Range<usize>) {
+        let Some(host) = self.host() else {
+            return;
+        };
+        let (Some(before), Some(after)) = (text.get(..range.start), text.get(range.end..)) else {
+            return;
+        };
+        let rest = format!("{before}{after}");
+        let selection = self.selected_text();
+        let Some(resolved) = host.expand_saved(name, &rest, selection.as_deref()) else {
+            host.notify(&format!("There is no saved prompt /{name} any more"));
+            return;
+        };
+        let (new, _) = apply_completion(text, range.clone(), &resolved.text);
+        let at = |offset: usize| range.start + offset;
+        self.replace(&new, at(resolved.cursor));
+        if let Some(first) = resolved.unresolved.first() {
+            self.select_bytes(&new, at(first.range.start)..at(first.range.end));
+        }
+        self.view.grab_focus();
+    }
+
+    /// The text selected in the composer, if any.
+    fn selected_text(&self) -> Option<String> {
+        let (start, end) = self.buffer.selection_bounds()?;
+        let text = self.buffer.text(&start, &end, false).to_string();
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Selects the byte range `range` of `text` (the buffer's text).
+    fn select_bytes(&self, text: &str, range: std::ops::Range<usize>) {
+        let chars = |byte: usize| {
+            text.get(..byte)
+                .map_or(0, |s| i32::try_from(s.chars().count()).unwrap_or(i32::MAX))
+        };
+        let start = self.buffer.iter_at_offset(chars(range.start));
+        let end = self.buffer.iter_at_offset(chars(range.end));
+        self.editing.set(true);
+        self.buffer.select_range(&start, &end);
+        self.editing.set(false);
     }
 
     fn replace(&self, text: &str, cursor_byte: usize) {
@@ -1121,11 +1181,7 @@ fn entry_row(entry: &Entry) -> gtk4::ListBoxRow {
     b.add_css_class("typeahead-row");
     match entry {
         Entry::Command(item) => {
-            let (badge, sigil) = match item.kind {
-                CompletionKind::Builtin => ("app", "/"),
-                CompletionKind::Agent => ("agent", "/"),
-                CompletionKind::Skill => ("skill", "$"),
-            };
+            let (badge, sigil) = item.kind.badge();
             let badge = label(badge, &["kind-badge", &format!("badge-{badge}")]);
             badge.set_valign(gtk4::Align::Center);
             b.append(&badge);
@@ -1161,6 +1217,9 @@ fn entry_row(entry: &Entry) -> gtk4::ListBoxRow {
 
 fn entry_description(entry: &Entry) -> String {
     match entry {
+        Entry::Command(item) if item.kind == CompletionKind::Saved => {
+            format!("Saved prompt /{}: {}", item.name, item.description)
+        }
         Entry::Command(item) => {
             let hint = item.hint.as_deref().unwrap_or("");
             format!("{} {hint}: {}", item.insert_text, item.description)
@@ -1169,13 +1228,15 @@ fn entry_description(entry: &Entry) -> String {
     }
 }
 
-/// Candidates for a `/` or `$` trigger (wraps `completion_items` so the host stays small).
+/// Candidates for a `/` or `$` trigger (wraps `completion_items_with` so the host stays small).
+/// `saved` are the saved prompts offered in this thread, as items.
 pub fn items_for(
     trigger: &Trigger,
     commands: &[agent_core::event::AgentCommand],
+    saved: &[CompletionItem],
     caps: &agent_core::caps::Capabilities,
 ) -> Vec<CompletionItem> {
-    completion_items(builtins(), commands, caps, trigger)
+    completion_items_with(builtins(), commands, saved, caps, trigger)
 }
 
 /// `block` as it goes into a draft between `before` and `after` (the text either side of the
@@ -1328,6 +1389,10 @@ pub(super) mod tests {
         running: Cell<bool>,
         interrupts: Cell<usize>,
         submitted: RefCell<Vec<String>>,
+        /// A saved prompt the typeahead offers: name and body.
+        saved: RefCell<Option<(String, String)>>,
+        /// The draft and selection `expand_saved` was given.
+        expanded_with: RefCell<Option<(String, Option<String>)>>,
     }
 
     impl ComposerHost for Host {
@@ -1341,8 +1406,27 @@ pub(super) mod tests {
             self.running.get()
         }
         fn run_builtin(&self, _name: &str) {}
-        fn command_items(&self, _trigger: &Trigger) -> Vec<CompletionItem> {
-            Vec::new()
+        fn command_items(&self, trigger: &Trigger) -> Vec<CompletionItem> {
+            let saved: Vec<CompletionItem> = self
+                .saved
+                .borrow()
+                .iter()
+                .map(|(name, body)| {
+                    agent_core::saved_prompts::completion_item(
+                        &agent_core::saved_prompts::SavedPrompt {
+                            name: name.clone(),
+                            body: body.clone(),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect();
+            items_for(
+                trigger,
+                &[],
+                &saved,
+                &agent_core::caps::Capabilities::claude(),
+            )
         }
         fn request_files(&self, _query: &str) -> Option<String> {
             None
@@ -1350,6 +1434,72 @@ pub(super) mod tests {
         fn placeholder(&self) -> String {
             "Message Codex".to_owned()
         }
+        fn expand_saved(
+            &self,
+            name: &str,
+            draft: &str,
+            selection: Option<&str>,
+        ) -> Option<Resolved> {
+            *self.expanded_with.borrow_mut() =
+                Some((draft.to_owned(), selection.map(str::to_owned)));
+            let saved = self.saved.borrow();
+            let (_, body) = saved.as_ref().filter(|(n, _)| n == name)?;
+            let mut values = agent_core::saved_prompts::Values::default().with_folder("/w");
+            if let Some(file) = agent_core::saved_prompts::first_file_mention(draft) {
+                values = values.with_file(&file);
+            }
+            Some(agent_core::saved_prompts::expand(body, &values))
+        }
+    }
+
+    #[test]
+    #[ignore = "native GTK; run alone in an isolated display"]
+    fn accepting_a_saved_prompt_fills_the_draft_and_does_not_submit() {
+        crate::testutil::gtk_init().expect("GTK init");
+        let host = Rc::new(Host::default());
+        *host.saved.borrow_mut() = Some((
+            "review".to_owned(),
+            "Review {file} in {folder} on {branch}, then {selection}".to_owned(),
+        ));
+        let host_trait: Rc<dyn ComposerHost> = host.clone();
+        let composer = Composer::new();
+        composer.set_host(Rc::downgrade(&host_trait));
+        // The popup is a popover: it needs a window to open in.
+        let window = gtk4::Window::new();
+        window.set_child(Some(composer.widget()));
+        window.present();
+
+        // Typing `/rev` lists the saved prompt under its badge.
+        composer.set_text("/rev @src/a.rs");
+        let at = composer.buffer.iter_at_offset(4);
+        composer.buffer.place_cursor(&at);
+        let entries = composer.entries.borrow().clone();
+        let index = entries
+            .iter()
+            .position(|e| matches!(e, Entry::Command(i) if i.kind == CompletionKind::Saved))
+            .expect("the saved prompt is offered");
+        assert!(entry_description(&entries[index]).starts_with("Saved prompt /review"));
+
+        composer.accept(index);
+        // The `/rev` token became the text; the rest of the draft stays and fed `{file}`.
+        assert_eq!(
+            composer.text(),
+            "Review src/a.rs in /w on {branch}, then {selection} @src/a.rs"
+        );
+        assert_eq!(
+            host.expanded_with
+                .borrow()
+                .as_ref()
+                .map(|(d, _)| d.as_str()),
+            Some(" @src/a.rs")
+        );
+        // Nothing went to the agent, and the first placeholder to fill is selected.
+        assert!(host.submitted.borrow().is_empty());
+        assert_eq!(composer.selected_text().as_deref(), Some("{branch}"));
+        composer.dispose();
+        window.set_child(None::<&gtk4::Widget>);
+        drop(composer);
+        window.destroy();
     }
 
     /// Runs on the window smoke test's GTK thread. Exercise the actual button callback: a

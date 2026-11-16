@@ -758,6 +758,7 @@ popover.typeahead > contents {
 .badge-agent { background-color: alpha(@brand_claude, 0.18); color: mix(@brand_claude, white, 0.4); }
 .badge-skill { background-color: alpha(@at_success, 0.16); color: @at_success_soft; }
 .badge-file { background-color: alpha(@at_info, 0.16); color: mix(@at_info, @at_fg_strong, 0.4); }
+.badge-prompt { background-color: alpha(@at_warning, 0.16); color: mix(@at_warning, @at_fg_strong, 0.4); }
 
 /* panels */
 dialog.chat-panel sheet,

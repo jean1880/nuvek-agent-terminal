@@ -272,12 +272,36 @@ pub fn compact_text(caps: &Capabilities) -> Option<String> {
 // Completion items
 // ---------------------------------------------------------------------------------------------
 
-/// Source of a completion. The derived order is the ranking tie-break: built-in, agent, skill.
+/// Source of a completion. The derived order is the ranking tie-break: built-in, agent, skill,
+/// saved prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CompletionKind {
     Builtin,
     Agent,
     Skill,
+    /// One of the user's saved prompts ([`crate::saved_prompts`]): choosing it expands its text
+    /// into the draft, never sends it.
+    Saved,
+}
+
+impl CompletionKind {
+    /// Every kind, in ranking order.
+    pub const ALL: [CompletionKind; 4] = [
+        CompletionKind::Builtin,
+        CompletionKind::Agent,
+        CompletionKind::Skill,
+        CompletionKind::Saved,
+    ];
+
+    /// The typeahead row's badge word and the sigil its name is shown with.
+    pub fn badge(self) -> (&'static str, char) {
+        match self {
+            CompletionKind::Builtin => ("app", '/'),
+            CompletionKind::Agent => ("agent", '/'),
+            CompletionKind::Skill => ("skill", '$'),
+            CompletionKind::Saved => ("prompt", '/'),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -301,6 +325,20 @@ pub struct CompletionItem {
 pub fn completion_items(
     builtins: &[Builtin],
     agent: &[AgentCommand],
+    driver_caps: &Capabilities,
+    trigger: &Trigger,
+) -> Vec<CompletionItem> {
+    completion_items_with(builtins, agent, &[], driver_caps, trigger)
+}
+
+/// [`completion_items`] with the user's saved prompts (already built as items, see
+/// [`crate::saved_prompts::completion_item`]) listed after the agent's commands on a `/` at the
+/// start of the prompt. A saved prompt never shadows a built-in (one that names a built-in or
+/// alias is dropped), and one named like an agent command is shown beside it, under its own badge.
+pub fn completion_items_with(
+    builtins: &[Builtin],
+    agent: &[AgentCommand],
+    saved: &[CompletionItem],
     driver_caps: &Capabilities,
     trigger: &Trigger,
 ) -> Vec<CompletionItem> {
@@ -328,6 +366,25 @@ pub fn completion_items(
                         continue;
                     }
                     items.push(agent_item(CompletionKind::Agent, name, cmd, '/'));
+                }
+                for item in saved {
+                    let name = normalize_name(&item.name);
+                    if item.kind != CompletionKind::Saved
+                        || name.is_empty()
+                        || builtins.iter().any(|b| b.answers_to(&name))
+                        || items
+                            .iter()
+                            .any(|i| i.kind == CompletionKind::Saved && i.name == name)
+                    {
+                        continue;
+                    }
+                    // Pushed under the name it was compared by, so `Review` and `review` are
+                    // one row, and what it inserts follows.
+                    items.push(CompletionItem {
+                        insert_text: format!("/{name} "),
+                        name,
+                        ..item.clone()
+                    });
                 }
             }
         }
@@ -887,6 +944,107 @@ mod tests {
         let items = completion_items(builtins(), &[], &Capabilities::claude(), &slash(""));
         assert_eq!(items.len(), builtins().len());
         assert_eq!(names(&items).first(), Some(&"model"));
+    }
+
+    fn saved(name: &str) -> CompletionItem {
+        CompletionItem {
+            kind: CompletionKind::Saved,
+            name: name.into(),
+            description: format!("saved {name}"),
+            hint: None,
+            insert_text: format!("/{name} "),
+        }
+    }
+
+    #[test]
+    fn saved_prompts_rank_after_agent_commands_and_never_shadow_a_builtin() {
+        let agent = [cmd("review", AgentCommandKind::Command)];
+        let prompts = [
+            saved("review"),
+            saved("tidy"),
+            saved("model"),
+            saved("tidy"),
+        ];
+        let items = completion_items_with(
+            builtins(),
+            &agent,
+            &prompts,
+            &Capabilities::claude(),
+            &slash(""),
+        );
+        let kinds: Vec<(CompletionKind, &str)> = items
+            .iter()
+            .filter(|i| i.kind != CompletionKind::Builtin)
+            .map(|i| (i.kind, i.name.as_str()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                (CompletionKind::Agent, "review"),
+                (CompletionKind::Saved, "review"),
+                (CompletionKind::Saved, "tidy"),
+            ]
+        );
+        // Names differing only in case (or a leading slash) are one row, under the normal name.
+        let mixed = [saved("Tidy"), saved("tidy"), saved("/TIDY"), saved("MODEL")];
+        let items =
+            completion_items_with(builtins(), &[], &mixed, &Capabilities::claude(), &slash(""));
+        let tidy: Vec<(&str, &str)> = items
+            .iter()
+            .filter(|i| i.kind == CompletionKind::Saved)
+            .map(|i| (i.name.as_str(), i.insert_text.as_str()))
+            .collect();
+        assert_eq!(tidy, [("tidy", "/tidy ")]);
+        // The built-in keeps its name: no saved row for /model.
+        assert_eq!(names(&items).iter().filter(|n| **n == "model").count(), 1);
+        // On a tie, the agent's command comes before the saved prompt of the same name.
+        let items = completion_items_with(
+            builtins(),
+            &agent,
+            &prompts,
+            &Capabilities::claude(),
+            &slash("review"),
+        );
+        let order: Vec<CompletionKind> = items.iter().map(|i| i.kind).collect();
+        assert_eq!(order[..2], [CompletionKind::Agent, CompletionKind::Saved]);
+        // Not at the start of the prompt: no saved prompts.
+        let mut t = slash("");
+        t.at_prompt_start = false;
+        let items = completion_items_with(builtins(), &[], &prompts, &Capabilities::claude(), &t);
+        assert!(items.iter().all(|i| i.kind == CompletionKind::Builtin));
+        // `$` never lists them.
+        let skill = Trigger {
+            kind: TriggerKind::Skill,
+            query: String::new(),
+            range: 0..1,
+            at_prompt_start: true,
+        };
+        assert!(
+            completion_items_with(builtins(), &[], &prompts, &Capabilities::claude(), &skill)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn every_completion_kind_has_a_badge() {
+        // Exhaustive: a new kind fails to compile here until it has a place in `ALL`.
+        let index = |kind: CompletionKind| match kind {
+            CompletionKind::Builtin => 0,
+            CompletionKind::Agent => 1,
+            CompletionKind::Skill => 2,
+            CompletionKind::Saved => 3,
+        };
+        for (i, kind) in CompletionKind::ALL.into_iter().enumerate() {
+            assert_eq!(index(kind), i);
+            let (word, sigil) = kind.badge();
+            assert!(!word.is_empty() && (sigil == '/' || sigil == '$'));
+        }
+        let mut sorted = CompletionKind::ALL;
+        sorted.sort();
+        assert_eq!(sorted, CompletionKind::ALL);
+        let words: std::collections::HashSet<&str> =
+            CompletionKind::ALL.iter().map(|k| k.badge().0).collect();
+        assert_eq!(words.len(), CompletionKind::ALL.len());
     }
 
     #[test]

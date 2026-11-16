@@ -12873,8 +12873,8 @@ pub(super) mod tests {
             assert!(problems.is_empty(), "{problems:?}");
         }
 
-        // Its text takes the chip's own colour, not the app-wide label rule's.
-        crate::load_css();
+        // Its text takes the chip's own colour, not the app-wide label rule's, nor what the
+        // sidebar pane hands down (libadwaita 1.5's `@sidebar_fg_color`).
         let text: gtk4::Label = find_first(review.upcast_ref()).expect("the chip's label");
         let want = crate::palette::current().fg_strong;
         assert!(
@@ -13012,6 +13012,9 @@ pub(super) mod tests {
         crate::testutil::gtk_init().unwrap();
         crate::testutil::adw_init().unwrap();
         crate::icons::register();
+        // The app's stylesheet, as the app loads it before any window: the tag chips are checked
+        // for the colour it gives them.
+        crate::load_css();
         let config_home = tempfile::tempdir().unwrap();
         std::env::set_var("XDG_CONFIG_HOME", config_home.path());
         let state = tempfile::tempdir().unwrap();

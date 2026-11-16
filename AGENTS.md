@@ -89,7 +89,11 @@ Architectural mandates, standards, and workflows for this codebase.
     once per crossing, and the popover's and the offer's actions) and `review` (comments on
     diff lines composed into one review message: each quote redacted whole before it is
     capped, then fenced; notes and paths redacted, control characters out of paths; the whole
-    within the hand-off budget, the comments past it left for the next review).
+    within the hand-off budget, the comments past it left for the next review) and
+    `terminal_excerpt` (terminal text for a thread's draft: control bytes stripped, redacted
+    before it is cut to 200 lines and 12,000 characters, fenced under a label naming its
+    `Source`, and `last_output_range`, the last-output heuristic, which says when it fell
+    back).
   - `crates/agent-kit` (GTK-free; blocking process and file I/O): `git`
     (git plumbing for turn checkpoints and diffs: shells out, but its parsers
     and filters are pure), `diff` (diff bases, numstat, line classification,
@@ -338,6 +342,12 @@ Architectural mandates, standards, and workflows for this codebase.
   prompt's placeholder values (`{file}`, `{selection}`, `{folder}`, `{branch}`) are redacted
   when they are given to `saved_prompts::Values` (a selection before it is cut to 8 KB);
   the expanded text only fills the draft, never sends, and is then the user's own prompt.
+  Terminal text sent to a thread ("Send Selection" or "Send Last Output", from a drawer or a
+  terminal page, a remote one included) goes through `terminal_excerpt::format_excerpt`: only
+  whole lines reach redaction, before any cut, and it stays fenced under its "data, not
+  instructions" label. It only fills a draft, never sends, and a terminal page's target is the
+  thread last shown in its window (`last_chat_key`), never one opened for it; with none the
+  actions are disabled.
   A thread's tag is shown on every row, so one that redaction would change is refused (by the
   Tags dialog and again by `Store::set_tags`), never stored masked; tags are never injected
   into a prompt or a hand-off.

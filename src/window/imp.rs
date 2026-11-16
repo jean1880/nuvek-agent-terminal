@@ -1428,6 +1428,10 @@ pub struct AgentTerminalWindow {
     /// Set while a transcript quota check is running off-thread, so a slow
     /// disk cannot stack up overlapping checks.
     quota_poll_running: std::cell::Cell<bool>,
+    /// The registry key of the thread page last shown in this window: where a terminal page's
+    /// "Send … to Thread" goes. A key no longer in the registry (the thread closed or moved to
+    /// another window) means there is nowhere to send.
+    last_chat_key: std::cell::Cell<Option<u64>>,
     /// Where the quota poll found each 2.x session's transcript, by (store, session id), so a
     /// poll does not list the store's directories again. A new session id is a new key.
     transcript_paths: RefCell<std::collections::HashMap<(String, String), std::path::PathBuf>>,
@@ -1968,10 +1972,17 @@ impl AgentTerminalWindow {
             }
         });
 
-        // No accelerator: Ctrl+Shift+E is the resume chord. Enabled by `refresh_send_selection`
-        // as the terminal's menu opens.
-        self.add_win_action("send-selection", Self::send_selection_to_thread)
-            .set_enabled(false);
+        // No accelerators: Ctrl+Shift+E is the resume chord, and Ctrl+Alt+E is the shell's own
+        // (readline's shell-expand-line). Enabled by `refresh_send_actions` as the terminal's
+        // menu opens, which the Menu key and Shift+F10 reach too.
+        self.add_win_action("send-selection", |imp| {
+            imp.send_to_thread(SendWhat::Selection)
+        })
+        .set_enabled(false);
+        self.add_win_action("send-last-output", |imp| {
+            imp.send_to_thread(SendWhat::LastOutput)
+        })
+        .set_enabled(false);
 
         // New Tab Action (bound to Ctrl+Shift+T in main.rs)
         self.add_win_action("new-tab", |imp| {
@@ -4167,9 +4178,10 @@ impl AgentTerminalWindow {
         win: &super::AgentTerminalWindow,
         terminal: &Terminal,
         popover: &gtk4::PopoverMenu,
+        send: &gtk4::gio::Menu,
     ) {
         terminal.grab_focus();
-        win.imp().refresh_send_selection();
+        win.imp().refresh_send_actions(Some(send));
         popover.popup();
     }
 
@@ -4188,17 +4200,20 @@ impl AgentTerminalWindow {
         let section = gtk4::gio::Menu::new();
         section.append(Some("Copy"), Some("win.copy"));
         section.append(Some("Paste"), Some("win.paste"));
-        // A terminal page has no composer to send to; its entry says so, and stays disabled.
-        section.append(
-            Some(if drawer {
-                "Send Selection to Thread"
-            } else {
-                "Send Selection to Thread (open a thread first)"
-            }),
-            Some("win.send-selection"),
-        );
+        // A drawer sends to its own thread, a page to the thread last shown; the entries name it
+        // (or say to open a thread first) each time the menu opens.
+        let send = gtk4::gio::Menu::new();
+        let from = if drawer {
+            SendFrom::Drawer
+        } else {
+            SendFrom::Page
+        };
+        let [selection, last_output] = send_menu_labels(Some(from), None);
+        send.append(Some(&selection), Some("win.send-selection"));
+        send.append(Some(&last_output), Some("win.send-last-output"));
+        section.append_section(None, &send);
         menu.append_section(None, &section);
-        self.attach_terminal_menu(terminal, &menu, remote);
+        self.attach_terminal_menu(terminal, &menu, remote, &send);
     }
 
     /// A remote page's menu: nothing that reads a local folder (checkpoints, changes, sessions
@@ -4250,7 +4265,13 @@ impl AgentTerminalWindow {
     /// Opens `menu` on a right click, the Menu key, Shift+F10 or a long press, and Ctrl+click
     /// opens a hyperlink (on a `remote` page, only a web link:
     /// [`agent_core::remote::remote_link_allowed`]).
-    fn attach_terminal_menu(&self, terminal: &Terminal, menu: &gtk4::gio::Menu, remote: bool) {
+    fn attach_terminal_menu(
+        &self,
+        terminal: &Terminal,
+        menu: &gtk4::gio::Menu,
+        remote: bool,
+        send: &gtk4::gio::Menu,
+    ) {
         let win = self.obj().clone();
         let popover = gtk4::PopoverMenu::builder()
             .menu_model(menu)
@@ -4274,11 +4295,13 @@ impl AgentTerminalWindow {
             terminal,
             #[weak]
             win,
+            #[weak]
+            send,
             move |gesture, _, x, y| {
                 gesture.set_state(gtk4::EventSequenceState::Claimed);
                 let rect = gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
                 popover.set_pointing_to(Some(&rect));
-                Self::popup_terminal_menu(&win, &terminal, &popover);
+                Self::popup_terminal_menu(&win, &terminal, &popover, &send);
             }
         ));
         terminal.add_controller(click_gesture);
@@ -4294,6 +4317,8 @@ impl AgentTerminalWindow {
             terminal,
             #[weak]
             win,
+            #[weak]
+            send,
             #[upgrade_or]
             glib::Propagation::Proceed,
             move |_, key, _, state| {
@@ -4303,7 +4328,7 @@ impl AgentTerminalWindow {
                     return glib::Propagation::Proceed;
                 }
                 popover.set_pointing_to(None);
-                Self::popup_terminal_menu(&win, &terminal, &popover);
+                Self::popup_terminal_menu(&win, &terminal, &popover, &send);
                 glib::Propagation::Stop
             }
         ));
@@ -4317,11 +4342,13 @@ impl AgentTerminalWindow {
             terminal,
             #[weak]
             win,
+            #[weak]
+            send,
             move |gesture, x, y| {
                 gesture.set_state(gtk4::EventSequenceState::Claimed);
                 let rect = gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
                 popover.set_pointing_to(Some(&rect));
-                Self::popup_terminal_menu(&win, &terminal, &popover);
+                Self::popup_terminal_menu(&win, &terminal, &popover, &send);
             }
         ));
         terminal.add_controller(long_press);
@@ -7653,57 +7680,137 @@ impl AgentTerminalWindow {
         ));
     }
 
-    /// The page in view as "Send Selection to Thread" sees it: its state, and when it is a thread
-    /// with a composer, that composer's view, its drawer terminal and the thread's title. Found
-    /// through the registry, never the widget tree.
-    fn send_selection_target(
-        &self,
-    ) -> (
-        SendSelection,
-        Option<(crate::chat::view::ChatView, Terminal, String)>,
-    ) {
-        let Some(page) = self.selected_page() else {
+    /// The page in view as "Send … to Thread" sees it: where the text comes from, the terminal
+    /// it is read from, and the thread it goes to (with a composer to take it). A thread page
+    /// sends its drawer to itself; a terminal page sends to the thread last shown in this
+    /// window. Found through the registry, never the widget tree.
+    fn send_context(&self) -> Option<SendContext> {
+        let page = self.selected_page()?;
+        let tabs = self.tabs.borrow();
+        let facts: Vec<SendTab> = tabs
+            .iter()
+            .map(|t| SendTab {
+                key: t.key,
+                thread: t.chat.is_some(),
+                built: t.chat.as_ref().is_some_and(|c| c.view.is_some()),
+            })
+            .collect();
+        let selected = tabs.iter().find(|t| t.page == page)?;
+        let from = if selected.chat.is_some() {
+            SendFrom::Drawer
+        } else {
+            SendFrom::Page
+        };
+        let source = match (from, selected.remote.is_some()) {
+            (SendFrom::Drawer, _) => agent_core::terminal_excerpt::Source::Drawer,
+            (SendFrom::Page, false) => agent_core::terminal_excerpt::Source::Page,
+            (SendFrom::Page, true) => agent_core::terminal_excerpt::Source::RemotePage,
+        };
+        let target = send_target_key(selected.key, self.last_chat_key.get(), &facts)
+            .and_then(|key| tabs.iter().find(|t| t.key == key))
+            .and_then(|t| {
+                let chat = t.chat.as_ref()?;
+                Some(SendTarget {
+                    view: chat.view.clone()?,
+                    title: chat.title.clone(),
+                    page: t.page.clone(),
+                })
+            });
+        Some(SendContext {
+            from,
+            source,
+            terminal: selected.terminal.clone(),
+            target,
+        })
+    }
+
+    /// Whether a send of `what` can run now, and where it would go.
+    fn send_readiness(&self, what: SendWhat) -> (SendSelection, Option<SendContext>) {
+        let Some(ctx) = self.send_context() else {
             return (SendSelection::NoThread, None);
         };
-        let found = self
-            .with_page_tab(&page, |t| {
-                let chat = t.chat.as_ref()?;
-                Some((chat.view.clone()?, t.terminal.clone(), chat.title.clone()))
-            })
-            .flatten();
-        let state = send_selection_state(
-            found.is_some(),
-            found.as_ref().is_some_and(|(_, term, _)| term.has_focus()),
-            found
-                .as_ref()
-                .is_some_and(|(_, term, _)| term.has_selection()),
+        let state = send_state(
+            ctx.from,
+            ctx.target.is_some(),
+            ctx.terminal.has_focus(),
+            what,
+            ctx.terminal.has_selection(),
         );
-        (state, found)
+        (state, Some(ctx))
     }
 
-    /// Enables "Send Selection to Thread" only while the focused drawer terminal has a selection.
-    fn refresh_send_selection(&self) {
-        let enabled = self.send_selection_target().0 == SendSelection::Ready;
-        if let Some(action) = self
-            .obj()
-            .lookup_action("send-selection")
-            .and_then(|a| a.downcast::<gtk4::gio::SimpleAction>().ok())
-        {
-            action.set_enabled(enabled);
+    /// Brings "Send Selection" and "Send Last Output" up to date for the terminal in view: each
+    /// action enabled only when it can run, and the menu's `send` section naming where they go
+    /// (the thread's title from a terminal page, or that a thread must be opened first).
+    fn refresh_send_actions(&self, send: Option<&gtk4::gio::Menu>) {
+        let obj = self.obj();
+        for (name, what) in [
+            ("send-selection", SendWhat::Selection),
+            ("send-last-output", SendWhat::LastOutput),
+        ] {
+            let enabled = self.send_readiness(what).0 == SendSelection::Ready;
+            if let Some(action) = obj
+                .lookup_action(name)
+                .and_then(|a| a.downcast::<gtk4::gio::SimpleAction>().ok())
+            {
+                action.set_enabled(enabled);
+            }
         }
-    }
-
-    /// Puts the drawer terminal's selection in its own thread's draft: cleaned, redacted, capped
-    /// and fenced. The draft is never sent.
-    fn send_selection_to_thread(&self) {
-        let (state, found) = self.send_selection_target();
-        let (SendSelection::Ready, Some((view, terminal, title))) = (state, found) else {
+        let Some(send) = send else {
             return;
         };
-        let selected = terminal.text_selected(Format::Text);
-        let excerpt = selected.and_then(|text| {
+        let ctx = self.send_context();
+        let labels = send_menu_labels(
+            ctx.as_ref().map(|c| c.from),
+            ctx.as_ref()
+                .and_then(|c| c.target.as_ref())
+                .map(|t| t.title.as_str()),
+        );
+        send.remove_all();
+        send.append(Some(&labels[0]), Some("win.send-selection"));
+        send.append(Some(&labels[1]), Some("win.send-last-output"));
+    }
+
+    /// Puts the terminal's selection, or its last command's output, in the target thread's
+    /// draft: cleaned, redacted, capped and fenced, with a label saying where it came from. From
+    /// a terminal page the thread is brought into view. The draft is never sent.
+    fn send_to_thread(&self, what: SendWhat) {
+        let (state, ctx) = self.send_readiness(what);
+        let (SendSelection::Ready, Some(ctx)) = (state, ctx) else {
+            return;
+        };
+        let Some(target) = ctx.target else {
+            return;
+        };
+        let (raw, fell_back) = match what {
+            SendWhat::Selection => (
+                ctx.terminal
+                    .text_selected(Format::Text)
+                    .map(|t| t.to_string()),
+                false,
+            ),
+            SendWhat::LastOutput => {
+                let (text, fell_back) = last_output_text(&ctx.terminal);
+                (Some(text), fell_back)
+            }
+        };
+        self.put_in_draft(&target, ctx.source, raw.as_deref(), fell_back);
+    }
+
+    /// Formats `raw` (terminal text from `source`) and adds it to `target`'s draft, bringing the
+    /// thread into view first when it is not, then says what was added. "Nothing to send" when
+    /// it holds nothing but blanks.
+    fn put_in_draft(
+        &self,
+        target: &SendTarget,
+        source: agent_core::terminal_excerpt::Source,
+        raw: Option<&str>,
+        fell_back: bool,
+    ) {
+        let excerpt = raw.and_then(|text| {
             agent_core::terminal_excerpt::format_excerpt(
-                &text,
+                text,
+                source,
                 agent_core::terminal_excerpt::Caps::default(),
             )
         });
@@ -7711,8 +7818,13 @@ impl AgentTerminalWindow {
             self.show_toast("Nothing to send");
             return;
         };
-        view.insert_attachment_text(&excerpt.text);
-        self.show_toast(&excerpt_toast(&excerpt, &title));
+        if !self.is_selected(&target.page) {
+            if let Some(view) = self.tab_view.borrow().as_ref() {
+                view.set_selected_page(&target.page);
+            }
+        }
+        target.view.insert_attachment_text(&excerpt.text);
+        self.show_toast(&excerpt_toast(&excerpt, &target.title, fell_back));
     }
 
     /// A short confirmation over the tab view. The text is data, not markup.
@@ -8098,35 +8210,169 @@ fn check_directory_entry(entry: &gtk4::Entry, row: &adw::ActionRow, help: &str) 
     }
 }
 
-/// Whether "Send Selection to Thread" can run for the terminal in view.
+/// What a "Send … to Thread" action reads from the terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendWhat {
+    /// The selected text.
+    Selection,
+    /// The last command's output, found by [`agent_core::terminal_excerpt::last_output_range`].
+    LastOutput,
+}
+
+/// Which kind of terminal a send reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendFrom {
+    /// A thread's drawer: it sends to its own thread.
+    Drawer,
+    /// A terminal page: it sends to the thread last shown in its window.
+    Page,
+}
+
+/// The thread a send goes to.
+struct SendTarget {
+    view: crate::chat::view::ChatView,
+    title: String,
+    page: adw::TabPage,
+}
+
+/// The terminal in view and where its text would go.
+struct SendContext {
+    from: SendFrom,
+    source: agent_core::terminal_excerpt::Source,
+    terminal: Terminal,
+    target: Option<SendTarget>,
+}
+
+/// What [`send_target_key`] needs to know of a registry entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SendTab {
+    key: u64,
+    /// The page is a thread.
+    thread: bool,
+    /// Its composer exists (the thread has been shown).
+    built: bool,
+}
+
+/// The registry key of the thread a send from the page `selected` goes to: a thread page's own,
+/// a terminal page's the thread last shown (`last_chat`) while it is still open here. `None`
+/// when there is no composer to take it. Never a thread opened for the purpose.
+fn send_target_key(selected: u64, last_chat: Option<u64>, tabs: &[SendTab]) -> Option<u64> {
+    let open = |key: u64| tabs.iter().find(|t| t.key == key && t.thread && t.built);
+    let own = tabs.iter().find(|t| t.key == selected)?;
+    if own.thread {
+        return open(selected).map(|t| t.key);
+    }
+    open(last_chat?).map(|t| t.key)
+}
+
+/// Whether "Send Selection to Thread" or "Send Last Output to Thread" can run for the terminal in
+/// view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SendSelection {
-    /// The focused drawer terminal has a selection and its thread has a composer to take it.
+    /// The text is there and a thread's composer can take it.
     Ready,
-    /// A terminal page, or a thread whose view is not built yet: no composer to send to.
+    /// No composer to send to: a terminal page with no open thread shown, or a thread whose
+    /// view is not built yet.
     NoThread,
-    /// The terminal does not have the keyboard, so the selection is not the one in play.
+    /// A drawer that does not have the keyboard: its selection is not the one in play.
     NotFocused,
-    /// The drawer is focused but nothing in it is selected.
+    /// Nothing is selected (for "Send Selection").
     NoSelection,
 }
 
-/// What the action does for a terminal, from facts read off the registry entry and the terminal:
-/// `thread_view` is whether the owning tab is a thread with a built composer.
-fn send_selection_state(thread_view: bool, focused: bool, has_selection: bool) -> SendSelection {
-    if !thread_view {
+/// What a send does, from facts read off the registry and the terminal. A drawer must have the
+/// keyboard (its thread's chat otherwise has it); a terminal page is the page's only content.
+fn send_state(
+    from: SendFrom,
+    has_target: bool,
+    focused: bool,
+    what: SendWhat,
+    has_selection: bool,
+) -> SendSelection {
+    if !has_target {
         SendSelection::NoThread
-    } else if !focused {
+    } else if from == SendFrom::Drawer && !focused {
         SendSelection::NotFocused
-    } else if !has_selection {
+    } else if what == SendWhat::Selection && !has_selection {
         SendSelection::NoSelection
     } else {
         SendSelection::Ready
     }
 }
 
-/// The toast after a block went into `thread`'s draft: the lines, any masking and any cut.
-fn excerpt_toast(excerpt: &agent_core::terminal_excerpt::Excerpt, thread: &str) -> String {
+/// The most characters of a thread's title a menu entry shows.
+const SEND_MENU_TITLE_MAX: usize = 32;
+
+/// The two send entries of a terminal's menu: to "Thread" from a drawer, to the thread's title
+/// from a terminal page, and from a page with nowhere to send, a hint to open a thread first.
+/// A title's underscores are doubled, since a menu label reads one as a mnemonic, and control
+/// characters become spaces.
+fn send_menu_labels(from: Option<SendFrom>, target_title: Option<&str>) -> [String; 2] {
+    let to = match (from, target_title) {
+        (Some(SendFrom::Page), Some(title)) => {
+            let clean: String = title
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect();
+            let clean = clean.trim();
+            let shown: String = if clean.chars().count() > SEND_MENU_TITLE_MAX {
+                let cut: String = clean.chars().take(SEND_MENU_TITLE_MAX - 1).collect();
+                format!("{}…", cut.trim_end())
+            } else {
+                clean.to_owned()
+            };
+            if shown.is_empty() {
+                "Thread".to_owned()
+            } else {
+                format!("“{}”", shown.replace('_', "__"))
+            }
+        }
+        (Some(SendFrom::Drawer), _) => "Thread".to_owned(),
+        _ => "Thread (open a thread first)".to_owned(),
+    };
+    [
+        format!("Send Selection to {to}"),
+        format!("Send Last Output to {to}"),
+    ]
+}
+
+/// The last command's output in `terminal`, and whether no previous prompt was found (so it is
+/// the last rows instead). Reads at most [`agent_core::terminal_excerpt::LAST_OUTPUT_SCAN_ROWS`]
+/// rows above the cursor, on the main thread, as the quota watcher does.
+fn last_output_text(terminal: &Terminal) -> (String, bool) {
+    use agent_core::terminal_excerpt::{last_output_range, LAST_OUTPUT_SCAN_ROWS};
+    let (col, row) = terminal.cursor_position();
+    let columns = terminal.column_count();
+    let (cursor_line, _) = terminal.text_range_format(Format::Text, row, 0, row, columns);
+    let cursor_line = cursor_line.map(|t| t.to_string()).unwrap_or_default();
+    let cursor_line = cursor_line.trim_end_matches('\n');
+    let scan = i64::try_from(LAST_OUTPUT_SCAN_ROWS).unwrap_or(i64::MAX);
+    let start = row.saturating_sub(scan).max(0);
+    let above = if row > 0 {
+        terminal
+            .text_range_format(Format::Text, start, 0, row - 1, columns)
+            .0
+            .map(|t| t.to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let mut rows: Vec<&str> = above.lines().collect();
+    if start > 0 && !rows.is_empty() {
+        // The window may start inside a wrapped line: only whole lines go on to redaction.
+        rows.remove(0);
+    }
+    let found = last_output_range(&rows, cursor_line, usize::try_from(col).unwrap_or(0));
+    (rows[found.range].join("\n"), found.fell_back)
+}
+
+/// The toast after a block went into `thread`'s draft: the lines, any masking and any cut, and
+/// when the last output was not found by its prompt, that these are the terminal's last lines.
+fn excerpt_toast(
+    excerpt: &agent_core::terminal_excerpt::Excerpt,
+    thread: &str,
+    fell_back: bool,
+) -> String {
     let lines = if excerpt.lines == 1 {
         "1 line".to_owned()
     } else {
@@ -8156,7 +8402,15 @@ fn excerpt_toast(excerpt: &agent_core::terminal_excerpt::Excerpt, thread: &str) 
     } else {
         format!(" ({})", notes.join(", "))
     };
-    format!("Added {lines}{notes} to the draft of {thread}")
+    let fallback = if fell_back {
+        format!(
+            ". No earlier prompt was found, so these are the terminal's last {} lines",
+            agent_core::terminal_excerpt::LAST_OUTPUT_FALLBACK_LINES
+        )
+    } else {
+        String::new()
+    };
+    format!("Added {lines}{notes} to the draft of {thread}{fallback}")
 }
 
 #[cfg(test)]
@@ -8164,13 +8418,129 @@ mod tests {
     use super::*;
 
     #[test]
-    fn send_selection_resolves_by_owner_focus_and_selection() {
+    fn send_resolves_by_target_focus_and_selection() {
+        use SendFrom::{Drawer, Page};
         use SendSelection::*;
-        // A terminal page, or a thread not built yet, has no composer: whatever else is true.
-        assert_eq!(send_selection_state(false, true, true), NoThread);
-        assert_eq!(send_selection_state(true, false, true), NotFocused);
-        assert_eq!(send_selection_state(true, true, false), NoSelection);
-        assert_eq!(send_selection_state(true, true, true), Ready);
+        use SendWhat::{LastOutput, Selection};
+        // No composer to take it: disabled, whatever else is true.
+        for from in [Drawer, Page] {
+            for what in [Selection, LastOutput] {
+                assert_eq!(send_state(from, false, true, what, true), NoThread);
+            }
+        }
+        // A drawer must have the keyboard; a page is its own content.
+        assert_eq!(send_state(Drawer, true, false, Selection, true), NotFocused);
+        assert_eq!(
+            send_state(Drawer, true, false, LastOutput, false),
+            NotFocused
+        );
+        assert_eq!(send_state(Page, true, false, Selection, true), Ready);
+        // The last output needs no selection; the selection does.
+        assert_eq!(
+            send_state(Drawer, true, true, Selection, false),
+            NoSelection
+        );
+        assert_eq!(send_state(Page, true, false, Selection, false), NoSelection);
+        assert_eq!(send_state(Drawer, true, true, LastOutput, false), Ready);
+        assert_eq!(send_state(Page, true, false, LastOutput, false), Ready);
+        assert_eq!(send_state(Drawer, true, true, Selection, true), Ready);
+    }
+
+    #[test]
+    fn a_send_goes_to_the_drawers_thread_or_the_last_thread_shown() {
+        let thread = |key, built| SendTab {
+            key,
+            thread: true,
+            built,
+        };
+        let page = |key| SendTab {
+            key,
+            thread: false,
+            built: false,
+        };
+        let tabs = [thread(1, true), thread(2, true), page(3), thread(4, false)];
+        // A drawer sends to its own thread, whatever was shown last.
+        assert_eq!(send_target_key(1, Some(2), &tabs), Some(1));
+        assert_eq!(send_target_key(2, None, &tabs), Some(2));
+        // A thread not built yet has no composer.
+        assert_eq!(send_target_key(4, Some(1), &tabs), None);
+        // A terminal page sends to the thread last shown.
+        assert_eq!(send_target_key(3, Some(2), &tabs), Some(2));
+        assert_eq!(send_target_key(3, Some(1), &tabs), Some(1));
+        // No thread shown yet: nowhere to send, never a thread made for it.
+        assert_eq!(send_target_key(3, None, &tabs), None);
+        // The last thread was closed (or moved to another window): disabled, no other picked.
+        assert_eq!(send_target_key(3, Some(9), &tabs), None);
+        // A key that names a page, not a thread, is never a target.
+        assert_eq!(send_target_key(3, Some(3), &tabs), None);
+        // An unknown selected page sends nowhere.
+        assert_eq!(send_target_key(8, Some(1), &tabs), None);
+    }
+
+    /// The last output is read off the rows above the cursor of a real terminal, and says when
+    /// no prompt was found.
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    fn the_last_output_is_read_above_the_cursor() {
+        use crate::testutil::pump_until;
+        crate::testutil::gtk_init().unwrap();
+        crate::testutil::adw_init().unwrap();
+        crate::load_css();
+        let ctx = glib::MainContext::default();
+        let terminal = Terminal::new();
+        let window = gtk4::Window::new();
+        window.set_default_size(600, 400);
+        window.set_child(Some(&terminal));
+        window.present();
+        assert!(pump_until(&ctx, 5, || terminal.is_mapped()));
+        terminal.feed(b"$ ls\r\na b\r\n$ make\r\nerror: one\r\nerror: two\r\n$ ");
+        assert!(pump_until(&ctx, 5, || terminal.cursor_position() == (2, 5)));
+        assert_eq!(
+            last_output_text(&terminal),
+            ("$ make\nerror: one\nerror: two".to_owned(), false)
+        );
+        // Output with no prompt above it, and the cursor in column 0: the last rows, said so.
+        terminal.feed(b"\r\nplain\r\n");
+        assert!(pump_until(&ctx, 5, || terminal.cursor_position() == (0, 7)));
+        let (text, fell_back) = last_output_text(&terminal);
+        assert!(fell_back);
+        assert!(
+            text.starts_with("$ ls\n") && text.contains("error: two\n") && text.ends_with("plain"),
+            "{text:?}"
+        );
+        window.destroy();
+        crate::testutil::settle(&ctx);
+    }
+
+    #[test]
+    fn the_send_menu_names_its_target_or_says_to_open_a_thread() {
+        assert_eq!(
+            send_menu_labels(Some(SendFrom::Drawer), Some("Fix build")),
+            [
+                "Send Selection to Thread".to_owned(),
+                "Send Last Output to Thread".to_owned()
+            ]
+        );
+        assert_eq!(
+            send_menu_labels(Some(SendFrom::Page), Some("Fix build")),
+            [
+                "Send Selection to “Fix build”".to_owned(),
+                "Send Last Output to “Fix build”".to_owned()
+            ]
+        );
+        for from in [Some(SendFrom::Page), None] {
+            let [sel, last] = send_menu_labels(from, None);
+            assert_eq!(sel, "Send Selection to Thread (open a thread first)");
+            assert_eq!(last, "Send Last Output to Thread (open a thread first)");
+        }
+        // Underscores are not mnemonics, control characters are spaces, and a long title is cut.
+        let [sel, _] = send_menu_labels(Some(SendFrom::Page), Some("fix_the\nbuild"));
+        assert_eq!(sel, "Send Selection to “fix__the build”");
+        let long = "a".repeat(80);
+        let [sel, _] = send_menu_labels(Some(SendFrom::Page), Some(&long));
+        assert_eq!(sel, format!("Send Selection to “{}…”", "a".repeat(31)));
+        let [sel, _] = send_menu_labels(Some(SendFrom::Page), Some("  "));
+        assert_eq!(sel, "Send Selection to Thread");
     }
 
     #[test]
@@ -8184,27 +8554,35 @@ mod tests {
             masked: 0,
         };
         assert_eq!(
-            excerpt_toast(&e, "Fix build"),
+            excerpt_toast(&e, "Fix build", false),
             "Added 42 lines to the draft of Fix build"
         );
         e.masked = 1;
         e.truncated = true;
         e.trimmed_by = Some(Trim::Lines);
         assert_eq!(
-            excerpt_toast(&e, "T"),
+            excerpt_toast(&e, "T", false),
             "Added 42 lines (1 secret masked, trimmed to the last 200 lines) to the draft of T"
         );
         e.trimmed_by = Some(Trim::Chars);
         assert_eq!(
-            excerpt_toast(&e, "T"),
+            excerpt_toast(&e, "T", false),
             "Added 42 lines (1 secret masked, trimmed to the last 12,000 characters) to the draft of T"
         );
         e.lines = 1;
         e.masked = 3;
         e.truncated = false;
         assert_eq!(
-            excerpt_toast(&e, "T"),
+            excerpt_toast(&e, "T", false),
             "Added 1 line (3 secrets masked) to the draft of T"
+        );
+        // The last output found no prompt: the toast says what was taken instead.
+        e.lines = 60;
+        e.masked = 0;
+        assert_eq!(
+            excerpt_toast(&e, "T", true),
+            "Added 60 lines to the draft of T. No earlier prompt was found, so these are the \
+             terminal's last 60 lines"
         );
     }
 

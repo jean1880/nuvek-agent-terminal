@@ -241,9 +241,11 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
 
 - **Terminal drawer** (`` Ctrl+` ``): your `$SHELL` in the thread's folder, under the
   chat.
-- **Send Selection to Thread**: select text in the drawer, right-click, and it is added to
-  that thread's draft as a labelled, redacted, size-capped block. You review it before
-  sending; nothing goes on its own. Details in the [reference](reference.md).
+- **Send Selection / Last Output to Thread**: right-click a drawer or a terminal page and the
+  selected text, or the last command's output, is added to a thread's draft as a labelled,
+  redacted, size-capped block: a drawer's own thread, or from a terminal page the thread last
+  shown, which comes into view. You review it before sending; nothing goes on its own. Details
+  in the [reference](reference.md).
 - **Terminal threads**: **+** → New Terminal Thread runs any configured CLI in a full
   terminal page, for tools with no chat support (a script, the Gemini CLI). These have
   scrollback search (`Ctrl+Shift+F`), Sixel images and clickable links.

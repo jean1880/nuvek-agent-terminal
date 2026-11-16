@@ -722,6 +722,14 @@ impl ChatView {
             .is_some_and(|inner| !inner.composer.text().trim().is_empty())
     }
 
+    /// The composer's text (tests).
+    #[cfg(test)]
+    pub(crate) fn draft(&self) -> String {
+        self.inner()
+            .map(|inner| inner.composer.text().to_string())
+            .unwrap_or_default()
+    }
+
     /// Puts `text` in the composer, as typing it would (tests).
     #[cfg(test)]
     pub(crate) fn set_draft(&self, text: &str) {

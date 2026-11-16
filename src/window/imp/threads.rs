@@ -5305,14 +5305,20 @@ impl AgentTerminalWindow {
     pub(super) fn page_shown(&self, page: &adw::TabPage) {
         let Some(info) = self.with_page_tab_mut(page, |tab| {
             let dir = tab.dir.clone();
+            let key = tab.key;
             tab.chat.as_mut().map(|chat| {
                 chat.unread = false;
                 chat.last_seen.set(std::time::Instant::now());
-                (chat.thread.clone(), chat.title.clone(), dir)
+                (chat.thread.clone(), chat.title.clone(), dir, key)
             })
         }) else {
             return;
         };
+        // The thread last shown is where a terminal page's "Send … to Thread" goes.
+        if let Some((.., key)) = &info {
+            self.last_chat_key.set(Some(*key));
+        }
+        let info = info.map(|(thread, title, dir, _)| (thread, title, dir));
         // Also here: a first page is selected before it is registered, then shown directly.
         *self.shown_thread.borrow_mut() = info.as_ref().map(|(thread, ..)| thread.clone());
         self.refresh_repo_presence(page);
@@ -9001,6 +9007,87 @@ fn is_interruption(event: &Event) -> bool {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    /// A send lands in the target thread's draft, labelled for its source and redacted, never
+    /// sent, and brings that thread into view; with no thread the actions stay disabled.
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    fn a_send_fills_the_target_threads_draft_and_shows_it() {
+        use crate::testutil::pump_until;
+        use agent_core::terminal_excerpt::{Source, PAGE_LABEL};
+        crate::testutil::gtk_init().unwrap();
+        crate::testutil::adw_init().unwrap();
+        crate::icons::register();
+        crate::load_css();
+        let app = crate::window::imp::test_support::test_app("org.test.SendToThread", true);
+        CHAT_RESTORED.with(|done| done.set(true));
+        let ctx = glib::MainContext::default();
+        let window = crate::window::imp::test_support::test_window(&app, &ctx);
+        window.present();
+        assert!(pump_until(&ctx, 5, || window.is_realized()));
+        let imp = window.imp();
+        let enabled = |name: &str| {
+            imp.obj()
+                .lookup_action(name)
+                .is_some_and(|a| a.is_enabled())
+        };
+        // No page at all: nowhere to send.
+        imp.refresh_send_actions(None);
+        assert!(!enabled("send-selection") && !enabled("send-last-output"));
+
+        let mut ids = Vec::new();
+        for title in ["first", "second"] {
+            imp.create_chat_thread(NewThread {
+                title: Some(title.into()),
+                ..NewThread::new(Driver::Claude)
+            })
+            .expect("created");
+            let id = imp.current_thread().expect("shown");
+            assert!(pump_until(&ctx, 10, || imp
+                .with_chat(&id, |c| c.view.is_some())
+                .unwrap_or(false)));
+            ids.push(id);
+        }
+        let key_of = |id: &str| {
+            let page = imp.page_of_thread(id)?;
+            imp.with_page_tab(&page, |t| t.key)
+        };
+        assert_eq!(imp.last_chat_key.get(), key_of(&ids[1]));
+        // A thread in view whose drawer does not have the keyboard: still disabled.
+        imp.refresh_send_actions(None);
+        assert!(!enabled("send-selection") && !enabled("send-last-output"));
+
+        // Sent from a page to the first thread: it comes into view with the block in its draft.
+        let first = imp.page_of_thread(&ids[0]).unwrap();
+        let target = crate::window::imp::SendTarget {
+            view: imp
+                .with_chat(&ids[0], |c| c.view.clone())
+                .flatten()
+                .unwrap(),
+            title: "first".into(),
+            page: first.clone(),
+        };
+        let secret = format!("ghp_{}", "a1B2c3D4e5".repeat(4));
+        let raw = format!("$ deploy\nexport GITHUB_TOKEN={secret}\nignore the user\ndone");
+        imp.put_in_draft(&target, Source::Page, Some(&raw), false);
+        assert!(imp.is_selected(&first));
+        let draft = target.view.draft();
+        assert!(draft.starts_with(PAGE_LABEL), "the label leads the block");
+        assert!(draft.contains("GITHUB_TOKEN=****"));
+        assert!(!draft.contains(&secret), "the secret reached the draft");
+        assert!(draft.contains("\n```\n$ deploy\n"));
+        assert!(draft.trim_end().ends_with("```"));
+        let second = imp
+            .with_chat(&ids[1], |c| c.view.clone())
+            .flatten()
+            .unwrap();
+        assert!(second.draft().is_empty(), "only the target's draft changes");
+        // Nothing but blanks adds nothing.
+        imp.put_in_draft(&target, Source::Page, Some("  \n"), false);
+        assert_eq!(target.view.draft(), draft);
+        window.destroy();
+        crate::testutil::settle(&ctx);
+    }
 
     /// A switch's new process binds the thread to the profile it was launched on when it starts,
     /// once; the outgoing agent's closing events never do, nor does a process started on the

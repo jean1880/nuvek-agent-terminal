@@ -8,6 +8,7 @@
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use agent_core::commit_message::{self, MessageCheck};
+use agent_core::redact::redact;
 use agent_kit::commit::{CommitContext, CommitRequest};
 use gtk4::glib;
 use tracing::{info, warn};
@@ -98,13 +99,45 @@ pub(super) fn check_words(check: &MessageCheck) -> String {
     words.join(" ")
 }
 
-/// The two commands a commit runs, as the confirmation shows them.
-pub(super) fn shown_commands(request: &CommitRequest) -> String {
-    format!(
-        "{}\n{}",
-        commit_message::shown_command(&agent_kit::commit::add_args(&request.paths)),
-        commit_message::shown_command(&agent_kit::commit::commit_args(request))
-    )
+/// The two commands a commit runs, as the confirmation shows them, built from the very argument
+/// lists the commit runs. Everything but the message depends on the paths alone, so it is
+/// written once; each keystroke only quotes the message.
+pub(super) struct ShownCommit {
+    add: String,
+    before_message: String,
+    after_message: String,
+}
+
+impl ShownCommit {
+    pub(super) fn new(paths: &[String]) -> Self {
+        use agent_kit::commit::{add_args, commit_args, Expected, MESSAGE_ARG};
+        let args = commit_args(&CommitRequest {
+            message: String::new(),
+            paths: paths.to_vec(),
+            expected: Expected {
+                branch: None,
+                head: None,
+            },
+        });
+        Self {
+            add: commit_message::shown_command(&add_args(paths)),
+            before_message: commit_message::shown_command(&args[..MESSAGE_ARG]),
+            after_message: args[MESSAGE_ARG + 1..]
+                .iter()
+                .map(|arg| format!(" {}", commit_message::shown_arg(arg)))
+                .collect(),
+        }
+    }
+
+    pub(super) fn text(&self, message: &str) -> String {
+        format!(
+            "{}\n{} {}{}",
+            self.add,
+            self.before_message,
+            commit_message::shown_arg(message),
+            self.after_message
+        )
+    }
 }
 
 /// The commit dialog's parts the flow reads back.
@@ -191,7 +224,7 @@ pub(super) fn commit_dialog(
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
 
-    let paths = paths.to_vec();
+    let shown = ShownCommit::new(paths);
     let update = glib::clone!(
         #[weak]
         dialog,
@@ -206,10 +239,7 @@ pub(super) fn commit_dialog(
             let words = check_words(&found);
             check.set_visible(!words.is_empty());
             check.set_text(&words);
-            commands.set_text(&shown_commands(&CommitRequest {
-                message: text.to_string(),
-                paths: paths.clone(),
-            }));
+            commands.set_text(&shown.text(&text));
         }
     );
     update(&message.buffer());
@@ -240,8 +270,8 @@ fn text_of(view: &gtk4::TextView) -> String {
 
 impl AgentTerminalWindow {
     /// "Commit…" in the diff panel behind `panel_root`: reads the repository off the main thread,
-    /// then asks with the dialog. A half-done merge or rebase, or a repository that cannot be
-    /// read, is said instead.
+    /// then asks with the dialog. Too many files, a half-done merge or rebase, or a repository
+    /// that cannot be read, is said instead. The panel's button stays off until one or the other.
     pub(super) fn commit_from_panel(&self, panel_root: &gtk4::Box, ask: CommitAsk) {
         let Some((page, panel, view)) = self.tab_by_panel(panel_root, |t| {
             (
@@ -254,6 +284,11 @@ impl AgentTerminalWindow {
         };
         let parent = panel.dialog_parent();
         let paths = ask_paths(&ask);
+        if let Err(why) = agent_kit::commit::validate_paths(&paths) {
+            panel.set_preparing(false);
+            present_message_over(&parent, "Can't Commit These Files Here", &redact(&why));
+            return;
+        }
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
             let read = {
@@ -263,11 +298,12 @@ impl AgentTerminalWindow {
                 })
                 .await
             };
+            panel.set_preparing(false);
             let Some(obj) = obj.upgrade() else { return };
             let ctx = match read {
                 Ok(ctx) => ctx,
                 Err(why) => {
-                    present_message_over(&parent, "Could Not Read the Repository", &why);
+                    present_message_over(&parent, "Could Not Read the Repository", &redact(&why));
                     return;
                 }
             };
@@ -275,6 +311,7 @@ impl AgentTerminalWindow {
                 present_message_over(&parent, "Can't Commit Right Now", op.reason());
                 return;
             }
+            let expected = ctx.expected();
             let parts = commit_dialog(&ctx, &ask, &paths, &panel.commit_draft(), view.is_some());
             let message = parts.message.clone();
             parts.dialog.present(Some(&parent));
@@ -298,6 +335,7 @@ impl AgentTerminalWindow {
                         let request = CommitRequest {
                             message: text,
                             paths: paths.clone(),
+                            expected: expected.clone(),
                         };
                         obj.imp().confirm_and_commit(
                             &page,
@@ -391,6 +429,7 @@ pub(super) mod tests {
         CommitContext {
             toplevel: PathBuf::from("/r"),
             branch: branch.map(str::to_owned),
+            head: Some("abc".into()),
             unborn: false,
             on_default_branch: branch == Some("main"),
             in_progress: None,
@@ -427,15 +466,26 @@ pub(super) mod tests {
 
     #[test]
     fn the_shown_commands_are_the_ones_that_run() {
-        let request = CommitRequest {
-            message: "Fix it\n\nWhy.".into(),
-            paths: vec!["a.rs".into(), "-odd".into()],
-        };
-        assert_eq!(
-            shown_commands(&request),
-            "git --literal-pathspecs add -A -- a.rs -odd\n\
-             git --literal-pathspecs commit -m 'Fix it\n\nWhy.' -- a.rs -odd"
-        );
+        use agent_kit::commit::{add_args, commit_args};
+        let paths: Vec<String> = vec!["a.rs".into(), "-odd".into(), "it's *".into()];
+        let shown = ShownCommit::new(&paths);
+        for message in ["Fix it\n\nWhy.", "-n", "it's $HOME", ""] {
+            let request = CommitRequest {
+                message: message.into(),
+                paths: paths.clone(),
+                expected: ctx(None, &[]).expected(),
+            };
+            // Exactly the argument lists the commit runs, written as a shell would read them.
+            assert_eq!(
+                shown.text(message),
+                format!(
+                    "{}\n{}",
+                    commit_message::shown_command(&add_args(&request.paths)),
+                    commit_message::shown_command(&commit_args(&request))
+                ),
+                "{message:?}"
+            );
+        }
         assert!(check_words(&commit_message::check("ok")).is_empty());
         assert!(check_words(&commit_message::check("")).contains("Write a message"));
     }
@@ -453,7 +503,7 @@ pub(super) mod tests {
         assert!(parts.dialog.is_response_enabled("commit"));
         assert_eq!(
             parts.commands.text().as_str(),
-            "git --literal-pathspecs add -A -- a.rs\ngit --literal-pathspecs commit -m 'Fix it' -- a.rs"
+            ShownCommit::new(&paths).text("Fix it")
         );
         assert!(!parts.check.is_visible());
 

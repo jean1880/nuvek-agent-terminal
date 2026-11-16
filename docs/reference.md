@@ -308,9 +308,16 @@ git --literal-pathspecs commit -m '<message>' -- <files>
   `--no-verify`, `--amend`, `--allow-empty`, `-a` or `--no-gpg-sign`. Your own `user.name`
   and `user.email` are used; when one is missing git's message is shown and nothing is
   committed. A hook or signing step that waits for input cannot be answered from here and
-  fails (after two minutes at most); commit in the drawer's terminal instead.
+  fails (after two minutes at most, when git is stopped together with every hook and helper
+  it started); commit in the drawer's terminal instead.
 - **A failing hook** leaves HEAD where it was, with git's and the hook's own words shown
-  (anything secret-shaped in them masked). The ticked files stay staged.
+  (anything secret-shaped in them masked). The dialog then says that the ticked files stay
+  staged as they are on disk, replacing any part of them you had staged before.
+- **If the branch or its latest commit changed** while the dialog was open, nothing is
+  staged or committed, and you're asked to open Commit… again.
+- **A file replaced by a folder** is refused before anything is staged: staging that path
+  would take in everything in the folder. Commit that change in a terminal. A file whose name
+  is not valid UTF-8 cannot be ticked, for the same reason: it would name another file.
 - **On the default branch or a detached HEAD** the dialog warns you, and the commit is
   still yours to make.
 - **A message that looks like it holds a key or token** is committed exactly as typed, but

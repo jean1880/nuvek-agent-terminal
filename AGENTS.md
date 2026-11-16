@@ -221,7 +221,11 @@ Architectural mandates, standards, and workflows for this codebase.
   `-n`, `--amend`, `--allow-empty`, `-a` or `--no-gpg-sign`, and the checkpoint identity is
   never substituted. It refuses during a merge, rebase, cherry-pick or revert, warns (never
   refuses) on the default branch or a detached HEAD, and asks again before a message that
-  looks like a secret; failure text is redacted. `commit::tests` prove these, and that
+  looks like a secret; failure text is redacted. Before staging it refuses a branch or HEAD
+  that moved since the dialog read them (`Expected`), and a chosen path that is now a folder
+  and not a submodule (`add -A` would take the folder whole). Names not valid UTF-8 cannot be
+  ticked. Each step runs in a process group of its own (`exec::run_command_in_group`), killed
+  whole on timeout before git is reaped, so no hook or helper outlives it. `commit::tests` prove these, and that
   `refs/agent-terminal/*` is untouched. Every git call strips inherited
   `GIT_DIR`-style variables and sets `GIT_OPTIONAL_LOCKS=0`. Untracked files
   whose names look like secrets are never captured.

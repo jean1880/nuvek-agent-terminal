@@ -44,8 +44,13 @@ pub fn subject(message: &str) -> &str {
 }
 
 /// The prompt "Draft Message" puts in the thread's composer: it names the files and never pastes
-/// their diff, so it gives the agent nothing it cannot already read. The user reviews and sends it.
+/// their diff, so it gives the agent nothing it cannot already read. The user reviews and sends
+/// it. Redacted, as every injected text is: a file name can look like a credential.
 pub fn draft_prompt(paths: &[String]) -> String {
+    crate::redact::redact(&unredacted_prompt(paths))
+}
+
+fn unredacted_prompt(paths: &[String]) -> String {
     let named: Vec<&str> = paths
         .iter()
         .take(PROMPT_PATHS)
@@ -70,17 +75,22 @@ pub fn shown_command(args: &[String]) -> String {
     let mut line = String::from("git");
     for arg in args {
         line.push(' ');
-        let plain = !arg.is_empty()
-            && arg
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "-_./=:@+,".contains(c));
-        if plain {
-            line.push_str(arg);
-        } else {
-            line.push_str(&sh_quote(arg));
-        }
+        line.push_str(&shown_arg(arg));
     }
     line
+}
+
+/// One argument as [`shown_command`] writes it: as is when plainly safe, else single-quoted.
+pub fn shown_arg(arg: &str) -> String {
+    let plain = !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./=:@+,".contains(c));
+    if plain {
+        arg.to_owned()
+    } else {
+        sh_quote(arg)
+    }
 }
 
 #[cfg(test)]
@@ -125,6 +135,9 @@ mod tests {
         assert!(prompt.contains(&format!("f{}", PROMPT_PATHS - 1)));
         assert!(!prompt.contains(&format!("f{}", PROMPT_PATHS)));
         assert!(prompt.contains("and 3 more"));
+        let token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let prompt = draft_prompt(&[format!("{token}.txt")]);
+        assert!(!prompt.contains(token), "{prompt}");
     }
 
     #[test]

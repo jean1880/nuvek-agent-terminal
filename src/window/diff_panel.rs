@@ -293,6 +293,32 @@ pub fn commit_off(
     }
 }
 
+/// Whether a listed file can be ticked for a commit. A name that is not valid UTF-8 reached the
+/// panel decoded lossily, and would name some other file to git.
+pub fn committable(stat: &crate::diff::FileStat) -> bool {
+    agent_kit::commit::committable_path(&stat.path)
+        && stat
+            .old_path
+            .as_deref()
+            .is_none_or(agent_kit::commit::committable_path)
+}
+
+/// Why a row has no tick box that can be ticked.
+pub const UNCOMMITTABLE: &str =
+    "This file's name cannot be passed on exactly (it is not valid UTF-8): commit it in a terminal";
+
+/// The tick box of a row that cannot be committed from here: unticked, off, and saying why.
+fn uncommittable_tick() -> gtk4::CheckButton {
+    let check = gtk4::CheckButton::builder()
+        .valign(gtk4::Align::Center)
+        .active(false)
+        .sensitive(false)
+        .tooltip_text(UNCOMMITTABLE)
+        .build();
+    check.update_property(&[gtk4::accessible::Property::Label(UNCOMMITTABLE)]);
+    check
+}
+
 /// The words beside a usable Commit button.
 pub fn chosen_words(chosen: usize, listed: usize) -> String {
     match (chosen, listed) {
@@ -334,6 +360,9 @@ struct CommitBar {
 struct CommitData {
     /// A commit is running (`set_committing`).
     committing: Rc<Cell<bool>>,
+    /// "Commit…" was pressed and its dialog is not up yet (`set_preparing`): a second press
+    /// would open a second dialog.
+    preparing: Rc<Cell<bool>>,
     /// The files the Uncommitted diff on show lists (empty for another base, or none).
     listed: Rc<RefCell<Vec<CommitFile>>>,
     /// Paths the user unticked. Kept across refreshes, so a file that appears starts ticked
@@ -460,6 +489,7 @@ impl CommitBar {
             spinner,
             data: CommitData {
                 committing: Rc::new(Cell::new(false)),
+                preparing: Rc::new(Cell::new(false)),
                 listed: Rc::new(RefCell::new(Vec::new())),
                 unticked: Rc::new(RefCell::new(BTreeSet::new())),
                 ticks: Rc::new(RefCell::new(Vec::new())),
@@ -498,17 +528,22 @@ impl CommitBar {
             self.op.get(),
             pushing,
         );
-        self.bar.set_visible(!off.is_some_and(CommitOff::hides_bar));
+        let committing = self.committing.get();
+        // A commit running keeps its bar, whatever a refresh meanwhile found ("git is busy").
+        self.bar
+            .set_visible(committing || !off.is_some_and(CommitOff::hides_bar));
         let words = match off {
+            _ if committing => "Committing the chosen files…".to_owned(),
             Some(off) => off.reason().to_owned(),
             None => chosen_words(chosen, listed),
         };
         self.status.set_text(&words);
         self.button
-            .set_sensitive(off.is_none() && !self.committing.get());
+            .set_sensitive(off.is_none() && !committing && !self.preparing.get());
         self.syncing.set(true);
-        self.all
-            .set_visible(!matches!(off, Some(CommitOff::InProgress(_))));
+        self.all.set_visible(
+            !committing && !off.is_some_and(|o| matches!(o, CommitOff::InProgress(_))),
+        );
         self.all.set_active(listed > 0 && chosen == listed);
         self.all.set_inconsistent(chosen > 0 && chosen < listed);
         self.syncing.set(false);
@@ -799,17 +834,24 @@ impl DiffPanel {
             };
             handler(state);
         });
-        let bar = panel.commit.data.clone();
+        let weak = panel.commit.downgrade();
+        let pushing = Rc::clone(&panel.pr_pushing);
         panel.commit.button.connect_clicked(move |_| {
+            let Some(bar) = weak.upgrade() else {
+                return;
+            };
             let (Some(handler), Some(repo)) =
                 (bar.handler.borrow().clone(), bar.repo.borrow().clone())
             else {
                 return;
             };
             let files = bar.chosen();
-            if files.is_empty() || bar.committing.get() {
+            if files.is_empty() || bar.committing.get() || bar.preparing.get() {
                 return;
             }
+            // Off until the window has its dialog up (or has said why not): `set_preparing`.
+            bar.preparing.set(true);
+            bar.sync(pushing.get());
             let listed = bar.listed.borrow().len();
             handler(CommitAsk {
                 repo,
@@ -1069,6 +1111,13 @@ impl DiffPanel {
             self.pr_button
                 .set_sensitive(self.pr_state.borrow().is_some() && !self.pr_pushing.get());
         }
+        self.commit.sync(self.pr_pushing.get());
+    }
+
+    /// Ends (or starts) the wait between a "Commit…" press and its dialog being up: the button
+    /// is off meanwhile, so one press opens one dialog.
+    pub fn set_preparing(&self, preparing: bool) {
+        self.commit.preparing.set(preparing);
         self.commit.sync(self.pr_pushing.get());
     }
 
@@ -1483,7 +1532,7 @@ impl DiffPanel {
             self.files.append(&header);
             for index in files {
                 let stat = &diff.stats[index];
-                if self.commit.uncommitted.get() {
+                if self.commit.uncommitted.get() && committable(stat) {
                     self.commit.listed.borrow_mut().push(CommitFile {
                         path: stat.path.clone(),
                         old_path: stat.old_path.clone(),
@@ -1542,7 +1591,11 @@ impl DiffPanel {
             .build();
         let title = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         if self.commit.uncommitted.get() {
-            title.append(&self.commit_tick(&stat.path));
+            if committable(stat) {
+                title.append(&self.commit_tick(&stat.path));
+            } else {
+                title.append(&uncommittable_tick());
+            }
         }
         title.append(&label);
         // Binary files open fine in a tool that knows them; the button is for every row.
@@ -1786,6 +1839,12 @@ pub(crate) mod tests {
         assert_eq!(ask.listed, 4);
         let paths: Vec<&str> = ask.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(paths, ["a.rs", "c.rs", "d.rs"]);
+        // Until the window has its dialog up, the button is off: one press, one dialog.
+        assert_eq!(panel.commit_view().map(|v| v.1), Some(false));
+        panel.commit.button.emit_clicked();
+        assert!(asked.borrow().is_none(), "a second press opens nothing");
+        panel.set_preparing(false);
+        assert_eq!(panel.commit_view().map(|v| v.1), Some(true));
 
         // Untick everything with the bar's own box: Commit is off, and says why.
         panel.commit.all.set_active(true);
@@ -1816,8 +1875,32 @@ pub(crate) mod tests {
         assert_eq!(panel.commit_view().map(|v| (v.1, v.2)), Some((false, true)));
         panel.commit.button.emit_clicked();
         assert!(asked.borrow().is_none(), "no second commit while one runs");
+        // A refresh that finds git busy (the commit holds its lock) keeps the bar and its state.
+        let generation = panel.begin();
+        panel.show(
+            generation,
+            Ok(DiffOutcome::Unavailable("Git is busy".into())),
+        );
+        assert_eq!(
+            panel.commit_view(),
+            Some(("Committing the chosen files…".to_owned(), false, true))
+        );
         panel.set_committing(false);
+        let generation = panel.begin();
+        panel.show(generation, ready(&["a.rs"]));
+        panel.show_commit(generation, Some(repo.clone()), None);
         assert_eq!(panel.commit_view().map(|v| (v.1, v.2)), Some((true, false)));
+
+        // A name that is not valid UTF-8 (decoded with U+FFFD) has a tick box that is off, and
+        // is never handed over.
+        let generation = panel.begin();
+        panel.show(generation, ready(&["caf\u{FFFD}.rs", "a.rs"]));
+        panel.show_commit(generation, Some(repo.clone()), None);
+        assert_eq!(ticks(&panel), vec![("a.rs".to_owned(), true)]);
+        assert_eq!(
+            panel.commit_view().map(|v| v.0),
+            Some("1 file to commit".to_owned())
+        );
 
         // Clean, or another view: no bar.
         let generation = panel.begin();

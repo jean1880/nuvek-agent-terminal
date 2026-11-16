@@ -32,7 +32,8 @@
 //!   would wait for readers. It says whether the queue really drained ([`Shutdown`]).
 //!
 //! - **After open.** Before its first write the writer makes sure the full-text search index
-//!   exists ([`Store::ensure_search_fts`]): one read once it does.
+//!   exists ([`Store::ensure_search_fts`]) and that the store records where per-turn costs begin
+//!   ([`Store::ensure_spend_cost_marker`]): one read each once they do.
 //!
 //! [`StoreHandle`] is what the app holds: the writer plus a read connection of the calling
 //! thread, or (memory-only store, tests) one store that runs writes in place.
@@ -284,6 +285,7 @@ impl StoreWriter {
                     Ok(store) => {
                         let _ = ready_tx.send(Ok(()));
                         ensure_search_index(&store);
+                        mark_trusted_costs(&store);
                         run(store, rx, &thread_shared);
                     }
                     Err(e) => {
@@ -720,6 +722,16 @@ fn ensure_search_index(store: &Store) {
             );
         }
         Err(e) => tracing::error!(error = %e, "could not create the full-text search index"),
+    }
+}
+
+/// Records where per-turn costs begin ([`Store::ensure_spend_cost_marker`]), before any queued
+/// write: an event stored from here on was stored by a build that records each turn's own cost.
+/// Once recorded this is one read. A failure is logged and stops nothing: the next start tries
+/// again, and until then every stored cost is counted.
+fn mark_trusted_costs(store: &Store) {
+    if let Err(e) = store.ensure_spend_cost_marker() {
+        tracing::error!(error = %e, "could not record where per-turn costs begin");
     }
 }
 
@@ -1429,6 +1441,15 @@ mod tests {
         assert_eq!(
             handle.reader().ensure_search_fts().expect("a read"),
             SearchIndex::Ready
+        );
+        // Where per-turn costs begin is recorded too: an empty store trusts every cost.
+        assert_eq!(
+            handle
+                .reader()
+                .meta(crate::store::SPEND_COST_FROM_KEY)
+                .expect("read")
+                .as_deref(),
+            Some("0")
         );
     }
 

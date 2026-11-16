@@ -4978,6 +4978,78 @@ mod tests {
         assert_eq!(left, 0);
     }
 
+    /// Deleting a delegation root folds its own turns and its workers' (their hidden threads go
+    /// with it) into the spending ledger: the workers' under the root's folder, marked delegated,
+    /// with their own profile.
+    #[test]
+    fn a_deleted_root_keeps_its_workers_cost_under_its_folder() {
+        use agent_core::event::{Envelope, Event, TurnState};
+        let f = fx();
+        let child = spawn(&f.s, &f.root.worker, "k1").worker.expect("w");
+        let backing =
+            f.s.delegation_worker(child.as_str())
+                .expect("q")
+                .expect("row")
+                .backing_thread_id
+                .expect("t");
+        f.s.conn
+            .execute(
+                "UPDATE threads SET cwd = '/elsewhere' WHERE id = ?1",
+                rusqlite::params![backing],
+            )
+            .expect("the worker in a folder of its own");
+        let turn = |thread: &str, driver: &str, cost: f64| {
+            let pt = f.s.add_provider_thread(thread, driver, "m").expect("pt");
+            let env = Envelope::new(Event::TurnCompleted {
+                state: TurnState::Completed,
+                usage: None,
+                cost_usd: Some(cost),
+                error: None,
+            });
+            f.s.append_event(thread, Some(&pt), &env).expect("turn");
+        };
+        turn(&f.root_thread, "claude", 1.0);
+        turn(&backing, "codex", 0.25);
+        let day = crate::store::local_day;
+        let before = f.s.spend_rows(0, &day).expect("rows");
+        f.s.close_and_revoke_for_delete(&f.root_thread)
+            .expect("s")
+            .expect("revoked");
+        f.s.delete_thread(&f.root_thread).expect("deleted");
+        let after = f.s.spend_rows(0, &day).expect("rows");
+        let costs = |d: &crate::store::SpendData| {
+            let mut c: Vec<(String, String, bool, f64)> = d
+                .rows
+                .iter()
+                .map(|r| {
+                    (
+                        r.folder.clone(),
+                        r.profile_id.clone(),
+                        r.delegated,
+                        r.cost_usd,
+                    )
+                })
+                .collect();
+            c.sort_by(|a, b| a.3.total_cmp(&b.3));
+            c
+        };
+        let expected = vec![
+            ("/w".to_owned(), "codex-default".to_owned(), true, 0.25),
+            ("/w".to_owned(), String::new(), false, 1.0),
+        ];
+        assert_eq!(
+            costs(&before),
+            expected,
+            "live, the worker counts under its root"
+        );
+        assert_eq!(costs(&after), expected, "and still does once deleted");
+        let live: i64 =
+            f.s.conn
+                .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+                .expect("count");
+        assert_eq!(live, 0, "no turn is counted twice");
+    }
+
     #[test]
     fn a_child_with_a_reply_chain_past_the_cascade_limit_is_deleted() {
         let f = fx();

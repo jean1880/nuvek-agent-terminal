@@ -126,6 +126,18 @@ Architectural mandates, standards, and workflows for this codebase.
     time, and is stopped before the writer shuts down (`close_store_writer`). A delegated
     worker's hidden backing thread is never indexed, listed as pending or found. `Store::search` (queries compiled by `agent_core::search_query`, which no input can
     make fail) is a read, run only through `store_job`.
+    `store/spend.rs` is the spending history: `Store::spend_rows` reads live threads' completed
+    turns through `events_turns` (the query repeats its WHERE term with the literal
+    `'turn_completed'`) plus `spend_ledger`, attributing a delegated worker's turns to its root
+    thread's folder; it is a read, run only through `store_job`, after `ensure_spend_index`
+    through the writer. `delete_thread` folds the deleted threads' turns (hidden worker threads
+    included, read before their delegation rows go) into `spend_ledger` by each turn's own local
+    day (`local_day`), inside the delete, so totals never drop and no turn is counted twice. The
+    writer records `spend_cost_from_seq` once at its start (`ensure_spend_cost_marker`): a cost
+    stored at or below it was Claude's running total, so it is withheld (tokens only), never
+    summed. The sums are `agent_core::spend` (`report`, `Period`/`Group` with guarded `ALL`
+    arrays); kinds of spend (metered, list price, unknown billing) are never added together,
+    and a turn with no cost is "not reported", never $0.
   - The app (`src/`): `config.rs` (persisted settings + migration, re-exporting
     `SessionFormat`; per-agent defaults live on the profiles), `theme.rs`
     (colour schemes, infallible `RGBA::new`), `utils.rs` (detection and
@@ -140,7 +152,8 @@ Architectural mandates, standards, and workflows for this codebase.
     150 ms it shows the closing screen, drawn by `window/imp/pack_animation.rs`),
     `window/imp/agents_prefs.rs` (Settings → Agents; `agents_prefs/local_context.rs` and
     `local_mcp.rs` are the Local Instructions and Tools group: instruction files, budgets, MCP
-    server definitions, discovery and the Codex import), `window/imp/remote.rs` (Settings →
+    server definitions, discovery and the Codex import), `window/imp/spending.rs` (the Spending dialog: reads and sums in one `store_job`, then
+    only draws), `window/imp/remote.rs` (Settings →
     General → Remote Machines and the New Terminal Thread on Another Machine dialog),
     `window/imp/threads/message_search.rs` (the sidebar's "In Messages" section, behind the
     toggle beside its search entry: `Store::search` through `store_job` after typing pauses, a

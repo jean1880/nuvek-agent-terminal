@@ -408,7 +408,8 @@ fn commit_with(
         }
     };
     step(add_args(&request.paths))?;
-    step(commit_args(request)).map_err(|why| format!("{why}\n\n{STILL_STAGED}"))?;
+    let unborn = repo.head.is_none();
+    step(commit_args(request)).map_err(|why| format!("{why}\n\n{}", still_staged(unborn)))?;
     let short = git_raw(
         top,
         ["rev-parse", "--short", "HEAD"],
@@ -420,10 +421,20 @@ fn commit_with(
     Ok(Committed { short })
 }
 
-/// Added to a failure after the files were staged: what the user's index now holds.
-pub const STILL_STAGED: &str = "Nothing was committed. The chosen files stay staged as they are \
-     on disk, replacing any part of them you had staged before; `git restore --staged -- <file>` \
-     unstages one.";
+/// Added to a failure after the files were staged: what the user's index now holds, and how to
+/// unstage one. Before the first commit there is no HEAD to restore from, so `git restore
+/// --staged` fails there; `git rm --cached` unstages and leaves the file on disk.
+pub fn still_staged(unborn: bool) -> String {
+    let unstage = if unborn {
+        "git rm --cached -- <file>"
+    } else {
+        "git restore --staged -- <file>"
+    };
+    format!(
+        "Nothing was committed. The chosen files stay staged as they are on disk, replacing any \
+         part of them you had staged before; `{unstage}` unstages one and leaves it on disk."
+    )
+}
 
 /// What the user is told when a step fails: git's (and a hook's) own words, masked, with what a
 /// timeout means.
@@ -736,11 +747,40 @@ mod tests {
             let err = commit(dir, "Will fail", &["a.txt"]).unwrap_err();
             assert!(err.contains("lint failed: fix a.txt"), "{err}");
             assert!(
-                err.ends_with(STILL_STAGED),
+                err.ends_with(&still_staged(false)),
                 "the dialog says what is staged: {err}"
             );
+            assert!(err.contains("`git restore --staged -- <file>`"), "{err}");
             assert_eq!(sh(dir, &["rev-parse", "HEAD"]), before);
             assert_eq!(staged(dir), "a.txt");
+            // The command it gives works, and leaves the file on disk.
+            sh(dir, &["restore", "--staged", "--", "a.txt"]);
+            assert_eq!(staged(dir), "");
+            assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "changed\n");
+        }
+
+        #[test]
+        fn a_failing_first_commit_gives_the_unstage_command_that_works_there() {
+            if !git_or_skip() {
+                return;
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
+            sh(dir, &["init", "-q"]);
+            identity(dir);
+            hook(dir, "pre-commit", "exit 1");
+            fs::write(dir.join("first.txt"), "1\n").unwrap();
+            let err = commit(dir, "First", &["first.txt"]).unwrap_err();
+            assert!(err.ends_with(&still_staged(true)), "{err}");
+            assert!(err.contains("`git rm --cached -- <file>`"), "{err}");
+            assert_eq!(staged(dir), "first.txt");
+            // `git restore --staged` has no HEAD to restore from here; `git rm --cached` works.
+            assert!(!sh_output(dir, &["restore", "--staged", "--", "first.txt"])
+                .status
+                .success());
+            sh(dir, &["rm", "-q", "--cached", "--", "first.txt"]);
+            assert_eq!(staged(dir), "");
+            assert_eq!(fs::read_to_string(dir.join("first.txt")).unwrap(), "1\n");
         }
 
         #[test]

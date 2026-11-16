@@ -312,12 +312,17 @@ git --literal-pathspecs commit -m '<message>' -- <files>
   it started); commit in the drawer's terminal instead.
 - **A failing hook** leaves HEAD where it was, with git's and the hook's own words shown
   (anything secret-shaped in them masked). The dialog then says that the ticked files stay
-  staged as they are on disk, replacing any part of them you had staged before.
+  staged as they are on disk, replacing any part of them you had staged before, and how to
+  unstage one: `git restore --staged -- <file>`, or `git rm --cached -- <file>` before the
+  first commit. Either leaves the file on disk.
 - **If the branch or its latest commit changed** while the dialog was open, nothing is
   staged or committed, and you're asked to open Commit… again.
 - **A file replaced by a folder** is refused before anything is staged: staging that path
   would take in everything in the folder. Commit that change in a terminal. A file whose name
   is not valid UTF-8 cannot be ticked, for the same reason: it would name another file.
+- **These checks are made just before staging.** A change another program makes while git
+  itself is staging and committing (moving HEAD, or swapping a file for a folder) is not
+  detected, just as when you run git by hand.
 - **On the default branch or a detached HEAD** the dialog warns you, and the commit is
   still yours to make.
 - **A message that looks like it holds a key or token** is committed exactly as typed, but

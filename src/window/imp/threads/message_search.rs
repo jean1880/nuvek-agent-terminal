@@ -43,6 +43,8 @@ pub(in crate::window::imp) struct MessageSearch {
     generation: Cell<u64>,
     /// The search waiting for typing to pause (or the next refresh while indexing).
     timer: RefCell<Option<glib::SourceId>>,
+    /// A refresh while indexing was due with the sidebar hidden: it runs when it shows again.
+    paused: Cell<bool>,
 }
 
 impl MessageSearch {
@@ -95,6 +97,7 @@ impl MessageSearch {
             rows: RefCell::new(Vec::new()),
             generation: Cell::new(0),
             timer: RefCell::new(None),
+            paused: Cell::new(false),
         }
     }
 
@@ -104,6 +107,7 @@ impl MessageSearch {
         if let Some(timer) = self.timer.borrow_mut().take() {
             timer.remove();
         }
+        self.paused.set(false);
         let next = self.generation.get().wrapping_add(1);
         self.generation.set(next);
         next
@@ -118,15 +122,41 @@ impl MessageSearch {
         self.section.set_visible(false);
     }
 
+    /// The (thread, item) of the hit row holding the keyboard focus, if one does.
+    fn focused_hit(&self) -> Option<(String, String)> {
+        let focus = self.list.root().and_then(|r| r.focus())?;
+        let mut at = Some(focus);
+        while let Some(widget) = at {
+            if let Some(row) = widget.downcast_ref::<gtk4::ListBoxRow>() {
+                if row.parent().as_ref() == Some(self.list.upcast_ref::<gtk4::Widget>()) {
+                    return self.hit_at(row.index()).map(|hit| (hit.thread, hit.item));
+                }
+            }
+            at = widget.parent();
+        }
+        None
+    }
+
     /// Lists `rows` (what was `found`), with the status line for it. The same hits as shown
-    /// already (a refresh while indexing that found nothing new) keep their widgets, so a
-    /// keyboard user's place in the list is kept.
+    /// already (a refresh while indexing that found nothing new) keep their widgets; new ones
+    /// keep the keyboard focus on the hit that had it, when it is still listed.
     fn show(&self, found: Found, rows: Vec<MessageHitRow>, indexing: usize, now: i64, home: &str) {
         let unchanged = self.list.is_visible() && *self.rows.borrow() == rows;
         if !unchanged {
+            let focused = self.focused_hit();
             clear_rows(&self.list);
             for row in &rows {
                 self.list.append(&hit_row(row, now, home));
+            }
+            let refocus = focused.and_then(|(thread, item)| {
+                rows.iter()
+                    .position(|r| r.thread == thread && r.item == item)
+            });
+            if let Some(row) = refocus
+                .and_then(|i| i32::try_from(i).ok())
+                .and_then(|i| self.list.row_at_index(i))
+            {
+                row.grab_focus();
             }
         }
         self.list.set_visible(!rows.is_empty());
@@ -148,13 +178,14 @@ impl MessageSearch {
     }
 }
 
-/// Threads the start-up backfill has still to index (0 once it has ended, or never started).
-fn search_indexing() -> usize {
-    SEARCH_BACKFILL.with(|b| {
-        b.borrow()
-            .as_ref()
-            .filter(|b| !b.finished())
-            .map_or(0, agent_kit::search_backfill::Backfill::remaining)
+/// The start-up backfill as the section reads it: whether it is still to come or running (its
+/// delayed start not yet fired, or not finished), and how many threads it has still to index
+/// (0 too while it is still listing them).
+fn backfill_activity() -> (bool, usize) {
+    let waiting = SEARCH_BACKFILL_TIMER.with(|t| t.borrow().is_some());
+    SEARCH_BACKFILL.with(|b| match b.borrow().as_ref() {
+        Some(b) if !b.finished() => (true, b.remaining()),
+        _ => (waiting, 0),
     })
 }
 
@@ -219,12 +250,20 @@ fn hit_row(hit: &MessageHitRow, now: i64, home: &str) -> gtk4::ListBoxRow {
     row
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The last note [`jump_to_hit`] put over a transcript (tests).
+    static LAST_NOTE: RefCell<Option<&'static str>> = const { RefCell::new(None) };
+}
+
 /// Brings `item` into view in `view`, or says (over the transcript) that it is older than the
 /// history the thread shows.
 pub(super) fn jump_to_hit(view: &ChatView, item: &str) {
     if view.show_item(item) {
         return;
     }
+    #[cfg(test)]
+    LAST_NOTE.with(|n| *n.borrow_mut() = Some(OLDER_THAN_SHOWN));
     if let Some(overlay) = view.toast_overlay() {
         overlay.add_toast(
             adw::Toast::builder()
@@ -243,6 +282,22 @@ impl AgentTerminalWindow {
             #[weak]
             obj,
             move |_| obj.imp().message_search_changed()
+        ));
+        // A refresh held while the sidebar was hidden runs once it shows again.
+        search.section.connect_map(glib::clone!(
+            #[weak]
+            obj,
+            move |_| {
+                let imp = obj.imp();
+                let paused = imp
+                    .sidebar
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|s| s.messages.paused.get());
+                if paused {
+                    imp.message_search_changed();
+                }
+            }
         ));
         search.list.connect_row_activated(glib::clone!(
             #[weak]
@@ -330,27 +385,47 @@ impl AgentTerminalWindow {
         if search.generation.get() != generation {
             return false;
         }
-        let (found, rows) = match found {
-            Some(Ok(SearchResults::Hits(hits))) => {
-                let rows =
-                    message_hit_rows(hits, self.summaries.borrow().as_deref().unwrap_or_default());
+        let threads = self.summaries.borrow().clone();
+        let (found, rows) = match (found, threads) {
+            // Nothing could be named yet: the load runs the search again when it lands.
+            (Some(Ok(SearchResults::Hits(_))), None) => (Found::Loading, Vec::new()),
+            (Some(Ok(SearchResults::Hits(hits))), Some(threads)) => {
+                let rows = message_hit_rows(hits, &threads);
                 (Found::Found(rows.len()), rows)
             }
-            Some(Ok(SearchResults::Unavailable)) => (Found::Unavailable, Vec::new()),
-            Some(Err(e)) => {
+            (Some(Ok(SearchResults::Unavailable)), _) => (Found::Unavailable, Vec::new()),
+            (Some(Err(e)), _) => {
                 warn!("Cannot search messages: {e}");
                 (Found::Unavailable, Vec::new())
             }
-            None => (Found::Unavailable, Vec::new()),
+            (None, _) => (Found::Unavailable, Vec::new()),
         };
-        let indexing = search_indexing();
+        let (backfilling, indexing) = backfill_activity();
         let home = env::var("HOME").unwrap_or_default();
         search.show(found, rows, indexing, sidebar_now(), &home);
-        // What the backfill indexes meanwhile shows up without another keystroke.
-        if indexing > 0 && found != Found::Unavailable {
-            self.arm_message_search(MESSAGE_SEARCH_REFRESH_MS);
+        // What the backfill indexes meanwhile (or once its delayed start fires) shows up without
+        // another keystroke; not while the sidebar is hidden, which resumes it when shown.
+        if backfilling && matches!(found, Found::Found(_)) {
+            if sidebar.root.is_mapped() {
+                self.arm_message_search(MESSAGE_SEARCH_REFRESH_MS);
+            } else {
+                search.paused.set(true);
+            }
         }
         true
+    }
+
+    /// The thread list was loaded again (a thread made, renamed, archived or deleted): an
+    /// active search runs again, so its hits name what is there now.
+    pub(super) fn message_search_threads_changed(&self) {
+        let active = self
+            .sidebar
+            .borrow()
+            .as_ref()
+            .is_some_and(|s| s.messages.section.is_visible());
+        if active {
+            self.message_search_changed();
+        }
     }
 
     /// Opens (or shows) `thread` and brings its item `item` into view: at once when the thread
@@ -365,6 +440,23 @@ impl AgentTerminalWindow {
             owner.present();
             return;
         }
+        // Only a thread in the loaded list: opening one that is not would read the store here,
+        // on the main thread, and a hit on a thread deleted since has nothing to open.
+        let listed = self
+            .summaries
+            .borrow()
+            .as_ref()
+            .is_some_and(|list| list.iter().any(|s| s.id == thread));
+        if !listed {
+            self.show_toast("This thread is no longer there");
+            self.message_search_changed();
+            return;
+        }
+        // Set before the page is shown: showing a built thread takes it in place of its move to
+        // the newest messages (`ensure_built`), and a build takes it once it has replayed.
+        if let Some(page) = self.page_of_thread(thread) {
+            self.with_page_chat_mut(&page, |chat| chat.pending_jump = Some(item.to_owned()));
+        }
         let Some(page) = self.open_thread(thread, true) else {
             return;
         };
@@ -374,18 +466,19 @@ impl AgentTerminalWindow {
                 split.set_show_sidebar(false);
             }
         }
-        let item = item.to_owned();
-        let built = self
+        let leftover = self
             .with_page_chat_mut(&page, |chat| match &chat.view {
-                Some(view) => Some(view.clone()),
+                // Built, and showing it did not take the jump: made here, after anything
+                // showing the page queued.
+                Some(view) => chat.pending_jump.take().map(|item| (view.clone(), item)),
+                // Not built yet (a page made just now): its build takes it.
                 None => {
-                    chat.pending_jump = Some(item.clone());
+                    chat.pending_jump = Some(item.to_owned());
                     None
                 }
             })
             .flatten();
-        if let Some(view) = built {
-            // After the move to the newest messages that showing the page queued.
+        if let Some((view, item)) = leftover {
             glib::idle_add_local_once(move || jump_to_hit(&view, &item));
         }
     }
@@ -583,6 +676,30 @@ pub(in crate::window::imp) mod tests {
             "a built thread needs no pending jump"
         );
 
+        // Before the thread list has loaded, hits cannot be named: loading, never "no match";
+        // the load runs the search again.
+        let saved = imp.summaries.borrow_mut().take();
+        let current = search.generation.get();
+        assert!(imp.message_search_landed(current, Some(Ok(SearchResults::Hits(Vec::new())))));
+        assert_eq!(search.status.text(), "Loading threads…");
+        *imp.summaries.borrow_mut() = saved;
+        imp.reload_summaries();
+        pump_until("the load ran the search again", || {
+            search.rows.borrow().len() == 1
+        });
+
+        // A thread deleted while its hit is listed: the reload takes the hit away.
+        imp.close_row_now(&RowKey::Thread(thread.clone()));
+        pump_until("the page closed", || imp.page_of_thread(&thread).is_none());
+        store.delete_thread(&thread).expect("delete");
+        imp.reload_summaries();
+        pump_until("the deleted thread's hit left", || {
+            search.rows.borrow().is_empty() && search.status.is_visible()
+        });
+        // And its hit, had it stayed, opens nothing.
+        imp.open_message_hit(&thread, "r1");
+        assert!(imp.page_of_thread(&thread).is_none());
+
         // Turning the toggle off hides the section.
         search.toggle.set_active(false);
         assert!(!search.section.is_visible());
@@ -591,11 +708,135 @@ pub(in crate::window::imp) mod tests {
             Some(PLACEHOLDER_THREADS)
         );
         sidebar.search.set_text("");
-        imp.close_row_now(&RowKey::Thread(thread.clone()));
-        pump_until("the page closed", || imp.page_of_thread(&thread).is_none());
-        store.delete_thread(&thread).expect("delete");
         store.delete_thread(&archived).expect("delete");
         imp.reload_summaries();
+    }
+
+    /// On a shown window: a hit in a long thread (more items than the first paint builds) opens
+    /// the thread on that message, never at the bottom; early and recent hits alike, whether
+    /// the thread was built by the open or already was. An item the view does not hold says so.
+    pub(crate) fn hits_open_at_their_message(window: &crate::window::AgentTerminalWindow) {
+        // Three times the rows a transcript's first paint builds (30).
+        const FIRST_PAINT: usize = 30;
+        let imp = window.imp();
+        let ctx = glib::MainContext::default();
+        let store = app_store();
+        let dir = tempfile::tempdir().expect("tmp");
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let thread = store
+            .create_thread(&cwd, Some("Long thread"))
+            .expect("thread");
+        let replies = FIRST_PAINT * 3;
+        for n in 0..replies {
+            let body = format!(
+                "reply number{n}\n\n{}",
+                "A line of the reply.\n\n".repeat(10)
+            );
+            reply(&store, &thread, &format!("r{n}"), &body);
+        }
+        store
+            .index_thread(&thread, agent_kit::store::INDEX_BUDGET)
+            .expect("index");
+        let other = store.create_thread(&cwd, Some("Another")).expect("thread");
+        reply(&store, &other, "o1", "something else");
+        imp.reload_summaries();
+        pump_until("the threads are listed", || {
+            imp.summaries.borrow().as_ref().is_some_and(|l| {
+                l.iter().any(|s| s.id == thread) && l.iter().any(|s| s.id == other)
+            })
+        });
+
+        let lands = |item: &str| {
+            let item = item.to_owned();
+            let landed = crate::testutil::pump_until(&ctx, 10, || {
+                let Some(view) = imp
+                    .page_of_thread(&thread)
+                    .and_then(|p| imp.with_page_chat(&p, |c| c.view.clone()))
+                    .flatten()
+                else {
+                    return false;
+                };
+                view.pending_jump_id().is_none() && view.item_in_view(&item).0
+            });
+            // A few more frames: nothing (a late move to the end) takes it away again.
+            for _ in 0..20 {
+                ctx.iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let view = imp
+                .page_of_thread(&thread)
+                .and_then(|p| imp.with_page_chat(&p, |c| c.view.clone()))
+                .flatten()
+                .expect("the thread's view");
+            let (shown, at_end) = view.item_in_view(&item);
+            assert!(landed && shown, "{item} is on screen");
+            at_end
+        };
+
+        let close = || {
+            imp.close_row_now(&RowKey::Thread(thread.clone()));
+            pump_until("the page closed", || imp.page_of_thread(&thread).is_none());
+        };
+        // Several replies below it, each taller than a line: at the bottom it would be off
+        // screen above.
+        let recent = format!("r{}", replies - 8);
+
+        // Left for another thread while it builds: the jump waits, off screen, and showing the
+        // thread again shows the hit, not the newest messages.
+        imp.open_message_hit(&thread, &recent);
+        imp.open_thread(&other, true);
+        pump_until("the hit's thread was built out of sight", || {
+            imp.page_of_thread(&thread)
+                .and_then(|p| imp.with_page_chat(&p, |c| c.view.is_some()))
+                .unwrap_or(false)
+        });
+        for _ in 0..20 {
+            ctx.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        imp.open_thread(&thread, true);
+        assert!(
+            !lands(&recent),
+            "a hit built out of sight is shown when its thread is"
+        );
+        close();
+
+        // Built by the open: a recent hit (among the rows the first paint builds, which have
+        // no place yet when the jump is asked for), then an early one (outside them).
+        imp.open_message_hit(&thread, &recent);
+        assert!(
+            !lands(&recent),
+            "a recent hit in a fresh build is not left at the bottom"
+        );
+        close();
+        imp.open_message_hit(&thread, "r2");
+        assert!(!lands("r2"), "an early hit is not shown at the bottom");
+        // Already built: the recent one, then an early one again.
+        imp.open_message_hit(&thread, &recent);
+        assert!(!lands(&recent), "a recent hit on a built thread");
+        imp.open_message_hit(&thread, "r5");
+        assert!(
+            !lands("r5"),
+            "an early hit on a built thread is not at the bottom"
+        );
+
+        // An item the view does not hold (older than it replays) is said to be so.
+        LAST_NOTE.with(|n| n.borrow_mut().take());
+        imp.open_message_hit(&thread, "not-replayed");
+        pump_until("the note was shown", || {
+            LAST_NOTE.with(|n| *n.borrow()) == Some(OLDER_THAN_SHOWN)
+        });
+
+        // A thread no longer in the list is refused, never opened.
+        imp.open_message_hit("deleted-thread", "r1");
+        assert!(imp.page_of_thread("deleted-thread").is_none());
+        close();
+        imp.close_row_now(&RowKey::Thread(other.clone()));
+        pump_until("the other page closed", || {
+            imp.page_of_thread(&other).is_none()
+        });
+        store.delete_thread(&thread).expect("delete");
+        store.delete_thread(&other).expect("delete");
     }
 
     #[test]

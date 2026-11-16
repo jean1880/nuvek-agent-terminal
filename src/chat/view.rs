@@ -651,6 +651,22 @@ impl ChatView {
         held
     }
 
+    /// Whether a jump to an item ([`Self::show_item`]) is still waiting for its row to be laid
+    /// out (its page was not on screen yet, say): showing the thread then keeps it.
+    pub fn jump_pending(&self) -> bool {
+        self.inner()
+            .is_some_and(|inner| inner.transcript.jump_pending())
+    }
+
+    /// Whether item `id`'s row is on screen in the transcript, and whether the transcript is
+    /// at its newest end (tests).
+    #[cfg(test)]
+    pub(crate) fn item_in_view(&self, id: &str) -> (bool, bool) {
+        self.inner().map_or((false, false), |inner| {
+            (inner.transcript.row_in_view(id), inner.transcript.at_end())
+        })
+    }
+
     /// The item a jump the transcript has not placed yet goes to (tests).
     #[cfg(test)]
     pub(crate) fn pending_jump_id(&self) -> Option<String> {

@@ -145,8 +145,10 @@ Architectural mandates, standards, and workflows for this codebase.
     `window/imp/threads/message_search.rs` (the sidebar's "In Messages" section, behind the
     toggle beside its search entry: `Store::search` through `store_job` after typing pauses, a
     generation counter so only the newest search draws, "Search is unavailable" never shown as
-    no match, and a hit opened through `open_thread` then `ChatView::show_item`, or held as the
-    page's `pending_jump` until its build has replayed it; its snippets go through
+    no match, a hit opened only for a thread in the loaded list, held as the page's
+    `pending_jump`, which showing the page (`ensure_built`, in place of its move to the newest
+    messages) or its build takes and passes to `ChatView::show_item`; a jump waits for its row
+    to be laid out, never falling back to the end; its snippets go through
     `sidebar_model::snippet_markup`, which escapes every character and makes only the match
     markers bold), `window/sidebar_model.rs` (pure sidebar logic), `window/diff_panel.rs` (the
     diff panel's widgets and its "Open a PR" bar; it pops out into its own window, keeping its

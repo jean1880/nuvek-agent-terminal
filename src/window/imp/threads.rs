@@ -4133,6 +4133,7 @@ impl AgentTerminalWindow {
             });
             *self.summaries.borrow_mut() = Some(list);
             self.refresh_sidebar();
+            self.message_search_threads_changed();
             return;
         }
         if self.summaries_loading.replace(true) {
@@ -4161,6 +4162,7 @@ impl AgentTerminalWindow {
                 }
                 imp.summaries_loading.set(false);
                 imp.refresh_sidebar();
+                imp.message_search_threads_changed();
                 return;
             }
         });
@@ -5845,9 +5847,17 @@ impl AgentTerminalWindow {
             if chat.view.is_some() || chat.building {
                 if let Some(view) = &chat.view {
                     let view = view.clone();
+                    // A message-search hit being opened goes to its message instead.
+                    let jump = chat.pending_jump.take();
                     // Selecting a thread shows its newest messages, wherever it was left.
                     glib::idle_add_local_once(move || {
-                        view.scroll_to_end();
+                        match jump {
+                            Some(item) => message_search::jump_to_hit(&view, &item),
+                            // A hit's jump asked for while the page was out of sight is still
+                            // waiting for its row: it, not the newest messages, is shown.
+                            None if view.jump_pending() => {}
+                            None => view.scroll_to_end(),
+                        }
                         view.focus_composer();
                     });
                 }
@@ -5945,6 +5955,7 @@ impl AgentTerminalWindow {
         self.with_page_chat_mut(page, |chat| {
             chat.building = false;
             chat.pending_switch = None;
+            chat.pending_jump = None;
             // Not loading any more: the skeleton holds still until a retry.
             if let Some(skeleton) = chat.holder.first_child() {
                 loading::settle(&skeleton);

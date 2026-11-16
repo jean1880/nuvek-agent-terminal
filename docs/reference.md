@@ -170,8 +170,10 @@ from the entry) adds what the threads said to the search. It has no shortcut of 
   formatting. A thread's folder is the match's tooltip.
 - **Its states:** "No messages match." when nothing does; "Indexing N threads…" while earlier
   threads are still being indexed, when the matches may be partial (the search runs again
-  every few seconds until the indexing is done); "Search is unavailable" when the index
-  cannot be read, never "no match".
+  every few seconds until the indexing is done, and pauses while the sidebar is hidden);
+  "Loading threads…" before the thread list has loaded; "Search is unavailable" when the
+  index cannot be read, never "no match". The matches follow the thread list: a thread
+  deleted or renamed meanwhile is searched for again.
 - **Opening a match** opens its thread (or brings it forward, in whichever window has it)
   and scrolls to the message, opening the card it is in. A thread shows its newest 50,000
   events; a match older than that opens the thread with a note that the message is further

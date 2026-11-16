@@ -260,6 +260,9 @@ pub enum MessageSearch {
     /// The index could not be read (no full-text search in this SQLite, or the read failed):
     /// never shown as "no match".
     Unavailable,
+    /// The thread list has not loaded yet, so no hit can be named: never "no match" either.
+    /// The search runs again once it has.
+    Loading,
     /// This many hits (0: no match).
     Found(usize),
 }
@@ -280,6 +283,7 @@ pub fn message_status(found: MessageSearch, indexing: usize) -> Option<String> {
         (MessageSearch::Unavailable, _) => {
             Some("Search is unavailable: the message index could not be read.".to_owned())
         }
+        (MessageSearch::Loading, _) => Some("Loading threads…".to_owned()),
         (MessageSearch::Found(0), None) => Some("No messages match.".to_owned()),
         (MessageSearch::Found(0), Some(building)) => {
             Some(format!("No messages match yet. {building}"))
@@ -2561,6 +2565,10 @@ mod message_search_tests {
             Some("Indexing 12 threads… These results may be partial.")
         );
         assert_eq!(message_status(MessageSearch::Found(3), 0), None);
+        assert_eq!(
+            message_status(MessageSearch::Loading, 2).as_deref(),
+            Some("Loading threads…")
+        );
     }
 
     fn summary(id: &str, title: &str) -> ThreadSummary {

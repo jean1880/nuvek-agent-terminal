@@ -504,7 +504,11 @@ impl TranscriptView {
                     // layout after it places the row.
                     !self.laid_out_at_value(&adj) || w.height() == 0
                 }
-                _ => {
+                // Built but not on screen yet: the page it is on is not shown, or the row came
+                // after the last layout. Placed once it is mapped; on a shown transcript the
+                // wait still ends with `jump_gives_up`, so a row that stays hidden holds nothing.
+                Some(_) => true,
+                None => {
                     self.clear_jump();
                     self.reveal_after_jump.set(false);
                     false
@@ -882,13 +886,10 @@ impl TranscriptView {
             }
         }
         // Built already: placed by `settle`, once, from bounds read after a layout (bounds read
-        // now can predate the layout the last change of content or scroll position queued).
-        let placed = self
-            .rows
-            .borrow()
-            .get(id)
-            .is_some_and(|row| row.widget().compute_bounds(&self.scroller).is_some());
-        if placed {
+        // now can predate the layout the last change of content or scroll position queued). A
+        // row built a moment ago (a thread just replayed, or one whose page is not on screen)
+        // has no allocation yet: the jump waits for it, never falling back to the end.
+        if self.rows.borrow().contains_key(id) {
             self.stick.set(false);
             self.anchor.set(None);
             self.restore_to.set(None);
@@ -2012,10 +2013,27 @@ impl TranscriptView {
         self.settle();
     }
 
-    /// Whether a jump is waiting to be placed (tests).
-    #[cfg(test)]
+    /// Whether a jump is waiting to be placed.
     pub fn jump_pending(&self) -> bool {
         self.jump_to.borrow().is_some()
+    }
+
+    /// Whether the row for `id` is built and its top is within the visible area (tests).
+    #[cfg(test)]
+    pub fn row_in_view(&self, id: &str) -> bool {
+        let page = self.scroller.vadjustment().page_size();
+        self.rows
+            .borrow()
+            .get(id)
+            .and_then(|row| row.widget().compute_bounds(&self.scroller))
+            .is_some_and(|b| f64::from(b.y()) >= -1.0 && f64::from(b.y()) < page)
+    }
+
+    /// Whether the view is at the newest end of the transcript (tests).
+    #[cfg(test)]
+    pub fn at_end(&self) -> bool {
+        let adj = self.scroller.vadjustment();
+        adj.value() >= adj.upper() - adj.page_size() - 1.0
     }
 
     /// The item a jump waiting to be placed goes to (tests).

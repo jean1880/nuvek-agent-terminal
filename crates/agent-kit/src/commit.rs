@@ -1,7 +1,8 @@
 //! A commit the user confirms in the diff panel: the chosen paths, committed in one step through
 //! the user's own git, so their hooks, signing and identity apply.
 //!
-//! This is the one place the app writes the user's index or HEAD. It never uses a private index
+//! With the merge back from a worktree (`merge`), this is one of the two places the app writes
+//! the user's index or HEAD. It never uses a private index
 //! (`GIT_INDEX_FILE`) and shares nothing with checkpoints: `snapshot_tree`, `take_checkpoint` and
 //! `restore` are untouched, and so is `refs/agent-terminal/*`.
 //!

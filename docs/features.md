@@ -242,6 +242,9 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   See [Undoing a turn](reference.md#undoing-a-turn).
 - **Worktrees** (`Ctrl+Shift+G`): a new branch in its own checkout, so an agent can
   work without touching yours. See [Worktree threads](reference.md#worktree-threads).
+  When the work is done, **Merge into <base>…** in its Changes panel merges the branch back
+  after showing the exact command, refusing anything half-done, and undoes a merge that stops
+  part-way. The branch is always kept. See [Merging back](reference.md#merging-back).
 
 ### Terminals
 

@@ -12847,6 +12847,7 @@ pub(super) mod tests {
             path: tree.path().to_path_buf(),
             branch: "feat/x".into(),
             main_toplevel: tree.path().join("main"),
+            base: Some("main".into()),
         };
         let dir = tree.path().to_string_lossy().into_owned();
         assert!(
@@ -13028,6 +13029,7 @@ pub(super) mod tests {
             path: "/w/tree".into(),
             branch: "feat/x".into(),
             main_toplevel: "/w/main".into(),
+            base: Some("main".into()),
         };
         let spec = DiscardedThread {
             driver: Driver::Codex,
@@ -13669,6 +13671,7 @@ pub(super) mod tests {
             path: tree.path().to_path_buf(),
             branch: "feat/y".into(),
             main_toplevel: tree.path().join("main"),
+            base: Some("main".into()),
         };
         let handle = app_handle();
         let ids = NewThreadIds {

@@ -612,6 +612,43 @@ git worktree remove <path>      # refuses if it has changes
 git branch -d <branch>          # refuses if it is unmerged
 ```
 
+#### Merging back
+
+A worktree thread's Changes panel has a **Merge into <base>…** bar, where `<base>` is the branch
+the worktree was started from (a worktree started from a commit or a tag, or made by an older
+version, merges into whatever branch the main checkout has checked out). Pressing it reads,
+without changing anything:
+
+- how many commits each side has that the other does not;
+- whether git predicts a conflict (`git merge-tree`, which needs git 2.38 or newer; an older git
+  says it cannot tell, never "no conflicts");
+- which of your merge hooks will run;
+- every open tab in the main checkout.
+
+The dialog then shows the exact command and the folder it runs in:
+
+```bash
+# in the main checkout
+git merge --no-ff --no-edit -m "Merge branch '<branch>'" -- refs/heads/<branch>
+```
+
+**Merge** runs it off the main thread. It is refused, with the reason, when:
+
+- the worktree has uncommitted or untracked files (commit them first; nothing is committed or
+  stashed for you);
+- the main checkout has uncommitted changes, is on another branch or a detached HEAD, or is in the
+  middle of a merge, rebase, cherry-pick or revert;
+- a conflict is predicted, or the base already has every commit of the branch;
+- this thread, or any tab open in the main checkout, is working (an idle one is only a warning);
+- either branch moved since the dialog opened (open it again to see what it would do now).
+
+The merge always makes a merge commit, is never forced and skips no hook. If it stops part-way (a
+conflict git did not predict, a hook that refuses, a timeout after two minutes) it is undone with
+`git merge --abort`, and the message says the main checkout is as it was; if that undo fails, it
+says the merge is left in progress and how to finish or abort it. The branch and the worktree are
+always kept: afterwards the dialog gives the command that deletes the branch, for you to run once
+the worktree is removed, and **Close Thread** closes the thread, which offers **Remove** as usual.
+
 
 ### Theme
 

@@ -4820,6 +4820,7 @@ mod tests {
             path: PathBuf::from("/r/.main.worktrees/feat-x"),
             branch: "feat/x".into(),
             main_toplevel: PathBuf::from("/r/main"),
+            base: Some("main".into()),
         }
     }
 

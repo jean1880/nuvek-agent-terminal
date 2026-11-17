@@ -2371,15 +2371,32 @@ pub(crate) mod tests {
         }
         assert_eq!(panel.review.drafts().len(), 2);
         discard.emit_clicked();
-        let dialog = window.visible_dialog().expect("Discard asks first");
-        // Closing it (Escape, a press outside) answers Cancel.
-        dialog.close();
-        assert!(crate::testutil::pump_until(&ctx, 5, || window
+        let alert = window
             .visible_dialog()
-            .is_none()));
-        assert_eq!(panel.review.drafts().len(), 2);
+            .and_downcast::<adw::AlertDialog>()
+            .expect("Discard asks first");
+        let answered = Rc::new(RefCell::new(None::<String>));
+        let seen = Rc::clone(&answered);
+        alert.connect_response(None, move |_, response| {
+            *seen.borrow_mut() = Some(response.to_owned());
+        });
+        // Closing it (Escape, a press outside) answers its close response, Cancel. The answer is
+        // what proves it: the window's visible dialog only clears once the closing animation has
+        // run, after the answer.
+        let first = alert.clone().upcast::<adw::Dialog>();
+        assert!(crate::testutil::pump_until_dialog_open(&ctx, &first, 5));
+        assert!(alert.close());
+        assert!(crate::testutil::pump_until(&ctx, 5, || answered
+            .borrow()
+            .is_some()));
+        assert_eq!(answered.borrow().as_deref(), Some("cancel"));
+        assert_eq!(panel.review.drafts().len(), 2, "Cancel keeps the comments");
         discard.emit_clicked();
-        let dialog = window.visible_dialog().expect("asked again");
+        let dialog = window
+            .visible_dialog()
+            .filter(|d| *d != first)
+            .expect("asked again, with a new alert");
+        assert!(crate::testutil::pump_until_dialog_open(&ctx, &dialog, 5));
         dialog.emit_by_name::<()>("response", &[&"discard"]);
         assert!(panel.review.drafts().is_empty());
         dialog.force_close();

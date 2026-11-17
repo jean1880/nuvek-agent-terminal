@@ -4,6 +4,8 @@
 //!
 //! Nothing here runs git; `crate::git` does, and the window renders.
 
+pub use agent_core::review::{Located, Side};
+
 /// What the panel compares against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DiffBase {
@@ -33,6 +35,16 @@ impl DiffBase {
             DiffBase::TargetBranch => "Target branch",
             DiffBase::LastTurn => "Last turn",
             DiffBase::ThisTab => "This tab",
+        }
+    }
+
+    /// The name a review draft keeps for the base it was made on (`review_drafts.diff_base`).
+    pub fn key(self) -> &'static str {
+        match self {
+            DiffBase::Uncommitted => "uncommitted",
+            DiffBase::TargetBranch => "target_branch",
+            DiffBase::LastTurn => "last_turn",
+            DiffBase::ThisTab => "this_tab",
         }
     }
 }
@@ -398,6 +410,172 @@ pub fn new_line_at(chunk: &str, row: usize) -> Option<u32> {
 pub fn first_hunk_line(diff: &str) -> Option<u32> {
     let row = classify(diff).iter().position(|k| *k == LineKind::Hunk)?;
     new_line_at(diff, row)
+}
+
+/// The lines of a file's diff a review comment is on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentSpan {
+    pub side: Side,
+    /// 1-based, inclusive, on `side`.
+    pub start: u32,
+    pub end: u32,
+    /// The first and last row of the chunk the comment covers (both changed or context lines).
+    pub rows: (usize, usize),
+    /// The changed and context lines in those rows, prefix kept, in order.
+    pub quoted: Vec<String>,
+}
+
+/// Why rows of a diff cannot take a comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpanRefusal {
+    /// Only file, meta or hunk header lines were chosen.
+    NoLines,
+    /// More changed or context lines than one comment may quote.
+    TooMany(usize),
+}
+
+impl SpanRefusal {
+    /// What the panel says.
+    pub fn reason(self) -> String {
+        match self {
+            SpanRefusal::NoLines => "Select changed or context lines".to_owned(),
+            SpanRefusal::TooMany(n) => format!(
+                "Select at most {} lines for one comment ({n} chosen)",
+                agent_core::review::SELECTION_MAX_LINES
+            ),
+        }
+    }
+}
+
+/// Whether a row is a changed or context line with a place in a file.
+fn is_content(r: &LineRef) -> bool {
+    matches!(
+        r.kind,
+        LineKind::Added | LineKind::Removed | LineKind::Context
+    ) && (r.old.is_some() || r.new.is_some())
+}
+
+/// The side and range of the content rows `rows` of `refs`: the new side when any of them has a
+/// new line (context or added), else the old side (only removed lines).
+fn span_of(refs: &[LineRef], rows: &[usize]) -> Option<(Side, u32, u32)> {
+    let numbers = |pick: fn(&LineRef) -> Option<u32>| -> Option<(u32, u32)> {
+        let mut it = rows.iter().filter_map(|&i| pick(&refs[i]));
+        let first = it.next()?;
+        Some(it.fold((first, first), |(lo, hi), n| (lo.min(n), hi.max(n))))
+    };
+    if let Some((start, end)) = numbers(|r| r.new) {
+        return Some((Side::New, start, end));
+    }
+    numbers(|r| r.old).map(|(start, end)| (Side::Old, start, end))
+}
+
+/// The comment rows `first_row..=last_row` of `chunk` (a file's diff, as [`split_by_file`] cuts
+/// it) would make: file, meta and hunk rows are left out, and the range is counted on the new
+/// side unless only removed lines were chosen. Rows past the end are ignored.
+pub fn comment_span(
+    chunk: &str,
+    first_row: usize,
+    last_row: usize,
+) -> Result<CommentSpan, SpanRefusal> {
+    let refs = parse_hunks(chunk);
+    let (lo, hi) = (first_row.min(last_row), first_row.max(last_row));
+    let rows: Vec<usize> = (lo..=hi.min(refs.len().saturating_sub(1)))
+        .filter(|&i| i < refs.len() && is_content(&refs[i]))
+        .collect();
+    let (Some(&first), Some(&last)) = (rows.first(), rows.last()) else {
+        return Err(SpanRefusal::NoLines);
+    };
+    if rows.len() > agent_core::review::SELECTION_MAX_LINES {
+        return Err(SpanRefusal::TooMany(rows.len()));
+    }
+    let (side, start, end) = span_of(&refs, &rows).ok_or(SpanRefusal::NoLines)?;
+    let lines: Vec<&str> = chunk.lines().collect();
+    Ok(CommentSpan {
+        side,
+        start,
+        end,
+        rows: (first, last),
+        quoted: rows.iter().map(|&i| lines[i].to_owned()).collect(),
+    })
+}
+
+/// Where a comment made earlier sits in `chunk`, the file's diff as it is now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Anchor {
+    pub located: Located,
+    /// Its span in this diff, unless it is [`Located::Gone`].
+    pub span: Option<CommentSpan>,
+}
+
+/// Finds a comment's `quoted` lines in `chunk`. A run of content rows whose lines are exactly
+/// `quoted` (a quote is compared as kept: redacted, so a row is also compared redacted) and
+/// whose range is the recorded `side`, `start` and `end` is [`Located::Exact`]. Else one such
+/// run elsewhere, and only one, is [`Located::Moved`] with its own range. None, or several
+/// (which one was meant cannot be told), is [`Located::Gone`]: never a guess.
+pub fn anchor(chunk: &str, side: Side, start: u32, end: u32, quoted: &[String]) -> Anchor {
+    let gone = Anchor {
+        located: Located::Gone,
+        span: None,
+    };
+    if quoted.is_empty() {
+        return gone;
+    }
+    let refs = parse_hunks(chunk);
+    let lines: Vec<&str> = chunk.lines().collect();
+    let content: Vec<usize> = (0..refs.len().min(lines.len()))
+        .filter(|&i| is_content(&refs[i]))
+        .collect();
+    // Each row redacted at most once, and only when its text is not already the quote's.
+    let mut redacted: Vec<Option<String>> = vec![None; lines.len()];
+    let mut same = |row: usize, want: &str| {
+        let line = lines[row];
+        if line == want {
+            return true;
+        }
+        redacted[row]
+            .get_or_insert_with(|| agent_core::redact::redact(line))
+            .as_str()
+            == want
+    };
+    let mut found: Vec<&[usize]> = Vec::new();
+    if content.len() >= quoted.len() {
+        for window in content.windows(quoted.len()) {
+            if window
+                .iter()
+                .zip(quoted)
+                .all(|(&row, want)| same(row, want))
+            {
+                found.push(window);
+            }
+        }
+    }
+    let to_span = |rows: &[usize]| -> Option<CommentSpan> {
+        let (side, start, end) = span_of(&refs, rows)?;
+        Some(CommentSpan {
+            side,
+            start,
+            end,
+            rows: (*rows.first()?, *rows.last()?),
+            quoted: quoted.to_vec(),
+        })
+    };
+    let spans: Vec<CommentSpan> = found.iter().filter_map(|rows| to_span(rows)).collect();
+    if let Some(exact) = spans
+        .iter()
+        .find(|s| s.side == side && s.start == start && s.end == end)
+    {
+        return Anchor {
+            located: Located::Exact,
+            span: Some(exact.clone()),
+        };
+    }
+    match spans.as_slice() {
+        [only] => Anchor {
+            located: Located::Moved,
+            span: Some(only.clone()),
+        },
+        _ => gone,
+    }
 }
 
 /// At most this much diff text is put in the panel.
@@ -1021,5 +1199,113 @@ mod tests {
     #[test]
     fn new_line_at_a_stray_row_after_a_hunk_takes_the_preceding_line() {
         assert_eq!(new_line_at("@@ -0,0 +4 @@\n+a\n stray\n", 2), Some(4));
+    }
+
+    /// A file's diff: header rows 0-3, hunk row 4, then rows 5-9.
+    const CHUNK: &str = "diff --git a/f.rs b/f.rs\nindex 1..2 100644\n--- a/f.rs\n+++ b/f.rs\n\
+                         @@ -10,4 +10,3 @@\n keep\n-old one\n-old two\n+new one\n tail\n";
+
+    fn quoted(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_comment_span_counts_on_the_new_side_unless_only_removed_lines_are_chosen() {
+        // Context, removed and added: the new side, from the context and added lines.
+        let span = comment_span(CHUNK, 5, 8).expect("lines");
+        assert_eq!((span.side, span.start, span.end), (Side::New, 10, 11));
+        assert_eq!(span.rows, (5, 8));
+        assert_eq!(
+            span.quoted,
+            quoted(&[" keep", "-old one", "-old two", "+new one"])
+        );
+        // Only removed lines: the old side.
+        let span = comment_span(CHUNK, 6, 7).expect("lines");
+        assert_eq!((span.side, span.start, span.end), (Side::Old, 11, 12));
+        // Rows given backwards are the same rows.
+        assert_eq!(comment_span(CHUNK, 7, 6), comment_span(CHUNK, 6, 7));
+        // Header rows around the lines are left out of the span.
+        let span = comment_span(CHUNK, 0, 5).expect("lines");
+        assert_eq!((span.start, span.end, span.rows), (10, 10, (5, 5)));
+        assert_eq!(span.quoted, quoted(&[" keep"]));
+        // A row past the end is ignored.
+        assert_eq!(comment_span(CHUNK, 9, 400).map(|s| s.rows), Ok((9, 9)));
+    }
+
+    #[test]
+    fn header_rows_alone_take_no_comment_and_a_huge_selection_is_refused() {
+        assert_eq!(comment_span(CHUNK, 0, 4), Err(SpanRefusal::NoLines));
+        assert_eq!(comment_span("", 0, 0), Err(SpanRefusal::NoLines));
+        let big: String = std::iter::once("@@ -0,0 +1,401 @@\n".to_owned())
+            .chain((0..401).map(|i| format!("+l{i}\n")))
+            .collect();
+        assert_eq!(comment_span(&big, 0, 401), Err(SpanRefusal::TooMany(401)));
+        assert!(comment_span(&big, 0, 400).is_ok());
+        assert!(SpanRefusal::TooMany(401).reason().contains("401"));
+        assert_eq!(
+            SpanRefusal::NoLines.reason(),
+            "Select changed or context lines"
+        );
+    }
+
+    #[test]
+    fn a_comment_is_anchored_where_it_was_moved_or_gone() {
+        let span = comment_span(CHUNK, 6, 8).expect("lines");
+        let here = anchor(CHUNK, span.side, span.start, span.end, &span.quoted);
+        assert_eq!(here.located, Located::Exact);
+        assert_eq!(here.span.as_ref().map(|s| s.rows), Some((6, 8)));
+
+        // Three lines inserted above: the same lines, found once, renumbered.
+        let shifted = CHUNK.replace("@@ -10,4 +10,3 @@", "@@ -13,4 +13,3 @@");
+        let moved = anchor(&shifted, span.side, span.start, span.end, &span.quoted);
+        assert_eq!(moved.located, Located::Moved);
+        let s = moved.span.expect("span");
+        assert_eq!(
+            (s.side, s.start, s.end, s.rows),
+            (Side::New, 14, 14, (6, 8))
+        );
+
+        // The lines changed: gone, with no span.
+        let changed = CHUNK.replace("+new one", "+newer one");
+        let gone = anchor(&changed, span.side, span.start, span.end, &span.quoted);
+        assert_eq!(
+            gone,
+            Anchor {
+                located: Located::Gone,
+                span: None
+            }
+        );
+
+        // Found twice, and neither at its recorded lines: which was meant cannot be told.
+        let twice = "@@ -1,2 +1,2 @@\n a\n+x\n@@ -20,2 +20,2 @@\n a\n+x\n";
+        let q = quoted(&[" a", "+x"]);
+        assert_eq!(anchor(twice, Side::New, 5, 6, &q).located, Located::Gone);
+        // Twice, but once at its recorded lines: that one.
+        let at = anchor(twice, Side::New, 20, 21, &q);
+        assert_eq!(at.located, Located::Exact);
+        assert_eq!(at.span.map(|s| s.rows), Some((4, 5)));
+        assert_eq!(anchor(CHUNK, Side::New, 1, 1, &[]).located, Located::Gone);
+    }
+
+    #[test]
+    fn a_redacted_quote_still_finds_its_line() {
+        let token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let chunk = format!("@@ -1 +1 @@\n+let t = \"{token}\";\n");
+        let kept = vec![agent_core::redact::redact(&format!(
+            "+let t = \"{token}\";"
+        ))];
+        assert_ne!(
+            kept[0],
+            format!("+let t = \"{token}\";"),
+            "the quote was masked"
+        );
+        let found = anchor(&chunk, Side::New, 1, 1, &kept);
+        assert_eq!(found.located, Located::Exact);
+    }
+
+    #[test]
+    fn every_base_has_its_own_key() {
+        let keys: std::collections::HashSet<_> = DiffBase::ALL.iter().map(|b| b.key()).collect();
+        assert_eq!(keys.len(), DiffBase::ALL.len());
     }
 }

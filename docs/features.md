@@ -227,8 +227,11 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   links in a reply (`src/a.rs:12`) open in the editor too; a file outside the thread's folder
   is asked about first, every time.
   Tick the files you want and **Commit…** them through your own git, hooks and signing
-  included, after seeing the exact commands. See [Diff panel](reference.md#diff-panel)
-  and [Committing](reference.md#committing).
+  included, after seeing the exact commands. Select lines and **Comment** on them
+  (`Ctrl+Alt+M`), keep collecting notes while you read, then **Send Review** to the thread's
+  agent as one message with exact paths, lines and quoted code. See
+  [Diff panel](reference.md#diff-panel), [Committing](reference.md#committing) and
+  [Reviewing a diff](reference.md#reviewing-a-diff).
 - **Undo a turn**, which saves the current state first, so the undo can itself be undone.
   See [Undoing a turn](reference.md#undoing-a-turn).
 - **Worktrees** (`Ctrl+Shift+G`): a new branch in its own checkout, so an agent can

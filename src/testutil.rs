@@ -76,6 +76,30 @@ pub fn pump_until(ctx: &glib::MainContext, secs: u64, mut cond: impl FnMut() -> 
     true
 }
 
+/// Iterates `ctx` until `dialog` is open as the user sees it, so a `close()` then does what
+/// Escape or a press outside would: mapped, then two of its frames drawn. libadwaita 1.5 opens a
+/// dialog's sheet on the second frame after it is mapped, and a `close()` before that does
+/// nothing at all (no `closed`, no response, and the sheet still opens); later versions open it
+/// at once. Bounded by the dialog's own frame clock, with `secs` as the timeout (false).
+pub fn pump_until_dialog_open(ctx: &glib::MainContext, dialog: &adw::Dialog, secs: u64) -> bool {
+    use gtk4::prelude::*;
+    use std::{cell::Cell, rc::Rc};
+    if !pump_until(ctx, secs, || dialog.is_mapped()) {
+        return false;
+    }
+    // Added after the dialog's own (it adds one when mapped), and every frame runs them all, so
+    // this one's second frame is at least the dialog's second.
+    let frames = Rc::new(Cell::new(0u32));
+    let seen = Rc::clone(&frames);
+    let tick = dialog.add_tick_callback(move |_, _| {
+        seen.set(seen.get() + 1);
+        glib::ControlFlow::Continue
+    });
+    let open = pump_until(ctx, secs, || frames.get() >= 2);
+    tick.remove();
+    open
+}
+
 /// The kept warnings: `Some` while a [`GtkWarningCapture`] is alive, `None` otherwise. The flag
 /// and the buffer are one value under one lock, so checking and appending cannot interleave
 /// with a guard starting, draining or dropping.

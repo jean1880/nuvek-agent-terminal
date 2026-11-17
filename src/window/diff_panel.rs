@@ -23,9 +23,11 @@ use agent_kit::commit::InProgress;
 use agent_kit::github::{PrOutcome, PrState, PushState};
 use gtk4::glib;
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::rc::Rc;
+
+mod review;
 
 /// Narrowest width the panel remembers being dragged to.
 pub const MIN_WIDTH: i32 = 220;
@@ -633,6 +635,8 @@ pub struct DiffPanel {
     pr_handler: Rc<RefCell<Option<PrHandler>>>,
     /// The "Commit…" bar under the diff, above the PR bar.
     commit: CommitBar,
+    /// The comments on diff lines and the review bar under the diff, above the commit bar.
+    review: review::Review,
     base: gtk4::DropDown,
     /// The base the refresh in flight was started with.
     begun_base: Rc<Cell<DiffBase>>,
@@ -815,6 +819,18 @@ impl DiffPanel {
         content.append(&header);
         content.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
         content.append(&stack);
+        let review_bar = review::bar();
+        let review_separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        review_bar
+            .region
+            .bind_property("visible", &review_separator, "visible")
+            .sync_create()
+            .build();
+        content.append(&review_separator);
+        content.append(&review_bar.region);
+        let shared_colours = Rc::new(RefCell::new(colours.clone()));
+        let review = review::Review::new(&review_bar, Rc::clone(&shared_colours));
+        let (review_send, review_discard) = (review_bar.send.clone(), review_bar.discard.clone());
         let commit = CommitBar::new();
         let commit_separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
         commit
@@ -855,6 +871,7 @@ impl DiffPanel {
             pr_state: Rc::new(RefCell::new(None)),
             pr_handler: Rc::new(RefCell::new(None)),
             commit,
+            review,
             base,
             begun_base: Rc::new(Cell::new(DiffBase::default())),
             summary,
@@ -869,7 +886,7 @@ impl DiffPanel {
             chunks: Rc::new(RefCell::new(Vec::new())),
             file_rows: Rc::new(Cell::new(0)),
             views: Rc::new(RefCell::new(Vec::new())),
-            colours: Rc::new(RefCell::new(colours.clone())),
+            colours: shared_colours,
             generation: Rc::new(super::Generation::new()),
             open_handler: Rc::new(RefCell::new(None)),
             edit_handler: Rc::new(RefCell::new(None)),
@@ -880,6 +897,36 @@ impl DiffPanel {
         };
         panel.set_colours(colours);
         panel.show_pop_state();
+
+        let review = panel.review.clone();
+        review_send.connect_clicked(move |_| review.send_now());
+        let review = panel.review.clone();
+        let parent = panel.content.downgrade();
+        review_discard.connect_clicked(move |_| {
+            let n = review.drafts().len();
+            if n < 2 {
+                review.clear();
+                return;
+            }
+            let Some(parent) = parent.upgrade() else {
+                return;
+            };
+            let dialog = adw::AlertDialog::new(
+                Some(&format!("Discard {}?", review::count_words(n))),
+                Some("The comments are deleted and not sent."),
+            );
+            dialog.add_responses(&[("cancel", "Cancel"), ("discard", "Discard")]);
+            dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_close_response("cancel");
+            let review = review.clone();
+            dialog.connect_response(None, move |_, response| {
+                if response == "discard" {
+                    review.clear();
+                }
+            });
+            dialog.present(Some(&parent));
+        });
 
         let handler = Rc::clone(&panel.pr_handler);
         let state = Rc::clone(&panel.pr_state);
@@ -1136,6 +1183,35 @@ impl DiffPanel {
         self.commit.sync(pushing);
     }
 
+    /// Binds the panel's comments to its tab's thread: until then none can be made. True the
+    /// first time, when the caller loads the thread's saved drafts ([`Self::restore_review`]).
+    pub fn bind_review(&self, thread: &str) -> bool {
+        self.review.bind(thread)
+    }
+
+    /// Takes `thread`'s saved drafts, read from the store.
+    pub fn restore_review(&self, thread: &str, drafts: Vec<agent_kit::store::ReviewDraft>) {
+        self.review.restore(thread, drafts);
+    }
+
+    /// The saved drafts could not be read: nothing is written over them.
+    pub fn review_load_failed(&self, thread: &str) {
+        self.review.load_failed(thread);
+    }
+
+    /// Calls `persist` with the thread and its whole draft list (redacted) after every change.
+    pub fn connect_review_persist(
+        &self,
+        persist: impl Fn(String, Vec<agent_kit::store::ReviewDraft>) + 'static,
+    ) {
+        self.review.set_persist(Rc::new(persist));
+    }
+
+    /// Calls `send` with the composed review when "Send Review" is clicked; `Err` is shown.
+    pub fn connect_send_review(&self, send: impl Fn(String) -> Result<(), String> + 'static) {
+        self.review.set_send(Rc::new(send));
+    }
+
     /// Calls `commit` with the chosen files when "Commit…" is clicked.
     pub fn connect_commit(&self, commit: impl Fn(CommitAsk) + 'static) {
         *self.commit.handler.borrow_mut() = Some(Rc::new(commit));
@@ -1275,6 +1351,7 @@ impl DiffPanel {
         *self.colours.borrow_mut() = colours.clone();
         for view in self.views.borrow().iter() {
             colour_tags(view, colours);
+            self.review.recolour(view);
         }
     }
 
@@ -1372,6 +1449,8 @@ impl DiffPanel {
 
     fn show_status(&self, icon: &str, title: &str, description: &str, retry: bool) {
         self.focused.borrow_mut().take();
+        // No diff on show: every comment is kept, flagged as not in it.
+        self.review.show(self.begun_base.get(), HashMap::new());
         self.set_undo(None);
         self.summary.set_text("");
         crate::icons::set_status_icon(&self.status, icon);
@@ -1572,6 +1651,16 @@ impl DiffPanel {
             *slot = chunk;
         }
         let cut_short = !diff.too_large && diff.omitted_lines > 0;
+        // Before the rows are built: their Comment buttons register with the review.
+        self.review.show(
+            self.begun_base.get(),
+            diff.stats
+                .iter()
+                .zip(&by_stat)
+                .filter(|(_, chunk)| !chunk.is_empty())
+                .map(|(stat, chunk)| (stat.path.clone(), Rc::from(chunk.as_str())))
+                .collect(),
+        );
 
         let mut rows = 0;
         for (folder, files) in crate::diff::group_by_folder(&diff.stats) {
@@ -1660,6 +1749,7 @@ impl DiffPanel {
         // Binary files open fine in a tool that knows them; the button is for every row.
         title.append(&self.open_button(stat.path.clone()));
         title.append(&self.editor_button(stat.path.clone(), crate::diff::first_hunk_line(&text)));
+        title.append(&self.review.comment_button(&stat.path, why_hidden));
         let expander = gtk4::Expander::builder()
             .label_widget(&title)
             .margin_start(8)
@@ -1680,6 +1770,7 @@ impl DiffPanel {
         let views = Rc::clone(&self.views);
         let colours = Rc::clone(&self.colours);
         let (edit, path) = (Rc::clone(&self.edit_handler), stat.path.clone());
+        let review = self.review.clone();
         expander.connect_expanded_notify(move |expander| {
             if !expander.is_expanded() || expander.child().is_some() {
                 return;
@@ -1697,7 +1788,7 @@ impl DiffPanel {
                     let view = file_view(&text, &colours.borrow());
                     open_at_ctrl_click(&view, &text, &path, &edit);
                     views.borrow_mut().push(view.clone());
-                    view.upcast()
+                    review.decorate(&path, &text, &view)
                 }
             };
             expander.set_child(Some(&child));
@@ -2011,6 +2102,570 @@ pub(crate) mod tests {
         // The message draft is kept for the tab.
         panel.set_commit_draft("Half written");
         assert_eq!(panel.commit_draft(), "Half written");
+    }
+
+    /// A one-file diff of `path` whose hunk starts at `at` (rows: four header rows, the hunk,
+    /// then ` keep`, `-old one`, `-old two`, `+<added>`, ` tail`).
+    fn one_file(path: &str, at: u32, added: &str) -> Result<DiffOutcome, String> {
+        let text = format!(
+            "diff --git a/{path} b/{path}\nindex 1..2 100644\n--- a/{path}\n+++ b/{path}\n\
+             @@ -{at},4 +{at},3 @@\n keep\n-old one\n-old two\n+{added}\n tail\n"
+        );
+        Ok(DiffOutcome::Ready(TabDiff {
+            stats: crate::diff::parse_numstat(format!("1\t2\t{path}\0").as_bytes()),
+            text,
+            omitted_lines: 0,
+            too_large: false,
+            undo_to: None,
+            from: "HEAD".into(),
+            to_checkpoint: None,
+        }))
+    }
+
+    /// Writes `note` in an open note editor and presses its Save.
+    fn save_note(popover: &gtk4::Popover, note: &str) {
+        let root = popover.clone().upcast::<gtk4::Widget>();
+        let entry: gtk4::TextView =
+            crate::testutil::find_first(&root).expect("the editor has an entry");
+        entry.buffer().set_text(note);
+        let save = crate::testutil::find_all::<gtk4::Button>(&root)
+            .into_iter()
+            .find(|b| b.label().as_deref() == Some("Save"))
+            .expect("Save");
+        assert!(save.is_sensitive());
+        save.emit_clicked();
+    }
+
+    /// GTK: run from the window's construction test. Comments are made from a selection in a
+    /// file's view, refused on header lines, marked, kept redacted and written whole after every
+    /// change, restored from the store, re-anchored when the diff moves or changes, and sent as
+    /// one composed, fenced message, after which they are gone; a failed send keeps them.
+    pub(crate) fn comments_are_kept_anchored_and_sent_as_one_review() {
+        let ctx = glib::MainContext::default();
+        let panel = DiffPanel::new(&crate::theme::Theme::diff_colours(Default::default()));
+        let window = adw::Window::builder()
+            .default_width(700)
+            .default_height(700)
+            .content(&panel.root)
+            .build();
+        panel.set_shown(true);
+        window.present();
+        assert!(crate::testutil::pump_until(&ctx, 5, || panel
+            .root
+            .is_mapped()));
+
+        type Written = Vec<(String, Vec<agent_kit::store::ReviewDraft>)>;
+        let saved: Rc<RefCell<Written>> = Rc::default();
+        let log = Rc::clone(&saved);
+        panel.connect_review_persist(move |thread, drafts| log.borrow_mut().push((thread, drafts)));
+        let sent: Rc<RefCell<Vec<String>>> = Rc::default();
+        let refuse = Rc::new(Cell::new(false));
+        let (log, no) = (Rc::clone(&sent), Rc::clone(&refuse));
+        panel.connect_send_review(move |text| {
+            if no.get() {
+                return Err("the thread is not open".into());
+            }
+            log.borrow_mut().push(text);
+            Ok(())
+        });
+
+        // No thread: no Comment button and no bar.
+        let generation = panel.begin();
+        panel.show(generation, one_file("a.rs", 10, "new one"));
+        let button = |panel: &DiffPanel| {
+            crate::testutil::find_by_class::<gtk4::Button>(
+                panel.files.upcast_ref(),
+                "diff-comment-button",
+            )
+            .expect("the row has a Comment button")
+        };
+        assert!(!button(&panel).is_visible());
+        assert_eq!(panel.review.bar_view(), None);
+
+        // Bound, with one stored comment: it is shown at its lines, and nothing is written back.
+        assert!(panel.bind_review("t1"));
+        assert!(!panel.bind_review("t2"), "a panel's thread never changes");
+        assert!(button(&panel).is_visible());
+        let stored = agent_kit::store::ReviewDraft {
+            path: "a.rs".into(),
+            side: crate::diff::Side::New,
+            start_line: 11,
+            end_line: 11,
+            quoted: vec!["+new one".into()],
+            note: "Stored note".into(),
+            diff_base: "uncommitted".into(),
+            created_at: 1,
+        };
+        panel.restore_review("t2", vec![stored.clone()]);
+        assert_eq!(
+            panel.review.bar_view(),
+            None,
+            "another thread's drafts are not taken"
+        );
+        panel.restore_review("t1", vec![stored.clone()]);
+        assert!(saved.borrow().is_empty());
+        assert_eq!(
+            panel.review.bar_view(),
+            Some(("1 comment".to_owned(), true))
+        );
+
+        // Expanding the row builds its view, with the stored comment's line marked.
+        panel.file_expanders()[0].set_expanded(true);
+        assert_eq!(panel.review.marked_rows("a.rs"), vec![8]);
+        let view = panel.review.view_of("a.rs").expect("view");
+        assert!(
+            view.is_cursor_visible(),
+            "a caret, for choosing lines by keyboard"
+        );
+        assert!(!button(&panel).is_sensitive(), "nothing selected yet");
+        assert!(crate::testutil::pump_until(&ctx, 5, || view.is_mapped()));
+
+        // Header lines alone are refused, with the reason.
+        let buffer = view.buffer();
+        let line = |n: i32| buffer.iter_at_line(n).expect("line");
+        buffer.select_range(&line(0), &line(3));
+        assert!(button(&panel).is_sensitive());
+
+        // A collapsed row's view is off screen: Comment is off and opens nothing.
+        panel.file_expanders()[0].set_expanded(false);
+        assert!(crate::testutil::pump_until(&ctx, 5, || !view.is_mapped()));
+        assert!(!button(&panel).is_sensitive());
+        assert!(panel.review.comment_on("a.rs").is_none());
+        panel.file_expanders()[0].set_expanded(true);
+        assert!(crate::testutil::pump_until(&ctx, 5, || view.is_mapped()));
+        buffer.select_range(&line(0), &line(3));
+        assert!(button(&panel).is_sensitive());
+        let refused = panel.review.comment_on("a.rs").expect("a popover");
+        assert_eq!(
+            crate::testutil::label_texts(refused.upcast_ref()),
+            vec!["Select changed or context lines".to_owned()]
+        );
+        refused.popdown();
+
+        // Rows 5 and 6 (the selection ends at the start of row 7): a comment with a secret.
+        let token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        buffer.select_range(&line(5), &line(7));
+        let editor = panel.review.comment_on("a.rs").expect("the editor");
+        save_note(&editor, &format!("Rotate {token} here"));
+        {
+            let saved = saved.borrow();
+            let (thread, drafts) = saved.last().expect("written after the change");
+            assert_eq!(thread, "t1");
+            assert_eq!(drafts.len(), 2, "the stored comment and the new one, whole");
+            let made = drafts
+                .iter()
+                .find(|d| d.start_line == 10)
+                .expect("the new one");
+            assert_eq!((made.end_line, made.side), (10, crate::diff::Side::New));
+            assert_eq!(made.quoted, vec![" keep".to_owned(), "-old one".to_owned()]);
+            assert!(!made.note.contains(token), "kept redacted: {}", made.note);
+            assert_eq!(made.diff_base, "uncommitted");
+        }
+        assert_eq!(panel.review.marked_rows("a.rs"), vec![5, 6, 8]);
+        assert_eq!(
+            panel.review.bar_view(),
+            Some(("2 comments".to_owned(), true))
+        );
+        assert!(crate::testutil::button_problems(panel.content.upcast_ref(), 24).is_empty());
+        assert!(crate::testutil::icon_only_without_label(panel.content.upcast_ref()).is_empty());
+
+        // Three lines inserted above: both comments move with their lines.
+        let generation = panel.begin();
+        panel.show(generation, one_file("a.rs", 13, "new one"));
+        assert_eq!(
+            panel.review.located(),
+            vec![
+                ("a.rs".to_owned(), crate::diff::Located::Moved, 13, 13),
+                ("a.rs".to_owned(), crate::diff::Located::Moved, 14, 14),
+            ]
+        );
+        // The added line changed: that comment is not in this diff, but kept.
+        let generation = panel.begin();
+        panel.show(generation, one_file("a.rs", 13, "newer one"));
+        assert_eq!(
+            panel.review.bar_view().map(|v| v.0),
+            Some("2 comments · 1 not in this diff".to_owned())
+        );
+        panel.file_expanders()[0].set_expanded(true);
+        assert_eq!(panel.review.marked_rows("a.rs"), vec![5, 6]);
+
+        // A send that fails keeps every comment and says why.
+        refuse.set(true);
+        panel.review.send_now();
+        assert_eq!(
+            panel.review.bar_view().map(|v| v.0),
+            Some("2 comments · 1 not in this diff · Could not send the review: the thread is not open".to_owned())
+        );
+        assert_eq!(panel.review.drafts().len(), 2);
+
+        // Sent: one message, fenced and redacted; then they are gone, and the store is told.
+        refuse.set(false);
+        let writes = saved.borrow().len();
+        let send = crate::testutil::find_by_class::<gtk4::Button>(
+            panel.content.upcast_ref(),
+            "diff-send-review",
+        )
+        .expect("Send Review");
+        send.emit_clicked();
+        let texts = sent.borrow().clone();
+        assert_eq!(texts.len(), 1, "one message for the whole review");
+        let text = &texts[0];
+        assert!(
+            text.starts_with("Review comments on your changes (2)."),
+            "{text}"
+        );
+        assert!(text.contains("1. a.rs, line 13 (new side)\n```\n keep\n-old one\n```"));
+        assert!(text.contains("2. a.rs, no longer at these lines (was line 11, new side)"));
+        assert!(!text.contains(token));
+        assert!(panel.review.drafts().is_empty());
+        assert_eq!(saved.borrow().len(), writes + 1);
+        assert_eq!(saved.borrow().last().map(|(_, d)| d.len()), Some(0));
+        assert_eq!(panel.review.bar_view(), None);
+
+        // Ctrl+Alt+M on the caret's line, with nothing selected, opens the editor there; in it
+        // Shift+Enter adds a line, Enter saves.
+        let view = panel.review.view_of("a.rs").expect("view");
+        assert!(crate::testutil::pump_until(&ctx, 5, || view.is_mapped()));
+        let buffer = view.buffer();
+        let tail = buffer.iter_at_line(9).expect("tail");
+        buffer.select_range(&tail, &tail);
+        let ctrl_alt = gtk4::gdk::ModifierType::CONTROL_MASK | gtk4::gdk::ModifierType::ALT_MASK;
+        assert!(press(&view, gtk4::gdk::Key::m, ctrl_alt));
+        let editor = open_popover(&view).expect("Ctrl+Alt+M opened the editor");
+        let entry: gtk4::TextView =
+            crate::testutil::find_first(editor.upcast_ref()).expect("entry");
+        entry.buffer().set_text("Tail");
+        assert!(!press(
+            &entry,
+            gtk4::gdk::Key::Return,
+            gtk4::gdk::ModifierType::SHIFT_MASK
+        ));
+        assert!(
+            panel.review.drafts().is_empty(),
+            "Shift+Enter does not save"
+        );
+        assert!(press(
+            &entry,
+            gtk4::gdk::Key::Return,
+            gtk4::gdk::ModifierType::empty()
+        ));
+        assert_eq!(panel.review.drafts().len(), 1);
+        assert_eq!(panel.review.drafts()[0].note, "Tail");
+        assert_eq!(panel.review.drafts()[0].start_line, 15);
+
+        // Discard: one comment goes without asking.
+        let discard = crate::testutil::find_by_class::<gtk4::Button>(
+            panel.content.upcast_ref(),
+            "diff-discard-review",
+        )
+        .expect("Discard");
+        discard.emit_clicked();
+        assert!(panel.review.drafts().is_empty());
+        assert!(window.visible_dialog().is_none());
+
+        // Two or more: it asks, and Cancel keeps them.
+        for (from, to) in [(5, 6), (8, 9)] {
+            buffer.select_range(&line_of(&buffer, from), &line_of(&buffer, to));
+            let editor = panel.review.comment_on("a.rs").expect("the editor");
+            save_note(&editor, "n");
+        }
+        assert_eq!(panel.review.drafts().len(), 2);
+        discard.emit_clicked();
+        let alert = window
+            .visible_dialog()
+            .and_downcast::<adw::AlertDialog>()
+            .expect("Discard asks first");
+        let answered = Rc::new(RefCell::new(None::<String>));
+        let seen = Rc::clone(&answered);
+        alert.connect_response(None, move |_, response| {
+            *seen.borrow_mut() = Some(response.to_owned());
+        });
+        // Closing it (Escape, a press outside) answers its close response, Cancel. The answer is
+        // what proves it: the window's visible dialog only clears once the closing animation has
+        // run, after the answer.
+        let first = alert.clone().upcast::<adw::Dialog>();
+        assert!(crate::testutil::pump_until_dialog_open(&ctx, &first, 5));
+        assert!(alert.close());
+        assert!(crate::testutil::pump_until(&ctx, 5, || answered
+            .borrow()
+            .is_some()));
+        assert_eq!(answered.borrow().as_deref(), Some("cancel"));
+        assert_eq!(panel.review.drafts().len(), 2, "Cancel keeps the comments");
+        discard.emit_clicked();
+        let dialog = window
+            .visible_dialog()
+            .filter(|d| *d != first)
+            .expect("asked again, with a new alert");
+        assert!(crate::testutil::pump_until_dialog_open(&ctx, &dialog, 5));
+        dialog.emit_by_name::<()>("response", &[&"discard"]);
+        assert!(panel.review.drafts().is_empty());
+        dialog.force_close();
+        window.close();
+    }
+
+    /// The popover open on `view`'s file box, if any.
+    fn open_popover(view: &gtk4::TextView) -> Option<gtk4::Popover> {
+        let column = view.parent()?;
+        crate::testutil::find_all::<gtk4::Popover>(&column)
+            .into_iter()
+            .find(|p| p.is_visible())
+    }
+
+    /// The start of line `n` of `buffer`.
+    fn line_of(buffer: &gtk4::TextBuffer, n: i32) -> gtk4::TextIter {
+        buffer.iter_at_line(n).expect("line")
+    }
+
+    /// Delivers a key press to the review's own key controller on `widget`; whether it was
+    /// handled.
+    fn press(
+        widget: &impl IsA<gtk4::Widget>,
+        key: gtk4::gdk::Key,
+        state: gtk4::gdk::ModifierType,
+    ) -> bool {
+        use gtk4::glib::translate::IntoGlib;
+        let controllers = widget.observe_controllers();
+        let keys = (0..controllers.n_items())
+            .filter_map(|i| {
+                controllers
+                    .item(i)
+                    .and_downcast::<gtk4::EventControllerKey>()
+            })
+            .find(|k| k.name().as_deref() == Some(review::KEYS_NAME))
+            .expect("the review's key controller");
+        keys.emit_by_name::<bool>("key-pressed", &[&key.into_glib(), &0u32, &state])
+    }
+
+    /// A panel bound to `thread`, in a shown window, with `a.rs` expanded and on screen, whose
+    /// writes and sends are logged.
+    struct Rig {
+        window: adw::Window,
+        panel: DiffPanel,
+        saved: Rc<RefCell<Vec<Vec<agent_kit::store::ReviewDraft>>>>,
+        sent: Rc<RefCell<Vec<String>>>,
+    }
+
+    /// GTK. A review `send` refuses (a thread with no session yet) is kept whole, saved as it
+    /// was, and the bar says why.
+    pub(crate) fn a_refused_review_is_kept(send: impl Fn(String) -> Result<(), String> + 'static) {
+        let rig = Rig::new("t1", one_file("a.rs", 10, "new one"));
+        rig.panel.restore_review("t1", Vec::new());
+        let why = Rc::new(RefCell::new(None));
+        let seen = Rc::clone(&why);
+        rig.panel.connect_send_review(move |text| {
+            let answer = send(text);
+            *seen.borrow_mut() = answer.clone().err();
+            answer
+        });
+        rig.comment(5, 5, "Kept");
+        let writes = rig.saved.borrow().len();
+        rig.panel.review.send_now();
+        let why = why.borrow().clone().expect("the send was refused");
+        assert_eq!(rig.panel.review.drafts().len(), 1, "nothing is lost");
+        assert_eq!(rig.saved.borrow().len(), writes, "and nothing is written");
+        assert_eq!(
+            rig.panel.review.bar_view().map(|v| v.0),
+            Some(format!("1 comment · Could not send the review: {why}"))
+        );
+        rig.window.close();
+    }
+
+    impl Rig {
+        fn new(thread: &str, diff: Result<DiffOutcome, String>) -> Self {
+            let ctx = glib::MainContext::default();
+            let panel = DiffPanel::new(&crate::theme::Theme::diff_colours(Default::default()));
+            let window = adw::Window::builder()
+                .default_width(700)
+                .default_height(700)
+                .content(&panel.root)
+                .build();
+            panel.set_shown(true);
+            window.present();
+            let saved: Rc<RefCell<Vec<Vec<agent_kit::store::ReviewDraft>>>> = Rc::default();
+            let log = Rc::clone(&saved);
+            panel.connect_review_persist(move |_, drafts| log.borrow_mut().push(drafts));
+            let sent: Rc<RefCell<Vec<String>>> = Rc::default();
+            let log = Rc::clone(&sent);
+            panel.connect_send_review(move |text| {
+                log.borrow_mut().push(text);
+                Ok(())
+            });
+            assert!(panel.bind_review(thread));
+            let generation = panel.begin();
+            panel.show(generation, diff);
+            panel.file_expanders()[0].set_expanded(true);
+            let view = panel.review.view_of("a.rs").expect("view");
+            assert!(crate::testutil::pump_until(&ctx, 5, || view.is_mapped()));
+            Self {
+                window,
+                panel,
+                saved,
+                sent,
+            }
+        }
+
+        /// Comments on rows `from..=to` of `a.rs` with `note`.
+        fn comment(&self, from: i32, to: i32, note: &str) {
+            let view = self.panel.review.view_of("a.rs").expect("view");
+            let buffer = view.buffer();
+            let end = buffer
+                .iter_at_line(to + 1)
+                .unwrap_or_else(|| buffer.end_iter());
+            buffer.select_range(&line_of(&buffer, from), &end);
+            let editor = self.panel.review.comment_on("a.rs").expect("the editor");
+            save_note(&editor, note);
+        }
+    }
+
+    /// GTK: run from the window's construction test. A comment's Edit and Delete; a comment on a
+    /// file not in the diff is listed in the bar with its own Delete; comments past the message
+    /// budget stay, and the bar says so; comments made before the stored ones arrive are kept
+    /// with them; after a failed read nothing is written, and the bar keeps saying so.
+    pub(crate) fn review_rows_budget_and_loading() {
+        let ctx = glib::MainContext::default();
+
+        // Edit and Delete under the file's diff.
+        let rig = Rig::new("t1", one_file("a.rs", 10, "new one"));
+        rig.panel.restore_review("t1", Vec::new());
+        rig.comment(5, 5, "First");
+        rig.comment(9, 9, "Second");
+        let content = rig.panel.content.clone().upcast::<gtk4::Widget>();
+        let edit = crate::testutil::find_by_class::<gtk4::Button>(&content, "diff-comment-edit")
+            .expect("Edit");
+        edit.emit_clicked();
+        let column = rig
+            .panel
+            .review
+            .view_of("a.rs")
+            .and_then(|v| v.parent())
+            .expect("the file's box");
+        let editor = crate::testutil::find_all::<gtk4::Popover>(&column)
+            .into_iter()
+            .find(|p| p.is_visible())
+            .expect("the editor");
+        let entry: gtk4::TextView =
+            crate::testutil::find_first(editor.upcast_ref()).expect("entry");
+        let shown = entry.buffer();
+        assert_eq!(
+            shown.text(&shown.start_iter(), &shown.end_iter(), false),
+            "First",
+            "the editor starts from the note"
+        );
+        save_note(&editor, "First, edited");
+        let notes: Vec<String> = rig
+            .panel
+            .review
+            .drafts()
+            .into_iter()
+            .map(|d| d.note)
+            .collect();
+        assert_eq!(notes, ["First, edited", "Second"]);
+        assert_eq!(
+            rig.saved.borrow().last().map(|d| d[0].note.clone()),
+            Some("First, edited".to_owned())
+        );
+        crate::testutil::find_by_class::<gtk4::Button>(&content, "diff-comment-delete")
+            .expect("Delete")
+            .emit_clicked();
+        assert!(crate::testutil::pump_until(&ctx, 5, || rig
+            .panel
+            .review
+            .drafts()
+            .len()
+            == 1));
+        assert_eq!(rig.panel.review.drafts()[0].note, "Second");
+
+        // A diff without a.rs: its comment is listed in the bar, with its own Delete.
+        let generation = rig.panel.begin();
+        rig.panel.show(generation, one_file("b.rs", 1, "x"));
+        let orphan = crate::testutil::find_by_class::<gtk4::Box>(&content, "diff-review-bar")
+            .expect("the bar");
+        let texts = crate::testutil::label_texts(orphan.upcast_ref());
+        assert!(
+            texts
+                .iter()
+                .any(|t| t == "a.rs · Line 12 · not in this diff"),
+            "{texts:?}"
+        );
+        crate::testutil::find_by_class::<gtk4::Button>(orphan.upcast_ref(), "diff-comment-delete")
+            .expect("its Delete")
+            .emit_clicked();
+        assert!(crate::testutil::pump_until(&ctx, 5, || rig
+            .panel
+            .review
+            .drafts()
+            .is_empty()));
+        assert_eq!(rig.saved.borrow().last().map(Vec::len), Some(0));
+        rig.window.close();
+
+        // Past the budget: what fits goes, the rest stays, and the bar says so.
+        let rig = Rig::new("t2", one_file("a.rs", 10, "new one"));
+        rig.panel.restore_review("t2", Vec::new());
+        let long = "n".repeat(agent_core::review::NOTE_MAX_BYTES);
+        for _ in 0..5 {
+            rig.comment(5, 5, &long);
+        }
+        rig.panel.review.send_now();
+        let text = rig.sent.borrow().last().cloned().expect("sent");
+        assert!(text.len() <= agent_core::review::REVIEW_BUDGET);
+        let left = rig.panel.review.drafts().len();
+        assert!(left > 0 && left < 5, "{left} left");
+        let (words, _) = rig.panel.review.bar_view().expect("the bar stays");
+        assert!(
+            words.contains(&format!(
+                "did not fit in one message and {}",
+                if left == 1 { "is" } else { "are" }
+            )),
+            "{words}"
+        );
+        assert!(text.starts_with(&format!("Review comments on your changes ({}).", 5 - left)));
+        rig.window.close();
+
+        // Made before the stored ones arrive: nothing is written until they do, then both.
+        let rig = Rig::new("t3", one_file("a.rs", 10, "new one"));
+        rig.comment(5, 5, "Early");
+        assert!(
+            rig.saved.borrow().is_empty(),
+            "nothing written before the read"
+        );
+        let stored = agent_kit::store::ReviewDraft {
+            path: "a.rs".into(),
+            side: crate::diff::Side::New,
+            start_line: 12,
+            end_line: 12,
+            quoted: vec![" tail".into()],
+            note: "Stored".into(),
+            diff_base: "uncommitted".into(),
+            created_at: 1,
+        };
+        rig.panel.restore_review("t3", vec![stored]);
+        let written: Vec<String> = rig
+            .saved
+            .borrow()
+            .last()
+            .expect("the merged list is written")
+            .iter()
+            .map(|d| d.note.clone())
+            .collect();
+        assert_eq!(written, ["Early", "Stored"]);
+        rig.window.close();
+
+        // The read failed: comments are kept here, never written, and the bar keeps saying so.
+        let rig = Rig::new("t4", one_file("a.rs", 10, "new one"));
+        rig.panel.review_load_failed("t4");
+        assert_eq!(
+            rig.panel.review.bar_view().map(|v| v.0),
+            Some(review::LOAD_FAILED.to_owned())
+        );
+        rig.comment(5, 5, "Unsaved");
+        assert!(rig.saved.borrow().is_empty());
+        assert_eq!(
+            rig.panel.review.bar_view().map(|v| v.0),
+            Some(format!("1 comment · {}", review::LOAD_FAILED))
+        );
+        rig.panel.restore_review("t4", Vec::new());
+        assert!(rig.saved.borrow().is_empty(), "a late read is not taken");
+        rig.window.close();
     }
 
     /// GTK: run from the window's construction test. The panel pops out into its own window,

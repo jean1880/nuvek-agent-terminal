@@ -9085,6 +9085,21 @@ pub(super) mod tests {
         // Nothing but blanks adds nothing.
         imp.put_in_draft(&target, Source::Page, Some("  \n"), false);
         assert_eq!(target.view.draft(), draft);
+        // Another machine's text goes under its own label, a blank line after the first block,
+        // through the same cleaning: the escape sequence never reaches the draft.
+        imp.put_in_draft(
+            &target,
+            Source::RemotePage,
+            Some("\x1b[31mremote\x1b[0m"),
+            true,
+        );
+        let both = target.view.draft();
+        assert!(both.starts_with(&draft), "the earlier block stays");
+        assert!(both.contains(&format!(
+            "\n\n{}\n```\nremote\n```",
+            agent_core::terminal_excerpt::REMOTE_LABEL
+        )));
+        assert!(!both.contains('\x1b'));
         window.destroy();
         crate::testutil::settle(&ctx);
     }

@@ -615,8 +615,8 @@ shortcut.
   `❯` or `»` followed by a space), and the output starts at the nearest line above that begins
   the same way. Empty prompts (Enter pressed with nothing typed) are skipped. The last 1,000 rows
   are searched. With no match (a prompt that shows the time or another folder, a cleared
-  screen, a full-screen program such as an editor, a command still running) the last 60 lines
-  are sent instead, and the toast says so. A prompt over two lines matches on its last line, so
+  screen, a full-screen program such as an editor, a command still running) up to the last 60
+  lines are sent instead, and the toast says so. A prompt over two lines matches on its last line, so
   its first line comes along at the end.
 - Escape sequences and control characters are removed. A carriage return becomes a line break,
   so text an overwrite would hide stays visible.

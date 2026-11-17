@@ -7701,11 +7701,7 @@ impl AgentTerminalWindow {
         } else {
             SendFrom::Page
         };
-        let source = match (from, selected.remote.is_some()) {
-            (SendFrom::Drawer, _) => agent_core::terminal_excerpt::Source::Drawer,
-            (SendFrom::Page, false) => agent_core::terminal_excerpt::Source::Page,
-            (SendFrom::Page, true) => agent_core::terminal_excerpt::Source::RemotePage,
-        };
+        let source = send_source(from, selected.remote.is_some());
         let target = send_target_key(selected.key, self.last_chat_key.get(), &facts)
             .and_then(|key| tabs.iter().find(|t| t.key == key))
             .and_then(|t| {
@@ -8265,6 +8261,17 @@ fn send_target_key(selected: u64, last_chat: Option<u64>, tabs: &[SendTab]) -> O
     open(last_chat?).map(|t| t.key)
 }
 
+/// The label a send's block goes under. Text from a page on another machine is that machine's,
+/// whatever kind of terminal shows it, so `remote` always wins.
+fn send_source(from: SendFrom, remote: bool) -> agent_core::terminal_excerpt::Source {
+    use agent_core::terminal_excerpt::Source;
+    match (from, remote) {
+        (_, true) => Source::RemotePage,
+        (SendFrom::Drawer, false) => Source::Drawer,
+        (SendFrom::Page, false) => Source::Page,
+    }
+}
+
 /// Whether "Send Selection to Thread" or "Send Last Output to Thread" can run for the terminal in
 /// view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8402,11 +8409,10 @@ fn excerpt_toast(
     } else {
         format!(" ({})", notes.join(", "))
     };
+    // The count is already in "Added N lines": a short terminal gives fewer than the fallback's
+    // most, so the notice names no number of its own.
     let fallback = if fell_back {
-        format!(
-            ". No earlier prompt was found, so these are the terminal's last {} lines",
-            agent_core::terminal_excerpt::LAST_OUTPUT_FALLBACK_LINES
-        )
+        ". No earlier prompt was found, so these are the terminal's last lines".to_owned()
     } else {
         String::new()
     };
@@ -8475,6 +8481,15 @@ mod tests {
         assert_eq!(send_target_key(3, Some(3), &tabs), None);
         // An unknown selected page sends nowhere.
         assert_eq!(send_target_key(8, Some(1), &tabs), None);
+    }
+
+    #[test]
+    fn a_remote_terminal_is_always_labelled_as_another_machine() {
+        use agent_core::terminal_excerpt::Source;
+        assert_eq!(send_source(SendFrom::Drawer, false), Source::Drawer);
+        assert_eq!(send_source(SendFrom::Page, false), Source::Page);
+        assert_eq!(send_source(SendFrom::Page, true), Source::RemotePage);
+        assert_eq!(send_source(SendFrom::Drawer, true), Source::RemotePage);
     }
 
     /// The last output is read off the rows above the cursor of a real terminal, and says when
@@ -8582,7 +8597,14 @@ mod tests {
         assert_eq!(
             excerpt_toast(&e, "T", true),
             "Added 60 lines to the draft of T. No earlier prompt was found, so these are the \
-             terminal's last 60 lines"
+             terminal's last lines"
+        );
+        // A short terminal gives fewer: the notice claims no count of its own.
+        e.lines = 2;
+        assert_eq!(
+            excerpt_toast(&e, "T", true),
+            "Added 2 lines to the draft of T. No earlier prompt was found, so these are the \
+             terminal's last lines"
         );
     }
 

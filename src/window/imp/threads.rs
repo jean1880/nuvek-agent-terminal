@@ -9104,6 +9104,179 @@ pub(super) mod tests {
         crate::testutil::settle(&ctx);
     }
 
+    /// Terminal pages, on this machine and another, send through their actions to the thread
+    /// last shown, which comes into view with its composer focused; with no thread shown, or once
+    /// it is closed, the actions are disabled, say so, and open nothing.
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    fn terminal_pages_send_to_the_thread_last_shown() {
+        use crate::testutil::pump_until;
+        use agent_core::terminal_excerpt::{PAGE_LABEL, REMOTE_LABEL};
+        crate::testutil::gtk_init().unwrap();
+        crate::testutil::adw_init().unwrap();
+        crate::icons::register();
+        crate::load_css();
+        // The pages are real, but start no shell and no ssh: the test feeds their text.
+        crate::window::imp::SPAWN_TERMINAL_PAGES.with(|s| s.set(false));
+        let app = crate::window::imp::test_support::test_app("org.test.SendFromPages", true);
+        CHAT_RESTORED.with(|done| done.set(true));
+        let ctx = glib::MainContext::default();
+        let window = crate::window::imp::test_support::test_window(&app, &ctx);
+        window.present();
+        assert!(pump_until(&ctx, 5, || window.is_realized()));
+        let imp = window.imp();
+        let obj = imp.obj().clone();
+        let enabled = |name: &str| obj.lookup_action(name).is_some_and(|a| a.is_enabled());
+        let send = |name: &str| {
+            // As a menu item activates it; a disabled action does nothing, which is checked.
+            gtk4::gio::prelude::ActionGroupExt::activate_action(&obj, name, None);
+        };
+        let menu = gtk4::gio::Menu::new();
+        let labels = |menu: &gtk4::gio::Menu| -> Vec<String> {
+            (0..menu.n_items())
+                .filter_map(|i| menu.item_attribute_value(i, "label", None)?.get::<String>())
+                .collect()
+        };
+        let threads = || {
+            imp.tabs
+                .borrow()
+                .iter()
+                .filter(|t| t.chat.is_some())
+                .count()
+        };
+        let last_toast = || {
+            imp.test_toasts
+                .borrow()
+                .last()
+                .and_then(|t| t.title())
+                .map(|t| t.to_string())
+                .unwrap_or_default()
+        };
+        let view = imp.tab_view.borrow().clone().unwrap();
+        let terminal_of = |page: &adw::TabPage| imp.with_page_tab(page, |t| t.terminal.clone());
+        let hint = [
+            "Send Selection to Thread (open a thread first)",
+            "Send Last Output to Thread (open a thread first)",
+        ];
+
+        // A local page with no thread shown yet: disabled, and the menu says to open one.
+        imp.add_terminal_tab(None, None);
+        let local = view.selected_page().expect("the page is shown");
+        let terminal = terminal_of(&local).expect("registered");
+        terminal.feed(b"$ make\r\nerror: one\r\n$ ");
+        assert!(pump_until(&ctx, 5, || terminal.cursor_position() == (2, 2)));
+        imp.refresh_send_actions(Some(&menu));
+        assert!(!enabled("send-selection") && !enabled("send-last-output"));
+        assert_eq!(labels(&menu), hint);
+        send("send-last-output");
+        assert_eq!(threads(), 0, "no thread is opened for a send");
+
+        // A thread shown, then the page again: the menu names it, and the send fills it.
+        imp.create_chat_thread(NewThread {
+            title: Some("Fix build".into()),
+            ..NewThread::new(Driver::Claude)
+        })
+        .expect("created");
+        let id = imp.current_thread().expect("shown");
+        assert!(pump_until(&ctx, 10, || imp
+            .with_chat(&id, |c| c.view.is_some())
+            .unwrap_or(false)));
+        let chat = imp.with_chat(&id, |c| c.view.clone()).flatten().unwrap();
+        let thread_page = imp.page_of_thread(&id).unwrap();
+        view.set_selected_page(&local);
+        imp.refresh_send_actions(Some(&menu));
+        assert!(enabled("send-last-output"));
+        assert!(!enabled("send-selection"), "nothing is selected");
+        assert_eq!(
+            labels(&menu),
+            [
+                "Send Selection to “Fix build”",
+                "Send Last Output to “Fix build”"
+            ]
+        );
+        send("send-last-output");
+        assert!(imp.is_selected(&thread_page), "the thread comes into view");
+        let draft = chat.draft();
+        assert!(draft.starts_with(PAGE_LABEL), "the label leads the block");
+        assert!(draft.contains("\n```\n$ make\nerror: one\n```"));
+        assert!(pump_until(&ctx, 5, || chat.composer_is_focus()));
+        assert!(last_toast().contains("to the draft of Fix build"));
+        assert_eq!(threads(), 1);
+
+        // The selection, from the same page.
+        view.set_selected_page(&local);
+        // VTE puts a selection on the primary clipboard, which it has only once realized.
+        assert!(pump_until(&ctx, 5, || terminal.is_mapped()));
+        terminal.select_all();
+        assert!(pump_until(&ctx, 5, || terminal.has_selection()));
+        imp.refresh_send_actions(None);
+        assert!(enabled("send-selection"));
+        send("send-selection");
+        assert!(imp.is_selected(&thread_page));
+        assert_eq!(chat.draft().matches(PAGE_LABEL).count(), 2);
+
+        // A page on another machine: its text goes under that label, redacted, and with no
+        // prompt above the cursor it says it took the last lines instead.
+        imp.add_remote_terminal_tab(crate::window::imp::RemoteTab {
+            alias: "box.example".into(),
+            dir: "~/src".into(),
+        });
+        let remote = view.selected_page().expect("the remote page is shown");
+        let remote_terminal = terminal_of(&remote).expect("registered");
+        let secret = format!("ghp_{}", "a1B2c3D4e5".repeat(4));
+        remote_terminal.feed(format!("export GITHUB_TOKEN={secret}\r\n$ ").as_bytes());
+        assert!(pump_until(&ctx, 5, || remote_terminal.cursor_position() == (2, 1)));
+        imp.refresh_send_actions(Some(&menu));
+        assert_eq!(labels(&menu)[1], "Send Last Output to “Fix build”");
+        send("send-last-output");
+        let draft = chat.draft();
+        assert!(draft.contains(REMOTE_LABEL));
+        assert!(draft.contains("GITHUB_TOKEN=****"));
+        assert!(!draft.contains(&secret), "the secret reached the draft");
+        assert!(last_toast().contains("No earlier prompt was found"));
+
+        // The thread closed: its key is forgotten, the page's actions are disabled and say so,
+        // and a send opens nothing.
+        view.close_page(&thread_page);
+        assert!(pump_until(&ctx, 10, || imp.page_of_thread(&id).is_none()));
+        assert_eq!(imp.last_chat_key.get(), None);
+        view.set_selected_page(&local);
+        imp.refresh_send_actions(Some(&menu));
+        assert!(!enabled("send-selection") && !enabled("send-last-output"));
+        assert_eq!(labels(&menu), hint);
+        send("send-last-output");
+        send("send-selection");
+        crate::testutil::settle(&ctx);
+        assert_eq!(threads(), 0, "no thread is opened for a send");
+        assert!(imp.is_selected(&local));
+
+        // An untitled thread is named as the sidebar names it. A draft keeps it from being
+        // discarded as blank when the page comes back into view.
+        imp.create_chat_thread(NewThread::new(Driver::Claude))
+            .expect("created");
+        let untitled = imp.current_thread().expect("shown");
+        assert!(pump_until(&ctx, 10, || imp
+            .with_chat(&untitled, |c| c.view.is_some())
+            .unwrap_or(false)));
+        let untitled_view = imp
+            .with_chat(&untitled, |c| c.view.clone())
+            .flatten()
+            .unwrap();
+        untitled_view.set_draft("note");
+        view.set_selected_page(&local);
+        imp.refresh_send_actions(Some(&menu));
+        assert_eq!(labels(&menu)[1], "Send Last Output to “New thread”");
+        send("send-last-output");
+        assert!(
+            last_toast().contains("to the draft of New thread"),
+            "{}",
+            last_toast()
+        );
+        window.destroy();
+        crate::testutil::settle(&ctx);
+        crate::window::imp::SPAWN_TERMINAL_PAGES.with(|s| s.set(true));
+    }
+
     /// A switch's new process binds the thread to the profile it was launched on when it starts,
     /// once; the outgoing agent's closing events never do, nor does a process started on the
     /// thread's own profile (a rollback, the old agent started again after a refused move).

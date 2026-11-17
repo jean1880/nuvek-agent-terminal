@@ -613,14 +613,17 @@ shortcut.
 - **Finding the last output.** The terminal does not mark prompts, so the app guesses: the
   prompt is the text left of the cursor, up to its first prompt sign (`$`, `#`, `%`, `>`,
   `❯` or `»` followed by a space), and the output starts at the nearest line above that begins
-  the same way. Empty prompts (Enter pressed with nothing typed) are skipped. The last 1,000 rows
+  the same way, with a space or nothing after the sign (so output such as `$PATH`, `#include` or
+  `>>>` is not taken for a prompt). Empty prompts (Enter pressed with nothing typed) are skipped. The last 1,000 rows
   are searched. With no match (a prompt that shows the time or another folder, a cleared
   screen, a full-screen program such as an editor, a command still running) up to the last 60
   lines are sent instead, and the toast says so. A prompt over two lines matches on its last line, so
   its first line comes along at the end.
 - Escape sequences and control characters are removed. A carriage return becomes a line break,
   so text an overwrite would hide stays visible.
-- The text is redacted before it is cut. Masking is best-effort: a secret in a format the
+- The text is redacted before it is cut. A very long selection is first cut to its end at a
+  line break, and when that falls inside a private key block (`-----BEGIN …`), the rest of the
+  block is dropped too, so no part of it is sent. Masking is best-effort: a secret in a format the
   redaction does not know can remain, so read the draft before sending.
 - At most the last 200 lines and 12,000 characters are kept, whichever limit is reached first,
   with a `[... N earlier lines omitted ...]` line first. The limits are fixed.

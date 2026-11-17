@@ -1298,6 +1298,14 @@ fn launch_uri(parent: &gtk4::Widget, uri: &str, what: &str) {
     );
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Whether a terminal page starts its shell (or `ssh`). Tests that only need the page turn
+    /// it off, so no shell of the user's and no connection to another machine is started.
+    pub(super) static SPAWN_TERMINAL_PAGES: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(true) };
+}
+
 thread_local! {
     /// The process's one copy of the settings. GTK is single-threaded, so
     /// thread-local is process-wide in practice.
@@ -2847,6 +2855,11 @@ impl AgentTerminalWindow {
                     imp.tabs.take().into_iter().partition(|t| &t.page == page);
                 imp.tabs.replace(staying);
                 for tab in &leaving {
+                    // A terminal page here no longer sends to a thread that left (closed, or
+                    // moved to another window, whose keys are its own).
+                    if imp.last_chat_key.get() == Some(tab.key) {
+                        imp.last_chat_key.set(None);
+                    }
                     // A popped-out diff panel goes back into its place, which leaves (or
                     // travels to another window) with the page.
                     tab.diff_panel.dock();
@@ -3775,7 +3788,12 @@ impl AgentTerminalWindow {
             remote: remote.clone(),
         });
 
+        #[cfg(test)]
+        let spawn = SPAWN_TERMINAL_PAGES.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let spawn = true;
         match &remote {
+            _ if !spawn => stack.set_visible_child_name("terminal"),
             Some(remote) => self.spawn_remote_session(&terminal, &stack, remote, &work_dir),
             None => self.spawn_session(&terminal, &stack, profile, &work_dir, launch),
         }
@@ -4173,15 +4191,18 @@ impl AgentTerminalWindow {
     }
 
     /// Opens a terminal's context menu, with the terminal focused (a right click does not
-    /// always move focus first) and the actions that depend on it brought up to date.
+    /// always move focus first) and the actions that depend on it brought up to date. The window
+    /// is the one the terminal is in now, found when the menu opens: its page may have been moved
+    /// to another window since it was made.
     fn popup_terminal_menu(
-        win: &super::AgentTerminalWindow,
         terminal: &Terminal,
         popover: &gtk4::PopoverMenu,
         send: &gtk4::gio::Menu,
     ) {
         terminal.grab_focus();
-        win.imp().refresh_send_actions(Some(send));
+        if let Some(win) = window_of(terminal) {
+            win.imp().refresh_send_actions(Some(send));
+        }
         popover.popup();
     }
 
@@ -4272,7 +4293,6 @@ impl AgentTerminalWindow {
         remote: bool,
         send: &gtk4::gio::Menu,
     ) {
-        let win = self.obj().clone();
         let popover = gtk4::PopoverMenu::builder()
             .menu_model(menu)
             .has_arrow(false)
@@ -4294,14 +4314,12 @@ impl AgentTerminalWindow {
             #[weak]
             terminal,
             #[weak]
-            win,
-            #[weak]
             send,
             move |gesture, _, x, y| {
                 gesture.set_state(gtk4::EventSequenceState::Claimed);
                 let rect = gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
                 popover.set_pointing_to(Some(&rect));
-                Self::popup_terminal_menu(&win, &terminal, &popover, &send);
+                Self::popup_terminal_menu(&terminal, &popover, &send);
             }
         ));
         terminal.add_controller(click_gesture);
@@ -4316,8 +4334,6 @@ impl AgentTerminalWindow {
             #[weak]
             terminal,
             #[weak]
-            win,
-            #[weak]
             send,
             #[upgrade_or]
             glib::Propagation::Proceed,
@@ -4328,7 +4344,7 @@ impl AgentTerminalWindow {
                     return glib::Propagation::Proceed;
                 }
                 popover.set_pointing_to(None);
-                Self::popup_terminal_menu(&win, &terminal, &popover, &send);
+                Self::popup_terminal_menu(&terminal, &popover, &send);
                 glib::Propagation::Stop
             }
         ));
@@ -4341,14 +4357,12 @@ impl AgentTerminalWindow {
             #[weak]
             terminal,
             #[weak]
-            win,
-            #[weak]
             send,
             move |gesture, x, y| {
                 gesture.set_state(gtk4::EventSequenceState::Claimed);
                 let rect = gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
                 popover.set_pointing_to(Some(&rect));
-                Self::popup_terminal_menu(&win, &terminal, &popover, &send);
+                Self::popup_terminal_menu(&terminal, &popover, &send);
             }
         ));
         terminal.add_controller(long_press);
@@ -7708,7 +7722,8 @@ impl AgentTerminalWindow {
                 let chat = t.chat.as_ref()?;
                 Some(SendTarget {
                     view: chat.view.clone()?,
-                    title: chat.title.clone(),
+                    // An untitled thread is named as the sidebar names it.
+                    title: crate::window::sidebar_model::display_title(&chat.title).to_owned(),
                     page: t.page.clone(),
                 })
             });
@@ -8312,13 +8327,15 @@ const SEND_MENU_TITLE_MAX: usize = 32;
 
 /// The two send entries of a terminal's menu: to "Thread" from a drawer, to the thread's title
 /// from a terminal page, and from a page with nowhere to send, a hint to open a thread first.
-/// A title's underscores are doubled, since a menu label reads one as a mnemonic, and control
-/// characters become spaces.
+/// A title's underscores are doubled, since a menu label reads one as a mnemonic, control
+/// characters become spaces, and bidirectional and zero-width characters are dropped, so a title
+/// cannot reorder or hide the rest of the label.
 fn send_menu_labels(from: Option<SendFrom>, target_title: Option<&str>) -> [String; 2] {
     let to = match (from, target_title) {
         (Some(SendFrom::Page), Some(title)) => {
             let clean: String = title
                 .chars()
+                .filter(|c| !agent_core::text::is_bidi_or_zero_width(*c))
                 .map(|c| if c.is_control() { ' ' } else { c })
                 .collect();
             let clean = clean.trim();
@@ -8348,11 +8365,9 @@ fn send_menu_labels(from: Option<SendFrom>, target_title: Option<&str>) -> [Stri
 /// rows above the cursor, on the main thread, as the quota watcher does.
 fn last_output_text(terminal: &Terminal) -> (String, bool) {
     use agent_core::terminal_excerpt::{last_output_range, LAST_OUTPUT_SCAN_ROWS};
-    let (col, row) = terminal.cursor_position();
+    let (_, row) = terminal.cursor_position();
     let columns = terminal.column_count();
-    let (cursor_line, _) = terminal.text_range_format(Format::Text, row, 0, row, columns);
-    let cursor_line = cursor_line.map(|t| t.to_string()).unwrap_or_default();
-    let cursor_line = cursor_line.trim_end_matches('\n');
+    let before = text_before_cursor(terminal);
     let scan = i64::try_from(LAST_OUTPUT_SCAN_ROWS).unwrap_or(i64::MAX);
     let start = row.saturating_sub(scan).max(0);
     let above = if row > 0 {
@@ -8369,8 +8384,27 @@ fn last_output_text(terminal: &Terminal) -> (String, bool) {
         // The window may start inside a wrapped line: only whole lines go on to redaction.
         rows.remove(0);
     }
-    let found = last_output_range(&rows, cursor_line, usize::try_from(col).unwrap_or(0));
+    let found = last_output_range(&rows, &before);
     (rows[found.range].join("\n"), found.fell_back)
+}
+
+/// The cursor row's text up to the cursor, as the terminal lays it out. The cursor column counts
+/// cells, not characters (a wide glyph takes two, a combining mark none, a tab up to eight), so
+/// the terminal is asked for the cells before it rather than the line being cut by a count.
+/// Empty with the cursor in the first column.
+///
+/// The range ends at the cursor's own column: VTE stops before it (an end column one less drops
+/// the cell just left of the cursor, which can be the prompt sign). Were the end included, the
+/// one more cell would be the cell under the cursor, blank at a prompt, and a prompt is cut at
+/// its sign anyway.
+fn text_before_cursor(terminal: &Terminal) -> String {
+    let (col, row) = terminal.cursor_position();
+    if col <= 0 {
+        return String::new();
+    }
+    let (text, _) = terminal.text_range_format(Format::Text, row, 0, row, col);
+    text.map(|t| t.trim_end_matches('\n').to_owned())
+        .unwrap_or_default()
 }
 
 /// The toast after a block went into `thread`'s draft: the lines, any masking and any cut, and
@@ -8523,6 +8557,76 @@ mod tests {
             text.starts_with("$ ls\n") && text.contains("error: two\n") && text.ends_with("plain"),
             "{text:?}"
         );
+
+        // A new terminal in the window, fed `bytes`, with the cursor waited for at `(col, row)`.
+        // A new one each time: a reset does not number its rows from 0 again.
+        let fresh = |bytes: &[u8], at: (i64, i64)| {
+            let terminal = Terminal::new();
+            terminal.set_scrollback_lines(5_000);
+            window.set_child(Some(&terminal));
+            assert!(pump_until(&ctx, 5, || terminal.is_mapped()));
+            terminal.feed(bytes);
+            assert!(
+                pump_until(&ctx, 5, || terminal.cursor_position() == at),
+                "{:?}",
+                terminal.cursor_position()
+            );
+            terminal
+        };
+        // The text before the cursor is the cells left of it, the last one included.
+        assert_eq!(text_before_cursor(&fresh(b"$ ab", (4, 0))), "$ ab");
+        assert_eq!(text_before_cursor(&fresh(b"", (0, 0))), "");
+        // The cursor on row 0: nothing above it, said as a fallback.
+        assert_eq!(
+            last_output_text(&fresh(b"$ ", (2, 0))),
+            (String::new(), true)
+        );
+        // Wide glyphs take two cells and a combining mark none: the prompt sign is still found.
+        let t = fresh("日本$ ls\r\nout\r\n日本$ ".as_bytes(), (6, 2));
+        assert_eq!(last_output_text(&t), ("日本$ ls\nout".to_owned(), false));
+        let t = fresh("e\u{301}$ ls\r\nout\r\ne\u{301}$ ".as_bytes(), (3, 2));
+        assert_eq!(
+            last_output_text(&t),
+            ("e\u{301}$ ls\nout".to_owned(), false)
+        );
+        // An output line that only starts with the sign is not a prompt.
+        let t = fresh(b"$ env\r\n$PATH\r\n$ ", (2, 2));
+        assert_eq!(last_output_text(&t), ("$ env\n$PATH".to_owned(), false));
+
+        // More rows than the scan reads: the window starts past row 0 and its first (perhaps
+        // partial) line is dropped, but a prompt inside it is still found.
+        let scan = agent_core::terminal_excerpt::LAST_OUTPUT_SCAN_ROWS;
+        let mut bytes = String::new();
+        for n in 0..200 {
+            bytes.push_str(&format!("old {n}\r\n"));
+        }
+        bytes.push_str("$ make\r\n");
+        let run = scan - 50;
+        for n in 0..run {
+            bytes.push_str(&format!("out {n}\r\n"));
+        }
+        bytes.push_str("$ ");
+        let t = fresh(bytes.as_bytes(), (2, i64::try_from(200 + 1 + run).unwrap()));
+        let (text, fell_back) = last_output_text(&t);
+        assert!(!fell_back);
+        assert!(text.starts_with("$ make\nout 0\n"), "{:?}", &text[..40]);
+        assert!(text.ends_with(&format!("out {}", run - 1)));
+        // With no prompt inside the window: the last 60 lines, said so.
+        let mut bytes = String::from("$ make\r\n");
+        let run = scan + 100;
+        for n in 0..run {
+            bytes.push_str(&format!("out {n}\r\n"));
+        }
+        bytes.push_str("$ ");
+        let t = fresh(bytes.as_bytes(), (2, i64::try_from(1 + run).unwrap()));
+        let (text, fell_back) = last_output_text(&t);
+        assert!(fell_back);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            agent_core::terminal_excerpt::LAST_OUTPUT_FALLBACK_LINES
+        );
+        assert_eq!(lines.last(), Some(&format!("out {}", run - 1).as_str()));
         window.destroy();
         crate::testutil::settle(&ctx);
     }
@@ -8555,6 +8659,12 @@ mod tests {
         let [sel, _] = send_menu_labels(Some(SendFrom::Page), Some(&long));
         assert_eq!(sel, format!("Send Selection to “{}…”", "a".repeat(31)));
         let [sel, _] = send_menu_labels(Some(SendFrom::Page), Some("  "));
+        assert_eq!(sel, "Send Selection to Thread");
+        // Bidi controls and zero-width characters are dropped: they could reorder or hide the
+        // rest of the label.
+        let [sel, _] = send_menu_labels(Some(SendFrom::Page), Some("fix\u{202e}dliub\u{200b}"));
+        assert_eq!(sel, "Send Selection to “fixdliub”");
+        let [sel, _] = send_menu_labels(Some(SendFrom::Page), Some("\u{2066}\u{feff}"));
         assert_eq!(sel, "Send Selection to Thread");
     }
 

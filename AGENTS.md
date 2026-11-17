@@ -344,7 +344,8 @@ Architectural mandates, standards, and workflows for this codebase.
   the expanded text only fills the draft, never sends, and is then the user's own prompt.
   Terminal text sent to a thread ("Send Selection" or "Send Last Output", from a drawer or a
   terminal page, a remote one included) goes through `terminal_excerpt::format_excerpt`: only
-  whole lines reach redaction, before any cut, and it stays fenced under its "data, not
+  whole lines reach redaction, before any cut, never the tail of a PEM block whose BEGIN line
+  the raw bound cut off (the rest of such a block is dropped), and it stays fenced under its "data, not
   instructions" label. It only fills a draft, never sends, and a terminal page's target is the
   thread last shown in its window (`last_chat_key`), never one opened for it; with none the
   actions are disabled.

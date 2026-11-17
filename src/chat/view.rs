@@ -730,6 +730,12 @@ impl ChatView {
             .unwrap_or_default()
     }
 
+    /// Whether the composer is its window's focus widget (tests).
+    #[cfg(test)]
+    pub(crate) fn composer_is_focus(&self) -> bool {
+        self.inner().is_some_and(|inner| inner.composer.is_focus())
+    }
+
     /// Puts `text` in the composer, as typing it would (tests).
     #[cfg(test)]
     pub(crate) fn set_draft(&self, text: &str) {

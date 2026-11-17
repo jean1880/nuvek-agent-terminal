@@ -366,6 +366,12 @@ impl Composer {
         self.view.grab_focus();
     }
 
+    /// Whether the text view is its window's focus widget (tests).
+    #[cfg(test)]
+    pub fn is_focus(&self) -> bool {
+        self.view.is_focus()
+    }
+
     /// The popover is parented to the text view and must be unparented before it goes.
     pub fn dispose(&self) {
         self.cancel_file_timer();

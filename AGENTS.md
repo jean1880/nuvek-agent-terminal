@@ -93,7 +93,14 @@ Architectural mandates, standards, and workflows for this codebase.
     `terminal_excerpt` (terminal text for a thread's draft: control bytes stripped, redacted
     before it is cut to 200 lines and 12,000 characters, fenced under a label naming its
     `Source`, and `last_output_range`, the last-output heuristic, which says when it fell
-    back).
+    back) and `compare`
+    (two to four transcripts read side by side, whatever made them: each column a list of
+    `Entry`s from a `Side`, a thread and the sequence number after which it counts; `table`
+    lines them up by turn, a turn being a prompt and what follows it, with an `Earlier` row for
+    what came before a column's first prompt; summaries and the text cap) and `fork_compare`
+    (a fork's `ForkLink`, its source's id and last stored seq at the fork, read leniently; and
+    `pairings`: a thread pairs with its source, its forks and its source's other forks, a fork of
+    a fork with its own source only, never a thread that is gone).
   - `crates/agent-kit` (GTK-free; blocking process and file I/O): `git`
     (git plumbing for turn checkpoints and diffs: shells out, but its parsers
     and filters are pure), `diff` (diff bases, numstat, line classification,
@@ -188,6 +195,14 @@ Architectural mandates, standards, and workflows for this codebase.
     in order so the last list wins; `Store::review_drafts` is read through `store_job` when a
     thread's diff panel is first bound to it, and nothing is written until that read has
     answered (a failed read leaves the stored list alone).
+    `store/compare.rs` reads what a comparison needs: `ThreadAttributes::fork` is the `meta` key
+    `thread_fork:<thread>` (in `thread_meta_keys`, so it goes with its thread; written only by
+    Fork thread and `/fork`, never a compaction, a continuation or a switch, inside
+    `create_thread_record`), `Store::transcript_at_fork` takes the hand-off's transcript and the
+    fork point in one read, `Store::fork_pairings` names only threads that exist and are not
+    hidden, and `Store::compare_columns` folds each side as a hand-off reads it (no reasoning,
+    notices or inherited context) after its point, all in one read; each a read through
+    `store_job`.
   - The app (`src/`): `config.rs` (persisted settings + migration, re-exporting
     `SessionFormat`; per-agent defaults live on the profiles), `theme.rs`
     (colour schemes, infallible `RGBA::new`), `utils.rs` (detection and
@@ -217,7 +232,13 @@ Architectural mandates, standards, and workflows for this codebase.
     `sidebar_model::snippet_markup`, which escapes every character and makes only the match
     markers bold), `window/sidebar_model.rs` (pure sidebar logic: sections, the `SearchQuery`
     filter on titles, folders and tags, tag chips and the Tags dialog's choices),
-    `window/imp/commit.rs` (the diff panel's commit dialog and flow), `window/diff_panel.rs` (the
+    `window/imp/commit.rs` (the diff panel's commit dialog and flow), `window/compare.rs` (the
+    compare window: an `adw::Window` of its own, never a page or a `TabState`, that only reads;
+    it holds itself until closed or destroyed with its parent, so no caller keeps it;
+    a spinner until its first read, a generation so only the newest read draws, Refresh, replies
+    as guarded markdown; it knows nothing of forks), `window/imp/fork_compare.rs` (Compare with
+    Fork…, `/compare` and the fork toast's Compare: the pairings and the picker, then each
+    column read through `store_job`), `window/diff_panel.rs` (the
     diff panel's widgets, its file tick boxes, "Commit…" and "Open a PR" bars; it pops out into
     its own window, keeping its
     place, hidden, as its identity, and docks back when that window closes or its page leaves;

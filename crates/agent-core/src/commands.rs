@@ -87,6 +87,8 @@ pub enum BuiltinAction {
     Compact,
     Handoff,
     Fork,
+    /// `/compare`: read this thread beside a fork of it (or its source) in a window.
+    CompareForks,
     /// `/mode plan|default|accept-edits`; the UI parses the argument.
     SetMode,
     OpenUsage,
@@ -130,6 +132,7 @@ impl Builtin {
             BuiltinAction::Compact
             | BuiltinAction::Handoff
             | BuiltinAction::Fork
+            | BuiltinAction::CompareForks
             | BuiltinAction::SetMode
             | BuiltinAction::Rewind
             | BuiltinAction::NewThread
@@ -138,7 +141,7 @@ impl Builtin {
     }
 }
 
-static BUILTINS: [Builtin; 12] = [
+static BUILTINS: [Builtin; 13] = [
     Builtin {
         name: "model",
         aliases: &[],
@@ -180,6 +183,13 @@ static BUILTINS: [Builtin; 12] = [
         description: "Branch the thread from this turn",
         hint: None,
         action: BuiltinAction::Fork,
+    },
+    Builtin {
+        name: "compare",
+        aliases: &[],
+        description: "Compare this thread with a fork, side by side",
+        hint: None,
+        action: BuiltinAction::CompareForks,
     },
     Builtin {
         name: "mode",
@@ -696,8 +706,8 @@ mod tests {
         assert_eq!(
             all,
             [
-                "model", "mcp", "config", "compact", "handoff", "fork", "mode", "usage", "context",
-                "rewind", "clear", "help"
+                "model", "mcp", "config", "compact", "handoff", "fork", "compare", "mode", "usage",
+                "context", "rewind", "clear", "help"
             ]
         );
     }

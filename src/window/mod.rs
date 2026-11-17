@@ -1,5 +1,6 @@
 //! Main window implementation for Agent Terminal.
 
+pub(crate) mod compare;
 mod diff_panel;
 mod imp;
 mod loading;

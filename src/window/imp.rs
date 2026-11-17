@@ -8,6 +8,7 @@ mod diff_prefs;
 mod diffs;
 mod editor_prefs;
 mod environment_review;
+mod fork_compare;
 mod pack_animation;
 mod remote;
 mod setup;
@@ -9178,6 +9179,7 @@ mod tests {
         super::super::diff_panel::tests::the_panel_pops_out_docks_and_offers_a_pr(
             window.upcast_ref(),
         );
+        super::super::compare::tests::the_window_lines_columns_up_by_turn(window.upcast_ref());
         super::super::diff_panel::tests::the_commit_bar_follows_the_view_and_the_ticks();
         super::super::diff_panel::tests::comments_are_kept_anchored_and_sent_as_one_review();
         super::super::diff_panel::tests::review_rows_budget_and_loading();
@@ -10064,6 +10066,7 @@ mod tests {
         spending::tests::the_spending_dialog_shows_and_keeps_what_turns_cost(window);
         spending::tests::the_spending_group_saves_only_valid_amounts(window);
         spending::tests::a_metered_turn_warns_once_through_the_window(window);
+        fork_compare::tests::a_fork_is_linked_and_compared_side_by_side(window);
     }
 
     /// A folder outside any repository has nothing to diff: no Changes toggle, no shortcut.

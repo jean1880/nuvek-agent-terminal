@@ -1991,4 +1991,55 @@ mod tests {
         assert!(s.delete_thread(&child_thread).is_err());
         assert!(s.delete_thread(&root_thread).is_err());
     }
+
+    /// A worker's hidden backing thread is never offered for comparison: not as a fork of a
+    /// visible thread, not as the source of one, not as a sibling.
+    #[test]
+    fn a_hidden_child_thread_is_never_offered_for_comparison() {
+        use agent_core::fork_compare::{ForkLink, Relation};
+        let Tree {
+            s,
+            root_thread,
+            child_thread,
+        } = tree();
+        let link = |source: &str| {
+            ForkLink {
+                source_thread: source.to_owned(),
+                fork_seq: 0,
+            }
+            .to_json()
+        };
+        // The hidden thread as a fork of the root, beside a visible fork of the root.
+        s.set_meta(
+            &super::super::thread_fork_key(&child_thread),
+            &link(&root_thread),
+        )
+        .expect("link");
+        let visible = s.create_thread("/w", Some("visible fork")).expect("t");
+        s.set_meta(
+            &super::super::thread_fork_key(&visible),
+            &link(&root_thread),
+        )
+        .expect("link");
+        // And as the source of another visible thread.
+        let from_hidden = s.create_thread("/w", Some("from hidden")).expect("t");
+        s.set_meta(
+            &super::super::thread_fork_key(&from_hidden),
+            &link(&child_thread),
+        )
+        .expect("link");
+        let offered = |t: &str| -> Vec<(String, Relation)> {
+            s.fork_pairings(t)
+                .expect("pairings")
+                .into_iter()
+                .map(|p| (p.other, p.relation))
+                .collect()
+        };
+        assert_eq!(offered(&root_thread), [(visible.clone(), Relation::Fork)]);
+        assert_eq!(offered(&visible), [(root_thread.clone(), Relation::Source)]);
+        assert!(
+            offered(&from_hidden).is_empty(),
+            "a hidden source is never offered"
+        );
+    }
 }

@@ -387,9 +387,11 @@ impl Chrome {
         }
     }
 
-    /// The secondary text colours (soft, dim, faint) lifted to [`MIN_TEXT_CONTRAST`] on every
-    /// surface text is drawn on, each moved toward the body text only as far as it must (toward
-    /// the strong text where even the body text falls short), so their order is kept.
+    /// The secondary text colours (soft, dim, faint) and the body text lifted to
+    /// [`MIN_TEXT_CONTRAST`] on every surface text is drawn on, each moved toward the body text
+    /// only as far as it must (toward the strong text where even the body text falls short), so
+    /// their order is kept. The body text itself moves toward the strong text only as far as it
+    /// must, last, so a scheme whose own text reads on every surface keeps it.
     fn with_readable_text(mut self) -> Chrome {
         let grounds = [self.bg, self.surface, self.surface_raised];
         let lift = |c: Rgb| {
@@ -403,6 +405,9 @@ impl Chrome {
         self.fg_soft = lift(self.fg_soft);
         self.fg_dim = lift(self.fg_dim);
         self.fg_faint = lift(self.fg_faint);
+        self.fg = self
+            .fg
+            .readable_on_all(&grounds, self.fg_strong, MIN_TEXT_CONTRAST);
         self
     }
 
@@ -1278,7 +1283,7 @@ mod tests {
                 ThemeChoice::SolarizedDark,
                 [
                     "002b36", "002029", "002731", "052f39", "09323d", "192c3f", "352e49", "1e2d41",
-                    "332e48", "542f54", "c7cfd0", "839496", "8a9a9c", "8a9a9c", "8a9a9c", "d33682",
+                    "332e48", "542f54", "c7cfd0", "8a9a9c", "8a9a9c", "8a9a9c", "8a9a9c", "d33682",
                     "dc5e9b", "859900", "b0bd59", "b58900", "c8a740", "dc322f", "e35b59", "f1adac",
                     "1f2c35", "5c2e33", "268bd2",
                 ],
@@ -1310,6 +1315,30 @@ mod tests {
                 .map(|(_, v)| v.hex()[1..].to_owned())
                 .collect();
             assert_eq!(got, expected, "{choice}");
+        }
+    }
+
+    /// A dark scheme's body and strong text read at AA on every surface text is drawn on.
+    #[test]
+    fn every_dark_theme_body_text_reads_on_every_surface() {
+        for choice in ThemeChoice::ALL {
+            if choice.is_light() != Some(false) {
+                continue;
+            }
+            let c = Chrome::for_choice(choice).expect("bundled");
+            for (role, text) in [("fg", c.fg), ("fg_strong", c.fg_strong)] {
+                for (ground, bg) in [
+                    ("bg", c.bg),
+                    ("surface", c.surface),
+                    ("raised", c.surface_raised),
+                ] {
+                    let ratio = text.contrast(bg);
+                    assert!(
+                        ratio >= MIN_TEXT_CONTRAST,
+                        "{choice}: {role} on {ground} at {ratio:.2}:1"
+                    );
+                }
+            }
         }
     }
 

@@ -9125,6 +9125,22 @@ pub(super) mod tests {
         window.present();
         assert!(pump_until(&ctx, 5, || window.is_realized()));
         let imp = window.imp();
+        // The pages are drawn in the shell, which detection shows only when it finds an agent
+        // CLI; without one (as on CI) it ends on the welcome screen and the shell is never
+        // mapped. Wait for detection to settle on either, then show the shell.
+        let boot = || {
+            imp.boot
+                .borrow()
+                .as_ref()
+                .and_then(|b| b.visible_child_name())
+                .map(|n| n.to_string())
+        };
+        assert!(pump_until(&ctx, 20, || !imp.detecting.get()
+            && matches!(boot().as_deref(), Some("ready" | "welcome"))));
+        if boot().as_deref() != Some("ready") {
+            imp.finish_shell(None);
+            imp.reveal_shell();
+        }
         let obj = imp.obj().clone();
         let enabled = |name: &str| obj.lookup_action(name).is_some_and(|a| a.is_enabled());
         let send = |name: &str| {

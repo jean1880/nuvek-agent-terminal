@@ -42,6 +42,7 @@ mod model_catalog;
 mod model_tags_file;
 mod palette;
 mod probe;
+mod review_popover;
 mod style;
 mod support;
 mod tag_edit;

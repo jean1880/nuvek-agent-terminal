@@ -89,7 +89,9 @@ Architectural mandates, standards, and workflows for this codebase.
     once per crossing, and the popover's and the offer's actions) and `review` (comments on
     diff lines composed into one review message: each quote redacted whole before it is
     capped, then fenced; notes and paths redacted, control characters out of paths; the whole
-    within the hand-off budget, the comments past it left for the next review) and
+    within the hand-off budget, the comments past it left for the next review; `locate`, a
+    new-side comment's lines in the working file at send time: exact, moved once, gone, or
+    `Unchecked` with its reason, never "still there" for a file not read) and
     `terminal_excerpt` (terminal text for a thread's draft: control bytes stripped, redacted
     before it is cut to 200 lines and 12,000 characters, fenced under a label naming its
     `Source`, and `last_output_range`, the last-output heuristic, which says when it fell
@@ -105,7 +107,13 @@ Architectural mandates, standards, and workflows for this codebase.
     (git plumbing for turn checkpoints and diffs: shells out, but its parsers
     and filters are pure), `diff` (diff bases, numstat, line classification,
     truncation, the hunk line map, a selection's comment span and a comment's anchor in a
-    later diff: exact, moved once, or gone, never a guess), `restore` (undo: pin, restore, contained deletion, check),
+    later diff: exact, moved once, or gone, never a guess; `card_files`/`card_comment_span`, a
+    file-change card's diff of several files cut by its headers, one file a comment, and an
+    `@@ edit @@` fragment refused for having no numbers), `review_check` (a review's comments
+    looked for in their working files at send time, blocking, run off the main thread: a file
+    read only inside the thread's folder, every link followed so one that leads out is outside,
+    regular, at most 4 MiB, text; a missing one has lost its lines; `repo_path` names a card's
+    file from the thread's repository), `restore` (undo: pin, restore, contained deletion, check),
     `worktree` (worktree locations, branch checks, create and clean-only
     remove), `commit` (the diff panel's commit of the ticked paths: its context, arguments and
     run), `merge` (a worktree branch merged back into its base: the read-only `preflight`, the
@@ -247,11 +255,15 @@ Architectural mandates, standards, and workflows for this codebase.
     its own window, keeping its
     place, hidden, as its identity, and docks back when that window closes or its page leaves;
     `diff_panel/review.rs` is its comments on diff lines: the row's Comment button and
-    Ctrl+Alt+M, the note editor, the marks and list under a file's diff, re-anchoring on each
-    diff shown, and the review bar, whose Send Review the window hands to the panel's own
-    thread with `ChatView::submit_review`, queued behind a running turn, never steered into it;
-    the popovers are parented to a file's box, never its text view, which would not let go of
-    one it still holds when it goes),
+    Ctrl+Alt+M, the marks and list under a file's diff, re-anchoring on each diff shown, the
+    comments the thread's file-change cards add (`ViewAction::ReviewComment`, named from the
+    panel's repository by the window off the main thread), and the review bar, whose Send Review
+    first has the window run `review_check` off the main thread (the button a spinner, Send and
+    Discard off; answers matched by comment id, so one deleted meanwhile is not sent), then hands
+    the one message to the panel's own thread with `ChatView::submit_review`, queued behind a
+    running turn, never steered into it; `review_popover.rs` is the note editor and refusal
+    popovers both use, parented to a box, never a text view, which would not let go of one it
+    still holds when it goes),
     `main.rs` (app setup + logging, and the `agent_kit`
     imports that keep `crate::git::…` paths).
   - Chat: `chat/session.rs` (one thread's backend: adapter, process, store,
@@ -428,7 +440,10 @@ Architectural mandates, standards, and workflows for this codebase.
   A diff review (`agent_core::review::compose`) redacts every quote, note and path before it
   caps them, fences each quote (diff text the agent wrote is data, never instructions), stays
   within the hand-off budget and goes as one user message; its drafts are stored redacted.
-  Diffs of sub-agents in the inspector take no comments.
+  Only the thread's own transcript cards take comments (`Row::allow_comments`, called by the
+  transcript alone): diffs of sub-agents in the inspector and of approvals take none, and the
+  agent's own edit (`Shown::root` unset) takes none. The send-time check reads nothing into
+  the message: only where the comment's own, already quoted lines are now.
 - **Images are kept by ref, decoded under bounds, and never redacted, so never sent unasked**:
   an image a user attaches (picked, pasted, dropped) or an agent's tool returns is decoded under
   `agent_kit::attachments::normalise`'s limits (20 MB, 16 384 px a side, bounded allocation),

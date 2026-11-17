@@ -101,6 +101,20 @@ pub enum ViewAction {
     /// "Don't suggest these" on the quick-reply chips: the window turns the setting off, which
     /// applies at once, and says where it turns back on.
     StopQuickReplies,
+    /// A comment written on one of this thread's file-change cards: the window adds it to the
+    /// thread's review, the one its diff panel's "Send Review" sends.
+    ReviewComment(CardComment),
+}
+
+/// A comment written on a file-change card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardComment {
+    /// The repository root (canonical) the card's diff names its files from.
+    pub root: std::path::PathBuf,
+    /// The file, as the card's diff names it from `root`, and the lines chosen.
+    pub place: agent_kit::diff::CardSpan,
+    /// What the user wrote.
+    pub note: String,
 }
 
 /// What a gauge popover action runs: a built-in command, or something for the window.
@@ -1618,6 +1632,7 @@ impl Inner {
                 self.emit(ViewAction::StopQuickReplies);
             }
             RowEvent::LoadDiff { id } => self.load_diff(&id),
+            RowEvent::ReviewComment(comment) => self.emit(ViewAction::ReviewComment(comment)),
             RowEvent::OpenDiff { id } => {
                 let source = self.diffs.borrow().clone();
                 if let (Some(source), Some(ask)) = (source, self.diff_ask(&id)) {
@@ -2460,6 +2475,7 @@ pub(crate) mod tests {
             quoted: vec!["+a".into(), "+b".into()],
             note: "Split this.".into(),
             located: agent_core::review::Located::Exact,
+            checked: None,
         }])
         .text;
         for driver in Driver::ALL {
@@ -2489,6 +2505,175 @@ pub(crate) mod tests {
             assert!(view.submit_review("  ").is_err());
             assert_eq!(backend.routes.borrow().len(), 3);
         }
+    }
+
+    /// A thread's file-change card takes a comment on lines of its diff: "Comment" follows the
+    /// selection, header rows are refused with the reason, and the saved note goes to the window
+    /// as the thread's review comment, naming the file, its lines and the repository the diff
+    /// was taken in. The agent's own edit (no repository) and an approval's diff take none.
+    #[test]
+    #[ignore = "presents a window; run on a private display"]
+    fn a_cards_comment_goes_to_the_threads_review() {
+        use agent_core::event::ItemKind;
+        use agent_kit::filediff::{Origin, Shown};
+        crate::testutil::gtk_init().expect("GTK init");
+        crate::testutil::adw_init().expect("adw init");
+        let ctx = glib::MainContext::default();
+        let text = "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n\
+                    --- /dev/null\n+++ b/new.rs\n@@ -0,0 +1,2 @@\n+x\n+y\n";
+        let diffs = |root: Option<&str>| {
+            Rc::new(FakeDiffs {
+                asks: RefCell::default(),
+                opened: RefCell::default(),
+                in_editor: RefCell::default(),
+                locations: RefCell::default(),
+                reply: Ok(Shown {
+                    text: text.to_owned(),
+                    origin: Origin::Checkpoint,
+                    omitted_lines: 0,
+                    clipped: false,
+                    files: vec!["src/a.rs".to_owned(), "new.rs".to_owned()],
+                    root: root.map(Into::into),
+                }),
+            })
+        };
+        let backend = StubBackend::new(Driver::Claude);
+        let view = ChatView::new(backend);
+        let window = gtk4::Window::new();
+        window.set_default_size(700, 800);
+        window.set_child(Some(&view));
+        window.present();
+        assert!(crate::testutil::pump_until(&ctx, 5, || view.width() > 0));
+        let actions: Rc<RefCell<Vec<ViewAction>>> = Rc::default();
+        let log = Rc::clone(&actions);
+        view.connect_action(move |a| log.borrow_mut().push(a.clone()));
+        view.set_diff_source(diffs(Some("/w")));
+        let sink = view.sink();
+        let input = serde_json::json!({"file_path": "/w/new.rs", "content": "x\ny\n"});
+        sink(&Envelope::item_started(
+            "edit1",
+            ItemKind::FileChange,
+            "Write",
+            Some(input.clone()),
+            None,
+        ));
+        let inner = view.inner().expect("inner");
+        let with_text = |id: &str, f: &dyn Fn(&difftext::DiffText) -> Option<gtk4::Popover>| {
+            inner
+                .transcript
+                .with_row(id, |row| match row {
+                    cards::Row::Tool(card) => f(card.diff_text()),
+                    _ => None,
+                })
+                .flatten()
+        };
+        let button = |id: &str| {
+            inner
+                .transcript
+                .with_row(id, |row| match row {
+                    cards::Row::Tool(card) => Some(card.diff_text().comment_button()),
+                    _ => None,
+                })
+                .flatten()
+                .expect("a card")
+        };
+        inner.transcript.with_row("edit1", |row| {
+            if let cards::Row::Tool(c) = row {
+                c.click_view_diff();
+            }
+        });
+        let (shown, on, tip) = button("edit1");
+        assert!(shown, "the thread's own card takes comments");
+        assert!(!on, "nothing selected yet");
+        assert_eq!(tip.as_deref(), Some(difftext::SELECT_FIRST));
+        with_text("edit1", &|t| {
+            t.select_rows(10, 11);
+            None
+        });
+        assert!(
+            crate::testutil::pump_until(&ctx, 5, || button("edit1").1),
+            "on once the diff is on screen with a selection"
+        );
+
+        // Header rows alone: the reason, and nothing for the window.
+        with_text("edit1", &|t| {
+            t.select_rows(7, 8);
+            None
+        });
+        let refused = with_text("edit1", &|t| t.comment_on()).expect("a popover");
+        assert_eq!(
+            crate::testutil::label_texts(refused.upcast_ref()),
+            vec!["Select changed or context lines".to_owned()]
+        );
+        refused.popdown();
+
+        // The second file's two added lines.
+        with_text("edit1", &|t| {
+            t.select_rows(10, 11);
+            None
+        });
+        let editor = with_text("edit1", &|t| t.comment_on()).expect("the editor");
+        let root = editor.clone().upcast::<gtk4::Widget>();
+        let entry: gtk4::TextView = crate::testutil::find_first(&root).expect("an entry");
+        entry.buffer().set_text("Name these.");
+        crate::testutil::find_all::<gtk4::Button>(&root)
+            .into_iter()
+            .find(|b| b.label().as_deref() == Some("Save"))
+            .expect("Save")
+            .emit_clicked();
+        let comment = actions
+            .borrow()
+            .iter()
+            .find_map(|a| match a {
+                ViewAction::ReviewComment(c) => Some(c.clone()),
+                _ => None,
+            })
+            .expect("the comment reached the window");
+        assert_eq!(comment.root, std::path::PathBuf::from("/w"));
+        assert_eq!(comment.place.path, "new.rs");
+        assert_eq!(
+            (
+                comment.place.span.side,
+                comment.place.span.start,
+                comment.place.span.end
+            ),
+            (agent_core::review::Side::New, 1, 2)
+        );
+        assert_eq!(comment.place.span.quoted, ["+x", "+y"]);
+        assert_eq!(comment.note, "Name these.");
+
+        // The agent's own account of its edit names no repository: no comment, and why.
+        view.set_diff_source(diffs(None));
+        sink(&Envelope::item_started(
+            "edit2",
+            ItemKind::FileChange,
+            "Write",
+            Some(input),
+            None,
+        ));
+        inner.transcript.with_row("edit2", |row| {
+            if let cards::Row::Tool(c) = row {
+                c.click_view_diff();
+            }
+        });
+        with_text("edit2", &|t| {
+            t.select_rows(10, 11);
+            None
+        });
+        assert!(crate::testutil::pump_until(&ctx, 5, || {
+            button("edit2").2.as_deref() == Some(cards::AGENT_EDIT_NO_COMMENTS)
+        }));
+        assert!(!button("edit2").1);
+        assert!(with_text("edit2", &|t| t.comment_on()).is_none());
+        assert_eq!(
+            actions
+                .borrow()
+                .iter()
+                .filter(|a| matches!(a, ViewAction::ReviewComment(_)))
+                .count(),
+            1
+        );
+        window.close();
     }
 
     /// Transitions ease colour and opacity only: a transitioned size or spacing would relayout the
@@ -5744,6 +5929,7 @@ pub(crate) mod tests {
                 omitted_lines: 0,
                 clipped: false,
                 files: vec!["src/a.rs".to_owned()],
+                root: Some("/w".into()),
             }),
         });
         view.set_diff_source(source.clone());

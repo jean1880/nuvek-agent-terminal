@@ -7638,7 +7638,58 @@ impl AgentTerminalWindow {
                     "Quick replies are off. Turn them back on in Settings, General, Replies.",
                 );
             }
+            ViewAction::ReviewComment(comment) => self.add_card_comment(thread, comment.clone()),
         }
+    }
+
+    /// A comment written on one of `thread`'s file-change cards joins the thread's review, the
+    /// one its diff panel lists and sends. The card's file is named, off the main thread, as the
+    /// panel names files (from the root of the repository the panel shows); a file outside that
+    /// repository takes no comment, and the toast says so.
+    fn add_card_comment(&self, thread: &str, comment: crate::chat::view::CardComment) {
+        let Some((panel, repo)) = self
+            .with_thread_tab(thread, |t| {
+                (t.remote.is_none()).then(|| {
+                    let repo = t
+                        .diff_panel
+                        .shown_repo()
+                        .unwrap_or_else(|| t.repo_dir().into());
+                    (t.diff_panel.clone(), repo)
+                })
+            })
+            .flatten()
+        else {
+            return;
+        };
+        super::bind_review(&panel, thread);
+        let obj = self.obj().downgrade();
+        glib::MainContext::default().spawn_local(async move {
+            let (root, rel) = (comment.root.clone(), comment.place.path.clone());
+            let path = blocking_or(
+                move || {
+                    let top = agent_kit::review_check::toplevel(&repo)?;
+                    agent_kit::review_check::repo_path(&top, &root, &rel)
+                },
+                None,
+            )
+            .await;
+            let Some(obj) = obj.upgrade() else { return };
+            let words = match path {
+                Some(path) => {
+                    match panel.add_card_comment(&path, &comment.place.span, &comment.note) {
+                        Some(n) => format!(
+                            "Added to this thread's review ({}). Send it from the Changes panel.",
+                            crate::window::diff_panel::count_words(n)
+                        ),
+                        None => "The comment could not be added to the review".to_owned(),
+                    }
+                }
+                None => "This file is not in the thread's repository, so the comment was not \
+                         added to its review"
+                    .to_owned(),
+            };
+            obj.imp().show_toast(&words);
+        });
     }
 
     /// A new thread on the same agent and folder, carrying a budgeted, redacted handoff of

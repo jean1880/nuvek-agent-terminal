@@ -11,17 +11,26 @@
 //! panel is bound to its thread, and every change hands the whole list back to be written
 //! (redacted) through the store writer. They are keyed by path, so they survive a refresh and a
 //! change of base; each diff shown re-anchors them (`agent_kit::diff::anchor`), and one whose
-//! lines are not found is kept and flagged "not in this diff".
+//! lines are not found is kept and flagged "not in this diff". Comments made on the thread's
+//! file-change cards join the same list ([`Review::add_from_card`]).
+//!
+//! "Send Review" first has the window look for each new-side comment in its working file, off
+//! the main thread (`agent_kit::review_check`), the button spinning meanwhile; the message then
+//! names the lines where they are now, or says they moved, went, or could not be checked.
 
 use crate::diff::{Anchor, CommentSpan, DiffBase, Located, Side};
+use crate::review_popover::{chosen_rows, note_editor, refusal, selection_rect};
 use crate::theme::DiffColours;
 use adw::prelude::*;
-use agent_core::review::{Composed, ReviewComment};
+use agent_core::review::{Checked, Composed, ReviewComment};
+use agent_kit::review_check::CheckAsk;
 use agent_kit::store::ReviewDraft;
 use gtk4::glib;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+
+pub(super) use crate::review_popover::KEYS_NAME;
 
 /// Tag of the lines a comment is on.
 pub(super) const TAG_COMMENTED: &str = "commented";
@@ -34,9 +43,6 @@ const COMMENTED_ALPHA: f32 = 0.22;
 /// What the bar says, for as long as the panel lives, when the stored drafts could not be read.
 pub(super) const LOAD_FAILED: &str = "Saved comments could not be read; new ones are not saved";
 
-/// The name of the review's own key controllers (a file's view, the note editor).
-pub(super) const KEYS_NAME: &str = "diff-review-keys";
-
 /// What "Comment" says while it cannot be pressed.
 pub(super) const SELECT_FIRST: &str = "Select lines in this file's diff to comment on them";
 
@@ -44,6 +50,10 @@ pub(super) const SELECT_FIRST: &str = "Select lines in this file's diff to comme
 pub(super) type PersistHandler = Rc<dyn Fn(String, Vec<ReviewDraft>)>;
 /// Queues a composed review to the thread; `Err` says why it could not.
 pub(super) type SendHandler = Rc<dyn Fn(String) -> Result<(), String>>;
+/// What a check of the working files answers: one result per ask, in order.
+pub(super) type CheckDone = Box<dyn FnOnce(Vec<Checked>)>;
+/// Looks for each comment in its working file, off the main thread, and answers on it.
+pub(super) type CheckHandler = Rc<dyn Fn(Vec<CheckAsk>, CheckDone)>;
 
 /// A row's Comment button, held weakly (its row owns it), with the row's path.
 type RowButton = (glib::WeakRef<gtk4::Button>, String);
@@ -89,6 +99,9 @@ pub(super) struct Review {
     notice: Rc<RefCell<Option<String>>>,
     persist: Rc<RefCell<Option<PersistHandler>>>,
     send: Rc<RefCell<Option<SendHandler>>>,
+    check: Rc<RefCell<Option<CheckHandler>>>,
+    /// The working files are being checked for a send: the button spins and nothing else sends.
+    checking: Rc<Cell<bool>>,
     /// The stored drafts could not be read: nothing is saved for the rest of the panel's life,
     /// and the bar says so for as long.
     load_failed: Rc<Cell<bool>>,
@@ -97,11 +110,13 @@ pub(super) struct Review {
     orphans: glib::WeakRef<gtk4::Box>,
     status: glib::WeakRef<gtk4::Label>,
     send_button: glib::WeakRef<gtk4::Button>,
+    send_face: glib::WeakRef<gtk4::Stack>,
+    spinner: glib::WeakRef<gtk4::Spinner>,
     discard_button: glib::WeakRef<gtk4::Button>,
 }
 
 /// `1 comment`, `3 comments`.
-pub(super) fn count_words(n: usize) -> String {
+pub(crate) fn count_words(n: usize) -> String {
     if n == 1 {
         "1 comment".to_owned()
     } else {
@@ -131,6 +146,30 @@ fn place_words(side: Side, start: u32, end: u32) -> String {
     }
 }
 
+/// What the bar says after a send of what the working files showed, when any comment was not
+/// at its lines: `Checked against the files: 1 moved, 2 no longer there, 1 not checked`.
+pub(super) fn recheck_words(checks: impl Iterator<Item = Checked>) -> Option<String> {
+    let (mut moved, mut gone, mut unchecked) = (0, 0, 0);
+    for check in checks {
+        match check {
+            Checked::Exact => {}
+            Checked::Moved { .. } => moved += 1,
+            Checked::Gone => gone += 1,
+            Checked::Unchecked(_) => unchecked += 1,
+        }
+    }
+    let parts: Vec<String> = [
+        (moved, "moved"),
+        (gone, "no longer there"),
+        (unchecked, "not checked"),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, what)| format!("{n} {what}"))
+    .collect();
+    (!parts.is_empty()).then(|| format!("Checked against the files: {}", parts.join(", ")))
+}
+
 /// The current time in epoch milliseconds.
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -147,8 +186,14 @@ pub(super) struct Bar {
     pub(super) orphans: gtk4::Box,
     pub(super) status: gtk4::Label,
     pub(super) send: gtk4::Button,
+    /// The send button's face: its label, or a spinner while the files are checked.
+    pub(super) send_face: gtk4::Stack,
+    pub(super) spinner: gtk4::Spinner,
     pub(super) discard: gtk4::Button,
 }
+
+/// What the send button says while the working files are checked.
+pub(super) const CHECKING: &str = "Checking lines…";
 
 /// The review bar: the comments on files not in the diff, the count, "Send Review" and
 /// "Discard".
@@ -160,13 +205,27 @@ pub(super) fn bar() -> Bar {
         .wrap_mode(gtk4::pango::WrapMode::WordChar)
         .css_classes(["dim-label", "caption"])
         .build();
+    let busy = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .spacing(6)
+        .halign(gtk4::Align::Center)
+        .build();
+    let spinner = gtk4::Spinner::new();
+    busy.append(&spinner);
+    busy.append(&gtk4::Label::new(Some(CHECKING)));
+    let send_face = gtk4::Stack::builder()
+        .transition_type(gtk4::StackTransitionType::Crossfade)
+        .build();
+    send_face.add_named(
+        &adw::ButtonContent::builder()
+            .icon_name("at-chat-message-new-symbolic")
+            .label("Send Review")
+            .build(),
+        Some("idle"),
+    );
+    send_face.add_named(&busy, Some("busy"));
     let send = gtk4::Button::builder()
-        .child(
-            &adw::ButtonContent::builder()
-                .icon_name("at-chat-message-new-symbolic")
-                .label("Send Review")
-                .build(),
-        )
+        .child(&send_face)
         .valign(gtk4::Align::Center)
         .tooltip_text(
             "Send every comment to this thread's agent as one message (queued while it works)",
@@ -213,6 +272,8 @@ pub(super) fn bar() -> Bar {
         orphans,
         status,
         send,
+        send_face,
+        spinner,
         discard,
     }
 }
@@ -231,14 +292,22 @@ impl Review {
             notice: Rc::new(RefCell::new(None)),
             persist: Rc::new(RefCell::new(None)),
             send: Rc::new(RefCell::new(None)),
+            check: Rc::new(RefCell::new(None)),
+            checking: Rc::new(Cell::new(false)),
             load_failed: Rc::new(Cell::new(false)),
             colours,
             bar: bar.region.downgrade(),
             orphans: bar.orphans.downgrade(),
             status: bar.status.downgrade(),
             send_button: bar.send.downgrade(),
+            send_face: bar.send_face.downgrade(),
+            spinner: bar.spinner.downgrade(),
             discard_button: bar.discard.downgrade(),
         }
+    }
+
+    pub(super) fn set_check(&self, handler: CheckHandler) {
+        *self.check.borrow_mut() = Some(handler);
     }
 
     pub(super) fn set_persist(&self, handler: PersistHandler) {
@@ -353,6 +422,24 @@ impl Review {
 
     /// Adds a comment on `span` of `path` with `note`, redacted as it is kept.
     pub(super) fn add(&self, path: &str, span: &CommentSpan, note: &str) {
+        self.add_on(path, span, note, self.base.get().key());
+    }
+
+    /// Adds a comment made on one of the thread's file-change cards (`path` from the
+    /// repository's top, as the panel names files). Refused (`None`) with no thread bound yet;
+    /// else how many comments the review then holds.
+    pub(super) fn add_from_card(
+        &self,
+        path: &str,
+        span: &CommentSpan,
+        note: &str,
+    ) -> Option<usize> {
+        self.thread.borrow().as_ref()?;
+        self.add_on(path, span, note, agent_core::review::CARD_BASE);
+        Some(self.entries.borrow().len())
+    }
+
+    fn add_on(&self, path: &str, span: &CommentSpan, note: &str, base: &str) {
         let draft = ReviewDraft {
             path: path.to_owned(),
             side: span.side,
@@ -360,7 +447,7 @@ impl Review {
             end_line: span.end,
             quoted: span.quoted.clone(),
             note: note.trim().to_owned(),
-            diff_base: self.base.get().key().to_owned(),
+            diff_base: base.to_owned(),
             created_at: now_ms(),
         }
         .redacted();
@@ -405,8 +492,8 @@ impl Review {
     }
 
     /// The comments as the review sends them: each placed in the diff on show (a moved one with
-    /// its new lines).
-    pub(super) fn comments(&self) -> Vec<ReviewComment> {
+    /// its new lines), with what the working file said of it when `checks` (by entry id) has it.
+    fn comments_checked(&self, checks: &HashMap<u64, Checked>) -> Vec<ReviewComment> {
         self.entries
             .borrow()
             .iter()
@@ -425,21 +512,104 @@ impl Review {
                     quoted: d.quoted.clone(),
                     note: d.note.clone(),
                     located: anchor.located,
+                    checked: checks.get(&e.id).copied(),
                 }
             })
             .collect()
     }
 
-    /// Composes the review and hands it to the window to queue. What went is deleted; comments
-    /// past the message budget stay for the next review, and the bar says so.
+    /// The comments as they would be sent with no file checked.
+    pub(super) fn comments(&self) -> Vec<ReviewComment> {
+        self.comments_checked(&HashMap::new())
+    }
+
+    /// "Send Review": with a check handler, first has each new-side comment looked for in its
+    /// working file (the button spinning, nothing else sent meanwhile), then sends; without one,
+    /// sends at once. Removed lines are never looked for.
     pub(super) fn send_now(&self) {
+        if self.checking.get() || self.send.borrow().is_none() || self.entries.borrow().is_empty() {
+            return;
+        }
+        let Some(check) = self.check.borrow().clone() else {
+            self.deliver(&HashMap::new());
+            return;
+        };
+        let (ids, asks): (Vec<u64>, Vec<CheckAsk>) = self
+            .comments()
+            .into_iter()
+            .zip(self.entries.borrow().iter().map(|e| e.id))
+            .filter(|(c, _)| c.side == Side::New)
+            .map(|(c, id)| {
+                (
+                    id,
+                    CheckAsk {
+                        path: c.path,
+                        start: c.start,
+                        end: c.end,
+                        quoted: c.quoted,
+                    },
+                )
+            })
+            .unzip();
+        if asks.is_empty() {
+            self.deliver(&HashMap::new());
+            return;
+        }
+        self.set_checking(true);
+        let review = self.clone();
+        check(
+            asks,
+            Box::new(move |found| {
+                review.set_checking(false);
+                // By id: a comment deleted meanwhile is not sent, one added meanwhile is sent
+                // unchecked, and an answer of the wrong length checks nothing.
+                let checks: HashMap<u64, Checked> = if found.len() == ids.len() {
+                    ids.into_iter().zip(found).collect()
+                } else {
+                    HashMap::new()
+                };
+                review.deliver(&checks);
+            }),
+        );
+    }
+
+    /// Spins the send button (and keeps Send and Discard off) while the files are checked.
+    fn set_checking(&self, on: bool) {
+        self.checking.set(on);
+        if let (Some(face), Some(spinner)) = (self.send_face.upgrade(), self.spinner.upgrade()) {
+            face.set_visible_child_name(if on { "busy" } else { "idle" });
+            if on {
+                spinner.start();
+            } else {
+                spinner.stop();
+            }
+        }
+        self.sync_bar();
+    }
+
+    /// Whether the files are being checked for a send (tests).
+    #[cfg(test)]
+    pub(super) fn is_checking(&self) -> bool {
+        self.checking.get()
+            && self
+                .send_face
+                .upgrade()
+                .is_some_and(|f| f.visible_child_name().as_deref() == Some("busy"))
+    }
+
+    /// Composes the review, with what the files said of each comment, and hands it to the
+    /// window to queue. What went is deleted; comments past the message budget stay for the
+    /// next review, and the bar says so.
+    fn deliver(&self, checks: &HashMap<u64, Checked>) {
         let Some(send) = self.send.borrow().clone() else {
             return;
         };
-        let Composed { text, included } = agent_core::review::compose(&self.comments());
+        let comments = self.comments_checked(checks);
+        let Composed { text, included } = agent_core::review::compose(&comments);
         if included == 0 {
             return;
         }
+        let rechecked = recheck_words(comments[..included].iter().filter_map(|c| c.checked));
         match send(text) {
             Ok(()) => {
                 let left = {
@@ -449,13 +619,18 @@ impl Review {
                     entries.len()
                 };
                 self.changed();
+                let mut notice = Vec::new();
                 if left > 0 {
-                    *self.notice.borrow_mut() = Some(format!(
+                    notice.push(format!(
                         "Sent {}; {} did not fit in one message and {} kept for the next review",
                         count_words(included),
                         count_words(left),
                         if left == 1 { "is" } else { "are" }
                     ));
+                }
+                notice.extend(rechecked);
+                if !notice.is_empty() {
+                    *self.notice.borrow_mut() = Some(notice.join(" · "));
                     self.sync_bar();
                 }
             }
@@ -507,8 +682,15 @@ impl Review {
             parts.push(LOAD_FAILED.to_owned());
         }
         status.set_text(&parts.join(" · "));
-        send.set_sensitive(total > 0 && self.send.borrow().is_some());
+        let checking = self.checking.get();
+        send.set_sensitive(total > 0 && self.send.borrow().is_some() && !checking);
+        send.set_tooltip_text(Some(if checking {
+            "Looking for each comment's lines in the working files"
+        } else {
+            "Send every comment to this thread's agent as one message (queued while it works)"
+        }));
         discard.set_visible(total > 0);
+        discard.set_sensitive(!checking);
         self.render_orphans();
     }
 
@@ -817,9 +999,7 @@ impl Review {
         let review = self.clone();
         let owned = path.to_owned();
         keys.connect_key_pressed(move |_, key, _, state| {
-            let mods = state & gtk4::accelerator_get_default_mod_mask();
-            let wanted = gtk4::gdk::ModifierType::CONTROL_MASK | gtk4::gdk::ModifierType::ALT_MASK;
-            if mods == wanted && matches!(key, gtk4::gdk::Key::m | gtk4::gdk::Key::M) {
+            if crate::review_popover::is_comment_key(key, state) {
                 review.comment_on(&owned);
                 return glib::Propagation::Stop;
             }
@@ -848,22 +1028,8 @@ impl Review {
         if !view.is_mapped() {
             return None;
         }
-        let buffer = view.buffer();
-        let (from, to) = buffer.selection_bounds().unwrap_or_else(|| {
-            let caret = buffer.iter_at_mark(&buffer.get_insert());
-            (caret, caret)
-        });
-        let first = from.line();
-        // A selection ending at the start of a line does not take that line.
-        let last = if to.line() > first && to.line_offset() == 0 {
-            to.line() - 1
-        } else {
-            to.line()
-        };
+        let (first, last, from, to) = chosen_rows(&view.buffer())?;
         let rect = selection_rect(&view, &column, &from, &to);
-        let (Ok(first), Ok(last)) = (usize::try_from(first), usize::try_from(last)) else {
-            return None;
-        };
         Some(match crate::diff::comment_span(&chunk, first, last) {
             Err(why) => refusal(&column, rect, &why.reason()),
             Ok(span) => {
@@ -929,201 +1095,6 @@ impl Review {
             .iter()
             .find_map(|f| (f.path == path).then(|| f.view.upgrade()).flatten())
     }
-}
-
-/// Where the selection from `from` to `to` is in `view`, in its widget's coordinates.
-fn selection_rect(
-    view: &gtk4::TextView,
-    column: &gtk4::Box,
-    from: &gtk4::TextIter,
-    to: &gtk4::TextIter,
-) -> gtk4::gdk::Rectangle {
-    let a = view.iter_location(from);
-    let b = view.iter_location(to);
-    let (x, y) = view.buffer_to_window_coords(gtk4::TextWindowType::Widget, a.x(), a.y());
-    let (_, y2) = view.buffer_to_window_coords(gtk4::TextWindowType::Widget, b.x(), b.y());
-    let bottom = y2 + b.height().max(1);
-    // In the column's coordinates; the view is its first child, so at worst the same.
-    let (dx, dy) = view
-        .compute_point(column, &gtk4::graphene::Point::new(0.0, 0.0))
-        .map_or((0, 0), |p| (p.x() as i32, p.y() as i32));
-    gtk4::gdk::Rectangle::new((x + dx).max(0), y + dy, 1, (bottom - y).max(1))
-}
-
-/// A popover on `parent` that is let go of when it closes, or when `parent` is unmapped (the
-/// panel redrawn under it).
-fn transient_popover(
-    parent: &impl IsA<gtk4::Widget>,
-    rect: Option<gtk4::gdk::Rectangle>,
-) -> gtk4::Popover {
-    let popover = gtk4::Popover::new();
-    popover.set_parent(parent);
-    if let Some(rect) = rect {
-        popover.set_pointing_to(Some(&rect));
-    }
-    let parent = parent.upcast_ref::<gtk4::Widget>().clone();
-    let unmapped = parent.connect_unmap(glib::clone!(
-        #[weak]
-        popover,
-        move |_| {
-            popover.popdown();
-            if popover.parent().is_some() {
-                popover.unparent();
-            }
-        }
-    ));
-    let handler = RefCell::new(Some(unmapped));
-    popover.connect_closed(glib::clone!(
-        #[weak]
-        parent,
-        move |p| {
-            if let Some(id) = handler.borrow_mut().take() {
-                parent.disconnect(id);
-            }
-            let p = p.clone();
-            glib::idle_add_local_once(move || {
-                if p.parent().is_some() {
-                    p.unparent();
-                }
-            });
-        }
-    ));
-    popover
-}
-
-/// Says, at the selection, why it takes no comment.
-fn refusal(column: &gtk4::Box, rect: gtk4::gdk::Rectangle, why: &str) -> gtk4::Popover {
-    let popover = transient_popover(column, Some(rect));
-    let label = gtk4::Label::builder()
-        .label(why)
-        .wrap(true)
-        .max_width_chars(40)
-        .margin_top(6)
-        .margin_bottom(6)
-        .margin_start(6)
-        .margin_end(6)
-        .build();
-    label.add_css_class("diff-comment-refusal");
-    popover.set_child(Some(&label));
-    popover.popup();
-    popover
-}
-
-/// The note editor: a multi-line entry in a popover on `parent`. Enter saves, Shift+Enter adds a
-/// line, Escape (or a press outside) cancels. Save is off while the note is empty.
-fn note_editor(
-    parent: &impl IsA<gtk4::Widget>,
-    rect: Option<gtk4::gdk::Rectangle>,
-    title: &str,
-    initial: &str,
-    on_save: impl Fn(String) + 'static,
-) -> gtk4::Popover {
-    let popover = transient_popover(parent, rect);
-    popover.add_css_class("diff-comment-editor");
-    let heading = gtk4::Label::builder()
-        .label(title)
-        .xalign(0.0)
-        .css_classes(["heading"])
-        .build();
-    let entry = gtk4::TextView::builder()
-        .wrap_mode(gtk4::WrapMode::WordChar)
-        .accepts_tab(false)
-        .top_margin(6)
-        .bottom_margin(6)
-        .left_margin(6)
-        .right_margin(6)
-        .build();
-    entry.add_css_class("card");
-    entry.buffer().set_text(initial);
-    entry.update_property(&[gtk4::accessible::Property::Label("Comment")]);
-    let scroller = gtk4::ScrolledWindow::builder()
-        .child(&entry)
-        .min_content_width(320)
-        .min_content_height(80)
-        .max_content_height(240)
-        .propagate_natural_height(true)
-        .hscrollbar_policy(gtk4::PolicyType::Never)
-        .build();
-    let hint = gtk4::Label::builder()
-        .label("Enter saves · Shift+Enter adds a line")
-        .xalign(0.0)
-        .hexpand(true)
-        .css_classes(["dim-label", "caption"])
-        .build();
-    let cancel = gtk4::Button::with_label("Cancel");
-    let save = gtk4::Button::builder()
-        .label("Save")
-        .css_classes(["suggested-action"])
-        .sensitive(!initial.trim().is_empty())
-        .build();
-    let buttons = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-    buttons.append(&hint);
-    buttons.append(&cancel);
-    buttons.append(&save);
-    let column = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(6)
-        .margin_top(6)
-        .margin_bottom(6)
-        .margin_start(6)
-        .margin_end(6)
-        .build();
-    column.append(&heading);
-    column.append(&scroller);
-    column.append(&buttons);
-    popover.set_child(Some(&column));
-
-    let on_save = Rc::new(on_save);
-    let commit = Rc::new(glib::clone!(
-        #[weak]
-        popover,
-        #[weak]
-        entry,
-        move || {
-            let buffer = entry.buffer();
-            let (start, end) = buffer.bounds();
-            let note = buffer.text(&start, &end, false).to_string();
-            if note.trim().is_empty() {
-                return;
-            }
-            popover.popdown();
-            on_save(note);
-        }
-    ));
-    entry.buffer().connect_changed(glib::clone!(
-        #[weak]
-        save,
-        move |buffer| {
-            let (start, end) = buffer.bounds();
-            save.set_sensitive(!buffer.text(&start, &end, false).trim().is_empty());
-        }
-    ));
-    let keys = gtk4::EventControllerKey::new();
-    keys.set_name(Some(KEYS_NAME));
-    keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
-    let on_enter = Rc::clone(&commit);
-    keys.connect_key_pressed(move |_, key, _, state| {
-        let enter = matches!(
-            key,
-            gtk4::gdk::Key::Return | gtk4::gdk::Key::KP_Enter | gtk4::gdk::Key::ISO_Enter
-        );
-        if enter && !state.contains(gtk4::gdk::ModifierType::SHIFT_MASK) {
-            on_enter();
-            return glib::Propagation::Stop;
-        }
-        glib::Propagation::Proceed
-    });
-    entry.add_controller(keys);
-    let on_click = Rc::clone(&commit);
-    save.connect_clicked(move |_| on_click());
-    cancel.connect_clicked(glib::clone!(
-        #[weak]
-        popover,
-        move |_| popover.popdown()
-    ));
-    popover.popup();
-    entry.grab_focus();
-    popover
 }
 
 #[cfg(test)]

@@ -77,32 +77,45 @@ impl AgentTerminalWindow {
         let obj = self.obj().downgrade();
         let thread = thread.to_owned();
         glib::MainContext::default().spawn_local(async move {
+            // The titles come with the pairings, read on the worker too: the picker names them.
             let found = store_job({
                 let thread = thread.clone();
-                move |store| store.fork_pairings(&thread).map_err(|e| e.to_string())
+                move |store| -> agent_kit::store::Result<(String, Vec<(Pairing, String)>)> {
+                    let title = |id: &str| -> agent_kit::store::Result<String> {
+                        Ok(store
+                            .thread_summary(id)?
+                            .map(|s| display_title(&s.title).to_owned())
+                            .unwrap_or_default())
+                    };
+                    let own = title(&thread)?;
+                    let mut named = Vec::new();
+                    for pairing in store.fork_pairings(&thread)? {
+                        let other = title(&pairing.other)?;
+                        named.push((pairing, other));
+                    }
+                    Ok((own, named))
+                }
             })
             .await;
             let Some(obj) = obj.upgrade() else { return };
             let imp = obj.imp();
             match found {
-                Some(Ok(pairings)) => match pairings.as_slice() {
+                Some(Ok((title, pairings))) => match pairings.as_slice() {
                     [] => imp.show_toast(
                         "Nothing to compare with: this thread has no fork, and is no fork",
                     ),
-                    [one] => {
-                        imp.open_fork_compare(&thread, one.clone());
-                    }
-                    _ => imp.pick_fork(&thread, pairings),
+                    [(one, _)] => imp.open_fork_compare(&thread, one.clone()),
+                    _ => imp.pick_fork(&thread, &title, pairings),
                 },
-                Some(Err(e)) => present_message(&obj, "Cannot Compare the Thread", &e),
+                Some(Err(e)) => present_message(&obj, "Cannot Compare the Thread", &e.to_string()),
                 None => imp.show_toast("Cannot read the thread"),
             }
         });
     }
 
-    /// Asks which of `pairings` to compare `thread` with.
-    fn pick_fork(&self, thread: &str, pairings: Vec<Pairing>) {
-        let title = self.thread_title_of(thread);
+    /// Asks which of `pairings` (each with its thread's title) to compare `thread`, titled
+    /// `title`, with.
+    fn pick_fork(&self, thread: &str, title: &str, pairings: Vec<(Pairing, String)>) {
         let dialog = confirm_dialog(
             "Compare with Fork",
             &format!("Choose the thread to read beside “{title}”."),
@@ -113,13 +126,7 @@ impl AgentTerminalWindow {
         );
         let labels: Vec<String> = pairings
             .iter()
-            .map(|p| {
-                format!(
-                    "{} ({})",
-                    self.thread_title_of(&p.other),
-                    p.relation.label()
-                )
-            })
+            .map(|(p, other)| format!("{other} ({})", p.relation.label()))
             .collect();
         let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
         let choice = adw::ComboRow::builder()
@@ -140,21 +147,21 @@ impl AgentTerminalWindow {
             let picked = usize::try_from(choice.selected())
                 .ok()
                 .and_then(|i| pairings.get(i));
-            if let Some(pairing) = picked {
+            if let Some((pairing, _)) = picked {
                 imp.open_fork_compare(&thread, pairing.clone());
             }
         });
     }
 
-    /// Opens a compare window on `thread` and `pairing`'s other thread, and reads them.
-    pub(super) fn open_fork_compare(&self, thread: &str, pairing: Pairing) -> CompareWindow {
+    /// Opens a compare window on `thread` and `pairing`'s other thread, and reads them. The
+    /// window keeps itself alive while it is open, so Refresh works with no one holding it.
+    pub(super) fn open_fork_compare(&self, thread: &str, pairing: Pairing) {
         let window = CompareWindow::new(self.obj().upcast_ref(), "Compare Forks");
         let sides = pairing.sides(thread);
         let relation = pairing.relation;
         load_fork_compare(&window, sides.clone(), relation);
         window.connect_refresh(move |window| load_fork_compare(window, sides.clone(), relation));
         window.window().present();
-        window
     }
 }
 
@@ -365,8 +372,14 @@ pub(super) mod tests {
 
         let pairings = store.fork_pairings(&fork).expect("pairings");
         assert_eq!(pairings.len(), 1);
-        let compare = imp.open_fork_compare(&fork, pairings[0].clone());
-        let root: gtk4::Widget = compare.window().clone().upcast();
+        // Nothing holds the window but the window itself, as from the menu or the toast.
+        imp.open_fork_compare(&fork, pairings[0].clone());
+        let compare = gtk4::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk4::Window>().ok())
+            .find(|w| w.has_css_class("compare-window") && w.is_visible())
+            .expect("the compare window");
+        let root: gtk4::Widget = compare.clone().upcast();
         assert!(
             crate::testutil::pump_until(&ctx, 20, || {
                 crate::testutil::label_texts(&root)
@@ -396,10 +409,25 @@ pub(super) mod tests {
         );
         let problems = crate::testutil::button_problems(&root, 24);
         assert!(problems.is_empty(), "{problems:#?}");
-        compare.window().close();
-        assert!(crate::testutil::pump_until(&ctx, 10, || !compare
-            .window()
-            .is_visible()));
+        // Refresh reads again and draws what came since.
+        store
+            .append_user_message(&fork, None, "a second try")
+            .expect("prompt");
+        let refresh = crate::testutil::find_all::<gtk4::Button>(&root)
+            .into_iter()
+            .find(|b| b.icon_name().as_deref() == Some("at-view-refresh-symbolic"))
+            .expect("refresh");
+        refresh.emit_clicked();
+        assert!(
+            crate::testutil::pump_until(&ctx, 20, || {
+                crate::testutil::label_texts(&root)
+                    .iter()
+                    .any(|t| t == "a second try")
+            }),
+            "Refresh draws the new message"
+        );
+        compare.close();
+        assert!(crate::testutil::pump_until(&ctx, 10, || !compare.is_visible()));
 
         // Deleting the source leaves the fork's link; there is then nothing to compare it with.
         store.delete_thread(&source).expect("delete");

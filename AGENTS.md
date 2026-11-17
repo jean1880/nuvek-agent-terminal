@@ -234,6 +234,7 @@ Architectural mandates, standards, and workflows for this codebase.
     filter on titles, folders and tags, tag chips and the Tags dialog's choices),
     `window/imp/commit.rs` (the diff panel's commit dialog and flow), `window/compare.rs` (the
     compare window: an `adw::Window` of its own, never a page or a `TabState`, that only reads;
+    it holds itself until closed or destroyed with its parent, so no caller keeps it;
     a spinner until its first read, a generation so only the newest read draws, Refresh, replies
     as guarded markdown; it knows nothing of forks), `window/imp/fork_compare.rs` (Compare with
     Fork…, `/compare` and the fork toast's Compare: the pairings and the picker, then each

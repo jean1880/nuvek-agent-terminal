@@ -49,9 +49,13 @@ struct Inner {
     refresh: gtk4::Button,
     generation: Generation,
     on_refresh: RefCell<Option<Refresh>>,
+    /// The window's own hold on itself, so it lives (and Refresh works) with no caller keeping
+    /// it: let go once its `adw::Window` is destroyed (closed, or its parent gone).
+    kept: RefCell<Option<CompareWindow>>,
 }
 
-/// A compare window. Cheap to clone: every clone is the same window.
+/// A compare window. Cheap to clone: every clone is the same window, which stays alive until
+/// its `adw::Window` is destroyed, whoever holds a clone.
 #[derive(Clone)]
 pub(crate) struct CompareWindow(Rc<Inner>);
 
@@ -109,7 +113,27 @@ impl CompareWindow {
             refresh,
             generation: Generation::new(),
             on_refresh: RefCell::new(None),
+            kept: RefCell::new(None),
         });
+        *inner.kept.borrow_mut() = Some(Self(inner.clone()));
+        // Let go once it is closed (or destroyed with its parent). GTK holds the window
+        // through its own signal, so the last hold may go here.
+        let release = {
+            let weak = Rc::downgrade(&inner);
+            move || {
+                if let Some(inner) = weak.upgrade() {
+                    let kept = inner.kept.borrow_mut().take();
+                    drop(inner);
+                    drop(kept);
+                }
+            }
+        };
+        let on_close = release.clone();
+        inner.window.connect_close_request(move |_| {
+            on_close();
+            glib::Propagation::Proceed
+        });
+        inner.window.connect_destroy(move |_| release());
         let weak = Rc::downgrade(&inner);
         inner.refresh.connect_clicked(move |_| {
             let Some(inner) = weak.upgrade() else { return };
@@ -388,6 +412,7 @@ pub(crate) mod tests {
     pub(crate) fn the_window_lines_columns_up_by_turn(parent: &gtk4::Window) {
         let ctx = glib::MainContext::default();
         let window = CompareWindow::new(parent, "Compare Forks");
+        let alive = Rc::downgrade(&window.0);
         let root: gtk4::Widget = window.window().clone().upcast();
         assert!(
             crate::testutil::find_first::<gtk4::Spinner>(&root).is_some(),
@@ -491,9 +516,24 @@ pub(crate) mod tests {
             texts.iter().any(|t| t == "Nothing yet"),
             "each column's summary"
         );
-        window.window().close();
-        assert!(crate::testutil::pump_until(&ctx, 10, || !window
-            .window()
-            .is_visible()));
+        // Nobody else holds it: Refresh still reaches the caller while the window is open.
+        let shown = window.window().clone();
+        drop(window);
+        assert!(
+            alive.upgrade().is_some(),
+            "an open window keeps itself alive"
+        );
+        refresh.emit_clicked();
+        assert_eq!(
+            refreshed.get(),
+            2,
+            "Refresh works with no caller holding the window"
+        );
+        // Closed, it lets go of itself.
+        shown.close();
+        assert!(
+            crate::testutil::pump_until(&ctx, 10, || alive.upgrade().is_none()),
+            "a closed window is freed"
+        );
     }
 }

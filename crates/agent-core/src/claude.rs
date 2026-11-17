@@ -2531,7 +2531,7 @@ mod tests {
         assert_eq!(costs, [Some(0.5), None, Some(0.25)]);
     }
 
-    fn turn_billings(out: &[Envelope]) -> Vec<Option<crate::spend::Billing>> {
+    fn turn_payment_kinds(out: &[Envelope]) -> Vec<Option<crate::spend::Billing>> {
         out.iter()
             .filter_map(|e| match &e.event {
                 Event::TurnCompleted { billing, .. } => Some(*billing),
@@ -2595,9 +2595,9 @@ mod tests {
         use crate::spend::Billing;
         // Without its initialize reply, "no key" alone says nothing of a plan.
         let (_, out) = replay(CONTROLS);
-        let billings = turn_billings(&out);
-        assert!(!billings.is_empty());
-        assert!(billings.iter().all(Option::is_none), "{billings:?}");
+        let kinds = turn_payment_kinds(&out);
+        assert!(!kinds.is_empty());
+        assert!(kinds.iter().all(Option::is_none), "{kinds:?}");
         let mut a = ClaudeAdapter::new();
         a.handshake(); // the recording starts with the same request id
         let mut out = Vec::new();
@@ -2607,23 +2607,20 @@ mod tests {
                 out.extend(a.feed(&rec["frame"].to_string()));
             }
         }
-        let billings = turn_billings(&out);
-        assert!(!billings.is_empty());
-        assert!(
-            billings.iter().all(|b| *b == Some(Billing::Plan)),
-            "{billings:?}"
-        );
+        let kinds = turn_payment_kinds(&out);
+        assert!(!kinds.is_empty());
+        assert!(kinds.iter().all(|b| *b == Some(Billing::Plan)), "{kinds:?}");
 
         let mut a = ClaudeAdapter::new();
         let init = json!({"type": "system", "subtype": "init", "model": "m", "session_id": "s",
             "apiKeySource": "ANTHROPIC_API_KEY"});
         a.feed(&init.to_string());
         let out = a.feed(&result_frame(Some(0.5)));
-        assert_eq!(turn_billings(&out), [Some(Billing::Metered)]);
+        assert_eq!(turn_payment_kinds(&out), [Some(Billing::Metered)]);
         a.on_exit(Some(0));
         let out = a.feed(&result_frame(Some(0.5)));
         assert_eq!(
-            turn_billings(&out),
+            turn_payment_kinds(&out),
             [None],
             "a new process has said nothing yet"
         );

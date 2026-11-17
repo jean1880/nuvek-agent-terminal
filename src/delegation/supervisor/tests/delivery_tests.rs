@@ -1355,7 +1355,7 @@ fn a_worker_on_a_free_profile_stamps_its_turns_free() {
         let (dir, sup, root) = harness();
         std::fs::write(dir.path().join("free-profile"), "").unwrap();
         let _worker = spawn_idle(&sup, &root, "free").await;
-        let billings: Vec<Option<agent_core::spend::Billing>> = heard
+        let kinds: Vec<Option<agent_core::spend::Billing>> = heard
             .borrow()
             .iter()
             .filter_map(|e| match e {
@@ -1363,12 +1363,12 @@ fn a_worker_on_a_free_profile_stamps_its_turns_free() {
                 _ => None,
             })
             .collect();
-        assert!(!billings.is_empty(), "no turn was committed");
+        assert!(!kinds.is_empty(), "no turn was committed");
         assert!(
-            billings
+            kinds
                 .iter()
                 .all(|b| *b == Some(agent_core::spend::Billing::Free)),
-            "{billings:?}"
+            "{kinds:?}"
         );
         stop(&sup).await;
     });

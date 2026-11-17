@@ -903,7 +903,12 @@ epoch field) in `make package` and `packaging/build-deb.sh`; the rpm has `epoch 
   aliases every `@at_*` name to the desktop theme's named colours, leaves
   libadwaita's own alone, does not force dark, and reads values back (for VTE,
   diffs, and Pango markup parsed from then on) when the desktop's style changes.
-  Never give it a literal colour.
+  Never give it a literal colour. A bundled light scheme forces libadwaita light, a dark one
+  dark. `ThemeChoice::Automatic` has no colours of its own either: it applies the member of
+  `theme_light`/`theme_dark` (`ThemePair`, each slot only its polarity, a wrong one loading as
+  the slot's default) matching `StyleManager::is_dark`, never forces the colour scheme, and
+  swaps members through the same watch as System (`palette::desktop_changed`); every lookup by
+  choice resolves it first (`palette::concrete`, `palette::in_effect`).
 - If you modify startup/detection logic, update and run the tests in `utils.rs`.
 - Deployment-specific behaviour belongs in config, not in the binary. Anything
   that reads a path or runs a command particular to one machine should be an

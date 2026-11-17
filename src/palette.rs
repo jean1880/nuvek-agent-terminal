@@ -17,13 +17,20 @@
 //! the colour scheme is not forced, so light or dark, the accent colour and any `gtk.css` all come
 //! through. What Rust code needs as values (terminal and diff colours, Pango markup) is read
 //! back from the resolved style, again whenever the desktop's style changes.
+//!
+//! [`ThemeChoice::Automatic`] has no values of its own either: it applies one member of the
+//! user's pair ([`ThemePair`]), the light scheme while the desktop prefers light and the dark
+//! one while it prefers dark, and swaps them when the desktop's preference changes, through the
+//! same watch as the system theme. It never forces libadwaita's colour scheme: each member has
+//! the desktop's polarity, so libadwaita already agrees and nothing feeds back. Every lookup by
+//! choice resolves it to the member in effect first ([`concrete`]).
 
 use std::cell::{Cell, RefCell};
 
 use gtk4::gdk;
 use gtk4::prelude::*;
 
-use crate::config::ThemeChoice;
+use crate::config::{ThemeChoice, ThemePair};
 use crate::theme::Theme;
 
 /// WCAG AA for body text: what every text colour must reach on what it is drawn on.
@@ -354,7 +361,7 @@ impl Chrome {
     /// The colours of a bundled palette; `None` for the system theme, whose colours are the
     /// desktop's (see [`resolve_system`]).
     pub fn for_choice(choice: ThemeChoice) -> Option<Chrome> {
-        match choice {
+        match concrete(choice) {
             ThemeChoice::System => None,
             ThemeChoice::AgentTerminal => Some(Self::agent_terminal().with_readable_text()),
             other => Theme::chrome_base(other).map(|base| {
@@ -631,13 +638,17 @@ thread_local! {
     static CURRENT: RefCell<Option<Chrome>> = const { RefCell::new(None) };
     /// Whether the system theme is the one applied, so a desktop change re-resolves it.
     static SYSTEM_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    /// The pair while Automatic is the one applied, so a desktop change picks its member again.
+    static AUTOMATIC: Cell<Option<ThemePair>> = const { Cell::new(None) };
+    /// The choice whose colours are in use: never Automatic, which is resolved to its member.
+    static IN_EFFECT: Cell<ThemeChoice> = const { Cell::new(ThemeChoice::AgentTerminal) };
     /// Whether the desktop's style is being watched (connected once per process).
     static WATCHING: Cell<bool> = const { Cell::new(false) };
     /// Whether a re-resolve is queued: one desktop switch notifies several properties at once,
     /// and they share one refresh.
     static REFRESH_PENDING: Cell<bool> = const { Cell::new(false) };
     /// Recolours what holds colours as values (terminals, diff panels) after the system
-    /// theme re-resolved. Set by the app.
+    /// theme re-resolved or Automatic changed member. Set by the app.
     static ON_SYSTEM_CHANGE: Cell<Option<fn()>> = const { Cell::new(None) };
     /// Bumped each time the colours in use change.
     static GENERATION: Cell<u64> = const { Cell::new(0) };
@@ -668,6 +679,24 @@ pub fn is_light() -> bool {
     current().bg.luminance() > 0.179
 }
 
+/// The choice whose colours are in use: the applied one, or for Automatic its member in effect.
+/// Never Automatic.
+pub fn in_effect() -> ThemeChoice {
+    IN_EFFECT.with(Cell::get)
+}
+
+/// `choice` as a lookup takes it: Automatic is the member in effect, every other choice itself.
+pub fn concrete(choice: ThemeChoice) -> ThemeChoice {
+    match choice {
+        ThemeChoice::Automatic => match in_effect() {
+            // Never stored, but a lookup must not resolve to itself.
+            ThemeChoice::Automatic => ThemePair::default().dark,
+            member => member,
+        },
+        other => other,
+    }
+}
+
 /// The colours in use (the app's own until [`apply`] first runs).
 pub fn current() -> Chrome {
     CURRENT
@@ -675,8 +704,8 @@ pub fn current() -> Chrome {
         .unwrap_or_else(Chrome::agent_terminal)
 }
 
-/// What to run after the system theme follows a change of the desktop's style: recolour what
-/// took its colours as values.
+/// What to run after the system theme or Automatic follows a change of the desktop's style:
+/// recolour what took its colours as values.
 pub fn set_on_system_change(f: fn()) {
     ON_SYSTEM_CHANGE.with(|slot| slot.set(Some(f)));
 }
@@ -691,49 +720,105 @@ fn set_current(chrome: Chrome) {
     }
 }
 
-/// The libadwaita colour scheme forced for a bundled palette: light for a light one, dark
-/// otherwise, so popovers, menus and entries follow the palette instead of the opposite default
-/// (pale text on white, or the reverse).
+/// The libadwaita colour scheme set for a choice: light for a light palette and dark for a dark
+/// one, so popovers, menus and entries follow the palette instead of the opposite default (pale
+/// text on white, or the reverse); the desktop's own for the system theme and Automatic, which
+/// follow it rather than force it.
 fn forced_scheme(choice: ThemeChoice) -> adw::ColorScheme {
-    if choice.is_light() == Some(true) {
-        adw::ColorScheme::ForceLight
-    } else {
-        adw::ColorScheme::ForceDark
+    match choice.is_light() {
+        Some(true) => adw::ColorScheme::ForceLight,
+        Some(false) => adw::ColorScheme::ForceDark,
+        None => adw::ColorScheme::Default,
     }
 }
 
-/// Restyles the whole app for `choice`: defines every named colour for it, replacing the last
-/// theme's. Above the app's own stylesheets, so the names resolve however they load.
-pub fn apply(choice: ThemeChoice) {
-    let system = choice == ThemeChoice::System;
-    SYSTEM_ACTIVE.with(|s| s.set(system));
-    let Some(chrome) = Chrome::for_choice(choice) else {
-        apply_system();
+/// Restyles the whole app for `choice` (`pair` is what Automatic switches between): defines
+/// every named colour for it, replacing the last theme's. Above the app's own stylesheets, so
+/// the names resolve however they load.
+pub fn apply(choice: ThemeChoice, pair: ThemePair) {
+    SYSTEM_ACTIVE.with(|s| s.set(choice == ThemeChoice::System));
+    AUTOMATIC.with(|a| a.set((choice == ThemeChoice::Automatic).then_some(pair)));
+    match choice {
+        ThemeChoice::System => apply_system(),
+        ThemeChoice::Automatic => apply_automatic(pair),
+        bundled => {
+            if gdk::Display::default().is_some() {
+                adw::StyleManager::default().set_color_scheme(forced_scheme(bundled));
+            }
+            apply_palette(bundled);
+        }
+    }
+}
+
+/// Defines every name for a bundled scheme and makes it the one in effect, leaving the colour
+/// scheme as it is.
+fn apply_palette(bundled: ThemeChoice) {
+    let Some(chrome) = Chrome::for_choice(bundled) else {
         return;
     };
     let css = chrome.css();
+    IN_EFFECT.with(|e| e.set(bundled));
     set_current(chrome);
-    if gdk::Display::default().is_none() {
-        return;
-    }
-    adw::StyleManager::default().set_color_scheme(forced_scheme(choice));
     load(&css);
 }
 
 /// The system theme: the desktop's colour scheme, the aliases, and the colours they resolve to.
 fn apply_system() {
+    IN_EFFECT.with(|e| e.set(ThemeChoice::System));
     if gdk::Display::default().is_none() {
         set_current(Chrome::agent_terminal());
         return;
     }
-    adw::StyleManager::default().set_color_scheme(adw::ColorScheme::Default);
+    adw::StyleManager::default().set_color_scheme(forced_scheme(ThemeChoice::System));
     load(&system_css());
     set_current(resolve_system());
     watch_system();
 }
 
+/// Automatic: the desktop's colour scheme, and the member of `pair` that matches it. With no
+/// display there is no desktop to ask, and the dark member (the app's default polarity) is used.
+fn apply_automatic(pair: ThemePair) {
+    if gdk::Display::default().is_none() {
+        apply_palette(pair.pick(true));
+        return;
+    }
+    let style = adw::StyleManager::default();
+    style.set_color_scheme(forced_scheme(ThemeChoice::Automatic));
+    apply_palette(pair.pick(style.is_dark()));
+    watch_system();
+}
+
+/// After the desktop's style changed (`desktop_dark` is its preference now): the system theme
+/// resolves its colours again, Automatic takes the member that matches, and what holds colours
+/// as values is recoloured when anything changed. Nothing for a bundled scheme.
+fn desktop_changed(desktop_dark: bool) {
+    if SYSTEM_ACTIVE.with(Cell::get) {
+        set_current(resolve_system());
+    } else if !follow_desktop(desktop_dark) {
+        return;
+    }
+    if let Some(f) = ON_SYSTEM_CHANGE.with(Cell::get) {
+        f();
+    }
+}
+
+/// Under Automatic, after the desktop's preference became `desktop_dark`: the member that
+/// matches it, if it is not the one in effect already. Whether anything changed.
+fn follow_desktop(desktop_dark: bool) -> bool {
+    let Some(pair) = AUTOMATIC.with(Cell::get) else {
+        return false;
+    };
+    let member = pair.pick(desktop_dark);
+    if member == in_effect() {
+        return false;
+    }
+    apply_palette(member);
+    true
+}
+
 /// Re-resolves the system theme when the desktop's style changes: dark or light, accent,
-/// contrast, or the GTK theme. On idle, once the new stylesheet is in.
+/// contrast, or the GTK theme; under Automatic, picks the member for the desktop's preference.
+/// On idle, once the new stylesheet is in.
 fn watch_system() {
     if WATCHING.with(|w| w.replace(true)) {
         return;
@@ -744,13 +829,7 @@ fn watch_system() {
         }
         gtk4::glib::idle_add_local_once(|| {
             REFRESH_PENDING.with(|p| p.set(false));
-            if !SYSTEM_ACTIVE.with(Cell::get) {
-                return;
-            }
-            set_current(resolve_system());
-            if let Some(f) = ON_SYSTEM_CHANGE.with(Cell::get) {
-                f();
-            }
+            desktop_changed(adw::StyleManager::default().is_dark());
         });
     };
     let style = adw::StyleManager::default();
@@ -1315,8 +1394,8 @@ mod tests {
         }
     }
 
-    /// The window is forced light for a light scheme, dark otherwise; the system theme is not
-    /// forced at all.
+    /// The window is forced light for a light scheme and dark for a dark one; the system theme
+    /// and Automatic are not forced at all.
     #[test]
     fn the_forced_colour_scheme_follows_the_polarity() {
         assert_eq!(
@@ -1327,13 +1406,151 @@ mod tests {
             forced_scheme(ThemeChoice::Nord),
             adw::ColorScheme::ForceDark
         );
+        assert_eq!(
+            forced_scheme(ThemeChoice::System),
+            adw::ColorScheme::Default
+        );
+        assert_eq!(
+            forced_scheme(ThemeChoice::Automatic),
+            adw::ColorScheme::Default
+        );
         for choice in ThemeChoice::ALL {
             let want = match choice.is_light() {
                 Some(true) => adw::ColorScheme::ForceLight,
-                _ => adw::ColorScheme::ForceDark,
+                Some(false) => adw::ColorScheme::ForceDark,
+                None => adw::ColorScheme::Default,
             };
             assert_eq!(forced_scheme(choice), want, "{choice}");
         }
+    }
+
+    /// Both halves of every pair the Automatic theme can be given read at AA: every scheme each
+    /// slot offers, with the body text on the background and the secondary text on every
+    /// surface, and for a light one every text, accent and status colour on every surface (as
+    /// [`every_light_theme_text_reads`] holds them); its diff text and meta lines too.
+    #[test]
+    fn every_pair_member_reads() {
+        for light in [true, false] {
+            let offered = ThemeChoice::pair_choices(light);
+            assert!(!offered.is_empty());
+            for choice in offered {
+                let c = Chrome::for_choice(choice).expect("a bundled scheme");
+                assert_eq!(is_light_chrome(&c), light, "{choice}: polarity");
+                for (role, text) in [("fg", c.fg), ("fg_strong", c.fg_strong)] {
+                    let ratio = text.contrast(c.bg);
+                    assert!(
+                        ratio >= MIN_TEXT_CONTRAST,
+                        "{choice}: {role} on bg at {ratio:.2}:1"
+                    );
+                }
+                let mut roles = vec![
+                    ("fg_soft", c.fg_soft),
+                    ("fg_dim", c.fg_dim),
+                    ("fg_faint", c.fg_faint),
+                ];
+                if light {
+                    roles.extend([
+                        ("fg", c.fg),
+                        ("fg_strong", c.fg_strong),
+                        ("accent", c.accent),
+                        ("success", c.success),
+                        ("warning", c.warning),
+                        ("danger", c.danger),
+                        ("info", c.info),
+                    ]);
+                }
+                for (role, text) in roles {
+                    for (ground, bg) in [
+                        ("bg", c.bg),
+                        ("surface", c.surface),
+                        ("raised", c.surface_raised),
+                    ] {
+                        let ratio = text.contrast(bg);
+                        assert!(
+                            ratio >= MIN_TEXT_CONTRAST,
+                            "{choice}: {role} on {ground} at {ratio:.2}:1"
+                        );
+                    }
+                }
+                let diff = Theme::diff_colours(choice);
+                let bg = Rgb::from_rgba(&diff.background);
+                for (role, colour) in [("text", &diff.text), ("meta", &diff.meta)] {
+                    let ratio = Rgb::from_rgba(colour).contrast(bg);
+                    assert!(
+                        ratio >= MIN_TEXT_CONTRAST,
+                        "{choice}: diff {role} at {ratio:.2}:1"
+                    );
+                }
+            }
+        }
+    }
+
+    fn is_light_chrome(c: &Chrome) -> bool {
+        c.bg.luminance() > 0.179
+    }
+
+    /// Automatic applies the member for the desktop's preference without forcing libadwaita's
+    /// colour scheme, swaps to the other member (recolouring what holds colours as values) when
+    /// the desktop's preference changes, back again, and stops following once a bundled scheme
+    /// replaces it. Lookups by Automatic give the member in effect.
+    #[test]
+    fn an_automatic_theme_follows_the_desktop_live() {
+        crate::testutil::adw_init().expect("libadwaita init");
+        thread_local! {
+            static RECOLOURED: Cell<u32> = const { Cell::new(0) };
+        }
+        fn recoloured() {
+            RECOLOURED.with(|n| n.set(n.get() + 1));
+        }
+        set_on_system_change(recoloured);
+        let pair = ThemePair {
+            light: ThemeChoice::SolarizedLight,
+            dark: ThemeChoice::Nord,
+        };
+        let style = adw::StyleManager::default();
+        let bg_of = |choice| Chrome::for_choice(choice).expect("bundled").bg;
+
+        // From a forced scheme, Automatic hands the colour scheme back to the desktop.
+        apply(ThemeChoice::Dracula, pair);
+        assert_eq!(style.color_scheme(), adw::ColorScheme::ForceDark);
+        apply(ThemeChoice::Automatic, pair);
+        assert_eq!(style.color_scheme(), adw::ColorScheme::Default);
+        let member = pair.pick(style.is_dark());
+        assert_eq!(in_effect(), member);
+        assert_eq!(current().bg, bg_of(member));
+        assert_eq!(concrete(ThemeChoice::Automatic), member);
+        assert_eq!(
+            Theme::diff_colours(ThemeChoice::Automatic).background,
+            Theme::diff_colours(member).background
+        );
+
+        // The desktop turns dark, then light: each time the matching member, and a recolour.
+        let before = RECOLOURED.with(Cell::get);
+        let generation_before = generation();
+        desktop_changed(true);
+        assert_eq!(in_effect(), ThemeChoice::Nord);
+        assert_eq!(current().bg, bg_of(ThemeChoice::Nord));
+        assert!(!is_light());
+        assert!(generation() > generation_before);
+        desktop_changed(false);
+        assert_eq!(in_effect(), ThemeChoice::SolarizedLight);
+        assert_eq!(current().bg, bg_of(ThemeChoice::SolarizedLight));
+        assert!(is_light());
+        assert_eq!(RECOLOURED.with(Cell::get), before + 2);
+        // Never forced, whichever member is in effect.
+        assert_eq!(style.color_scheme(), adw::ColorScheme::Default);
+        // The same preference again changes nothing.
+        let generation_before = generation();
+        desktop_changed(false);
+        assert_eq!(generation(), generation_before);
+        assert_eq!(RECOLOURED.with(Cell::get), before + 2);
+
+        // A bundled scheme ends it: the desktop's preference no longer moves the colours.
+        apply(ThemeChoice::GruvboxDark, pair);
+        assert_eq!(in_effect(), ThemeChoice::GruvboxDark);
+        desktop_changed(false);
+        assert_eq!(in_effect(), ThemeChoice::GruvboxDark);
+        assert_eq!(RECOLOURED.with(Cell::get), before + 2);
     }
 
     #[test]

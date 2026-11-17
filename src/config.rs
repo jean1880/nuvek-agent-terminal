@@ -707,6 +707,39 @@ pub enum ThemeChoice {
     GruvboxLight,
     OneLight,
     GithubLight,
+    /// No colours of its own: the light member of the pair (`theme_light`) while the desktop
+    /// prefers light, the dark one (`theme_dark`) while it prefers dark, switching when the
+    /// desktop does. Never forces libadwaita's colour scheme. See `crate::palette`.
+    Automatic,
+}
+
+/// The two schemes [`ThemeChoice::Automatic`] switches between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThemePair {
+    /// A light scheme (`is_light() == Some(true)`).
+    pub light: ThemeChoice,
+    /// A dark scheme (`is_light() == Some(false)`).
+    pub dark: ThemeChoice,
+}
+
+impl Default for ThemePair {
+    fn default() -> Self {
+        Self {
+            light: ThemeChoice::AgentTerminalLight,
+            dark: ThemeChoice::AgentTerminal,
+        }
+    }
+}
+
+impl ThemePair {
+    /// The member for the desktop's preference: the dark one when it prefers dark.
+    pub fn pick(self, desktop_dark: bool) -> ThemeChoice {
+        if desktop_dark {
+            self.dark
+        } else {
+            self.light
+        }
+    }
 }
 
 /// A `theme` this build does not know (a later version's scheme) loads as the default theme
@@ -717,6 +750,32 @@ fn tolerant_theme<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ThemeChoice,
         warn!("unknown theme {value}; using the default theme");
         ThemeChoice::default()
     }))
+}
+
+/// One member of the Automatic pair from the file: a scheme of the slot's polarity, else (an
+/// unknown name, a scheme of the other polarity, the system theme or Automatic itself) the
+/// slot's default, so a hand edit never resets the rest of the file.
+fn pair_member(value: &serde_json::Value, light: bool) -> ThemeChoice {
+    let default = ThemePair::default().pick(!light);
+    match serde_json::from_value::<ThemeChoice>(value.clone()) {
+        Ok(choice) if choice.is_light() == Some(light) => choice,
+        _ => {
+            let slot = if light { "theme_light" } else { "theme_dark" };
+            warn!(
+                "{slot} {value} is not a {} scheme; using {default}",
+                if light { "light" } else { "dark" }
+            );
+            default
+        }
+    }
+}
+
+fn tolerant_light_theme<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ThemeChoice, D::Error> {
+    Ok(pair_member(&serde_json::Value::deserialize(d)?, true))
+}
+
+fn tolerant_dark_theme<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ThemeChoice, D::Error> {
+    Ok(pair_member(&serde_json::Value::deserialize(d)?, false))
 }
 
 /// The context warning as its percentage (0 for never), the shape the file keeps.
@@ -759,6 +818,7 @@ impl std::fmt::Display for ThemeChoice {
             ThemeChoice::GruvboxLight => "Gruvbox Light",
             ThemeChoice::OneLight => "One Light",
             ThemeChoice::GithubLight => "GitHub Light",
+            ThemeChoice::Automatic => "Match Desktop: Light and Dark",
         };
         f.write_str(name)
     }
@@ -766,7 +826,7 @@ impl std::fmt::Display for ThemeChoice {
 
 impl ThemeChoice {
     /// All choices in display order; the index matches the settings dropdown.
-    pub const ALL: [ThemeChoice; 13] = [
+    pub const ALL: [ThemeChoice; 14] = [
         ThemeChoice::System,
         ThemeChoice::AgentTerminal,
         ThemeChoice::Dracula,
@@ -780,14 +840,15 @@ impl ThemeChoice {
         ThemeChoice::GruvboxLight,
         ThemeChoice::OneLight,
         ThemeChoice::GithubLight,
+        ThemeChoice::Automatic,
     ];
 
     /// Whether the bundled palette is light (`Some(true)`) or dark (`Some(false)`); `None` for
-    /// the system theme, whose polarity is the desktop's. The match is exhaustive, so a new
-    /// variant must be classified.
+    /// the system theme and Automatic, whose polarity is the desktop's. The match is
+    /// exhaustive, so a new variant must be classified.
     pub fn is_light(self) -> Option<bool> {
         match self {
-            ThemeChoice::System => None,
+            ThemeChoice::System | ThemeChoice::Automatic => None,
             ThemeChoice::AgentTerminal
             | ThemeChoice::Dracula
             | ThemeChoice::Nord
@@ -801,6 +862,16 @@ impl ThemeChoice {
             | ThemeChoice::OneLight
             | ThemeChoice::GithubLight => Some(true),
         }
+    }
+
+    /// The schemes one slot of the Automatic pair offers, in display order: every light one, or
+    /// every dark one. Taken from [`Self::ALL`] by [`Self::is_light`], so it needs no array of
+    /// its own.
+    pub fn pair_choices(light: bool) -> Vec<ThemeChoice> {
+        Self::ALL
+            .into_iter()
+            .filter(|t| t.is_light() == Some(light))
+            .collect()
     }
 }
 
@@ -829,6 +900,12 @@ pub struct TerminalConfig {
     pub starting_directory: String,
     #[serde(deserialize_with = "tolerant_theme")]
     pub theme: ThemeChoice,
+    /// The light member of the Automatic pair: always a light scheme.
+    #[serde(deserialize_with = "tolerant_light_theme")]
+    pub theme_light: ThemeChoice,
+    /// The dark member of the Automatic pair: always a dark scheme.
+    #[serde(deserialize_with = "tolerant_dark_theme")]
+    pub theme_dark: ThemeChoice,
     /// The sessions offered in Settings and the new-tab menu.
     pub profiles: Vec<Profile>,
     /// Which profile to launch. `None` means "use the first one whose command is
@@ -1032,6 +1109,14 @@ pub fn field_change<T: PartialEq>(
 }
 
 impl TerminalConfig {
+    /// The schemes [`ThemeChoice::Automatic`] switches between.
+    pub fn theme_pair(&self) -> ThemePair {
+        ThemePair {
+            light: self.theme_light,
+            dark: self.theme_dark,
+        }
+    }
+
     /// [`Self::permission_sources`] as paths (`~/` expanded), for the import and export code.
     pub fn permission_source_paths(&self) -> Vec<PathBuf> {
         self.permission_sources
@@ -1309,6 +1394,8 @@ impl Default for TerminalConfig {
             cli_client: CliClient::default(),
             starting_directory: String::new(),
             theme: ThemeChoice::default(),
+            theme_light: ThemePair::default().light,
+            theme_dark: ThemePair::default().dark,
             profiles: default_profiles(),
             default_profile: None,
             font: "JetBrains Mono, Fira Code, Monospace 11".to_string(),
@@ -2357,10 +2444,11 @@ mod tests {
                 ThemeChoice::GruvboxLight => 10,
                 ThemeChoice::OneLight => 11,
                 ThemeChoice::GithubLight => 12,
+                ThemeChoice::Automatic => 13,
             }
         }
 
-        assert_eq!(ThemeChoice::ALL.len(), 13);
+        assert_eq!(ThemeChoice::ALL.len(), 14);
         for theme in ThemeChoice::ALL {
             let index = expected_index(theme);
             assert_eq!(ThemeChoice::ALL[index], theme);
@@ -2389,6 +2477,7 @@ mod tests {
     #[test]
     fn is_light_classifies_every_variant() {
         assert_eq!(ThemeChoice::System.is_light(), None);
+        assert_eq!(ThemeChoice::Automatic.is_light(), None);
         let light: Vec<ThemeChoice> = ThemeChoice::ALL
             .into_iter()
             .filter(|t| t.is_light() == Some(true))
@@ -2420,6 +2509,7 @@ mod tests {
             (ThemeChoice::GruvboxLight, "gruvbox-light"),
             (ThemeChoice::OneLight, "one-light"),
             (ThemeChoice::GithubLight, "github-light"),
+            (ThemeChoice::Automatic, "automatic"),
         ] {
             let json = format!("\"{name}\"");
             assert_eq!(serde_json::to_string(&theme).expect("serialises"), json);
@@ -2501,6 +2591,110 @@ mod tests {
         let loaded = TerminalConfig::read_config(&path).unwrap().unwrap();
         assert_eq!(loaded.theme, ThemeChoice::default());
         assert_eq!(loaded.scrollback_lines, 778);
+    }
+
+    /// A file from before the Automatic pair (no `theme_light`/`theme_dark`) loads its theme as
+    /// it always did, and the pair at its defaults.
+    #[test]
+    fn a_config_without_the_pair_loads_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        for (name, theme) in [
+            ("nord", ThemeChoice::Nord),
+            ("system", ThemeChoice::System),
+            ("solarized-light", ThemeChoice::SolarizedLight),
+            ("antigravity", ThemeChoice::AgentTerminal),
+        ] {
+            let body = format!(r#"{{"theme":"{name}","scrollback_lines":4321}}"#);
+            std::fs::write(&path, body).unwrap();
+            let loaded = TerminalConfig::read_config(&path).unwrap().unwrap();
+            assert_eq!(loaded.theme, theme, "{name}");
+            assert_eq!(loaded.theme_pair(), ThemePair::default(), "{name}");
+            assert_eq!(loaded.scrollback_lines, 4321, "{name}");
+        }
+    }
+
+    /// The pair round-trips, and each slot keeps only a scheme of its own polarity: a dark
+    /// scheme in the light slot (or the reverse), the system theme, Automatic itself, an unknown
+    /// name or a non-string falls back to that slot's default, keeping the rest of the file.
+    #[test]
+    fn a_pair_slot_rejects_the_wrong_polarity() {
+        let cfg = TerminalConfig {
+            theme: ThemeChoice::Automatic,
+            theme_light: ThemeChoice::GithubLight,
+            theme_dark: ThemeChoice::Nord,
+            ..TerminalConfig::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains(r#""theme":"automatic""#), "{json}");
+        assert!(json.contains(r#""theme_light":"github-light""#), "{json}");
+        assert!(json.contains(r#""theme_dark":"nord""#), "{json}");
+        let back: TerminalConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.theme, ThemeChoice::Automatic);
+        assert_eq!(
+            back.theme_pair(),
+            ThemePair {
+                light: ThemeChoice::GithubLight,
+                dark: ThemeChoice::Nord
+            }
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        for (light, dark) in [
+            (r#""dracula""#, r#""one-light""#),
+            (r#""system""#, r#""system""#),
+            (r#""automatic""#, r#""automatic""#),
+            (r#""paper-white""#, r#""midnight""#),
+            ("7", "null"),
+        ] {
+            let body = format!(
+                r#"{{"theme":"automatic","theme_light":{light},"theme_dark":{dark},"scrollback_lines":555}}"#
+            );
+            std::fs::write(&path, body).unwrap();
+            let loaded = TerminalConfig::read_config(&path)
+                .expect("the file is valid")
+                .expect("it exists");
+            assert_eq!(loaded.theme, ThemeChoice::Automatic);
+            assert_eq!(
+                loaded.theme_pair(),
+                ThemePair::default(),
+                "{light} / {dark}"
+            );
+            assert_eq!(loaded.scrollback_lines, 555);
+        }
+    }
+
+    /// The pair picks the member that matches the desktop's preference.
+    #[test]
+    fn an_automatic_pair_follows_the_desktop() {
+        let pair = ThemePair {
+            light: ThemeChoice::SolarizedLight,
+            dark: ThemeChoice::GruvboxDark,
+        };
+        assert_eq!(pair.pick(true), ThemeChoice::GruvboxDark);
+        assert_eq!(pair.pick(false), ThemeChoice::SolarizedLight);
+        let default = ThemePair::default();
+        assert_eq!(default.pick(true), ThemeChoice::AgentTerminal);
+        assert_eq!(default.pick(false), ThemeChoice::AgentTerminalLight);
+        assert_eq!(default.light.is_light(), Some(true));
+        assert_eq!(default.dark.is_light(), Some(false));
+    }
+
+    /// Each slot offers exactly the schemes of its polarity, in the dropdown's order, and
+    /// together they are every bundled scheme.
+    #[test]
+    fn each_pair_slot_offers_only_its_polarity() {
+        let light = ThemeChoice::pair_choices(true);
+        let dark = ThemeChoice::pair_choices(false);
+        assert!(light.iter().all(|t| t.is_light() == Some(true)));
+        assert!(dark.iter().all(|t| t.is_light() == Some(false)));
+        assert_eq!(light.len() + dark.len(), ThemeChoice::ALL.len() - 2);
+        assert!(!light.contains(&ThemeChoice::System) && !dark.contains(&ThemeChoice::System));
+        assert!(!light.contains(&ThemeChoice::Automatic));
+        assert!(!dark.contains(&ThemeChoice::Automatic));
+        assert!(light.contains(&ThemePair::default().light));
+        assert!(dark.contains(&ThemePair::default().dark));
     }
 
     #[test]

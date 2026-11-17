@@ -239,8 +239,8 @@ impl Store {
     }
 
     /// The budget warnings due as of `now_ms`, each given once a period: what today and this
-    /// month spent in real money (metered turns, deleted threads' included, plus this month's
-    /// `extra_usd`, a plan's extra usage in US dollars), against `budget`, above the level
+    /// month spent in real money (metered turns, deleted threads' included; never extra usage,
+    /// whose unit is not confirmed), against `budget`, above the level
     /// already warned of in that period (kept in `meta` under [`BudgetPeriod::meta_key`], so a
     /// restart does not warn again). The levels due are recorded in the same transaction that
     /// read them, so two checks never both warn. Keys of past periods are removed. A write:
@@ -250,7 +250,6 @@ impl Store {
         now_ms: i64,
         day_of: &dyn Fn(i64) -> DayKey,
         budget: &Budget,
-        extra_usd: Option<f64>,
     ) -> Result<Vec<BudgetWarning>> {
         if budget.limit(BudgetPeriod::Day).is_none() && budget.limit(BudgetPeriod::Month).is_none()
         {
@@ -270,12 +269,7 @@ impl Store {
             )?;
             let mut due = Vec::new();
             for (period, key) in BudgetPeriod::ALL.into_iter().zip(&keys) {
-                let mut spent = real_money(&rows, period.first_day(today));
-                if period == BudgetPeriod::Month {
-                    spent += extra_usd
-                        .filter(|e| e.is_finite() && *e > 0.0)
-                        .unwrap_or(0.0);
-                }
+                let spent = real_money(&rows, period.first_day(today));
                 let warned = s.meta(key)?.as_deref().and_then(BudgetLevel::parse);
                 if let Some(warning) = warning_due(period, spent, budget, warned) {
                     s.set_meta(key, warning.level.as_str())?;
@@ -608,7 +602,7 @@ mod tests {
     }
 
     /// Each level is warned of once a period, across restarts of the store; only metered
-    /// turns and the plan's extra usage count, and a new day warns again.
+    /// turns count, and a new day warns again.
     #[test]
     fn budget_warning_once_per_period_across_restarts() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -629,12 +623,10 @@ mod tests {
             billed(&s, &t, &pt, 500.0, Billing::Plan, NOON);
             billed(&s, &t, &pt, 500.0, Billing::Unknown, NOON);
             billed(&s, &t, &pt, 8.5, Billing::Metered, NOON);
-            let first = s
-                .spend_budget_check(NOON, &utc, &budget, None)
-                .expect("check");
+            let first = s.spend_budget_check(NOON, &utc, &budget).expect("check");
             assert_eq!(levels(first), [(BudgetPeriod::Day, BudgetLevel::Near)]);
             assert!(s
-                .spend_budget_check(NOON, &utc, &budget, None)
+                .spend_budget_check(NOON, &utc, &budget)
                 .expect("again")
                 .is_empty());
             (t, pt)
@@ -642,30 +634,28 @@ mod tests {
         // A new start of the app: nothing is warned of again.
         let s = Store::open(&path).expect("reopen");
         assert!(s
-            .spend_budget_check(NOON + 1, &utc, &budget, None)
+            .spend_budget_check(NOON + 1, &utc, &budget)
             .expect("after a restart")
             .is_empty());
         billed(&s, &t, &pt, 2.0, Billing::Metered, NOON + 2);
-        let over = s
-            .spend_budget_check(NOON + 2, &utc, &budget, None)
-            .expect("over");
+        let over = s.spend_budget_check(NOON + 2, &utc, &budget).expect("over");
         assert_eq!(levels(over), [(BudgetPeriod::Day, BudgetLevel::Over)]);
-        // The plan's extra usage counts toward the month (10.5 + 75 is past 80% of 100).
+        // The month reaches 80% of its own amount (10.5 + 70 of 100); the day, already over,
+        // says nothing more.
+        billed(&s, &t, &pt, 70.0, Billing::Metered, NOON + 3);
         let month = s
-            .spend_budget_check(NOON + 3, &utc, &budget, Some(75.0))
+            .spend_budget_check(NOON + 3, &utc, &budget)
             .expect("month");
         assert_eq!(levels(month), [(BudgetPeriod::Month, BudgetLevel::Near)]);
         // The next day warns again, from its own spending, and the old day's key goes.
         let next = NOON + DAY_MS;
         billed(&s, &t, &pt, 9.0, Billing::Metered, next);
-        let tomorrow = s
-            .spend_budget_check(next, &utc, &budget, Some(75.0))
-            .expect("next");
+        let tomorrow = s.spend_budget_check(next, &utc, &budget).expect("next");
         assert_eq!(levels(tomorrow), [(BudgetPeriod::Day, BudgetLevel::Near)]);
         assert_eq!(s.meta("spend_warned:day:2026-11-15").expect("read"), None);
         // With no budget, nothing is read or written.
         assert!(s
-            .spend_budget_check(next, &utc, &Budget::default(), Some(1e6))
+            .spend_budget_check(next, &utc, &Budget::default())
             .expect("none")
             .is_empty());
     }

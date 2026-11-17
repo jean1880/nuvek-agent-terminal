@@ -1304,6 +1304,76 @@ fn a_pending_cancel_never_stops_the_newer_work_it_leaves_queued() {
     });
 }
 
+/// A worker's committed turn reaches the window's hook (its sink reaches no window), so its
+/// metered cost can start a budget check.
+#[test]
+fn a_committed_worker_turn_reaches_the_window() {
+    use crate::delegation::seam::ChildPublish;
+    let heard: Rc<RefCell<Vec<Event>>> = Rc::default();
+    let into = heard.clone();
+    TEST_COMMITTED.with(|c| {
+        *c.borrow_mut() = Some(Rc::new(move |e: &Event| into.borrow_mut().push(e.clone())));
+    });
+    in_context(async {
+        let (_dir, sup, root) = harness();
+        let worker = spawn_idle(&sup, &root, "metered").await;
+        let publisher =
+            crate::delegation::publish::Publisher::new(Rc::downgrade(&sup), worker.clone());
+        let end = Envelope::new(Event::TurnCompleted {
+            state: agent_core::event::TurnState::Completed,
+            usage: None,
+            cost_usd: Some(0.25),
+            error: None,
+            model: Some("synthetic-model".into()),
+            billing: Some(agent_core::spend::Billing::Metered),
+        });
+        publisher.persist("t", None, &end);
+        let mut waited = 0;
+        while waited < 100 && !heard.borrow().contains(&end.event) {
+            gtk4::glib::timeout_future(Duration::from_millis(50)).await;
+            waited += 1;
+        }
+        assert!(
+            heard.borrow().contains(&end.event),
+            "the committed turn was not heard: {:?}",
+            heard.borrow()
+        );
+        stop(&sup).await;
+    });
+}
+
+/// A worker started on a profile free to run stamps its turns free: the resolved profile's
+/// cost reaches the worker's session through its launch, as a thread's does through its own.
+#[test]
+fn a_worker_on_a_free_profile_stamps_its_turns_free() {
+    let heard: Rc<RefCell<Vec<Event>>> = Rc::default();
+    let into = heard.clone();
+    TEST_COMMITTED.with(|c| {
+        *c.borrow_mut() = Some(Rc::new(move |e: &Event| into.borrow_mut().push(e.clone())));
+    });
+    in_context(async {
+        let (dir, sup, root) = harness();
+        std::fs::write(dir.path().join("free-profile"), "").unwrap();
+        let _worker = spawn_idle(&sup, &root, "free").await;
+        let billings: Vec<Option<agent_core::spend::Billing>> = heard
+            .borrow()
+            .iter()
+            .filter_map(|e| match e {
+                Event::TurnCompleted { billing, .. } => Some(*billing),
+                _ => None,
+            })
+            .collect();
+        assert!(!billings.is_empty(), "no turn was committed");
+        assert!(
+            billings
+                .iter()
+                .all(|b| *b == Some(agent_core::spend::Billing::Free)),
+            "{billings:?}"
+        );
+        stop(&sup).await;
+    });
+}
+
 /// Two items still held by the stream sanitiser at the turn's end are released in the order
 /// they began.
 #[test]

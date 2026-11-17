@@ -27,6 +27,9 @@ pub(crate) struct AppServices {
     pub make_adapter: Rc<MakeAdapter>,
     pub tab_open_in: Rc<dyn Fn(&Path) -> bool>,
     pub report: Rc<dyn Fn(&str)>,
+    /// Told of every event a worker's store receipt committed (its no-op sink reaches no
+    /// window): what the window watches for there, such as a metered turn's cost.
+    pub committed: Rc<dyn Fn(&agent_core::event::Event)>,
     /// Models, tags and usage for `cross_agent_capabilities`.
     pub catalog: CatalogServices,
 }

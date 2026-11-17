@@ -457,20 +457,21 @@ pub fn format_money(amount: f64, currency: Option<&str>) -> String {
     }
 }
 
-/// "Extra usage: $2.50 of $40.00 this month", "Extra usage: off".
-pub fn extra_usage_text(extra: &crate::event::ExtraUsage) -> String {
-    let currency = extra.currency.as_deref();
-    if !extra.enabled && extra.used <= 0.0 {
-        return "Extra usage: off".to_owned();
+/// "Extra usage: $2.50 of $40.00 this month"; `None` while extra usage is switched off for the
+/// account (its numbers are then the service's own, not anything the user set or spent).
+pub fn extra_usage_text(extra: &crate::event::ExtraUsage) -> Option<String> {
+    if !extra.enabled {
+        return None;
     }
+    let currency = extra.currency.as_deref();
     let used = format_money(extra.used, currency);
-    match extra.limit {
+    Some(match extra.limit {
         Some(limit) => format!(
             "Extra usage: {used} of {} this month",
             format_money(limit, currency)
         ),
         None => format!("Extra usage: {used} this month"),
-    }
+    })
 }
 
 /// "950", "12.3k", "4.5M".
@@ -662,17 +663,34 @@ pub fn bar_fractions<'a>(totals: impl IntoIterator<Item = &'a Total>) -> Vec<f64
 }
 
 // ---------------------------------------------------------------------------------------------
-// Budget warning: real money only (metered turns, and a plan's extra usage), never a plan's
-// list price, never a cost whose billing was not recorded.
+// Budget warning: real money only (metered turns), never a plan's list price, never a cost
+// whose billing was not recorded, never extra usage (whose unit is not confirmed). Amounts are
+// summed and compared in whole micro-dollars, so a sum of cents never drifts past or short of
+// a threshold.
 // ---------------------------------------------------------------------------------------------
 
-/// The share of a budget at which the first warning is given.
-pub const NEAR_SHARE: f64 = 0.8;
+/// Micro-dollars in a dollar.
+const MICROS: f64 = 1_000_000.0;
+
+/// `usd` in whole micro-dollars; a value that is not a positive finite number is none.
+pub fn to_micros(usd: f64) -> i64 {
+    if usd.is_finite() && usd > 0.0 {
+        // At most a billion dollars a turn or a budget: well inside `i64`.
+        (usd.min(1e12) * MICROS).round() as i64
+    } else {
+        0
+    }
+}
+
+/// Whole micro-dollars as dollars, for showing.
+pub fn from_micros(micros: i64) -> f64 {
+    micros as f64 / MICROS
+}
 
 /// How far a period's spending has gone into its budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BudgetLevel {
-    /// At or past [`NEAR_SHARE`] of it.
+    /// At or past four fifths (80 %) of it.
     Near,
     /// At or past all of it.
     Over,
@@ -697,15 +715,16 @@ impl BudgetLevel {
     }
 }
 
-/// How far `spent` has gone into `limit`; `None` below [`NEAR_SHARE`] of it, or for a limit
-/// that is not a positive number.
-pub fn budget_level(spent: f64, limit: f64) -> Option<BudgetLevel> {
-    if !limit.is_finite() || limit <= 0.0 || !spent.is_finite() {
+/// How far `spent` has gone into `limit`, both in micro-dollars; `None` below four fifths of
+/// it, or for a limit that is not positive. Exact: four fifths is `spent * 5 >= limit * 4`.
+pub fn budget_level(spent: i64, limit: i64) -> Option<BudgetLevel> {
+    if limit <= 0 {
         return None;
     }
+    let (spent, limit) = (i128::from(spent.max(0)), i128::from(limit));
     if spent >= limit {
         Some(BudgetLevel::Over)
-    } else if spent >= limit * NEAR_SHARE {
+    } else if spent * 5 >= limit * 4 {
         Some(BudgetLevel::Near)
     } else {
         None
@@ -759,51 +778,45 @@ pub struct Budget {
 }
 
 impl Budget {
-    pub fn limit(&self, period: BudgetPeriod) -> Option<f64> {
+    /// The period's amount in micro-dollars, when it has one.
+    pub fn limit(&self, period: BudgetPeriod) -> Option<i64> {
         match period {
             BudgetPeriod::Day => self.daily,
             BudgetPeriod::Month => self.monthly,
         }
-        .filter(|l| l.is_finite() && *l > 0.0)
+        .map(to_micros)
+        .filter(|l| *l > 0)
     }
 }
 
-/// The real money `rows` spent from `first` on, in US dollars: metered turns only (a delegated
-/// worker's included). A plan's list price, a free profile's turns and a cost whose billing was
-/// not recorded are never real money here.
-pub fn real_money(rows: &[SpendRow], first: DayKey) -> f64 {
+/// The real money `rows` spent from `first` on, in micro-dollars: metered turns only (a
+/// delegated worker's included), each turn's cost made whole micro-dollars before it is
+/// added. A plan's list price, a free profile's turns, a cost whose billing was not recorded
+/// and extra usage are never real money here.
+pub fn real_money(rows: &[SpendRow], first: DayKey) -> i64 {
     rows.iter()
         .filter(|r| r.day >= first && r.billing == Billing::Metered)
-        .map(|r| {
-            if r.cost_usd.is_finite() {
-                r.cost_usd.max(0.0)
-            } else {
-                0.0
-            }
-        })
-        .sum()
+        .map(|r| to_micros(r.cost_usd))
+        .fold(0_i64, i64::saturating_add)
 }
 
-/// A plan's extra usage as real US dollars spent this month: what it says it used when it is
-/// in US dollars; `None` in another currency or none named (it is never converted or guessed).
-pub fn extra_usage_usd(extra: &crate::event::ExtraUsage) -> Option<f64> {
-    (extra.currency.as_deref() == Some("USD") && extra.used.is_finite())
-        .then_some(extra.used.max(0.0))
-}
-
-/// A warning to give: the period, how far it went, what it spent and its budget.
+/// A warning to give: the period, how far it went, what it spent and its budget (both in
+/// micro-dollars).
 #[derive(Debug, Clone, PartialEq)]
 pub struct BudgetWarning {
     pub period: BudgetPeriod,
     pub level: BudgetLevel,
-    pub spent: f64,
-    pub limit: f64,
+    pub spent: i64,
+    pub limit: i64,
 }
 
 impl BudgetWarning {
-    /// "Spending today has reached $8.12 of your $10.00 warning." The amount is real money.
+    /// "Spending today is $8.50, near your $10.00 warning". The amount is real money.
     pub fn text(&self) -> String {
-        let (spent, limit) = (format_usd(self.spent), format_usd(self.limit));
+        let (spent, limit) = (
+            format_usd(from_micros(self.spent)),
+            format_usd(from_micros(self.limit)),
+        );
         match self.level {
             BudgetLevel::Near => format!(
                 "Spending {} is {spent}, near your {limit} warning",
@@ -822,7 +835,7 @@ impl BudgetWarning {
 /// warned of once a period, and a jump straight past the budget warns once, as over.
 pub fn warning_due(
     period: BudgetPeriod,
-    spent: f64,
+    spent: i64,
     budget: &Budget,
     warned: Option<BudgetLevel>,
 ) -> Option<BudgetWarning> {
@@ -1192,60 +1205,55 @@ mod report_tests {
             with("2026-11-02", Billing::Metered, 2.0, false),
             with("2026-10-31", Billing::Metered, 4.0, false),
         ];
-        assert_eq!(real_money(&rows, BudgetPeriod::Day.first_day(today)), 1.5);
-        assert_eq!(real_money(&rows, BudgetPeriod::Month.first_day(today)), 3.5);
-
-        use crate::event::ExtraUsage;
-        let extra = |currency: Option<&str>| ExtraUsage {
-            enabled: true,
-            used: 4.25,
-            limit: None,
-            currency: currency.map(str::to_owned),
-        };
-        assert_eq!(extra_usage_usd(&extra(Some("USD"))), Some(4.25));
         assert_eq!(
-            extra_usage_usd(&extra(Some("CAD"))),
-            None,
-            "never converted"
+            real_money(&rows, BudgetPeriod::Day.first_day(today)),
+            1_500_000
         );
-        assert_eq!(extra_usage_usd(&extra(None)), None, "never assumed");
+        assert_eq!(
+            real_money(&rows, BudgetPeriod::Month.first_day(today)),
+            3_500_000
+        );
+        assert_eq!((to_micros(f64::NAN), to_micros(-1.0)), (0, 0));
     }
 
     #[test]
     fn budget_state_thresholds_fire_once_per_period() {
-        assert_eq!(budget_level(7.9, 10.0), None);
-        assert_eq!(budget_level(8.0, 10.0), Some(BudgetLevel::Near));
-        assert_eq!(budget_level(10.0, 10.0), Some(BudgetLevel::Over));
-        assert_eq!(budget_level(5.0, 0.0), None);
-        assert_eq!(budget_level(f64::NAN, 10.0), None);
+        let usd = to_micros;
+        assert_eq!(budget_level(usd(7.9), usd(10.0)), None);
+        assert_eq!(budget_level(usd(8.0), usd(10.0)), Some(BudgetLevel::Near));
+        assert_eq!(budget_level(usd(10.0), usd(10.0)), Some(BudgetLevel::Over));
+        assert_eq!(budget_level(usd(5.0), 0), None);
 
         let budget = Budget {
             daily: Some(10.0),
             monthly: None,
         };
         let day = BudgetPeriod::Day;
-        let near = warning_due(day, 8.5, &budget, None).expect("near");
+        let near = warning_due(day, usd(8.5), &budget, None).expect("near");
         assert_eq!(near.level, BudgetLevel::Near);
         assert_eq!(
             near.text(),
             "Spending today is $8.50, near your $10.00 warning"
         );
         assert_eq!(
-            warning_due(day, 9.0, &budget, Some(BudgetLevel::Near)),
+            warning_due(day, usd(9.0), &budget, Some(BudgetLevel::Near)),
             None
         );
-        let over = warning_due(day, 12.0, &budget, Some(BudgetLevel::Near)).expect("over");
+        let over = warning_due(day, usd(12.0), &budget, Some(BudgetLevel::Near)).expect("over");
         assert_eq!(over.level, BudgetLevel::Over);
         assert_eq!(
-            warning_due(day, 50.0, &budget, Some(BudgetLevel::Over)),
+            warning_due(day, usd(50.0), &budget, Some(BudgetLevel::Over)),
             None
         );
         // Straight past the budget: one warning, as over.
         assert_eq!(
-            warning_due(day, 12.0, &budget, None).map(|w| w.level),
+            warning_due(day, usd(12.0), &budget, None).map(|w| w.level),
             Some(BudgetLevel::Over)
         );
-        assert_eq!(warning_due(BudgetPeriod::Month, 1e6, &budget, None), None);
+        assert_eq!(
+            warning_due(BudgetPeriod::Month, usd(1e6), &budget, None),
+            None
+        );
 
         let today = DayKey::parse("2026-11-16").expect("day");
         assert_eq!(day.meta_key(today), "spend_warned:day:2026-11-16");
@@ -1260,6 +1268,55 @@ mod report_tests {
         assert_eq!(BudgetLevel::parse("garbage"), None);
     }
 
+    /// Sums of cents and limits that are not binary fractions land exactly on the thresholds:
+    /// $2.40 of $3.00 is near, and ten $0.10 turns are $1.00, past a $1.00 warning.
+    #[test]
+    fn budget_thresholds_are_exact_for_cents() {
+        let today = day("2026-11-16");
+        let metered = |cost| {
+            let mut r = row("2026-11-16", "claude", "/a", Some(cost), 1);
+            r.billing = Billing::Metered;
+            r
+        };
+        let near = [metered(1.2), metered(1.2)];
+        let spent = real_money(&near, today);
+        assert_eq!(spent, 2_400_000);
+        let three = Budget {
+            daily: Some(3.0),
+            monthly: None,
+        };
+        assert_eq!(
+            warning_due(BudgetPeriod::Day, spent, &three, None).map(|w| w.level),
+            Some(BudgetLevel::Near),
+            "exactly 80% is near"
+        );
+        assert_eq!(budget_level(2_399_999, 3_000_000), None);
+
+        let dimes: Vec<SpendRow> = (0..10).map(|_| metered(0.1)).collect();
+        let spent = real_money(&dimes, today);
+        assert_eq!(spent, 1_000_000);
+        let dollar = Budget {
+            daily: Some(1.0),
+            monthly: None,
+        };
+        let warning = warning_due(BudgetPeriod::Day, spent, &dollar, None).expect("over");
+        assert_eq!(warning.level, BudgetLevel::Over);
+        assert_eq!(
+            warning.text(),
+            "Spending today is $1.00, past your $1.00 warning"
+        );
+        // Seven turns of $0.10 against $0.875 (not a binary fraction): $0.70 is exactly 80%.
+        let seven: Vec<SpendRow> = (0..7).map(|_| metered(0.1)).collect();
+        let odd = Budget {
+            daily: Some(0.875),
+            monthly: None,
+        };
+        assert_eq!(
+            warning_due(BudgetPeriod::Day, real_money(&seven, today), &odd, None).map(|w| w.level),
+            Some(BudgetLevel::Near)
+        );
+    }
+
     #[test]
     fn budget_entry_rejects_non_numbers_and_negative() {
         assert_eq!(parse_budget(""), Ok(None));
@@ -1271,8 +1328,10 @@ mod report_tests {
         }
     }
 
+    /// Extra usage is shown, in its own currency, only while it is switched on: switched off,
+    /// its numbers are the service's own (a plan's internal cap), not anything set or spent.
     #[test]
-    fn extra_usage_is_shown_in_its_own_currency() {
+    fn extra_usage_is_shown_only_while_switched_on() {
         use crate::event::ExtraUsage;
         let extra = |enabled, used, limit, currency: Option<&str>| ExtraUsage {
             enabled,
@@ -1281,22 +1340,22 @@ mod report_tests {
             currency: currency.map(str::to_owned),
         };
         assert_eq!(
-            extra_usage_text(&extra(true, 2.5, Some(40.0), Some("USD"))),
-            "Extra usage: $2.50 of $40.00 this month"
+            extra_usage_text(&extra(true, 2.5, Some(40.0), Some("USD"))).as_deref(),
+            Some("Extra usage: $2.50 of $40.00 this month")
         );
         assert_eq!(
-            extra_usage_text(&extra(true, 2.5, None, Some("CAD"))),
-            "Extra usage: 2.50 CAD this month"
+            extra_usage_text(&extra(true, 2.5, None, Some("CAD"))).as_deref(),
+            Some("Extra usage: 2.50 CAD this month")
+        );
+        assert_eq!(
+            extra_usage_text(&extra(true, 1.0, None, None)).as_deref(),
+            Some("Extra usage: 1.00 this month")
         );
         assert_eq!(
             extra_usage_text(&extra(false, 0.0, Some(40.0), Some("CAD"))),
-            "Extra usage: off"
+            None
         );
-        // Switched off after spending: what was spent still shows.
-        assert_eq!(
-            extra_usage_text(&extra(false, 1.0, None, None)),
-            "Extra usage: 1.00 this month"
-        );
+        assert_eq!(extra_usage_text(&extra(false, 1.0, None, None)), None);
     }
 
     #[test]

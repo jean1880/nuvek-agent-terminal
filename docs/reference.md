@@ -261,7 +261,8 @@ session, behind a preview.
 **Week** or **Month** for the last 30 days, 12 weeks or 12 months, and **Group by** folder,
 agent, profile or model. Each row shows its amount, a bar against the largest row, and its
 tokens and turns; below the groups, the same totals by day, week or month. **Plan usage**
-repeats the quota windows the agents last reported, and Claude's extra usage this month.
+repeats the quota windows the agents last reported, and Claude's extra usage this month while
+it is switched on for the account.
 
 What each agent reports:
 
@@ -276,8 +277,10 @@ What each agent reports:
 
   A turn stored before turns recorded their billing, or whose billing Claude did not make
   clear, reads as "reported": metered or list price, unknown which.
-- **Claude's extra usage** (credits bought past a plan's windows) is real money. It is shown
-  in the usage popover and under **Plan usage**, in the account's own currency.
+- **Claude's extra usage** (credits bought past a plan's windows) is shown in the usage popover
+  and under **Plan usage**, in the account's own currency, only while extra usage is switched
+  on for the account. The unit Claude reports it in is not confirmed (it is read as cents), so
+  it is shown for reference and never counted in any total or warning.
 - **Codex, Antigravity and the Local agent** report tokens only. Their rows say "Not
   reported" and show their tokens. The app never estimates dollars from a price list of its
   own.
@@ -296,11 +299,10 @@ background. Nothing here makes a request or leaves this computer.
 
 **Settings → General → Spending** turns on a warning and takes a daily and a monthly amount in
 US dollars (blank for none; an amount that is not a positive number is refused and the
-previous one kept). It counts real money only: metered turns, sub-agents' included, and, for
-the month, Claude's extra usage when it is reported in US dollars (extra usage in another
-currency is shown but not counted, never converted). A plan's list price and a cost whose
-billing is unknown are never counted. After a metered turn or a new extra-usage reading, the
-app checks both amounts: at 80% and again at 100% it shows a notice, once a day or month at
+previous one kept). It counts real money only: metered turns, sub-agents' included, summed
+to the micro-dollar so a sum of cents meets a threshold exactly. A plan's list price, a cost
+whose billing is unknown and Claude's extra usage are never counted. After a metered turn,
+the app checks both amounts: at 80% and again at 100% it shows a notice, once a day or month at
 each level, remembered in the thread store so restarting the app does not repeat it. The
 Spending dialog shows a banner while an amount is reached. It is a warning only: no turn is
 ever stopped.

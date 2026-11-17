@@ -9553,6 +9553,7 @@ mod tests {
         threads::message_search::tests::message_search_finds_and_opens_a_hit(window);
         spending::tests::the_spending_dialog_shows_and_keeps_what_turns_cost(window);
         spending::tests::the_spending_group_saves_only_valid_amounts(window);
+        spending::tests::a_metered_turn_warns_once_through_the_window(window);
     }
 
     /// A folder outside any repository has nothing to diff: no Changes toggle, no shortcut.

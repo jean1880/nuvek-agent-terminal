@@ -34,24 +34,22 @@ const READ_BACK_DAYS: i64 = 400;
 pub(super) struct Loaded {
     /// `Period::ALL` × `Group::ALL`, in that order ([`Loaded::report`]).
     reports: Vec<Report>,
-    /// Real money spent today and this month (metered turns), for the warning banner.
-    real_today: f64,
-    real_month: f64,
+    /// Real money spent today and this month (metered turns, micro-dollars), for the banner.
+    real_today: i64,
+    real_month: i64,
 }
 
 /// The banner's text when a warning amount is reached, worst first; `None` below 80 % of every
-/// amount set. `extra_usd` is this month's extra usage in US dollars.
+/// amount set. The amounts are micro-dollars of metered turns.
 pub(super) fn budget_banner(
     budget: &spend::Budget,
-    real_today: f64,
-    real_month: f64,
-    extra_usd: Option<f64>,
+    real_today: i64,
+    real_month: i64,
 ) -> Option<String> {
     use spend::BudgetPeriod;
-    let month = real_month + extra_usd.unwrap_or(0.0);
     let mut due: Vec<spend::BudgetWarning> = [
         (BudgetPeriod::Day, real_today),
-        (BudgetPeriod::Month, month),
+        (BudgetPeriod::Month, real_month),
     ]
     .into_iter()
     .filter_map(|(period, spent)| spend::warning_due(period, spent, budget, None))
@@ -336,7 +334,7 @@ fn show_report(content: &gtk4::Box, report: &Report, names: &Names, plan_lines: 
 }
 
 /// The live plan windows of every agent that has some, one line each, each followed by its
-/// extra usage when it reported one.
+/// extra usage while it is switched on.
 fn plan_lines(status: &AccountStatus) -> Vec<String> {
     Driver::ALL
         .into_iter()
@@ -346,7 +344,8 @@ fn plan_lines(status: &AccountStatus) -> Vec<String> {
             plan_usage_line(agent, &snap.windows).into_iter().chain(
                 snap.extra
                     .as_ref()
-                    .map(|e| format!("{agent}: {}", spend::extra_usage_text(e))),
+                    .and_then(spend::extra_usage_text)
+                    .map(|text| format!("{agent}: {text}")),
             )
         })
         .collect()
@@ -356,18 +355,39 @@ fn now_ms() -> i64 {
     glib::real_time() / 1000
 }
 
-/// Whether `event` may have moved the real money spent: a metered turn that reported a cost, or
-/// a new reading of a plan's extra usage. Only these start a budget check.
-pub(super) fn moves_real_money(event: &agent_core::event::Event) -> bool {
-    use agent_core::event::Event;
-    match event {
-        Event::TurnCompleted {
+/// Whether `event` moved the real money spent: a metered turn that reported a cost. Only this
+/// starts a budget check (extra usage never counts: its unit is not confirmed).
+pub(in crate::window) fn moves_real_money(event: &agent_core::event::Event) -> bool {
+    matches!(
+        event,
+        agent_core::event::Event::TurnCompleted {
             billing: Some(spend::Billing::Metered),
             cost_usd: Some(cost),
             ..
-        } => *cost > 0.0,
-        Event::ExtraUsageUpdated { extra } => extra.used > 0.0,
-        _ => false,
+        } if *cost > 0.0
+    )
+}
+
+/// An open main window other than `except`, to show what a closed one cannot.
+fn another_window(
+    except: Option<&crate::window::AgentTerminalWindow>,
+) -> Option<crate::window::AgentTerminalWindow> {
+    let app = gtk4::gio::Application::default()?
+        .downcast::<gtk4::Application>()
+        .ok()?;
+    app.windows()
+        .into_iter()
+        .filter_map(|w| w.downcast::<crate::window::AgentTerminalWindow>().ok())
+        .find(|w| Some(w) != except)
+}
+
+/// [`AgentTerminalWindow::check_spending_budget`] from outside a window (a delegated worker's
+/// committed turn): on `preferred` while it is open, else on any open window.
+pub(in crate::window) fn check_spending_budget_on(
+    preferred: Option<crate::window::AgentTerminalWindow>,
+) {
+    if let Some(window) = preferred.or_else(|| another_window(None)) {
+        window.imp().check_spending_budget();
     }
 }
 
@@ -385,8 +405,8 @@ const BUDGET_HELP_DAILY: &str =
     "Warn when today's real money spent reaches 80% and then all of this amount, in US dollars. \
      Blank: no daily warning";
 const BUDGET_HELP_MONTHLY: &str =
-    "Warn when this month's real money spent, Claude's extra usage in US dollars included, \
-     reaches 80% and then all of this amount. Blank: no monthly warning";
+    "Warn when this month's real money spent reaches 80% and then all of this amount, in US \
+     dollars. Blank: no monthly warning";
 
 /// Shows on a warning amount's row whether its entry holds an amount Settings can keep: the
 /// reason in the subtitle and the entry marked invalid. Returns the amount when it can.
@@ -429,7 +449,7 @@ impl AgentTerminalWindow {
             .title("Spending")
             .description(
                 "A warning counts real money only: turns on an API key or a metered model \
-                 server, and Claude's extra usage. A plan's list price is never counted. It \
+                 server. A plan's list price and Claude's extra usage are never counted. It \
                  warns once a day or month at each level, and never stops a turn.",
             )
             .build();
@@ -523,6 +543,8 @@ impl AgentTerminalWindow {
     /// Checks the spending warnings now, off the main thread, through the store writer (which
     /// records each warning given, so it is given once a period, across windows and restarts),
     /// and shows a toast for each one due. Asked again while one runs, it runs once more after.
+    /// A window closed before the writer answered hands its toasts, and the check asked for
+    /// meanwhile, to another open window: a warning recorded as given is never lost.
     pub(super) fn check_spending_budget(&self) {
         let budget = self.config.borrow().spend_budget();
         if budget == spend::Budget::default() {
@@ -534,37 +556,40 @@ impl AgentTerminalWindow {
             return;
         }
         BUDGET_CHECK.with(|c| c.set((true, false)));
-        let extra = AccountStatus::shared()
-            .snapshot(Driver::Claude)
-            .extra
-            .as_ref()
-            .and_then(spend::extra_usage_usd);
         let now = now_ms();
         let weak = self.obj().downgrade();
         glib::spawn_future_local(async move {
             let result = write_job("check the spending warnings", move |s| {
                 s.ensure_spend_index()?;
-                s.spend_budget_check(now, &local_day, &budget, extra)
+                s.spend_budget_check(now, &local_day, &budget)
             })
             .await;
-            let obj = weak.upgrade();
+            // The window that asked while it is still open (still the application's), else
+            // another open one.
+            let asked = weak.upgrade();
+            let shown = match asked {
+                Some(w) if w.application().is_some() => Some(w),
+                other => another_window(other.as_ref()).or(other),
+            };
             match result {
-                Some(Ok(warnings)) => {
-                    if let Some(obj) = &obj {
+                Some(Ok(warnings)) => match &shown {
+                    Some(window) => {
                         for warning in warnings {
-                            obj.imp().show_toast(&warning.text());
+                            window.imp().show_toast(&warning.text());
                         }
                     }
-                }
+                    None if !warnings.is_empty() => {
+                        tracing::warn!("no window is open to show a spending warning");
+                    }
+                    None => {}
+                },
                 Some(Err(e)) => tracing::warn!(error = %e, "could not check the spending warnings"),
                 None => tracing::warn!("the spending warnings were not checked"),
             }
             let (_, again) = BUDGET_CHECK.with(Cell::get);
             BUDGET_CHECK.with(|c| c.set((false, false)));
             if again {
-                if let Some(obj) = obj {
-                    obj.imp().check_spending_budget();
-                }
+                check_spending_budget_on(shown);
             }
         });
     }
@@ -597,11 +622,6 @@ impl AgentTerminalWindow {
         let names = Rc::new(Names::new(&self.config.borrow(), glib::home_dir().into()));
         let plan = Rc::new(plan_lines(&AccountStatus::shared()));
         let budget = self.config.borrow().spend_budget();
-        let extra = AccountStatus::shared()
-            .snapshot(Driver::Claude)
-            .extra
-            .as_ref()
-            .and_then(spend::extra_usage_usd);
         let now = now_ms();
         glib::spawn_future_local(glib::clone!(
             #[weak]
@@ -626,7 +646,7 @@ impl AgentTerminalWindow {
                     Some(Err(why)) => return show_error(&stack, &why),
                     None => return show_error(&stack, "The thread store could not be read."),
                 };
-                let banner = budget_banner(&budget, loaded.real_today, loaded.real_month, extra);
+                let banner = budget_banner(&budget, loaded.real_today, loaded.real_month);
                 show_loaded(&stack, Rc::new(loaded), names, plan, banner);
             }
         ));
@@ -878,28 +898,31 @@ pub(super) mod tests {
                 currency: Some("USD".into()),
             },
         };
-        assert!(moves_real_money(&extra(1.0)));
-        assert!(!moves_real_money(&extra(0.0)));
+        assert!(
+            !moves_real_money(&extra(1.0)),
+            "extra usage never counts: its unit is not confirmed"
+        );
     }
 
     #[test]
     fn the_banner_names_the_worst_warning_reached() {
+        let usd = spend::to_micros;
         let budget = spend::Budget {
             daily: Some(10.0),
             monthly: Some(100.0),
         };
-        assert_eq!(budget_banner(&budget, 1.0, 10.0, None), None);
+        assert_eq!(budget_banner(&budget, usd(1.0), usd(10.0)), None);
         assert_eq!(
-            budget_banner(&budget, 8.0, 10.0, None).as_deref(),
+            budget_banner(&budget, usd(8.0), usd(10.0)).as_deref(),
             Some("Spending today is $8.00, near your $10.00 warning")
         );
-        // The month passed through its extra usage outranks a day only near.
+        // A month past its amount outranks a day only near.
         assert_eq!(
-            budget_banner(&budget, 8.0, 10.0, Some(95.0)).as_deref(),
+            budget_banner(&budget, usd(8.0), usd(105.0)).as_deref(),
             Some("Spending this month is $105.00, past your $100.00 warning")
         );
         assert_eq!(
-            budget_banner(&spend::Budget::default(), 1e6, 1e6, None),
+            budget_banner(&spend::Budget::default(), usd(1e6), usd(1e6)),
             None
         );
         assert_eq!(budget_text(Some(12.5)), "12.5");
@@ -971,6 +994,23 @@ pub(super) mod tests {
         );
         commit(monthly, "");
         assert_eq!(saved(), (Some(12.5), None), "blank is no warning");
+        // Leaving the field commits it as Enter does.
+        monthly.set_text("75");
+        crate::testutil::settle(&ctx);
+        assert_eq!(saved().1, None, "typing saves nothing");
+        let focus = monthly
+            .observe_controllers()
+            .into_iter()
+            .filter_map(|c| c.ok()?.downcast::<gtk4::EventControllerFocus>().ok())
+            .last()
+            .expect("the entry's focus controller");
+        focus.emit_by_name::<()>("leave", &[]);
+        crate::testutil::settle(&ctx);
+        assert_eq!(
+            saved(),
+            (Some(12.5), Some(75.0)),
+            "leaving the field saved it"
+        );
 
         let switch =
             crate::testutil::find_first::<adw::SwitchRow>(group.upcast_ref()).expect("the switch");
@@ -979,6 +1019,78 @@ pub(super) mod tests {
         crate::testutil::settle(&ctx);
         assert!(imp.config.borrow().spend_warn_enabled);
 
+        let mut c = imp.config.borrow_mut();
+        (
+            c.spend_warn_enabled,
+            c.spend_warn_daily,
+            c.spend_warn_monthly,
+        ) = before;
+    }
+
+    /// A metered turn's cost, checked through the store writer, shows its warning as a toast
+    /// once: the same check again shows nothing, and a turn on a plan never warns. Run from the
+    /// window test.
+    pub(in crate::window) fn a_metered_turn_warns_once_through_the_window(
+        window: &crate::window::AgentTerminalWindow,
+    ) {
+        use agent_core::event::{Envelope, Event, TurnState};
+        let imp = window.imp();
+        let store = super::super::threads::app_store();
+        let ctx = glib::MainContext::default();
+        let before = {
+            let c = imp.config.borrow();
+            (
+                c.spend_warn_enabled,
+                c.spend_warn_daily,
+                c.spend_warn_monthly,
+            )
+        };
+        let thread = store.create_thread("/spend/budget", None).expect("thread");
+        let pt = store
+            .add_provider_thread(&thread, "claude", "opus")
+            .expect("pt");
+        let turn = |cost: f64, billing| {
+            let env = Envelope::new(Event::TurnCompleted {
+                state: TurnState::Completed,
+                usage: None,
+                cost_usd: Some(cost),
+                error: None,
+                model: None,
+                billing: Some(billing),
+            });
+            store.append_event(&thread, Some(&pt), &env).expect("turn");
+        };
+        // Whatever today already spent, the amount is set so this turn reaches 90% of it.
+        let spent_before = load(&store, now_ms()).map(|l| l.real_today).unwrap_or(0);
+        turn(9.0, Billing::Metered);
+        turn(500.0, Billing::Plan);
+        let amount = spend::from_micros(spent_before + spend::to_micros(9.0)) / 0.9;
+        {
+            let mut c = imp.config.borrow_mut();
+            c.spend_warn_enabled = true;
+            c.spend_warn_daily = Some(amount);
+            c.spend_warn_monthly = None;
+        }
+        let warned = || {
+            imp.test_toasts
+                .borrow()
+                .iter()
+                .filter_map(|t| t.title())
+                .filter(|t| t.contains("today") && t.contains("near your"))
+                .count()
+        };
+        let shown = warned();
+        imp.check_spending_budget();
+        assert!(
+            crate::testutil::pump_until(&ctx, 20, || warned() == shown + 1),
+            "the warning was not shown"
+        );
+        imp.check_spending_budget();
+        crate::testutil::pump_until(&ctx, 2, || BUDGET_CHECK.with(Cell::get) == (false, false));
+        crate::testutil::settle(&ctx);
+        assert_eq!(warned(), shown + 1, "a level is warned of once a period");
+
+        store.delete_thread(&thread).expect("delete");
         let mut c = imp.config.borrow_mut();
         (
             c.spend_warn_enabled,

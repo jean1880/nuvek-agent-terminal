@@ -137,7 +137,7 @@ until it is fixed.
 | `context_warning` | `75` | Percent of a thread's context used at which it offers to compact or continue in a new thread, once per crossing, and the gauge turns amber: `60`, `75` or `90`, or `0` for never. Any other value loads as `75` (the rest of the file is kept). See [The context gauge](reference.md#the-context-gauge) |
 | `spend_warn_enabled` | `false` | Warn when real money spent nears or passes the amounts below. See [Spending warning](reference.md#spending-warning) |
 | `spend_warn_daily` | none | Today's warning amount in US dollars (a positive number; anything else warns of nothing) |
-| `spend_warn_monthly` | none | This month's warning amount in US dollars, Claude's extra usage in US dollars included |
+| `spend_warn_monthly` | none | This month's warning amount in US dollars (metered turns only; Claude's extra usage is never counted) |
 | `font`, `font_scale` | JetBrains Mono 11, `1.0` | Terminal font and zoom |
 | `cursor_shape`, `cursor_blink` | `block`, `true` | Terminal cursor |
 | `scrollback_lines` | `10000` | Terminal scrollback |

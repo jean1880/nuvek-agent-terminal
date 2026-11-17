@@ -11716,6 +11716,62 @@ pub(super) mod tests {
         reset_hook_verdicts();
     }
 
+    /// A switch's launch says whether the profile it was built from is free to run, which the
+    /// session stamps on its turns: a local server's kind is free, unless the profile says it
+    /// is not, and the vendor's own is metered.
+    #[test]
+    fn a_launch_says_whether_its_profile_is_free_to_run() {
+        use agent_core::provider::{ModelProvider, ProviderKind};
+        crate::testutil::in_loop(|_ctx| {
+            let config = SharedConfig::default();
+            let saved = config.borrow().clone();
+            let mut free = crate::config::new_agent_profile(Driver::Codex);
+            free.id = "free-codex".into();
+            free.provider = Some(ModelProvider::new(ProviderKind::Ollama));
+            free.default_model = Some("local-model".into());
+            let mut paid = free.clone();
+            paid.id = "paid-codex".into();
+            paid.free_to_run = Some(false);
+            let mut vendor = crate::config::new_agent_profile(Driver::Codex);
+            vendor.id = "vendor-codex".into();
+            config.borrow_mut().profiles = vec![free.clone(), paid, vendor];
+            let key = (free.command.clone(), free.env_file.clone());
+            let old = RESOLVED.with(|r| {
+                r.borrow_mut().insert(
+                    key.clone(),
+                    ResolvedAgent {
+                        program: Some("/fixture/codex".into()),
+                        env: vec![("HOME".into(), "/fixture/home".into())],
+                        env_failed: false,
+                    },
+                )
+            });
+            let launch = |id: &str| {
+                agent_launch_with(
+                    &Availability::Ready("/fixture/codex".into()),
+                    Driver::Codex,
+                    "t",
+                    "/tmp",
+                    Some(id),
+                )
+            };
+            let results: Vec<Result<bool, String>> = ["free-codex", "paid-codex", "vendor-codex"]
+                .into_iter()
+                .map(|id| launch(id).map(|l| l.free))
+                .collect();
+            *config.borrow_mut() = saved;
+            RESOLVED.with(|r| {
+                let mut r = r.borrow_mut();
+                if let Some(old) = old {
+                    r.insert(key, old);
+                } else {
+                    r.remove(&key);
+                }
+            });
+            assert_eq!(results, [Ok(true), Ok(false), Ok(false)]);
+        });
+    }
+
     #[test]
     fn a_missing_agy_profile_uses_the_launch_fallback() {
         crate::testutil::in_loop(|ctx| {

@@ -171,10 +171,13 @@ Architectural mandates, standards, and workflows for this codebase.
     `AgentLaunch::free`/`set_launched_free` and `launched_server`, a delegated worker's too).
     A free turn's reported cost is never summed. `Store::spend_budget_check` (a write, through
     the writer) sums today's and this month's real money only (`spend::real_money`: metered
-    turns; plus, for the month, Claude's extra usage when in US dollars, never converted) and
-    records each level warned of (80 %, 100 %) in `meta` (`spend_warned:day:<day>`,
+    turns, in whole micro-dollars, the 80 % test `spent * 5 >= limit * 4`; Claude's extra
+    usage is never counted, its unit being unconfirmed, and is shown only while switched on)
+    and records each level warned of (80 %, 100 %) in `meta` (`spend_warned:day:<day>`,
     `spend_warned:month:<yyyy-mm>`, older keys removed) in the same transaction, so a level
-    is warned of once a period across windows and restarts; it never stops a turn.
+    is warned of once a period across windows and restarts; it never stops a turn. A
+    delegated worker's committed events reach the window through `AppServices::committed`
+    (its sink reaches none), so its metered turn starts the check too.
     `store/review.rs` keeps a thread's unsent diff-review comments (`review_drafts`):
     `Store::replace_review_drafts` writes the whole list in one transaction (empty: sent or
     discarded), each quote redacted whole and each note redacted on write, queued on the writer

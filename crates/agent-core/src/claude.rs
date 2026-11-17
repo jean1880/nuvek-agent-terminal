@@ -1683,6 +1683,9 @@ impl Adapter for ClaudeAdapter {
         self.api_key_source = None;
         self.api_provider = None;
         self.plan = None;
+        // The next process's first reading is said again, whatever the last one was: what it
+        // fed may have been forgotten meanwhile (a sign-out, another account).
+        self.extra_usage = None;
         self.blocks.clear();
         self.reasoning_shared.clear();
         self.started_items.clear();
@@ -2551,6 +2554,20 @@ mod tests {
             .collect();
         assert_eq!(extras.len(), 1, "{extras:?}");
         assert_eq!(extras[0].limit, Some(40.0));
+        let extras_in = |a: &mut ClaudeAdapter| {
+            let mut out = Vec::new();
+            for frame in stdout_frames(CONTROLS, Malformed::Panic) {
+                out.extend(a.feed(&frame));
+            }
+            out.iter()
+                .filter(|e| matches!(e.event, Event::ExtraUsageUpdated { .. }))
+                .count()
+        };
+        assert_eq!(extras_in(&mut a), 0, "the same process repeats nothing");
+        // The next process says its reading again: what the last one fed may have been
+        // forgotten (a sign-out, another account) meanwhile.
+        a.on_exit(Some(0));
+        assert_eq!(extras_in(&mut a), 1, "a new process reports its reading");
         a.encode(Command::Control {
             id: "usage-9".into(),
             control: Control::Usage,

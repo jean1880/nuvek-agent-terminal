@@ -28,6 +28,7 @@ use serde_json::Value;
 
 use crate::heal_tail::HealTails;
 
+mod compare;
 pub mod delegation;
 pub mod delegation_typed;
 mod preflight;
@@ -37,6 +38,7 @@ mod schema_v8;
 mod search;
 mod spend;
 
+pub use compare::CompareColumn;
 pub use preflight::{BACKUP_DIR, PRE_V4_BACKUP_KEY};
 pub use review::ReviewDraft;
 pub use search::{
@@ -88,12 +90,22 @@ pub fn thread_worktree_key(thread: &str) -> String {
     format!("thread_worktree:{thread}")
 }
 
+/// The [`Store::meta`] key of the fork point a forked thread came from, as JSON (see
+/// [`ThreadAttributes::fork`]).
+pub fn thread_fork_key(thread: &str) -> String {
+    format!("{THREAD_FORK_PREFIX}{thread}")
+}
+
+/// What every [`thread_fork_key`] starts with.
+const THREAD_FORK_PREFIX: &str = "thread_fork:";
+
 /// Every per-thread [`Store::meta`] key: what deleting a thread removes with it.
-fn thread_meta_keys(thread: &str) -> [String; 3] {
+fn thread_meta_keys(thread: &str) -> [String; 4] {
     [
         pending_prompt_key(thread),
         thread_profile_key(thread),
         thread_worktree_key(thread),
+        thread_fork_key(thread),
     ]
 }
 const MAX_DISMISSED_NATIVES: usize = 500;
@@ -107,6 +119,9 @@ pub struct ThreadAttributes {
     pub profile_id: Option<String>,
     /// The worktree the thread was opened in (New Thread in Isolated Git Worktree).
     pub worktree: Option<crate::worktree::WorktreeInfo>,
+    /// Where the thread was forked from (Fork thread, `/fork`): only a fork has one, never a
+    /// compaction, a continuation or a switch.
+    pub fork: Option<agent_core::fork_compare::ForkLink>,
 }
 
 /// A thread's provider thread, written with it by [`Store::create_thread_record`].
@@ -2257,6 +2272,7 @@ impl Store {
         Ok(ThreadAttributes {
             profile_id,
             worktree,
+            fork: self.fork_link(thread)?,
         })
     }
 
@@ -2275,6 +2291,11 @@ impl Store {
         let key = thread_worktree_key(thread);
         match &attributes.worktree {
             Some(info) => self.set_meta(&key, &serde_json::to_string(info)?),
+            None => self.delete_meta(&key),
+        }?;
+        let key = thread_fork_key(thread);
+        match &attributes.fork {
+            Some(link) => self.set_meta(&key, &link.to_json()),
             None => self.delete_meta(&key),
         }
     }
@@ -4820,6 +4841,7 @@ mod tests {
             attributes: ThreadAttributes {
                 profile_id: Some("p-1".into()),
                 worktree: Some(worktree()),
+                fork: None,
             },
             ..ThreadRecord::new(&t, "/r/.main.worktrees/feat-x")
         })
@@ -4836,6 +4858,7 @@ mod tests {
             ThreadAttributes {
                 profile_id: Some("p-1".into()),
                 worktree: Some(worktree()),
+                fork: None,
             }
         );
         // A later write of the same id fails whole: nothing half-made is left of the second.
@@ -4864,6 +4887,7 @@ mod tests {
             attributes: ThreadAttributes {
                 profile_id: Some("p".into()),
                 worktree: None,
+                fork: None,
             },
             ..ThreadRecord::new(&t, "/w")
         });
@@ -4899,6 +4923,10 @@ mod tests {
             attributes: ThreadAttributes {
                 profile_id: Some("p".into()),
                 worktree: Some(worktree()),
+                fork: Some(agent_core::fork_compare::ForkLink {
+                    source_thread: "src".into(),
+                    fork_seq: 1,
+                }),
             },
             ..ThreadRecord::new(&t, "/w")
         })
@@ -4913,6 +4941,7 @@ mod tests {
             attributes: ThreadAttributes {
                 profile_id: Some("p".into()),
                 worktree: None,
+                fork: None,
             },
             ..ThreadRecord::new(&blank, "/w")
         })

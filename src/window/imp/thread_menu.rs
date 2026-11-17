@@ -250,12 +250,19 @@ impl AgentTerminalWindow {
         };
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
-            let has_messages = store_job({
+            let (has_messages, forks) = store_job({
                 let thread = thread.clone();
-                move |store| store.has_messages(&thread).unwrap_or(false)
+                move |store| {
+                    (
+                        store.has_messages(&thread).unwrap_or(false),
+                        store
+                            .fork_pairings(&thread)
+                            .is_ok_and(|pairings| !pairings.is_empty()),
+                    )
+                }
             })
             .await
-            .unwrap_or(false);
+            .unwrap_or((false, false));
             let Some(obj) = obj.upgrade() else { return };
             let imp = obj.imp();
             let Some(summary) = imp.summary_of(&thread) else {
@@ -267,6 +274,7 @@ impl AgentTerminalWindow {
                 pinned: summary.pin_rank.is_some(),
                 tagged: !summary.tags.is_empty(),
                 has_messages,
+                forks,
                 agents: imp.menu_agents(),
             };
             let menu = to_gio_menu(&thread_menu(&input));
@@ -308,6 +316,7 @@ impl AgentTerminalWindow {
                     }
                 }
             }
+            ThreadAction::CompareForks(thread) => self.compare_with_fork(&thread),
             ThreadAction::Rename(thread) => self.prompt_rename(&thread),
             ThreadAction::Pin(thread) => self.change_pin(&thread, PinChange::Pin { at: None }),
             ThreadAction::Unpin(thread) => self.change_pin(&thread, PinChange::Unpin),
@@ -1336,6 +1345,7 @@ pub(super) mod tests {
             pinned: false,
             tagged: false,
             has_messages: false,
+            forks: false,
             agents: vec![MenuAgent {
                 driver: Driver::Claude,
                 models: Vec::new(),
@@ -1433,6 +1443,17 @@ pub(super) mod tests {
             assert!(section.item_link(index, "submenu").is_none(), "{index}");
             assert_eq!(action_of(&section, index).as_deref(), Some(ACTION_OFF));
         }
+
+        // A fork (or a thread that was forked) offers Compare with Fork… beside Fork thread.
+        let forked = ThreadMenuInput {
+            forks: true,
+            ..none
+        };
+        let menu = to_gio_menu(&thread_menu(&forked));
+        let model: &gio::MenuModel = menu.upcast_ref();
+        let section = model.item_link(0, "section").expect("first section");
+        assert_eq!(gio_menu_labels_of(&section)[3], "Compare with Fork…");
+        assert_eq!(action_of(&section, 3).as_deref(), Some(ACTION));
     }
 
     /// Each menu choice, carried out on a real window and store, does what its label says and

@@ -37,6 +37,9 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   **Continue in <other agent>**.
 - **Fork instead of switching**: `/fork` starts a new thread with this one's history, so
   two agents can take the same problem in different directions.
+- **Compare forks side by side**: **Compare with Fork…** in a thread's context menu, `/compare`,
+  or **Compare** on the toast after a fork opens a window with both conversations since the
+  fork, lined up turn by turn.
 
 ### Multi-agent environment review
 

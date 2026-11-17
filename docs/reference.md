@@ -104,6 +104,41 @@ agent switches, notices and carried-in context. Tool output over 20,000 characte
 
 Fields are only ever added within a version; removing or renaming one raises `version`.
 
+### Comparing forks
+
+A fork (**Fork thread** in a thread's context menu, or `/fork`) remembers the thread it came from
+and where that thread was at the fork: the last event stored. Only a fork does; a compaction, a
+**Continue in** and an agent switch do not. Threads forked before this was recorded have no link
+and cannot be compared.
+
+**Compare with Fork…** appears in the first section of the context menu, after **Fork thread**,
+for a fork whose source still exists, a thread that has a fork, and a fork with sibling forks of
+the same thread (archived threads included). `/compare` does the same from the composer, and the
+toast after a fork offers **Compare** with its source. With one thread to compare with, the window
+opens at once; with several, a dialog asks which. A fork of a fork is compared with its own
+source only.
+
+The **Compare Forks** window is a window of its own beside the main one, closed with it. It only
+reads: nothing in it starts an agent or sends anything. Its header names each thread with its
+agent, model and a summary (messages, replies, tool calls and how many failed, and whether
+something is still running). Below, each column shows:
+
+- for the source, what it did after the fork point;
+- for the fork, everything it did itself (the context it inherited is left out);
+- for two forks of one thread, each one's own work.
+
+Rows are lined up by turn: a turn is one of your messages and everything up to the next, so
+**Turn 1** is the first message each thread got after they parted, side by side. A column with no
+such turn says so; anything before a column's first message (a turn still running at the fork)
+gets a row of its own first. Replies show as formatted text, tool calls by their one-line title.
+The model's reasoning and the app's notices are not shown. The first 100 rows are laid out, and
+each entry at most 16 KB of text; the window says what it leaves out. **Refresh** (the header's
+button) reads both threads again.
+
+The link is a `thread_fork:<thread>` entry in the store's metadata, holding only the source's id
+and a sequence number. It goes when the fork is deleted; deleting the source leaves the forks
+comparable with each other. File changes are not compared yet.
+
 ### Pinning threads
 
 A thread's context menu (right-click, the Menu key or `Shift+F10`) has, next to **Archive**:

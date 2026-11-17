@@ -1021,6 +1021,8 @@ pub enum ThreadAction {
         effort: Option<String>,
     },
     Fork(String),
+    /// Opens a window reading the thread beside a fork of it, its source or a sibling fork.
+    CompareForks(String),
     Compact(String),
     Rename(String),
     Archive(String),
@@ -1075,6 +1077,7 @@ impl ThreadAction {
                 effort,
             } => full("switch", thread, *driver, model, effort),
             Self::Fork(t) => simple("fork", t),
+            Self::CompareForks(t) => simple("compare-forks", t),
             Self::Compact(t) => simple("compact", t),
             Self::Rename(t) => simple("rename", t),
             Self::Archive(t) => simple("archive", t),
@@ -1124,6 +1127,7 @@ impl ThreadAction {
                 effort,
             }),
             "fork" => simple(Self::Fork(thread)),
+            "compare-forks" => simple(Self::CompareForks(thread)),
             "compact" => simple(Self::Compact(thread)),
             "rename" => simple(Self::Rename(thread)),
             "archive" => simple(Self::Archive(thread)),
@@ -1181,6 +1185,9 @@ pub struct ThreadMenuInput {
     pub tagged: bool,
     /// The thread has at least one message to hand over ("Continue in a new thread with…" needs one).
     pub has_messages: bool,
+    /// The thread is a fork, or was forked, and the other thread still exists: it offers
+    /// Compare with Fork….
+    pub forks: bool,
     /// Only enabled (and installed) agents appear.
     pub agents: Vec<MenuAgent>,
 }
@@ -1315,20 +1322,30 @@ pub fn thread_menu(input: &ThreadMenuInput) -> Vec<MenuEntry> {
         enabled: true,
     };
     vec![
-        MenuEntry::Section(vec![
-            continue_in,
-            switch_to,
-            MenuEntry::Item {
-                label: "Fork thread".to_owned(),
-                action: ThreadAction::Fork(thread.clone()),
-                enabled: input.has_messages,
-            },
-            MenuEntry::Item {
+        MenuEntry::Section(
+            vec![
+                continue_in,
+                switch_to,
+                MenuEntry::Item {
+                    label: "Fork thread".to_owned(),
+                    action: ThreadAction::Fork(thread.clone()),
+                    enabled: input.has_messages,
+                },
+            ]
+            .into_iter()
+            .chain(input.forks.then(|| {
+                item(
+                    "Compare with Fork…",
+                    ThreadAction::CompareForks(thread.clone()),
+                )
+            }))
+            .chain([MenuEntry::Item {
                 label: "Compact into a new thread".to_owned(),
                 action: ThreadAction::Compact(thread.clone()),
                 enabled: input.has_messages,
-            },
-        ]),
+            }])
+            .collect(),
+        ),
         MenuEntry::Section({
             let mut entries = vec![
                 item("Rename…", ThreadAction::Rename(thread.clone())),
@@ -1904,6 +1921,7 @@ mod tests {
             pinned: false,
             tagged: false,
             has_messages,
+            forks: false,
             agents: vec![
                 MenuAgent {
                     driver: Driver::Claude,
@@ -2125,6 +2143,7 @@ mod tests {
                 effort: None,
             },
             ThreadAction::Fork("t".into()),
+            ThreadAction::CompareForks("t".into()),
             ThreadAction::Compact("t".into()),
             ThreadAction::Rename("t".into()),
             ThreadAction::Archive("t".into()),
@@ -2551,6 +2570,41 @@ mod tests {
         assert_eq!(ThreadAction::decode(&action.encode()), Some(action));
         assert_eq!(ThreadAction::decode("export\u{1f}"), None);
         assert_eq!(ThreadAction::decode("export\u{1f}t\u{1f}x"), None);
+    }
+
+    /// Compare with Fork… is offered only for a thread with a fork relation, right after Fork
+    /// thread, for the clicked thread, whether or not it has messages of its own yet.
+    #[test]
+    fn compare_appears_only_for_threads_with_a_fork_relation() {
+        let compare = |menu: &[MenuEntry]| {
+            items(menu)
+                .into_iter()
+                .find(|(_, a, _)| matches!(a, ThreadAction::CompareForks(_)))
+        };
+        assert_eq!(compare(&thread_menu(&input(true, false))), None);
+        for has_messages in [false, true] {
+            let mut forked = input(has_messages, false);
+            forked.forks = true;
+            let menu = thread_menu(&forked);
+            assert_eq!(
+                compare(&menu),
+                Some((
+                    "Compare with Fork…".to_owned(),
+                    ThreadAction::CompareForks("t1".into()),
+                    true
+                ))
+            );
+            let labels: Vec<String> = items(&menu).into_iter().map(|(l, _, _)| l).collect();
+            let at = |label: &str| labels.iter().position(|l| l == label);
+            assert_eq!(
+                at("Compare with Fork…"),
+                at("Fork thread").map(|i| i + 1),
+                "beside Fork thread"
+            );
+        }
+        let action = ThreadAction::CompareForks("t-1".into());
+        assert_eq!(action.encode(), "compare-forks\u{1f}t-1");
+        assert_eq!(ThreadAction::decode("compare-forks\u{1f}t\u{1f}x"), None);
     }
 
     #[test]

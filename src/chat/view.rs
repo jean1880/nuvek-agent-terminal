@@ -88,6 +88,8 @@ pub enum ViewAction {
     Handoff { target: Option<Driver> },
     /// `/fork`.
     Fork,
+    /// `/compare`: this thread beside a fork of it (or its source).
+    CompareForks,
     /// `/rewind`.
     Rewind,
     /// `/compact` on an agent with no compaction command: continue in a fresh thread of the same
@@ -1751,6 +1753,7 @@ impl Inner {
                 self.emit(ViewAction::Handoff { target });
             }
             BuiltinAction::Fork => self.emit(ViewAction::Fork),
+            BuiltinAction::CompareForks => self.emit(ViewAction::CompareForks),
             BuiltinAction::Rewind => self.emit(ViewAction::Rewind),
             BuiltinAction::NewThread => self.emit(ViewAction::NewThread),
             BuiltinAction::Help => {
@@ -6221,6 +6224,21 @@ pub(crate) mod tests {
                     "{driver:?} {typed}"
                 );
             }
+        }
+    }
+
+    /// `/compare` is a built-in for every agent, run locally, never sent to the agent as text.
+    #[test]
+    fn slash_compare_is_a_local_builtin_for_every_agent() {
+        use agent_core::adapter::Driver;
+        for driver in Driver::ALL {
+            let caps = agent_core::caps::Capabilities::of(driver);
+            let line = typeahead::parse_command_line("/compare", &caps).expect("a built-in");
+            assert_eq!(
+                line.builtin.action,
+                BuiltinAction::CompareForks,
+                "{driver:?}"
+            );
         }
     }
 

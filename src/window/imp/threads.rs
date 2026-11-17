@@ -1757,7 +1757,8 @@ impl NewThreadSpec {
 /// What a thread made by `create_chat_thread` carries into its page once it is stored.
 pub(super) enum CreationNotice {
     New,
-    Fork,
+    /// A fork, and where it came from (also kept with the thread): its toast offers Compare.
+    Fork(agent_core::fork_compare::ForkLink),
     Compact(String),
 }
 
@@ -1896,6 +1897,8 @@ pub(super) struct NewThread {
     pub(super) profile_id: Option<String>,
     /// The worktree the thread opens in (New Thread in Isolated Git Worktree), kept with it.
     pub(super) worktree: Option<crate::worktree::WorktreeInfo>,
+    /// Where a fork came from (Fork thread, `/fork`), kept with it; `None` for anything else.
+    pub(super) fork: Option<agent_core::fork_compare::ForkLink>,
 }
 
 impl NewThread {
@@ -1913,6 +1916,7 @@ impl NewThread {
             mode: None,
             profile_id: None,
             worktree: None,
+            fork: None,
         }
     }
 }
@@ -7608,6 +7612,7 @@ impl AgentTerminalWindow {
                 self.when_not_busy(thread, move |imp| imp.continue_rate_limited(&id));
             }
             ViewAction::Fork => self.fork_thread(thread, slot.driver(), dir, false),
+            ViewAction::CompareForks => self.compare_with_fork(thread),
             ViewAction::CompactByHandoff => self.fork_thread(thread, slot.driver(), dir, true),
             ViewAction::Rewind => {
                 if let Some(page) = self.page_of_thread(thread) {
@@ -7723,17 +7728,19 @@ impl AgentTerminalWindow {
                 let thread = thread.clone();
                 move |store| {
                     let loaded = load_thread(store, &thread, None)?;
-                    let messages = store.transcript_messages(&thread)?;
+                    // The fork point is where the hand-off's transcript ends.
+                    let (messages, fork_seq) = store.transcript_at_fork(&thread)?;
                     Ok::<_, agent_kit::store::StoreError>((
                         build_handoff(&messages, &format!("thread {thread}")),
                         loaded,
+                        fork_seq,
                     ))
                 }
             })
             .await;
             let Some(obj) = obj.upgrade() else { return };
             let imp = obj.imp();
-            let (handoff, loaded) = match loaded {
+            let (handoff, loaded, fork_seq) = match loaded {
                 Some(Ok(value)) => value,
                 Some(Err(e)) => {
                     present_message(&obj, "Cannot Fork the Thread", &e.to_string());
@@ -7746,6 +7753,11 @@ impl AgentTerminalWindow {
             };
             let settings = carried_with_stored(model, effort, mode, &loaded);
             let profile_id = profile_id.or_else(|| carried_stored_profile(&loaded, driver));
+            // Only a fork is linked to its source: a compaction replaces its thread.
+            let fork = (!compact).then(|| agent_core::fork_compare::ForkLink {
+                source_thread: thread.clone(),
+                fork_seq,
+            });
             imp.create_chat_thread(NewThread {
                 dir,
                 model: settings.model,
@@ -7753,11 +7765,11 @@ impl AgentTerminalWindow {
                 mode: settings.mode,
                 handoff: Some((handoff, source)),
                 profile_id,
-                notice: Some(if compact {
-                    CreationNotice::Compact(thread)
-                } else {
-                    CreationNotice::Fork
+                notice: Some(match &fork {
+                    Some(link) => CreationNotice::Fork(link.clone()),
+                    None => CreationNotice::Compact(thread),
                 }),
+                fork,
                 ..NewThread::new(driver)
             });
         });
@@ -8019,6 +8031,7 @@ impl AgentTerminalWindow {
             mode,
             profile_id,
             worktree,
+            fork,
             ..
         } = new;
         let store = app_handle();
@@ -8063,6 +8076,7 @@ impl AgentTerminalWindow {
             attributes: agent_kit::store::ThreadAttributes {
                 profile_id: profile_id.clone(),
                 worktree: worktree.clone(),
+                fork,
             },
             ..NewThreadSpec::new(&cwd, driver)
         };
@@ -8157,8 +8171,24 @@ impl AgentTerminalWindow {
             Some(CreationNotice::New) => {
                 self.show_toast("New thread: kept the model and safe mode")
             }
-            Some(CreationNotice::Fork) => {
-                self.show_toast("Forked thread: kept the model, effort and safe mode")
+            Some(CreationNotice::Fork(link)) => {
+                let fork = thread.to_owned();
+                self.action_toast(
+                    "Forked thread: kept the model, effort and safe mode",
+                    "Compare",
+                    10,
+                    adw::ToastPriority::Normal,
+                    move |imp| {
+                        imp.open_fork_compare(
+                            &fork,
+                            agent_core::fork_compare::Pairing {
+                                other: link.source_thread.clone(),
+                                relation: agent_core::fork_compare::Relation::Source,
+                                fork_seq: link.fork_seq,
+                            },
+                        );
+                    },
+                );
             }
             Some(CreationNotice::Compact(source)) => {
                 self.action_toast(
@@ -12510,6 +12540,7 @@ pub(super) mod tests {
             attributes: agent_kit::store::ThreadAttributes {
                 profile_id: Some("claude-work".into()),
                 worktree: None,
+                fork: None,
             },
             ..NewThreadSpec::new("/w", Driver::Claude)
         };
@@ -13041,6 +13072,7 @@ pub(super) mod tests {
             attributes: agent_kit::store::ThreadAttributes {
                 profile_id: Some("codex-work".into()),
                 worktree: Some(worktree.clone()),
+                fork: None,
             },
             mode: Some(Mode::Bypass),
         };
@@ -13650,6 +13682,7 @@ pub(super) mod tests {
             attributes: agent_kit::store::ThreadAttributes {
                 profile_id: Some("claude-work".into()),
                 worktree: Some(info.clone()),
+                fork: None,
             },
             ..NewThreadSpec::new(&tree_dir, Driver::Claude)
         };

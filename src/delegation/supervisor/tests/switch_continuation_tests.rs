@@ -280,6 +280,7 @@ async fn busy_root(
     session.set_adapter_factory(Rc::new(move |driver, _| {
         Ok(AgentLaunch {
             server: None,
+            free: false,
             profile: None,
             adapter: Box::new(Relabelled {
                 inner: agent_core::claude::ClaudeAdapter::new(),

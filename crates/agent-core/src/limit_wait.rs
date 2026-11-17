@@ -469,6 +469,8 @@ mod tests {
             usage: None,
             cost_usd: None,
             error: Some(error.into()),
+            model: None,
+            billing: None,
         }
     }
 

@@ -590,6 +590,8 @@ impl Supervisor {
         bootstrap: bool,
         result: Option<&str>,
     ) {
+        // Committed: the window may act on it (a metered turn's cost) as it does for a thread's.
+        (self.services.committed)(&env.event);
         let mut ended = None;
         {
             let mut state = self.state.borrow_mut();

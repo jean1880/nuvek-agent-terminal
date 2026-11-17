@@ -588,6 +588,7 @@ fn scripted_codex_claude_codex_switch_routes_replies_and_recovers_a_failed_switc
             }
             Ok(AgentLaunch {
                 server: None,
+                free: false,
                 profile: None,
                 adapter: if driver == Driver::Claude {
                     Box::new(ClaudeAdapter::new())

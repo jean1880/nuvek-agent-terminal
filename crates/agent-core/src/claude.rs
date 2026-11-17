@@ -147,6 +147,14 @@ pub struct ClaudeAdapter {
     /// and later turns report the step from it. Set by `argv`, which takes `&self`; a fresh
     /// launch reports its first total in full.
     resume_base_pending: std::cell::Cell<bool>,
+    /// How the running process is paid for, from what it said of itself: its `init` frame's
+    /// `apiKeySource`, and its `initialize` reply's `apiProvider` and `subscriptionType`
+    /// ([`crate::spend::claude_billing`]). Forgotten when the process exits.
+    api_key_source: Option<String>,
+    api_provider: Option<String>,
+    plan: Option<String>,
+    /// The extra usage last reported ([`Event::ExtraUsageUpdated`]), so a repeat says nothing.
+    extra_usage: Option<crate::event::ExtraUsage>,
 }
 
 impl Default for ClaudeAdapter {
@@ -199,6 +207,10 @@ impl ClaudeAdapter {
             child: false,
             last_total_cost: None,
             resume_base_pending: std::cell::Cell::new(false),
+            api_key_source: None,
+            api_provider: None,
+            plan: None,
+            extra_usage: None,
         }
     }
 
@@ -547,13 +559,29 @@ impl ClaudeAdapter {
         self.commands_event()
     }
 
+    /// [`Event::ExtraUsageUpdated`] when `v` (an assistant frame's `usage_report`, or a
+    /// `get_usage` reply) says what the plan's extra usage stands at, and it changed since the
+    /// last one: the assistant frames repeat it.
+    fn extra_usage(&mut self, v: &Value) -> Option<Envelope> {
+        let extra = crate::quota::claude_extra_usage(v)?;
+        if self.extra_usage.as_ref() == Some(&extra) {
+            return None;
+        }
+        self.extra_usage = Some(extra.clone());
+        Some(Envelope::new(Event::ExtraUsageUpdated { extra }))
+    }
+
     // ----- frame mapping -----
 
     fn map_frame(&mut self, v: &Value) -> Vec<Envelope> {
         match str_of(v, "type").unwrap_or("") {
             "system" => self.system(v),
             "stream_event" => self.stream_event(v),
-            "assistant" => self.assistant(v),
+            "assistant" => {
+                let mut out = self.assistant(v);
+                out.extend(self.extra_usage(v));
+                out
+            }
             "user" => self.user(v),
             "control_request" => self.control_request(v),
             "control_response" => self.control_response(v),
@@ -605,6 +633,9 @@ impl ClaudeAdapter {
     fn init(&mut self, v: &Value) -> Vec<Envelope> {
         let mut out = Vec::new();
         let model = str_of(v, "model").map(str::to_owned);
+        if let Some(source) = str_of(v, "apiKeySource") {
+            self.api_key_source = Some(source.to_owned());
+        }
 
         if !self.session_started {
             self.session_started = true;
@@ -1151,6 +1182,12 @@ impl ClaudeAdapter {
         let body = body.unwrap_or(Value::Null);
         if self.init_id.as_deref() == Some(id) && str_of(resp, "subtype") == Some("success") {
             self.init_answered = true;
+            if let Some(account) =
+                crate::adapter::response_chain(&body).find_map(|r| r.get("account"))
+            {
+                self.api_provider = str_of(account, "apiProvider").map(str::to_owned);
+                self.plan = str_of(account, "subscriptionType").map(str::to_owned);
+            }
             if let Some(account) = crate::quota::claude_account(&body) {
                 out.push(Envelope::new(Event::QuotaUpdated {
                     account: Some(account),
@@ -1169,6 +1206,7 @@ impl ClaudeAdapter {
                     windows,
                 }));
             }
+            out.extend(self.extra_usage(&body));
         }
         if self.context_requests.remove(id) {
             if let Some(used) = u64_of(&body, "totalTokens") {
@@ -1324,8 +1362,20 @@ impl ClaudeAdapter {
             usage,
             cost_usd,
             error,
+            // The session stamps the model it knows the turn ran on.
+            model: None,
+            billing: self.billing(),
         }));
         out
+    }
+
+    /// How the running process is paid for, as far as it said ([`crate::spend::claude_billing`]).
+    fn billing(&self) -> Option<crate::spend::Billing> {
+        crate::spend::claude_billing(
+            self.api_key_source.as_deref(),
+            self.api_provider.as_deref(),
+            self.plan.as_deref(),
+        )
     }
 }
 
@@ -1623,11 +1673,19 @@ impl Adapter for ClaudeAdapter {
                 usage: None,
                 cost_usd: None,
                 error: (!expected).then(|| format!("agent exited unexpectedly (code {code:?})")),
+                model: None,
+                billing: None,
             }));
         }
         out.push(Envelope::new(Event::SessionExited { code, expected }));
-        // The next process counts its cost from zero.
+        // The next process counts its cost from zero, and says again how it is paid for.
         self.last_total_cost = None;
+        self.api_key_source = None;
+        self.api_provider = None;
+        self.plan = None;
+        // The next process's first reading is said again, whatever the last one was: what it
+        // fed may have been forgotten meanwhile (a sign-out, another account).
+        self.extra_usage = None;
         self.blocks.clear();
         self.reasoning_shared.clear();
         self.started_items.clear();
@@ -2471,6 +2529,101 @@ mod tests {
         let mut a = ClaudeAdapter::new();
         let costs = costs_for(&mut a, &[Some(0.5), None, Some(0.75)]);
         assert_eq!(costs, [Some(0.5), None, Some(0.25)]);
+    }
+
+    fn turn_payment_kinds(out: &[Envelope]) -> Vec<Option<crate::spend::Billing>> {
+        out.iter()
+            .filter_map(|e| match &e.event {
+                Event::TurnCompleted { billing, .. } => Some(*billing),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The assistant frames' usage report names the plan's extra usage: said once, and again
+    /// only when it changes; a `get_usage` reply says it too.
+    #[test]
+    fn extra_usage_is_reported_once_and_on_change() {
+        let (mut a, out) = replay(CONTROLS);
+        let extras: Vec<crate::event::ExtraUsage> = out
+            .iter()
+            .filter_map(|e| match &e.event {
+                Event::ExtraUsageUpdated { extra } => Some(extra.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(extras.len(), 1, "{extras:?}");
+        assert_eq!(extras[0].limit, Some(40.0));
+        let extras_in = |a: &mut ClaudeAdapter| {
+            let mut out = Vec::new();
+            for frame in stdout_frames(CONTROLS, Malformed::Panic) {
+                out.extend(a.feed(&frame));
+            }
+            out.iter()
+                .filter(|e| matches!(e.event, Event::ExtraUsageUpdated { .. }))
+                .count()
+        };
+        assert_eq!(extras_in(&mut a), 0, "the same process repeats nothing");
+        // The next process says its reading again: what the last one fed may have been
+        // forgotten (a sign-out, another account) meanwhile.
+        a.on_exit(Some(0));
+        assert_eq!(extras_in(&mut a), 1, "a new process reports its reading");
+        a.encode(Command::Control {
+            id: "usage-9".into(),
+            control: Control::Usage,
+        })
+        .expect("encode");
+        let reply = json!({"type": "control_response", "response": {
+            "subtype": "success", "request_id": "usage-9",
+            "response": {"rate_limits": {"extra_usage": {"is_enabled": true,
+                "used_credits": 250, "monthly_limit": 4000, "currency": "CAD"}}}}});
+        let out = a.feed(&reply.to_string());
+        let used: Vec<f64> = out
+            .iter()
+            .filter_map(|e| match &e.event {
+                Event::ExtraUsageUpdated { extra } => Some(extra.used),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(used, [2.5]);
+    }
+
+    /// The recording is a plan account signed in with no key: its turns are at list price. A
+    /// key in `init` makes them metered, and an exit forgets both.
+    #[test]
+    fn each_turn_says_how_the_process_is_paid_for() {
+        use crate::spend::Billing;
+        // Without its initialize reply, "no key" alone says nothing of a plan.
+        let (_, out) = replay(CONTROLS);
+        let kinds = turn_payment_kinds(&out);
+        assert!(!kinds.is_empty());
+        assert!(kinds.iter().all(Option::is_none), "{kinds:?}");
+        let mut a = ClaudeAdapter::new();
+        a.handshake(); // the recording starts with the same request id
+        let mut out = Vec::new();
+        for line in CONTROLS.lines().filter(|l| !l.trim().is_empty()) {
+            let rec: Value = serde_json::from_str(line).expect("fixture line is JSON");
+            if str_of(&rec, "dir") == Some("out") {
+                out.extend(a.feed(&rec["frame"].to_string()));
+            }
+        }
+        let kinds = turn_payment_kinds(&out);
+        assert!(!kinds.is_empty());
+        assert!(kinds.iter().all(|b| *b == Some(Billing::Plan)), "{kinds:?}");
+
+        let mut a = ClaudeAdapter::new();
+        let init = json!({"type": "system", "subtype": "init", "model": "m", "session_id": "s",
+            "apiKeySource": "ANTHROPIC_API_KEY"});
+        a.feed(&init.to_string());
+        let out = a.feed(&result_frame(Some(0.5)));
+        assert_eq!(turn_payment_kinds(&out), [Some(Billing::Metered)]);
+        a.on_exit(Some(0));
+        let out = a.feed(&result_frame(Some(0.5)));
+        assert_eq!(
+            turn_payment_kinds(&out),
+            [None],
+            "a new process has said nothing yet"
+        );
     }
 
     #[test]

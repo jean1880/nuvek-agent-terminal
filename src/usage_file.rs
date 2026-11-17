@@ -363,6 +363,7 @@ mod tests {
                 plan: Some("Max plan".into()),
                 provider: Some("provider-secret".into()),
             }),
+            extra: None,
             windows: vec![QuotaWindow {
                 group: None,
                 label: "5-hour".into(),

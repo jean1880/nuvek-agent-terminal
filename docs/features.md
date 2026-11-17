@@ -95,7 +95,10 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   turns cost, by day (the last 30), week (the last 12) or month (the last 12), grouped by
   folder, agent, profile or model, with each group's tokens. A turn that reported no cost
   says "Not reported", never $0, and sub-agents' turns count under the thread that started
-  them. Deleted threads keep counting. See [spending](reference.md#spending).
+  them. Deleted threads keep counting. Each turn records how it was paid for, so metered
+  spend and a plan's list price stay apart, and Claude's extra usage, while switched on,
+  shows beside its plan windows (for reference only: its unit is not confirmed). An optional daily or monthly warning (Settings → General → Spending) counts real
+  money only. See [spending](reference.md#spending).
 - **Your existing sessions.** Recent Claude and agy sessions appear as threads.
   Opening one imports its history and resumes it. A Codex thread resumes its own Codex
   thread; if Codex no longer has it, the next prompt continues in a new Codex thread with

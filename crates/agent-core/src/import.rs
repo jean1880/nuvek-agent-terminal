@@ -757,6 +757,8 @@ fn turn_completed(state: TurnState) -> Envelope {
         usage: None,
         cost_usd: None,
         error: None,
+        model: None,
+        billing: None,
     })
 }
 

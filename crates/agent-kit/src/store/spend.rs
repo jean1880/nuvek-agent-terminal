@@ -17,7 +17,10 @@
 use std::collections::HashMap;
 
 use agent_core::event::Usage;
-use agent_core::spend::{Billing, DayKey, SpendRow};
+use agent_core::spend::{
+    real_money, warning_due, Billing, Budget, BudgetLevel, BudgetPeriod, BudgetWarning, DayKey,
+    SpendRow,
+};
 use rusqlite::params;
 
 use super::{Result, Store};
@@ -235,6 +238,48 @@ impl Store {
         Ok(data)
     }
 
+    /// The budget warnings due as of `now_ms`, each given once a period: what today and this
+    /// month spent in real money (metered turns, deleted threads' included; never extra usage,
+    /// whose unit is not confirmed), against `budget`, above the level
+    /// already warned of in that period (kept in `meta` under [`BudgetPeriod::meta_key`], so a
+    /// restart does not warn again). The levels due are recorded in the same transaction that
+    /// read them, so two checks never both warn. Keys of past periods are removed. A write:
+    /// run it through the store writer.
+    pub fn spend_budget_check(
+        &self,
+        now_ms: i64,
+        day_of: &dyn Fn(i64) -> DayKey,
+        budget: &Budget,
+    ) -> Result<Vec<BudgetWarning>> {
+        if budget.limit(BudgetPeriod::Day).is_none() && budget.limit(BudgetPeriod::Month).is_none()
+        {
+            return Ok(Vec::new());
+        }
+        self.atomically(|s| {
+            let today = day_of(now_ms);
+            // A month's first day is at most 31 days back; the sum keeps only its own days.
+            let rows = s.spend_rows(now_ms - 32 * 86_400_000, day_of)?.rows;
+            let keys: Vec<String> = BudgetPeriod::ALL
+                .iter()
+                .map(|p| p.meta_key(today))
+                .collect();
+            s.conn.execute(
+                "DELETE FROM meta WHERE key LIKE 'spend_warned:%' AND key NOT IN (?1, ?2)",
+                params![keys[0], keys[1]],
+            )?;
+            let mut due = Vec::new();
+            for (period, key) in BudgetPeriod::ALL.into_iter().zip(&keys) {
+                let spent = real_money(&rows, period.first_day(today));
+                let warned = s.meta(key)?.as_deref().and_then(BudgetLevel::parse);
+                if let Some(warning) = warning_due(period, spent, budget, warned) {
+                    s.set_meta(key, warning.level.as_str())?;
+                    due.push(warning);
+                }
+            }
+            Ok(due)
+        })
+    }
+
     /// The backing threads of the delegation tree `thread` belongs to, with their root thread's
     /// folder and their own profile: read before a delete releases those rows.
     pub(super) fn spend_delegated_before_delete(&self, thread: &str) -> Result<Delegated> {
@@ -406,6 +451,8 @@ mod tests {
             }),
             cost_usd: cost,
             error: None,
+            model: None,
+            billing: None,
         });
         let seq = s.append_event(thread, Some(pt), &env).expect("append");
         s.conn
@@ -485,6 +532,132 @@ mod tests {
             ]
         );
         assert!(data.rows.iter().all(|r| r.billing == Billing::Unknown));
+    }
+
+    /// A turn stamped with its model and billing is read with them (its own model over the
+    /// provider thread's current one); one stored before the stamp reads as unknown billing.
+    #[test]
+    fn a_stamped_turn_keeps_its_model_and_billing_and_an_old_one_reads_unknown() {
+        let s = store();
+        let (t, pt) = thread(&s, "/a", "claude", "sonnet");
+        turn(&s, &t, &pt, Some(0.25), 1, NOON);
+        for (model, billing) in [("opus", Billing::Metered), ("haiku", Billing::Plan)] {
+            let env = Envelope::new(Event::TurnCompleted {
+                state: TurnState::Completed,
+                usage: None,
+                cost_usd: Some(1.0),
+                error: None,
+                model: Some(model.into()),
+                billing: Some(billing),
+            });
+            s.append_event(&t, Some(&pt), &env).expect("append");
+        }
+        let data = s.spend_rows(0, &utc).expect("rows");
+        let got: Vec<(String, Billing)> = data
+            .rows
+            .iter()
+            .map(|r| (r.model.clone(), r.billing))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("sonnet".into(), Billing::Unknown),
+                ("opus".into(), Billing::Metered),
+                ("haiku".into(), Billing::Plan),
+            ]
+        );
+        // Deleted, they keep it in the ledger.
+        s.delete_thread(&t).expect("delete");
+        let mut kept: Vec<(String, Billing)> = s
+            .spend_rows(0, &utc)
+            .expect("rows")
+            .rows
+            .iter()
+            .map(|r| (r.model.clone(), r.billing))
+            .collect();
+        kept.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            kept,
+            [
+                ("haiku".into(), Billing::Plan),
+                ("opus".into(), Billing::Metered),
+                ("sonnet".into(), Billing::Unknown),
+            ]
+        );
+    }
+
+    fn billed(s: &Store, thread: &str, pt: &str, cost: f64, billing: Billing, at: i64) {
+        let env = Envelope::new(Event::TurnCompleted {
+            state: TurnState::Completed,
+            usage: None,
+            cost_usd: Some(cost),
+            error: None,
+            model: None,
+            billing: Some(billing),
+        });
+        let seq = s.append_event(thread, Some(pt), &env).expect("append");
+        s.conn
+            .execute("UPDATE events SET at = ?1 WHERE seq = ?2", params![at, seq])
+            .expect("date it");
+    }
+
+    /// Each level is warned of once a period, across restarts of the store; only metered
+    /// turns count, and a new day warns again.
+    #[test]
+    fn budget_warning_once_per_period_across_restarts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("threads.db");
+        let budget = Budget {
+            daily: Some(10.0),
+            monthly: Some(100.0),
+        };
+        let levels = |w: Vec<BudgetWarning>| -> Vec<(BudgetPeriod, BudgetLevel)> {
+            w.into_iter().map(|w| (w.period, w.level)).collect()
+        };
+        let (t, pt) = {
+            let s = Store::open(&path).expect("open");
+            s.ensure_spend_cost_marker().expect("marker");
+            s.ensure_spend_index().expect("index");
+            let (t, pt) = thread(&s, "/a", "claude", "opus");
+            // List price and unknown billing are never real money.
+            billed(&s, &t, &pt, 500.0, Billing::Plan, NOON);
+            billed(&s, &t, &pt, 500.0, Billing::Unknown, NOON);
+            billed(&s, &t, &pt, 8.5, Billing::Metered, NOON);
+            let first = s.spend_budget_check(NOON, &utc, &budget).expect("check");
+            assert_eq!(levels(first), [(BudgetPeriod::Day, BudgetLevel::Near)]);
+            assert!(s
+                .spend_budget_check(NOON, &utc, &budget)
+                .expect("again")
+                .is_empty());
+            (t, pt)
+        };
+        // A new start of the app: nothing is warned of again.
+        let s = Store::open(&path).expect("reopen");
+        assert!(s
+            .spend_budget_check(NOON + 1, &utc, &budget)
+            .expect("after a restart")
+            .is_empty());
+        billed(&s, &t, &pt, 2.0, Billing::Metered, NOON + 2);
+        let over = s.spend_budget_check(NOON + 2, &utc, &budget).expect("over");
+        assert_eq!(levels(over), [(BudgetPeriod::Day, BudgetLevel::Over)]);
+        // The month reaches 80% of its own amount (10.5 + 70 of 100); the day, already over,
+        // says nothing more.
+        billed(&s, &t, &pt, 70.0, Billing::Metered, NOON + 3);
+        let month = s
+            .spend_budget_check(NOON + 3, &utc, &budget)
+            .expect("month");
+        assert_eq!(levels(month), [(BudgetPeriod::Month, BudgetLevel::Near)]);
+        // The next day warns again, from its own spending, and the old day's key goes.
+        let next = NOON + DAY_MS;
+        billed(&s, &t, &pt, 9.0, Billing::Metered, next);
+        let tomorrow = s.spend_budget_check(next, &utc, &budget).expect("next");
+        assert_eq!(levels(tomorrow), [(BudgetPeriod::Day, BudgetLevel::Near)]);
+        assert_eq!(s.meta("spend_warned:day:2026-11-15").expect("read"), None);
+        // With no budget, nothing is read or written.
+        assert!(s
+            .spend_budget_check(next, &utc, &Budget::default())
+            .expect("none")
+            .is_empty());
     }
 
     /// The adapter stores each turn's own cost (the running total 0.0173, 0.0259, 0.0553 becomes
@@ -720,6 +893,8 @@ mod tests {
             usage: None,
             cost_usd: Some(1.0),
             error: None,
+            model: None,
+            billing: None,
         });
         s.append_event(&t, None, &env).expect("append");
         s.conn

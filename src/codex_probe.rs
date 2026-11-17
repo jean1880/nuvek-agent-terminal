@@ -151,6 +151,7 @@ pub async fn probe_codex(program: &str, env: &AgentEnv) -> ProbeResult {
         models: parse_codex_models(&models),
         account: ok(ACCOUNT_ID).and_then(codex_account),
         windows: ok(LIMITS_ID).map(codex_rate_limits).unwrap_or_default(),
+        extra: None,
         signed_out: ok(ACCOUNT_ID).is_some_and(codex_signed_out),
     })
 }

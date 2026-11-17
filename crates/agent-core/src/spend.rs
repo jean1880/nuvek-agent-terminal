@@ -9,6 +9,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use crate::event::Usage;
 
 /// The running total to measure the next turn from, once a turn reported `now`.
@@ -209,6 +211,64 @@ impl Billing {
     }
 }
 
+/// Stored as its name ([`Billing::as_str`]).
+impl Serialize for Billing {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+/// Read leniently: a name a newer build wrote, or anything that is not a string, is
+/// [`Billing::Unknown`], so the turn it belongs to still reads.
+impl<'de> Deserialize<'de> for Billing {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(d)?;
+        Ok(value.as_str().map_or(Billing::Unknown, Billing::parse))
+    }
+}
+
+/// How a Claude process is paid for, from what it said of itself: its `init` frame's
+/// `apiKeySource` and its `initialize` reply's account (`apiProvider`, `subscriptionType`).
+///
+/// An API key (any source but `none`) is metered whatever the account says, as is a cloud
+/// provider other than Anthropic's own (Bedrock, Vertex). Signed in with no key, an account on
+/// Anthropic's own service, or one that names a plan, is a plan: its reported cost is the list
+/// price. Anything less is not known, and never counted as real money.
+pub fn claude_billing(
+    api_key_source: Option<&str>,
+    api_provider: Option<&str>,
+    plan: Option<&str>,
+) -> Option<Billing> {
+    let api_key_source = api_key_source.map(str::trim).filter(|s| !s.is_empty());
+    let api_provider = api_provider.map(str::trim).filter(|s| !s.is_empty());
+    let has_plan = plan.is_some_and(|p| !p.trim().is_empty());
+    if api_key_source.is_some_and(|s| s != "none") {
+        return Some(Billing::Metered);
+    }
+    if api_provider.is_some_and(|p| p != "firstParty") {
+        return Some(Billing::Metered);
+    }
+    let signed_in_without_key = api_key_source == Some("none");
+    if has_plan || (signed_in_without_key && api_provider == Some("firstParty")) {
+        return Some(Billing::Plan);
+    }
+    None
+}
+
+/// How a turn was paid for, from what the agent said (`reported`, [`claude_billing`] for
+/// Claude) and the profile it was launched on: a profile marked free to run costs nothing, and
+/// one on a model server is metered there (the server bills it, whatever the agent thinks of
+/// its account). Otherwise the agent's own word stands.
+pub fn turn_billing(reported: Option<Billing>, free: bool, on_server: bool) -> Option<Billing> {
+    if free {
+        Some(Billing::Free)
+    } else if on_server {
+        Some(Billing::Metered)
+    } else {
+        reported
+    }
+}
+
 /// One turn, or (from the ledger of deleted threads) one day's sum of turns with the same
 /// attribution. Numbers and ids only.
 #[derive(Debug, Clone, PartialEq)]
@@ -249,7 +309,8 @@ impl Costs {
         match billing {
             Billing::Metered => self.metered += usd,
             Billing::Plan => self.list_price += usd,
-            Billing::Free | Billing::Unknown => self.reported += usd,
+            Billing::Free => {}
+            Billing::Unknown => self.reported += usd,
         }
     }
 
@@ -330,11 +391,13 @@ impl Total {
         } else {
             0.0
         };
-        self.costs.add(row.billing, usd);
         self.turns += row.turns;
-        self.cost_turns += row.cost_turns;
         if row.billing == Billing::Free {
+            // What an agent reports of a free profile's turn prices nothing anyone pays.
             self.free_turns += row.turns;
+        } else {
+            self.costs.add(row.billing, usd);
+            self.cost_turns += row.cost_turns;
         }
         self.withheld_turns += row.withheld_turns;
         self.tokens.input_tokens += row.tokens.input_tokens;
@@ -377,6 +440,38 @@ pub fn format_usd(usd: f64) -> String {
     } else {
         format!("${usd:.2}")
     }
+}
+
+/// An amount in `currency`: "$1.23" in US dollars, "1.23 CAD" in another, a bare "1.23" when
+/// the currency was not reported (never assumed to be dollars).
+pub fn format_money(amount: f64, currency: Option<&str>) -> String {
+    let plain = if amount.is_finite() {
+        amount.max(0.0)
+    } else {
+        0.0
+    };
+    match currency {
+        Some("USD") => format_usd(amount),
+        Some(code) => format!("{plain:.2} {code}"),
+        None => format!("{plain:.2}"),
+    }
+}
+
+/// "Extra usage: $2.50 of $40.00 this month"; `None` while extra usage is switched off for the
+/// account (its numbers are then the service's own, not anything the user set or spent).
+pub fn extra_usage_text(extra: &crate::event::ExtraUsage) -> Option<String> {
+    if !extra.enabled {
+        return None;
+    }
+    let currency = extra.currency.as_deref();
+    let used = format_money(extra.used, currency);
+    Some(match extra.limit {
+        Some(limit) => format!(
+            "Extra usage: {used} of {} this month",
+            format_money(limit, currency)
+        ),
+        None => format!("Extra usage: {used} this month"),
+    })
 }
 
 /// "950", "12.3k", "4.5M".
@@ -565,6 +660,208 @@ pub fn bar_fractions<'a>(totals: impl IntoIterator<Item = &'a Total>) -> Vec<f64
         .iter()
         .map(|t| if max > 0.0 { value(t) / max } else { 0.0 })
         .collect()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Budget warning: real money only (metered turns), never a plan's list price, never a cost
+// whose billing was not recorded, never extra usage (whose unit is not confirmed). Amounts are
+// summed and compared in whole micro-dollars, so a sum of cents never drifts past or short of
+// a threshold.
+// ---------------------------------------------------------------------------------------------
+
+/// Micro-dollars in a dollar.
+const MICROS: f64 = 1_000_000.0;
+
+/// `usd` in whole micro-dollars; a value that is not a positive finite number is none.
+pub fn to_micros(usd: f64) -> i64 {
+    if usd.is_finite() && usd > 0.0 {
+        // At most a billion dollars a turn or a budget: well inside `i64`.
+        (usd.min(1e12) * MICROS).round() as i64
+    } else {
+        0
+    }
+}
+
+/// Whole micro-dollars as dollars, for showing.
+pub fn from_micros(micros: i64) -> f64 {
+    micros as f64 / MICROS
+}
+
+/// How far a period's spending has gone into its budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BudgetLevel {
+    /// At or past four fifths (80 %) of it.
+    Near,
+    /// At or past all of it.
+    Over,
+}
+
+impl BudgetLevel {
+    /// As kept in the store's `meta` ([`BudgetPeriod::meta_key`]).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BudgetLevel::Near => "near",
+            BudgetLevel::Over => "over",
+        }
+    }
+
+    /// A kept level; `None` for anything else.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim() {
+            "near" => Some(BudgetLevel::Near),
+            "over" => Some(BudgetLevel::Over),
+            _ => None,
+        }
+    }
+}
+
+/// How far `spent` has gone into `limit`, both in micro-dollars; `None` below four fifths of
+/// it, or for a limit that is not positive. Exact: four fifths is `spent * 5 >= limit * 4`.
+pub fn budget_level(spent: i64, limit: i64) -> Option<BudgetLevel> {
+    if limit <= 0 {
+        return None;
+    }
+    let (spent, limit) = (i128::from(spent.max(0)), i128::from(limit));
+    if spent >= limit {
+        Some(BudgetLevel::Over)
+    } else if spent * 5 >= limit * 4 {
+        Some(BudgetLevel::Near)
+    } else {
+        None
+    }
+}
+
+/// A period a budget covers: the user's own calendar day or month.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetPeriod {
+    Day,
+    Month,
+}
+
+impl BudgetPeriod {
+    pub const ALL: [BudgetPeriod; 2] = [BudgetPeriod::Day, BudgetPeriod::Month];
+
+    /// The first day of the period `today` is in.
+    pub fn first_day(self, today: DayKey) -> DayKey {
+        match self {
+            BudgetPeriod::Day => today,
+            BudgetPeriod::Month => today.month_start(),
+        }
+    }
+
+    /// The `meta` key that keeps the highest level warned of in the period `today` is in:
+    /// `spend_warned:day:2026-11-16`, `spend_warned:month:2026-11`. A new period has a new
+    /// key, so its warnings are given again.
+    pub fn meta_key(self, today: DayKey) -> String {
+        match self {
+            BudgetPeriod::Day => format!("spend_warned:day:{today}"),
+            BudgetPeriod::Month => {
+                format!("spend_warned:month:{:04}-{:02}", today.year, today.month)
+            }
+        }
+    }
+
+    /// "today", "this month".
+    pub fn label(self) -> &'static str {
+        match self {
+            BudgetPeriod::Day => "today",
+            BudgetPeriod::Month => "this month",
+        }
+    }
+}
+
+/// The warning budgets, in US dollars; `None` warns of nothing for that period.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Budget {
+    pub daily: Option<f64>,
+    pub monthly: Option<f64>,
+}
+
+impl Budget {
+    /// The period's amount in micro-dollars, when it has one.
+    pub fn limit(&self, period: BudgetPeriod) -> Option<i64> {
+        match period {
+            BudgetPeriod::Day => self.daily,
+            BudgetPeriod::Month => self.monthly,
+        }
+        .map(to_micros)
+        .filter(|l| *l > 0)
+    }
+}
+
+/// The real money `rows` spent from `first` on, in micro-dollars: metered turns only (a
+/// delegated worker's included), each turn's cost made whole micro-dollars before it is
+/// added. A plan's list price, a free profile's turns, a cost whose billing was not recorded
+/// and extra usage are never real money here.
+pub fn real_money(rows: &[SpendRow], first: DayKey) -> i64 {
+    rows.iter()
+        .filter(|r| r.day >= first && r.billing == Billing::Metered)
+        .map(|r| to_micros(r.cost_usd))
+        .fold(0_i64, i64::saturating_add)
+}
+
+/// A warning to give: the period, how far it went, what it spent and its budget (both in
+/// micro-dollars).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BudgetWarning {
+    pub period: BudgetPeriod,
+    pub level: BudgetLevel,
+    pub spent: i64,
+    pub limit: i64,
+}
+
+impl BudgetWarning {
+    /// "Spending today is $8.50, near your $10.00 warning". The amount is real money.
+    pub fn text(&self) -> String {
+        let (spent, limit) = (
+            format_usd(from_micros(self.spent)),
+            format_usd(from_micros(self.limit)),
+        );
+        match self.level {
+            BudgetLevel::Near => format!(
+                "Spending {} is {spent}, near your {limit} warning",
+                self.period.label()
+            ),
+            BudgetLevel::Over => format!(
+                "Spending {} is {spent}, past your {limit} warning",
+                self.period.label()
+            ),
+        }
+    }
+}
+
+/// The warning due for `period`, given what it spent, its budget and the highest level already
+/// warned of in it (`warned`, from `meta`): only a level above that one, so each level is
+/// warned of once a period, and a jump straight past the budget warns once, as over.
+pub fn warning_due(
+    period: BudgetPeriod,
+    spent: i64,
+    budget: &Budget,
+    warned: Option<BudgetLevel>,
+) -> Option<BudgetWarning> {
+    let limit = budget.limit(period)?;
+    let level = budget_level(spent, limit)?;
+    (Some(level) > warned).then_some(BudgetWarning {
+        period,
+        level,
+        spent,
+        limit,
+    })
+}
+
+/// A warning budget as typed: blank is none; otherwise a positive number of dollars (a leading
+/// `$` allowed). Anything else is refused with the reason, never read as none.
+pub fn parse_budget(text: &str) -> Result<Option<f64>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let number = text.strip_prefix('$').unwrap_or(text).trim();
+    match number.parse::<f64>() {
+        Ok(n) if n.is_finite() && n > 0.0 && n <= 1e9 => Ok(Some(n)),
+        Ok(_) => Err("Enter an amount above $0, or leave it blank for no warning.".to_owned()),
+        Err(_) => Err("Enter an amount in dollars, such as 25 or 12.50.".to_owned()),
+    }
 }
 
 #[cfg(test)]
@@ -891,6 +1188,177 @@ mod report_tests {
     }
 
     #[test]
+    fn budget_counts_real_money_only() {
+        let today = day("2026-11-16");
+        let with = |on: &str, billing, cost: f64, delegated| {
+            let mut r = row(on, "claude", "/a", Some(cost), 1);
+            r.billing = billing;
+            r.delegated = delegated;
+            r
+        };
+        let rows = [
+            with("2026-11-16", Billing::Metered, 1.0, false),
+            with("2026-11-16", Billing::Metered, 0.5, true),
+            with("2026-11-16", Billing::Plan, 50.0, false),
+            with("2026-11-16", Billing::Unknown, 70.0, false),
+            with("2026-11-16", Billing::Free, 90.0, false),
+            with("2026-11-02", Billing::Metered, 2.0, false),
+            with("2026-10-31", Billing::Metered, 4.0, false),
+        ];
+        assert_eq!(
+            real_money(&rows, BudgetPeriod::Day.first_day(today)),
+            1_500_000
+        );
+        assert_eq!(
+            real_money(&rows, BudgetPeriod::Month.first_day(today)),
+            3_500_000
+        );
+        assert_eq!((to_micros(f64::NAN), to_micros(-1.0)), (0, 0));
+    }
+
+    #[test]
+    fn budget_state_thresholds_fire_once_per_period() {
+        let usd = to_micros;
+        assert_eq!(budget_level(usd(7.9), usd(10.0)), None);
+        assert_eq!(budget_level(usd(8.0), usd(10.0)), Some(BudgetLevel::Near));
+        assert_eq!(budget_level(usd(10.0), usd(10.0)), Some(BudgetLevel::Over));
+        assert_eq!(budget_level(usd(5.0), 0), None);
+
+        let budget = Budget {
+            daily: Some(10.0),
+            monthly: None,
+        };
+        let day = BudgetPeriod::Day;
+        let near = warning_due(day, usd(8.5), &budget, None).expect("near");
+        assert_eq!(near.level, BudgetLevel::Near);
+        assert_eq!(
+            near.text(),
+            "Spending today is $8.50, near your $10.00 warning"
+        );
+        assert_eq!(
+            warning_due(day, usd(9.0), &budget, Some(BudgetLevel::Near)),
+            None
+        );
+        let over = warning_due(day, usd(12.0), &budget, Some(BudgetLevel::Near)).expect("over");
+        assert_eq!(over.level, BudgetLevel::Over);
+        assert_eq!(
+            warning_due(day, usd(50.0), &budget, Some(BudgetLevel::Over)),
+            None
+        );
+        // Straight past the budget: one warning, as over.
+        assert_eq!(
+            warning_due(day, usd(12.0), &budget, None).map(|w| w.level),
+            Some(BudgetLevel::Over)
+        );
+        assert_eq!(
+            warning_due(BudgetPeriod::Month, usd(1e6), &budget, None),
+            None
+        );
+
+        let today = DayKey::parse("2026-11-16").expect("day");
+        assert_eq!(day.meta_key(today), "spend_warned:day:2026-11-16");
+        assert_eq!(
+            BudgetPeriod::Month.meta_key(today),
+            "spend_warned:month:2026-11"
+        );
+        assert_ne!(day.meta_key(today), day.meta_key(today.add_days(1)));
+        for level in [BudgetLevel::Near, BudgetLevel::Over] {
+            assert_eq!(BudgetLevel::parse(level.as_str()), Some(level));
+        }
+        assert_eq!(BudgetLevel::parse("garbage"), None);
+    }
+
+    /// Sums of cents and limits that are not binary fractions land exactly on the thresholds:
+    /// $2.40 of $3.00 is near, and ten $0.10 turns are $1.00, past a $1.00 warning.
+    #[test]
+    fn budget_thresholds_are_exact_for_cents() {
+        let today = day("2026-11-16");
+        let metered = |cost| {
+            let mut r = row("2026-11-16", "claude", "/a", Some(cost), 1);
+            r.billing = Billing::Metered;
+            r
+        };
+        let near = [metered(1.2), metered(1.2)];
+        let spent = real_money(&near, today);
+        assert_eq!(spent, 2_400_000);
+        let three = Budget {
+            daily: Some(3.0),
+            monthly: None,
+        };
+        assert_eq!(
+            warning_due(BudgetPeriod::Day, spent, &three, None).map(|w| w.level),
+            Some(BudgetLevel::Near),
+            "exactly 80% is near"
+        );
+        assert_eq!(budget_level(2_399_999, 3_000_000), None);
+
+        let dimes: Vec<SpendRow> = (0..10).map(|_| metered(0.1)).collect();
+        let spent = real_money(&dimes, today);
+        assert_eq!(spent, 1_000_000);
+        let dollar = Budget {
+            daily: Some(1.0),
+            monthly: None,
+        };
+        let warning = warning_due(BudgetPeriod::Day, spent, &dollar, None).expect("over");
+        assert_eq!(warning.level, BudgetLevel::Over);
+        assert_eq!(
+            warning.text(),
+            "Spending today is $1.00, past your $1.00 warning"
+        );
+        // Seven turns of $0.10 against $0.875 (not a binary fraction): $0.70 is exactly 80%.
+        let seven: Vec<SpendRow> = (0..7).map(|_| metered(0.1)).collect();
+        let odd = Budget {
+            daily: Some(0.875),
+            monthly: None,
+        };
+        assert_eq!(
+            warning_due(BudgetPeriod::Day, real_money(&seven, today), &odd, None).map(|w| w.level),
+            Some(BudgetLevel::Near)
+        );
+    }
+
+    #[test]
+    fn budget_entry_rejects_non_numbers_and_negative() {
+        assert_eq!(parse_budget(""), Ok(None));
+        assert_eq!(parse_budget("  "), Ok(None));
+        assert_eq!(parse_budget("25"), Ok(Some(25.0)));
+        assert_eq!(parse_budget(" $12.50 "), Ok(Some(12.5)));
+        for bad in ["-5", "0", "abc", "nan", "inf", "12,50", "$", "1e12"] {
+            assert!(parse_budget(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// Extra usage is shown, in its own currency, only while it is switched on: switched off,
+    /// its numbers are the service's own (a plan's internal cap), not anything set or spent.
+    #[test]
+    fn extra_usage_is_shown_only_while_switched_on() {
+        use crate::event::ExtraUsage;
+        let extra = |enabled, used, limit, currency: Option<&str>| ExtraUsage {
+            enabled,
+            used,
+            limit,
+            currency: currency.map(str::to_owned),
+        };
+        assert_eq!(
+            extra_usage_text(&extra(true, 2.5, Some(40.0), Some("USD"))).as_deref(),
+            Some("Extra usage: $2.50 of $40.00 this month")
+        );
+        assert_eq!(
+            extra_usage_text(&extra(true, 2.5, None, Some("CAD"))).as_deref(),
+            Some("Extra usage: 2.50 CAD this month")
+        );
+        assert_eq!(
+            extra_usage_text(&extra(true, 1.0, None, None)).as_deref(),
+            Some("Extra usage: 1.00 this month")
+        );
+        assert_eq!(
+            extra_usage_text(&extra(false, 0.0, Some(40.0), Some("CAD"))),
+            None
+        );
+        assert_eq!(extra_usage_text(&extra(false, 1.0, None, None)), None);
+    }
+
+    #[test]
     fn amounts_and_tokens_are_formatted_for_reading() {
         assert_eq!(format_usd(0.0), "$0.00");
         assert_eq!(format_usd(0.004), "<$0.01");
@@ -905,8 +1373,89 @@ mod report_tests {
     fn billing_names_round_trip() {
         for b in Billing::ALL {
             assert_eq!(Billing::parse(b.as_str()), b);
+            let json = serde_json::to_string(&b).expect("encode");
+            assert_eq!(json, format!("\"{}\"", b.as_str()));
+            assert_eq!(serde_json::from_str::<Billing>(&json).expect("decode"), b);
         }
         assert_eq!(Billing::parse("invoice"), Billing::Unknown);
+        // A name a newer build wrote, or a value of another type, still reads.
+        assert_eq!(
+            serde_json::from_str::<Billing>("\"invoice\"").expect("decode"),
+            Billing::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<Billing>("7").expect("decode"),
+            Billing::Unknown
+        );
+    }
+
+    #[test]
+    fn plan_turns_are_list_price_not_metered() {
+        // What Claude says of itself.
+        let key = claude_billing(Some("ANTHROPIC_API_KEY"), Some("firstParty"), Some("max"));
+        assert_eq!(key, Some(Billing::Metered), "a key is metered, plan or not");
+        assert_eq!(
+            claude_billing(Some("apiKeyHelper"), None, None),
+            Some(Billing::Metered)
+        );
+        assert_eq!(
+            claude_billing(Some("none"), Some("bedrock"), None),
+            Some(Billing::Metered),
+            "another cloud bills it"
+        );
+        assert_eq!(
+            claude_billing(Some("none"), Some("firstParty"), None),
+            Some(Billing::Plan)
+        );
+        assert_eq!(
+            claude_billing(None, None, Some("Claude Pro")),
+            Some(Billing::Plan)
+        );
+        assert_eq!(claude_billing(Some("none"), None, None), None);
+        assert_eq!(claude_billing(None, Some("firstParty"), None), None);
+        assert_eq!(claude_billing(None, None, None), None);
+        assert_eq!(claude_billing(Some(" "), None, Some(" ")), None);
+
+        // Then the profile it ran on.
+        assert_eq!(
+            turn_billing(Some(Billing::Plan), true, true),
+            Some(Billing::Free)
+        );
+        assert_eq!(
+            turn_billing(Some(Billing::Plan), false, true),
+            Some(Billing::Metered),
+            "a model server bills its turns"
+        );
+        assert_eq!(turn_billing(None, false, true), Some(Billing::Metered));
+        assert_eq!(
+            turn_billing(Some(Billing::Plan), false, false),
+            Some(Billing::Plan)
+        );
+        assert_eq!(turn_billing(None, false, false), None);
+
+        // The sums keep them apart, and a free turn's reported price is no spend.
+        let today = day("2026-11-15");
+        let mut plan = row("2026-11-15", "claude", "/a", Some(2.0), 1);
+        plan.billing = Billing::Plan;
+        let mut metered = row("2026-11-15", "claude", "/a", Some(0.5), 1);
+        metered.billing = Billing::Metered;
+        let mut free = row("2026-11-15", "claude", "/a", Some(9.0), 1);
+        free.billing = Billing::Free;
+        let r = report(
+            &[plan, metered, free.clone()],
+            Period::Day,
+            Group::Folder,
+            today,
+        );
+        assert_eq!(r.total.costs.metered, 0.5);
+        assert_eq!(r.total.costs.list_price, 2.0);
+        assert_eq!(r.total.costs.reported, 0.0);
+        assert_eq!(
+            (r.total.turns, r.total.cost_turns, r.total.free_turns),
+            (3, 2, 1)
+        );
+        let r = report(&[free], Period::Day, Group::Folder, today);
+        assert_eq!(r.total.amount(), Amount::Free);
     }
 
     /// The selectors drive dropdowns by index: a new variant fails to compile here until its

@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use agent_core::adapter::Driver;
-use agent_core::event::{Account, Envelope, Event, QuotaWindow};
+use agent_core::event::{Account, Envelope, Event, ExtraUsage, QuotaWindow};
 use agent_core::quota::{agy_account, agy_signed_out, agy_usage};
 use gtk4::{gio, glib};
 use serde_json::Value;
@@ -31,6 +31,8 @@ use crate::probe::{join_n, ListenerSet, ProbeTargets};
 pub struct Snapshot {
     pub account: Option<Account>,
     pub windows: Vec<QuotaWindow>,
+    /// The plan's extra usage this month, when the agent reported it (Claude only).
+    pub extra: Option<ExtraUsage>,
     /// When a window was last updated (epoch seconds); `None` before the first update.
     pub updated_at: Option<i64>,
     /// The agent says no one is signed in to it: installed, but its login was skipped or has
@@ -70,6 +72,9 @@ pub fn merge(
             if other && !snap.windows.is_empty() {
                 snap.windows.clear();
                 snap.updated_at = None;
+            }
+            if other {
+                snap.extra = None;
             }
             snap.account = Some(account);
             changed = true;
@@ -285,6 +290,7 @@ impl AccountStatus {
                 if signed_out {
                     snap.account = None;
                     snap.windows.clear();
+                    snap.extra = None;
                 }
                 true
             }
@@ -316,8 +322,26 @@ impl AccountStatus {
 
     /// Ingests an envelope from `driver`'s thread; only `QuotaUpdated` matters here.
     pub fn observe(&self, driver: Driver, envelope: &Envelope) {
-        if let Event::QuotaUpdated { account, windows } = &envelope.event {
-            self.update(driver, account.clone(), windows.clone());
+        match &envelope.event {
+            Event::QuotaUpdated { account, windows } => {
+                self.update(driver, account.clone(), windows.clone());
+            }
+            Event::ExtraUsageUpdated { extra } => self.set_extra(driver, extra.clone()),
+            _ => {}
+        }
+    }
+
+    /// The plan's extra usage as `driver` last reported it; listeners hear of a change. Not a
+    /// reading of the windows: their clock is left alone.
+    pub fn set_extra(&self, driver: Driver, extra: ExtraUsage) {
+        let changed = {
+            let mut snap = self.slot(driver).borrow_mut();
+            let changed = snap.extra.as_ref() != Some(&extra);
+            snap.extra = Some(extra);
+            changed
+        };
+        if changed {
+            self.notify();
         }
     }
 
@@ -504,6 +528,9 @@ impl AccountStatus {
                             Ok(reading) => {
                                 me.set_signed_out(driver, reading.signed_out);
                                 me.update(driver, reading.account.clone(), reading.windows.clone());
+                                if let Some(extra) = reading.extra.clone() {
+                                    me.set_extra(driver, extra);
+                                }
                             }
                             Err(_) => me.probe_failed(driver),
                         }
@@ -740,6 +767,42 @@ mod tests {
         assert_eq!(st.snapshot(Driver::Codex).windows[0].used, 0.7);
         assert_eq!(st.snapshot(Driver::Agy).windows[0].used, 0.3);
         assert_eq!(st.snapshot(Driver::Claude).windows[0].used, 0.5);
+    }
+
+    /// A thread's extra usage reaches the agent's snapshot, beside its windows; another account
+    /// or signing out forgets it.
+    #[test]
+    fn extra_usage_is_kept_beside_the_windows_of_its_account() {
+        let st = AccountStatus::new();
+        let hits = Rc::new(Cell::new(0));
+        let h = hits.clone();
+        st.connect_changed(move || h.set(h.get() + 1));
+        let extra = ExtraUsage {
+            enabled: true,
+            used: 2.5,
+            limit: Some(40.0),
+            currency: Some("USD".into()),
+        };
+        st.update(
+            Driver::Claude,
+            Some(acct("a")),
+            vec![win(None, "5-hour", 0.1)],
+        );
+        let before = hits.get();
+        let env = Envelope::new(Event::ExtraUsageUpdated {
+            extra: extra.clone(),
+        });
+        st.observe(Driver::Claude, &env);
+        st.observe(Driver::Claude, &env);
+        assert_eq!(hits.get(), before + 1, "told once, on the change");
+        let snap = st.snapshot(Driver::Claude);
+        assert_eq!(snap.extra, Some(extra.clone()));
+        assert_eq!(snap.windows.len(), 1, "the windows stay");
+        st.update(Driver::Claude, Some(acct("b")), vec![]);
+        assert_eq!(st.snapshot(Driver::Claude).extra, None, "another account's");
+        st.set_extra(Driver::Claude, extra);
+        st.set_signed_out(Driver::Claude, true);
+        assert_eq!(st.snapshot(Driver::Claude).extra, None);
     }
 
     const NOW: i64 = 1_800_000_000;

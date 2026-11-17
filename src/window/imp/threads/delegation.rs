@@ -691,7 +691,18 @@ impl AgentTerminalWindow {
                     },
                     default_effort: profile.default_effort.clone(),
                     source,
+                    free: crate::config::profile_is_free(profile, driver),
                 })
+            }),
+            // A worker's metered turn is spending as a thread's is: its root's window, or any
+            // open one, checks the warnings.
+            committed: Rc::new({
+                let weak = weak.clone();
+                move |event| {
+                    if super::super::spending::moves_real_money(event) {
+                        super::super::spending::check_spending_budget_on(weak.upgrade());
+                    }
+                }
             }),
             make_adapter: Rc::new(make_adapter),
             tab_open_in: Rc::new(tab_open_in),

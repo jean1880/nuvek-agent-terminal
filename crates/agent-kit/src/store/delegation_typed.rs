@@ -4018,6 +4018,8 @@ mod tests {
                     usage: None,
                     cost_usd: None,
                     error: None,
+                    model: None,
+                    billing: None,
                 }),
                 links: vec![LinkSpec {
                     process_generation: 0,
@@ -5007,6 +5009,8 @@ mod tests {
                 usage: None,
                 cost_usd: Some(cost),
                 error: None,
+                model: None,
+                billing: None,
             });
             f.s.append_event(thread, Some(&pt), &env).expect("turn");
         };

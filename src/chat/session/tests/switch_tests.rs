@@ -184,6 +184,8 @@ fn a_busy_switch_whose_turn_ended_meanwhile_sends_no_continuation() {
                 error: None,
                 usage: None,
                 cost_usd: None,
+                model: None,
+                billing: None,
             }));
             assert!(!s.session.status().running_turn);
             let switched = || {
@@ -422,6 +424,8 @@ fn a_busy_same_agent_switch_whose_read_fails_holds_or_sends_on_the_new_model() {
                     error: None,
                     usage: None,
                     cost_usd: None,
+                    model: None,
+                    billing: None,
                 }));
             };
             if turn_ends_first {
@@ -510,6 +514,8 @@ fn end_turn(session: &ChatSession) {
         error: None,
         usage: None,
         cost_usd: None,
+        model: None,
+        billing: None,
     }));
 }
 

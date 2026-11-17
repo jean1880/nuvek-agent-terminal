@@ -2483,7 +2483,7 @@ impl Transcript {
                 out.push(Change::Running);
             }
             // Quota feeds the usage indicator (app-wide service), not the transcript.
-            Event::QuotaUpdated { .. } | Event::Unknown => {}
+            Event::QuotaUpdated { .. } | Event::ExtraUsageUpdated { .. } | Event::Unknown => {}
             // Never delivered to the view: the session stores it and sends refs instead.
             Event::ToolImage { .. } => {}
             Event::Attachments { refs } => {
@@ -3657,6 +3657,8 @@ mod tests {
                 usage: None,
                 cost_usd: None,
                 error: None,
+                model: None,
+                billing: None,
             }),
             Driver::Codex,
         );
@@ -3683,6 +3685,8 @@ mod tests {
                 usage: None,
                 cost_usd: None,
                 error: None,
+                model: None,
+                billing: None,
             }),
             Driver::Codex,
         );
@@ -3723,6 +3727,8 @@ mod tests {
                 usage: None,
                 cost_usd: None,
                 error: Some("test failure".into()),
+                model: None,
+                billing: None,
             }),
             Driver::Codex,
         );
@@ -4858,6 +4864,8 @@ mod tests {
                 usage: None,
                 cost_usd: None,
                 error: None,
+                model: None,
+                billing: None,
             }),
             Driver::Codex,
         );
@@ -5187,6 +5195,8 @@ mod tests {
                 usage: None,
                 cost_usd: None,
                 error: None,
+                model: None,
+                billing: None,
             })
         };
         t.apply(&interrupted(), Driver::Claude);
@@ -5210,6 +5220,8 @@ mod tests {
                 usage: None,
                 cost_usd: None,
                 error: Some("quota".into()),
+                model: None,
+                billing: None,
             }),
             Driver::Claude,
         );
@@ -5473,6 +5485,8 @@ mod tests {
                 usage: None,
                 cost_usd: None,
                 error: None,
+                model: None,
+                billing: None,
             }),
             Driver::Claude,
         );
@@ -5488,6 +5502,8 @@ mod tests {
                 usage: None,
                 cost_usd: None,
                 error: None,
+                model: None,
+                billing: None,
             }),
             Driver::Claude,
         );

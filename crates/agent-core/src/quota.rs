@@ -7,7 +7,7 @@
 
 use serde_json::Value;
 
-use crate::event::{Account, QuotaWindow};
+use crate::event::{Account, ExtraUsage, QuotaWindow};
 
 fn clamp01(x: f64) -> f64 {
     if x.is_nan() {
@@ -97,6 +97,34 @@ pub fn claude_usage(usage: &Value) -> Vec<QuotaWindow> {
             })
         })
         .collect()
+}
+
+/// Claude's extra usage, from a `get_usage` reply or an assistant frame's `usage_report`:
+/// `rate_limits.extra_usage {is_enabled, used_credits, monthly_limit, currency}`. Credits are in
+/// the currency's minor units (cents), so they are divided by 100. `None` without an amount
+/// spent that can be read: an unreadable amount is never taken as nothing spent.
+pub fn claude_extra_usage(v: &Value) -> Option<ExtraUsage> {
+    let rate_limits =
+        find_in_response(v, "rate_limits").or_else(|| v.pointer("/usage_report/rate_limits"))?;
+    let extra = rate_limits.get("extra_usage").filter(|e| e.is_object())?;
+    let money = |key: &str| {
+        extra
+            .get(key)
+            .and_then(Value::as_f64)
+            .filter(|n| n.is_finite() && *n >= 0.0)
+            .map(|cents| cents / 100.0)
+    };
+    Some(ExtraUsage {
+        enabled: extra
+            .get("is_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        used: money("used_credits")?,
+        limit: money("monthly_limit"),
+        currency: text(extra, "currency")
+            .filter(|c| c.len() == 3 && c.chars().all(|ch| ch.is_ascii_alphabetic()))
+            .map(|c| c.to_ascii_uppercase()),
+    })
 }
 
 /// agy's `-p /usage --output-format json`: `command.data.groups[].buckets[]
@@ -616,6 +644,46 @@ mod tests {
             Some("2026-10-06T16:30:00.057599+00:00")
         );
         assert!(claude_usage(&json!({"nothing": 1})).is_empty());
+    }
+
+    #[test]
+    fn claude_extra_usage_is_read_in_major_units() {
+        // The recording's assistant frame: switched off, nothing spent, a CAD 40.00 cap.
+        let extra = frames(CONTROLS)
+            .find_map(|f| claude_extra_usage(&f))
+            .expect("the recorded extra usage");
+        assert_eq!(
+            extra,
+            ExtraUsage {
+                enabled: false,
+                used: 0.0,
+                limit: Some(40.0),
+                currency: Some("CAD".into()),
+            }
+        );
+        // A get_usage reply carries the same shape.
+        let reply = json!({"response": {"subtype": "success", "response": {"rate_limits": {
+            "extra_usage": {"is_enabled": true, "used_credits": 1234, "monthly_limit": null,
+                            "currency": "usd"}}}}});
+        let extra = claude_extra_usage(&reply).expect("extra usage");
+        assert!(extra.enabled);
+        assert!((extra.used - 12.34).abs() < 1e-9);
+        assert_eq!(
+            (extra.limit, extra.currency.as_deref()),
+            (None, Some("USD"))
+        );
+        // An amount that cannot be read is no reading at all, never nothing spent.
+        for bad in [
+            json!({"rate_limits": {"extra_usage": {"is_enabled": true}}}),
+            json!({"rate_limits": {"extra_usage": {"used_credits": -5}}}),
+            json!({"rate_limits": {"extra_usage": {"used_credits": "5"}}}),
+            json!({"rate_limits": {"limits": []}}),
+            json!({"nothing": 1}),
+        ] {
+            assert_eq!(claude_extra_usage(&bad), None, "{bad}");
+        }
+        let odd = json!({"rate_limits": {"extra_usage": {"used_credits": 1, "currency": "$$"}}});
+        assert_eq!(claude_extra_usage(&odd).and_then(|e| e.currency), None);
     }
 
     #[test]

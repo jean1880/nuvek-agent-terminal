@@ -1264,6 +1264,8 @@ impl<C: ChatClient, W: Write> Runner<C, W> {
             usage,
             cost_usd: None,
             error,
+            model: None,
+            billing: None,
         }));
         if result.is_err() {
             self.stop_mcp();

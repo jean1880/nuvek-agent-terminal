@@ -106,6 +106,7 @@ impl Thread {
         session.set_adapter_factory(Rc::new(move |driver, _| {
             Ok(AgentLaunch {
                 server: None,
+                free: false,
                 profile: None,
                 adapter: Box::new(Relabelled {
                     inner: agent_core::claude::ClaudeAdapter::new(),
@@ -294,6 +295,7 @@ fn a_switch_that_rolls_back_keeps_the_limit_wait_for_wakes() {
         t.session.set_adapter_factory(Rc::new(move |driver, _| {
             Ok(AgentLaunch {
                 server: None,
+                free: false,
                 profile: None,
                 adapter: Box::new(Relabelled {
                     inner: agent_core::claude::ClaudeAdapter::new(),
@@ -341,6 +343,7 @@ fn the_server_a_process_was_launched_on_outlives_a_settings_change() {
             Rc::new(move |driver, _| {
                 Ok(AgentLaunch {
                     server: server.clone(),
+                    free: false,
                     profile: None,
                     adapter: Box::new(Relabelled {
                         inner: agent_core::claude::ClaudeAdapter::new(),
@@ -373,6 +376,8 @@ fn the_server_a_process_was_launched_on_outlives_a_settings_change() {
             usage: None,
             cost_usd: None,
             error: Some("You've hit your usage limit".into()),
+            model: None,
+            billing: None,
         };
         assert!(record.observe(&source(), &refused));
 

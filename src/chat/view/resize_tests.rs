@@ -280,6 +280,8 @@ fn live_turns(start: usize, turns: usize, children: usize) -> Vec<Envelope> {
             usage: None,
             cost_usd: None,
             error: None,
+            model: None,
+            billing: None,
         }));
     }
     out

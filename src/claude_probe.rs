@@ -211,16 +211,16 @@ pub async fn probe_claude(program: &str, env: &AgentEnv) -> ProbeResult {
             "claude timed out"
         });
     };
-    let windows = usage
-        .borrow_mut()
-        .take()
-        .map(|u| claude_usage(&u))
-        .unwrap_or_default();
+    let usage = usage.borrow_mut().take();
+    let windows = usage.as_ref().map(claude_usage).unwrap_or_default();
     Ok(ClaudeProbe {
         reading: ProbeReading {
             models: parse_claude_initialize(&init),
             account: claude_account(&init),
             windows,
+            extra: usage
+                .as_ref()
+                .and_then(agent_core::quota::claude_extra_usage),
             signed_out: claude_signed_out(&init),
         },
         version,

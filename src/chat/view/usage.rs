@@ -544,6 +544,16 @@ fn detail_form(driver: Driver, snap: &Snapshot, now: i64) -> gtk4::Box {
         }
         section.append(&row);
     }
+    // A plan's extra usage, shown beside its windows while it is switched on.
+    if let Some(text) = snap
+        .extra
+        .as_ref()
+        .and_then(agent_core::spend::extra_usage_text)
+    {
+        let l = wrapped_text(&text, &["usage-window", "usage-extra"]);
+        l.set_halign(gtk4::Align::Start);
+        section.append(&l);
+    }
     section
 }
 

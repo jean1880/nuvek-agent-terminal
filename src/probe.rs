@@ -237,6 +237,8 @@ pub struct ProbeReading {
     pub models: Vec<CatalogModel>,
     pub account: Option<Account>,
     pub windows: Vec<QuotaWindow>,
+    /// The plan's extra usage this month, when reported (Claude's `get_usage`).
+    pub extra: Option<agent_core::event::ExtraUsage>,
     /// No one is signed in (a fresh install, a login that was removed or expired).
     pub signed_out: bool,
 }

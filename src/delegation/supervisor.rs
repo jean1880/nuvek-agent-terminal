@@ -99,7 +99,10 @@ mod tests {
         /// For the next harness on this thread: a `local` profile run by this runner binary on
         /// this model server.
         static TEST_LOCAL: RefCell<Option<(PathBuf, String)>> = const { RefCell::new(None) };
+        /// For the next harness on this thread: what hears each committed worker event.
+        static TEST_COMMITTED: RefCell<Option<CommittedHook>> = const { RefCell::new(None) };
     }
+    type CommittedHook = Rc<dyn Fn(&agent_core::event::Event)>;
     /// `request` as the bridge sends it, with call id `id`.
     fn call(id: u64, request: ToolRequest) -> agent_core::delegation::ipc::Call {
         agent_core::delegation::ipc::Call {
@@ -325,6 +328,7 @@ mod tests {
                         default_model: Some("fixture-model".into()),
                         default_effort: None,
                         source: None,
+                        free: false,
                         local_context: Some(Default::default()),
                     });
                 }
@@ -350,6 +354,8 @@ mod tests {
                     default_model: Some("synthetic-model".into()),
                     default_effort: None,
                     source: None,
+                    // A test marks the profile free to run with this file.
+                    free: cwd.join("free-profile").exists(),
                     local_context: None,
                 })
             }),
@@ -361,6 +367,9 @@ mod tests {
             }),
             tab_open_in: Rc::new(|_| false),
             report: Rc::new(|e| eprintln!("delegation test: {e}")),
+            committed: TEST_COMMITTED
+                .with(|c| c.borrow_mut().take())
+                .unwrap_or_else(|| Rc::new(|_| {})),
             catalog: TEST_CATALOG
                 .with(|c| c.borrow_mut().take())
                 .unwrap_or_default(),
@@ -866,6 +875,8 @@ mod tests {
                     usage: None,
                     error: None,
                     cost_usd: None,
+                    model: None,
+                    billing: None,
                 }),
                 (999, None),
                 false,

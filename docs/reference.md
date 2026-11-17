@@ -261,13 +261,26 @@ session, behind a preview.
 **Week** or **Month** for the last 30 days, 12 weeks or 12 months, and **Group by** folder,
 agent, profile or model. Each row shows its amount, a bar against the largest row, and its
 tokens and turns; below the groups, the same totals by day, week or month. **Plan usage**
-repeats the quota windows the agents last reported.
+repeats the quota windows the agents last reported, and Claude's extra usage this month while
+it is switched on for the account.
 
 What each agent reports:
 
-- **Claude** reports what each turn cost. On an API key or a metered model server that is real
-  money; on a plan it is the list price of the turn, not a charge. Until the app records how a
-  turn was billed, a cost reads as "reported".
+- **Claude** reports what each turn cost. Each turn records how it was paid for, from what
+  Claude says of its sign-in and the profile it ran on, so changing a profile later does not
+  relabel it:
+  - **metered**: an API key (or key helper), a cloud other than Anthropic's own, or a model
+    server that is not marked free to run. This is real money.
+  - **at list price**: a plan signed in without a key. The cost is what the turn would have
+    cost, not a charge.
+  - **free**: a profile marked free to run. Its reported cost is not counted.
+
+  A turn stored before turns recorded their billing, or whose billing Claude did not make
+  clear, reads as "reported": metered or list price, unknown which.
+- **Claude's extra usage** (credits bought past a plan's windows) is shown in the usage popover
+  and under **Plan usage**, in the account's own currency, only while extra usage is switched
+  on for the account. The unit Claude reports it in is not confirmed (it is read as cents), so
+  it is shown for reference and never counted in any total or warning.
 - **Codex, Antigravity and the Local agent** report tokens only. Their rows say "Not
   reported" and show their tokens. The app never estimates dollars from a price list of its
   own.
@@ -281,6 +294,18 @@ says how many there were.
 
 The first time the dialog opens it builds an index over completed turns, once, in the
 background. Nothing here makes a request or leaves this computer.
+
+#### Spending warning
+
+**Settings → General → Spending** turns on a warning and takes a daily and a monthly amount in
+US dollars (blank for none; an amount that is not a positive number is refused and the
+previous one kept). It counts real money only: metered turns, sub-agents' included, summed
+to the micro-dollar so a sum of cents meets a threshold exactly. A plan's list price, a cost
+whose billing is unknown and Claude's extra usage are never counted. After a metered turn,
+the app checks both amounts: at 80% and again at 100% it shows a notice, once a day or month at
+each level, remembered in the thread store so restarting the app does not repeat it. The
+Spending dialog shows a banner while an amount is reached. It is a warning only: no turn is
+ever stopped.
 
 ### The context gauge
 

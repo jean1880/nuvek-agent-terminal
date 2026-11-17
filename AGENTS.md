@@ -162,7 +162,22 @@ Architectural mandates, standards, and workflows for this codebase.
     turns and the ledger in one read transaction, so a delete committed meanwhile is never
     counted twice. The sums are `agent_core::spend` (`report`, `Period`/`Group` with guarded `ALL`
     arrays); kinds of spend (metered, list price, unknown billing) are never added together,
-    and a turn with no cost is "not reported", never $0.
+    and a turn with no cost is "not reported", never $0. Each `TurnCompleted` carries `model`
+    and `billing` (serde-defaulted, so older stored turns read as unknown): the Claude adapter
+    says what the process said of itself (`spend::claude_billing`: a key source other than
+    `none`, or a cloud other than `firstParty`, is metered; signed in without a key on a plan
+    is list price; less is unknown), and the session (`stamp_turn`) applies the profile it was
+    launched on (`spend::turn_billing`: free to run is free, a model server is metered; set by
+    `AgentLaunch::free`/`set_launched_free` and `launched_server`, a delegated worker's too).
+    A free turn's reported cost is never summed. `Store::spend_budget_check` (a write, through
+    the writer) sums today's and this month's real money only (`spend::real_money`: metered
+    turns, in whole micro-dollars, the 80 % test `spent * 5 >= limit * 4`; Claude's extra
+    usage is never counted, its unit being unconfirmed, and is shown only while switched on)
+    and records each level warned of (80 %, 100 %) in `meta` (`spend_warned:day:<day>`,
+    `spend_warned:month:<yyyy-mm>`, older keys removed) in the same transaction, so a level
+    is warned of once a period across windows and restarts; it never stops a turn. A
+    delegated worker's committed events reach the window through `AppServices::committed`
+    (its sink reaches none), so its metered turn starts the check too.
     `store/review.rs` keeps a thread's unsent diff-review comments (`review_drafts`):
     `Store::replace_review_drafts` writes the whole list in one transaction (empty: sent or
     discarded), each quote redacted whole and each note redacted on write, queued on the writer
@@ -184,7 +199,9 @@ Architectural mandates, standards, and workflows for this codebase.
     `window/imp/agents_prefs.rs` (Settings → Agents; `agents_prefs/local_context.rs` and
     `local_mcp.rs` are the Local Instructions and Tools group: instruction files, budgets, MCP
     server definitions, discovery and the Codex import), `window/imp/spending.rs` (the Spending dialog: reads and sums in one `store_job`, then
-    only draws), `window/imp/remote.rs` (Settings →
+    only draws; Settings → General → Spending, whose amounts are refused inline unless
+    `spend::parse_budget` accepts them; and the budget check, started by a metered turn or a
+    new extra-usage reading, run once at a time, its toasts what the writer recorded as due), `window/imp/remote.rs` (Settings →
     General → Remote Machines and the New Terminal Thread on Another Machine dialog),
     `window/imp/threads/message_search.rs` (the sidebar's "In Messages" section, behind the
     toggle beside its search entry: `Store::search` through `store_job` after typing pauses, a

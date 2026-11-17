@@ -625,14 +625,14 @@ without changing anything:
 - which of your merge hooks will run;
 - every open tab, and every delegated sub-agent, working in the main checkout or this worktree.
 
-The dialog then shows the exact command and the folder it runs in. It merges the very commit it
-read, by its id, and turns off for this one command the settings that would make it something else
-(`branch.<base>.mergeOptions`, `merge.ff`, `merge.log`):
+The dialog then shows the exact command, the settings it runs with and the folder it runs in. It
+merges the very commit it read, by its id, and turns off for this one command the settings that
+would make it something else (`branch.<base>.mergeOptions`, `merge.ff`, `merge.log`,
+`merge.autoStash`), passed through git's configuration environment so any branch name works:
 
 ```bash
-# in the main checkout
-git -c branch.<base>.mergeOptions= -c merge.ff=false -c merge.log=false \
-    merge --no-ff --no-edit -m "Merge branch '<branch>'" -- <commit>
+# in the main checkout, with those four settings
+git merge --no-ff --no-edit -m "Merge branch '<branch>'" -- <commit>
 ```
 
 **Merge** runs it off the main thread. It is refused, with the reason, when:
@@ -643,21 +643,25 @@ git -c branch.<base>.mergeOptions= -c merge.ff=false -c merge.log=false \
   middle of a merge, rebase, cherry-pick or revert;
 - a conflict is predicted, or the base already has every commit of the branch;
 - this thread, or any tab or sub-agent in the main checkout, is working or about to (starting, a
-  prompt or a switch waiting); an idle one there is only a warning;
-- another tab is open in this worktree;
-- either branch moved since the dialog opened (open it again to see what it would do now).
+  prompt or a switch waiting, a command running in its terminal); an idle one there is only a
+  warning;
+- another tab is open in this worktree, or one of this thread's sub-agents there is working;
+- either branch, or the merge hooks that would run, changed since the dialog opened (open it again
+  to see what it would do now).
 
 The merge always makes a merge commit, is never forced and skips no hook; it counts as made only
-when the new commit's parents are the two commits shown. If it stops part-way (a conflict git did
-not predict, a hook that refuses, a timeout after two minutes) it is undone: with `git merge
---abort`, or with `git reset --merge` back to the base's commit when git stopped before recording
-the merge (HEAD never moved), and the message says the main checkout is as it was. If it cannot be
-undone, or a stopped git left `.git/index.lock` behind, the message says so and what to run. Hooks
-or signing that ask for input (a passphrase prompt) cannot be answered from the app: merge in a
-terminal instead. The branch and the worktree are always kept: afterwards the dialog gives the
-command that deletes the branch, for you to run once the worktree is removed, and **Close Thread**
-closes the thread, which offers **Remove** as usual.
-
+when the new commit's parents are the two commits shown. If it stops part-way with a merge in
+progress (a conflict git did not predict, say) it is undone with `git merge --abort`, and the
+message says whether the main checkout is as it was. Nothing else is ever undone for you, since the
+app cannot tell what git wrote from changes of yours made meanwhile: if git stopped before
+recording the merge (a hook that refused or timed out), the main checkout is left exactly as git
+left it, HEAD unmoved, and the message names the files that differ and gives `git -C <base>
+status`, and `git -C <base> restore --staged --worktree -- .`, which discards every uncommitted
+change to tracked files, yours included. A `.git/index.lock` a stopped git left behind is said too.
+Hooks or signing that ask for input (a passphrase prompt) cannot be answered from the app: merge
+in a terminal instead. The branch and the worktree are always kept: afterwards the dialog gives
+the command that deletes the branch, for you to run once the worktree is removed, and **Close
+Thread** closes the thread, which offers **Remove** as usual.
 
 
 ### Theme

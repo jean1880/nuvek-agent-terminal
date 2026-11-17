@@ -5856,7 +5856,7 @@ impl AgentTerminalWindow {
         };
         self.tabs.borrow_mut().push(TabState {
             page: page.clone(),
-            terminal,
+            terminal: terminal.clone(),
             dir: summary.cwd.clone(),
             stack,
             exit_bar,
@@ -5875,6 +5875,8 @@ impl AgentTerminalWindow {
             quota_notified: false,
             bell_pending: false,
             last_output: std::rc::Rc::new(std::cell::Cell::new(std::time::Instant::now())),
+            // The drawer's shell: its output alone, apart from the turn's end in `last_output`.
+            terminal_output: super::watch_terminal_output(&terminal),
             checkpoint: CheckpointTrack::default(),
             diff_panel: diff_panel.clone(),
             worktree: None,

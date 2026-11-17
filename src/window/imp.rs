@@ -432,6 +432,9 @@ struct TabState {
     /// ended once this has been quiet for [`CHECKPOINT_QUIET`]. Kept apart
     /// from `screen_dirty`, which the quota poll consumes.
     last_output: std::rc::Rc<std::cell::Cell<std::time::Instant>>,
+    /// When the tab's terminal (a terminal page, or a thread's drawer) last changed on screen:
+    /// only its output, never a turn's end, so a merge can tell a shell at work from one idle.
+    terminal_output: std::rc::Rc<std::cell::Cell<Option<std::time::Instant>>>,
     checkpoint: CheckpointTrack,
     /// What changed in this tab's repository, beside the terminal.
     diff_panel: DiffPanel,
@@ -1191,6 +1194,30 @@ fn spawn_with_exact_env(
         None::<&gtk4::gio::Cancellable>,
         done,
     );
+}
+
+/// When `terminal` last changed on screen, kept from now on: `None` until it first does.
+fn watch_terminal_output(
+    terminal: &Terminal,
+) -> std::rc::Rc<std::cell::Cell<Option<std::time::Instant>>> {
+    let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+    let stamp = std::rc::Rc::clone(&seen);
+    terminal.connect_contents_changed(move |_| stamp.set(Some(std::time::Instant::now())));
+    seen
+}
+
+/// Whether a job other than `terminal`'s shell holds it in the foreground
+/// ([`merge::foreground_job`] on its pty). A build without terminals has none.
+#[cfg(feature = "terminal")]
+fn terminal_runs_a_job(terminal: &Terminal) -> bool {
+    terminal
+        .pty()
+        .is_some_and(|pty| merge::foreground_job(&pty.fd()))
+}
+
+#[cfg(not(feature = "terminal"))]
+fn terminal_runs_a_job(_terminal: &Terminal) -> bool {
+    false
 }
 
 /// Switches `stack` off its loading screen as soon as `terminal` prints anything, then
@@ -3664,6 +3691,7 @@ impl AgentTerminalWindow {
             .build();
         let screen_dirty = std::rc::Rc::new(std::cell::Cell::new(true));
         let last_output = std::rc::Rc::new(std::cell::Cell::new(std::time::Instant::now()));
+        let terminal_output = watch_terminal_output(&terminal);
         terminal.connect_contents_changed(glib::clone!(
             #[strong]
             screen_dirty,
@@ -3780,6 +3808,7 @@ impl AgentTerminalWindow {
             quota_notified: false,
             bell_pending: false,
             last_output,
+            terminal_output,
             checkpoint: CheckpointTrack::default(),
             diff_panel: diff_panel.clone(),
             worktree: None,

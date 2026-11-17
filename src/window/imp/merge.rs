@@ -32,6 +32,9 @@ pub(super) struct Seen {
     /// The worktree its tab was opened in, if any.
     pub worktree: Option<PathBuf>,
     pub busy: bool,
+    /// A delegated sub-agent of this very thread: closing it is not the user's to do from here,
+    /// so idle in this worktree it is only a warning.
+    pub own_child: bool,
 }
 
 /// Something in the base checkout or this worktree, as the dialog names it.
@@ -40,8 +43,9 @@ pub(super) struct BaseTab {
     pub title: String,
     /// It is working, or about to: a thread's turn, background work, a question, a start, a
     /// prompt or a switch waiting; a terminal (a page or a thread's drawer) that has shown
-    /// output just now; a sub-agent running.
+    /// output just now or runs a job of its own; a sub-agent running.
     pub busy: bool,
+    pub own_child: bool,
 }
 
 /// Where each [`Seen`] works, against the plan: in the base checkout, in this worktree, or
@@ -64,6 +68,7 @@ pub(super) fn place(plan: &MergePlan, seen: &[Seen]) -> (Vec<BaseTab>, Vec<BaseT
         let tab = BaseTab {
             title: s.title.clone(),
             busy: s.busy,
+            own_child: s.own_child,
         };
         if dir.starts_with(&here) || worktree.as_ref() == Some(&here) {
             in_here.push(tab);
@@ -94,11 +99,23 @@ pub(super) fn tab_lines(
         );
     }
     for tab in in_here {
-        lines.refusals.push(format!(
-            "“{}” is also open in this worktree. Close it first: it could commit to the branch \
-             while it is merged.",
-            tab.title
-        ));
+        match (tab.own_child, tab.busy) {
+            (true, true) => lines.refusals.push(format!(
+                "{} of this thread is working in this worktree. Wait for it to finish first: it \
+                 could commit to the branch while it is merged.",
+                tab.title
+            )),
+            (true, false) => lines.warnings.push(format!(
+                "{} of this thread is idle in this worktree: work given to it while the merge runs \
+                 could commit to the branch.",
+                tab.title
+            )),
+            (false, _) => lines.refusals.push(format!(
+                "“{}” is also open in this worktree. Close it first: it could commit to the \
+                 branch while it is merged.",
+                tab.title
+            )),
+        }
     }
     for tab in in_base {
         if tab.busy {
@@ -276,9 +293,9 @@ pub(super) fn merge_dialog(plan: &MergePlan, tabs: &TabLines) -> MergeDialog {
     column.append(&commands);
     let note = wrapped(&format!(
         "The merge is never forced and skips no hook, and it takes exactly the commit shown. If \
-         it stops part-way (a conflict, a hook that refuses, a timeout) it is undone with git \
-         merge --abort, or git reset --merge back to the base's commit when git had not yet \
-         recorded it. The branch {} and its worktree are kept.",
+         it stops part-way with a merge in progress (a conflict, say) it is undone with git \
+         merge --abort; anything else git leaves is left as it is and said, never undone for \
+         you. The branch {} and its worktree are kept.",
         plan.branch
     ));
     note.add_css_class("dim-label");
@@ -307,25 +324,51 @@ fn wrapped(text: &str) -> gtk4::Label {
         .build()
 }
 
+/// Whether `tab`'s terminal (a terminal page, or a thread's drawer) is at work: it changed on
+/// screen just now, or a job other than its shell holds the terminal. A quiet build, a `sleep`
+/// before a commit or an editor shows nothing for a while, but owns the foreground.
+fn terminal_busy(tab: &super::TabState) -> bool {
+    let recent = tab
+        .terminal_output
+        .get()
+        .is_some_and(|at| at.elapsed() < CHECKPOINT_QUIET);
+    recent || super::terminal_runs_a_job(&tab.terminal)
+}
+
+/// Whether the terminal `fd` is the controlling terminal of has a foreground process group other
+/// than its session leader's (the shell VTE started): a job the shell is running. Two `ioctl`s,
+/// which never block. Unknown (either fails) counts as no job.
+#[cfg_attr(
+    not(feature = "terminal"),
+    expect(dead_code, reason = "a build without terminals has no pty to ask")
+)]
+pub(super) fn foreground_job(fd: &impl std::os::fd::AsRawFd) -> bool {
+    let fd = fd.as_raw_fd();
+    // SAFETY: both only read the terminal's process group and session; `fd` is open for the
+    // duration of the call (borrowed from its owner).
+    let (group, session) = unsafe { (libc::tcgetpgrp(fd), libc::tcgetsid(fd)) };
+    group > 0 && session > 0 && group != session
+}
+
 impl AgentTerminalWindow {
     /// Every open tab other than the one whose panel is `own` (in every window) and every live
     /// delegated sub-agent, with where it works and whether it is working; and whether the
     /// tab whose panel is `own` is working itself. Read on the main thread, placed off it.
     fn seen_for_merge(&self, own: &gtk4::Box) -> (Vec<Seen>, bool) {
-        let busy_terminal =
-            |tab: &super::TabState| tab.last_output.get().elapsed() < CHECKPOINT_QUIET;
         let found = std::cell::RefCell::new(Vec::new());
         let own_busy = std::cell::Cell::new(false);
+        let own_thread = std::cell::RefCell::new(None::<String>);
         self.for_each_window(|window| {
             for tab in window.tabs.borrow().iter() {
                 if tab.remote.is_some() {
                     continue;
                 }
-                // A thread is busy while it holds its work, or while its drawer's shell has
-                // just shown output; a terminal page by its output alone.
-                let busy = busy_terminal(tab) || tab.chat.as_ref().is_some_and(|c| c.holds_merge());
+                // A thread is busy while it holds its work; a terminal (a page, or a thread's
+                // drawer) while it has just shown output or runs a job of its own.
+                let busy = terminal_busy(tab) || tab.chat.as_ref().is_some_and(|c| c.holds_merge());
                 if tab.diff_panel.root == *own {
                     own_busy.set(busy);
+                    *own_thread.borrow_mut() = tab.chat.as_ref().map(|c| c.thread.clone());
                     continue;
                 }
                 found.borrow_mut().push(Seen {
@@ -333,12 +376,14 @@ impl AgentTerminalWindow {
                     dir: PathBuf::from(&tab.dir),
                     worktree: tab.worktree.as_ref().map(|w| w.path.clone()),
                     busy,
+                    own_child: false,
                 });
             }
         });
         let mut found = found.into_inner();
         if let Some(supervisor) = crate::delegation::supervisor() {
-            for (name, cwd, working) in supervisor.live_workers() {
+            let own_thread = own_thread.into_inner();
+            for (name, cwd, working, own_child) in supervisor.live_workers(own_thread.as_deref()) {
                 if cwd.as_os_str().is_empty() {
                     continue;
                 }
@@ -347,6 +392,7 @@ impl AgentTerminalWindow {
                     dir: cwd,
                     worktree: None,
                     busy: working,
+                    own_child,
                 });
             }
         }
@@ -377,7 +423,6 @@ impl AgentTerminalWindow {
         }) else {
             return;
         };
-        let parent = panel.dialog_parent();
         let Some(info) = worktree else {
             panel.set_merge_preparing(false);
             return;
@@ -385,6 +430,10 @@ impl AgentTerminalWindow {
         let obj = self.obj().downgrade();
         let root = panel_root.clone();
         glib::MainContext::default().spawn_local(async move {
+            // The button stays off until the preview is up, or the reason it is not has been
+            // said: one press, one dialog.
+            let done =
+                |panel: &crate::window::diff_panel::DiffPanel| panel.set_merge_preparing(false);
             let read = {
                 let info = info.clone();
                 off_main("reading the merge", move || {
@@ -392,15 +441,21 @@ impl AgentTerminalWindow {
                 })
                 .await
             };
-            panel.set_merge_preparing(false);
-            let Some(obj) = obj.upgrade() else { return };
+            let Some(obj) = obj.upgrade() else {
+                done(&panel);
+                return;
+            };
             // The tab closed while the plan was read: there is nothing to ask about.
             if obj.imp().tab_by_panel(&root, |_| ()).is_none() {
+                done(&panel);
                 return;
             }
             let plan = match read {
                 Ok(plan) => plan,
                 Err(why) => {
+                    done(&panel);
+                    // Resolved again: the panel may have popped out or docked meanwhile.
+                    let parent = obj.imp().merge_result_parent(&root, &panel.dialog_parent());
                     present_message_over(&parent, "Can't Merge This Worktree", &redact(&why));
                     return;
                 }
@@ -413,12 +468,18 @@ impl AgentTerminalWindow {
                 })
                 .await
             };
-            let Ok(lines) = lines else { return };
+            let Ok(lines) = lines else {
+                done(&panel);
+                return;
+            };
             if obj.imp().tab_by_panel(&root, |_| ()).is_none() {
+                done(&panel);
                 return;
             }
+            let parent = obj.imp().merge_result_parent(&root, &panel.dialog_parent());
             let parts = merge_dialog(&plan, &lines);
             parts.dialog.present(Some(&parent));
+            done(&panel);
             let obj = obj.downgrade();
             parts.dialog.connect_response(None, move |_, response| {
                 if response != "merge" {
@@ -562,6 +623,7 @@ pub(super) mod tests {
             behind: 1,
             prediction: Prediction::Clean,
             hooks: Vec::new(),
+            hooks_dir: None,
             worktrees: vec![PathBuf::from("/r/.main.worktrees/feat-x")],
             refusals: Vec::new(),
         }
@@ -573,6 +635,7 @@ pub(super) mod tests {
             dir: dir.to_path_buf(),
             worktree: worktree.map(Path::to_path_buf),
             busy,
+            own_child: false,
         }
     }
 
@@ -638,6 +701,100 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn this_threads_own_sub_agents_here_refuse_only_while_working() {
+        let f = folders();
+        let child = |busy| Seen {
+            own_child: true,
+            ..seen("Sub-agent w1", &f.here, None, busy)
+        };
+        let idle = blockers(&f.plan, &[child(false)], false);
+        assert!(idle.refusals.is_empty(), "{idle:?}");
+        assert!(idle.warnings[0].starts_with("Sub-agent w1 of this thread is idle"));
+        let working = blockers(&f.plan, &[child(true)], false);
+        assert!(working.refusals[0].starts_with("Sub-agent w1 of this thread is working"));
+        // Another tree's sub-agent there is no different from another tab.
+        let other = blockers(
+            &f.plan,
+            &[seen("Sub-agent w2", &f.here, None, false)],
+            false,
+        );
+        assert_eq!(other.refusals.len(), 1);
+    }
+
+    #[test]
+    fn a_terminal_with_no_job_of_its_own_is_not_busy() {
+        // Not a terminal at all: unknown, which counts as no job.
+        let file = tempfile::tempfile().unwrap();
+        assert!(!foreground_job(&file));
+        // A terminal nobody's session controls: no job either.
+        let (mut leader, mut follower) = (0, 0);
+        // SAFETY: openpty writes the two descriptors it opens; the rest are null (defaults).
+        let opened = unsafe {
+            libc::openpty(
+                &mut leader,
+                &mut follower,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(opened, 0);
+        // SAFETY: openpty returned these two as open and owned by us.
+        let (leader, follower) = unsafe {
+            use std::os::fd::FromRawFd;
+            (
+                std::os::fd::OwnedFd::from_raw_fd(leader),
+                std::os::fd::OwnedFd::from_raw_fd(follower),
+            )
+        };
+        assert!(!foreground_job(&leader));
+
+        // A shell on it running a job in the foreground, as a terminal page's or drawer's
+        // would: busy while the job runs, idle once the shell has the terminal back.
+        use std::os::unix::process::CommandExt;
+        let stdio = || std::process::Stdio::from(follower.try_clone().unwrap());
+        let mut shell = std::process::Command::new("sh");
+        shell
+            .args(["-c", "set -m; sleep 5"])
+            .stdin(stdio())
+            .stdout(stdio())
+            .stderr(stdio());
+        // SAFETY: only async-signal-safe calls between fork and exec: a new session, and the
+        // terminal on stdin made its controlling terminal.
+        unsafe {
+            shell.pre_exec(|| {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = shell.spawn().unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut seen_busy = false;
+        while std::time::Instant::now() < until && !seen_busy {
+            seen_busy = foreground_job(&leader);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // The whole session goes: the job's own group, then the shell.
+        use std::os::fd::AsRawFd;
+        // SAFETY: reads the terminal's foreground group, then signals that group alone.
+        unsafe {
+            let job = libc::tcgetpgrp(leader.as_raw_fd());
+            if job > 0 && job as u32 != child.id() {
+                libc::kill(-job, libc::SIGKILL);
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            seen_busy,
+            "a foreground job other than the shell reads busy"
+        );
+        drop(follower);
+    }
+
+    #[test]
     fn another_tab_in_this_worktree_or_this_thread_working_refuses() {
         let f = folders();
         let lines = blockers(&f.plan, &[seen("Second", &f.here, None, false)], false);
@@ -669,10 +826,12 @@ pub(super) mod tests {
             BaseTab {
                 title: "Fix the parser".into(),
                 busy: true,
+                own_child: false,
             },
             BaseTab {
                 title: "Notes".into(),
                 busy: false,
+                own_child: false,
             },
         ];
         let lines = tab_lines(Path::new("/r/main"), &tabs, &[], false);
@@ -709,19 +868,19 @@ pub(super) mod tests {
             "Your pre-merge-commit, post-merge hooks run, as at any git merge."
         );
         // Exactly the list the merge runs.
+        let steps = agent_kit::merge::commands(&p);
         assert_eq!(
             shown_steps(&p),
-            agent_kit::merge::commands(&p)
+            steps
                 .iter()
-                .map(|s| format!("In {}:\n{}", s.dir.display(), shown_command(&s.args)))
+                .map(agent_kit::merge::GitStep::shown)
                 .collect::<Vec<_>>()
                 .join("\n")
         );
-        assert!(shown_steps(&p).starts_with("In /r/main:\ngit -c branch.main.mergeOptions="));
-        assert!(shown_steps(&p).ends_with(&format!(
-            "merge --no-ff --no-edit -m 'Merge branch '\\''feat/x'\\''' -- {}",
-            p.branch_tip
-        )));
+        // The settings it runs with are shown with it, and the command is the argument list.
+        assert!(shown_steps(&p)
+            .starts_with("In /r/main:\nwith branch.main.mergeOptions (unset), merge.ff=false"));
+        assert!(shown_steps(&p).ends_with(&shown_command(&steps[0].args)));
     }
 
     #[test]
@@ -772,6 +931,7 @@ pub(super) mod tests {
             &[BaseTab {
                 title: "Busy".into(),
                 busy: true,
+                own_child: false,
             }],
             &[],
             false,

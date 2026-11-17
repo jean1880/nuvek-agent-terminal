@@ -341,28 +341,32 @@ Architectural mandates, standards, and workflows for this codebase.
   place) writes the base branch, index and working tree of the checkout that has the base
   checked out, and only there: on an explicit click, after a dialog that reads everything first
   (`preflight`: both tips, ahead and behind, a `git merge-tree --write-tree` prediction that is
-  "unknown" when git cannot make it, the hooks that run, the linked worktrees) and shows the
-  exact command and its folder (`commands`, the one list the merge runs), it runs `git -c
-  branch.<base>.mergeOptions= -c merge.ff=false -c merge.log=false merge --no-ff --no-edit -m
-  "Merge branch '<branch>'" -- <commit>`: the exact commit the preview read (so no tag of the
-  name, nor a commit made since, is taken), with the settings that would change what was shown
-  turned off for that command, never with `--force`, `--no-verify`, `-X` or `-s`. Names with
-  control, direction or invisible characters are refused (`precheck_name`). It refuses a
-  worktree with uncommitted or untracked files, a base checkout with uncommitted changes, on
-  another branch, detached or mid-operation, a predicted conflict, nothing to merge, this thread
-  or anything in the base checkout working or about to (`window/imp/merge.rs`: open tabs in any
-  window, paths resolved, other linked worktrees nested in it excluded, a thread's start,
-  pending prompt or switch and its drawer, live delegated sub-agents by their folder; an idle one
-  only warns), another tab open in this worktree, and either tip or the base branch moved since
-  the preview (read again just before it runs, and the tabs again at the click). Exit 0 counts
-  only when nothing is in progress and HEAD is a new commit whose parents are the two shown. A
-  merge that stops part-way is undone with `git merge --abort`, or, when git stopped before
-  recording it with HEAD unmoved, `git reset --merge` to the base's own commit (the only reset,
-  never `--hard`, moving no branch); a left `index.lock`, or an undo that fails, is said with
-  what to run, never taken as restored. Failure text is redacted, the timeout says a prompting
-  hook or signing cannot be answered from the app, and each step runs in its own process group
-  like the commit. It never deletes the branch or the worktree. `merge::tests` prove these.
-  Every git call strips inherited
+  "unknown" when git cannot make it, the hooks that run and their folder, the linked worktrees)
+  and shows the exact command, its settings and its folder (`commands`, the one list the merge
+  runs), it runs `git merge --no-ff --no-edit -m "Merge branch '<branch>'" -- <commit>`: the
+  exact commit the preview read (so no tag of the name, nor a commit made since, is taken), with
+  `branch.<base>.mergeOptions` unset and `merge.ff`, `merge.log` and `merge.autoStash` false for
+  that command, passed through git's configuration environment (`GIT_CONFIG_COUNT`, keys taken
+  whole, so a branch named with `=` is no escape; `GIT_CONFIG_PARAMETERS` set empty), never with
+  `--force`, `--no-verify`, `-X` or `-s`. Names with control, direction or invisible characters
+  are refused (`precheck_name`). It refuses a worktree with uncommitted or untracked files, a base
+  checkout with uncommitted changes, on another branch, detached or mid-operation, a predicted
+  conflict, nothing to merge, this thread or anything in the base checkout working or about to
+  (`window/imp/merge.rs`: open tabs in any window, paths resolved, other linked worktrees nested
+  in it excluded, a thread's start, pending prompt or switch, a terminal page's or thread
+  drawer's recent output or a foreground job other than its shell, live delegated sub-agents by
+  their folder; an idle one only warns), another tab open in this worktree or one of this
+  thread's sub-agents working there, and either tip, the base branch or the hooks that would run
+  changed since the preview (read again just before it runs, and the tabs again at the click).
+  Exit 0 counts only when nothing is in progress and HEAD is a new commit whose parents are the
+  two shown. A merge git recorded as in progress (`MERGE_HEAD`) that stops part-way is undone
+  with `git merge --abort`, and nothing else is ever undone: every other failure leaves the
+  checkout exactly as git left it (nothing can tell what git wrote from the user's own changes
+  made meanwhile), saying what state it is in and the commands the user can run, a discarding
+  one said to discard; a left `index.lock` is never taken as restored. Failure text is redacted,
+  the timeout says a prompting hook or signing cannot be answered from the app, and each step
+  runs in its own process group like the commit. It never deletes the branch or the worktree.
+  `merge::tests` prove these. Every git call strips inherited
   `GIT_DIR`-style variables and sets `GIT_OPTIONAL_LOCKS=0`. Untracked files
   whose names look like secrets are never captured.
 - **Hand-off briefs are the terminal's, not the CLI's**: a CLI out of quota

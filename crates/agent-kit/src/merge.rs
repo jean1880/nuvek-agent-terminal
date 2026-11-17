@@ -12,10 +12,10 @@
 //! state of either checkout moved since the preview, then merges the exact commit the preview
 //! read. It never forces, never skips a hook and never picks a side (`--force`, `--no-verify`,
 //! `-X`, `-s` are never passed). Exit 0 is checked too: only a new commit whose parents are the
-//! two shown counts as merged. A merge that stops part-way is undone with `git merge --abort`,
-//! or, when git stopped before recording it (HEAD unmoved), `git reset --merge` to the base's
-//! own commit; both are safe because the base checkout was proven clean. One that cannot be
-//! undone (a left `index.lock` included) is said to be left as it is, with what to run. The
+//! two shown counts as merged. A merge git recorded as in progress (`MERGE_HEAD`) that stops
+//! part-way is undone with `git merge --abort`, and with nothing else: in every other failure the
+//! checkout is left exactly as git left it (nothing can tell what git wrote from changes the user
+//! made meanwhile), and the message says what state it is in and what the user can run. The
 //! branch and the worktree are never deleted.
 //!
 //! Each step runs in a process group of its own, so a timeout ends the hooks git started too.
@@ -146,6 +146,9 @@ pub struct MergePlan {
     pub prediction: Prediction,
     /// The merge hooks that will run in the base checkout.
     pub hooks: Vec<String>,
+    /// The folder they run from: a merge that finds another (`core.hooksPath` changed) does
+    /// nothing.
+    pub hooks_dir: Option<PathBuf>,
     /// Every linked worktree of the repository (this one included), as git lists them: a folder
     /// inside one of them is not in the base checkout even when it is inside its folder.
     pub worktrees: Vec<PathBuf>,
@@ -171,43 +174,81 @@ impl MergePlan {
     }
 }
 
-/// One git command, and the directory it runs in.
+/// One git command, the settings it runs with, and the directory it runs in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitStep {
     pub dir: PathBuf,
     pub args: Vec<String>,
+    /// Settings for this one command (key, value), passed through git's configuration
+    /// environment ([`config_env`]), which takes any key, `=` in a branch name included.
+    pub config: Vec<(String, String)>,
 }
 
 impl GitStep {
-    /// The step as the preview shows it: the directory, then the command as a POSIX shell would
-    /// read it back.
+    /// The step as the preview shows it: the directory, the settings it runs with, then the
+    /// command as a POSIX shell would read it back.
     pub fn shown(&self) -> String {
-        format!(
-            "In {}:\n{}",
-            self.dir.display(),
-            agent_core::commit_message::shown_command(&self.args)
-        )
+        let mut text = format!("In {}:\n", self.dir.display());
+        if !self.config.is_empty() {
+            let settings: Vec<String> = self
+                .config
+                .iter()
+                .map(|(key, value)| {
+                    if value.is_empty() {
+                        format!("{key} (unset)")
+                    } else {
+                        format!("{key}={value}")
+                    }
+                })
+                .collect();
+            text.push_str(&format!("with {}:\n", settings.join(", ")));
+        }
+        text.push_str(&agent_core::commit_message::shown_command(&self.args));
+        text
+    }
+
+    /// The environment that gives git this step's settings.
+    pub fn env(&self) -> Vec<(String, String)> {
+        config_env(&self.config)
     }
 }
 
-/// The arguments of the merge of `tip`, the commit the preview read as `branch`'s, into `base`:
-/// always a merge commit with the message git itself gives a branch merge (one `-m` value), and
-/// the exact commit after `--`, so no name is ever read as an option, no tag of the same name and
-/// no commit made on the branch since the preview is merged in its place.
-///
-/// Configuration that would make the merge something other than what the preview shows is
-/// overridden for this one command: `branch.<base>.mergeOptions` (a `--no-commit`,
-/// `--squash` or `--ff-only` there), `merge.ff` (already overridden by `--no-ff`) and
-/// `merge.log` (which would append a log to the shown message). Hooks and signing are not
-/// touched: they run as at any `git merge`.
-pub fn merge_args(base: &str, branch: &str, tip: &str) -> Vec<String> {
+/// `settings` as git's configuration environment: `GIT_CONFIG_COUNT`, then a
+/// `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` pair each. These override every configuration
+/// file but are themselves overridden by `git -c` options inherited in `GIT_CONFIG_PARAMETERS`,
+/// so that is set empty: nothing from the app's own environment changes what was shown.
+pub fn config_env(settings: &[(String, String)]) -> Vec<(String, String)> {
+    let mut env = vec![
+        ("GIT_CONFIG_PARAMETERS".to_owned(), String::new()),
+        ("GIT_CONFIG_COUNT".to_owned(), settings.len().to_string()),
+    ];
+    for (n, (key, value)) in settings.iter().enumerate() {
+        env.push((format!("GIT_CONFIG_KEY_{n}"), key.clone()));
+        env.push((format!("GIT_CONFIG_VALUE_{n}"), value.clone()));
+    }
+    env
+}
+
+/// The settings that would make the merge something other than what the preview shows, turned
+/// off for that one command: `branch.<base>.mergeOptions` (a `--no-commit`, `--squash`, `-s`
+/// there), `merge.ff` (already overridden by `--no-ff`), `merge.log` (which would append a log
+/// to the shown message) and `merge.autoStash`. Hooks and signing are not touched: they run as
+/// at any `git merge`.
+pub fn merge_config(base: &str) -> Vec<(String, String)> {
     vec![
-        "-c".to_owned(),
-        format!("branch.{base}.mergeOptions="),
-        "-c".to_owned(),
-        "merge.ff=false".to_owned(),
-        "-c".to_owned(),
-        "merge.log=false".to_owned(),
+        (format!("branch.{base}.mergeOptions"), String::new()),
+        ("merge.ff".to_owned(), "false".to_owned()),
+        ("merge.log".to_owned(), "false".to_owned()),
+        ("merge.autoStash".to_owned(), "false".to_owned()),
+    ]
+}
+
+/// The arguments of the merge of `tip`, the commit the preview read as `branch`'s: always a
+/// merge commit with the message git itself gives a branch merge (one `-m` value), and the exact
+/// commit after `--`, so no name is ever read as an option, no tag of the same name and no
+/// commit made on the branch since the preview is merged in its place.
+pub fn merge_args(branch: &str, tip: &str) -> Vec<String> {
+    vec![
         "merge".to_owned(),
         "--no-ff".to_owned(),
         "--no-edit".to_owned(),
@@ -227,7 +268,8 @@ pub fn abort_args() -> Vec<String> {
 pub fn commands(plan: &MergePlan) -> Vec<GitStep> {
     vec![GitStep {
         dir: plan.base_dir.clone(),
-        args: merge_args(&plan.base, &plan.branch, &plan.branch_tip),
+        args: merge_args(&plan.branch, &plan.branch_tip),
+        config: merge_config(&plan.base),
     }]
 }
 
@@ -320,7 +362,7 @@ fn preflight_with(info: &WorktreeInfo, env: &[(&str, &OsStr)]) -> Result<MergePl
         }
         prediction
     };
-    let hooks = hooks(&base_dir, env);
+    let (hooks_dir, hooks) = hooks(&base_dir, env);
     let worktrees = git_raw(
         main,
         ["worktree", "list", "--porcelain"],
@@ -338,6 +380,7 @@ fn preflight_with(info: &WorktreeInfo, env: &[(&str, &OsStr)]) -> Result<MergePl
         ahead,
         behind,
         prediction,
+        hooks_dir,
         hooks,
         worktrees,
         refusals,
@@ -421,8 +464,9 @@ pub fn read_prediction(code: Option<i32>, stdout: &[u8]) -> Prediction {
     }
 }
 
-/// The merge hooks installed for `dir`'s repository (`core.hooksPath` honoured).
-fn hooks(dir: &Path, env: &[(&str, &OsStr)]) -> Vec<String> {
+/// The folder `dir`'s repository runs hooks from (`core.hooksPath` honoured), and the merge
+/// hooks installed there.
+fn hooks(dir: &Path, env: &[(&str, &OsStr)]) -> (Option<PathBuf>, Vec<String>) {
     use std::os::unix::fs::PermissionsExt;
     let Ok(out) = git_raw(
         dir,
@@ -430,7 +474,7 @@ fn hooks(dir: &Path, env: &[(&str, &OsStr)]) -> Vec<String> {
         env,
         QUERY_TIMEOUT_SECS,
     ) else {
-        return Vec::new();
+        return (None, Vec::new());
     };
     let path = PathBuf::from(String::from_utf8_lossy(&out).trim());
     let hooks = if path.is_absolute() {
@@ -438,14 +482,15 @@ fn hooks(dir: &Path, env: &[(&str, &OsStr)]) -> Vec<String> {
     } else {
         dir.join(path)
     };
-    MERGE_HOOKS
+    let found = MERGE_HOOKS
         .iter()
         .filter(|name| {
             std::fs::metadata(hooks.join(name))
                 .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         })
         .map(|name| (*name).to_owned())
-        .collect()
+        .collect();
+    (Some(hooks), found)
 }
 
 /// A merge that was made.
@@ -489,6 +534,14 @@ fn merge_with(
             plan.base, plan.branch
         )));
     }
+    if now.hooks != plan.hooks || now.hooks_dir != plan.hooks_dir {
+        return Err(
+            "The merge hooks that would run changed since the preview (one added or removed, \
+             or core.hooksPath changed). Nothing was merged: open the merge again to see which \
+             run now."
+                .to_owned(),
+        );
+    }
     if let Some(refusal) = now.refusals.first() {
         return Err(format!(
             "{}\n\nNothing was merged.",
@@ -501,7 +554,14 @@ fn merge_with(
 /// Runs [`commands`], undoing the merge if it stops part-way.
 fn execute(plan: &MergePlan, env: &[(&str, &OsStr)], timeout_secs: u64) -> Result<Merged, String> {
     for step in commands(plan) {
-        let ran = git_output_in_group(&step.dir, &step.args, env, timeout_secs);
+        let settings = step.env();
+        let mut step_env: Vec<(&str, &OsStr)> = env.to_vec();
+        step_env.extend(
+            settings
+                .iter()
+                .map(|(k, v)| (k.as_str(), OsStr::new(v.as_str()))),
+        );
+        let ran = git_output_in_group(&step.dir, &step.args, &step_env, timeout_secs);
         let why = match ran {
             Ok(out) if out.status.success() => continue,
             Ok(out) => said(&out),
@@ -606,51 +666,61 @@ fn short(sha: &str) -> String {
     sha.chars().take(12).collect()
 }
 
-/// The arguments of the undo of a merge git stopped before recording (no `MERGE_HEAD`, HEAD
-/// not moved, the merged files left in the index and tree): back to the base's own commit,
-/// keeping anything the merge did not touch. Used only when HEAD is still that commit, so no
-/// branch moves.
-pub fn unrecorded_undo_args(base_tip: &str) -> Vec<String> {
-    vec![
-        "reset".to_owned(),
-        "--merge".to_owned(),
-        base_tip.to_owned(),
-    ]
-}
-
 /// How the base checkout stands after a failed merge.
 struct Standing {
     /// HEAD is the base's old commit, on the base branch.
     at_base: bool,
     merging: bool,
     locked: bool,
-    /// No tracked file differs from HEAD.
-    clean: bool,
+    /// The tracked files that differ from HEAD (staged or not), as `git status` names them.
+    changed: Vec<String>,
 }
 
 fn standing(plan: &MergePlan, env: &[(&str, &OsStr)]) -> Option<Standing> {
     let repo = discover(&plan.base_dir).ok().flatten()?;
-    let clean = git_raw(
+    let status = git_raw(
         &plan.base_dir,
         ["status", "--porcelain", "--untracked-files=no"],
         env,
         QUERY_TIMEOUT_SECS,
     )
-    .ok()?
-    .is_empty();
+    .ok()?;
+    let changed = String::from_utf8_lossy(&status)
+        .lines()
+        .filter_map(|line| line.get(3..))
+        .map(str::to_owned)
+        .collect();
     Some(Standing {
         at_base: repo.head.as_deref() == Some(plan.base_tip.as_str())
             && repo.branch.as_deref() == Some(plan.base.as_str()),
         merging: in_progress_op(&repo.git_dir) == Some(InProgress::Merge),
         locked: index_locked(&repo.git_dir),
-        clean,
+        changed,
     })
 }
 
-/// After a merge that failed: undoes it with `git merge --abort` when git left one in progress,
-/// or, when git stopped before recording it with HEAD unmoved, with `git reset --merge` to the
-/// base's own commit (safe because the checkout was proven clean before the merge). Then says
-/// whether the base checkout is exactly as it was. Nothing else is ever run.
+/// The commands the user may run in `dir` when the app leaves a checkout as git left it:
+/// what it shows, and what puts the tracked files back (said to discard changes).
+fn left_as_is(dir: &Path) -> String {
+    let git = |args: &[&str]| {
+        let mut all = vec!["-C".to_owned(), dir.to_string_lossy().into_owned()];
+        all.extend(args.iter().map(|a| (*a).to_owned()));
+        agent_core::commit_message::shown_command(&all)
+    };
+    format!(
+        "`{}` shows what is there. If none of it is yours, `{}` puts every tracked file back as \
+         the base's commit has it: it discards every uncommitted change to them, staged or not, \
+         yours included.",
+        git(&["status"]),
+        git(&["restore", "--staged", "--worktree", "--", "."])
+    )
+}
+
+/// After a merge that failed: undoes it with `git merge --abort`, and only when git recorded a
+/// merge in progress (`MERGE_HEAD`). In every other case the checkout is left exactly as git
+/// left it, since nothing can tell what git wrote from changes of the user's made meanwhile: it
+/// says what state it is in and what the user can run. Says whether the base checkout is
+/// exactly as it was.
 fn recover(plan: &MergePlan, env: &[(&str, &OsStr)], timeout_secs: u64) -> String {
     let dir = plan.base_dir.display();
     let base = &plan.base;
@@ -663,8 +733,8 @@ fn recover(plan: &MergePlan, env: &[(&str, &OsStr)], timeout_secs: u64) -> Strin
     );
     let Some(now) = standing(plan, env) else {
         return format!(
-            "{dir} could not be read after the merge ({base} was at {before}). Check `git \
-             status` there; `git merge --abort` undoes a merge in progress."
+            "{dir} could not be read after the merge ({base} was at {before}). {}",
+            left_as_is(&plan.base_dir)
         );
     };
     // A lock left behind by a git that was stopped: an undo would only fail on it, and the
@@ -672,41 +742,59 @@ fn recover(plan: &MergePlan, env: &[(&str, &OsStr)], timeout_secs: u64) -> Strin
     if now.locked {
         return locked_words;
     }
-    let undo = if now.merging {
-        Some(("git merge --abort".to_owned(), abort_args()))
-    } else if now.at_base && !now.clean {
-        let args = unrecorded_undo_args(&plan.base_tip);
-        Some((agent_core::commit_message::shown_command(&args), args))
-    } else {
-        None
-    };
-    let mut undone = None;
-    if let Some((shown, args)) = &undo {
-        let ran = git_output_in_group(&plan.base_dir, args, env, timeout_secs);
-        undone = Some(match ran {
-            Ok(out) if out.status.success() => Ok(shown.clone()),
+    if now.merging {
+        let undo = git_output_in_group(&plan.base_dir, abort_args(), env, timeout_secs);
+        let undone = match undo {
+            Ok(out) if out.status.success() => Ok(()),
             Ok(out) => Err(failure_message(&out.stderr)),
             Err(why) => Err(why),
-        });
-    }
-    let after = standing(plan, env);
-    if after.as_ref().is_some_and(|s| s.locked) {
-        return locked_words;
-    }
-    let restored = after.is_some_and(|s| s.at_base && !s.merging && s.clean);
-    match (undone, restored) {
-        (Some(Ok(shown)), true) => {
-            format!("The merge was undone with `{shown}`: {base} is at {before} again, as it was.")
+        };
+        let after = standing(plan, env);
+        if after.as_ref().is_some_and(|s| s.locked) {
+            return locked_words;
         }
-        (None, true) => format!("Nothing was merged: {base} is still at {before}."),
-        (Some(Err(why)), _) => format!(
-            "The merge could not be undone ({}). It is left as git left it in {dir}: run `git \
-             merge --abort` there for a merge in progress, or check `git status`.",
-            agent_core::redact::redact(&why)
-        ),
-        (Some(Ok(_)), false) | (None, false) => format!(
-            "{dir} is not as it was before the merge ({base} was at {before}). Check `git status` \
-             there; `git merge --abort` undoes a merge in progress."
+        return match (undone, after) {
+            (Ok(()), Some(s)) if s.at_base && !s.merging && s.changed.is_empty() => format!(
+                "The merge was undone with `git merge --abort`: {base} is at {before} again, as \
+                 it was."
+            ),
+            (Err(why), _) => format!(
+                "The merge could not be undone ({}). It is left in progress in {dir}: run `git \
+                 merge --abort` there, or resolve it and commit.",
+                agent_core::redact::redact(&why)
+            ),
+            (Ok(()), _) => format!(
+                "The merge was undone with `git merge --abort`, but {dir} is still not as it was \
+                 ({base} was at {before}). {}",
+                left_as_is(&plan.base_dir)
+            ),
+        };
+    }
+    match (now.at_base, now.changed.is_empty()) {
+        (true, true) => format!("Nothing was merged: {base} is still at {before}."),
+        (true, false) => {
+            let mut files: Vec<String> = now
+                .changed
+                .iter()
+                .take(8)
+                .map(|f| agent_core::redact::redact(f))
+                .collect();
+            if now.changed.len() > 8 {
+                files.push(format!("{} more", now.changed.len() - 8));
+            }
+            format!(
+                "Nothing was committed and {base} is still at {before}, but git did not record a \
+                 merge it could undo, and {dir} has tracked files that differ from it: {}. They \
+                 are left exactly as they are, since the app cannot tell what git wrote from \
+                 changes of yours. {}",
+                files.join(", "),
+                left_as_is(&plan.base_dir)
+            )
+        }
+        (false, _) => format!(
+            "{dir} is not as it was before the merge ({base} was at {before}), and nothing was \
+             undone. {}",
+            left_as_is(&plan.base_dir)
         ),
     }
 }
@@ -751,6 +839,7 @@ mod tests {
             behind: 0,
             prediction: Prediction::Clean,
             hooks: Vec::new(),
+            hooks_dir: None,
             worktrees: Vec::new(),
             refusals: Vec::new(),
         }
@@ -774,43 +863,49 @@ mod tests {
     fn the_merge_is_never_forced_and_the_branch_follows_dashdash() {
         let tip = "b".repeat(40);
         for branch in ["feat/x", "-f", "--no-verify"] {
-            let args = merge_args("main", branch, &tip);
+            let args = merge_args(branch, &tip);
             let split = args.iter().position(|a| a == "--").unwrap();
-            // Every argument before `--` is an option of ours, except the value after `-c`
-            // (a setting) or `-m` (the message).
+            // Every argument before `--` is an option of ours, except the message after `-m`.
             let options: Vec<&str> = args[..split]
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| *i == 0 || !["-m", "-c"].contains(&args[i - 1].as_str()))
+                .filter(|(i, _)| *i == 0 || args[i - 1] != "-m")
                 .map(|(_, a)| a.as_str())
                 .collect();
             for arg in &options {
                 assert!(!FORBIDDEN.contains(arg), "{arg} in {args:?}");
             }
-            assert_eq!(
-                options,
-                ["-c", "-c", "-c", "merge", "--no-ff", "--no-edit", "-m"]
-            );
-            assert_eq!(args[10], format!("Merge branch '{branch}'"));
+            assert_eq!(options, ["merge", "--no-ff", "--no-edit", "-m"]);
+            assert_eq!(args[4], format!("Merge branch '{branch}'"));
             // The exact commit the preview read, never a name.
             assert_eq!(&args[split + 1..], std::slice::from_ref(&tip));
         }
-        // The settings that would change what the preview shows are overridden, and only those.
-        let args = merge_args("main", "feat/x", &tip);
-        assert_eq!(
-            [&args[1], &args[3], &args[5]],
-            [
-                "branch.main.mergeOptions=",
-                "merge.ff=false",
-                "merge.log=false"
-            ]
-        );
         assert_eq!(abort_args(), ["merge", "--abort"]);
-        // The one reset: back to the base's own commit, keeping what the merge did not touch.
+    }
+
+    #[test]
+    fn the_overrides_go_through_the_config_environment_whatever_the_branch_name() {
+        // A base named with `=`: a `-c` option would split its key there.
+        let config = merge_config("a=b");
         assert_eq!(
-            unrecorded_undo_args(&tip),
-            ["reset", "--merge", tip.as_str()]
+            config,
+            [
+                ("branch.a=b.mergeOptions", ""),
+                ("merge.ff", "false"),
+                ("merge.log", "false"),
+                ("merge.autoStash", "false"),
+            ]
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
         );
+        let env = config_env(&config);
+        assert_eq!(env[0], ("GIT_CONFIG_PARAMETERS".into(), String::new()));
+        assert_eq!(env[1], ("GIT_CONFIG_COUNT".into(), "4".into()));
+        assert_eq!(
+            env[2],
+            ("GIT_CONFIG_KEY_0".into(), "branch.a=b.mergeOptions".into())
+        );
+        assert_eq!(env[3], ("GIT_CONFIG_VALUE_0".into(), String::new()));
+        assert_eq!(env.len(), 2 + 2 * 4);
     }
 
     #[test]
@@ -819,12 +914,14 @@ mod tests {
         let steps = commands(&p);
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].dir, p.base_dir);
-        assert_eq!(steps[0].args, merge_args("main", "feat/x", &p.branch_tip));
+        assert_eq!(steps[0].args, merge_args("feat/x", &p.branch_tip));
+        assert_eq!(steps[0].config, merge_config("main"));
         assert_eq!(
             steps[0].shown(),
             format!(
-                "In /r/main:\ngit -c branch.main.mergeOptions= -c merge.ff=false -c \
-                 merge.log=false merge --no-ff --no-edit -m 'Merge branch '\\''feat/x'\\''' -- {}",
+                "In /r/main:\nwith branch.main.mergeOptions (unset), merge.ff=false, \
+                 merge.log=false, merge.autoStash=false:\ngit merge --no-ff --no-edit -m \
+                 'Merge branch '\\''feat/x'\\''' -- {}",
                 p.branch_tip
             )
         );
@@ -1250,14 +1347,87 @@ mod tests {
             for pid in &pids {
                 assert!(gone(pid), "process {} outlived the timeout", pid.trim());
             }
-            // The hook runs before git records the merge, so the merged files sit in the index
-            // and tree with HEAD unmoved: undone back to the base's commit, exactly.
+            // The hook runs before git records the merge: no MERGE_HEAD, HEAD unmoved, and the
+            // merged files in the index and tree. Nothing is undone (the app cannot tell them
+            // from the user's own changes); the message says so and what the user can run.
+            assert_eq!(head(&f.main), before.0, "HEAD never moved");
+            assert_eq!(in_progress_op(&f.main.join(".git")), None);
+            assert!(err.contains("left exactly as they are"), "{err}");
+            assert!(err.contains("new.txt"), "the files are named: {err}");
             assert!(
-                err.contains(&format!("undone with `git reset --merge {}`", p.base_tip)),
+                err.contains("restore --staged --worktree -- .")
+                    && err.contains("discards every uncommitted change"),
                 "{err}"
             );
-            assert_eq!(state(&f.main), before, "{err}");
-            assert_eq!(in_progress_op(&f.main.join(".git")), None);
+            assert!(err.contains("status`"), "{err}");
+            assert!(!err.contains("reset"), "{err}");
+        }
+
+        #[test]
+        fn a_change_staged_after_the_last_check_is_never_lost() {
+            let Some(f) = fixture() else { return };
+            let p = plan_of(&f);
+            // The user stages a change between the re-check and git starting.
+            fs::write(f.main.join("b.txt"), "mine, staged\n").unwrap();
+            sh(&f.main, &["add", "b.txt"]);
+            let before = state(&f.main);
+            let result = execute(&p, &env(), MERGE_TIMEOUT_SECS);
+            // Whatever git did, the user's change is still there and still staged.
+            assert_eq!(
+                fs::read_to_string(f.main.join("b.txt")).unwrap(),
+                "mine, staged\n",
+                "{result:?}"
+            );
+            match result {
+                Err(err) => {
+                    assert_eq!(state(&f.main), before, "{err}");
+                    assert!(!err.contains("undone"), "nothing was undone: {err}");
+                }
+                Ok(_) => {
+                    // A merge git made with it is checked like any other: exactly the two
+                    // parents shown.
+                    assert_eq!(sh(&f.main, &["rev-parse", "HEAD^2"]), p.branch_tip);
+                }
+            }
+        }
+
+        #[test]
+        fn mergeoptions_of_a_base_named_with_an_equals_sign_are_turned_off() {
+            let Some(f) = fixture() else { return };
+            sh(&f.main, &["branch", "-m", "main", "a=b"]);
+            // `-s ours` would make a merge commit that takes nothing from the branch.
+            sh(&f.main, &["config", "branch.a=b.mergeOptions", "-s ours"]);
+            let info = WorktreeInfo {
+                base: Some("a=b".into()),
+                ..f.info.clone()
+            };
+            let p = preflight_with(&info, &env()).unwrap();
+            assert!(p.ready(), "{:?}", p.refusals);
+            merge_with(&p, &env(), MERGE_TIMEOUT_SECS).unwrap();
+            assert!(f.main.join("new.txt").exists(), "the branch's work came in");
+            assert_eq!(sh(&f.main, &["rev-parse", "HEAD^2"]), p.branch_tip);
+        }
+
+        #[test]
+        fn hooks_changed_since_the_preview_refuse_the_merge() {
+            let Some(f) = fixture() else { return };
+            let p = plan_of(&f);
+            hook(&f.main, "post-merge", "true");
+            let before = state(&f.main);
+            let err = run(&p).unwrap_err();
+            assert!(err.contains("merge hooks that would run changed"), "{err}");
+            assert_eq!(state(&f.main), before);
+
+            let p = plan_of(&f);
+            let elsewhere = f.tmp.path().join("other-hooks");
+            fs::create_dir_all(&elsewhere).unwrap();
+            sh(
+                &f.main,
+                &["config", "core.hooksPath", elsewhere.to_str().unwrap()],
+            );
+            assert!(run(&p)
+                .unwrap_err()
+                .contains("hooks that would run changed"));
         }
 
         #[test]

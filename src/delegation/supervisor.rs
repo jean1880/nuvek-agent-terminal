@@ -3442,9 +3442,14 @@ impl Supervisor {
     }
     /// Every delegated sub-agent still alive, in any tree: its name, the folder it works in and
     /// whether it is working now (as [`Self::root_busy`] counts work) rather than idle between
-    /// turns with its process up. A merge into a checkout one of them works in waits for it.
-    pub(crate) fn live_workers(&self) -> Vec<(String, PathBuf, bool)> {
+    /// turns with its process up, and whether it is in `own_thread`'s tree. A merge into a
+    /// checkout one of them works in waits for it.
+    pub(crate) fn live_workers(
+        &self,
+        own_thread: Option<&str>,
+    ) -> Vec<(String, PathBuf, bool, bool)> {
         let state = self.state.borrow();
+        let own_root = own_thread.and_then(|t| state.threads.get(t));
         state
             .workers
             .values()
@@ -3454,8 +3459,14 @@ impl Supervisor {
             .filter_map(|w| {
                 let working =
                     w.run.is_some() || w.pending.is_some() || w.preparing || w.dispatching;
-                (working || !w.generations.is_empty())
-                    .then(|| (w.row.name.clone(), w.cwd.clone(), working))
+                (working || !w.generations.is_empty()).then(|| {
+                    (
+                        w.row.name.clone(),
+                        w.cwd.clone(),
+                        working,
+                        Some(&w.root) == own_root,
+                    )
+                })
             })
             .collect()
     }

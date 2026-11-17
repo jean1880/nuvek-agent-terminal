@@ -1796,7 +1796,10 @@ pub fn run() -> glib::ExitCode {
         crate::icons::register();
         // The app's own colours (and dark scheme), as a window gets them, so the demo looks
         // like the app it stands in for.
-        crate::palette::apply(crate::config::ThemeChoice::default());
+        crate::palette::apply(
+            crate::config::ThemeChoice::default(),
+            crate::config::ThemePair::default(),
+        );
         // Every agent installed, as the scripted threads assume: the usage indicator lists only
         // ready agents, and would otherwise stay empty.
         for driver in Driver::ALL {

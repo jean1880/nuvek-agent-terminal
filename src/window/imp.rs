@@ -1331,8 +1331,8 @@ fn initial_config() -> crate::config::TerminalConfig {
     crate::config::TerminalConfig::default()
 }
 
-/// After the desktop's style changed under the system theme: every terminal and diff panel, in
-/// every window, takes the colours it now resolves to.
+/// After the desktop's style changed under the system theme or Automatic: every terminal and
+/// diff panel, in every window, takes the colours now in effect.
 fn recolour_for_system() {
     let Some(app) = gtk4::gio::Application::default().and_downcast::<gtk4::Application>() else {
         return;
@@ -1345,7 +1345,7 @@ fn recolour_for_system() {
         return;
     };
     let imp = window.imp();
-    let theme = crate::config::ThemeChoice::System;
+    let theme = crate::palette::in_effect();
     imp.for_each_terminal_everywhere(|term| Theme::apply(term, theme));
     imp.recolour_diff_panels(theme);
 }
@@ -1781,11 +1781,12 @@ impl AgentTerminalWindow {
         };
 
         info!("Settings file changed on disk; applying it");
-        let (profiles_changed, clear_changed) = {
+        let (profiles_changed, clear_changed, theme_changed) = {
             let old = self.config.borrow();
             (
                 old.default_profile != new.default_profile || old.profiles != new.profiles,
                 old.clear_env != new.clear_env,
+                old.theme != new.theme || old.theme_pair() != new.theme_pair(),
             )
         };
         *self.config.borrow_mut() = *new;
@@ -1803,6 +1804,10 @@ impl AgentTerminalWindow {
         crate::diff_tool::DiffTools::shared()
             .set_expand_by_default(self.config.borrow().diffs_expanded);
 
+        if theme_changed {
+            let config = self.config.borrow();
+            crate::palette::apply(config.theme, config.theme_pair());
+        }
         let (theme, scrollback, scale, warning) = {
             let config = self.config.borrow();
             (
@@ -2479,7 +2484,10 @@ impl AgentTerminalWindow {
         obj.set_size_request(MIN_WINDOW.0, MIN_WINDOW.1);
         obj.set_title(Some("Agent Terminal"));
         // The whole app's colours, from the configured theme, before anything draws.
-        crate::palette::apply(self.config.borrow().theme);
+        {
+            let config = self.config.borrow();
+            crate::palette::apply(config.theme, config.theme_pair());
+        }
         crate::palette::set_on_system_change(recolour_for_system);
 
         let content = Box::builder().orientation(Orientation::Vertical).build();
@@ -5036,22 +5044,74 @@ impl AgentTerminalWindow {
             .selected(selected_index)
             .build();
 
+        // The two members of the Automatic pair, each offering only the schemes of its
+        // polarity, shown only while Automatic is the theme.
+        let pair_row = |light: bool| {
+            let (title, subtitle, current) = if light {
+                (
+                    "Light Theme",
+                    "Used while your desktop prefers a light style",
+                    config.theme_light,
+                )
+            } else {
+                (
+                    "Dark Theme",
+                    "Used while your desktop prefers a dark style",
+                    config.theme_dark,
+                )
+            };
+            let row = self.choice_row(
+                title,
+                subtitle,
+                crate::config::ThemeChoice::pair_choices(light)
+                    .into_iter()
+                    .map(|t| (t, t.to_string()))
+                    .collect(),
+                current,
+                move |imp, choice| {
+                    let Some(choice) = choice else {
+                        return;
+                    };
+                    let automatic = {
+                        let mut config = imp.config.borrow_mut();
+                        if light {
+                            config.theme_light = choice;
+                        } else {
+                            config.theme_dark = choice;
+                        }
+                        config.theme == crate::config::ThemeChoice::Automatic
+                    };
+                    if automatic {
+                        imp.apply_theme_everywhere();
+                    }
+                    imp.schedule_config_save();
+                },
+            );
+            row.set_visible(config.theme == crate::config::ThemeChoice::Automatic);
+            Self::keep_value_whole(&row);
+            row
+        };
+        let theme_light_row = pair_row(true);
+        let theme_dark_row = pair_row(false);
+        let pair_rows = [theme_light_row.downgrade(), theme_dark_row.downgrade()];
         let theme_row = self.choice_row(
             "Theme",
             "Colours of the whole app: threads, terminals and diffs. “Use System Theme” takes \
-             them from your desktop and follows it when it changes",
+             them from your desktop; “Match Desktop” switches between the light and dark themes \
+             below as your desktop does",
             crate::config::ThemeChoice::ALL
                 .iter()
                 .map(|t| (*t, t.to_string()))
                 .collect(),
             config.theme,
-            |imp, theme| {
+            move |imp, theme| {
                 let theme = theme.unwrap_or_default();
                 imp.config.borrow_mut().theme = theme;
+                for row in pair_rows.iter().filter_map(glib::WeakRef::upgrade) {
+                    row.set_visible(theme == crate::config::ThemeChoice::Automatic);
+                }
                 // Themes apply live to the whole app and every open tab; no restart needed.
-                crate::palette::apply(theme);
-                imp.for_each_terminal_everywhere(|term| Theme::apply(term, theme));
-                imp.recolour_diff_panels(theme);
+                imp.apply_theme_everywhere();
                 imp.schedule_config_save();
             },
         );
@@ -5214,6 +5274,8 @@ impl AgentTerminalWindow {
             .build();
         let look = adw::PreferencesGroup::builder().title("Appearance").build();
         look.add(&theme_row);
+        look.add(&theme_light_row);
+        look.add(&theme_dark_row);
         look.add(&font_scale_row);
         general.add(&look);
         let startup = adw::PreferencesGroup::builder().title("Startup").build();
@@ -6954,6 +7016,19 @@ impl AgentTerminalWindow {
         });
     }
 
+    /// Applies the configured theme (for Automatic, its member for the desktop's preference) to
+    /// the whole app, and every terminal and diff panel in every window.
+    fn apply_theme_everywhere(&self) {
+        let (theme, pair) = {
+            let config = self.config.borrow();
+            (config.theme, config.theme_pair())
+        };
+        crate::palette::apply(theme, pair);
+        let theme = crate::palette::in_effect();
+        self.for_each_terminal_everywhere(|term| Theme::apply(term, theme));
+        self.recolour_diff_panels(theme);
+    }
+
     /// Follows a theme change in every window's diff panels.
     fn recolour_diff_panels(&self, theme: crate::config::ThemeChoice) {
         let colours = Theme::diff_colours(theme);
@@ -8679,6 +8754,105 @@ mod tests {
         window.present();
         while ctx.iteration(false) {}
         threads::message_search::tests::hits_open_at_their_message(&window);
+        window.destroy();
+    }
+
+    /// Settings → Appearance: the Light Theme and Dark Theme rows show only while "Match
+    /// Desktop" is the theme, each offers only its polarity, and every pick applies at once (the
+    /// member for the desktop's preference is the one in effect, libadwaita's colour scheme is
+    /// left to the desktop) and is kept in the settings.
+    #[test]
+    #[ignore = "opens Settings on a shown window; run on a private display"]
+    fn the_automatic_pair_rows_apply_as_they_are_picked() {
+        use crate::config::ThemeChoice;
+        use adw::prelude::PreferencesRowExt;
+        init_gtk();
+        crate::testutil::adw_init().expect("adw init");
+        crate::icons::register();
+        crate::load_css();
+        let app = crate::window::imp::test_support::test_app("org.test.ThemePair", false);
+        let window = super::super::AgentTerminalWindow::new(&app);
+        let imp = window.imp();
+        for p in imp.config.borrow_mut().profiles.iter_mut() {
+            p.command = format!("/nonexistent/{}", p.command);
+        }
+        imp.config.borrow_mut().theme = ThemeChoice::Dracula;
+        let ctx = glib::MainContext::default();
+        crate::testutil::pump_until(&ctx, 20, || !imp.detecting.get());
+        imp.finish_shell(None);
+        imp.reveal_shell();
+        window.present();
+        crate::testutil::settle(&ctx);
+
+        imp.show_preferences();
+        crate::testutil::pump_until(&ctx, 5, || window.visible_dialog().is_some());
+        let dialog = window.visible_dialog().expect("Settings is open");
+        let rows = crate::testutil::find_all::<adw::ComboRow>(dialog.upcast_ref());
+        let row = |title: &str| {
+            rows.iter()
+                .find(|r| r.title() == title)
+                .cloned()
+                .unwrap_or_else(|| panic!("a {title} row"))
+        };
+        let (theme_row, light_row, dark_row) =
+            (row("Theme"), row("Light Theme"), row("Dark Theme"));
+        let labels = |r: &adw::ComboRow| -> Vec<String> {
+            let model = r.model().expect("a model");
+            (0..model.n_items())
+                .filter_map(|i| model.item(i).and_downcast::<gtk4::StringObject>())
+                .map(|s| s.string().to_string())
+                .collect()
+        };
+        let names = |light: bool| -> Vec<String> {
+            ThemeChoice::pair_choices(light)
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        assert_eq!(labels(&light_row), names(true));
+        assert_eq!(labels(&dark_row), names(false));
+        assert!(!light_row.is_visible() && !dark_row.is_visible());
+
+        let index = |list: &[ThemeChoice], t: ThemeChoice| -> u32 {
+            list.iter().position(|c| *c == t).expect("offered") as u32
+        };
+        theme_row.set_selected(index(&ThemeChoice::ALL, ThemeChoice::Automatic));
+        assert_eq!(imp.config.borrow().theme, ThemeChoice::Automatic);
+        assert!(light_row.is_visible() && dark_row.is_visible());
+        let style = adw::StyleManager::default();
+        assert_eq!(style.color_scheme(), adw::ColorScheme::Default);
+        let pair = imp.config.borrow().theme_pair();
+        assert_eq!(crate::palette::in_effect(), pair.pick(style.is_dark()));
+
+        light_row.set_selected(index(
+            &ThemeChoice::pair_choices(true),
+            ThemeChoice::GithubLight,
+        ));
+        dark_row.set_selected(index(&ThemeChoice::pair_choices(false), ThemeChoice::Nord));
+        let pair = imp.config.borrow().theme_pair();
+        assert_eq!(pair.light, ThemeChoice::GithubLight);
+        assert_eq!(pair.dark, ThemeChoice::Nord);
+        assert_eq!(crate::palette::in_effect(), pair.pick(style.is_dark()));
+        assert_eq!(style.color_scheme(), adw::ColorScheme::Default);
+
+        theme_row.set_selected(index(&ThemeChoice::ALL, ThemeChoice::OneDark));
+        assert_eq!(crate::palette::in_effect(), ThemeChoice::OneDark);
+        assert!(!light_row.is_visible() && !dark_row.is_visible());
+        // A pair member picked while another theme is in use is kept, and changes nothing now.
+        light_row.set_selected(index(
+            &ThemeChoice::pair_choices(true),
+            ThemeChoice::OneLight,
+        ));
+        assert_eq!(imp.config.borrow().theme_light, ThemeChoice::OneLight);
+        assert_eq!(crate::palette::in_effect(), ThemeChoice::OneDark);
+
+        let closed = std::rc::Rc::new(std::cell::Cell::new(false));
+        dialog.connect_closed({
+            let closed = closed.clone();
+            move |_| closed.set(true)
+        });
+        dialog.close();
+        crate::testutil::pump_until(&ctx, 5, || closed.get());
         window.destroy();
     }
 

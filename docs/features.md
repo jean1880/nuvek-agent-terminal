@@ -264,6 +264,10 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
     GTK theme (light or dark, its accent colour, any `~/.config/gtk-4.0/gtk.css`) and
     follows it as it changes. Terminals get the desktop's text and background with
     VTE's standard colours.
+  - **Match Desktop: Light and Dark** switches between two of the bundled schemes as your
+    desktop switches between light and dark, live. Pick them in the **Light Theme** and
+    **Dark Theme** rows that appear below it (Agent Terminal Light and Agent Terminal at
+    first); each lists only the schemes of its kind.
 - **Notifications** when a thread you aren't looking at finishes, needs your approval,
   or runs out of quota. For a terminal thread, the quota notification has a **Continue in…**
   button; a chat thread offers it in the thread itself.

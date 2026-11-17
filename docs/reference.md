@@ -509,6 +509,20 @@ The `theme` key in `~/.config/agent-terminal/config.json` takes one of these val
 | `agent-terminal` (default; `antigravity` still loads) | Agent Terminal |
 | `dracula`, `nord`, `gruvbox-dark`, `solarized-dark`, `one-dark`, `monokai` | the dark schemes |
 | `agent-terminal-light`, `solarized-light`, `gruvbox-light`, `one-light`, `github-light` | the light schemes |
+| `automatic` | Match Desktop: Light and Dark |
+
+With `automatic`, the app uses `theme_light` while the desktop prefers a light style and
+`theme_dark` while it prefers a dark one, and switches when the desktop does. It never forces
+the window light or dark: that stays the desktop's choice.
+
+| Key | Default | Takes |
+|---|---|---|
+| `theme_light` | `"agent-terminal-light"` | one of the light schemes |
+| `theme_dark` | `"agent-terminal"` | one of the dark schemes (or `antigravity`) |
+
+A value that is not a scheme of the key's kind (a dark scheme in `theme_light`, `system`,
+`automatic`, or a name this version does not know) loads as that key's default, and the rest
+of the file is kept. A file without these keys loads as before.
 
 A light scheme turns the whole window light, including menus, popovers and fields, and
 its code blocks and the composer take a light syntax scheme. Colours that would not read

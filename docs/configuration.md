@@ -111,7 +111,9 @@ until it is fixed.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `theme` | `"agent-terminal"` | `system`, `agent-terminal`, `dracula`, `nord`, `gruvbox-dark`, `solarized-dark`, `one-dark` or `monokai` |
+| `theme` | `"agent-terminal"` | `system`, `automatic`, `agent-terminal`, `dracula`, `nord`, `gruvbox-dark`, `solarized-dark`, `one-dark`, `monokai`, `agent-terminal-light`, `solarized-light`, `gruvbox-light`, `one-light` or `github-light`. See [Theme](reference.md#theme) |
+| `theme_light` | `"agent-terminal-light"` | The light scheme `automatic` uses while the desktop prefers light |
+| `theme_dark` | `"agent-terminal"` | The dark scheme `automatic` uses while the desktop prefers dark |
 | `starting_directory` | `""` | Where new threads open (blank: your home folder) |
 | `default_agent` | none | `claude`, `agy` or `codex` for new threads (none: the first one installed) |
 | `profiles` | Claude, Agy, Codex | The CLIs on offer. See [Profiles](#profiles) |

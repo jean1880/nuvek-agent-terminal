@@ -4,7 +4,8 @@
 //! string parsing, so applying a theme can never panic). Themes are cheap to
 //! build, so one is constructed on demand each time it is applied to a tab.
 //! [`ThemeChoice::System`] has no palette: terminals take the desktop's text and
-//! background, and VTE's default colours for the rest.
+//! background, and VTE's default colours for the rest. [`ThemeChoice::Automatic`] has none
+//! either: it takes the palette of its member in effect (`crate::palette::in_effect`).
 
 use crate::config::ThemeChoice;
 use crate::palette::{Rgb, MIN_TEXT_CONTRAST};
@@ -97,6 +98,11 @@ impl Theme {
     fn for_choice(choice: ThemeChoice) -> Option<Self> {
         Some(match choice {
             ThemeChoice::System => return None,
+            // No palette of its own: the member in effect's (never Automatic itself).
+            ThemeChoice::Automatic => match crate::palette::concrete(choice) {
+                ThemeChoice::Automatic => return None,
+                member => return Self::for_choice(member),
+            },
             ThemeChoice::AgentTerminal => Self::agent_terminal(),
             ThemeChoice::Dracula => Self::scheme(
                 0x282a36,
@@ -284,6 +290,7 @@ impl Theme {
     /// Colours for the diff panel, taken from the theme's own palette so it
     /// matches the terminal beside it. The system theme's come from the desktop's colours.
     pub fn diff_colours(choice: ThemeChoice) -> DiffColours {
+        let choice = crate::palette::concrete(choice);
         let Some(theme) = Self::for_choice(choice) else {
             let c = crate::palette::current();
             return DiffColours {

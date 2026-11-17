@@ -116,8 +116,10 @@ See [Git safety net](features.md#git-safety-net).
 
 ### 9. Make it yours
 
-Settings (`Ctrl+,`) apply as you change them. Pick the bundled theme, one of six classics,
-or **Use System Theme** to follow your desktop, light or dark.
+Settings (`Ctrl+,`) apply as you change them. Pick the bundled theme, one of the dark or light
+classics, **Use System Theme** to follow your desktop, light or dark, or **Match Desktop:
+Light and Dark** to switch between a light and a dark scheme of your choice as your desktop
+does.
 
 | | |
 |---|---|

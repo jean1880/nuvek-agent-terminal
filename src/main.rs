@@ -451,7 +451,7 @@ fn install_panic_hook() {
 /// `palette::apply` defines for the chosen theme; the window applies it before it draws.
 fn load_css() {
     // Until a window applies the configured theme: the app's own, so a name never misses.
-    palette::apply(config::ThemeChoice::default());
+    palette::apply(config::ThemeChoice::default(), config::ThemePair::default());
     // The agents' colours (`@brand_claude`…), which no theme changes.
     brand::install();
     let provider = CssProvider::new();

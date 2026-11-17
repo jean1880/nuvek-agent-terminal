@@ -7475,6 +7475,8 @@ impl AgentTerminalWindow {
                 };
                 if let Some(page) = page {
                     page.set_tooltip(&tab_tooltip(Some(&info.branch), None));
+                    // Its first refresh ran before it knew its worktree: the merge bar follows.
+                    self.refresh_diff(&page);
                 }
             }
             // A thread carries its worktree through its creation (stored with it), so its page
@@ -9477,19 +9479,12 @@ mod tests {
         });
         parts.dialog.present(Some(&window));
         assert!(
-            crate::testutil::pump_until(&ctx, 5, || window.visible_dialog().is_some()
-                && parts.dialog.is_mapped()),
+            crate::testutil::pump_until_dialog_open(&ctx, parts.dialog.upcast_ref(), 5),
             "the preview opened"
         );
-        // A close before the dialog has finished opening is ignored, so it is asked until the
-        // dialog answers.
+        parts.dialog.close();
         assert!(
-            crate::testutil::pump_until(&ctx, 5, || {
-                if answer.borrow().is_none() {
-                    parts.dialog.close();
-                }
-                answer.borrow().is_some()
-            }),
+            crate::testutil::pump_until(&ctx, 5, || answer.borrow().is_some()),
             "the preview answered"
         );
         assert_eq!(answer.borrow().as_deref(), Some("cancel"));

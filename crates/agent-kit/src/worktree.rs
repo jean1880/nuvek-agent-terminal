@@ -61,6 +61,13 @@ pub fn precheck_name(name: &str, what: &str) -> Result<(), String> {
     if name.starts_with('-') {
         return Err(format!("A {what} cannot start with '-'"));
     }
+    // A name is shown in dialogs and commands: one that can hide or reorder text there is no
+    // name to show for what will run.
+    if agent_core::text::has_control_or_bidi(name, &[]) {
+        return Err(format!(
+            "A {what} cannot hold control, direction or invisible characters"
+        ));
+    }
     Ok(())
 }
 
@@ -337,6 +344,9 @@ mod tests {
         assert!(precheck_name("-f", "branch name").is_err());
         assert!(precheck_name("  ", "branch name").is_err());
         assert!(precheck_name("feat/x", "branch name").is_ok());
+        for hidden in ["feat\u{202E}x", "a\nb", "a\u{200B}b", "x\u{7}"] {
+            assert!(precheck_name(hidden, "branch name").is_err(), "{hidden:?}");
+        }
     }
 
     #[test]

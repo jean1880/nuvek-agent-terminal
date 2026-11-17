@@ -623,13 +623,16 @@ without changing anything:
 - whether git predicts a conflict (`git merge-tree`, which needs git 2.38 or newer; an older git
   says it cannot tell, never "no conflicts");
 - which of your merge hooks will run;
-- every open tab in the main checkout.
+- every open tab, and every delegated sub-agent, working in the main checkout or this worktree.
 
-The dialog then shows the exact command and the folder it runs in:
+The dialog then shows the exact command and the folder it runs in. It merges the very commit it
+read, by its id, and turns off for this one command the settings that would make it something else
+(`branch.<base>.mergeOptions`, `merge.ff`, `merge.log`):
 
 ```bash
 # in the main checkout
-git merge --no-ff --no-edit -m "Merge branch '<branch>'" -- refs/heads/<branch>
+git -c branch.<base>.mergeOptions= -c merge.ff=false -c merge.log=false \
+    merge --no-ff --no-edit -m "Merge branch '<branch>'" -- <commit>
 ```
 
 **Merge** runs it off the main thread. It is refused, with the reason, when:
@@ -639,15 +642,22 @@ git merge --no-ff --no-edit -m "Merge branch '<branch>'" -- refs/heads/<branch>
 - the main checkout has uncommitted changes, is on another branch or a detached HEAD, or is in the
   middle of a merge, rebase, cherry-pick or revert;
 - a conflict is predicted, or the base already has every commit of the branch;
-- this thread, or any tab open in the main checkout, is working (an idle one is only a warning);
+- this thread, or any tab or sub-agent in the main checkout, is working or about to (starting, a
+  prompt or a switch waiting); an idle one there is only a warning;
+- another tab is open in this worktree;
 - either branch moved since the dialog opened (open it again to see what it would do now).
 
-The merge always makes a merge commit, is never forced and skips no hook. If it stops part-way (a
-conflict git did not predict, a hook that refuses, a timeout after two minutes) it is undone with
-`git merge --abort`, and the message says the main checkout is as it was; if that undo fails, it
-says the merge is left in progress and how to finish or abort it. The branch and the worktree are
-always kept: afterwards the dialog gives the command that deletes the branch, for you to run once
-the worktree is removed, and **Close Thread** closes the thread, which offers **Remove** as usual.
+The merge always makes a merge commit, is never forced and skips no hook; it counts as made only
+when the new commit's parents are the two commits shown. If it stops part-way (a conflict git did
+not predict, a hook that refuses, a timeout after two minutes) it is undone: with `git merge
+--abort`, or with `git reset --merge` back to the base's commit when git stopped before recording
+the merge (HEAD never moved), and the message says the main checkout is as it was. If it cannot be
+undone, or a stopped git left `.git/index.lock` behind, the message says so and what to run. Hooks
+or signing that ask for input (a passphrase prompt) cannot be answered from the app: merge in a
+terminal instead. The branch and the worktree are always kept: afterwards the dialog gives the
+command that deletes the branch, for you to run once the worktree is removed, and **Close Thread**
+closes the thread, which offers **Remove** as usual.
+
 
 
 ### Theme

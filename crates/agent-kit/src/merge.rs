@@ -9,11 +9,14 @@
 //! shown is what runs.
 //!
 //! [`merge`] reads everything again first and refuses if either tip, the base branch or the
-//! state of either checkout moved since the preview. It never forces, never skips a hook and
-//! never picks a side (`--force`, `--no-verify`, `-X`, `-s` are never passed). A merge that
-//! stops part-way is undone with `git merge --abort` alone, which is safe because the base
-//! checkout was proven clean; one that cannot be undone is said to be left in progress, with the
-//! command to finish or abort it. The branch and the worktree are never deleted.
+//! state of either checkout moved since the preview, then merges the exact commit the preview
+//! read. It never forces, never skips a hook and never picks a side (`--force`, `--no-verify`,
+//! `-X`, `-s` are never passed). Exit 0 is checked too: only a new commit whose parents are the
+//! two shown counts as merged. A merge that stops part-way is undone with `git merge --abort`,
+//! or, when git stopped before recording it (HEAD unmoved), `git reset --merge` to the base's
+//! own commit; both are safe because the base checkout was proven clean. One that cannot be
+//! undone (a left `index.lock` included) is said to be left as it is, with what to run. The
+//! branch and the worktree are never deleted.
 //!
 //! Each step runs in a process group of its own, so a timeout ends the hooks git started too.
 //!
@@ -143,8 +146,22 @@ pub struct MergePlan {
     pub prediction: Prediction,
     /// The merge hooks that will run in the base checkout.
     pub hooks: Vec<String>,
+    /// Every linked worktree of the repository (this one included), as git lists them: a folder
+    /// inside one of them is not in the base checkout even when it is inside its folder.
+    pub worktrees: Vec<PathBuf>,
     /// Every reason the merge cannot run; empty when it can.
     pub refusals: Vec<Refusal>,
+}
+
+/// The linked worktrees `git worktree list --porcelain` lists: every one after the first (the
+/// main working tree).
+pub fn linked_worktrees(porcelain: &str) -> Vec<PathBuf> {
+    porcelain
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .skip(1)
+        .map(PathBuf::from)
+        .collect()
 }
 
 impl MergePlan {
@@ -173,18 +190,31 @@ impl GitStep {
     }
 }
 
-/// The arguments of the merge: always a merge commit, with the message git itself gives a
-/// branch merge (one `-m` value), and the branch by its full ref after `--`, so no name is ever
-/// read as an option and a tag of the same name is never merged in its place.
-pub fn merge_args(branch: &str) -> Vec<String> {
+/// The arguments of the merge of `tip`, the commit the preview read as `branch`'s, into `base`:
+/// always a merge commit with the message git itself gives a branch merge (one `-m` value), and
+/// the exact commit after `--`, so no name is ever read as an option, no tag of the same name and
+/// no commit made on the branch since the preview is merged in its place.
+///
+/// Configuration that would make the merge something other than what the preview shows is
+/// overridden for this one command: `branch.<base>.mergeOptions` (a `--no-commit`,
+/// `--squash` or `--ff-only` there), `merge.ff` (already overridden by `--no-ff`) and
+/// `merge.log` (which would append a log to the shown message). Hooks and signing are not
+/// touched: they run as at any `git merge`.
+pub fn merge_args(base: &str, branch: &str, tip: &str) -> Vec<String> {
     vec![
+        "-c".to_owned(),
+        format!("branch.{base}.mergeOptions="),
+        "-c".to_owned(),
+        "merge.ff=false".to_owned(),
+        "-c".to_owned(),
+        "merge.log=false".to_owned(),
         "merge".to_owned(),
         "--no-ff".to_owned(),
         "--no-edit".to_owned(),
         "-m".to_owned(),
         format!("Merge branch '{branch}'"),
         "--".to_owned(),
-        format!("refs/heads/{branch}"),
+        tip.to_owned(),
     ]
 }
 
@@ -197,7 +227,7 @@ pub fn abort_args() -> Vec<String> {
 pub fn commands(plan: &MergePlan) -> Vec<GitStep> {
     vec![GitStep {
         dir: plan.base_dir.clone(),
-        args: merge_args(&plan.branch),
+        args: merge_args(&plan.base, &plan.branch, &plan.branch_tip),
     }]
 }
 
@@ -291,6 +321,13 @@ fn preflight_with(info: &WorktreeInfo, env: &[(&str, &OsStr)]) -> Result<MergePl
         prediction
     };
     let hooks = hooks(&base_dir, env);
+    let worktrees = git_raw(
+        main,
+        ["worktree", "list", "--porcelain"],
+        env,
+        QUERY_TIMEOUT_SECS,
+    )
+    .map(|out| linked_worktrees(&String::from_utf8_lossy(&out)))?;
     Ok(MergePlan {
         info: info.clone(),
         branch,
@@ -302,6 +339,7 @@ fn preflight_with(info: &WorktreeInfo, env: &[(&str, &OsStr)]) -> Result<MergePl
         behind,
         prediction,
         hooks,
+        worktrees,
         refusals,
     })
 }
@@ -445,11 +483,11 @@ fn merge_with(
         || now.base_tip != plan.base_tip
         || now.branch_tip != plan.branch_tip
     {
-        return Err(format!(
+        return Err(agent_core::redact::redact(&format!(
             "{} or {} changed since the preview. Nothing was merged: open the merge again to \
              see what it would do now.",
             plan.base, plan.branch
-        ));
+        )));
     }
     if let Some(refusal) = now.refusals.first() {
         return Err(format!(
@@ -473,11 +511,20 @@ fn execute(plan: &MergePlan, env: &[(&str, &OsStr)], timeout_secs: u64) -> Resul
         let timed_out = why.contains(&format!("did not finish within {timeout_secs}s"));
         let mut message = why;
         if timed_out {
-            message.push_str("\n\nIt was stopped, with the hooks it started.");
+            message.push_str(
+                "\n\nIt was stopped, with the hooks and helpers it started. Hooks and signing \
+                 that ask for input (a passphrase prompt, for one) cannot be answered from here: \
+                 merge in a terminal instead.",
+            );
         }
         message.push_str("\n\n");
         message.push_str(&recover(plan, env, timeout_secs));
         return Err(message);
+    }
+    // Exit 0 is not proof of a merge commit: configuration or a hook can stop short of one
+    // (`--no-commit` from somewhere, a merge left in progress) or make something else.
+    if let Err(why) = check_merged(plan, env) {
+        return Err(format!("{why}\n\n{}", recover(plan, env, timeout_secs)));
     }
     let after = git_raw(
         &plan.base_dir,
@@ -491,6 +538,53 @@ fn execute(plan: &MergePlan, env: &[(&str, &OsStr)], timeout_secs: u64) -> Resul
         before: short(&plan.base_tip),
         after,
     })
+}
+
+/// Whether the base checkout now holds exactly the merge the preview showed: nothing in
+/// progress, still on the base, and HEAD a new commit whose parents are the base's old commit
+/// and the merged one.
+fn check_merged(plan: &MergePlan, env: &[(&str, &OsStr)]) -> Result<(), String> {
+    let not = |what: &str| {
+        Err(format!(
+            "git reported success, but {what}, so this is not the merge the preview showed."
+        ))
+    };
+    let Some(repo) = discover(&plan.base_dir).ok().flatten() else {
+        return not("the base checkout could not be read back");
+    };
+    if in_progress_op(&repo.git_dir).is_some() {
+        return not("a merge is still in progress, uncommitted");
+    }
+    if repo.branch.as_deref() != Some(plan.base.as_str()) {
+        return not("the base checkout is no longer on its branch");
+    }
+    if repo.head.as_deref() == Some(plan.base_tip.as_str()) {
+        return not("no merge commit was made");
+    }
+    let parents = git_raw(
+        &plan.base_dir,
+        ["rev-list", "--parents", "-n", "1", "HEAD"],
+        env,
+        QUERY_TIMEOUT_SECS,
+    )
+    .map(|out| {
+        String::from_utf8_lossy(&out)
+            .split_whitespace()
+            .skip(1)
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+    if parents != [plan.base_tip.clone(), plan.branch_tip.clone()] {
+        return not("the new commit is not a merge of the two commits shown");
+    }
+    Ok(())
+}
+
+/// Whether a git in `git_dir` left its index lock behind (killed mid-write, for one). With
+/// `GIT_OPTIONAL_LOCKS=0`, `git status` succeeds regardless, so this is looked for itself.
+fn index_locked(git_dir: &Path) -> bool {
+    std::fs::symlink_metadata(git_dir.join("index.lock")).is_ok()
 }
 
 /// What a failed git said: a merge reports its conflicts on stdout, a hook its refusal on stderr.
@@ -512,52 +606,107 @@ fn short(sha: &str) -> String {
     sha.chars().take(12).collect()
 }
 
+/// The arguments of the undo of a merge git stopped before recording (no `MERGE_HEAD`, HEAD
+/// not moved, the merged files left in the index and tree): back to the base's own commit,
+/// keeping anything the merge did not touch. Used only when HEAD is still that commit, so no
+/// branch moves.
+pub fn unrecorded_undo_args(base_tip: &str) -> Vec<String> {
+    vec![
+        "reset".to_owned(),
+        "--merge".to_owned(),
+        base_tip.to_owned(),
+    ]
+}
+
+/// How the base checkout stands after a failed merge.
+struct Standing {
+    /// HEAD is the base's old commit, on the base branch.
+    at_base: bool,
+    merging: bool,
+    locked: bool,
+    /// No tracked file differs from HEAD.
+    clean: bool,
+}
+
+fn standing(plan: &MergePlan, env: &[(&str, &OsStr)]) -> Option<Standing> {
+    let repo = discover(&plan.base_dir).ok().flatten()?;
+    let clean = git_raw(
+        &plan.base_dir,
+        ["status", "--porcelain", "--untracked-files=no"],
+        env,
+        QUERY_TIMEOUT_SECS,
+    )
+    .ok()?
+    .is_empty();
+    Some(Standing {
+        at_base: repo.head.as_deref() == Some(plan.base_tip.as_str())
+            && repo.branch.as_deref() == Some(plan.base.as_str()),
+        merging: in_progress_op(&repo.git_dir) == Some(InProgress::Merge),
+        locked: index_locked(&repo.git_dir),
+        clean,
+    })
+}
+
 /// After a merge that failed: undoes it with `git merge --abort` when git left one in progress,
-/// then says whether the base checkout is exactly as it was. Never resets anything itself.
+/// or, when git stopped before recording it with HEAD unmoved, with `git reset --merge` to the
+/// base's own commit (safe because the checkout was proven clean before the merge). Then says
+/// whether the base checkout is exactly as it was. Nothing else is ever run.
 fn recover(plan: &MergePlan, env: &[(&str, &OsStr)], timeout_secs: u64) -> String {
     let dir = plan.base_dir.display();
-    let git_dir = discover(&plan.base_dir).ok().flatten().map(|r| r.git_dir);
-    let merging = git_dir
-        .as_deref()
-        .is_some_and(|g| in_progress_op(g) == Some(InProgress::Merge));
-    let mut aborted = None;
-    if merging {
-        let undo = git_output_in_group(&plan.base_dir, abort_args(), env, timeout_secs);
-        aborted = Some(match undo {
-            Ok(out) if out.status.success() => Ok(()),
+    let base = &plan.base;
+    let before = short(&plan.base_tip);
+    let locked_words = format!(
+        "A git was stopped while it held {dir}'s index: .git/index.lock is left behind, so the \
+         checkout cannot be trusted to be as it was ({base} was at {before}). Once no git is \
+         running there, remove .git/index.lock, then check `git status`; `git merge --abort` \
+         undoes a merge in progress."
+    );
+    let Some(now) = standing(plan, env) else {
+        return format!(
+            "{dir} could not be read after the merge ({base} was at {before}). Check `git \
+             status` there; `git merge --abort` undoes a merge in progress."
+        );
+    };
+    // A lock left behind by a git that was stopped: an undo would only fail on it, and the
+    // checkout cannot be read as settled until the user removes it.
+    if now.locked {
+        return locked_words;
+    }
+    let undo = if now.merging {
+        Some(("git merge --abort".to_owned(), abort_args()))
+    } else if now.at_base && !now.clean {
+        let args = unrecorded_undo_args(&plan.base_tip);
+        Some((agent_core::commit_message::shown_command(&args), args))
+    } else {
+        None
+    };
+    let mut undone = None;
+    if let Some((shown, args)) = &undo {
+        let ran = git_output_in_group(&plan.base_dir, args, env, timeout_secs);
+        undone = Some(match ran {
+            Ok(out) if out.status.success() => Ok(shown.clone()),
             Ok(out) => Err(failure_message(&out.stderr)),
             Err(why) => Err(why),
         });
     }
-    let restored = discover(&plan.base_dir).ok().flatten().is_some_and(|repo| {
-        repo.head.as_deref() == Some(plan.base_tip.as_str())
-            && repo.branch.as_deref() == Some(plan.base.as_str())
-            && in_progress_op(&repo.git_dir).is_none()
-            && git_raw(
-                &plan.base_dir,
-                ["status", "--porcelain", "--untracked-files=no"],
-                env,
-                QUERY_TIMEOUT_SECS,
-            )
-            .is_ok_and(|s| s.is_empty())
-    });
-    let base = &plan.base;
-    let before = short(&plan.base_tip);
-    match (aborted, restored) {
-        (Some(Ok(())), true) => format!(
-            "The merge was undone with `git merge --abort`: {base} is at {before} again, as it \
-             was."
-        ),
+    let after = standing(plan, env);
+    if after.as_ref().is_some_and(|s| s.locked) {
+        return locked_words;
+    }
+    let restored = after.is_some_and(|s| s.at_base && !s.merging && s.clean);
+    match (undone, restored) {
+        (Some(Ok(shown)), true) => {
+            format!("The merge was undone with `{shown}`: {base} is at {before} again, as it was.")
+        }
         (None, true) => format!("Nothing was merged: {base} is still at {before}."),
         (Some(Err(why)), _) => format!(
-            "The merge could not be undone ({}). It is left in progress in {dir}: run `git merge \
-             --abort` there, or resolve it and commit.",
+            "The merge could not be undone ({}). It is left as git left it in {dir}: run `git \
+             merge --abort` there for a merge in progress, or check `git status`.",
             agent_core::redact::redact(&why)
         ),
-        (Some(Ok(())), false) | (None, false) => format!(
+        (Some(Ok(_)), false) | (None, false) => format!(
             "{dir} is not as it was before the merge ({base} was at {before}). Check `git status` \
-             there; `git merge --abort` undoes a merge in progress. If .git/index.lock is left \
-             behind, remove it once no git is running."
+             there; `git merge --abort` undoes a merge in progress."
         ),
     }
 }
@@ -602,30 +751,66 @@ mod tests {
             behind: 0,
             prediction: Prediction::Clean,
             hooks: Vec::new(),
+            worktrees: Vec::new(),
             refusals: Vec::new(),
         }
     }
 
     #[test]
+    fn linked_worktrees_are_every_listed_one_but_the_main() {
+        let porcelain = "worktree /r/main\nHEAD abc\nbranch refs/heads/main\n\n\
+                         worktree /r/main/nested\nHEAD def\nbranch refs/heads/x\n\n\
+                         worktree /r/.main.worktrees/feat\nHEAD 123\ndetached\n";
+        assert_eq!(
+            linked_worktrees(porcelain),
+            vec![
+                PathBuf::from("/r/main/nested"),
+                PathBuf::from("/r/.main.worktrees/feat")
+            ]
+        );
+    }
+
+    #[test]
     fn the_merge_is_never_forced_and_the_branch_follows_dashdash() {
+        let tip = "b".repeat(40);
         for branch in ["feat/x", "-f", "--no-verify"] {
-            let args = merge_args(branch);
+            let args = merge_args("main", branch, &tip);
             let split = args.iter().position(|a| a == "--").unwrap();
-            // Every argument before `--` is an option of ours, except the message after `-m`.
+            // Every argument before `--` is an option of ours, except the value after `-c`
+            // (a setting) or `-m` (the message).
             let options: Vec<&str> = args[..split]
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| *i == 0 || args[i - 1] != "-m")
+                .filter(|(i, _)| *i == 0 || !["-m", "-c"].contains(&args[i - 1].as_str()))
                 .map(|(_, a)| a.as_str())
                 .collect();
             for arg in &options {
                 assert!(!FORBIDDEN.contains(arg), "{arg} in {args:?}");
             }
-            assert_eq!(options, ["merge", "--no-ff", "--no-edit", "-m"]);
-            assert_eq!(args[4], format!("Merge branch '{branch}'"));
-            assert_eq!(&args[split + 1..], [format!("refs/heads/{branch}")]);
+            assert_eq!(
+                options,
+                ["-c", "-c", "-c", "merge", "--no-ff", "--no-edit", "-m"]
+            );
+            assert_eq!(args[10], format!("Merge branch '{branch}'"));
+            // The exact commit the preview read, never a name.
+            assert_eq!(&args[split + 1..], std::slice::from_ref(&tip));
         }
+        // The settings that would change what the preview shows are overridden, and only those.
+        let args = merge_args("main", "feat/x", &tip);
+        assert_eq!(
+            [&args[1], &args[3], &args[5]],
+            [
+                "branch.main.mergeOptions=",
+                "merge.ff=false",
+                "merge.log=false"
+            ]
+        );
         assert_eq!(abort_args(), ["merge", "--abort"]);
+        // The one reset: back to the base's own commit, keeping what the merge did not touch.
+        assert_eq!(
+            unrecorded_undo_args(&tip),
+            ["reset", "--merge", tip.as_str()]
+        );
     }
 
     #[test]
@@ -634,15 +819,15 @@ mod tests {
         let steps = commands(&p);
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].dir, p.base_dir);
-        assert_eq!(steps[0].args, merge_args("feat/x"));
+        assert_eq!(steps[0].args, merge_args("main", "feat/x", &p.branch_tip));
         assert_eq!(
             steps[0].shown(),
-            "In /r/main:\ngit merge --no-ff --no-edit -m 'Merge branch '\\''feat/x'\\''' -- refs/heads/feat/x"
+            format!(
+                "In /r/main:\ngit -c branch.main.mergeOptions= -c merge.ff=false -c \
+                 merge.log=false merge --no-ff --no-edit -m 'Merge branch '\\''feat/x'\\''' -- {}",
+                p.branch_tip
+            )
         );
-        let odd = plan("it's");
-        assert!(commands(&odd)[0]
-            .shown()
-            .ends_with("-- 'refs/heads/it'\\''s'"));
     }
 
     #[test]
@@ -830,6 +1015,7 @@ mod tests {
             assert_eq!((p.ahead, p.behind), (1, 0));
             assert_eq!(p.prediction, Prediction::Clean);
             assert_eq!(p.base_dir, f.main);
+            assert_eq!(p.worktrees, vec![f.wt.clone()]);
             let done = run(&p).unwrap();
             assert!(before.starts_with(&done.before));
             // A merge commit even where a fast-forward was possible.
@@ -1045,10 +1231,14 @@ mod tests {
                     m = marks.display()
                 ),
             );
-            let before = head(&f.main);
+            let before = state(&f.main);
             let p = plan_of(&f);
             let err = merge_with(&p, &env(), 1).unwrap_err();
-            assert!(err.contains("stopped, with the hooks it started"), "{err}");
+            assert!(
+                err.contains("stopped, with the hooks and helpers it started"),
+                "{err}"
+            );
+            assert!(err.contains("cannot be answered from here"), "{err}");
             let pids: Vec<String> = ["hook.pid", "helper.pid"]
                 .iter()
                 .map(|n| fs::read_to_string(marks.join(n)).unwrap())
@@ -1060,15 +1250,89 @@ mod tests {
             for pid in &pids {
                 assert!(gone(pid), "process {} outlived the timeout", pid.trim());
             }
-            // Never half-done silently: undone, or said to be left in progress.
-            assert_eq!(head(&f.main), before);
-            let undone = in_progress_op(&f.main.join(".git")).is_none();
+            // The hook runs before git records the merge, so the merged files sit in the index
+            // and tree with HEAD unmoved: undone back to the base's commit, exactly.
             assert!(
-                (undone && err.contains("undone"))
-                    || (!undone && err.contains("left in progress"))
-                    || err.contains("is not as it was"),
+                err.contains(&format!("undone with `git reset --merge {}`", p.base_tip)),
                 "{err}"
             );
+            assert_eq!(state(&f.main), before, "{err}");
+            assert_eq!(in_progress_op(&f.main.join(".git")), None);
+        }
+
+        #[test]
+        fn configured_merge_options_never_change_what_runs() {
+            let Some(f) = fixture() else { return };
+            // Each of these would make `git merge` stop short of the merge commit shown, or
+            // change its message.
+            sh(
+                &f.main,
+                &["config", "branch.main.mergeOptions", "--no-commit"],
+            );
+            sh(&f.main, &["config", "merge.ff", "only"]);
+            sh(&f.main, &["config", "merge.log", "true"]);
+            let before = head(&f.main);
+            let p = plan_of(&f);
+            run(&p).unwrap();
+            assert_eq!(in_progress_op(&f.main.join(".git")), None);
+            assert_eq!(sh(&f.main, &["rev-parse", "HEAD^1"]), before);
+            assert_eq!(sh(&f.main, &["rev-parse", "HEAD^2"]), p.branch_tip);
+            assert_eq!(
+                sh(&f.main, &["log", "-1", "--format=%B"]),
+                "Merge branch 'feat'",
+                "the message shown, with no log appended"
+            );
+        }
+
+        #[test]
+        fn a_merge_that_reports_success_without_committing_is_undone_and_reported() {
+            let Some(f) = fixture() else { return };
+            let before = state(&f.main);
+            let p = plan_of(&f);
+            // What a git that exits 0 short of the commit leaves behind.
+            sh(
+                &f.main,
+                &["merge", "-q", "--no-ff", "--no-commit", &p.branch_tip],
+            );
+            assert_eq!(
+                in_progress_op(&f.main.join(".git")),
+                Some(InProgress::Merge)
+            );
+            let why = check_merged(&p, &env()).unwrap_err();
+            assert!(why.contains("still in progress"), "{why}");
+            let said = recover(&p, &env(), MERGE_TIMEOUT_SECS);
+            assert!(said.contains("undone with `git merge --abort`"), "{said}");
+            assert_eq!(state(&f.main), before);
+            // And a commit that is not the merge shown is never taken for it.
+            fs::write(f.main.join("b.txt"), "other\n").unwrap();
+            sh(&f.main, &["commit", "-q", "-am", "not a merge"]);
+            assert!(check_merged(&p, &env())
+                .unwrap_err()
+                .contains("not a merge of the two commits shown"));
+        }
+
+        #[test]
+        fn a_left_index_lock_is_never_taken_for_a_restored_checkout() {
+            let Some(f) = fixture() else { return };
+            let p = plan_of(&f);
+            fs::write(f.main.join(".git/index.lock"), b"").unwrap();
+            let said = recover(&p, &env(), MERGE_TIMEOUT_SECS);
+            assert!(said.contains(".git/index.lock is left behind"), "{said}");
+            assert!(!said.contains("Nothing was merged"), "{said}");
+        }
+
+        #[test]
+        fn the_commit_shown_is_the_one_merged_even_if_the_branch_moves() {
+            let Some(f) = fixture() else { return };
+            let p = plan_of(&f);
+            // A commit lands on the branch after the preview, past the re-check: the merge
+            // still takes only the commit that was shown.
+            fs::write(f.wt.join("late.txt"), "late\n").unwrap();
+            sh(&f.wt, &["add", "late.txt"]);
+            sh(&f.wt, &["commit", "-q", "-m", "late"]);
+            execute(&p, &env(), MERGE_TIMEOUT_SECS).unwrap();
+            assert_eq!(sh(&f.main, &["rev-parse", "HEAD^2"]), p.branch_tip);
+            assert!(!f.main.join("late.txt").exists());
         }
 
         #[test]

@@ -3,10 +3,13 @@
 //! exact command, in the directory it runs in.
 //!
 //! The reading and the merge are `agent_kit::merge`, run off the main thread. The window adds
-//! what only it knows: the tabs open in the base checkout. A tab there that is working refuses
-//! the merge (it would rewrite files under a running agent); an idle one is a warning. The branch
-//! and the worktree are never deleted: the success dialog says how to delete the branch, and
-//! closing the thread offers the usual clean-only removal of the worktree.
+//! what only it knows: the tabs open, and the delegated sub-agents alive, in the base checkout
+//! and in this worktree. One in the base checkout that is working (or about to: starting, a
+//! prompt or a switch waiting) refuses the merge, since it would rewrite files under a running
+//! agent; an idle one is a warning. Anything else open in this worktree refuses it too: it could
+//! commit to the branch being merged. The branch and the worktree are never deleted: the success
+//! dialog says how to delete the branch, and closing the thread offers the usual clean-only
+//! removal of the worktree.
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -14,24 +17,73 @@ use agent_core::commit_message::shown_command;
 use agent_core::redact::redact;
 use agent_kit::merge::{MergePlan, Merged, Prediction};
 use gtk4::glib;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 use super::threads::off_main;
 use super::{present_message_over, AgentTerminalWindow, CHECKPOINT_QUIET};
 
-/// An open tab in the base checkout, as the dialog names it.
+/// An open tab, or a live delegated sub-agent, as read on the main thread: where it works and
+/// whether it is working. Placed against the plan's folders off the main thread ([`blockers`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct BaseTab {
+pub(super) struct Seen {
     pub title: String,
-    /// Its agent is working (a thread's turn, background work or a question), or a terminal
-    /// page has shown output just now.
+    pub dir: PathBuf,
+    /// The worktree its tab was opened in, if any.
+    pub worktree: Option<PathBuf>,
     pub busy: bool,
 }
 
-/// What stops the merge and what to know first, from the tabs open in the base checkout and
-/// whether this tab itself is working.
-pub(super) fn tab_lines(base_dir: &Path, tabs: &[BaseTab], own_busy: bool) -> TabLines {
+/// Something in the base checkout or this worktree, as the dialog names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct BaseTab {
+    pub title: String,
+    /// It is working, or about to: a thread's turn, background work, a question, a start, a
+    /// prompt or a switch waiting; a terminal (a page or a thread's drawer) that has shown
+    /// output just now; a sub-agent running.
+    pub busy: bool,
+}
+
+/// Where each [`Seen`] works, against the plan: in the base checkout, in this worktree, or
+/// elsewhere (another worktree, nested in the base checkout's folder or not, counts as
+/// elsewhere). Paths are compared resolved (links followed), and as given when they cannot be.
+pub(super) fn place(plan: &MergePlan, seen: &[Seen]) -> (Vec<BaseTab>, Vec<BaseTab>) {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let base = canon(&plan.base_dir);
+    let here = canon(&plan.info.path);
+    let others: Vec<PathBuf> = plan
+        .worktrees
+        .iter()
+        .map(|w| canon(w))
+        .filter(|w| *w != here && *w != base)
+        .collect();
+    let (mut in_base, mut in_here) = (Vec::new(), Vec::new());
+    for s in seen {
+        let dir = canon(&s.dir);
+        let worktree = s.worktree.as_deref().map(canon);
+        let tab = BaseTab {
+            title: s.title.clone(),
+            busy: s.busy,
+        };
+        if dir.starts_with(&here) || worktree.as_ref() == Some(&here) {
+            in_here.push(tab);
+        } else if worktree.is_some_and(|w| w != base) || others.iter().any(|o| dir.starts_with(o)) {
+            continue;
+        } else if dir.starts_with(&base) {
+            in_base.push(tab);
+        }
+    }
+    (in_base, in_here)
+}
+
+/// What stops the merge and what to know first, from what works in the base checkout and in this
+/// worktree, and whether this tab itself is working.
+pub(super) fn tab_lines(
+    base_dir: &Path,
+    in_base: &[BaseTab],
+    in_here: &[BaseTab],
+    own_busy: bool,
+) -> TabLines {
     let dir = base_dir.display();
     let mut lines = TabLines::default();
     if own_busy {
@@ -41,7 +93,14 @@ pub(super) fn tab_lines(base_dir: &Path, tabs: &[BaseTab], own_busy: bool) -> Ta
                 .to_owned(),
         );
     }
-    for tab in tabs {
+    for tab in in_here {
+        lines.refusals.push(format!(
+            "“{}” is also open in this worktree. Close it first: it could commit to the branch \
+             while it is merged.",
+            tab.title
+        ));
+    }
+    for tab in in_base {
         if tab.busy {
             lines.refusals.push(format!(
                 "“{}” is working in {dir}. Wait for it to finish, or stop it, first: a merge \
@@ -56,6 +115,22 @@ pub(super) fn tab_lines(base_dir: &Path, tabs: &[BaseTab], own_busy: bool) -> Ta
         }
     }
     lines
+}
+
+/// [`place`], then [`tab_lines`]: everything open that stops the merge or should be known first.
+/// Reads the file system: run off the main thread.
+pub(super) fn blockers(plan: &MergePlan, seen: &[Seen], own_busy: bool) -> TabLines {
+    let (in_base, in_here) = place(plan, seen);
+    tab_lines(&plan.base_dir, &in_base, &in_here, own_busy)
+}
+
+/// What a press of Merge says instead of merging when something now stops it (a turn started,
+/// or a tab opened, while the dialog was up).
+pub(super) fn click_refusal(lines: &TabLines) -> Option<String> {
+    lines
+        .refusals
+        .first()
+        .map(|why| format!("{why}\n\nNothing was merged."))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -132,22 +207,25 @@ pub(super) fn delete_branch_command(plan: &MergePlan) -> String {
     ])
 }
 
-/// The success dialog's words.
-pub(super) fn merged_words(plan: &MergePlan, done: &Merged) -> String {
-    format!(
-        "{base} moved from {before} to {after} in {dir}.\n\nThe branch {branch} is kept: the app \
-         never deletes a branch. Once its worktree is removed, this deletes it:\n\n{command}\n\n\
-         Closing the thread offers to remove the worktree when nothing in it is uncommitted.",
-        base = plan.base,
-        before = done.before,
-        after = if done.after.is_empty() {
-            "the merge"
-        } else {
-            &done.after
-        },
-        dir = plan.base_dir.display(),
-        branch = plan.branch,
-        command = delete_branch_command(plan),
+/// The success dialog's words, before and after the delete command (shown on its own, in a
+/// label that can be selected and copied).
+pub(super) fn merged_words(plan: &MergePlan, done: &Merged) -> (String, String) {
+    (
+        format!(
+            "{base} moved from {before} to {after} in {dir}.\n\nThe branch {branch} is kept: the \
+             app never deletes a branch. Once its worktree is removed, this deletes it:",
+            base = plan.base,
+            before = done.before,
+            after = if done.after.is_empty() {
+                "the merge"
+            } else {
+                &done.after
+            },
+            dir = plan.base_dir.display(),
+            branch = plan.branch,
+        ),
+        "Closing the thread offers to remove the worktree when nothing in it is uncommitted."
+            .to_owned(),
     )
 }
 
@@ -197,9 +275,10 @@ pub(super) fn merge_dialog(plan: &MergePlan, tabs: &TabLines) -> MergeDialog {
     commands.set_selectable(true);
     column.append(&commands);
     let note = wrapped(&format!(
-        "The merge is never forced and skips no hook. If it stops part-way (a conflict, a hook \
-         that refuses, a timeout) it is undone with git merge --abort. The branch {} and its \
-         worktree are kept.",
+        "The merge is never forced and skips no hook, and it takes exactly the commit shown. If \
+         it stops part-way (a conflict, a hook that refuses, a timeout) it is undone with git \
+         merge --abort, or git reset --merge back to the base's commit when git had not yet \
+         recorded it. The branch {} and its worktree are kept.",
         plan.branch
     ));
     note.add_css_class("dim-label");
@@ -229,40 +308,69 @@ fn wrapped(text: &str) -> gtk4::Label {
 }
 
 impl AgentTerminalWindow {
-    /// The tabs open in `base_dir`, in every window, leaving out those in the worktree itself.
-    fn base_checkout_tabs(&self, base_dir: &Path, worktree: &Path) -> Vec<BaseTab> {
+    /// Every open tab other than the one whose panel is `own` (in every window) and every live
+    /// delegated sub-agent, with where it works and whether it is working; and whether the
+    /// tab whose panel is `own` is working itself. Read on the main thread, placed off it.
+    fn seen_for_merge(&self, own: &gtk4::Box) -> (Vec<Seen>, bool) {
+        let busy_terminal =
+            |tab: &super::TabState| tab.last_output.get().elapsed() < CHECKPOINT_QUIET;
         let found = std::cell::RefCell::new(Vec::new());
+        let own_busy = std::cell::Cell::new(false);
         self.for_each_window(|window| {
             for tab in window.tabs.borrow().iter() {
-                let dir = Path::new(&tab.dir);
-                if tab.remote.is_some() || !dir.starts_with(base_dir) || dir.starts_with(worktree) {
+                if tab.remote.is_some() {
                     continue;
                 }
-                let busy = match &tab.chat {
-                    Some(chat) => chat.busy(),
-                    None => tab.last_output.get().elapsed() < CHECKPOINT_QUIET,
-                };
-                found.borrow_mut().push(BaseTab {
+                // A thread is busy while it holds its work, or while its drawer's shell has
+                // just shown output; a terminal page by its output alone.
+                let busy = busy_terminal(tab) || tab.chat.as_ref().is_some_and(|c| c.holds_merge());
+                if tab.diff_panel.root == *own {
+                    own_busy.set(busy);
+                    continue;
+                }
+                found.borrow_mut().push(Seen {
                     title: tab.page.title().to_string(),
+                    dir: PathBuf::from(&tab.dir),
+                    worktree: tab.worktree.as_ref().map(|w| w.path.clone()),
                     busy,
                 });
             }
         });
-        found.into_inner()
+        let mut found = found.into_inner();
+        if let Some(supervisor) = crate::delegation::supervisor() {
+            for (name, cwd, working) in supervisor.live_workers() {
+                if cwd.as_os_str().is_empty() {
+                    continue;
+                }
+                found.push(Seen {
+                    title: format!("Sub-agent {name}"),
+                    dir: cwd,
+                    worktree: None,
+                    busy: working,
+                });
+            }
+        }
+        (found, own_busy.get())
     }
 
-    /// Whether the tab whose panel is `panel_root` is working.
-    fn panel_tab_busy(&self, panel_root: &gtk4::Box) -> bool {
-        self.tab_by_panel(panel_root, |t| match &t.chat {
-            Some(chat) => chat.busy(),
-            None => t.last_output.get().elapsed() < CHECKPOINT_QUIET,
-        })
-        .unwrap_or(false)
+    /// Where the outcome of a merge from the panel at `panel_root` is shown: over the panel while
+    /// its tab is open, else over this window.
+    fn merge_result_parent(
+        &self,
+        panel_root: &gtk4::Box,
+        panel_parent: &gtk4::Widget,
+    ) -> gtk4::Widget {
+        if self.tab_by_panel(panel_root, |_| ()).is_some() && panel_parent.root().is_some() {
+            panel_parent.clone()
+        } else {
+            self.obj().clone().upcast()
+        }
     }
 
-    /// "Merge into …" in the diff panel behind `panel_root`: reads the plan off the main thread,
-    /// then shows it with the exact command. The panel's button stays off until the dialog is up
-    /// or the reason it is not has been said.
+    /// "Merge into …" in the diff panel behind `panel_root`: reads the plan and what is open
+    /// off the main thread, then shows it with the exact command, unless the tab closed
+    /// meanwhile. The panel's button stays off until the dialog is up or the reason it is not
+    /// has been said.
     pub(super) fn merge_from_panel(&self, panel_root: &gtk4::Box) {
         let Some((page, panel, worktree)) = self.tab_by_panel(panel_root, |t| {
             (t.page.clone(), t.diff_panel.clone(), t.worktree.clone())
@@ -286,6 +394,10 @@ impl AgentTerminalWindow {
             };
             panel.set_merge_preparing(false);
             let Some(obj) = obj.upgrade() else { return };
+            // The tab closed while the plan was read: there is nothing to ask about.
+            if obj.imp().tab_by_panel(&root, |_| ()).is_none() {
+                return;
+            }
             let plan = match read {
                 Ok(plan) => plan,
                 Err(why) => {
@@ -293,13 +405,19 @@ impl AgentTerminalWindow {
                     return;
                 }
             };
-            let imp = obj.imp();
-            let tabs = tab_lines(
-                &plan.base_dir,
-                &imp.base_checkout_tabs(&plan.base_dir, &info.path),
-                imp.panel_tab_busy(&root),
-            );
-            let parts = merge_dialog(&plan, &tabs);
+            let (seen, own_busy) = obj.imp().seen_for_merge(&root);
+            let lines = {
+                let plan = plan.clone();
+                off_main("reading what is open", move || {
+                    Ok::<_, String>(blockers(&plan, &seen, own_busy))
+                })
+                .await
+            };
+            let Ok(lines) = lines else { return };
+            if obj.imp().tab_by_panel(&root, |_| ()).is_none() {
+                return;
+            }
+            let parts = merge_dialog(&plan, &lines);
             parts.dialog.present(Some(&parent));
             let obj = obj.downgrade();
             parts.dialog.connect_response(None, move |_, response| {
@@ -313,8 +431,8 @@ impl AgentTerminalWindow {
         });
     }
 
-    /// Runs the merge `plan` previewed, once the tabs in the base checkout are checked again: a
-    /// turn may have started while the dialog was up.
+    /// Runs the merge `plan` previewed, once what is open is checked again: a turn may have
+    /// started, or a tab opened, while the dialog was up.
     fn run_merge(
         &self,
         panel_root: &gtk4::Box,
@@ -323,54 +441,56 @@ impl AgentTerminalWindow {
         parent: &gtk4::Widget,
         plan: MergePlan,
     ) {
-        let tabs = tab_lines(
-            &plan.base_dir,
-            &self.base_checkout_tabs(&plan.base_dir, &plan.info.path),
-            self.panel_tab_busy(panel_root),
+        let (seen, own_busy) = self.seen_for_merge(panel_root);
+        let (page, panel, parent, root) = (
+            page.clone(),
+            panel.clone(),
+            parent.clone(),
+            panel_root.clone(),
         );
-        if let Some(why) = tabs.refusals.first() {
-            present_message_over(
-                parent,
-                "Can't Merge Right Now",
-                &format!("{why}\n\nNothing was merged."),
-            );
-            return;
-        }
-        let (page, panel, parent) = (page.clone(), panel.clone(), parent.clone());
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
             panel.set_merging(true);
             let done = {
                 let plan = plan.clone();
-                off_main("the merge", move || agent_kit::merge::merge(&plan)).await
+                off_main("the merge", move || {
+                    // Refused before git runs at all: something started while the dialog was up.
+                    let refused = click_refusal(&blockers(&plan, &seen, own_busy));
+                    Ok(match refused {
+                        Some(why) => Err(Err(why)),
+                        None => agent_kit::merge::merge(&plan).map_err(Ok),
+                    })
+                })
+                .await
             };
             panel.set_merging(false);
             let Some(obj) = obj.upgrade() else { return };
+            let imp = obj.imp();
+            let shown_over = imp.merge_result_parent(&root, &parent);
+            // `Err(Err(_))`: refused at the click; `Err(Ok(_))`: git's failure.
+            let done: Result<Merged, Result<String, String>> =
+                done.unwrap_or_else(|why| Err(Ok(why)));
             match done {
                 Ok(done) => {
                     info!("merged a worktree's branch into its base");
-                    obj.imp().merged(&page, &parent, &plan, &done);
+                    imp.merged(&page, &shown_over, &plan, &done);
                 }
-                Err(why) => {
+                Err(Err(why)) => {
+                    present_message_over(&shown_over, "Can't Merge Right Now", &why);
+                }
+                Err(Ok(why)) => {
                     warn!("a merge from a worktree did not go through");
-                    present_message_over(&parent, "Could Not Merge", &why);
+                    present_message_over(&shown_over, "Could Not Merge", &why);
                 }
             }
-            obj.imp().refresh_diff(&page);
+            imp.refresh_diff(&page);
         });
     }
 
     /// Says the merge is made, how to delete the branch, and offers to close the thread (which
     /// offers the worktree's removal as any worktree tab's close does).
     fn merged(&self, page: &adw::TabPage, parent: &gtk4::Widget, plan: &MergePlan, done: &Merged) {
-        let dialog = adw::AlertDialog::new(
-            Some(&format!("Merged {} into {}", plan.branch, plan.base)),
-            Some(&merged_words(plan, done)),
-        );
-        dialog.add_response("done", "Done");
-        dialog.add_response("close", "Close Thread");
-        dialog.set_default_response(Some("done"));
-        dialog.set_close_response("done");
+        let dialog = merged_dialog(plan, done);
         dialog.present(Some(parent));
         let obj = self.obj().downgrade();
         let page = page.clone();
@@ -390,6 +510,32 @@ impl AgentTerminalWindow {
             }
         });
     }
+}
+
+/// The success dialog: what moved, and the command that deletes the kept branch in a label that
+/// can be selected and copied. Done is the default and what a close answers.
+pub(super) fn merged_dialog(plan: &MergePlan, done: &Merged) -> adw::AlertDialog {
+    let (before, after) = merged_words(plan, done);
+    let dialog = adw::AlertDialog::new(
+        Some(&format!("Merged {} into {}", plan.branch, plan.base)),
+        None,
+    );
+    let column = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    column.append(&wrapped(&before));
+    let command = wrapped(&delete_branch_command(plan));
+    command.add_css_class("monospace");
+    command.add_css_class("merge-delete-command");
+    command.set_selectable(true);
+    column.append(&command);
+    let note = wrapped(&after);
+    note.add_css_class("dim-label");
+    column.append(&note);
+    dialog.set_extra_child(Some(&column));
+    dialog.add_response("done", "Done");
+    dialog.add_response("close", "Close Thread");
+    dialog.set_default_response(Some("done"));
+    dialog.set_close_response("done");
+    dialog
 }
 
 #[cfg(test)]
@@ -416,8 +562,105 @@ pub(super) mod tests {
             behind: 1,
             prediction: Prediction::Clean,
             hooks: Vec::new(),
+            worktrees: vec![PathBuf::from("/r/.main.worktrees/feat-x")],
             refusals: Vec::new(),
         }
+    }
+
+    fn seen(title: &str, dir: &Path, worktree: Option<&Path>, busy: bool) -> Seen {
+        Seen {
+            title: title.into(),
+            dir: dir.to_path_buf(),
+            worktree: worktree.map(Path::to_path_buf),
+            busy,
+        }
+    }
+
+    /// A base checkout with a worktree nested inside its folder, this worktree beside it, and a
+    /// link to the base checkout, on disk so paths resolve.
+    struct Folders {
+        _tmp: tempfile::TempDir,
+        base: PathBuf,
+        nested: PathBuf,
+        here: PathBuf,
+        link: PathBuf,
+        plan: MergePlan,
+    }
+
+    fn folders() -> Folders {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let base = root.join("main");
+        let nested = base.join(".wt/other");
+        let here = root.join(".main.worktrees/feat-x");
+        for dir in [&base.join("src"), &nested, &here] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let link = root.join("link-to-main");
+        std::os::unix::fs::symlink(&base, &link).unwrap();
+        let mut plan = plan();
+        plan.base_dir = base.clone();
+        plan.info.main_toplevel = base.clone();
+        plan.info.path = here.clone();
+        plan.worktrees = vec![nested.clone(), here.clone()];
+        Folders {
+            _tmp: tmp,
+            base,
+            nested,
+            here,
+            link,
+            plan,
+        }
+    }
+
+    #[test]
+    fn what_is_in_the_base_is_found_through_links_and_not_in_nested_worktrees() {
+        let f = folders();
+        let (in_base, in_here) = place(
+            &f.plan,
+            &[
+                seen("Via a link", &f.link.join("src"), None, false),
+                seen("In base", &f.base, None, true),
+                seen("Nested worktree", &f.nested, None, true),
+                seen(
+                    "Nested by its tab",
+                    &f.base.join(".wt"),
+                    Some(&f.nested),
+                    true,
+                ),
+                seen("Elsewhere", Path::new("/nowhere/at/all"), None, true),
+                seen("Here too", &f.here, Some(&f.here), false),
+            ],
+        );
+        let titles = |tabs: &[BaseTab]| tabs.iter().map(|t| t.title.clone()).collect::<Vec<_>>();
+        assert_eq!(titles(&in_base), ["Via a link", "In base"]);
+        assert_eq!(titles(&in_here), ["Here too"]);
+    }
+
+    #[test]
+    fn another_tab_in_this_worktree_or_this_thread_working_refuses() {
+        let f = folders();
+        let lines = blockers(&f.plan, &[seen("Second", &f.here, None, false)], false);
+        assert_eq!(lines.refusals.len(), 1, "{lines:?}");
+        assert!(lines.refusals[0].starts_with("“Second” is also open in this worktree"));
+        let lines = blockers(&f.plan, &[], true);
+        assert!(lines.refusals[0].starts_with("This thread's agent is working"));
+        assert_eq!(blockers(&f.plan, &[], false), TabLines::default());
+    }
+
+    #[test]
+    fn the_click_checks_again_and_a_turn_started_meanwhile_refuses() {
+        let f = folders();
+        // Idle when the dialog opened: a warning, and Merge is offered.
+        let idle = [seen("Parser", &f.base, None, false)];
+        assert_eq!(click_refusal(&blockers(&f.plan, &idle, false)), None);
+        // Working by the click: refused, saying nothing was merged.
+        let working = [seen("Parser", &f.base, None, true)];
+        let why = click_refusal(&blockers(&f.plan, &working, false)).unwrap();
+        assert!(why.starts_with("“Parser” is working in"), "{why}");
+        assert!(why.ends_with("Nothing was merged."), "{why}");
+        // And this thread having started a turn.
+        assert!(click_refusal(&blockers(&f.plan, &[], true)).is_some());
     }
 
     #[test]
@@ -432,15 +675,15 @@ pub(super) mod tests {
                 busy: false,
             },
         ];
-        let lines = tab_lines(Path::new("/r/main"), &tabs, false);
+        let lines = tab_lines(Path::new("/r/main"), &tabs, &[], false);
         assert_eq!(lines.refusals.len(), 1);
         assert!(lines.refusals[0].starts_with("“Fix the parser” is working in /r/main"));
         assert_eq!(lines.warnings.len(), 1);
         assert!(lines.warnings[0].starts_with("“Notes” is open in /r/main"));
-        let own = tab_lines(Path::new("/r/main"), &[], true);
+        let own = tab_lines(Path::new("/r/main"), &[], &[], true);
         assert!(own.refusals[0].starts_with("This thread's agent is working"));
         assert_eq!(
-            tab_lines(Path::new("/r/main"), &[], false),
+            tab_lines(Path::new("/r/main"), &[], &[], false),
             TabLines::default()
         );
     }
@@ -474,26 +717,30 @@ pub(super) mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
-        assert_eq!(
-            shown_steps(&p),
-            "In /r/main:\ngit merge --no-ff --no-edit -m 'Merge branch '\\''feat/x'\\''' -- \
-             refs/heads/feat/x"
-        );
+        assert!(shown_steps(&p).starts_with("In /r/main:\ngit -c branch.main.mergeOptions="));
+        assert!(shown_steps(&p).ends_with(&format!(
+            "merge --no-ff --no-edit -m 'Merge branch '\\''feat/x'\\''' -- {}",
+            p.branch_tip
+        )));
     }
 
     #[test]
     fn success_explains_the_kept_branch_and_gives_the_delete_command() {
         let p = plan();
-        let words = merged_words(
+        let (before, after) = merged_words(
             &p,
             &Merged {
                 before: "0123456789ab".into(),
                 after: "fedcba987654".into(),
             },
         );
-        assert!(words.starts_with("main moved from 0123456789ab to fedcba987654 in /r/main."));
-        assert!(words.contains("The branch feat/x is kept"));
-        assert!(words.contains("git -C /r/main branch -D -- feat/x"));
+        assert!(before.starts_with("main moved from 0123456789ab to fedcba987654 in /r/main."));
+        assert!(before.contains("The branch feat/x is kept"));
+        assert!(after.starts_with("Closing the thread offers to remove the worktree"));
+        assert_eq!(
+            delete_branch_command(&p),
+            "git -C /r/main branch -D -- feat/x"
+        );
         let mut odd = plan();
         odd.base_dir = PathBuf::from("/r/my repo");
         assert_eq!(
@@ -526,6 +773,7 @@ pub(super) mod tests {
                 title: "Busy".into(),
                 busy: true,
             }],
+            &[],
             false,
         );
         let parts = merge_dialog(&p, &busy);
@@ -533,5 +781,23 @@ pub(super) mod tests {
             !parts.dialog.is_response_enabled("merge"),
             "a busy tab refuses"
         );
+
+        // The success dialog's delete command is its own selectable, monospace label.
+        let done = merged_dialog(
+            &p,
+            &Merged {
+                before: "0123456789ab".into(),
+                after: "fedcba987654".into(),
+            },
+        );
+        assert_eq!(done.default_response().as_deref(), Some("done"));
+        assert_eq!(done.close_response().as_str(), "done");
+        let command = done
+            .extra_child()
+            .and_then(|c| crate::testutil::find_by_class::<gtk4::Label>(&c, "merge-delete-command"))
+            .expect("the delete command's label");
+        assert!(command.is_selectable());
+        assert!(command.has_css_class("monospace"));
+        assert_eq!(command.text().as_str(), delete_branch_command(&p));
     }
 }

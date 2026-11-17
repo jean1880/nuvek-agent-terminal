@@ -752,9 +752,24 @@ with a *prompt* badge, their name and the first line of their text. Choose one (
 then press Enter. The text you send is your own, so it goes through the usual path, history,
 queueing and redaction of the stored thread included.
 
-**Adding one.** For now saved prompts are kept in the settings file, under `saved_prompts`
-(see [Configuration](configuration.md)); a change to the file applies as soon as it is
-saved. They are stored unencrypted, like every other setting, so keep secrets out of them.
+**Adding one.** Settings → General → Saved Prompts lists every saved prompt. Open **New Saved
+Prompt**, give it a **Name**, its **Text** and, if you like, a folder under **Only in This
+Folder** (type it, or press **Choose…**), then press **Add** (or Enter in the name). Add is
+offered only once all three are valid; until then each field says what is wrong with it.
+
+**Editing one.** Open a prompt's row to change its name, text or folder. Each change is saved
+as you make it: a name or folder when you press Enter or leave the field, the text when you
+press **Apply** or leave it. A value that breaks a rule is shown in red with the reason and is
+not saved; the prompt keeps what it had. **Everywhere** removes its folder. **Duplicate** adds
+a copy just below (`review-copy`, `review-copy-2`, …) for you to change, and the bin button
+deletes it, with **Undo** on the note that says so. A prompt the settings file already holds
+that breaks a rule (from an edit by hand) is listed with "Not offered" and the reason, and is
+kept until you fix or delete it.
+
+The prompts are kept in the settings file, under `saved_prompts` (see
+[Configuration](configuration.md)), and a change made to the file by hand applies as soon as
+it is saved. They are stored unencrypted, like every other setting, so keep secrets out of
+them.
 
 ```json
 "saved_prompts": [
@@ -770,7 +785,7 @@ saved. They are stored unencrypted, like every other setting, so keep secrets ou
 | `{file}` | The first `@path` already in the draft, else the file in focus in the thread's diff panel (the row you last expanded or moved to), while the panel is open |
 | `{selection}` | The text selected in the thread's transcript, else the text selected in the composer. At most its first 8 KB is used, and a toast says when it was cut. One run of text with no space or line break, too long to check for secrets whole, is left out, and a toast says so |
 | `{folder}` | The thread's folder |
-| `{branch}` | Not filled in yet: it stays in place for you to type |
+| `{branch}` | The branch checked out in the thread's folder. It is read with git when you choose the prompt, away from the window, so your `/name` stays in the draft for that moment; if you type meanwhile, the answer is dropped and the draft is left as you made it. In a folder outside any git repository, or with a detached HEAD, it stays in place for you to type, and a toast says why |
 
 - Every value is redacted before it goes in, and a selection is redacted before it is cut, so
   a secret is never left half masked. Masking is best-effort: read the draft before sending.
@@ -786,8 +801,9 @@ allowed: both rows are listed, each with its own badge, the agent's first. A sav
 prompt never runs a command and is never sent as `/name`.
 
 **Limits.** The text is at most 16 KB, and only the first 200 saved prompts are used. A prompt
-that breaks a rule (an empty name or text, a repeated name, a folder that is not an absolute
-path or `~/…`) stays in the file but is not listed; the log says why.
+that breaks a rule (an empty name or text, a name another prompt has for the same folder, a
+folder that is not an absolute path or `~/…`) stays in the file but is not listed; Settings
+and the log say why.
 
 **Folders.** A prompt with a `folder` is listed only in threads in that folder or inside it
 (`/a/b` covers `/a/b/c`, not `/a/bc`). A folder's prompt is listed before the others, and takes

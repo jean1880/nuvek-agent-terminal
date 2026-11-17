@@ -25,12 +25,16 @@ use agent_core::commands::{
     TriggerKind,
 };
 use agent_core::saved_prompts::Resolved;
+use agent_kit::worktree::HeadBranch;
 use gtk4::prelude::*;
 use gtk4::{gdk, glib};
 use sourceview5::prelude::*;
 
 use super::cards::{label, wrap_words};
 use super::typeahead::{apply_completion, Key, KeyOutcome, LatestRequest, Popup};
+
+/// Reads a thread's branch for a saved prompt's `{branch}`. Blocking: run off the main thread.
+pub type BranchReader = Box<dyn FnOnce() -> HeadBranch + Send + 'static>;
 
 /// Debounce for `@file` suggestions (a round trip to the agent CLI).
 const FILE_DEBOUNCE: Duration = Duration::from_millis(120);
@@ -191,14 +195,21 @@ pub trait ComposerHost {
     fn notify(&self, _text: &str) {}
     /// A saved prompt was chosen: its text for this thread, placeholders filled, or `None` when
     /// there is no such prompt any more. `draft` is the rest of the draft (where `{file}` looks
-    /// for an `@path`) and `selection` the text selected in the composer, if any. Nothing is
-    /// sent: the composer puts the text in the draft.
+    /// for an `@path`), `selection` the text selected in the composer, if any, and `branch`
+    /// what [`Self::saved_branch_reader`]'s reader found (`None`: none was asked for). Nothing
+    /// is sent: the composer puts the text in the draft.
     fn expand_saved(
         &self,
         _name: &str,
         _draft: &str,
         _selection: Option<&str>,
+        _branch: Option<&HeadBranch>,
     ) -> Option<Resolved> {
+        None
+    }
+    /// How to read the branch for saved prompt `name`, when its text asks for `{branch}`. The
+    /// composer runs it off the main thread before it expands the prompt.
+    fn saved_branch_reader(&self, _name: &str) -> Option<BranchReader> {
         None
     }
 }
@@ -225,6 +236,10 @@ pub struct Composer {
     editing: Cell<bool>,
     preedit_active: Cell<bool>,
     host: RefCell<Option<std::rc::Weak<dyn ComposerHost>>>,
+    /// This composer, for work that finishes after an await (the branch lookup).
+    me: RefCell<std::rc::Weak<Self>>,
+    /// Bumped by each saved prompt chosen: a branch answer for an earlier one is dropped.
+    saved_seq: Cell<u64>,
 }
 
 impl Composer {
@@ -344,7 +359,10 @@ impl Composer {
             editing: Cell::new(false),
             preedit_active: Cell::new(false),
             host: RefCell::new(None),
+            me: RefCell::new(std::rc::Weak::new()),
+            saved_seq: Cell::new(0),
         });
+        *composer.me.borrow_mut() = Rc::downgrade(&composer);
         composer.connect_signals();
         composer
     }
@@ -1123,16 +1141,62 @@ impl Composer {
 
     /// Puts saved prompt `name`'s text where its `/name` was typed (`range` of `text`), with the
     /// first placeholder left to fill selected, else the cursor after the text. Never submits.
+    ///
+    /// A prompt that asks for `{branch}` waits for the branch, read off the main thread: the
+    /// typed `/name` stays until the answer comes, and the answer is used only if the draft is
+    /// still exactly `text` and no other saved prompt was chosen meanwhile.
     fn expand_saved(&self, name: &str, text: &str, range: std::ops::Range<usize>) {
         let Some(host) = self.host() else {
             return;
         };
+        let selection = self.selected_text();
+        let seq = self.saved_seq.get().wrapping_add(1);
+        self.saved_seq.set(seq);
+        let Some(read) = host.saved_branch_reader(name) else {
+            self.insert_saved(&*host, name, text, range, selection.as_deref(), None);
+            return;
+        };
+        drop(host);
+        let me = self.me.borrow().clone();
+        let (name, text) = (name.to_owned(), text.to_owned());
+        glib::MainContext::default().spawn_local(async move {
+            let branch = gtk4::gio::spawn_blocking(read)
+                .await
+                .unwrap_or(HeadBranch::Unknown);
+            let Some(composer) = me.upgrade() else {
+                return;
+            };
+            if composer.saved_seq.get() != seq || composer.text() != text {
+                return;
+            }
+            let Some(host) = composer.host() else {
+                return;
+            };
+            composer.insert_saved(
+                &*host,
+                &name,
+                &text,
+                range,
+                selection.as_deref(),
+                Some(&branch),
+            );
+        });
+    }
+
+    fn insert_saved(
+        &self,
+        host: &dyn ComposerHost,
+        name: &str,
+        text: &str,
+        range: std::ops::Range<usize>,
+        selection: Option<&str>,
+        branch: Option<&HeadBranch>,
+    ) {
         let (Some(before), Some(after)) = (text.get(..range.start), text.get(range.end..)) else {
             return;
         };
         let rest = format!("{before}{after}");
-        let selection = self.selected_text();
-        let Some(resolved) = host.expand_saved(name, &rest, selection.as_deref()) else {
+        let Some(resolved) = host.expand_saved(name, &rest, selection, branch) else {
             host.notify(&format!("There is no saved prompt /{name} any more"));
             return;
         };
@@ -1399,6 +1463,8 @@ pub(super) mod tests {
         saved: RefCell<Option<(String, String)>>,
         /// The draft and selection `expand_saved` was given.
         expanded_with: RefCell<Option<(String, Option<String>)>>,
+        /// Where the next `{branch}` answer comes from: the test sends it when it chooses.
+        branch: RefCell<Option<std::sync::mpsc::Receiver<HeadBranch>>>,
     }
 
     impl ComposerHost for Host {
@@ -1445,6 +1511,7 @@ pub(super) mod tests {
             name: &str,
             draft: &str,
             selection: Option<&str>,
+            branch: Option<&HeadBranch>,
         ) -> Option<Resolved> {
             *self.expanded_with.borrow_mut() =
                 Some((draft.to_owned(), selection.map(str::to_owned)));
@@ -1454,7 +1521,16 @@ pub(super) mod tests {
             if let Some(file) = agent_core::saved_prompts::first_file_mention(draft) {
                 values = values.with_file(&file);
             }
+            if let Some(HeadBranch::Branch(b)) = branch {
+                values = values.with_branch(b);
+            }
             Some(agent_core::saved_prompts::expand(body, &values))
+        }
+        fn saved_branch_reader(&self, _name: &str) -> Option<BranchReader> {
+            let answer = self.branch.borrow_mut().take()?;
+            Some(Box::new(move || {
+                answer.recv().unwrap_or(HeadBranch::Unknown)
+            }))
         }
     }
 
@@ -1502,6 +1578,67 @@ pub(super) mod tests {
         // Nothing went to the agent, and the first placeholder to fill is selected.
         assert!(host.submitted.borrow().is_empty());
         assert_eq!(composer.selected_text().as_deref(), Some("{branch}"));
+        composer.dispose();
+        window.set_child(None::<&gtk4::Widget>);
+        drop(composer);
+        window.destroy();
+    }
+
+    #[test]
+    #[ignore = "native GTK; run alone in an isolated display"]
+    fn a_late_branch_reply_is_dropped_when_the_draft_changed() {
+        crate::testutil::gtk_init().expect("GTK init");
+        let ctx = glib::MainContext::default();
+        let host = Rc::new(Host::default());
+        *host.saved.borrow_mut() = Some(("rel".to_owned(), "Notes for {branch}".to_owned()));
+        let host_trait: Rc<dyn ComposerHost> = host.clone();
+        let composer = Composer::new();
+        composer.set_host(Rc::downgrade(&host_trait));
+        let window = gtk4::Window::new();
+        window.set_child(Some(composer.widget()));
+        window.present();
+        let choose = |composer: &Composer| {
+            composer.set_text("/rel");
+            let at = composer.buffer.iter_at_offset(4);
+            composer.buffer.place_cursor(&at);
+            let index = composer
+                .entries
+                .borrow()
+                .iter()
+                .position(|e| matches!(e, Entry::Command(i) if i.kind == CompletionKind::Saved))
+                .expect("the saved prompt is offered");
+            composer.accept(index);
+        };
+
+        // The typed `/rel` stays until the branch is read, then the answer fills it.
+        let (send, answer) = std::sync::mpsc::channel();
+        *host.branch.borrow_mut() = Some(answer);
+        choose(&composer);
+        assert_eq!(composer.text(), "/rel", "nothing changes before the answer");
+        send.send(HeadBranch::Branch("feat/x".into()))
+            .expect("send");
+        assert!(crate::testutil::pump_until(&ctx, 10, || composer.text() == "Notes for feat/x"));
+
+        // The user typed meanwhile: the answer, arriving late, changes nothing.
+        let (send, answer) = std::sync::mpsc::channel();
+        *host.branch.borrow_mut() = Some(answer);
+        choose(&composer);
+        composer.set_text("something else");
+        send.send(HeadBranch::Branch("late".into())).expect("send");
+        let seq = composer.saved_seq.get();
+        crate::testutil::settle(&ctx);
+        assert!(!crate::testutil::pump_until(&ctx, 1, || composer.text() != "something else"));
+        assert_eq!(composer.saved_seq.get(), seq);
+
+        // A detached HEAD (or no repository): `{branch}` is left in place, selected to fill.
+        let (send, answer) = std::sync::mpsc::channel();
+        *host.branch.borrow_mut() = Some(answer);
+        choose(&composer);
+        send.send(HeadBranch::Detached).expect("send");
+        assert!(crate::testutil::pump_until(&ctx, 10, || composer.text() == "Notes for {branch}"));
+        assert_eq!(composer.selected_text().as_deref(), Some("{branch}"));
+        assert!(host.submitted.borrow().is_empty(), "nothing is ever sent");
+
         composer.dispose();
         window.set_child(None::<&gtk4::Widget>);
         drop(composer);

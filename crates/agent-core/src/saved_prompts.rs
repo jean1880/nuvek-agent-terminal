@@ -131,11 +131,7 @@ pub fn problems(
             if let Err(why) = checked {
                 return Some(why);
             }
-            // The folder by its path components, so `/a/b` and `/a/b/` are one folder.
-            let key = (
-                p.name.trim().to_ascii_lowercase(),
-                folder.map(|f| Path::new(&f).components().collect::<PathBuf>()),
-            );
+            let key = scope_key(&p.name, p.folder.as_deref(), &expand);
             if seen.contains(&key) {
                 return Some(format!("/{} is already a saved prompt", key.0));
             }
@@ -143,6 +139,115 @@ pub fn problems(
             None
         })
         .collect()
+}
+
+/// What two prompts clash on: the name without regard to case, and the folder (expanded) by its
+/// path components, so `/a/b` and `/a/b/` are one folder. A blank folder is none.
+fn scope_key(
+    name: &str,
+    folder: Option<&str>,
+    expand: &impl Fn(&str) -> String,
+) -> (String, Option<PathBuf>) {
+    let folder = folder
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .map(|f| Path::new(&expand(f)).components().collect::<PathBuf>());
+    (name.trim().to_ascii_lowercase(), folder)
+}
+
+/// Why the prompt at `index` (`None`: a new one) cannot be named `name` with the scope `folder`
+/// because another prompt already is: the same name for the same folder, or for every folder.
+/// A prompt of that name for another folder is no clash (the nearer folder's wins).
+pub fn clash(
+    prompts: &[SavedPrompt],
+    index: Option<usize>,
+    name: &str,
+    folder: Option<&str>,
+    expand: impl Fn(&str) -> String,
+) -> Option<String> {
+    let key = scope_key(name, folder, &expand);
+    let taken = prompts
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| Some(*i) != index)
+        .any(|(_, p)| scope_key(&p.name, p.folder.as_deref(), &expand) == key);
+    taken.then(|| match key.1 {
+        Some(_) => format!("/{} is already a saved prompt for this folder", key.0),
+        None => format!("/{} is already a saved prompt for every folder", key.0),
+    })
+}
+
+/// Why the prompt at `index` (`None`: a new one) cannot take the name `name`, keeping the scope
+/// `folder`: an invalid name ([`validate_name`]) or a [`clash`].
+pub fn name_problem(
+    prompts: &[SavedPrompt],
+    index: Option<usize>,
+    name: &str,
+    folder: Option<&str>,
+    builtins: &[Builtin],
+    expand: impl Fn(&str) -> String,
+) -> Option<String> {
+    validate_name(name, builtins)
+        .err()
+        .or_else(|| clash(prompts, index, name, folder, expand))
+}
+
+/// Why the prompt at `index` (`None`: a new one), named `name`, cannot be limited to `folder`
+/// (`None` or blank: every folder): a folder that is not absolute once expanded, or a [`clash`].
+pub fn folder_problem(
+    prompts: &[SavedPrompt],
+    index: Option<usize>,
+    name: &str,
+    folder: Option<&str>,
+    expand: impl Fn(&str) -> String,
+) -> Option<String> {
+    let folder = folder.map(str::trim).filter(|f| !f.is_empty());
+    folder
+        .and_then(|f| validate_folder(&expand(f)).err())
+        .or_else(|| clash(prompts, index, name, folder, expand))
+}
+
+/// Why `candidate` cannot be added to `prompts` (or, with `index`, stand in for the prompt
+/// there): its name, its text, its folder, or one more than [`MAX_PROMPTS`].
+pub fn candidate_problem(
+    prompts: &[SavedPrompt],
+    index: Option<usize>,
+    candidate: &SavedPrompt,
+    builtins: &[Builtin],
+    expand: impl Fn(&str) -> String,
+) -> Option<String> {
+    if index.is_none() && prompts.len() >= MAX_PROMPTS {
+        return Some(format!("There can be at most {MAX_PROMPTS} saved prompts"));
+    }
+    let folder = candidate.folder.as_deref();
+    validate_name(&candidate.name, builtins)
+        .err()
+        .or_else(|| validate_body(&candidate.body).err())
+        .or_else(|| folder_problem(prompts, index, &candidate.name, folder, &expand))
+}
+
+/// A name for a copy of the prompt named `name` that no prompt has: `name-copy`, then
+/// `name-copy-2` and on, shortened to fit [`MAX_NAME_CHARS`].
+pub fn copy_name(prompts: &[SavedPrompt], name: &str) -> String {
+    let base = name.trim().to_ascii_lowercase();
+    let taken = |candidate: &str| {
+        prompts
+            .iter()
+            .any(|p| p.name.trim().eq_ignore_ascii_case(candidate))
+    };
+    (1usize..)
+        .map(|n| {
+            let suffix = if n == 1 {
+                "-copy".to_owned()
+            } else {
+                format!("-copy-{n}")
+            };
+            let room = MAX_NAME_CHARS.saturating_sub(suffix.len());
+            let head: String = base.chars().take(room).collect();
+            format!("{head}{suffix}")
+        })
+        .find(|candidate| !taken(candidate))
+        .unwrap_or_default()
 }
 
 /// Whether a prompt limited to `folder` is offered in a thread in `dir`: `dir` is `folder` or
@@ -739,6 +844,77 @@ mod tests {
         let p = problems(&many, b, same);
         assert!(p[..MAX_PROMPTS].iter().all(Option::is_none));
         assert!(p[MAX_PROMPTS].is_some());
+    }
+
+    #[test]
+    fn an_edit_is_refused_when_it_would_clash_or_be_invalid_and_ignores_its_own_row() {
+        let b = builtins();
+        let prompts = [
+            prompt("review", "a", None),
+            prompt("review", "b", Some("/w")),
+            prompt("notes", "c", Some("/w/")),
+        ];
+        // A row keeps its own name: it is never its own duplicate.
+        assert_eq!(
+            name_problem(&prompts, Some(0), "Review", None, b, same),
+            None
+        );
+        // Another row's name and scope, in any case and however the folder is written.
+        let taken = name_problem(&prompts, Some(2), "REVIEW", Some("/w/"), b, same);
+        assert!(
+            taken.as_deref().is_some_and(|e| e.contains("this folder")),
+            "{taken:?}"
+        );
+        let taken = name_problem(&prompts, None, "review", None, b, same);
+        assert!(
+            taken.as_deref().is_some_and(|e| e.contains("every folder")),
+            "{taken:?}"
+        );
+        // The same name for another folder is allowed.
+        assert_eq!(
+            name_problem(&prompts, None, "review", Some("/x"), b, same),
+            None
+        );
+        // A built-in's name, or one that is not a name, is refused before any clash.
+        for bad in ["model", "two words", ""] {
+            assert!(name_problem(&prompts, None, bad, None, b, same).is_some());
+        }
+        // A folder: absolute once expanded, and not one where its name is taken.
+        assert!(folder_problem(&prompts, Some(0), "review", Some("rel"), same).is_some());
+        assert!(folder_problem(&prompts, Some(0), "review", Some("/w"), same).is_some());
+        assert_eq!(
+            folder_problem(&prompts, Some(0), "review", Some("~/x"), |f| f
+                .replacen('~', "/h", 1)),
+            None
+        );
+        // A blank folder is every folder: row 1 may not move there while row 0 is.
+        assert!(folder_problem(&prompts, Some(1), "review", Some("  "), same).is_some());
+        assert_eq!(folder_problem(&prompts, Some(2), "notes", None, same), None);
+        // A whole new prompt: name, text, folder, and the count cap.
+        let ok = prompt("tidy", "Tidy {file}", Some("/w"));
+        assert_eq!(candidate_problem(&prompts, None, &ok, b, same), None);
+        let empty = prompt("tidy", " \n", None);
+        assert!(candidate_problem(&prompts, None, &empty, b, same).is_some());
+        let many: Vec<SavedPrompt> = (0..MAX_PROMPTS)
+            .map(|i| prompt(&format!("p{i}"), "x", None))
+            .collect();
+        assert!(candidate_problem(&many, None, &ok, b, same).is_some());
+        assert_eq!(candidate_problem(&many, Some(0), &ok, b, same), None);
+    }
+
+    #[test]
+    fn a_copy_gets_a_free_name_that_still_fits() {
+        let prompts = [
+            prompt("review", "a", None),
+            prompt("review-copy", "b", None),
+        ];
+        assert_eq!(copy_name(&prompts, "Review"), "review-copy-2");
+        assert_eq!(copy_name(&prompts, "notes"), "notes-copy");
+        let long = "x".repeat(MAX_NAME_CHARS);
+        let copy = copy_name(&prompts, &long);
+        assert_eq!(copy.chars().count(), MAX_NAME_CHARS);
+        assert!(copy.ends_with("-copy"));
+        assert!(validate_name(&copy, builtins()).is_ok());
     }
 
     #[test]

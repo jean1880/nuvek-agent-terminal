@@ -11,6 +11,7 @@ mod environment_review;
 mod fork_compare;
 mod merge;
 mod pack_animation;
+mod prompts_prefs;
 mod remote;
 mod setup;
 mod spending;
@@ -5426,6 +5427,7 @@ impl AgentTerminalWindow {
         let replies = adw::PreferencesGroup::builder().title("Replies").build();
         replies.add(&quick_replies_row);
         general.add(&replies);
+        general.add(&self.saved_prompts_group());
         general.add(&self.spending_group());
         general.add(&self.remote_machines_group());
         general.add(&self.uninstall_group());
@@ -10174,6 +10176,7 @@ mod tests {
         diff_prefs::tests::the_diff_tool_group_saves_only_what_is_valid(window);
         editor_prefs::tests::the_group_saves_only_what_is_valid_and_applies_live(window);
         remote::tests::the_remote_machines_group_saves_only_valid_aliases(window);
+        prompts_prefs::tests::the_saved_prompts_group_saves_only_what_is_valid(window);
         threads::message_search::tests::message_search_finds_and_opens_a_hit(window);
         spending::tests::the_spending_dialog_shows_and_keeps_what_turns_cost(window);
         spending::tests::the_spending_group_saves_only_valid_amounts(window);

@@ -7651,7 +7651,54 @@ impl AgentTerminalWindow {
                     "Quick replies are off. Turn them back on in Settings, General, Replies.",
                 );
             }
+            ViewAction::ReviewComment(comment) => self.add_card_comment(thread, comment.clone()),
         }
+    }
+
+    /// A comment written on one of `thread`'s file-change cards joins the thread's review, the
+    /// one its diff panel lists and sends. The card's file is named, off the main thread, from
+    /// the thread's repository, or from the thread's folder when that folder holds repositories
+    /// without being one itself; a file outside both takes no comment, and the toast says so.
+    fn add_card_comment(&self, thread: &str, comment: crate::chat::view::CardComment) {
+        let Some((panel, folder)) = self
+            .with_thread_tab(thread, |t| {
+                (t.remote.is_none()).then(|| (t.diff_panel.clone(), t.dir.clone()))
+            })
+            .flatten()
+        else {
+            return;
+        };
+        super::bind_review(&panel, thread);
+        let obj = self.obj().downgrade();
+        glib::MainContext::default().spawn_local(async move {
+            let (root, rel) = (comment.root.clone(), comment.place.path.clone());
+            let path = blocking_or(
+                move || {
+                    let folder_path = std::path::Path::new(&folder);
+                    let top = agent_kit::review_check::toplevel(folder_path)
+                        .or_else(|| folder_path.canonicalize().ok())?;
+                    agent_kit::review_check::repo_path(&top, &root, &rel)
+                },
+                None,
+            )
+            .await;
+            let Some(obj) = obj.upgrade() else { return };
+            let words = match path {
+                Some(path) => {
+                    match panel.add_card_comment(&path, &comment.place.span, &comment.note) {
+                        Some(n) => format!(
+                            "Added to this thread's review ({}). Send it from the Changes panel.",
+                            crate::window::diff_panel::count_words(n)
+                        ),
+                        None => "The comment could not be added to the review".to_owned(),
+                    }
+                }
+                None => "This file is not in the thread's folder or repository, so the comment \
+                         was not added to its review"
+                    .to_owned(),
+            };
+            obj.imp().show_toast(&words);
+        });
     }
 
     /// A new thread on the same agent and folder, carrying a budgeted, redacted handoff of
@@ -11147,6 +11194,10 @@ pub(super) mod tests {
             pump_until(&ctx, 15, || dir.path().join("connections").exists()),
             "the process that started is the fixture"
         );
+        assert!(
+            !slot.get().expect("session").launched_free(),
+            "start_session_bound passes free = false for a metered profile"
+        );
 
         // A plain turn: sent to the agent, finished, and nothing left needing the user.
         slot.send_prompt("success");
@@ -11285,11 +11336,49 @@ pub(super) mod tests {
             pump_until(&ctx, 5, || imp.page_of_thread(&thread).is_none()),
             "stop and close closes the page"
         );
+
+        // start_session_bound also passes free = true when the profile runs on a free server.
+        availability.set(
+            Driver::Codex,
+            Availability::Ready("/usr/bin/python3".into()),
+        );
+        let mut old_provider = None;
+        let mut old_model = None;
+        for profile in imp.config.borrow_mut().profiles.iter_mut() {
+            if profile.command == command {
+                old_provider = profile
+                    .provider
+                    .replace(agent_core::provider::ModelProvider::new(
+                        agent_core::provider::ProviderKind::Ollama,
+                    ));
+                old_model = profile.default_model.replace("qwen3.5:9b".to_owned());
+            }
+        }
+        imp.new_chat_thread(Some(Driver::Codex), Some(folder.clone()), None);
+        let free_thread = imp
+            .tabs
+            .borrow()
+            .last()
+            .and_then(|t| t.chat.as_ref().map(|c| c.thread.clone()))
+            .expect("a free thread page");
+        let free_slot = imp.slot_of(&free_thread).expect("the free page's slot");
+        assert!(
+            pump_until(&ctx, 15, || free_slot.get().is_some()),
+            "the free-profile session starts"
+        );
+        assert!(
+            free_slot.get().expect("free session").launched_free(),
+            "start_session_bound passes free = true for a free-to-run profile"
+        );
+        imp.close_row_now(&RowKey::Thread(free_thread));
+
         availability.set(Driver::Codex, before);
         RESOLVED.with(|r| r.borrow_mut().remove(&(command.clone(), env_file)));
         for profile in imp.config.borrow_mut().profiles.iter_mut() {
             if profile.command == command {
                 profile.command = old_command.clone();
+                profile.provider = old_provider.clone();
+                profile.default_model = old_model.clone();
             }
         }
     }

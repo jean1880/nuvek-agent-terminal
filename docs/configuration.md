@@ -64,7 +64,7 @@ and [`.env.example`](../.env.example).
 | `F9`, `Ctrl+Shift+B` | Show or hide the sidebar |
 | `` Ctrl+` ``, `Ctrl+J` | Show or hide the terminal drawer |
 | `Ctrl+Shift+D` | Show or hide the diff panel |
-| `Ctrl+Alt+M` | In a diff panel file's diff: comment on the selected lines, or the caret's line |
+| `Ctrl+Alt+M` | In a diff panel file's diff, or a file change's diff in the thread: comment on the selected lines, or the caret's line |
 | `Ctrl+Shift+F` | Search a terminal's scrollback |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy / paste |
 | `Ctrl+,` | Open Settings |

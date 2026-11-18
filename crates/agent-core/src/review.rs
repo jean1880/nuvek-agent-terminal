@@ -1,9 +1,11 @@
 //! A review of a diff: the comments a user wrote on its lines, and the one message they become.
 //!
-//! Pure: the diff panel maps a selection to lines (`agent_kit::diff::comment_span`), keeps the
-//! drafts, and hands them here to be composed. Every quoted line and every note is redacted
-//! before it is cut, and the quoted lines are fenced, since they are file text the agent wrote
-//! and so may hold anything, instructions included.
+//! Pure: the diff panel (and a file-change card) maps a selection to lines
+//! (`agent_kit::diff::comment_span`), the panel keeps the drafts, and hands them here to be
+//! composed. At send time each new-side comment is looked for in the working file ([`locate`]),
+//! so the message never quotes lines that moved or went without saying so. Every quoted line and
+//! every note is redacted before it is cut, and the quoted lines are fenced, since they are file
+//! text the agent wrote and so may hold anything, instructions included.
 
 use crate::fence::fenced;
 use crate::redact::redact;
@@ -66,6 +68,59 @@ impl Located {
     pub const ALL: [Located; 3] = [Located::Exact, Located::Moved, Located::Gone];
 }
 
+/// The `diff_base` a comment made on a file-change card keeps: its diff is the working file
+/// against the state recorded when the edit's turn started.
+pub const CARD_BASE: &str = "turn";
+
+/// Why a comment's lines could not be checked against the working file. Never taken for "still
+/// there": the message says the lines were not checked, and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unchecked {
+    /// The file is outside the thread's folder (a link that leads out counts as outside).
+    Outside,
+    /// Not a regular file, too large, not text, or it could not be read.
+    Unreadable,
+    /// The chosen lines span more than one part of the diff, so they are not one block of the
+    /// file.
+    Split,
+    /// No repository was found to name the file in.
+    NoRepository,
+}
+
+impl Unchecked {
+    /// Every reason, for exhaustive tests.
+    pub const ALL: [Unchecked; 4] = [
+        Unchecked::Outside,
+        Unchecked::Unreadable,
+        Unchecked::Split,
+        Unchecked::NoRepository,
+    ];
+
+    /// The reason as the message (and the review bar) gives it.
+    pub fn words(self) -> &'static str {
+        match self {
+            Unchecked::Outside => "the file is outside the thread's folder",
+            Unchecked::Unreadable => "the file could not be read as text",
+            Unchecked::Split => "the lines span more than one part of the diff",
+            Unchecked::NoRepository => "no repository was found for it",
+        }
+    }
+}
+
+/// Where a comment's new-side lines are in the working file when the review is sent
+/// ([`locate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Checked {
+    /// At the lines the comment names.
+    Exact,
+    /// The same lines, found once elsewhere in the file: these are their lines now.
+    Moved { start: u32, end: u32 },
+    /// Not in the file (or the file is gone), or found more than once: never a guess.
+    Gone,
+    /// The file was not read: the message says so, never that the lines are there.
+    Unchecked(Unchecked),
+}
+
 /// One comment, ready to compose.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewComment {
@@ -79,7 +134,91 @@ pub struct ReviewComment {
     pub quoted: Vec<String>,
     /// What the user wrote.
     pub note: String,
+    /// Where the diff on show has it.
     pub located: Located,
+    /// What the working file said at send time; `None`: not checked (a removed line, which is
+    /// never looked for in the file, or no check was run). When set, it overrides `located`.
+    pub checked: Option<Checked>,
+}
+
+/// The file lines a new-side quote stands for: its context and added rows, each with its prefix
+/// (`' '` or `'+'`) and its text. Removed rows are not in the file.
+fn new_side_rows(quoted: &[String]) -> Vec<(char, &str)> {
+    quoted
+        .iter()
+        .filter_map(|q| {
+            let mut chars = q.chars();
+            match chars.next() {
+                Some(c @ ('+' | ' ')) => Some((c, chars.as_str())),
+                // A blank context line keeps no space prefix through some tools.
+                None => Some((' ', "")),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Where a new-side comment's lines (`start..=end`, quoted as `quoted`: the diff rows, prefixes
+/// kept and redacted as the draft keeps them) are in `file`, the working file's text now.
+///
+/// The recorded lines are tried first: when they still read as the quote, [`Checked::Exact`].
+/// Else the quote is looked for as one block anywhere in the file: found once, it has
+/// [`Checked::Moved`]; not found, or found more than once, [`Checked::Gone`]. A file line is
+/// compared with its diff prefix put back, as the quote was redacted with it, and redacted when
+/// it does not match as it is. A quote whose rows are not one block of the file (the selection
+/// crossed a hunk header) is [`Unchecked::Split`]; so is a quote with no new-side row, which only
+/// an old-side comment has, and those are never relocated.
+pub fn locate(file: &str, start: u32, end: u32, quoted: &[String]) -> Checked {
+    let want = new_side_rows(quoted);
+    let span = end
+        .checked_sub(start)
+        .and_then(|d| (d as usize).checked_add(1));
+    if want.is_empty() || start == 0 || span != Some(want.len()) {
+        return Checked::Unchecked(Unchecked::Split);
+    }
+    let lines: Vec<&str> = file.lines().collect();
+    // Each line redacted at most once per prefix, and only when it does not match as it is.
+    let mut redacted: Vec<[Option<String>; 2]> = vec![[None, None]; lines.len()];
+    let mut same = |row: usize, (prefix, text): (char, &str)| {
+        let line = lines[row];
+        if line == text {
+            return true;
+        }
+        let slot = usize::from(prefix == '+');
+        let wanted = format!("{prefix}{text}");
+        redacted[row][slot]
+            .get_or_insert_with(|| redact(&format!("{prefix}{line}")))
+            .as_str()
+            == wanted
+    };
+    let mut matches_at = |first: usize| {
+        first + want.len() <= lines.len()
+            && want
+                .iter()
+                .enumerate()
+                .all(|(i, &row)| same(first + i, row))
+    };
+    let recorded = start as usize - 1;
+    if matches_at(recorded) {
+        return Checked::Exact;
+    }
+    let mut found = None;
+    for first in 0..lines.len().saturating_sub(want.len() - 1) {
+        if first != recorded && matches_at(first) {
+            if found.is_some() {
+                return Checked::Gone;
+            }
+            found = Some(first);
+        }
+    }
+    match found.and_then(|first| {
+        let start = u32::try_from(first + 1).ok()?;
+        let end = u32::try_from(first + want.len()).ok()?;
+        Some((start, end))
+    }) {
+        Some((start, end)) => Checked::Moved { start, end },
+        None => Checked::Gone,
+    }
 }
 
 /// A composed review.
@@ -157,19 +296,25 @@ fn quote_block(quoted: &[String]) -> String {
 /// One comment's entry, numbered `n`.
 fn entry(n: usize, c: &ReviewComment) -> String {
     let path = shown_path(&c.path);
-    let place = match c.located {
-        Located::Exact | Located::Moved => {
-            format!(
-                "{path}, {} ({})",
-                range_words(c.start, c.end),
-                side_words(c.side)
-            )
+    let (range, side) = (range_words(c.start, c.end), side_words(c.side));
+    let place = match (c.checked, c.located) {
+        (Some(Checked::Exact), _) | (None, Located::Exact | Located::Moved) => {
+            format!("{path}, {range} ({side})")
         }
-        Located::Gone => format!(
-            "{path}, no longer at these lines (was {}, {})",
-            range_words(c.start, c.end),
-            side_words(c.side)
+        (Some(Checked::Moved { start, end }), _) => format!(
+            "{path}, {} ({side}; at {range} when the comment was made)",
+            range_words(start, end)
         ),
+        (Some(Checked::Gone), _) => {
+            format!("{path}, no longer in the file (was {range}, {side})")
+        }
+        (Some(Checked::Unchecked(why)), _) => format!(
+            "{path}, {range} ({side}; not checked against the file: {})",
+            why.words()
+        ),
+        (None, Located::Gone) => {
+            format!("{path}, no longer at these lines (was {range}, {side})")
+        }
     };
     let note = redact(&c.note);
     let note = note.trim();
@@ -231,6 +376,106 @@ mod tests {
             quoted: quoted.iter().map(|s| (*s).to_owned()).collect(),
             note: note.into(),
             located: Located::Exact,
+            checked: None,
+        }
+    }
+
+    fn owned(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn locate_finds_exact_moved_and_gone() {
+        let quote = owned(&[" let n = 1;", "+let dir = read(p)?;"]);
+        let file = "fn a() {\n    let n = 1;\nlet dir = read(p)?;\n}\n";
+        // The quote's text is the file's, prefix aside (indentation is the line's own).
+        let quote_here = owned(&["     let n = 1;", "+let dir = read(p)?;"]);
+        assert_eq!(locate(file, 2, 3, &quote_here), Checked::Exact);
+        // Two lines inserted above: found once, two lower.
+        let shifted = format!("// one\n// two\n{file}");
+        assert_eq!(
+            locate(&shifted, 2, 3, &quote_here),
+            Checked::Moved { start: 4, end: 5 }
+        );
+        // Deleted: gone.
+        assert_eq!(locate("fn a() {}\n", 2, 3, &quote_here), Checked::Gone);
+        assert_eq!(locate("", 2, 3, &quote_here), Checked::Gone);
+        // Twice elsewhere: which one was meant cannot be told.
+        let twice = format!("x\n{file}{file}");
+        assert_eq!(locate(&twice, 1, 2, &quote_here), Checked::Gone);
+        // Still at its own lines, though found again elsewhere: exact.
+        assert_eq!(
+            locate(&format!("{file}{file}"), 2, 3, &quote_here),
+            Checked::Exact
+        );
+        // A blank context line, with or without its space.
+        assert_eq!(locate("a\n\nb\n", 2, 2, &owned(&[" "])), Checked::Exact);
+        assert_eq!(locate("a\n\nb\n", 2, 2, &owned(&[""])), Checked::Exact);
+        // A removed row is not in the file: it is skipped, the rest is looked for.
+        let with_removed = owned(&["-old", "+new", " same"]);
+        assert_eq!(
+            locate("x\nnew\nsame\n", 2, 3, &with_removed),
+            Checked::Exact
+        );
+        // Lines the recorded range cannot hold were chosen across a hunk: not checked.
+        assert_eq!(
+            locate(file, 2, 9, &quote),
+            Checked::Unchecked(Unchecked::Split)
+        );
+        assert_eq!(
+            locate(file, 2, 2, &owned(&["-only removed"])),
+            Checked::Unchecked(Unchecked::Split)
+        );
+        assert_eq!(
+            locate(file, 0, 0, &owned(&["+x"])),
+            Checked::Unchecked(Unchecked::Split)
+        );
+    }
+
+    #[test]
+    fn locate_compares_a_line_as_the_quote_was_redacted() {
+        let token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let line = format!("let t = \"{token}\";");
+        // The draft keeps its quote redacted, prefix and all.
+        let kept = vec![redact(&format!("+{line}"))];
+        assert!(kept[0] != format!("+{line}"), "the quote is masked");
+        let file = format!("a\n{line}\n");
+        assert_eq!(locate(&file, 2, 2, &kept), Checked::Exact);
+        assert_eq!(
+            locate(&format!("z\n{file}"), 2, 2, &kept),
+            Checked::Moved { start: 3, end: 3 }
+        );
+    }
+
+    #[test]
+    fn the_message_says_what_the_file_check_found() {
+        let at = |checked: Checked, located: Located| {
+            let mut c = comment("src/a.rs", 80, 82, &[" a", "+b", " c"], "n");
+            c.checked = Some(checked);
+            c.located = located;
+            compose(&[c]).text
+        };
+        assert!(at(Checked::Exact, Located::Gone).contains("1. src/a.rs, lines 80-82 (new side)\n"));
+        assert!(
+            at(Checked::Moved { start: 90, end: 92 }, Located::Exact).contains(
+                "1. src/a.rs, lines 90-92 (new side; at lines 80-82 when the comment was made)\n"
+            )
+        );
+        assert!(at(Checked::Gone, Located::Exact)
+            .contains("1. src/a.rs, no longer in the file (was lines 80-82, new side)\n"));
+        for why in Unchecked::ALL {
+            // Exhaustive: a new reason fails to compile until it has words.
+            let words = match why {
+                Unchecked::Outside
+                | Unchecked::Unreadable
+                | Unchecked::Split
+                | Unchecked::NoRepository => why.words(),
+            };
+            assert!(
+                at(Checked::Unchecked(why), Located::Exact).contains(&format!(
+                    "1. src/a.rs, lines 80-82 (new side; not checked against the file: {words})\n"
+                ))
+            );
         }
     }
 

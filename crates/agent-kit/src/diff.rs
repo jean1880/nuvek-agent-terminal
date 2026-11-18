@@ -432,6 +432,10 @@ pub enum SpanRefusal {
     NoLines,
     /// More changed or context lines than one comment may quote.
     TooMany(usize),
+    /// A card's diff of several files: the lines chosen are in more than one.
+    AcrossFiles,
+    /// The chosen lines are in a hunk with no line numbers (an agent's `@@ edit @@` fragment).
+    Unnumbered,
 }
 
 impl SpanRefusal {
@@ -443,8 +447,154 @@ impl SpanRefusal {
                 "Select at most {} lines for one comment ({n} chosen)",
                 agent_core::review::SELECTION_MAX_LINES
             ),
+            SpanRefusal::AcrossFiles => "Select lines of one file for one comment".to_owned(),
+            SpanRefusal::Unnumbered => "These lines are the agent's own edit, with no line \
+                                        numbers in the file: comment on them in the Changes panel"
+                .to_owned(),
         }
     }
+}
+
+/// One file of a file-change card's diff: the path its header names and the rows it runs over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardFile {
+    /// As the `+++ b/…` header names it (the `--- a/…` one for a deleted file), `a/`/`b/` off.
+    pub path: String,
+    /// Its first row (its first header line) and the row after its last.
+    pub rows: std::ops::Range<usize>,
+}
+
+/// The path a `--- a/x` or `+++ b/x` header line names, without its prefix or a trailing
+/// timestamp; `None` for `/dev/null` or no path.
+fn header_path(line: &str, marker: &str, prefix: &str) -> Option<String> {
+    let rest = line.strip_prefix(marker)?;
+    let rest = rest.split('\t').next().unwrap_or(rest);
+    if rest == "/dev/null" || rest.is_empty() {
+        return None;
+    }
+    Some(rest.strip_prefix(prefix).unwrap_or(rest).to_owned())
+}
+
+/// The files of a file-change card's diff, in order. A file starts at a `diff --git` line, or
+/// at a `--- ` line followed by a `+++ ` line that is not inside a hunk (the shape the app's own
+/// differ writes, one file after another). Rows before the first file, and a file whose headers
+/// name no path, belong to no file.
+pub fn card_files(text: &str) -> Vec<CardFile> {
+    let lines: Vec<&str> = text.lines().collect();
+    let refs = parse_hunks(text);
+    let numbered = |i: usize| {
+        refs.get(i)
+            .is_some_and(|r| r.old.is_some() || r.new.is_some())
+    };
+    let mut starts: Vec<usize> = Vec::new();
+    // Inside a `diff --git` header, before its first hunk: its `---`/`+++` start nothing.
+    let mut in_git_header = false;
+    for (i, line) in lines.iter().enumerate() {
+        if line.starts_with("diff --git ") {
+            starts.push(i);
+            in_git_header = true;
+        } else if line.starts_with("@@") {
+            in_git_header = false;
+        } else if !in_git_header
+            && line.starts_with("--- ")
+            && lines.get(i + 1).is_some_and(|l| l.starts_with("+++ "))
+            && !numbered(i)
+            && !numbered(i + 1)
+        {
+            starts.push(i);
+        }
+    }
+    starts
+        .iter()
+        .enumerate()
+        .filter_map(|(n, &start)| {
+            let end = starts.get(n + 1).copied().unwrap_or(lines.len());
+            // The header ends at the first hunk.
+            let header = lines[start..end]
+                .iter()
+                .take_while(|l| !l.starts_with("@@"));
+            let (mut new, mut old) = (None, None);
+            for line in header {
+                new = new.or_else(|| header_path(line, "+++ ", "b/"));
+                old = old.or_else(|| header_path(line, "--- ", "a/"));
+            }
+            Some(CardFile {
+                path: new.or(old)?,
+                rows: start..end,
+            })
+        })
+        .collect()
+}
+
+/// A comment's place on a file-change card: the file and its span, the span's rows counted in
+/// the card's whole text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardSpan {
+    pub path: String,
+    pub span: CommentSpan,
+}
+
+/// The comment rows `first_row..=last_row` of a file-change card's `text` would make. As
+/// [`comment_span`] does in the file's own part of the text, which the rows must all be in
+/// ([`SpanRefusal::AcrossFiles`] else; header rows at either end do not count). Rows in a hunk
+/// with no numbers are [`SpanRefusal::Unnumbered`], never a guess.
+pub fn card_comment_span(
+    text: &str,
+    first_row: usize,
+    last_row: usize,
+) -> Result<CardSpan, SpanRefusal> {
+    let (lo, hi) = (first_row.min(last_row), first_row.max(last_row));
+    let files = card_files(text);
+    let refs = parse_hunks(text);
+    let lines: Vec<&str> = text.lines().collect();
+    // Only the rows a comment can take decide which file is meant: changed or context rows of a
+    // file, below a hunk header of that file (so never the file's own `---`/`+++` rows).
+    let mut commentable = vec![false; lines.len()];
+    for file in &files {
+        let mut in_hunk = false;
+        for i in file.rows.clone() {
+            if lines[i].starts_with("@@") {
+                in_hunk = true;
+            } else if in_hunk {
+                commentable[i] = refs.get(i).is_some_and(|r| {
+                    matches!(
+                        r.kind,
+                        LineKind::Added | LineKind::Removed | LineKind::Context
+                    )
+                });
+            }
+        }
+    }
+    let chosen: Vec<usize> = (lo..=hi.min(lines.len().saturating_sub(1)))
+        .filter(|&i| commentable.get(i).copied().unwrap_or(false))
+        .collect();
+    let (Some(&first), Some(&last)) = (chosen.first(), chosen.last()) else {
+        return Err(SpanRefusal::NoLines);
+    };
+    let file = files
+        .iter()
+        .find(|f| f.rows.contains(&first))
+        .ok_or(SpanRefusal::NoLines)?;
+    if !file.rows.contains(&last) {
+        return Err(SpanRefusal::AcrossFiles);
+    }
+    if chosen
+        .iter()
+        .all(|&i| refs[i].old.is_none() && refs[i].new.is_none())
+    {
+        return Err(SpanRefusal::Unnumbered);
+    }
+    let chunk: String = lines[file.rows.clone()]
+        .iter()
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let base = file.rows.start;
+    let mut span = comment_span(&chunk, first - base, last - base)?;
+    span.rows = (span.rows.0 + base, span.rows.1 + base);
+    Ok(CardSpan {
+        path: file.path.clone(),
+        span,
+    })
 }
 
 /// Whether a row is a changed or context line with a place in a file.
@@ -1307,5 +1457,89 @@ mod tests {
     fn every_base_has_its_own_key() {
         let keys: std::collections::HashSet<_> = DiffBase::ALL.iter().map(|b| b.key()).collect();
         assert_eq!(keys.len(), DiffBase::ALL.len());
+        assert!(!keys.contains(agent_core::review::CARD_BASE));
+    }
+
+    /// Two files as the app's differ writes a card's diff: headers, then hunks, one after the
+    /// other, no `diff --git` line.
+    const CARD: &str = "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n\
+                        --- /dev/null\n+++ b/new.rs\n@@ -0,0 +1,2 @@\n+x\n+y\n";
+
+    #[test]
+    fn a_card_diff_is_cut_into_its_files_by_their_headers() {
+        let files = card_files(CARD);
+        assert_eq!(
+            files,
+            vec![
+                CardFile {
+                    path: "src/a.rs".into(),
+                    rows: 0..7
+                },
+                CardFile {
+                    path: "new.rs".into(),
+                    rows: 7..12
+                },
+            ]
+        );
+        // A deleted file is named by its old header; `diff --git` headers start a file too, and
+        // their own `---`/`+++` lines start nothing more.
+        let git = "diff --git a/old.rs b/old.rs\ndeleted file mode 100644\n--- a/old.rs\n\
+                   +++ /dev/null\n@@ -1 +0,0 @@\n-gone\n";
+        assert_eq!(
+            card_files(git),
+            vec![CardFile {
+                path: "old.rs".into(),
+                rows: 0..6
+            }]
+        );
+        // A removed line that reads `--- ` inside a hunk is a line, not a header.
+        let inside = "--- a/x\n+++ b/x\n@@ -1,2 +1,0 @@\n--- y\n-+++ z\n";
+        assert_eq!(card_files(inside).len(), 1);
+        assert!(card_files("# a.rs: binary file, not shown\n").is_empty());
+    }
+
+    #[test]
+    fn a_card_comment_names_its_file_and_counts_rows_in_the_whole_card() {
+        let second = card_comment_span(CARD, 10, 11).expect("lines");
+        assert_eq!(second.path, "new.rs");
+        assert_eq!(
+            (second.span.side, second.span.start, second.span.end),
+            (Side::New, 1, 2)
+        );
+        assert_eq!(second.span.rows, (10, 11), "rows of the whole card");
+        assert_eq!(second.span.quoted, quoted(&["+x", "+y"]));
+        let first = card_comment_span(CARD, 4, 4).expect("a removed line");
+        assert_eq!(
+            (first.path.as_str(), first.span.side, first.span.start),
+            ("src/a.rs", Side::Old, 2)
+        );
+        // The next file's headers at the end of a selection do not count; its lines do.
+        assert_eq!(
+            card_comment_span(CARD, 5, 8).map(|s| s.span.rows),
+            Ok((5, 6))
+        );
+        assert_eq!(
+            card_comment_span(CARD, 5, 10),
+            Err(SpanRefusal::AcrossFiles)
+        );
+        assert_eq!(card_comment_span(CARD, 0, 2), Err(SpanRefusal::NoLines));
+        assert_eq!(card_comment_span("", 0, 0), Err(SpanRefusal::NoLines));
+        // The agent's own fragment has no numbers: refused, never guessed.
+        let fragment = "--- a/x.rs\n+++ b/x.rs\n@@ edit @@\n-old\n+new\n";
+        assert_eq!(
+            card_comment_span(fragment, 3, 4),
+            Err(SpanRefusal::Unnumbered)
+        );
+        for refusal in [SpanRefusal::AcrossFiles, SpanRefusal::Unnumbered] {
+            assert!(!refusal.reason().is_empty());
+        }
+        // A comment made on a card is found again in the panel's diff of the same file.
+        let panel = "diff --git a/new.rs b/new.rs\nnew file mode 100644\n--- /dev/null\n\
+                     +++ b/new.rs\n@@ -0,0 +1,2 @@\n+x\n+y\n";
+        let s = &second.span;
+        assert_eq!(
+            anchor(panel, s.side, s.start, s.end, &s.quoted).located,
+            Located::Exact
+        );
     }
 }

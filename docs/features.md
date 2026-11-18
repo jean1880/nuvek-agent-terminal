@@ -246,8 +246,10 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   is asked about first, every time.
   Tick the files you want and **Commit…** them through your own git, hooks and signing
   included, after seeing the exact commands. Select lines and **Comment** on them
-  (`Ctrl+Alt+M`), keep collecting notes while you read, then **Send Review** to the thread's
-  agent as one message with exact paths, lines and quoted code. See
+  (`Ctrl+Alt+M`), in the panel or on a file change in the thread, keep collecting notes while
+  you read, then **Send Review** to the thread's agent as one message with exact paths, lines
+  and quoted code, each comment's lines checked against the file first, so lines that moved
+  or went are said to have. See
   [Diff panel](reference.md#diff-panel), [Committing](reference.md#committing) and
   [Reviewing a diff](reference.md#reviewing-a-diff).
 - **Undo a turn**, which saves the current state first, so the undo can itself be undone.

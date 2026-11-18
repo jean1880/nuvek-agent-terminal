@@ -1550,6 +1550,9 @@ pub(crate) mod tests {
             matches!(backend.actions.borrow().last(),Some(WorkerAction::Approve{scope,request,..}) if scope==&scope1&&request=="native-permission")
         );
         assert_eq!(backend.root_answers.get(), 0);
+        // A worker's edit is not the root's to review: its card in the inspector offers no
+        // comment, though the root's own transcript cards do.
+        assert_eq!(inspector.panel.takes_comments(&item), Some(false));
         inner.worker_row("w_workerAA", RowEvent::LoadDiff { id: item });
         assert_eq!(
             backend.diff_scopes.borrow().as_slice(),

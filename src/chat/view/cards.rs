@@ -68,9 +68,15 @@ pub enum RowEvent {
     OpenLocation {
         location: agent_kit::editor::Location,
     },
+    /// A comment written on a file-change card's diff, for the thread's review.
+    ReviewComment(super::CardComment),
 }
 
 pub type RowSink = Rc<dyn Fn(RowEvent)>;
+
+/// Why a file-change card's diff takes no comment when it is the agent's own edit.
+pub const AGENT_EDIT_NO_COMMENTS: &str = "This is the agent's own account of its edit, not a diff \
+     of the file: comment on the file in the Changes panel";
 
 /// The CSS class carrying an agent's accent colour.
 pub fn accent_class(driver: Driver) -> &'static str {
@@ -803,6 +809,14 @@ pub enum Row {
 }
 
 impl Row {
+    /// Lets a file-change card's diff take review comments ([`ToolCard::allow_comments`]); no
+    /// other row has one.
+    pub fn allow_comments(&self) {
+        if let Self::Tool(card) = self {
+            card.allow_comments();
+        }
+    }
+
     pub fn build(item: &Item, sink: &RowSink) -> Self {
         let row = match &item.body {
             Body::User { queued, .. } => {
@@ -1609,6 +1623,11 @@ struct FileDiffUi {
     revealer: gtk4::Revealer,
     status: gtk4::Label,
     text: DiffText,
+    /// Where the card's events go: a comment written on its diff among them.
+    sink: RowSink,
+    /// The repository root the diff on show names its files from (`None`: the agent's own
+    /// edit, which takes no comment).
+    root: Rc<RefCell<Option<std::path::PathBuf>>>,
 }
 
 /// Shows or hides "Open in ‹tool›" and words the "View diff" tooltip to match the configured
@@ -2060,7 +2079,26 @@ impl ToolCard {
             revealer,
             status,
             text,
+            sink: sink.clone(),
+            root: Rc::default(),
         }
+    }
+
+    /// Lets the card's diff take review comments for the thread's review: only a thread's own
+    /// transcript asks (never an approval, nor a sub-agent's card in the inspector). A diff that
+    /// names its files from a repository takes them; the agent's own edit does not.
+    pub fn allow_comments(&self) {
+        let (sink, root) = (self.diff.sink.clone(), Rc::clone(&self.diff.root));
+        self.diff.text.allow_comments(Rc::new(move |place, note| {
+            let Some(root) = root.borrow().clone() else {
+                return;
+            };
+            sink(RowEvent::ReviewComment(super::CardComment {
+                root,
+                place,
+                note,
+            }));
+        }));
     }
 
     /// Shows the diff the host computed for this card.
@@ -2080,6 +2118,9 @@ impl ToolCard {
                 ui.text.widget().set_visible(false);
             }
             Ok(shown) => {
+                *ui.root.borrow_mut() = shown.root.clone();
+                ui.text
+                    .set_commentable(shown.root.is_none().then_some(AGENT_EDIT_NO_COMMENTS));
                 ui.text.set(
                     &shown.text,
                     &difftext::notes_for(shown.origin, shown.omitted_lines, shown.clipped),
@@ -2093,6 +2134,18 @@ impl ToolCard {
                 ui.text.widget().set_visible(false);
             }
         }
+    }
+
+    /// Whether the card's diff offers review comments at all (tests).
+    #[cfg(test)]
+    pub(super) fn takes_comments(&self) -> bool {
+        self.diff.text.comment_button().0
+    }
+
+    /// The card's diff (tests).
+    #[cfg(test)]
+    pub(super) fn diff_text(&self) -> &DiffText {
+        &self.diff.text
     }
 
     /// The diff section's state (tests): toggle on, status text, diff text.
@@ -3884,6 +3937,7 @@ pub(crate) mod tests {
             omitted_lines: 12,
             clipped: true,
             files: vec!["file.txt".into()],
+            root: None,
         }));
         assert!(card.diff.text.notes().contains(warning));
         let prefix = "same\n".repeat(120_000);

@@ -353,7 +353,7 @@ fn open_inside(
 /// Opens `rel` below the open folder `base`, one component at a time and never through a link
 /// (`O_NOFOLLOW`); its folders are only passed through (`O_PATH`), and its last component is
 /// opened with `leaf`. `rel` empty opens `base` itself.
-fn open_below(base: OwnedFd, rel: &Path, leaf: libc::c_int) -> std::io::Result<OwnedFd> {
+pub(crate) fn open_below(base: OwnedFd, rel: &Path, leaf: libc::c_int) -> std::io::Result<OwnedFd> {
     let names: Vec<_> = rel.components().map(|c| c.as_os_str().to_owned()).collect();
     let Some((last, folders)) = names.split_last() else {
         return Ok(base);
@@ -562,7 +562,7 @@ fn cstring(part: &OsStr) -> Result<CString, String> {
 }
 
 /// `openat(2)` relative to `dir` (the process's folder when `None`), close-on-exec.
-fn open_at(
+pub(crate) fn open_at(
     dir: Option<&OwnedFd>,
     name: &CString,
     flags: libc::c_int,

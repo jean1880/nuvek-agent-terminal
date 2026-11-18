@@ -28,6 +28,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 mod review;
+pub(crate) use review::count_words;
 
 /// Narrowest width the panel remembers being dragged to.
 pub const MIN_WIDTH: i32 = 220;
@@ -1559,6 +1560,32 @@ impl DiffPanel {
     #[cfg(test)]
     pub fn press_merge(&self) {
         self.merge_button.emit_clicked();
+    }
+
+    /// Calls `check` with the new-side comments when "Send Review" is clicked, before the review
+    /// is composed: it must look for each in its working file off the main thread and call `done`
+    /// on it with one answer per comment, in order. The button spins until then.
+    pub fn connect_review_check(
+        &self,
+        check: impl Fn(Vec<agent_kit::review_check::CheckAsk>, review::CheckDone) + 'static,
+    ) {
+        self.review.set_check(Rc::new(check));
+    }
+
+    /// Adds a comment made on one of the thread's file-change cards to the review (`path` from
+    /// the repository's top). `None` while no thread is bound; else how many comments there are.
+    pub fn add_card_comment(
+        &self,
+        path: &str,
+        span: &crate::diff::CommentSpan,
+        note: &str,
+    ) -> Option<usize> {
+        self.review.add_from_card(path, span, note)
+    }
+
+    /// The repository the diff on show came from, once a refresh has found one.
+    pub fn shown_repo(&self) -> Option<PathBuf> {
+        self.commit.repo.borrow().clone()
     }
 
     /// Calls `commit` with the chosen files when "Commit…" is clicked.
@@ -3121,5 +3148,202 @@ pub(crate) mod tests {
         let generation = panel.begin();
         panel.show_pr(generation, Some(Err("boom".into())));
         assert_eq!(panel.pr_view().map(|v| v.2), Some(false));
+    }
+
+    /// GTK: run from the window's construction test. Comments made on the thread's file-change
+    /// cards join the panel's one review; "Send Review" first looks for each new-side comment in
+    /// its working file, off the main thread, the button spinning and nothing sent meanwhile,
+    /// and the one message then names lines found, moved, gone, or not checked (a file outside
+    /// the thread's folder, through a link that leads out), never a removed line's. A comment
+    /// deleted while the files are checked is not sent.
+    pub(crate) fn card_comments_join_the_review_and_are_checked_when_sent() {
+        use crate::diff::{CommentSpan, Side};
+        use agent_core::review::{Checked, Unchecked};
+        let ctx = glib::MainContext::default();
+        let span = |side: Side, start: u32, quoted: &[&str]| CommentSpan {
+            side,
+            start,
+            end: start + quoted.len() as u32 - 1,
+            rows: (0, 0),
+            quoted: quoted.iter().map(|s| (*s).to_owned()).collect(),
+        };
+
+        // A panel with no thread takes no card comment.
+        let unbound = DiffPanel::new(&crate::theme::Theme::diff_colours(Default::default()));
+        assert_eq!(
+            unbound.add_card_comment("a.rs", &span(Side::New, 1, &["+x"]), "n"),
+            None
+        );
+
+        // The working files: the thread's folder `sub` in the repository, a file beside it.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let top = tmp.path().join("repo");
+        let sub = top.join("sub");
+        std::fs::create_dir_all(&sub).expect("dirs");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("dirs");
+        std::fs::write(sub.join("a.rs"), "one\ntwo\nthree\n").expect("write");
+        std::fs::write(sub.join("b.rs"), "inserted\nalpha\nbeta\n").expect("write");
+        std::fs::write(elsewhere.join("c.rs"), "x\n").expect("write");
+        std::os::unix::fs::symlink(elsewhere.join("c.rs"), sub.join("c.rs")).expect("link");
+        let (top, sub) = (
+            top.canonicalize().expect("canon"),
+            sub.canonicalize().expect("canon"),
+        );
+
+        let rig = Rig::new("t1", one_file("a.rs", 10, "new one"));
+        rig.panel.restore_review("t1", Vec::new());
+        let add = |path: &str, span: CommentSpan, note: &str| {
+            rig.panel.add_card_comment(path, &span, note)
+        };
+        assert_eq!(
+            add("sub/a.rs", span(Side::New, 2, &[" two", "+three"]), "Here"),
+            Some(1)
+        );
+        assert_eq!(
+            add(
+                "sub/b.rs",
+                span(Side::New, 1, &["+alpha", "+beta"]),
+                "Moved"
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            add("sub/gone.rs", span(Side::New, 1, &["+x"]), "Gone"),
+            Some(3)
+        );
+        assert_eq!(add("sub/c.rs", span(Side::New, 1, &["+x"]), "Out"), Some(4));
+        assert_eq!(
+            add("sub/a.rs", span(Side::Old, 7, &["-removed"]), "Removed"),
+            Some(5)
+        );
+        let drafts = rig.panel.review.drafts();
+        assert!(drafts
+            .iter()
+            .all(|d| d.diff_base == agent_core::review::CARD_BASE));
+        assert_eq!(
+            rig.saved.borrow().last().map(Vec::len),
+            Some(5),
+            "card comments are saved with the rest"
+        );
+        assert!(rig
+            .panel
+            .review
+            .bar_view()
+            .is_some_and(|(words, on)| words.starts_with("5 comments") && on));
+
+        // The check is held until answered: the button spins, and nothing is sent meanwhile.
+        type Pending = Option<(Vec<agent_kit::review_check::CheckAsk>, review::CheckDone)>;
+        let pending: Rc<RefCell<Pending>> = Rc::default();
+        let asked = Rc::clone(&pending);
+        rig.panel
+            .connect_review_check(move |asks, done| *asked.borrow_mut() = Some((asks, done)));
+        let content = rig.panel.content.clone().upcast::<gtk4::Widget>();
+        let send = crate::testutil::find_by_class::<gtk4::Button>(&content, "diff-send-review")
+            .expect("Send Review");
+        send.emit_clicked();
+        assert!(rig.panel.review.is_checking());
+        assert!(!send.is_sensitive());
+        assert!(rig.sent.borrow().is_empty());
+        send.emit_clicked();
+        let (asks, done) = pending.borrow_mut().take().expect("one check asked");
+        assert_eq!(
+            asks.iter().map(|a| a.path.as_str()).collect::<Vec<_>>(),
+            ["sub/a.rs", "sub/b.rs", "sub/c.rs", "sub/gone.rs"],
+            "every new-side comment, never a removed line"
+        );
+
+        // The real check, off the main thread.
+        let (folder, root) = (sub.clone(), top.clone());
+        ctx.spawn_local(async move {
+            let found = gtk4::gio::spawn_blocking(move || {
+                agent_kit::review_check::check(&folder, Some(&root), &asks)
+            })
+            .await
+            .unwrap_or_default();
+            done(found);
+        });
+        assert!(crate::testutil::pump_until(&ctx, 5, || !rig
+            .sent
+            .borrow()
+            .is_empty()));
+        let text = rig.sent.borrow()[0].clone();
+        for place in [
+            "sub/a.rs, lines 2-3 (new side)\n",
+            "sub/a.rs, no longer at these lines (was line 7, old side, removed)\n",
+            "sub/b.rs, lines 2-3 (new side; at lines 1-2 when the comment was made)\n",
+            &format!(
+                "sub/c.rs, line 1 (new side; not checked against the file: {})\n",
+                Unchecked::Outside.words()
+            ),
+            "sub/gone.rs, no longer in the file (was line 1, new side)\n",
+        ] {
+            assert!(text.contains(place), "{place:?} in {text}");
+        }
+        assert!(text.starts_with("Review comments on your changes (5)."));
+        assert!(!rig.panel.review.is_checking());
+        assert!(rig.panel.review.drafts().is_empty());
+        assert_eq!(
+            rig.panel.review.bar_view().map(|v| v.0),
+            Some("Checked against the files: 1 moved, 1 no longer there, 1 not checked".into())
+        );
+
+        // Deleted while its file is checked: not sent.
+        add("sub/a.rs", span(Side::New, 2, &[" two", "+three"]), "Late");
+        send.emit_clicked();
+        let (_, done) = pending.borrow_mut().take().expect("asked");
+        rig.panel.review.clear();
+        done(vec![Checked::Exact]);
+        assert_eq!(rig.sent.borrow().len(), 1);
+
+        // Added while its file is checked (even sorting earlier): not sent unchecked, and stays
+        // for the next review.
+        add(
+            "sub/b.rs",
+            span(Side::New, 1, &["+alpha", "+beta"]),
+            "First",
+        );
+        send.emit_clicked();
+        let (_, done) = pending.borrow_mut().take().expect("asked");
+        add(
+            "sub/a.rs",
+            span(Side::New, 2, &[" two", "+three"]),
+            "WhileChecking",
+        );
+        done(vec![Checked::Moved { start: 2, end: 3 }]);
+        assert_eq!(rig.sent.borrow().len(), 2);
+        let second = rig.sent.borrow()[1].clone();
+        assert!(second.contains("sub/b.rs"), "{second}");
+        assert!(!second.contains("WhileChecking"), "{second}");
+        let kept = rig.panel.review.drafts();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].path, "sub/a.rs");
+        assert_eq!(kept[0].note, "WhileChecking");
+        assert_eq!(
+            rig.panel.review.bar_view().map(|v| v.0),
+            Some("1 comment · 1 not in this diff · Checked against the files: 1 moved".into())
+        );
+
+        // A panel refresh landing while files are checked cannot shift the lines that were asked
+        // about out from under the reply.
+        rig.panel.review.clear();
+        let generation = rig.panel.begin();
+        rig.panel.show(generation, one_file("a.rs", 10, "new one"));
+        rig.panel.file_expanders()[0].set_expanded(true);
+        let view = rig.panel.review.view_of("a.rs").expect("view");
+        assert!(crate::testutil::pump_until(&ctx, 5, || view.is_mapped()));
+        rig.comment(5, 5, "BeforeRefresh");
+        send.emit_clicked();
+        let (asks, done) = pending.borrow_mut().take().expect("asked");
+        assert!(!asks[0].from_card);
+        let generation = rig.panel.begin();
+        rig.panel.show(generation, one_file("b.rs", 1, "x"));
+        done(vec![Checked::Exact]);
+        assert_eq!(rig.sent.borrow().len(), 3);
+        let third = &rig.sent.borrow()[2];
+        assert!(third.contains("a.rs, line 10 (new side)\n"), "{third}");
+        assert!(third.contains("BeforeRefresh"), "{third}");
+
+        rig.window.close();
     }
 }

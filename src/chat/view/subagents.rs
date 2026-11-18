@@ -744,6 +744,15 @@ impl SubagentPanel {
         self.rows.borrow().len()
     }
 
+    /// Whether the panel's copy of a file-change card offers review comments (tests).
+    #[cfg(test)]
+    pub fn takes_comments(&self, id: &str) -> Option<bool> {
+        match self.rows.borrow().get(id) {
+            Some(Row::Tool(card)) => Some(card.takes_comments()),
+            _ => None,
+        }
+    }
+
     /// The same widget is kept for a step across refreshes (tests).
     #[cfg(test)]
     pub fn row_widget(&self, id: &str) -> Option<gtk4::Widget> {

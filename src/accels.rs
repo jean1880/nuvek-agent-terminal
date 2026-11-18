@@ -199,19 +199,20 @@ const HAND_BOUND: &[HandBound] = &[
         "window/diff_panel/review.rs",
     ),
     hand(
-        "Return",
-        "diff comment editor focused",
-        "window/diff_panel/review.rs",
+        "<Control><Alt>m",
+        "file-change card diff focused",
+        "chat/view/difftext.rs",
     ),
+    hand("Return", "diff comment editor focused", "review_popover.rs"),
     hand(
         "KP_Enter",
         "diff comment editor focused",
-        "window/diff_panel/review.rs",
+        "review_popover.rs",
     ),
     hand(
         "ISO_Enter",
         "diff comment editor focused",
-        "window/diff_panel/review.rs",
+        "review_popover.rs",
     ),
 ];
 

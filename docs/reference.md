@@ -762,13 +762,16 @@ as you make it: a name or folder when you press Enter or leave the field, the te
 press **Apply** or leave it. A value that breaks a rule is shown in red with the reason and is
 not saved; the prompt keeps what it had. **Everywhere** removes its folder. **Duplicate** adds
 a copy just below (`review-copy`, `review-copy-2`, …) for you to change, and the bin button
-deletes it, with **Undo** on the note that says so. A prompt the settings file already holds
+deletes it, with **Undo** on the note that says so. Undo puts it back exactly as it was,
+unless a prompt of its name has been added for the same folder since, or the list is full:
+then it says so and changes nothing. A prompt the settings file already holds
 that breaks a rule (from an edit by hand) is listed with "Not offered" and the reason, and is
 kept until you fix or delete it.
 
 The prompts are kept in the settings file, under `saved_prompts` (see
 [Configuration](configuration.md)), and a change made to the file by hand applies as soon as
-it is saved. They are stored unencrypted, like every other setting, so keep secrets out of
+it is saved, to an open Settings list too. A change made in Settings and not yet written is
+written first, so it is not lost; the file's own version is then kept beside it as a copy. They are stored unencrypted, like every other setting, so keep secrets out of
 them.
 
 ```json
@@ -787,8 +790,10 @@ them.
 | `{folder}` | The thread's folder |
 | `{branch}` | The branch checked out in the thread's folder. It is read with git when you choose the prompt, away from the window, so your `/name` stays in the draft for that moment; if you type meanwhile, the answer is dropped and the draft is left as you made it. In a folder outside any git repository, or with a detached HEAD, it stays in place for you to type, and a toast says why |
 
-- Every value is redacted before it goes in, and a selection is redacted before it is cut, so
-  a secret is never left half masked. Masking is best-effort: read the draft before sending.
+- Every value loses its control, bidirectional and zero-width characters (a selection keeps
+  its line breaks and tabs), so nothing in the draft is hidden or shown out of order. It is
+  then redacted before it goes in, and a selection is redacted before it is cut, so a secret
+  is never left half masked. Masking is best-effort: read the draft before sending.
 - A placeholder with nothing to fill it stays as written (`{file}`) and the first one is
   selected, so typing replaces it. Nothing is silently left blank.
 - `{{` and `}}` are literal braces, and any other `{word}` stays as it is. A value is put in

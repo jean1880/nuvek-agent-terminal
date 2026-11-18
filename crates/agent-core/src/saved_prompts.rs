@@ -230,6 +230,19 @@ pub fn candidate_problem(
 /// `name-copy-2` and on, shortened to fit [`MAX_NAME_CHARS`].
 pub fn copy_name(prompts: &[SavedPrompt], name: &str) -> String {
     let base = name.trim().to_ascii_lowercase();
+    // A name that breaks the rules (a hand edit) would make a copy that breaks them too.
+    let well_formed = base
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+        && base
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    let base = if well_formed {
+        base
+    } else {
+        "prompt".to_owned()
+    };
     let taken = |candidate: &str| {
         prompts
             .iter()
@@ -415,8 +428,9 @@ pub fn parse(body: &str) -> Vec<Segment> {
     out
 }
 
-/// The values placeholders are filled with. Each is redacted when it is set, so nothing given
-/// here reaches a draft unmasked; a blank value counts as none.
+/// The values placeholders are filled with. Each is stripped of control, bidi and zero-width
+/// characters (a selection keeps its line breaks and tabs) and redacted when it is set, so
+/// nothing given here reaches a draft unmasked or hidden; a blank value counts as none.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Values {
     file: Option<String>,
@@ -445,7 +459,8 @@ impl Values {
 
     /// The selection, redacted and then cut to [`SELECTION_MAX_BYTES`] (see [`cap_selection`]).
     pub fn with_selection(mut self, raw: &str) -> Self {
-        let (text, cut) = cap_selection(raw, SELECTION_MAX_BYTES);
+        let raw = visible(raw, true);
+        let (text, cut) = cap_selection(&raw, SELECTION_MAX_BYTES);
         let kept = !text.trim().is_empty();
         self.selection_cut = cut && kept;
         // Cut to nothing (one unbroken run past the bound): not filled, but the caller is told.
@@ -466,8 +481,23 @@ impl Values {
 }
 
 fn prepared(value: &str) -> Option<String> {
+    let value = visible(value, false);
     let value = value.trim();
     (!value.is_empty()).then(|| redact(value))
+}
+
+/// `value` without what a reader of the draft could not see or that would reorder it: control
+/// characters (but line breaks and tabs when `lines`), bidi controls and zero-width characters.
+/// A file name, a folder or a branch can hold any of them; a draft shows them as nothing, or
+/// shows the text around them in another order.
+fn visible(value: &str, lines: bool) -> String {
+    value
+        .chars()
+        .filter(|&c| {
+            let kept_break = lines && (c == '\n' || c == '\t');
+            !crate::text::is_bidi_or_zero_width(c) && (kept_break || !c.is_control())
+        })
+        .collect()
 }
 
 /// A placeholder left in the text for the user to fill.
@@ -903,6 +933,25 @@ mod tests {
     }
 
     #[test]
+    fn values_lose_control_bidi_and_zero_width_characters() {
+        let values = Values::default()
+            .with_branch("feat/\u{202E}gnp.exe\u{1b}[31m\u{200B}x")
+            .with_file("src/\u{2066}a.rs\u{2069}\r")
+            .with_folder("/w/\u{0}app")
+            .with_selection("line one\r\n\tline\u{200D} two\u{7}");
+        assert_eq!(values.get(Placeholder::Branch), Some("feat/gnp.exe[31mx"));
+        assert_eq!(values.get(Placeholder::File), Some("src/a.rs"));
+        assert_eq!(values.get(Placeholder::Folder), Some("/w/app"));
+        assert_eq!(
+            values.get(Placeholder::Selection),
+            Some("line one\n\tline two")
+        );
+        // Nothing left but what was hidden: no value.
+        let hidden = Values::default().with_branch("\u{200B}\u{202E}");
+        assert_eq!(hidden.get(Placeholder::Branch), None);
+    }
+
+    #[test]
     fn a_copy_gets_a_free_name_that_still_fits() {
         let prompts = [
             prompt("review", "a", None),
@@ -915,6 +964,12 @@ mod tests {
         assert_eq!(copy.chars().count(), MAX_NAME_CHARS);
         assert!(copy.ends_with("-copy"));
         assert!(validate_name(&copy, builtins()).is_ok());
+        // A name a hand edit left invalid: the copy gets a valid one.
+        for bad in ["", "two words", "-lead", "é"] {
+            let copy = copy_name(&prompts, bad);
+            assert_eq!(copy, "prompt-copy", "{bad:?}");
+            assert!(validate_name(&copy, builtins()).is_ok());
+        }
     }
 
     #[test]

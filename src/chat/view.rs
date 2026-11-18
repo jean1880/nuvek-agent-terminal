@@ -2395,6 +2395,45 @@ pub(crate) mod tests {
 
     #[test]
     #[ignore = "constructs GTK widgets; run on a private display"]
+    fn a_branch_left_to_fill_says_why_in_a_toast() {
+        crate::testutil::gtk_init().expect("GTK init");
+        crate::testutil::adw_init().expect("adw init");
+        let ctx = glib::MainContext::default();
+        for (head, says) in [
+            (
+                agent_kit::worktree::HeadBranch::Detached,
+                "HEAD is detached",
+            ),
+            (
+                agent_kit::worktree::HeadBranch::NotRepository,
+                "not in a git repository",
+            ),
+        ] {
+            let view = ChatView::new(StubBackend::new(Driver::Claude));
+            let inner = view.inner().expect("inner");
+            view.set_prompt_source(Rc::new(StubPrompts {
+                prompts: vec![agent_core::saved_prompts::SavedPrompt {
+                    name: "rel".into(),
+                    body: "Notes for {branch}".into(),
+                    ..Default::default()
+                }],
+                focused: None,
+            }));
+            let r = ComposerHost::expand_saved(&*inner, "rel", "", None, Some(&head))
+                .expect("expanded");
+            assert_eq!(r.text, "Notes for {branch}");
+            let overlay = view.toast_overlay().expect("the toast overlay");
+            let shown = crate::testutil::pump_until(&ctx, 5, || {
+                crate::testutil::label_texts(overlay.upcast_ref())
+                    .iter()
+                    .any(|t| t.contains("{branch} is left to fill") && t.contains(says))
+            });
+            assert!(shown, "a toast says why: {says}");
+        }
+    }
+
+    #[test]
+    #[ignore = "constructs GTK widgets; run on a private display"]
     fn the_transcript_selection_is_read_from_its_labels_and_code_blocks() {
         crate::testutil::gtk_init().expect("GTK init");
         let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);

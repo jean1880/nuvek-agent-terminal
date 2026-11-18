@@ -1619,16 +1619,34 @@ pub(super) mod tests {
             .expect("send");
         assert!(crate::testutil::pump_until(&ctx, 10, || composer.text() == "Notes for feat/x"));
 
+        // The prompt was chosen again while the first read was still out: the first answer,
+        // arriving late into the very same draft, is dropped; the second one fills it.
+        let (first_send, first) = std::sync::mpsc::channel();
+        *host.branch.borrow_mut() = Some(first);
+        choose(&composer);
+        let (second_send, second) = std::sync::mpsc::channel();
+        *host.branch.borrow_mut() = Some(second);
+        choose(&composer);
+        assert_eq!(composer.text(), "/rel");
+        first_send
+            .send(HeadBranch::Branch("stale".into()))
+            .expect("send");
+        assert!(
+            !crate::testutil::pump_until(&ctx, 1, || composer.text() != "/rel"),
+            "the earlier answer is dropped"
+        );
+        second_send
+            .send(HeadBranch::Branch("fresh".into()))
+            .expect("send");
+        assert!(crate::testutil::pump_until(&ctx, 10, || composer.text() == "Notes for fresh"));
+
         // The user typed meanwhile: the answer, arriving late, changes nothing.
         let (send, answer) = std::sync::mpsc::channel();
         *host.branch.borrow_mut() = Some(answer);
         choose(&composer);
         composer.set_text("something else");
         send.send(HeadBranch::Branch("late".into())).expect("send");
-        let seq = composer.saved_seq.get();
-        crate::testutil::settle(&ctx);
         assert!(!crate::testutil::pump_until(&ctx, 1, || composer.text() != "something else"));
-        assert_eq!(composer.saved_seq.get(), seq);
 
         // A detached HEAD (or no repository): `{branch}` is left in place, selected to fill.
         let (send, answer) = std::sync::mpsc::channel();

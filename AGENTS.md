@@ -228,7 +228,9 @@ Architectural mandates, standards, and workflows for this codebase.
     committed and only when `saved_prompts::name_problem`/`validate_body`/`folder_problem` accept
     it, through `TerminalConfig::set_saved_prompt_*`; Add takes a whole valid prompt
     (`candidate_problem`); an invalid entry already in the file is listed with its problem and
-    kept, never dropped; Delete offers Undo, which puts it back exactly),
+    kept, never dropped; Delete offers Undo, which puts it back exactly, or is refused when the
+    name now clashes or the list is full; a reload of the file that changes the prompts redraws
+    an open group, after pending in-app saves are written),
     `window/imp/threads/message_search.rs` (the sidebar's "In Messages" section, behind the
     toggle beside its search entry: `Store::search` through `store_job` after typing pauses, a
     generation counter so only the newest search draws, "Search is unavailable" never shown as
@@ -419,7 +421,8 @@ Architectural mandates, standards, and workflows for this codebase.
   fork, compact-by-handoff, brief) goes through `agent_core::redact` and the
   handoff budget. A new store write or injected prompt must take the same path. A saved
   prompt's placeholder values (`{file}`, `{selection}`, `{folder}`, `{branch}`) are redacted
-  when they are given to `saved_prompts::Values` (a selection before it is cut to 8 KB);
+  when they are given to `saved_prompts::Values` (a selection before it is cut to 8 KB),
+  after their control, bidi and zero-width characters are taken out;
   the expanded text only fills the draft, never sends, and is then the user's own prompt.
   Terminal text sent to a thread ("Send Selection" or "Send Last Output", from a drawer or a
   terminal page, a remote one included) goes through `terminal_excerpt::format_excerpt`: only

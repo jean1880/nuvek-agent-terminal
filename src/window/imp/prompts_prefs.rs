@@ -197,30 +197,25 @@ impl Fields {
         }
     }
 
-    /// Opens a folder chooser; a folder picked goes into the folder entry and `then` runs.
-    fn connect_choose(&self, window: &Window, then: impl Fn() + 'static) {
-        let window = window.downgrade();
+    /// Opens a folder chooser over the window the button is in (the Settings dialog's own), a
+    /// folder picked goes into the folder entry and `then` runs. The chooser starts where it
+    /// likes: looking the typed folder up first would touch the disk on the main thread.
+    fn connect_choose(&self, then: impl Fn() + 'static) {
         let folder = self.folder.downgrade();
         let then = Rc::new(then);
-        self.choose.connect_clicked(move |_| {
-            let (Some(window), Some(entry)) = (window.upgrade(), folder.upgrade()) else {
+        self.choose.connect_clicked(move |button| {
+            let Some(entry) = folder.upgrade() else {
                 return;
             };
+            let parent = button.root().and_downcast::<gtk4::Window>();
             let picker = gtk4::FileDialog::builder()
                 .title("Only in This Folder")
                 .modal(true)
                 .build();
-            let current = crate::utils::expand_tilde(entry.text().trim());
-            if std::path::Path::new(&current).is_dir() {
-                picker.set_initial_folder(Some(&gtk4::gio::File::for_path(&current)));
-            }
             let then = Rc::clone(&then);
             let entry = entry.downgrade();
-            let parent = window.clone();
             glib::MainContext::default().spawn_local(async move {
-                let picked = picker
-                    .select_folder_future(Some(parent.upcast_ref::<gtk4::Window>()))
-                    .await;
+                let picked = picker.select_folder_future(parent.as_ref()).await;
                 // Dismissing the chooser is a normal outcome, not a failure.
                 let Some(path) = picked.ok().and_then(|f| f.path()) else {
                     return;
@@ -238,6 +233,10 @@ impl Fields {
 struct PromptRow {
     row: adw::ExpanderRow,
     named: Vec<(gtk4::Button, &'static str)>,
+    name: gtk4::Entry,
+    name_row: adw::ActionRow,
+    folder: gtk4::Entry,
+    folder_row: adw::ActionRow,
 }
 
 impl PromptRow {
@@ -351,6 +350,8 @@ impl Prompts {
         }
         empty.set_visible(prompts.is_empty());
         group.add(&add_row);
+        // Marks the fields of an entry already in the file that breaks a rule.
+        self.refresh();
     }
 
     /// Brings every row's title and subtitle up to date: a change to one prompt can make
@@ -375,6 +376,41 @@ impl Prompts {
             } else {
                 row.remove_css_class("error");
             }
+        }
+        // A field's own mark: what it holds now, against the list as it now is (another
+        // prompt's rename can make a name free, or take it).
+        for (index, shown) in self.rows.borrow().iter().enumerate() {
+            let Some(prompt) = prompts.get(index) else {
+                continue;
+            };
+            let name = shown.name.text();
+            let name_problem = saved_prompts::name_problem(
+                &prompts,
+                Some(index),
+                &name,
+                prompt.folder.as_deref(),
+                agent_core::commands::builtins(),
+                crate::utils::expand_tilde,
+            );
+            mark_entry(
+                &shown.name,
+                &shown.name_row,
+                name_problem.as_deref(),
+                NAME_HELP,
+            );
+            let folder_problem = saved_prompts::folder_problem(
+                &prompts,
+                Some(index),
+                &prompt.name,
+                Some(shown.folder.text().as_str()),
+                crate::utils::expand_tilde,
+            );
+            mark_entry(
+                &shown.folder,
+                &shown.folder_row,
+                folder_problem.as_deref(),
+                FOLDER_HELP,
+            );
         }
     }
 
@@ -579,10 +615,8 @@ impl Prompts {
         });
         let on_folder = Rc::clone(&commit_folder);
         on_commit(&fields.folder, move || on_folder());
-        if let Some(window) = self.window() {
-            let on_chosen = Rc::clone(&commit_folder);
-            fields.connect_choose(&window, move || on_chosen());
-        }
+        let on_chosen = Rc::clone(&commit_folder);
+        fields.connect_choose(move || on_chosen());
         let folder_entry = fields.folder.downgrade();
         fields.everywhere.connect_clicked(move |_| {
             if let Some(entry) = folder_entry.upgrade() {
@@ -636,14 +670,17 @@ impl Prompts {
             let this = Rc::clone(&this);
             glib::idle_add_local_once(move || this.rebuild());
         });
-        let apply = fields.apply.clone();
         let shown = PromptRow {
             row,
             named: vec![
                 (duplicate_named, "Duplicate"),
                 (delete_named, "Delete"),
-                (apply, "Apply the text of"),
+                (fields.apply.clone(), "Apply the text of"),
             ],
+            name: fields.name.clone(),
+            name_row: fields.name_row.clone(),
+            folder: fields.folder.clone(),
+            folder_row: fields.folder_row.clone(),
         };
         shown.name(&label);
         shown
@@ -652,12 +689,7 @@ impl Prompts {
     /// Says `text` on the Settings dialog's toast overlay; with `undo`, offers to put that
     /// removed prompt back where it was.
     fn toast(self: &Rc<Self>, text: &str, undo: Option<(usize, SavedPrompt)>) {
-        let Some(dialog) = self
-            .group
-            .upgrade()
-            .and_then(|g| g.ancestor(adw::PreferencesDialog::static_type()))
-            .and_downcast::<adw::PreferencesDialog>()
-        else {
+        let Some(group) = self.group.upgrade() else {
             return;
         };
         let toast = adw::Toast::new(&glib::markup_escape_text(text));
@@ -672,16 +704,33 @@ impl Prompts {
                 let Some(window) = this.window() else {
                     return;
                 };
-                window
+                let name = prompt.name.trim().to_owned();
+                let restored = window
                     .imp()
                     .config
                     .borrow_mut()
                     .restore_saved_prompt(index, prompt);
-                window.imp().schedule_config_save();
-                this.rebuild();
+                match restored {
+                    Ok(()) => {
+                        window.imp().schedule_config_save();
+                        this.rebuild();
+                    }
+                    Err(why) => this.toast(&format!("/{name} was not put back: {why}"), None),
+                }
             });
         }
-        dialog.add_toast(toast);
+        // The Settings dialog's own overlay; a group shown elsewhere uses the nearest one.
+        if let Some(dialog) = group
+            .ancestor(adw::PreferencesDialog::static_type())
+            .and_downcast::<adw::PreferencesDialog>()
+        {
+            dialog.add_toast(toast);
+        } else if let Some(overlay) = group
+            .ancestor(adw::ToastOverlay::static_type())
+            .and_downcast::<adw::ToastOverlay>()
+        {
+            overlay.add_toast(toast);
+        }
     }
 }
 
@@ -743,15 +792,23 @@ impl AgentTerminalWindow {
         group.add(&empty);
         group.add(&add_row);
         prompts.rebuild();
+        // A reload of the settings file that changes the prompts redraws the list from it.
+        let redraw = Rc::downgrade(&prompts);
+        *self.saved_prompts_redraw.borrow_mut() = Some(Rc::new(move || {
+            if let Some(prompts) = redraw.upgrade() {
+                prompts.rebuild();
+            }
+        }));
 
-        // As typed: each field shows its own problem (an empty field is not an error yet), and
-        // Add is offered only when the whole prompt could be saved.
+        // Each field shows its own problem. As typed (`strict` false) an empty field is not an
+        // error yet; on Add or Enter (`strict`) it is. Add is offered only when the whole prompt
+        // could be saved.
         let form = fields.form().downgrade();
-        let check = {
+        let check: Rc<dyn Fn(bool)> = {
             let form = form.clone();
             let window = self.obj().downgrade();
             let add = add.downgrade();
-            Rc::new(move || {
+            Rc::new(move |strict: bool| {
                 let (Some(fields), Some(window), Some(add)) =
                     (form.upgrade(), window.upgrade(), add.upgrade())
                 else {
@@ -761,7 +818,7 @@ impl AgentTerminalWindow {
                 let list = &config.saved_prompts;
                 let candidate = fields.candidate();
                 let folder = candidate.folder.as_deref();
-                let name_problem = (!candidate.name.is_empty())
+                let name_problem = (strict || !candidate.name.is_empty())
                     .then(|| {
                         saved_prompts::name_problem(
                             list,
@@ -773,25 +830,13 @@ impl AgentTerminalWindow {
                         )
                     })
                     .flatten();
-                mark_entry(
-                    &fields.name,
-                    &fields.name_row,
-                    name_problem.as_deref(),
-                    NAME_HELP,
-                );
-                let body_problem = (!candidate.body.is_empty())
+                let body_problem = (strict || !candidate.body.is_empty())
                     .then(|| saved_prompts::validate_body(&candidate.body).err())
                     .flatten();
                 mark_view(&fields.body, &fields.body_note, body_problem.as_deref());
                 let folder_problem = folder.and_then(|f| {
                     saved_prompts::validate_folder(&crate::utils::expand_tilde(f)).err()
                 });
-                mark_entry(
-                    &fields.folder,
-                    &fields.folder_row,
-                    folder_problem.as_deref(),
-                    FOLDER_HELP,
-                );
                 let whole = saved_prompts::candidate_problem(
                     list,
                     None,
@@ -799,18 +844,40 @@ impl AgentTerminalWindow {
                     agent_core::commands::builtins(),
                     crate::utils::expand_tilde,
                 );
+                // A problem no one field has (the count cap) is shown on the name.
+                let other = (strict
+                    && name_problem.is_none()
+                    && body_problem.is_none()
+                    && folder_problem.is_none())
+                .then(|| whole.clone())
+                .flatten();
+                mark_entry(
+                    &fields.name,
+                    &fields.name_row,
+                    name_problem.or(other).as_deref(),
+                    NAME_HELP,
+                );
+                mark_entry(
+                    &fields.folder,
+                    &fields.folder_row,
+                    folder_problem.as_deref(),
+                    FOLDER_HELP,
+                );
                 add.set_sensitive(whole.is_none());
                 add.set_tooltip_text(whole.as_deref());
             })
         };
         let on_name = Rc::clone(&check);
-        fields.name.connect_changed(move |_| on_name());
+        fields.name.connect_changed(move |_| on_name(false));
         let on_body = Rc::clone(&check);
-        fields.body.buffer().connect_changed(move |_| on_body());
+        fields
+            .body
+            .buffer()
+            .connect_changed(move |_| on_body(false));
         let on_folder = Rc::clone(&check);
-        fields.folder.connect_changed(move |_| on_folder());
+        fields.folder.connect_changed(move |_| on_folder(false));
         let on_chosen = Rc::clone(&check);
-        fields.connect_choose(&self.obj(), move || on_chosen());
+        fields.connect_choose(move || on_chosen(false));
         let folder_entry = fields.folder.downgrade();
         fields.everywhere.connect_clicked(move |_| {
             if let Some(entry) = folder_entry.upgrade() {
@@ -839,9 +906,10 @@ impl AgentTerminalWindow {
                             add_row.set_expanded(false);
                         }
                         prompts.rebuild();
-                        check();
+                        check(false);
                     }
-                    Err(why) => mark_entry(&fields.name, &fields.name_row, Some(&why), NAME_HELP),
+                    // Each field says what is wrong with it.
+                    Err(_) => check(true),
                 }
             })
         };
@@ -874,8 +942,8 @@ pub(super) mod tests {
 
     /// The Saved Prompts group, driven as a user drives it: a field is saved only when it is
     /// valid and committed, a refusal is shown on the field and saves nothing, an invalid entry
-    /// already in the file is listed and kept, and Duplicate and Delete change the list. Run
-    /// from the window test.
+    /// already in the file is listed and kept, Duplicate and Delete change the list, and an Undo
+    /// that would now clash is refused. Run from the window test.
     pub(in crate::window) fn the_saved_prompts_group_saves_only_what_is_valid(
         window: &crate::window::AgentTerminalWindow,
     ) {
@@ -888,7 +956,20 @@ pub(super) mod tests {
             ..Default::default()
         });
         let group = imp.saved_prompts_group();
+        // The toasts (Delete's Undo) go to the nearest overlay, as in the Settings dialog.
+        let overlay = adw::ToastOverlay::new();
+        overlay.set_child(Some(&group));
         let ctx = glib::MainContext::default();
+        // Focus leaving a field, as moving to another one does.
+        let leave = |widget: &gtk4::Widget| {
+            let controllers = widget.observe_controllers();
+            let focus = (0..controllers.n_items())
+                .filter_map(|i| controllers.item(i))
+                .find_map(|c| c.downcast::<gtk4::EventControllerFocus>().ok())
+                .expect("a focus controller");
+            focus.emit_by_name::<()>("leave", &[]);
+            crate::testutil::settle(&ctx);
+        };
         // In document order: the rows as listed, then the new-prompt form.
         let entries = || crate::testutil::find_all::<gtk4::Entry>(group.upcast_ref());
         let views = || crate::testutil::find_all::<gtk4::TextView>(group.upcast_ref());
@@ -915,6 +996,7 @@ pub(super) mod tests {
         assert_eq!(rows[0].title(), "/model");
         assert!(rows[0].subtitle().starts_with("Not offered"));
         assert!(rows[0].has_css_class("error"));
+        assert!(entries()[0].has_css_class("error"), "its name says so too");
 
         // The new-prompt form: Add is offered only for a whole valid prompt.
         let [_, _, new_name, new_folder]: [gtk4::Entry; 4] =
@@ -965,6 +1047,22 @@ pub(super) mod tests {
         assert_eq!(prompts()[1].name, "review2");
         assert!(!name.has_css_class("error"));
         assert_eq!(rows[1].title(), "/review2");
+        // Its controls are named after the new name.
+        assert!(crate::testutil::has_accessible_label(
+            nth("Duplicate", 1).upcast_ref(),
+            "Duplicate /review2"
+        ));
+        assert!(crate::testutil::has_accessible_label(
+            nth("Apply", 1).upcast_ref(),
+            "Apply the text of /review2"
+        ));
+        // Focus leaving the name commits it, as Enter does.
+        name.set_text("review3");
+        leave(name.upcast_ref());
+        assert_eq!(prompts()[1].name, "review3");
+        name.set_text("review2");
+        leave(name.upcast_ref());
+        assert_eq!(prompts()[1].name, "review2");
 
         // The text: a blank one is refused on Apply; another is kept exactly.
         let view = views()
@@ -977,8 +1075,13 @@ pub(super) mod tests {
         assert_eq!(prompts()[1].body, "Review {file}");
         assert!(view.has_css_class("error"));
         view.buffer().set_text("Notes for {branch}\n");
-        nth("Apply", 1).emit_clicked();
-        crate::testutil::settle(&ctx);
+        assert_eq!(
+            prompts()[1].body,
+            "Review {file}",
+            "nothing saved while typing"
+        );
+        // Focus leaving the text commits it, as Apply does.
+        leave(view.upcast_ref());
         assert_eq!(prompts()[1].body, "Notes for {branch}\n");
 
         // The folder: relative refused, absolute saved, Everywhere clears it.
@@ -990,8 +1093,10 @@ pub(super) mod tests {
         commit(&folder, "not/absolute");
         assert_eq!(prompts()[1].folder, None);
         assert!(folder.has_css_class("error"));
-        commit(&folder, "/w/app");
+        folder.set_text("/w/app");
+        leave(folder.upcast_ref());
         assert_eq!(prompts()[1].folder.as_deref(), Some("/w/app"));
+        assert!(!folder.has_css_class("error"));
         assert_eq!(rows[1].subtitle(), "Only in /w/app");
         nth("Everywhere", 1).emit_clicked();
         crate::testutil::settle(&ctx);
@@ -1015,6 +1120,34 @@ pub(super) mod tests {
         assert_eq!(prompts().len(), 2);
         assert_eq!(expanders().len(), 3, "its row is gone");
 
+        // A prompt of the deleted one's name is added meanwhile: its Undo is refused, and the
+        // new one stays as it is, offered.
+        new_name.set_text("review2-copy");
+        new_body.buffer().set_text("the new one");
+        crate::testutil::settle(&ctx);
+        add.emit_clicked();
+        crate::testutil::settle(&ctx);
+        assert_eq!(prompts().len(), 3);
+        let before_undo = prompts();
+        let undo = crate::testutil::pump_until(&ctx, 10, || {
+            crate::testutil::find_all::<gtk4::Button>(overlay.upcast_ref())
+                .iter()
+                .any(|b| b.label().as_deref() == Some("Undo"))
+        });
+        assert!(undo, "Delete offers Undo");
+        let undo = crate::testutil::find_all::<gtk4::Button>(overlay.upcast_ref())
+            .into_iter()
+            .find(|b| b.label().as_deref() == Some("Undo"))
+            .expect("the Undo button");
+        undo.emit_clicked();
+        crate::testutil::settle(&ctx);
+        assert_eq!(prompts(), before_undo, "a clashing Undo changes nothing");
+        assert!(
+            !expanders()[2].has_css_class("error"),
+            "the new one is offered"
+        );
+
+        overlay.set_child(None::<&gtk4::Widget>);
         imp.config.borrow_mut().saved_prompts = before;
     }
 }

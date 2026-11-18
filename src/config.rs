@@ -1974,14 +1974,32 @@ impl TerminalConfig {
     }
 
     /// Puts a removed saved prompt back at `index` (or the end), exactly as it was: an undo
-    /// never changes or drops what it restores, even if it is not valid now.
+    /// never changes what it restores, and one that was not valid (a hand edit) may come back
+    /// as it was. Refused, leaving the list as it is, when another prompt now has its name for
+    /// the same folder (the one added meanwhile would stop being offered) or the list is full.
     pub fn restore_saved_prompt(
         &mut self,
         index: usize,
         prompt: agent_core::saved_prompts::SavedPrompt,
-    ) {
+    ) -> Result<(), String> {
+        if self.saved_prompts.len() >= agent_core::saved_prompts::MAX_PROMPTS {
+            return Err(format!(
+                "there can be at most {} saved prompts",
+                agent_core::saved_prompts::MAX_PROMPTS
+            ));
+        }
+        if let Some(why) = agent_core::saved_prompts::clash(
+            &self.saved_prompts,
+            None,
+            &prompt.name,
+            prompt.folder.as_deref(),
+            crate::utils::expand_tilde,
+        ) {
+            return Err(why);
+        }
         let index = index.min(self.saved_prompts.len());
         self.saved_prompts.insert(index, prompt);
+        Ok(())
     }
 
     /// Gives every profile a valid, unique id. A missing (or malformed) id is assigned once; of
@@ -2478,9 +2496,35 @@ mod tests {
         // Remove and undo: back exactly where and as it was, invalid or not.
         let removed = cfg.remove_saved_prompt(0).unwrap();
         assert_eq!(removed.name, "model");
-        cfg.restore_saved_prompt(0, removed.clone());
+        cfg.restore_saved_prompt(0, removed.clone()).unwrap();
         assert_eq!(cfg.saved_prompts[0], removed);
         assert!(cfg.remove_saved_prompt(99).is_none());
+
+        // An undo into a slot now taken: refused, and the prompt added meanwhile stays first.
+        let at = cfg
+            .saved_prompts
+            .iter()
+            .position(|p| p.name == "tidy")
+            .unwrap();
+        let tidy = cfg.remove_saved_prompt(at).unwrap();
+        cfg.add_saved_prompt(prompt("Tidy", "the new one", None))
+            .unwrap();
+        let before = cfg.saved_prompts.clone();
+        let refused = cfg.restore_saved_prompt(0, tidy.clone());
+        assert!(refused.is_err_and(|why| why.contains("already")));
+        assert_eq!(cfg.saved_prompts, before, "a refused undo changes nothing");
+        // Nor past the cap.
+        let mut full = TerminalConfig {
+            saved_prompts: (0..agent_core::saved_prompts::MAX_PROMPTS)
+                .map(|i| prompt(&format!("p{i}"), "x", None))
+                .collect(),
+            ..TerminalConfig::default()
+        };
+        assert!(full.restore_saved_prompt(0, tidy).is_err());
+        assert_eq!(
+            full.saved_prompts.len(),
+            agent_core::saved_prompts::MAX_PROMPTS
+        );
 
         // The invalid entry survives a save and a load untouched.
         let dir = tempfile::tempdir().unwrap();

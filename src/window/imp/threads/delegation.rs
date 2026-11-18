@@ -95,7 +95,8 @@ fn tab_open_in(path: &std::path::Path) -> bool {
             .tabs
             .borrow()
             .iter()
-            .any(|tab| std::path::Path::new(&tab.dir).starts_with(path))
+            // A page on another machine is in no folder here.
+            .any(|tab| tab.remote.is_none() && std::path::Path::new(&tab.dir).starts_with(path))
     })
 }
 

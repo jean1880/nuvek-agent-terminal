@@ -359,6 +359,9 @@ pub struct SessionStatus {
     /// another machine, which reads an image from a path ([`agent_core::remote::takes_images`]).
     /// `capabilities.image_input` is then false too.
     pub images_refused: Option<&'static str>,
+    /// The thread's agent runs on another machine: dangerous permissive mode is refused and
+    /// only web links open from its transcript.
+    pub remote: bool,
 }
 
 /// Where a backend delivers envelopes (the view's `apply`). Called on the main thread.

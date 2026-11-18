@@ -484,6 +484,27 @@ fn takes_checkpoints(enabled: bool, remote: Option<&RemoteTab>) -> bool {
     enabled && remote.is_none()
 }
 
+/// `env` (`KEY=value` entries) without the variables only the app may give an agent: the
+/// delegation markers and credentials (`STRIP_ON_SPAWN`), the approval socket and the hook
+/// binary's path. What every `ssh` to another machine starts in.
+pub(super) fn ssh_env_from(mut env: Vec<String>) -> Vec<String> {
+    let own: Vec<&str> = agent_core::delegation::env::STRIP_ON_SPAWN
+        .iter()
+        .copied()
+        .chain([
+            agent_core::approval::ENV_SOCKET,
+            crate::approval_server::ENV_HOOK_BIN,
+        ])
+        .collect();
+    env.retain(|entry| {
+        let name = entry
+            .split_once('=')
+            .map_or(entry.as_str(), |(name, _)| name);
+        !own.contains(&name)
+    });
+    env
+}
+
 /// Whether a page is saved for Reopen Terminal Tabs: a local terminal page. A remote page never
 /// is, so no `ssh` starts at launch without the user asking.
 fn restorable(tab: &TabState) -> bool {
@@ -4918,6 +4939,14 @@ impl AgentTerminalWindow {
         env_strs
     }
 
+    /// The environment of every `ssh` the app starts for another machine (a remote page or
+    /// drawer, Check, a thread's probe and folder check): [`Self::terminal_env`] without what
+    /// only the app may hand an agent ([`ssh_env_from`]), so a `SendEnv` in the user's ssh
+    /// configuration can never carry an approval socket or a delegation credential there.
+    pub(super) fn ssh_env(&self) -> Vec<String> {
+        ssh_env_from(self.terminal_env())
+    }
+
     /// Starts a remote page's `ssh -t` in `terminal`: the argv of
     /// [`agent_core::remote::ssh_tty_argv`] with the local `ssh` resolved on `PATH` (off the
     /// main thread), no shell around it, in [`Self::terminal_env`] exactly. No profile env file,
@@ -4939,7 +4968,7 @@ impl AgentTerminalWindow {
             }
         };
         reveal_on_first_output(terminal, stack);
-        let env_strs = self.terminal_env();
+        let env_strs = self.ssh_env();
         let work_dir = work_dir.to_string();
         glib::MainContext::default().spawn_local(glib::clone!(
             #[weak]
@@ -6203,6 +6232,15 @@ impl AgentTerminalWindow {
     /// named in the new session's opening prompt. The source tab is left as it
     /// is, so its session can be resumed once its quota resets.
     fn continue_in(&self, target_name: &str) {
+        // A page on another machine is never handed to another agent or profile here, nor its
+        // brief built from this machine's files.
+        if self
+            .selected_page()
+            .is_some_and(|page| self.page_is_remote(&page))
+        {
+            self.show_toast(threads::REMOTE_KEEPS_AGENT);
+            return;
+        }
         let target = self.profile_named(target_name);
         // A thread hands itself over in place: budgeted, fenced, redacted, shown as a switch
         // divider. That needs no prompt arguments (the handoff rides on the next message), so it
@@ -6726,14 +6764,21 @@ impl AgentTerminalWindow {
         // diff-panel comments and the thread's folder/repo for file-change-card comments.
         let weak_root = panel.root.downgrade();
         panel.connect_review_check(move |asks, done| {
+            // A page on another machine has no working files here to check comments against:
+            // every comment is unchecked (`NoRepository`), and nothing local is read.
             let place = weak_root.upgrade().and_then(|root| {
-                window_of(&root)?.imp().tab_by_panel(&root, |t| {
-                    let repo = t
-                        .diff_panel
-                        .shown_repo()
-                        .unwrap_or_else(|| t.repo_dir().into());
-                    (t.dir.clone(), repo)
-                })
+                window_of(&root)?
+                    .imp()
+                    .tab_by_panel(&root, |t| {
+                        t.remote.is_none().then(|| {
+                            let repo = t
+                                .diff_panel
+                                .shown_repo()
+                                .unwrap_or_else(|| t.repo_dir().into());
+                            (t.dir.clone(), repo)
+                        })
+                    })
+                    .flatten()
             });
             glib::MainContext::default().spawn_local(async move {
                 let unchecked = vec![
@@ -7084,10 +7129,25 @@ impl AgentTerminalWindow {
         }
     }
 
+    /// Whether `panel_root`'s page is on another machine, said in a toast when it is: its diff
+    /// panel reads and opens nothing of this machine's (a remote page's `dir` is `ssh://`).
+    fn refuse_remote_panel(&self, panel_root: &gtk4::Box) -> bool {
+        let remote = self
+            .tab_by_panel(panel_root, |t| t.remote.is_some())
+            .unwrap_or(false);
+        if remote {
+            self.show_toast(NOT_ON_REMOTE);
+        }
+        remote
+    }
+
     /// "Open a PR" in a diff panel: opens GitHub's compare page for the branch in the browser.
     /// A branch whose commits are not all on its remote is pushed first (never forced), once the
     /// user confirms it; one never pushed can only be pushed, since its page would be empty.
     fn open_pull_request(&self, panel_root: &gtk4::Box, state: agent_kit::github::PrState) {
+        if self.refuse_remote_panel(panel_root) {
+            return;
+        }
         let Some((page, dir, panel)) = self.tab_by_panel(panel_root, |t| {
             (t.page.clone(), t.repo_dir(), t.diff_panel.clone())
         }) else {
@@ -7194,6 +7254,9 @@ impl AgentTerminalWindow {
     /// Opens a diff-panel file in the external diff tool, off the main thread. A missing tool or
     /// binary, or any failure, is a toast.
     fn open_panel_file(&self, panel_root: &gtk4::Box, file: super::diff_panel::OpenFile) {
+        if self.refuse_remote_panel(panel_root) {
+            return;
+        }
         let Some(tool) = crate::diff_tool::DiffTools::shared().get() else {
             self.show_toast(crate::diff_tool::NO_TOOL_HINT);
             return;
@@ -7229,6 +7292,9 @@ impl AgentTerminalWindow {
     /// first, over the panel (in whichever window it is in). Everything that touches the disk
     /// runs off the main thread; a failure is a toast.
     fn open_panel_file_in_editor(&self, panel_root: &gtk4::Box, file: super::diff_panel::EditFile) {
+        if self.refuse_remote_panel(panel_root) {
+            return;
+        }
         let Some((folder, repo, parent)) = self.tab_by_panel(panel_root, |t| {
             (t.dir.clone(), t.repo_dir(), t.diff_panel.dialog_parent())
         }) else {
@@ -7678,11 +7744,12 @@ impl AgentTerminalWindow {
     fn worktree_in_use(&self, path: &std::path::Path) -> bool {
         let in_use = std::cell::Cell::new(false);
         self.for_each_window(|window| {
+            // A page on another machine is in no local worktree, whatever its `ssh://` folder.
             if window
                 .tabs
                 .borrow()
                 .iter()
-                .any(|t| std::path::Path::new(&t.dir).starts_with(path))
+                .any(|t| t.remote.is_none() && std::path::Path::new(&t.dir).starts_with(path))
             {
                 in_use.set(true);
             }
@@ -7727,6 +7794,11 @@ impl AgentTerminalWindow {
     /// `target` would do, and does it only if confirmed. `to` finishes
     /// "Puts … back to" in the confirmation.
     fn confirm_restore(&self, page: &adw::TabPage, target: String, to: &'static str) {
+        // Undo restores this machine's working tree: a page on another machine has none here.
+        if self.page_is_remote(page) {
+            self.show_toast(NOT_ON_REMOTE);
+            return;
+        }
         let Some((dir, key, mid_turn)) = self.with_page_tab(page, |t| {
             let quiet_for = t.last_output.get().elapsed();
             (t.dir.clone(), t.key, quiet_for < CHECKPOINT_QUIET)
@@ -9139,6 +9211,25 @@ mod tests {
 
     /// The bell handler, the quiet-output poll and Checkpoint Now all ask `takes_checkpoints`
     /// first: a remote page's working tree is never handed to the local git.
+    /// Every `ssh` to another machine starts without what only an agent may be given, whatever
+    /// the app itself inherited: a `SendEnv` there could otherwise forward it.
+    #[test]
+    fn an_ssh_to_another_machine_never_inherits_an_agents_credentials() {
+        let mut env = vec![
+            "PATH=/usr/bin".to_owned(),
+            "HOME=/home/me".to_owned(),
+            format!("{}=/run/socket", agent_core::approval::ENV_SOCKET),
+            format!("{}=/usr/bin/hook", crate::approval_server::ENV_HOOK_BIN),
+        ];
+        for name in agent_core::delegation::env::STRIP_ON_SPAWN {
+            env.push(format!("{name}=secret"));
+        }
+        assert_eq!(
+            ssh_env_from(env),
+            ["PATH=/usr/bin".to_owned(), "HOME=/home/me".to_owned()]
+        );
+    }
+
     #[test]
     fn remote_tab_takes_no_checkpoint_on_bell() {
         let remote = RemoteTab {

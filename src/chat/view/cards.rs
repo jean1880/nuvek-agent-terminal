@@ -263,9 +263,13 @@ pub(super) type LinkSink = Rc<RefCell<Option<Rc<dyn Fn(agent_kit::editor::Locati
 /// opens nothing. So no local path ever reaches the system's handler for URIs.
 pub(super) fn route_file_links(label: &gtk4::Label, links: &LinkSink) {
     let links = Rc::clone(links);
-    label.connect_activate_link(move |_, uri| {
+    label.connect_activate_link(move |label, uri| {
         use agent_kit::editor::LinkAction;
         match agent_kit::editor::link_action(uri) {
+            // In a thread on another machine, a link the other machine wrote reaches this one's
+            // handler only when it is a plain web link (no `mailto:`, no `user@` authority, no
+            // hidden characters).
+            LinkAction::System if !system_link_allowed(label, uri) => glib::Propagation::Stop,
             LinkAction::System => glib::Propagation::Proceed,
             LinkAction::Refuse => glib::Propagation::Stop,
             LinkAction::Open(location) => {
@@ -277,6 +281,23 @@ pub(super) fn route_file_links(label: &gtk4::Label, links: &LinkSink) {
             }
         }
     });
+}
+
+/// Whether `uri`, a link [`agent_kit::editor::link_action`] would hand the system, may go there
+/// from `label`: always, unless the label is in a thread on another machine
+/// ([`super::ChatView::web_links_only`]), where only
+/// [`agent_core::remote::remote_link_allowed`] links do.
+fn system_link_allowed(label: &gtk4::Label, uri: &str) -> bool {
+    let remote = label
+        .ancestor(super::ChatView::static_type())
+        .and_downcast::<super::ChatView>()
+        .is_some_and(|view| view.web_links_only());
+    system_link_allowed_for(remote, uri)
+}
+
+/// [`system_link_allowed`] once it is known whether the thread is remote.
+fn system_link_allowed_for(remote: bool, uri: &str) -> bool {
+    !remote || agent_core::remote::remote_link_allowed(uri)
 }
 
 /// Guards a label whose markup came from [`super::markdown`] outside any thread (no file to
@@ -3681,6 +3702,30 @@ pub(super) fn pattern_error(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A link the system would open: any in a local thread, only a plain web link in a thread on
+    /// another machine, whose transcript the other machine wrote.
+    #[test]
+    fn a_remote_threads_transcript_hands_the_system_only_plain_web_links() {
+        for refused in [
+            "mailto:me@example.com",
+            "https://good.example@evil.example/",
+            "https:///etc/passwd",
+            "https://exa\u{202e}mple.com",
+            "https://user:pass@example.com/",
+        ] {
+            assert!(
+                matches!(
+                    agent_kit::editor::link_action(refused),
+                    agent_kit::editor::LinkAction::System | agent_kit::editor::LinkAction::Refuse
+                ),
+                "{refused}"
+            );
+            assert!(!system_link_allowed_for(true, refused), "{refused}");
+        }
+        assert!(system_link_allowed_for(true, "https://example.com/docs"));
+        assert!(system_link_allowed_for(false, "mailto:me@example.com"));
+    }
 
     #[test]
     fn only_a_visible_stale_view_is_parsed_again_at_once() {

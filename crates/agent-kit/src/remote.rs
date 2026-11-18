@@ -16,6 +16,9 @@ use agent_core::remote::{self, BatchFailure, RemoteProbe};
 /// The most either question may take, `ssh`'s own connect timeout included.
 pub const TIMEOUT_SECS: u64 = 15;
 
+/// The most of each of stdout and stderr kept from either question.
+pub const MAX_OUTPUT: usize = 256 * 1024;
+
 /// Why a question to another machine got no answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteError {
@@ -62,12 +65,16 @@ impl Ssh {
             .env_clear()
             .stdin(std::process::Stdio::null());
         command.envs(self.env.iter().filter_map(|entry| entry.split_once('=')));
-        let out = crate::exec::run_command(command, "ssh", TIMEOUT_SECS).map_err(|why| {
-            RemoteError::Ssh(BatchFailure {
-                reason: agent_core::redact::redact(&why),
-                needs_terminal: false,
-            })
-        })?;
+        // Its own process group, so a `ProxyCommand` it started dies with it on timeout, and
+        // at most `MAX_OUTPUT` of what the other machine prints is kept.
+        let out =
+            crate::exec::run_command_in_group_capped(command, "ssh", TIMEOUT_SECS, MAX_OUTPUT)
+                .map_err(|why| {
+                    RemoteError::Ssh(BatchFailure {
+                        reason: agent_core::redact::redact(&why),
+                        needs_terminal: false,
+                    })
+                })?;
         if !out.status.success() {
             return Err(RemoteError::Ssh(remote::batch_failure(
                 out.status.code(),
@@ -117,8 +124,19 @@ pub fn probe(ssh: &Ssh, alias: &str, cli: &str) -> Result<RemoteProbe, RemoteErr
     Ok(found)
 }
 
-/// The canonical absolute path of `dir` (as typed: `~` allowed) on `alias`.
-pub fn check_folder(ssh: &Ssh, alias: &str, dir: &str) -> Result<String, RemoteError> {
+/// The canonical absolute path of `dir` (as typed: `~` allowed) on `alias`. Asked only after a
+/// probe there found a POSIX login shell (`probe`, the proof): the folder's quoting is POSIX.
+pub fn check_folder(
+    ssh: &Ssh,
+    alias: &str,
+    dir: &str,
+    probe: &RemoteProbe,
+) -> Result<String, RemoteError> {
+    if !remote::posix_shell(&probe.shell) {
+        return Err(RemoteError::Refused(
+            "The login shell there is not a POSIX shell".to_owned(),
+        ));
+    }
     let command = remote::folder_command(dir).map_err(RemoteError::Refused)?;
     let argv = remote::ssh_batch_argv(alias, command).map_err(RemoteError::Refused)?;
     let stdout = ssh.run(&argv)?;
@@ -201,11 +219,67 @@ mod tests {
         // The folder check gives the canonical path, and a missing folder fails.
         let canonical = std::fs::canonicalize(&work).unwrap();
         assert_eq!(
-            check_folder(&ssh, &alias, "~/my 'src'").unwrap(),
+            check_folder(&ssh, &alias, "~/my 'src'", &found).unwrap(),
             canonical.to_string_lossy()
         );
-        assert!(check_folder(&ssh, &alias, "/nonexistent/agent-kit").is_err());
-        assert!(check_folder(&ssh, "-oProxyCommand=x", "~").is_err());
+        assert!(check_folder(&ssh, &alias, "/nonexistent/agent-kit", &found).is_err());
+        assert!(check_folder(&ssh, "-oProxyCommand=x", "~", &found).is_err());
+    }
+
+    /// The folder check's quoting is POSIX: it is never sent to a machine whose login shell is
+    /// not (fish would read `\'` inside quotes as an escaped quote), and ssh is never run.
+    #[test]
+    fn the_folder_check_needs_a_posix_login_shell() {
+        let base = tempfile::tempdir().unwrap();
+        let ran = base.path().join("ran");
+        let script = base.path().join("ssh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\n: > '{}'\necho /srv\n", ran.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ssh = Ssh {
+            program: script.to_string_lossy().into_owned(),
+            env: Vec::new(),
+        };
+        for shell in [
+            "/usr/bin/fish",
+            "/usr/bin/nu",
+            "/usr/bin/pwsh",
+            "/bin/tcsh",
+            "",
+        ] {
+            let probe = RemoteProbe {
+                shell: shell.into(),
+                path: "/usr/bin".into(),
+                cli: "/usr/bin/claude".into(),
+            };
+            let refused = check_folder(&ssh, "box", "~/a'b", &probe).unwrap_err();
+            assert!(refused.reason().contains("POSIX"), "{shell}");
+        }
+        assert!(!ran.exists(), "ssh never ran");
+    }
+
+    /// What the other machine prints is kept only up to [`MAX_OUTPUT`].
+    #[test]
+    fn a_flood_of_output_from_the_other_machine_is_capped() {
+        let base = tempfile::tempdir().unwrap();
+        let script = base.path().join("ssh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ni=0\nwhile [ $i -lt 40000 ]; do echo 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; \
+             i=$((i+1)); done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ssh = Ssh {
+            program: script.to_string_lossy().into_owned(),
+            env: vec!["PATH=/usr/bin:/bin".into()],
+        };
+        let out = ssh.run(&["ssh".to_owned()]).unwrap();
+        assert!(out.len() <= MAX_OUTPUT, "{}", out.len());
+        assert!(out.len() > MAX_OUTPUT / 2);
     }
 
     #[test]

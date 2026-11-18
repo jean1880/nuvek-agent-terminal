@@ -733,6 +733,13 @@ impl ChatView {
     }
 
     /// Whether the composer holds unsent text (a thread with one is not blank).
+    /// Whether this thread's agent runs on another machine: its transcript opens only the web
+    /// links [`agent_core::remote::remote_link_allowed`] accepts.
+    pub fn web_links_only(&self) -> bool {
+        self.inner()
+            .is_some_and(|inner| inner.backend.status().remote)
+    }
+
     pub fn has_draft(&self) -> bool {
         self.inner()
             .is_some_and(|inner| !inner.composer.text().trim().is_empty())
@@ -1513,6 +1520,9 @@ impl Inner {
     /// picker shows the mode still running; Cancel (the default, and Escape) changes nothing.
     fn confirm_bypass(self: &Rc<Self>) {
         self.refresh_status();
+        if self.refuse_remote_bypass() {
+            return;
+        }
         let weak = Rc::downgrade(self);
         panels::confirm_bypass(&self.header.mode, self.backend.status().driver, move || {
             if let Some(inner) = weak.upgrade() {
@@ -1521,8 +1531,26 @@ impl Inner {
         });
     }
 
+    /// A thread on another machine offers no dangerous permissive mode: says why, keeps the
+    /// picker on the running mode, and is true (nothing is asked of the backend or the user).
+    fn refuse_remote_bypass(self: &Rc<Self>) -> bool {
+        if !self.backend.status().remote {
+            return false;
+        }
+        let changes = self
+            .model
+            .borrow_mut()
+            .push_notice(crate::chat::session::REMOTE_NO_BYPASS, Tone::Warning);
+        self.handle(changes);
+        self.refresh_status();
+        true
+    }
+
     /// Asks the backend for `mode`; false when the agent has no such mode (nothing was asked).
     fn set_mode(self: &Rc<Self>, mode: Mode, header_pick: bool) -> bool {
+        if mode == Mode::Bypass && self.refuse_remote_bypass() {
+            return false;
+        }
         let status = self.backend.status();
         let caps = &status.capabilities;
         if mode == Mode::Plan && !caps.plan_mode {
@@ -2520,6 +2548,7 @@ pub(crate) mod tests {
             capabilities: agent_core::caps::Capabilities::of(driver),
             commands: Vec::new(),
             images_refused: None,
+            remote: false,
         }
     }
 
@@ -6485,6 +6514,7 @@ pub(crate) mod tests {
                 capabilities: caps.clone(),
                 commands: Vec::new(),
                 images_refused: None,
+                remote: false,
             };
             for feature in agent_core::caps::Feature::ALL {
                 if let Some(note) = caps.unsupported_note(feature, name) {
@@ -6557,6 +6587,7 @@ pub(crate) mod tests {
             capabilities: agent_core::caps::Capabilities::codex(),
             commands: Vec::new(),
             images_refused: None,
+            remote: false,
         };
         let note = unavailable_builtin_note("/mcp", &status).expect("a note");
         assert!(note.ends_with("has no MCP panel."), "{note}");

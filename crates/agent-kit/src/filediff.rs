@@ -523,6 +523,9 @@ pub fn agent_edit_only(input: &serde_json::Value) -> Result<Shown, String> {
         omitted_lines,
         clipped: preview.iter().any(|edit| edit.clipped),
         files,
+        // No repository here: its paths are as the agent named them there, and no card review
+        // comment can be anchored to a file on this machine.
+        root: None,
     })
 }
 
@@ -1123,6 +1126,7 @@ mod remote_tests {
         });
         let shown = agent_edit_only(&edit).unwrap();
         assert_eq!(shown.origin, Origin::AgentEdit);
+        assert_eq!(shown.root, None, "no local repository is named");
         assert!(!shown.text.contains("LOCAL CONTENT"), "{}", shown.text);
         assert!(shown.text.contains("+b"), "{}", shown.text);
         // No diff of its own: refused, the local file still unread.

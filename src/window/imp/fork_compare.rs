@@ -86,6 +86,10 @@ pub(super) fn stored_baseline(store: &Store, thread: &str) -> Option<(String, St
 /// Deletes deleted fork `thread`'s baseline ref in the repository of `dir`, off the main
 /// thread, while it still points at `commit`.
 pub(super) fn drop_fork_baseline(dir: String, thread: String, commit: String) {
+    // A fork on another machine took no baseline here: no local git is run for its folder.
+    if agent_core::remote::is_remote_cwd(&dir) {
+        return;
+    }
     glib::MainContext::default().spawn_local(async move {
         let dropped = off_main("the fork baseline", move || {
             crate::git::drop_fork_baseline(Path::new(&dir), &thread, &commit)

@@ -114,8 +114,27 @@ impl RemoteHost {
 
 /// Whether `alias` may be handed to `ssh`: 1 to [`MAX_ALIAS_LEN`] characters of
 /// `[A-Za-z0-9._@:-]`, not starting with `-` (which ssh would read as an option, `-oProxyCommand=`
-/// above all). The `--` before it in every argv is a second guard, not the only one.
+/// above all), with at most one `@`, and then a user and a host that are both non-empty and
+/// neither starting with `-` (`me@-v` would hand ssh `-v` as the host). The `--` before it in
+/// every argv is a second guard, not the only one.
 pub fn validate_alias(alias: &str) -> Result<(), String> {
+    validate_alias_chars(alias)?;
+    if let Some((user, host)) = alias.split_once('@') {
+        if host.contains('@') {
+            return Err("A name holds at most one “@”".into());
+        }
+        if user.is_empty() || host.is_empty() {
+            return Err("Write user@host with both a user and a host".into());
+        }
+        if user.starts_with('-') || host.starts_with('-') {
+            return Err("Neither the user nor the host can start with “-”".into());
+        }
+    }
+    Ok(())
+}
+
+/// [`validate_alias`]'s length and character rules.
+fn validate_alias_chars(alias: &str) -> Result<(), String> {
     if alias.is_empty() {
         return Err("Enter the machine's ssh name (a Host alias, host name or user@host)".into());
     }
@@ -476,12 +495,26 @@ const PROBE_SHELL: &str = "__agent_terminal_shell=";
 const PROBE_PATH: &str = "__agent_terminal_path=";
 const PROBE_CLI: &str = "__agent_terminal_cli=";
 
+/// The login shells a thread on another machine runs under, by name: POSIX shells only. The
+/// account's login shell parses the thread's command line (`cd -- '…' && exec …`), and the
+/// quoting that keeps every value literal ([`sh_quote`]) holds only for a POSIX shell: in fish,
+/// `\'` inside single quotes is an escaped quote, so a folder, path or argument could close the
+/// quote and run there. csh, tcsh, fish, nu, elvish, xonsh, pwsh and any shell not listed are
+/// refused.
+pub const POSIX_SHELLS: &[&str] = &["sh", "bash", "zsh", "ksh", "dash", "ash", "mksh", "yash"];
+
+/// Whether `shell` (a path, as `$SHELL` names it) is one of [`POSIX_SHELLS`].
+pub fn posix_shell(shell: &str) -> bool {
+    let name = shell.rsplit('/').next().unwrap_or_default();
+    !shell.is_empty() && POSIX_SHELLS.contains(&name)
+}
+
 /// The remote command of the probe for `cli` (a bare command name). Read by whatever login
 /// shell the account has, so it is written to parse the same in csh: one line, a single-quoted
 /// `/bin/sh` script with no `'` or `!` in it. The script says the login shell, stops there for
-/// csh and tcsh, and otherwise asks a login shell (`-l`, never interactive, its input empty) for
-/// its `PATH` and where `cli` is on it. Markers set the answers apart from anything a profile
-/// prints.
+/// any shell not in [`POSIX_SHELLS`], and otherwise asks a login shell (`-l`, never
+/// interactive, its input empty) for its `PATH` and where `cli` is on it. Markers set the
+/// answers apart from anything a profile prints.
 pub fn probe_command(cli: &str) -> Result<String, String> {
     if cli.is_empty()
         || !cli
@@ -493,15 +526,17 @@ pub fn probe_command(cli: &str) -> Result<String, String> {
     }
     Ok(format!(
         "exec /bin/sh -c 'printf \"{PROBE_SHELL}%s\\n\" \"$SHELL\"; case \"${{SHELL##*/}}\" in \
-         csh|tcsh) exit 0;; esac; exec \"$SHELL\" -lc \"printf \\\"{PROBE_PATH}%s\\\\n\\\" \
+         {shells}) ;; *) exit 0;; esac; exec \"$SHELL\" -lc \"printf \\\"{PROBE_PATH}%s\\\\n\\\" \
          \\\"\\$PATH\\\"; printf \\\"{PROBE_CLI}%s\\\\n\\\" \\\"\\$(command -v {cli})\\\"\" \
-         </dev/null'"
+         </dev/null'",
+        shells = POSIX_SHELLS.join("|")
     ))
 }
 
-/// What the probe printed, as a [`RemoteProbe`], or why the agent cannot run there: a csh or
-/// tcsh login shell (the thread's command line is POSIX), no `PATH`, or `cli` not found on it.
-/// What the other machine printed is redacted before it is quoted.
+/// What the probe printed, as a [`RemoteProbe`], or why the agent cannot run there: a login
+/// shell not in [`POSIX_SHELLS`] (the thread's command line is POSIX), no `PATH`, or `cli` not
+/// found on it (or not a plain absolute path). What the other machine printed is redacted before
+/// it is quoted.
 pub fn parse_probe(cli: &str, stdout: &str) -> Result<RemoteProbe, String> {
     let field = |marker: &str| {
         stdout
@@ -512,11 +547,18 @@ pub fn parse_probe(cli: &str, stdout: &str) -> Result<RemoteProbe, String> {
     };
     let shell = field(PROBE_SHELL)
         .ok_or_else(|| "The other machine did not say what its login shell is".to_owned())?;
-    let name = shell.rsplit('/').next().unwrap_or_default();
-    if matches!(name, "csh" | "tcsh") {
+    if !posix_shell(&shell) {
+        let name = crate::text::truncate_bytes(
+            &crate::text::without_hidden(&crate::redact::redact(
+                shell.rsplit('/').next().unwrap_or_default(),
+            )),
+            60,
+        )
+        .to_owned();
         return Err(format!(
-            "The login shell there is {name}; a thread on another machine needs a POSIX shell \
-             (sh, bash, zsh, ksh, dash)"
+            "The login shell there is “{name}”; a thread on another machine needs a POSIX \
+             login shell ({})",
+            POSIX_SHELLS.join(", ")
         ));
     }
     let path = field(PROBE_PATH).unwrap_or_default();
@@ -531,11 +573,7 @@ pub fn parse_probe(cli: &str, stdout: &str) -> Result<RemoteProbe, String> {
              the PATH a login shell gets"
         ));
     }
-    if !found.starts_with('/')
-        || found.len() > MAX_DIR_LEN
-        || crate::text::has_control_or_bidi(&found, &[])
-        || crate::text::has_hidden(&found)
-    {
+    if !plain_cli_path(&found) {
         let shown = crate::text::truncate_bytes(
             &crate::text::without_hidden(&crate::redact::redact(&found)),
             120,
@@ -548,6 +586,23 @@ pub fn parse_probe(cli: &str, stdout: &str) -> Result<RemoteProbe, String> {
         path,
         cli: found,
     })
+}
+
+/// Whether a probed CLI path can follow `env` in the command line: absolute, bounded, with no
+/// control or invisible character and no `=` (which `env` would take for an assignment).
+fn plain_cli_path(cli: &str) -> bool {
+    cli.starts_with('/')
+        && cli.len() <= MAX_DIR_LEN
+        && !cli.contains('=')
+        && !crate::text::has_control_or_bidi(cli, &[])
+        && !crate::text::has_hidden(cli)
+}
+
+/// Whether an adapter argument (a model, a session id, a flag) can go on the command line
+/// there: no control, bidi or invisible character, a NUL above all, which no argv can carry.
+/// A model or session id the other machine reported comes back as one of these.
+pub fn plain_arg(arg: &str) -> bool {
+    !crate::text::has_control_or_bidi(arg, &[]) && !crate::text::has_hidden(arg)
 }
 
 /// The remote command of the folder check: `cd -- '<dir>' && pwd -P` (the folder as typed,
@@ -578,15 +633,28 @@ pub fn ssh_batch_argv(alias: &str, remote: String) -> Result<Vec<String>, String
 
 /// The argv of a chat thread's agent on another machine: `ssh` + [`BATCH_OPTIONS`] + `--` + the
 /// alias + `cd -- '<dir>' && exec env PATH='<probed>' '<cli>' '<arg>'…`, every value quoted.
-/// `args` are the adapter's arguments after its program, which the probed CLI replaces.
+/// `args` are the adapter's arguments after its program, which the probed CLI replaces. Refused
+/// unless the probe found a POSIX login shell ([`posix_shell`]: the quoting is POSIX), a plain
+/// CLI path and a usable `PATH`, and every argument is [`plain_arg`].
 pub fn ssh_chat_argv(
     folder: &RemoteFolder,
     probe: &RemoteProbe,
     args: &[String],
 ) -> Result<Vec<String>, String> {
-    validate_absolute(&probe.cli)?;
-    if probe.path.is_empty() || crate::text::has_control_or_bidi(&probe.path, &[]) {
+    if !posix_shell(&probe.shell) {
+        return Err("The login shell there is not a POSIX shell".into());
+    }
+    if !plain_cli_path(&probe.cli) {
+        return Err("The agent's path there is not a plain absolute path".into());
+    }
+    if probe.path.is_empty()
+        || probe.path.len() > MAX_PATH_LEN
+        || crate::text::has_control_or_bidi(&probe.path, &[])
+    {
         return Err("The PATH there is not usable".into());
+    }
+    if !args.iter().all(|a| plain_arg(a)) {
+        return Err("An argument holds a control or invisible character".into());
     }
     let mut line = format!(
         "cd -- {} && exec env {} {}",
@@ -1216,6 +1284,117 @@ mod tests {
         }
         assert!(!is_remote_cwd("/srv"));
         assert!(RemoteFolder::new("box", "~/src").is_err(), "only absolute");
+    }
+
+    /// Only a POSIX login shell runs a thread's command line: fish reads `\'` inside single
+    /// quotes as an escaped quote, so a value could close [`sh_quote`]'s quoting there.
+    #[test]
+    fn only_a_posix_login_shell_is_accepted() {
+        let reply = |shell: &str| {
+            format!("{PROBE_SHELL}{shell}\n{PROBE_PATH}/usr/bin\n{PROBE_CLI}/usr/bin/claude\n")
+        };
+        for ok in [
+            "/bin/sh",
+            "/bin/bash",
+            "/usr/bin/zsh",
+            "/bin/dash",
+            "/bin/ksh",
+            "/bin/ash",
+        ] {
+            assert!(parse_probe("claude", &reply(ok)).is_ok(), "{ok}");
+        }
+        for refused in [
+            "/usr/bin/fish",
+            "/usr/bin/nu",
+            "/usr/bin/pwsh",
+            "/usr/bin/elvish",
+            "/usr/bin/xonsh",
+            "/bin/csh",
+            "/bin/tcsh",
+            "/opt/bin/mysh",
+            "",
+        ] {
+            let why = parse_probe("claude", &reply(refused)).unwrap_err();
+            assert!(why.contains("POSIX"), "{refused}: {why}");
+        }
+        // A probe naming such a shell never makes a command line, however it was made.
+        let folder = RemoteFolder::new("box", "/srv").unwrap();
+        for shell in [
+            "/usr/bin/fish",
+            "/usr/bin/nu",
+            "/usr/bin/pwsh",
+            "/opt/bin/unknown",
+        ] {
+            let probe = RemoteProbe {
+                shell: shell.into(),
+                ..probe()
+            };
+            assert!(ssh_chat_argv(&folder, &probe, &[]).is_err(), "{shell}");
+        }
+        // The probe script itself stops for anything not listed (checked in a local sh).
+        if std::process::Command::new("sh")
+            .arg("-c")
+            .arg("true")
+            .status()
+            .is_ok()
+        {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(probe_command("claude").unwrap())
+                .env("SHELL", "/usr/bin/fish")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(stdout.contains(PROBE_SHELL), "{stdout}");
+            assert!(!stdout.contains(PROBE_PATH), "fish is never run: {stdout}");
+        }
+    }
+
+    /// A CLI path with `=` would be read by `env` as an assignment, and an argument with a NUL
+    /// or a control character (a model or session id the other machine reported) can be no argv.
+    #[test]
+    fn a_cli_with_an_equals_sign_or_an_argument_with_a_control_character_is_refused() {
+        let folder = RemoteFolder::new("box", "/srv").unwrap();
+        let assigned = RemoteProbe {
+            cli: "/opt/A=B/claude".into(),
+            ..probe()
+        };
+        assert!(ssh_chat_argv(&folder, &assigned, &[]).is_err());
+        let reply =
+            format!("{PROBE_SHELL}/bin/bash\n{PROBE_PATH}/usr/bin\n{PROBE_CLI}/x=y/codex\n");
+        assert!(parse_probe("codex", &reply).is_err());
+        for bad in [
+            "sess\0ion",
+            "model\nname",
+            "a\u{202e}b",
+            "a\u{200b}b",
+            "x\u{1b}[2J",
+        ] {
+            assert!(
+                ssh_chat_argv(&folder, &probe(), &[bad.to_owned()]).is_err(),
+                "{bad:?}"
+            );
+            assert!(!plain_arg(bad));
+        }
+        assert!(ssh_chat_argv(&folder, &probe(), &["--model".into(), "opus".into()]).is_ok());
+    }
+
+    #[test]
+    fn an_alias_holds_at_most_one_at_with_a_user_and_a_host_neither_an_option() {
+        for bad in [
+            "me@-v",
+            "@host",
+            "user@",
+            "a@b@c",
+            "-u@host",
+            "me@-oProxyCommand=x",
+        ] {
+            assert!(validate_alias(bad).is_err(), "{bad}");
+            assert!(ssh_batch_argv(bad, "true".into()).is_err(), "{bad}");
+        }
+        for ok in ["me@box", "me@fe80::1", "box", "me.name@host-1.example"] {
+            assert!(validate_alias(ok).is_ok(), "{ok}");
+        }
     }
 
     #[test]

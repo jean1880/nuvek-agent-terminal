@@ -1576,6 +1576,7 @@ pub(crate) mod tests {
             capabilities: agent_core::caps::Capabilities::claude(),
             commands: Vec::new(),
             images_refused: None,
+            remote: false,
         }
     }
 

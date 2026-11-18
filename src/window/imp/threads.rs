@@ -702,6 +702,36 @@ pub(super) fn thread_folder_label(cwd: &str) -> (String, bool) {
     }
 }
 
+/// What a thread with no session yet says of itself: its agent's own capabilities, less what
+/// another machine takes away when `remote` (Codex's images: [`agent_core::remote::takes_images`]).
+pub(super) fn unstarted_status(
+    driver: Driver,
+    model: Option<String>,
+    mode: Mode,
+    remote: bool,
+) -> SessionStatus {
+    let mut capabilities = agent_core::caps::Capabilities::of(driver);
+    let images_refused = remote
+        .then(|| agent_core::remote::takes_images(driver).err())
+        .flatten();
+    if images_refused.is_some() {
+        capabilities.image_input = false;
+    }
+    SessionStatus {
+        driver,
+        model,
+        pending_model: None,
+        effort: None,
+        mode,
+        running_turn: false,
+        alive: false,
+        capabilities,
+        commands: Vec::new(),
+        images_refused,
+        remote,
+    }
+}
+
 /// The desktop notification id for a thread waiting on an approval or a question.
 fn approval_notification_id(thread: &str) -> String {
     format!("approval-{thread}")
@@ -972,6 +1002,10 @@ pub(super) struct SessionSlot {
     driver: std::cell::Cell<Driver>,
     model: Option<String>,
     mode: Mode,
+    /// The thread's folder is on another machine: fixed for the slot's life, and said by its
+    /// status before any session exists (no images for Codex there, no dangerous permissive
+    /// mode, web links only).
+    remote: bool,
 }
 
 impl SessionSlot {
@@ -996,6 +1030,16 @@ impl SessionSlot {
     }
     pub(super) fn get(&self) -> Option<Rc<ChatSession>> {
         self.session.borrow().clone()
+    }
+
+    /// Says `why` in the thread's view (shown, not stored): a choice it refused.
+    fn notify_refusal(&self, why: &str) {
+        let view = self.view.borrow().as_ref().and_then(|v| v.upgrade());
+        if let Some(view) = view {
+            view.apply(&Envelope::new(Event::Notice {
+                text: why.to_owned(),
+            }));
+        }
     }
 
     pub(super) fn driver(&self) -> Driver {
@@ -1155,6 +1199,12 @@ impl ChatBackend for SessionSlot {
         model: Option<String>,
         effort: Option<String>,
     ) {
+        // A thread on another machine runs on no profile: a pick from another profile's group
+        // is refused, never a new process on this machine's profile or model server.
+        if self.remote {
+            self.notify_refusal(REMOTE_KEEPS_AGENT);
+            return;
+        }
         let Some((window, thread)) = self
             .thread
             .as_deref()
@@ -1177,6 +1227,15 @@ impl ChatBackend for SessionSlot {
             .switch_agent_confirmed(&thread, driver, model, effort, Some(target));
     }
     fn reload_session(&self) {
+        // A thread on another machine reloads as its own session does (stop, then start its
+        // agent there again, its machine checked first): never a switch through this machine's
+        // launch.
+        if self.remote {
+            if let Some(s) = self.get() {
+                crate::chat::ChatBackend::reload_session(&*s);
+            }
+            return;
+        }
         if let Some(s) = self.get() {
             let status = s.status();
             s.rebind_stop();
@@ -1204,18 +1263,12 @@ impl ChatBackend for SessionSlot {
     fn status(&self) -> SessionStatus {
         match self.get() {
             Some(s) => s.status(),
-            None => SessionStatus {
-                driver: self.driver.get(),
-                model: self.model.clone(),
-                pending_model: None,
-                effort: None,
-                mode: self.mode,
-                running_turn: false,
-                alive: false,
-                capabilities: agent_core::caps::Capabilities::of(self.driver.get()),
-                commands: Vec::new(),
-                images_refused: None,
-            },
+            None => unstarted_status(
+                self.driver.get(),
+                self.model.clone(),
+                self.mode,
+                self.remote,
+            ),
         }
     }
     fn lifecycle(&self) -> crate::chat::Lifecycle {
@@ -2076,6 +2129,20 @@ pub(super) fn launch_source(
     crate::model_catalog::ServerSource::of(profile, driver)
 }
 
+/// The model picker's one group for a thread on another machine running `current`: its own
+/// agent, on no profile (a pick changes the model on that agent, never moves it to a profile,
+/// another agent or a model server here).
+pub(super) fn remote_picker_specs(current: Driver) -> Vec<crate::model_catalog::PickerSpec> {
+    vec![crate::model_catalog::PickerSpec {
+        driver: current,
+        profile: None,
+        name: current.info().long_label.to_owned(),
+        detail: Some("On another machine".to_owned()),
+        source: None,
+        current: true,
+    }]
+}
+
 /// The model picker's groups for a thread opened with `profile_id` that runs `current` now: for
 /// each agent, its vendor (the thread's own profile on it, else the first enabled one on it) and
 /// each enabled profile on a model server, every server its own group. The profile the thread
@@ -2163,6 +2230,9 @@ struct StartJob {
     hook: Result<(), String>,
 }
 
+/// Why a thread on another machine is never switched to another agent or profile.
+pub(super) const REMOTE_KEEPS_AGENT: &str = crate::chat::session::REMOTE_SWITCH_REFUSED;
+
 /// What a thread on another machine's start needs: its agent, its machine and folder there, and
 /// its active provider thread (to resume).
 struct RemoteStart {
@@ -2184,11 +2254,7 @@ fn remote_agent_launch(
     clear: &[String],
 ) -> Result<AgentLaunch, String> {
     if asked != own || profile.is_some() {
-        return Err(
-            "A thread on another machine keeps its agent: start a new thread there for another \
-             agent."
-                .to_owned(),
-        );
+        return Err(REMOTE_KEEPS_AGENT.to_owned());
     }
     let cli = agent_core::remote::chat_cli(own)?;
     Ok(AgentLaunch {
@@ -4320,12 +4386,26 @@ impl AgentTerminalWindow {
     /// one-row read, after the store writer has committed what is queued (the thread's creation
     /// may still be on its way).
     /// Whether `thread`'s folder is on another machine (an unreadable `ssh://` one included), as
-    /// the cached list knows it.
+    /// its open page or the cached list knows it.
     pub(super) fn thread_is_remote(&self, thread: &str) -> bool {
-        self.summaries.borrow().as_ref().is_some_and(|list| {
-            list.iter()
-                .any(|s| s.id == thread && agent_core::remote::is_remote_cwd(&s.cwd))
-        })
+        self.with_thread_tab(thread, |t| t.remote.is_some())
+            .unwrap_or(false)
+            || self.summaries.borrow().as_ref().is_some_and(|list| {
+                list.iter()
+                    .any(|s| s.id == thread && agent_core::remote::is_remote_cwd(&s.cwd))
+            })
+    }
+
+    /// Refuses, with a toast saying why, a switch of `thread` to another agent or profile (or a
+    /// continuation in one) when the thread is on another machine: the probe found its own
+    /// agent's CLI there, and a profile's environment and model server are this machine's. True
+    /// when refused; nothing (no stop, no store write) has happened then.
+    pub(super) fn refuse_remote_switch(&self, thread: &str) -> bool {
+        if !self.thread_is_remote(thread) {
+            return false;
+        }
+        self.show_toast(REMOTE_KEEPS_AGENT);
+        true
     }
 
     pub(super) fn summary_of(&self, thread: &str) -> Option<agent_kit::store::ThreadSummary> {
@@ -5110,6 +5190,11 @@ impl AgentTerminalWindow {
         let Some(slot) = self.slot_of(thread) else {
             return;
         };
+        // Refused before anything stops or reads this machine's environment: a thread on another
+        // machine changes only its model, on its own agent.
+        if (driver != slot.driver() || target.is_some()) && self.refuse_remote_switch(thread) {
+            return;
+        }
         if !self.switch_would_stop_work(thread) {
             delegation::switch(&slot, driver, model, effort, target);
             return;
@@ -5590,7 +5675,12 @@ impl AgentTerminalWindow {
             if let Some((saved, threads)) = loaded {
                 // With "Reopen Last Thread" off, the empty state offers what it would reopen.
                 if !imp.config.borrow().reopen_last_thread {
-                    let known: Vec<String> = threads.iter().map(|s| s.id.clone()).collect();
+                    // A thread on another machine is never reopened, so never counted as one.
+                    let known: Vec<String> = threads
+                        .iter()
+                        .filter(|s| !agent_core::remote::is_remote_cwd(&s.cwd))
+                        .map(|s| s.id.clone())
+                        .collect();
                     let count = last_session_count(saved.as_deref(), &known);
                     if let Some(saved) = saved.clone().filter(|_| count > 0) {
                         LAST_SESSION.with(|s| *s.borrow_mut() = Some(LastSession { saved, count }));
@@ -5821,11 +5911,10 @@ impl AgentTerminalWindow {
                 return None;
             }
         };
-        let page_dir = if remote.is_some() {
-            env::var("HOME").unwrap_or_else(|_| "/".to_owned())
-        } else {
-            summary.cwd.clone()
-        };
+        // A remote page's `dir` is its `ssh://` folder, never a local one: anything that takes it
+        // for a local path is refused by `is_remote_cwd`, and only the drawer's local `ssh`
+        // starts in `$HOME` (`toggle_drawer`).
+        let page_dir = summary.cwd.clone();
         let driver = summary
             .driver
             .as_deref()
@@ -5986,6 +6075,7 @@ impl AgentTerminalWindow {
             driver: std::cell::Cell::new(driver),
             model: None,
             mode,
+            remote: remote.is_some(),
         });
         let key = next_tab_key();
         let diffs = {
@@ -6100,10 +6190,26 @@ impl AgentTerminalWindow {
                 return;
             };
             let dir = tab.dir.clone();
+            let remote = tab.remote.is_some();
             let Some(chat) = tab.chat.as_mut() else {
                 return;
             };
             if chat.view.is_some() || chat.building {
+                // A built thread on another machine whose start failed (unreachable, not
+                // listed, no agent there): showing it again is the user's asking to try again.
+                let retry_remote = remote
+                    && chat.view.is_some()
+                    && !chat.building
+                    && !chat.starting
+                    && chat.slot.get().is_none();
+                if retry_remote {
+                    let (page, thread, driver) = (page.clone(), chat.thread.clone(), chat.driver);
+                    glib::idle_add_local_once(glib::clone!(
+                        #[weak(rename_to = obj)]
+                        self.obj(),
+                        move || obj.imp().retry_remote_start(&page, thread, driver)
+                    ));
+                }
                 if let Some(view) = &chat.view {
                     let view = view.clone();
                     // A message-search hit being opened goes to its message instead.
@@ -6134,9 +6240,9 @@ impl AgentTerminalWindow {
             if let Some(skeleton) = chat.holder.first_child() {
                 loading::unsettle(&skeleton);
             }
-            (chat.thread.clone(), chat.driver, dir)
+            (chat.thread.clone(), chat.driver, dir, remote)
         };
-        let (thread, driver, dir) = job;
+        let (thread, driver, dir, remote) = job;
         // Its agent is on its way: the row spins.
         self.refresh_sidebar();
         let obj = self.obj();
@@ -6153,7 +6259,8 @@ impl AgentTerminalWindow {
                     let thread = thread.clone();
                     // Importing reads the agent's transcript; only where store jobs really run
                     // off the main thread (never with the memory-only fallback, or under test).
-                    let home = (store_is_async() && !cfg!(test))
+                    // A remote thread's transcript is on the other machine: nothing is imported.
+                    let home = (store_is_async() && !cfg!(test) && !remote)
                         .then(|| env::var_os("HOME").map(std::path::PathBuf::from))
                         .flatten();
                     let writer = store_writer();
@@ -6175,6 +6282,23 @@ impl AgentTerminalWindow {
                         return;
                     }
                 };
+                // A thread on another machine needs nothing of this machine's agent, profile,
+                // hooks or model list: built at once, its agent probed there by its own start.
+                if remote {
+                    obj.imp().build_thread(
+                        &page,
+                        BuildJob {
+                            thread,
+                            driver,
+                            dir,
+                            profile: crate::config::new_agent_profile(driver),
+                            resolved: ResolvedAgent::default(),
+                            loaded,
+                            hook: Ok(()),
+                        },
+                    );
+                    return;
+                }
                 let profile = obj
                     .imp()
                     .thread_profile_for(loaded.attributes.profile_id.as_deref(), driver);
@@ -6289,11 +6413,16 @@ impl AgentTerminalWindow {
             }),
             // Every agent as each of its profiles runs it: every model server its own group.
             Rc::new(move || {
-                let Some(driver) = thread_owner(&specs_thread)
-                    .and_then(|w| w.imp().with_chat(&specs_thread, |c| c.driver))
-                else {
+                let Some((driver, remote)) = thread_owner(&specs_thread).and_then(|w| {
+                    let imp = w.imp();
+                    imp.with_chat(&specs_thread, |c| c.driver)
+                        .map(|d| (d, imp.thread_is_remote(&specs_thread)))
+                }) else {
                     return Vec::new();
                 };
+                if remote {
+                    return remote_picker_specs(driver);
+                }
                 picker_specs(
                     &SharedConfig::default().borrow(),
                     specs_profile_id().as_deref(),
@@ -6733,6 +6862,39 @@ impl AgentTerminalWindow {
         }
     }
 
+    /// Starts a built thread on another machine again, the user having shown it after its start
+    /// failed: its provider thread is read again (to resume it), then the remote start runs.
+    fn retry_remote_start(&self, page: &adw::TabPage, thread: String, driver: Driver) {
+        let Some(remote) = self.with_page_tab(page, |t| t.remote.clone()).flatten() else {
+            return;
+        };
+        self.with_page_chat_mut(page, |c| c.starting = true);
+        let (obj, page) = (self.obj().downgrade(), page.clone());
+        glib::MainContext::default().spawn_local(async move {
+            let provider = store_job({
+                let thread = thread.clone();
+                move |store| load_provider(store, &thread)
+            })
+            .await;
+            let Some(obj) = obj.upgrade() else { return };
+            let imp = obj.imp();
+            imp.with_page_chat_mut(&page, |c| c.starting = false);
+            match provider {
+                Some(Ok(provider)) if imp.session_start_allowed() => imp.start_remote_session(
+                    &page,
+                    RemoteStart {
+                        thread,
+                        driver,
+                        remote,
+                        provider,
+                    },
+                ),
+                Some(Err(e)) => warn!("Cannot read thread {thread} to start it again: {e}"),
+                _ => {}
+            }
+        });
+    }
+
     /// Whether `page` is a page on another machine (a remote thread or terminal page).
     pub(super) fn page_is_remote(&self, page: &adw::TabPage) -> bool {
         self.with_page_tab(page, |t| t.remote.is_some())
@@ -6773,7 +6935,7 @@ impl AgentTerminalWindow {
         };
         self.with_page_chat_mut(page, |c| c.starting = true);
         self.refresh_sidebar();
-        let ssh_env = self.terminal_env();
+        let ssh_env = self.ssh_env();
         let (alias, page) = (folder.alias().to_owned(), page.clone());
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
@@ -6899,6 +7061,10 @@ impl AgentTerminalWindow {
             sink,
             launch.env,
             crate::chat::session::RemoteLaunch { folder, probe },
+            // Read again before every process: a machine removed from Settings is never reached.
+            Rc::new(|alias: &str| {
+                agent_core::remote::listed(&SharedConfig::default().borrow().remote_hosts, alias)
+            }),
         );
         if !self.session_start_allowed() {
             session.shutdown(true);
@@ -6983,6 +7149,22 @@ impl AgentTerminalWindow {
     }
 
     fn on_thread_envelope(&self, thread: &str, driver: Driver, env: &Envelope) {
+        // A remote thread's ssh stopped at a host key or a login: offer a terminal page there,
+        // where the user can answer it (once its handlers have returned).
+        if matches!(env.event, Event::Error { .. }) {
+            let there = self
+                .slot_of(thread)
+                .and_then(|slot| slot.get())
+                .and_then(|session| session.take_remote_needs_terminal());
+            if let Some((alias, dir)) = there {
+                let weak = self.obj().downgrade();
+                glib::idle_add_local_once(move || {
+                    if let Some(obj) = weak.upgrade() {
+                        obj.imp().offer_remote_terminal(&alias, &dir);
+                    }
+                });
+            }
+        }
         if super::spending::moves_real_money(&env.event) {
             self.check_spending_budget();
         }
@@ -7333,7 +7515,11 @@ impl AgentTerminalWindow {
                 // With no other usable agent there is nothing to continue in: no button. An agy
                 // that would edit unasked is offered only as a last resort, and says so.
                 let unasked = self.agy_cannot_ask_for(thread);
-                match safe_handoff_target(driver, |d| self.agent_usable(d), unasked) {
+                // A thread on another machine keeps its agent: nothing to continue in.
+                let remote = self.thread_is_remote(thread);
+                match safe_handoff_target(driver, |d| self.agent_usable(d), unasked)
+                    .filter(|_| !remote)
+                {
                     Some((other, flagged)) => {
                         banner.set_button_label(Some(&continue_label(other, flagged)));
                     }
@@ -7691,6 +7877,9 @@ impl AgentTerminalWindow {
     /// usage limit ([`Self::stopped_by_limit`]), the new agent then continues the work with the
     /// handoff, as a busy switch does; otherwise the handoff waits for the user's next message.
     fn continue_rate_limited(&self, thread: &str) {
+        if self.refuse_remote_switch(thread) {
+            return;
+        }
         let Some(slot) = self.slot_of(thread) else {
             return;
         };
@@ -7753,6 +7942,9 @@ impl AgentTerminalWindow {
         let Some(slot) = self.slot_of(thread) else {
             return;
         };
+        if target != slot.driver() && self.refuse_remote_switch(thread) {
+            return;
+        }
         // The old agent's limit wait ends once the new agent is up (`LimitRecord::moved_on`),
         // never before: a switch that fails rolls back to the agent it waits for.
         if slot.get().is_some() {
@@ -7796,6 +7988,10 @@ impl AgentTerminalWindow {
         model: Option<String>,
         effort: Option<String>,
     ) {
+        // Never writes another agent (agy, the Local agent) into a remote thread's store.
+        if self.refuse_remote_switch(thread) {
+            return;
+        }
         let Some(from) = self.with_chat_mut(thread, |chat| {
             chat.rebinding = true;
             chat.pending_switch = None;
@@ -8246,6 +8442,11 @@ impl AgentTerminalWindow {
     /// `/rewind`: undo the last turn's changes in the thread's folder, through the 2.x
     /// checkpoint restore (confirmed, and itself undoable).
     fn rewind(&self, page: &adw::TabPage) {
+        // Its checkpoints would be this machine's: a page on another machine has none.
+        if self.page_is_remote(page) {
+            self.show_toast(agent_core::remote::NOT_ON_REMOTE);
+            return;
+        }
         let Some((dir, key)) = self.with_page_tab(page, |t| (t.dir.clone(), t.key)) else {
             return;
         };
@@ -8838,6 +9039,18 @@ impl AgentTerminalWindow {
         let Some(page) = self.selected_page() else {
             return;
         };
+        // A remote thread's drawer connects to its machine: refused, and not marked started (so
+        // listing the machine again lets the next toggle start it), while it is not listed.
+        let remote_listed = self
+            .with_page_tab(&page, |t| t.remote.clone())
+            .flatten()
+            .map(|remote| {
+                agent_core::remote::listed(&self.config.borrow().remote_hosts, &remote.alias)
+            });
+        if let Some(Err(why)) = remote_listed {
+            self.show_toast(&why);
+            return;
+        }
         let state = {
             let mut tabs = self.tabs.borrow_mut();
             let Some(tab) = tabs.iter_mut().find(|t| t.page == page) else {
@@ -8879,15 +9092,10 @@ impl AgentTerminalWindow {
                 match &remote {
                     // A thread on another machine: its drawer is `ssh -t` to the same folder
                     // there, started by this toggle (a user action), as a remote page is.
+                    // The local `ssh` itself starts in `$HOME` (`dir` is the `ssh://` folder).
                     Some(remote) => {
-                        if let Err(why) = agent_core::remote::listed(
-                            &self.config.borrow().remote_hosts,
-                            &remote.alias,
-                        ) {
-                            self.show_toast(&why);
-                        } else {
-                            self.spawn_remote_session(&terminal, &stack, remote, &dir);
-                        }
+                        let home = env::var("HOME").unwrap_or_else(|_| "/".to_owned());
+                        self.spawn_remote_session(&terminal, &stack, remote, &home);
                     }
                     None => self.spawn_session(&terminal, &stack, None, &dir, Launch::Fresh),
                 }
@@ -8970,7 +9178,13 @@ impl AgentTerminalWindow {
         let sources = RefCell::new((Vec::new(), Vec::new()));
         self.for_each_window(|window| {
             let mut sources = sources.borrow_mut();
-            for tab in window.tabs.borrow().iter().filter(|tab| tab.chat.is_some()) {
+            // A page on another machine has no folder here to read agy's hooks in.
+            for tab in window
+                .tabs
+                .borrow()
+                .iter()
+                .filter(|tab| tab.chat.is_some() && tab.remote.is_none())
+            {
                 sources.0.push(std::path::PathBuf::from(&tab.dir));
                 if let Some(session) = tab.chat.as_ref().and_then(|chat| chat.slot.get()) {
                     sources.1.push((tab.dir.clone(), session));
@@ -9232,6 +9446,9 @@ impl AgentTerminalWindow {
             .tabs
             .borrow()
             .iter()
+            // This machine's model list says nothing of what the agent on another machine
+            // offers: a remote thread's model is never judged retired, nor moved, by it.
+            .filter(|t| t.remote.is_none())
             .filter_map(|t| t.chat.as_ref())
             .filter_map(|c| {
                 Some((
@@ -9442,6 +9659,12 @@ impl AgentTerminalWindow {
             .borrow_mut()
             .iter_mut()
             .filter_map(|t| {
+                // A thread on another machine starts only from its own remote start, which the
+                // user's opening it or a message brings, never from this machine's agent
+                // becoming ready.
+                if t.remote.is_some() {
+                    return None;
+                }
                 let chat = t.chat.as_mut()?;
                 let driver = chat.slot.driver();
                 if chat.view.is_none()
@@ -12123,6 +12346,7 @@ pub(super) mod tests {
             driver: std::cell::Cell::new(Driver::Agy),
             model: Some("gemini".into()),
             mode: Mode::Plan,
+            remote: false,
         };
         let status = slot.status();
         assert_eq!(status.driver, Driver::Agy);
@@ -12139,9 +12363,23 @@ pub(super) mod tests {
             driver: std::cell::Cell::new(Driver::Codex),
             model: None,
             mode: Mode::Ask,
+            remote: false,
         };
         assert_eq!(codex.status().driver, Driver::Codex);
         assert!(codex.status().capabilities.live_approvals);
+        assert!(codex.status().capabilities.image_input);
+        // Codex on another machine takes no images, before its session exists too.
+        let remote = SessionSlot {
+            remote: true,
+            ..codex
+        };
+        let status = remote.status();
+        assert!(status.remote);
+        assert!(!status.capabilities.image_input);
+        assert_eq!(
+            status.images_refused,
+            Some(agent_core::remote::CODEX_IMAGES_REFUSED)
+        );
     }
 
     /// A thread whose session has not started (its agent not ready, its start still waiting or
@@ -12163,6 +12401,7 @@ pub(super) mod tests {
             driver: std::cell::Cell::new(Driver::Claude),
             model: None,
             mode: Mode::Ask,
+            remote: false,
         });
         assert_eq!(
             slot.send_refusal().as_deref(),

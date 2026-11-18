@@ -23,15 +23,21 @@ fn launch(cli: &str) -> RemoteLaunch {
 }
 
 /// A fake `ssh` in `dir` that writes what it was started with (its exported environment, then
-/// its arguments, one a line) with shell builtins only, and exits `code`. It runs nothing else.
+/// its arguments, one a line, and a line more in `runs` each time it runs) with shell builtins
+/// only, and exits `code`. It runs nothing else.
 fn fake_ssh(dir: &Path, code: i32) -> std::path::PathBuf {
+    fake_ssh_saying(dir, code, "")
+}
+
+/// [`fake_ssh`] that also writes `stderr` to its standard error, as ssh says why it failed.
+fn fake_ssh_saying(dir: &Path, code: i32, stderr: &str) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let script = dir.join("ssh");
     std::fs::write(
         &script,
         format!(
             "#!/bin/sh\nexport -p > '{d}/env'\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done \
-             > '{d}/argv'\nexit {code}\n",
+             > '{d}/argv'\necho run >> '{d}/runs'\nprintf '%s' '{stderr}' >&2\nexit {code}\n",
             d = dir.display()
         ),
     )
@@ -46,6 +52,17 @@ fn remote_session(
     env: LaunchEnv,
     cli: &str,
 ) -> (Rc<ChatSession>, Seen) {
+    remote_session_listed(adapter, store, env, cli, Rc::new(|_: &str| Ok(())))
+}
+
+/// [`remote_session`] whose machine is listed as long as `listed` says.
+fn remote_session_listed(
+    adapter: Box<dyn Adapter>,
+    store: &Rc<Store>,
+    env: LaunchEnv,
+    cli: &str,
+    listed: HostCheck,
+) -> (Rc<ChatSession>, Seen) {
     let thread = fresh(store, &RemoteFolder::new("box", FOLDER).unwrap().cwd());
     let (sink, seen) = make_sink();
     let session = ChatSession::remote(
@@ -56,8 +73,16 @@ fn remote_session(
         sink,
         env,
         launch(cli),
+        listed,
     );
     (session, seen)
+}
+
+/// How many times the fake `ssh` in `dir` ran ([`fake_ssh`] appends a line to `runs`).
+fn runs(dir: &Path) -> usize {
+    std::fs::read_to_string(dir.join("runs"))
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
 }
 
 #[test]
@@ -239,12 +264,6 @@ fn a_remote_card_offers_allow_once_and_deny_and_no_rule_answers_it() {
             session.inner.pending_rules.borrow().is_empty(),
             "no rule is recorded to keep from an answer"
         );
-        // Not even in dangerous permissive mode.
-        session.inner.state.borrow_mut().mode = Mode::Bypass;
-        let (_, auto) = session.inner.gate_approval(card("Bash", every.clone()));
-        assert!(!auto);
-        session.inner.state.borrow_mut().mode = Mode::Ask;
-
         // A Codex permission request names paths there: it can only be denied.
         let permission = card(agent_core::codex::PERMISSIONS_TOOL, every.clone());
         let generation = session.inner.generation.get();
@@ -255,6 +274,281 @@ fn a_remote_card_offers_allow_once_and_deny_and_no_rule_answers_it() {
         let (shown, auto) = session.inner.gate_approval(held);
         assert_eq!(options_of(&shown), [Decision::Deny]);
         assert!(!auto);
+    });
+}
+
+/// Dangerous permissive mode is refused on another machine, by the session itself and so for
+/// every caller: the mode never changes, nothing restarts into it, and no process there is ever
+/// started with Claude's bypass or Codex's never-ask policy.
+#[test]
+fn dangerous_permissive_mode_is_refused_for_a_remote_thread() {
+    in_loop(|ctx| {
+        let tmp = tempfile::tempdir().expect("tmp");
+        set_test_ssh(&fake_ssh(tmp.path(), 0).to_string_lossy());
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let (session, seen) = remote_session(
+            Box::new(ClaudeAdapter::new()),
+            &store,
+            LaunchEnv::default(),
+            "claude",
+        );
+        assert!(pump_until(ctx, 10, || exited_count(&seen) >= 1));
+        let before = runs(tmp.path());
+        ChatBackend::set_mode(&*session, Mode::Bypass);
+        pump_until(ctx, 1, || false);
+        assert!(has(&seen, |e| matches!(
+            e,
+            Event::Notice { text } if text == REMOTE_NO_BYPASS
+        )));
+        assert_ne!(session.status().mode, Mode::Bypass);
+        assert_ne!(session.wanted_mode(), Mode::Bypass);
+        assert_eq!(runs(tmp.path()), before, "nothing restarted into it");
+        // Even a start that somehow had it in hand goes in a safe mode.
+        session.inner.open.borrow_mut().mode = Mode::Bypass;
+        let spec = session.inner.launch_spec();
+        let line = spec.argv.last().expect("the remote command line");
+        assert!(!line.contains("bypassPermissions"), "{line}");
+        assert_ne!(session.inner.open.borrow().mode, Mode::Bypass);
+
+        // Codex there: its turn never asks for the never-ask policy or full access.
+        let (codex, _) = remote_session(
+            Box::new(agent_core::codex::CodexAdapter::new()),
+            &store,
+            LaunchEnv::default(),
+            "codex",
+        );
+        ChatBackend::set_mode(&*codex, Mode::Bypass);
+        assert_ne!(codex.status().mode, Mode::Bypass);
+        let spec = codex.inner.launch_spec();
+        let line = spec.argv.last().expect("the remote command line");
+        assert!(
+            !line.contains("dangerFullAccess") && !line.contains("never"),
+            "{line}"
+        );
+    });
+}
+
+/// The session itself refuses a switch to another agent or another profile, before anything
+/// stops: whoever asked, the agent and its process stay.
+#[test]
+fn a_remote_session_never_switches_agent_or_profile() {
+    in_loop(|_| {
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let (session, seen) = remote_session(
+            Box::new(ClaudeAdapter::new()),
+            &store,
+            LaunchEnv::default(),
+            "claude",
+        );
+        session.set_adapter_factory(Rc::new(|_, _| {
+            panic!("a remote session never builds another launch")
+        }));
+        let generation = session.inner.generation.get();
+        ChatBackend::switch(&*session, Driver::Codex, None, None);
+        session.switch_to(
+            Driver::Claude,
+            SwitchTarget {
+                profile: "server".into(),
+                label: "Claude on a server".into(),
+            },
+            None,
+            None,
+        );
+        let refused = seen
+            .borrow()
+            .iter()
+            .filter(|e| matches!(&e.event, Event::Notice { text } if text == REMOTE_SWITCH_REFUSED))
+            .count();
+        assert_eq!(refused, 2);
+        assert_eq!(session.status().driver, Driver::Claude);
+        assert_eq!(
+            session.inner.generation.get(),
+            generation,
+            "nothing stopped"
+        );
+    });
+}
+
+/// Images to Codex there are refused mid-turn as at a turn's start: never steered in as this
+/// machine's paths.
+#[test]
+fn images_steered_into_a_remote_codex_turn_are_refused() {
+    in_loop(|_| {
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let log: Log = Rc::default();
+        let (session, seen) = remote_session(
+            FakeAdapter::boxed(Driver::Codex, &log),
+            &store,
+            LaunchEnv::default(),
+            "codex",
+        );
+        session.inner.state.borrow_mut().running_turn = true;
+        log.borrow_mut().clear();
+        ChatBackend::steer_input(
+            &*session,
+            &PromptInput {
+                text: "look".into(),
+                images: vec![staged('a')],
+            },
+        );
+        assert!(has(&seen, |e| matches!(
+            e,
+            Event::Error { message } if message == agent_core::remote::CODEX_IMAGES_REFUSED
+        )));
+        assert!(
+            !log.borrow()
+                .iter()
+                .any(|c| matches!(c, Command::Steer { .. } | Command::Prompt { .. })),
+            "nothing was sent"
+        );
+        assert!(session.inner.queued_prompts.borrow().is_empty());
+    });
+}
+
+/// A machine removed from Settings is never reached again: the crash restart that follows is
+/// refused with the reason, and ssh does not run again.
+#[test]
+fn a_restart_after_the_machine_is_removed_is_refused() {
+    in_loop(|ctx| {
+        let tmp = tempfile::tempdir().expect("tmp");
+        set_test_ssh(&fake_ssh(tmp.path(), 1).to_string_lossy());
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let listed = Rc::new(Cell::new(true));
+        let check = Rc::clone(&listed);
+        let (_session, seen) = remote_session_listed(
+            Box::new(ClaudeAdapter::new()),
+            &store,
+            LaunchEnv::default(),
+            "claude",
+            Rc::new(move |alias: &str| {
+                if check.get() {
+                    Ok(())
+                } else {
+                    Err(format!("{alias} is not listed"))
+                }
+            }),
+        );
+        assert!(
+            pump_until(ctx, 10, || exited_count(&seen) >= 1),
+            "it ran once"
+        );
+        assert_eq!(runs(tmp.path()), 1);
+        // Removed while its restart (2 s) is pending.
+        listed.set(false);
+        assert!(
+            pump_until(ctx, 10, || has(&seen, |e| matches!(
+                e,
+                Event::Error { message } if message == "box is not listed"
+            ))),
+            "the restart is refused with the reason"
+        );
+        pump_until(ctx, 1, || false);
+        assert_eq!(runs(tmp.path()), 1, "ssh never ran again");
+    });
+}
+
+/// An Allow sent for a remote Codex permission request, whatever sent it, is answered Deny.
+#[test]
+fn an_allow_for_a_remote_codex_permission_request_is_answered_deny() {
+    in_loop(|_| {
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let log: Log = Rc::default();
+        let (session, _) = remote_session(
+            FakeAdapter::boxed(Driver::Codex, &log),
+            &store,
+            LaunchEnv::default(),
+            "codex",
+        );
+        let permission = card(
+            agent_core::codex::PERMISSIONS_TOOL,
+            vec![Decision::Allow, Decision::Deny],
+        );
+        let generation = session.inner.generation.get();
+        let shown = session
+            .inner
+            .hold_codex_permissions(generation, permission)
+            .expect("shown");
+        session.inner.gate_approval(shown);
+        log.borrow_mut().clear();
+        ChatBackend::respond_approval(&*session, "r1", Decision::Allow);
+        let answers: Vec<Decision> = log
+            .borrow()
+            .iter()
+            .filter_map(|c| match c {
+                Command::Approve { decision, .. } => Some(*decision),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(answers, [Decision::Deny]);
+    });
+}
+
+/// A session id or model the other machine reported holding a NUL or a control character is
+/// never kept, so no later start puts it on a command line.
+#[test]
+fn a_remote_session_id_or_model_with_a_control_character_is_never_kept() {
+    in_loop(|_| {
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let (session, seen) = remote_session(
+            Box::new(ClaudeAdapter::new()),
+            &store,
+            LaunchEnv::default(),
+            "claude",
+        );
+        session.inner.emit(Envelope::new(Event::SessionStarted {
+            native_id: "sess\0ion".into(),
+            model: None,
+            cwd: None,
+        }));
+        session.inner.emit(Envelope::new(Event::ModelChanged {
+            model: "opus\u{1b}[2J".into(),
+        }));
+        assert!(session.inner.state.borrow().native_id.is_none());
+        assert_ne!(
+            session.inner.state.borrow().model.as_deref(),
+            Some("opus\u{1b}[2J")
+        );
+        assert!(!has(&seen, |e| matches!(e, Event::SessionStarted { .. })));
+        assert!(has(&seen, |e| matches!(
+            e,
+            Event::Error { message } if message.contains("session id")
+        )));
+    });
+}
+
+/// ssh stopping at a host key is not tried again unasked: the thread says why and the window
+/// is told to offer a terminal page there.
+#[test]
+fn a_host_key_failure_is_not_retried_and_offers_a_terminal() {
+    in_loop(|ctx| {
+        let tmp = tempfile::tempdir().expect("tmp");
+        set_test_ssh(
+            &fake_ssh_saying(tmp.path(), 255, "Host key verification failed.").to_string_lossy(),
+        );
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let (session, seen) = remote_session(
+            Box::new(ClaudeAdapter::new()),
+            &store,
+            LaunchEnv::default(),
+            "claude",
+        );
+        assert!(pump_until(ctx, 10, || has(&seen, |e| matches!(
+            e,
+            Event::Error { message }
+                if message.starts_with("Could not reach box. Host key verification failed.")
+        ))));
+        assert_eq!(
+            session.take_remote_needs_terminal(),
+            Some(("box".to_owned(), FOLDER.to_owned()))
+        );
+        assert_eq!(session.take_remote_needs_terminal(), None, "taken once");
+        // No retry was scheduled.
+        assert!(!has(&seen, |e| matches!(
+            e,
+            Event::Notice { text } if text.contains("Trying again")
+        )));
+        pump_until(ctx, 3, || false);
+        assert_eq!(runs(tmp.path()), 1);
     });
 }
 

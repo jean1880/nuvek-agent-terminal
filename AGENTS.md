@@ -908,21 +908,37 @@ Architectural mandates, standards, and workflows for this codebase.
   or Codex only; agy and the Local agent are refused by `remote::chat_cli` before any process)
   keeps `ssh://<alias><abs path>` as its `cwd` for life (no schema change; every boundary that
   takes a thread's folder reads it with `ThreadFolder`, and `is_remote_cwd` never lets one reach
-  local git, files or folder resolution). Its agent is `ChatSession::remote`: `remote_spec`
-  wraps every process as `ssh_chat_argv` (`cd -- '<dir>' && exec env PATH='<probed>' '<cli>'
-  …`, `BatchMode=yes`) with no local cwd, no environment but the app's minus `clear_env` and
-  every agent-only variable, and no profile, provider, key file, approval socket or delegation
-  binding; the adapter gets an empty cwd. Its machine must still be listed at every start
-  (`remote::listed`). It is never reopened at launch (left out of the open-thread layout and
-  refused at restore), so its agent starts only when the user creates or opens it, or when a
-  crash restart follows a run the user started (ssh's exit 255 says "Could not reach <alias>").
-  It has no checkpoints (`ThreadDiffs` takes no baseline, so no ref is made), diff panel,
-  undo, worktree, fork baseline, hand-off brief, `/handoff`, agent or profile switch, session
-  pickers, sub-agents, usage-limit wait, vendor probe or sign-in banner; a card's diff is the
-  agent's own (`filediff::agent_edit_only`), file links and images Codex viewed are never read
-  here, Codex takes no images (`remote::takes_images`), and its cards keep Allow once and Deny
+  local git, files or folder resolution; a remote page's `TabState::dir` is that `ssh://` value,
+  and `$HOME` is only the drawer's local `ssh` working folder). Its agent is
+  `ChatSession::remote`: `remote_spec` wraps every process as `ssh_chat_argv` (`cd -- '<dir>' &&
+  exec env PATH='<probed>' '<cli>' …`, `BatchMode=yes`) with no local cwd, no environment but
+  the app's minus `clear_env` and every agent-only variable, and no profile, provider, key file,
+  approval socket or delegation binding; the adapter gets an empty cwd. Only a POSIX login shell
+  (`remote::POSIX_SHELLS`; the probe, the folder check and `ssh_chat_argv` all refuse any other,
+  since `sh_quote`'s quoting holds only there) and a CLI path with no `=` are accepted, and no
+  argument with a control or invisible character (`plain_arg`; a remote-reported session id or
+  model holding one is refused at ingestion, and `AgentProcess::spawn` refuses a NUL). Every
+  `ssh` to another machine starts in `ssh_env()` (no agent-only variable). Its machine must
+  still be listed before every process (`HostCheck`, `remote::listed`, in `start_process`), and
+  Settings forgets a machine's probe when it is removed or renamed. It is never reopened at
+  launch (left out of the open-thread layout and refused at restore), so its agent starts only
+  when the user creates or opens it, or when a crash restart follows a run the user started
+  (ssh's exit 255 says "Could not reach <alias>" with ssh's redacted reason; a host-key or login
+  failure is not retried and the window offers a terminal page there). Dangerous permissive
+  mode is refused (`Inner::set_mode`, the view, and a safe mode forced in `launch_spec`), and so
+  is a switch to another agent or profile (`Inner::switch` and every window entry,
+  `refuse_remote_switch`). It has no checkpoints (`ThreadDiffs` takes no baseline, so no ref is
+  made), diff panel, undo, worktree, fork baseline, hand-off brief, `/handoff`, session pickers,
+  sub-agents, usage-limit wait or continuation, model-retirement check, vendor probe or sign-in
+  banner; a card's diff is the agent's own (`filediff::agent_edit_only`), file links and images
+  Codex viewed are never read here, its transcript hands the system only
+  `remote::remote_link_allowed` links, Codex takes no images (`remote::takes_images`, steered
+  input too, and before its session starts), and its cards keep Allow once and Deny
   (`remote::approval_options`, no rule offered, recorded or applied, nothing auto-answered in
-  any mode; a Codex permission request is Deny only). Its drawer is `ssh -t` to the folder.
+  any mode; a Codex permission request is Deny only, and an Allow sent for one is answered
+  Deny). Its drawer is `ssh -t` to the folder. An older build reads such a `cwd` as a relative
+  local folder: its agent fails to start for want of that folder, unless a folder of that
+  relative name exists where it was started (said in `docs/reference.md`).
   The `remote_tests` session tests prove these with a recording fake `ssh` (`set_test_ssh`); an
   unset one is `false`. **Accepted risks:** a remote agent acts with the remote account's
   authority, under weaker approval scoping (Allow once is all a card can grant, and Codex's

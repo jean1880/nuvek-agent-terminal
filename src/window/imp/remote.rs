@@ -253,8 +253,10 @@ impl Machines {
                     match result {
                         Ok(false) => {}
                         Ok(true) => {
-                            // A new name is a new machine as far as the check knows.
+                            // A new name is a new machine as far as the check knows, and the
+                            // agents found under the old name are found again under the new.
                             this.checks.borrow_mut().remove(&old);
+                            agent_kit::remote::forget(&old);
                             imp.schedule_config_save();
                             let host = imp.config.borrow().remote_hosts.get(index).cloned();
                             if let Some(host) = host {
@@ -358,6 +360,7 @@ impl Machines {
             };
             if let Some(host) = removed {
                 this.checks.borrow_mut().remove(&host.alias);
+                agent_kit::remote::forget(&host.alias);
                 imp.schedule_config_save();
                 // Rebuilt after this handler returns, since it removes this very button's row.
                 let this = Rc::clone(&this);
@@ -375,10 +378,7 @@ impl Machines {
             .insert(alias.clone(), RemoteCheck::Checking);
         row.set_subtitle(&glib::markup_escape_text(&RemoteCheck::Checking.describe()));
         // The same environment a page on that machine gets.
-        let env = self
-            .window()
-            .map(|w| w.imp().terminal_env())
-            .unwrap_or_default();
+        let env = self.window().map(|w| w.imp().ssh_env()).unwrap_or_default();
         let this = Rc::downgrade(self);
         let row = row.downgrade();
         let button = button.downgrade();
@@ -451,8 +451,8 @@ fn check_remote_thread(
         program: program.to_string_lossy().into_owned(),
         env,
     };
-    agent_kit::remote::probe(&ssh, alias, cli)?;
-    let canonical = agent_kit::remote::check_folder(&ssh, alias, dir)?;
+    let probe = agent_kit::remote::probe(&ssh, alias, cli)?;
+    let canonical = agent_kit::remote::check_folder(&ssh, alias, dir, &probe)?;
     remote::RemoteFolder::new(alias, &canonical).map_err(RemoteError::Refused)
 }
 
@@ -626,7 +626,7 @@ impl AgentTerminalWindow {
             return;
         }
         self.show_toast(&format!("Checking {alias}…"));
-        let env = self.terminal_env();
+        let env = self.ssh_env();
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
             let (asked_alias, asked_dir) = (alias.clone(), dir.clone());

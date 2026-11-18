@@ -105,6 +105,10 @@ impl Names {
     pub(super) fn label(&self, group: Group, key: &str) -> String {
         match group {
             Group::Folder if key.is_empty() => "No folder".to_owned(),
+            // A folder on another machine is named as its threads are: `alias:/path`.
+            Group::Folder if agent_core::remote::is_remote_cwd(key) => {
+                crate::window::imp::threads::thread_folder_label(key).0
+            }
             Group::Folder => match &self.home {
                 Some(home) => agent_kit::paths::tilde(std::path::Path::new(key), home),
                 None => key.to_owned(),
@@ -925,6 +929,11 @@ pub(super) mod tests {
         };
         assert_eq!(names.label(Group::Folder, "/home/u/src"), "~/src");
         assert_eq!(names.label(Group::Folder, ""), "No folder");
+        // A folder on another machine, never shown as its stored `ssh://` value.
+        assert_eq!(
+            names.label(Group::Folder, "ssh://box/home/u/src"),
+            "box:/home/u/src"
+        );
         assert_eq!(names.label(Group::Agent, "agy"), "Antigravity");
         assert_eq!(names.label(Group::Agent, "mystery"), "mystery");
         assert_eq!(names.label(Group::Profile, "p1"), "Work");

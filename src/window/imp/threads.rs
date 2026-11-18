@@ -3902,10 +3902,13 @@ impl AgentTerminalWindow {
 
     fn build_sidebar(&self) -> Rc<Sidebar> {
         let obj = self.obj();
+        // A landmark a screen reader can jump to (F6 cycles to it too).
         let root = Box::builder()
             .orientation(Orientation::Vertical)
             .css_classes(["thread-sidebar"])
+            .accessible_role(gtk4::AccessibleRole::Navigation)
             .build();
+        root.update_property(&[gtk4::accessible::Property::Label("Threads")]);
         let top = Box::builder()
             .orientation(Orientation::Horizontal)
             .spacing(6)
@@ -3928,6 +3931,7 @@ impl AgentTerminalWindow {
             .selection_mode(gtk4::SelectionMode::Single)
             .css_classes(["navigation-sidebar", "thread-list"])
             .build();
+        list.update_property(&[gtk4::accessible::Property::Label("Thread list")]);
         // Until the first load lands (`refresh_sidebar`), rows in the shape of the real ones.
         let placeholder = loading::sidebar_rows();
         list.set_placeholder(Some(&placeholder));
@@ -5724,7 +5728,9 @@ impl AgentTerminalWindow {
             .orientation(Orientation::Vertical)
             .visible(false)
             .css_classes(["terminal-drawer"])
+            .accessible_role(gtk4::AccessibleRole::Region)
             .build();
+        drawer.update_property(&[gtk4::accessible::Property::Label("Terminal drawer")]);
         drawer.append(&search_bar);
         drawer.append(&stack);
 
@@ -12883,28 +12889,16 @@ pub(super) mod tests {
         crate::testutil::settle(&ctx);
     }
 
-    /// A thread's turn end reaches the window's polite live region, an approval its alert
-    /// region, both once the main loop is idle. The same words again are still a change a
-    /// screen reader sees, and with announcements off nothing changes.
-    #[test]
-    #[ignore = "needs a display; run alone in an isolated display"]
-    fn live_region_updates_on_turn_end() {
-        crate::testutil::gtk_init().unwrap();
-        crate::testutil::adw_init().unwrap();
-        crate::icons::register();
-        let app = crate::window::imp::test_support::test_app("org.test.LiveRegion", true);
-        CHAT_RESTORED.with(|done| done.set(true));
-        let ctx = glib::MainContext::default();
-        let window = crate::window::imp::test_support::test_window(&app, &ctx);
-        let imp = window.imp();
-        // An agent that starts and stays silent, so only the events below reach the regions.
-        let dir = tempfile::tempdir().unwrap();
-        let agent = dir.path().join("quiet-agent");
+    /// Opens a Claude thread titled `title` in `dir` whose agent starts and stays silent (a
+    /// script in `dir` that sleeps), so only the events a test sends reach the window. Returns
+    /// its id; the thread is the window's current one.
+    fn open_quiet_thread(imp: &AgentTerminalWindow, dir: &std::path::Path, title: &str) -> String {
+        let agent = dir.join("quiet-agent");
         std::fs::write(&agent, "#!/bin/sh\nexec sleep 600\n").unwrap();
         std::fs::set_permissions(&agent, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
         let profile = Profile {
-            id: "claude-live".into(),
+            id: "claude-quiet".into(),
             name: "Claude".into(),
             command: agent.to_string_lossy().into_owned(),
             ..crate::config::new_agent_profile(Driver::Claude)
@@ -12929,13 +12923,212 @@ pub(super) mod tests {
         AgentAvailability::shared()
             .set(Driver::Claude, Availability::Ready(profile.command.clone()));
         imp.create_chat_thread(NewThread {
-            dir: Some(dir.path().to_string_lossy().into_owned()),
-            title: Some("Live regions".into()),
-            profile_id: Some("claude-live".into()),
+            dir: Some(dir.to_string_lossy().into_owned()),
+            title: Some(title.into()),
+            profile_id: Some("claude-quiet".into()),
             ..NewThread::new(Driver::Claude)
         })
         .expect("opened in place");
-        let thread = imp.current_thread().expect("its page");
+        imp.current_thread().expect("its page")
+    }
+
+    /// F6 and Shift+F6 move between the regions shown, in order, wrapping round; Tab goes
+    /// through them in the same order (sidebar, transcript, shelf, message box, drawer). An
+    /// approval that arrives while the message box has focus leaves it there. Each region is
+    /// a landmark with a role and a name.
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    fn f6_cycles_regions_and_tab_follows_their_order() {
+        use crate::testutil::pump_until;
+        crate::testutil::gtk_init().unwrap();
+        crate::testutil::adw_init().unwrap();
+        crate::icons::register();
+        crate::load_css();
+        crate::window::imp::SPAWN_TERMINAL_PAGES.with(|s| s.set(false));
+        let app = crate::window::imp::test_support::test_app("org.test.FocusRegions", true);
+        CHAT_RESTORED.with(|done| done.set(true));
+        let ctx = glib::MainContext::default();
+        let window = crate::window::imp::test_support::test_window(&app, &ctx);
+        window.set_default_size(1200, 800);
+        window.present();
+        assert!(pump_until(&ctx, 5, || window.is_realized()));
+        let imp = window.imp();
+        assert!(pump_until(&ctx, 20, || !imp.detecting.get()));
+        imp.finish_shell(None);
+        imp.reveal_shell();
+        let dir = tempfile::tempdir().unwrap();
+        let thread = open_quiet_thread(imp, dir.path(), "Regions");
+        assert!(pump_until(&ctx, 10, || imp
+            .with_chat(&thread, |c| c.view.is_some())
+            .unwrap_or(false)));
+        let view = imp
+            .with_chat(&thread, |c| c.view.clone())
+            .flatten()
+            .unwrap();
+        view.replay(&crate::chat::view::demo::DemoBackend::script_envelopes());
+        // A sub-agent at work, so its shelf shows.
+        view.apply(&Envelope::new(Event::TurnStarted { model: None }));
+        view.apply(&Envelope::new(Event::WorkersUpdated {
+            workers: vec![agent_core::event::WorkerSnapshot {
+                id: "w1".into(),
+                name: Some("Reviewer".into()),
+                task: Some("Review the change".into()),
+                state: agent_core::event::WorkerState::Running,
+                activity: None,
+                delegation: None,
+            }],
+            waiting_for: Vec::new(),
+        }));
+        imp.split_view
+            .borrow()
+            .as_ref()
+            .expect("the split view")
+            .set_show_sidebar(true);
+        gtk4::gio::prelude::ActionGroupExt::activate_action(&window, "toggle-drawer", None);
+        let shelf = view.shelf_widget().expect("the shelf");
+        let names =
+            || -> Vec<&'static str> { imp.focus_regions().iter().map(|r| r.name).collect() };
+        assert!(
+            pump_until(&ctx, 10, || names()
+                == ["sidebar", "transcript", "composer", "terminal"]
+                && shelf.is_mapped()),
+            "{:?}, shelf mapped: {}",
+            names(),
+            shelf.is_mapped()
+        );
+
+        // Landmarks: each region has a role and a name.
+        let (transcript, composer, field) = view.region_widgets().unwrap();
+        let sidebar: gtk4::Widget = imp.sidebar.borrow().as_ref().unwrap().root.clone().upcast();
+        let page = imp.page_of_thread(&thread).expect("the thread's page");
+        let drawer = imp
+            .with_page_tab(&page, |t| t.terminal.clone().upcast::<gtk4::Widget>())
+            .expect("the drawer's terminal");
+        let drawer_box = std::iter::successors(drawer.parent(), |w| w.parent())
+            .find(|w| w.has_css_class("terminal-drawer"))
+            .expect("the drawer box");
+        for (widget, role, name) in [
+            (&sidebar, gtk4::AccessibleRole::Navigation, "Threads"),
+            (&transcript, gtk4::AccessibleRole::Region, "Transcript"),
+            (
+                &shelf,
+                gtk4::AccessibleRole::Group,
+                "Sub-agents and background work",
+            ),
+            (&composer, gtk4::AccessibleRole::Region, "Message composer"),
+            (&drawer_box, gtk4::AccessibleRole::Region, "Terminal drawer"),
+        ] {
+            assert!(gtk4::test_accessible_has_role(widget, role), "{name}");
+            assert!(
+                gtk4::test_accessible_has_property(widget, gtk4::AccessibleProperty::Label),
+                "{name}"
+            );
+        }
+
+        // F6 forward from nowhere, round and back to the start; Shift+F6 backwards.
+        let focus = || gtk4::prelude::GtkWindowExt::focus(&window);
+        gtk4::prelude::GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+        let mut went = Vec::new();
+        for _ in 0..5 {
+            went.push(imp.cycle_region(true).unwrap_or("none"));
+        }
+        assert_eq!(
+            went,
+            ["sidebar", "transcript", "composer", "terminal", "sidebar"]
+        );
+        assert!(focus().is_some_and(|f| f == sidebar || f.is_ancestor(&sidebar)));
+        assert_eq!(imp.cycle_region(false), Some("terminal"));
+        assert_eq!(imp.cycle_region(false), Some("composer"));
+        assert_eq!(
+            focus().as_ref(),
+            Some(&field),
+            "the message box's text field"
+        );
+        // Through the accelerator, as a key press reaches it.
+        gtk4::gio::prelude::ActionGroupExt::activate_action(&window, "focus-next-region", None);
+        assert!(focus().is_some_and(|f| f == drawer || f.is_ancestor(&drawer)));
+
+        // An approval arriving while typing leaves the focus in the message box.
+        view.focus_composer();
+        view.set_draft("half a thought");
+        assert!(view.composer_is_focus());
+        view.apply(
+            &Envelope::new(Event::ApprovalRequested {
+                tool: "Bash".into(),
+                title: Some("Run cargo test".into()),
+                input: serde_json::json!({"command": "cargo test"}),
+                reason: None,
+                options: vec![
+                    agent_core::event::Decision::Allow,
+                    agent_core::event::Decision::Deny,
+                ],
+                response: agent_core::event::ResponseCapability::Live,
+                remembers: None,
+            })
+            .request("req-1"),
+        );
+        crate::testutil::settle(&ctx);
+        assert!(
+            view.composer_is_focus(),
+            "the approval did not take the focus"
+        );
+
+        // Tab from the sidebar's row: each region is first entered in this order.
+        let order = [
+            ("sidebar", sidebar.clone()),
+            ("transcript", transcript.clone()),
+            ("shelf", shelf.clone()),
+            ("composer", composer.clone()),
+            ("drawer", drawer_box.clone()),
+        ];
+        for _ in 0..5 {
+            if focus().is_some_and(|f| f == sidebar || f.is_ancestor(&sidebar)) {
+                break;
+            }
+            imp.cycle_region(true);
+        }
+        let mut entered: Vec<&str> = Vec::new();
+        for _ in 0..3000 {
+            if let Some(f) = focus() {
+                if let Some((name, _)) = order
+                    .iter()
+                    .find(|(_, root)| &f == root || f.is_ancestor(root))
+                {
+                    if !entered.contains(name) {
+                        entered.push(name);
+                    }
+                }
+            }
+            if entered.len() == order.len() {
+                break;
+            }
+            window.child_focus(gtk4::DirectionType::TabForward);
+        }
+        assert_eq!(
+            entered,
+            order.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            "Tab order"
+        );
+        window.destroy();
+        crate::testutil::settle(&ctx);
+    }
+
+    /// A thread's turn end reaches the window's polite live region, an approval its alert
+    /// region, both once the main loop is idle. The same words again are still a change a
+    /// screen reader sees, and with announcements off nothing changes.
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    fn live_region_updates_on_turn_end() {
+        crate::testutil::gtk_init().unwrap();
+        crate::testutil::adw_init().unwrap();
+        crate::icons::register();
+        let app = crate::window::imp::test_support::test_app("org.test.LiveRegion", true);
+        CHAT_RESTORED.with(|done| done.set(true));
+        let ctx = glib::MainContext::default();
+        let window = crate::window::imp::test_support::test_window(&app, &ctx);
+        let imp = window.imp();
+        let dir = tempfile::tempdir().unwrap();
+        let thread = open_quiet_thread(imp, dir.path(), "Live regions");
         window.present();
         crate::testutil::settle(&ctx);
 

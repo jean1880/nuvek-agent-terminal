@@ -514,6 +514,24 @@ impl ChatView {
         self.imp().inner.borrow().clone()
     }
 
+    /// The thread's regions for F6: the transcript and the message box, and the box's text
+    /// field, which takes the focus.
+    pub fn region_widgets(&self) -> Option<(gtk4::Widget, gtk4::Widget, gtk4::Widget)> {
+        let inner = self.inner()?;
+        Some((
+            inner.transcript.widget().clone().upcast(),
+            inner.composer.widget().clone().upcast(),
+            inner.composer.field(),
+        ))
+    }
+
+    /// The sub-agent and background shelves' card (tests).
+    #[cfg(test)]
+    pub(crate) fn shelf_widget(&self) -> Option<gtk4::Widget> {
+        self.inner()
+            .map(|inner| inner.shelves.widget.clone().upcast())
+    }
+
     /// Where this thread's toasts go: over the transcript, so one never covers the shelves or
     /// the composer.
     pub fn toast_overlay(&self) -> Option<adw::ToastOverlay> {

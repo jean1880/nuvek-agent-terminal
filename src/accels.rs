@@ -50,6 +50,10 @@ const COMMON: &[Binding] = &[
     ),
     ("win.zoom-out", &["<Primary>minus", "<Primary>KP_Subtract"]),
     ("win.zoom-reset", &["<Primary>0", "<Primary>KP_0"]),
+    // Region cycling, as GTK and GNOME apps do it: the sidebar, the transcript, the composer,
+    // the drawer and the diff panel, whichever are shown.
+    ("win.focus-next-region", &["F6"]),
+    ("win.focus-previous-region", &["<Shift>F6"]),
     ("win.next-tab", &["<Primary>Tab", "<Primary>Page_Down"]),
     (
         "win.previous-tab",

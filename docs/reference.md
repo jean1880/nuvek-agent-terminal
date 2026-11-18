@@ -747,6 +747,16 @@ stores, and is never saved.
 Turn it off with Settings → General → Notifications → **Announce Events to Screen Readers**
 (`announce_events` in the config file).
 
+**Moving around.** F6 moves the keyboard focus to the next part of the window, and Shift+F6
+to the previous one, wrapping round: the thread list, the transcript (its newest message),
+the message box, the terminal drawer while it is open, and the Changes panel while it is
+docked. Tab goes through them in the same order. Each is a landmark a screen reader can jump
+to, named "Threads", "Transcript", "Message composer", "Terminal drawer" and "Changes"; the
+sub-agent shelf and the approval bar above the message box are named groups. A request for
+approval that arrives while you type never takes the focus away from the message box: its
+alert is read, and the approval bar's **Jump to card in transcript** button takes you to its
+card.
+
 ### Sending terminal output to a thread
 
 Right-click a terminal (or press the Menu key or Shift+F10 in it) for two items:

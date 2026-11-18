@@ -13,6 +13,7 @@ mod fork_compare;
 mod merge;
 mod pack_animation;
 mod prompts_prefs;
+mod regions;
 mod remote;
 mod setup;
 mod spending;
@@ -262,6 +263,18 @@ const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
               <object class="GtkShortcutsShortcut">
                 <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;Tab &lt;Primary&gt;Page_Up</property>
                 <property name="title">Previous Tab</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">F6</property>
+                <property name="title">Next Region (Threads, Transcript, Message Box, Drawer, Changes)</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Shift&gt;F6</property>
+                <property name="title">Previous Region</property>
               </object>
             </child>
             <child>
@@ -2062,6 +2075,12 @@ impl AgentTerminalWindow {
             });
         }
         self.add_win_action("zoom-reset", |imp| imp.set_font_scale(1.0));
+        self.add_win_action("focus-next-region", |imp| {
+            imp.cycle_region(true);
+        });
+        self.add_win_action("focus-previous-region", |imp| {
+            imp.cycle_region(false);
+        });
         self.add_win_action("search", Self::toggle_search);
         self.add_win_action("close-tab", |imp| {
             // Through the same door as the sidebar's X, so a running thread asks first.

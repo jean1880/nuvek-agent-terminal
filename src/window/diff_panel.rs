@@ -1058,11 +1058,14 @@ impl DiffPanel {
         stack.add_named(&status, Some("status"));
         stack.add_named(&diff_page, Some("diff"));
 
+        // A landmark, docked or popped out: F6 cycles to it, and a screen reader can jump to it.
         let content = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
             .vexpand(true)
             .hexpand(true)
+            .accessible_role(gtk4::AccessibleRole::Region)
             .build();
+        content.update_property(&[gtk4::accessible::Property::Label("Changes")]);
         content.append(&header);
         content.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
         content.append(&stack);

@@ -206,7 +206,14 @@ impl Drop for TranscriptView {
 
 impl TranscriptView {
     pub fn new(sink: RowSink) -> Rc<Self> {
-        let list = gtk4::Box::new(gtk4::Orientation::Vertical, 14);
+        // The messages, as a list a screen reader steps through item by item (each row is a
+        // list item naming its author: `cards::Row::build`).
+        let list = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .spacing(14)
+            .accessible_role(gtk4::AccessibleRole::List)
+            .build();
+        list.update_property(&[gtk4::accessible::Property::Label("Messages")]);
         list.add_css_class("transcript");
         list.set_valign(gtk4::Align::End);
         // A readable measure: centred column, capped width.
@@ -266,7 +273,11 @@ impl TranscriptView {
         )]);
         jump.set_visible(false);
 
-        let root = gtk4::Overlay::new();
+        // A landmark: F6 cycles to it, and a screen reader can jump to it.
+        let root = gtk4::Overlay::builder()
+            .accessible_role(gtk4::AccessibleRole::Region)
+            .build();
+        root.update_property(&[gtk4::accessible::Property::Label("Transcript")]);
         root.set_child(Some(&scroller));
         root.add_overlay(&empty);
         root.add_overlay(&jump);

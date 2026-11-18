@@ -102,7 +102,9 @@
 .usage-bar { min-height: 4px; }
 /* min-width: Adwaita gives every progress trough 150 px, which outweighs the bar's own width
    request and made each agent's meter (and the sidebar holding two) far wider than drawn. */
-.usage-bar trough { min-height: 4px; min-width: 24px; background-color: alpha(@at_fg, 0.15); border-radius: 2px; }
+/* A faint trough, so every fill stands out from it at 3:1
+   (palette.rs: `the_context_and_usage_bars_are_seen_on_their_troughs`). */
+.usage-bar trough { min-height: 4px; min-width: 24px; background-color: alpha(@at_fg, 0.08); border-radius: 2px; }
 .usage-bar progress { min-height: 4px; border-radius: 2px; background-color: @at_success; }
 .usage-bar.usage-warn progress { background-color: @at_warning; }
 .usage-bar.usage-crit progress { background-color: @at_danger; }
@@ -153,7 +155,9 @@
 levelbar.context-level trough {
     min-height: 6px;
     border-radius: 999px;
-    background-color: mix(@at_surface_strong, @at_border_strong, 0.5);
+    /* Not the strong border, which is lifted for outlines: the fill must stand out from it
+       (palette.rs: `the_context_and_usage_bars_are_seen_on_their_troughs`). */
+    background-color: mix(@at_surface_strong, @at_border, 0.5);
     padding: 0;
 }
 levelbar.context-level block.filled,
@@ -443,7 +447,7 @@ button.flat.quick-reply-action {
     box-shadow: none;
 }
 button.flat.quick-reply-action:hover { color: @at_fg_soft; text-decoration: underline; background: none; }
-.quick-reply:focus-visible, .quick-reply-action:focus-visible { outline: 2px solid @at_accent; outline-offset: -2px; }
+.quick-reply:focus-visible, .quick-reply-action:focus-visible { outline: 2px solid @at_focus; outline-offset: -2px; }
 .option-label { color: @at_fg_strong; font-weight: 600; }
 .option-desc { color: @at_fg_dim; font-size: 0.85em; }
 
@@ -716,7 +720,7 @@ button.flat.quick-reply-action:hover { color: @at_fg_soft; text-decoration: unde
     border: 1px solid @at_border_strong;
 }
 .composer:hover { border-color: @at_border_hover; }
-.composer:focus-within { border-color: alpha(@at_accent, 0.7); }
+.composer:focus-within { border-color: @at_focus; }
 /* The typing area itself is an inset field, a shade lighter than the bar around it, so it
    reads as the place to click. */
 textview.composer-view {
@@ -724,8 +728,10 @@ textview.composer-view {
     border-radius: 11px;
 }
 .composer-field { border-radius: 11px; }
-textview.composer-view:hover { background-color: mix(@at_surface_strong, @at_border_strong, 0.4); }
-textview.composer-view:focus-within { background-color: mix(@at_surface_strong, @at_border_strong, 0.6); }
+/* Tinted with the plain border: the strong one is lifted for outlines, and the text on it must
+   keep its contrast. */
+textview.composer-view:hover { background-color: mix(@at_surface_strong, @at_border, 0.4); }
+textview.composer-view:focus-within { background-color: mix(@at_surface_strong, @at_border, 0.6); }
 textview.composer-view text {
     background-color: transparent;
     color: @at_fg_strong;
@@ -813,10 +819,16 @@ dialog.chat-panel bottom-sheet > sheet,
 .section-more:focus-visible,
 .jump-button:focus-visible,
 .image-tile:focus-visible,
-.attach-button:focus-visible,
-.send-button:focus-visible {
-    outline: 2px solid @at_accent;
+.attach-button:focus-visible {
+    outline: 2px solid @at_focus;
     outline-offset: -2px;
+}
+/* Filled with the accent, which the focus colour may equal: the ring goes outside it, on the
+   composer, where the focus colour reads at 3:1. Every `button.suggested-action` has its ring
+   in the global stylesheet (main.rs). */
+.send-button:focus-visible {
+    outline: 2px solid @at_focus;
+    outline-offset: 2px;
 }
 
 /* ---------------------------------------------------------------- images */

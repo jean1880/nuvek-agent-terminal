@@ -2,6 +2,7 @@
 
 mod agents_prefs;
 mod animated_menu;
+mod announce;
 mod closing;
 mod commit;
 mod diff_prefs;
@@ -12,6 +13,7 @@ mod fork_compare;
 mod merge;
 mod pack_animation;
 mod prompts_prefs;
+mod regions;
 mod remote;
 mod setup;
 mod spending;
@@ -56,8 +58,8 @@ use crate::terminal_stub::{CursorBlinkMode, CursorShape, Format, PtyFlags, Termi
 const LOGO_SVG: &str = include_str!("../../assets/ca.nuvek.AgentTerminal.svg");
 
 /// The smallest the window may be made (GNOME's minimum for adaptive apps). Every layout state
-/// the breakpoints allow fits it at normal text size; large text is supported from a wider
-/// window. `tests::small_window_fits` measures both.
+/// the breakpoints allow fits it at normal text size; large text, which scales the whole app,
+/// is supported from a wider and taller window. `tests::small_window_fits` measures both.
 const MIN_WINDOW: (i32, i32) = (360, 294);
 /// The Settings descriptions of the two folder rows, restored once a typed path checks out.
 const STARTING_DIRECTORY_HELP: &str = "Where new tabs and threads open (blank: your home folder)";
@@ -261,6 +263,19 @@ const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
               <object class="GtkShortcutsShortcut">
                 <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;Tab &lt;Primary&gt;Page_Up</property>
                 <property name="title">Previous Tab</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">F6 &lt;Primary&gt;F6</property>
+                <property name="title">Next Region (Threads, Transcript, Message Box, Drawer, Changes)</property>
+                <property name="subtitle">In a terminal, F6 is the program's: use Ctrl+F6</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Shift&gt;F6 &lt;Primary&gt;&lt;Shift&gt;F6</property>
+                <property name="title">Previous Region</property>
               </object>
             </child>
             <child>
@@ -1499,6 +1514,8 @@ pub struct AgentTerminalWindow {
     transcript_paths: RefCell<std::collections::HashMap<(String, String), std::path::PathBuf>>,
     /// Wraps the tab view, for short confirmations that need no dialog.
     toast_overlay: RefCell<Option<adw::ToastOverlay>>,
+    /// The screen reader's live regions (`announce.rs`).
+    live: announce::LiveRegions,
     /// The header's "New Thread With" submenu, refilled when agent detection finishes.
     new_with_menu: RefCell<Option<gtk4::gio::Menu>>,
     /// The header's "New Thread in Existing Folder With" submenu, refilled when agent detection finishes.
@@ -1900,11 +1917,15 @@ impl AgentTerminalWindow {
             (
                 config.theme,
                 config.scrollback_lines,
-                config.font_scale,
+                // Held to the setting's range when read (`TerminalConfig::normalize`); again
+                // here, as every other way in is.
+                crate::style::clamp_text_scale(config.font_scale),
                 config.context_warning,
             )
         };
         self.apply_appearance_to_all();
+        // The whole app's text, whether or not a thread is open.
+        crate::style::set_text_scale(scale);
         self.for_each_terminal_everywhere(|term| {
             Theme::apply(term, theme);
             term.set_scrollback_lines(i64::from(scrollback));
@@ -2081,6 +2102,14 @@ impl AgentTerminalWindow {
             });
         }
         self.add_win_action("zoom-reset", |imp| imp.set_font_scale(1.0));
+        self.add_win_action("focus-next-region", |imp| {
+            imp.cycle_region(true);
+        });
+        self.add_win_action("focus-previous-region", |imp| {
+            imp.cycle_region(false);
+        });
+        // Bare F6 and Shift+F6: ahead of the panes, and left to a terminal's program.
+        self.install_region_keys();
         self.add_win_action("search", Self::toggle_search);
         self.add_win_action("close-tab", |imp| {
             // Through the same door as the sidebar's X, so a running thread asks first.
@@ -2581,6 +2610,8 @@ impl AgentTerminalWindow {
         {
             let config = self.config.borrow();
             crate::palette::apply(config.theme, config.theme_pair());
+            // And its text scale: the sidebar and Settings follow it, not only the threads.
+            crate::style::set_text_scale(config.font_scale);
         }
         crate::palette::set_on_system_change(recolour_for_system);
 
@@ -2623,7 +2654,10 @@ impl AgentTerminalWindow {
             .build();
         let (page, name) = self.loading_page();
         boot.add_named(&page, Some(name));
-        content.append(&boot);
+        // The screen reader's live regions ride over everything, drawn nowhere.
+        let stage = gtk4::Overlay::builder().child(&boot).vexpand(true).build();
+        stage.add_overlay(&self.build_live_regions());
+        content.append(&stage);
         obj.set_content(Some(&content));
 
         // The chat shell is built now, behind the splash, not once detection is done: the thread
@@ -4494,13 +4528,16 @@ impl AgentTerminalWindow {
         // be handled widget-locally.
     }
 
-    /// Sets the font scale on all tabs and queues a save.
-    fn set_font_scale(&self, scale: f64) {
+    /// Sets the text scale: the whole app's text (one stylesheet for every window, Settings
+    /// and dialogs included), every terminal's font and each thread header's breakpoints, live;
+    /// and queues a save.
+    pub(super) fn set_font_scale(&self, scale: f64) {
         // Every path in (keys, the spin's arrows) steps by 0.1; rounding here
         // keeps float error (1.2000000000000002) out of config.json.
-        let scale = (scale * 10.0).round() / 10.0;
+        let scale = crate::style::clamp_text_scale((scale * 10.0).round() / 10.0);
         debug!("Setting font scale: {}", scale);
         self.config.borrow_mut().font_scale = scale;
+        crate::style::set_text_scale(scale);
         self.for_each_window(|window| {
             window.for_each_terminal(|term| term.set_font_scale(scale));
             for tab in window.tabs.borrow().iter() {
@@ -5144,7 +5181,9 @@ impl AgentTerminalWindow {
             .and_then(|name| config.profiles.iter().position(|p| &p.name == name))
             .map_or(AUTO_INDEX, |i| i as u32 + 1);
 
-        let font_scale_adj = gtk4::Adjustment::new(config.font_scale, 0.5, 3.0, 0.1, 0.5, 0.0);
+        let (scale_min, scale_max) = crate::style::TEXT_SCALE_RANGE;
+        let font_scale_adj =
+            gtk4::Adjustment::new(config.font_scale, scale_min, scale_max, 0.1, 0.5, 0.0);
         let font_scale_spin = gtk4::SpinButton::builder()
             .adjustment(&font_scale_adj)
             .digits(1)
@@ -5153,7 +5192,10 @@ impl AgentTerminalWindow {
 
         let font_scale_row = adw::ActionRow::builder()
             .title("Text Scale")
-            .subtitle("Chat and terminal text size; default 1.0 (Ctrl+= and Ctrl+- change it)")
+            .subtitle(
+                "Text size of the whole app: threads, the sidebar, Settings, dialogs and \
+                 terminals; default 1.0 (Ctrl+= and Ctrl+- change it)",
+            )
             .build();
         font_scale_row.add_suffix(&font_scale_spin);
         font_scale_spin.update_property(&[gtk4::accessible::Property::Label("Text Scale")]);
@@ -5356,6 +5398,16 @@ impl AgentTerminalWindow {
             },
         );
 
+        let announce_row = self.config_switch(
+            "Announce Events to Screen Readers",
+            "Tell a screen reader when a turn finishes or fails, a thread asks for approval or \
+             a question, or an error arrives. Nothing is said twice: what a desktop \
+             notification already said is left to it",
+            |c| c.announce_events,
+            SaveWhen::Debounced(|c, on| c.announce_events = on),
+            |_, _| {},
+        );
+
         let update_check_row = self.update_check_row();
 
         let restore_row = self.config_switch(
@@ -5467,6 +5519,7 @@ impl AgentTerminalWindow {
             .build();
         notifications.add(&notify_row);
         notifications.add(&notify_quota_row);
+        notifications.add(&announce_row);
         general.add(&notifications);
         let replies = adw::PreferencesGroup::builder().title("Replies").build();
         replies.add(&quick_replies_row);
@@ -8612,6 +8665,26 @@ fn excerpt_toast(
 mod tests {
     use super::*;
 
+    /// The shortcuts window shows the region keys as they are bound: the bare key, then the
+    /// accelerator spelled as the table spells it (`<Primary>`, the Command key on macOS).
+    #[test]
+    fn the_shortcuts_window_lists_the_region_keys_as_bound() {
+        let escape = |a: &str| a.replace('<', "&lt;").replace('>', "&gt;");
+        for (action, bare) in [
+            ("win.focus-next-region", "F6"),
+            ("win.focus-previous-region", "&lt;Shift&gt;F6"),
+        ] {
+            let accels = crate::accels::accels_for(action);
+            assert!(!accels.is_empty(), "{action} is not bound");
+            let shown: Vec<String> = accels.iter().map(|a| escape(a)).collect();
+            let line = format!(
+                "<property name=\"accelerator\">{bare} {}</property>",
+                shown.join(" ")
+            );
+            assert!(SHORTCUTS_XML.contains(&line), "{action}: no {line}");
+        }
+    }
+
     #[test]
     fn send_resolves_by_target_focus_and_selection() {
         use SendFrom::{Drawer, Page};
@@ -9456,6 +9529,10 @@ mod tests {
     /// floor for normal text; doubling the text there leaves no room for a thread's controls,
     /// and is not a layout anyone works in.
     const LARGE_TEXT_MIN_WIDTH: i32 = 600;
+    /// The shortest window large text (2×) is supported in. The text scale is the whole app's, so
+    /// the header bar, the thread's header and the message box all double with it, and
+    /// [`MIN_WINDOW`]'s height leaves the transcript no room.
+    const LARGE_TEXT_MIN_HEIGHT: i32 = 400;
 
     /// A message-search hit opens its thread scrolled to that message, on a shown window (a
     /// jump is placed only once its row is laid out).
@@ -9769,7 +9846,13 @@ mod tests {
         // The window at each width either side of every breakpoint, the real breakpoints
         // choosing the layout, at the smallest height it may have. Whatever the layout, its
         // content must fit the window.
-        let (_, height) = MIN_WINDOW;
+        let height_at = |scale: f64| {
+            if scale > 1.0 {
+                LARGE_TEXT_MIN_HEIGHT
+            } else {
+                MIN_WINDOW.1
+            }
+        };
         // Native runners may cap windows to the monitor (Broadway defaults to 1024 px).
         // Verify every reachable breakpoint without mistaking that cap for an app failure.
         let display_width = window
@@ -9806,6 +9889,7 @@ mod tests {
                 if scale > 1.0 {
                     scaled_widths.retain(|width| *width >= LARGE_TEXT_MIN_WIDTH);
                 }
+                let height = height_at(scale);
                 for width in scaled_widths {
                     window.set_default_size(width + frame_width, height + frame_height);
                     let sized = crate::testutil::pump_until(&ctx, 3, || {
@@ -9885,6 +9969,82 @@ mod tests {
             "layout changes must not change permission mode"
         );
         assert!(failures.is_empty(), "{}", failures.join("; "));
+    }
+
+    /// The text scale is the whole app's: the sidebar and the Settings dialog take it live, as
+    /// threads do, with no thread open; the zoom keys move it, and it is kept in the config.
+    #[test]
+    #[ignore = "presents the window and Settings; run on a private display"]
+    fn the_text_scale_reaches_the_sidebar_and_settings() {
+        init_gtk();
+        crate::testutil::adw_init().expect("adw init");
+        crate::icons::register();
+        crate::load_css();
+        let app = crate::window::imp::test_support::test_app("org.test.TextScale", false);
+        let window = super::super::AgentTerminalWindow::new(&app);
+        let imp = window.imp();
+        for p in imp.config.borrow_mut().profiles.iter_mut() {
+            p.command = format!("/nonexistent/{}", p.command);
+        }
+        let ctx = glib::MainContext::default();
+        crate::testutil::pump_until(&ctx, 20, || !imp.detecting.get());
+        imp.finish_shell(None);
+        imp.reveal_shell();
+        window.set_default_size(1200, 800);
+        window.present();
+        imp.split_view
+            .borrow()
+            .as_ref()
+            .expect("the split view")
+            .set_show_sidebar(true);
+        crate::testutil::settle(&ctx);
+        let size = |w: &gtk4::Widget| w.pango_context().font_description().map_or(0, |d| d.size());
+        let labelled = |root: &gtk4::Widget, text: &str| -> gtk4::Widget {
+            crate::testutil::descendants(root)
+                .into_iter()
+                .find(|w| {
+                    w.downcast_ref::<gtk4::Label>()
+                        .is_some_and(|l| l.text() == text)
+                })
+                .unwrap_or_else(|| panic!("a label reading {text}"))
+        };
+        let sidebar: gtk4::Widget = imp.sidebar.borrow().as_ref().unwrap().root.clone().upcast();
+        let archived = labelled(&sidebar, "Show Archived");
+        let before = size(&archived);
+        assert!(before > 0);
+
+        imp.set_font_scale(2.0);
+        crate::testutil::settle(&ctx);
+        let doubled = size(&archived);
+        assert!(
+            (doubled - 2 * before).abs() <= 2 * gtk4::pango::SCALE,
+            "sidebar text {before} → {doubled}"
+        );
+        assert_eq!(imp.config.borrow().font_scale, 2.0);
+        assert!((crate::style::text_scale() - 2.0).abs() < 1e-9);
+
+        // Settings opens at the scale, and follows a zoom while open.
+        imp.show_preferences();
+        crate::testutil::settle(&ctx);
+        let dialog: gtk4::Widget = window
+            .visible_dialog()
+            .expect("the Settings dialog")
+            .upcast();
+        let row_title = labelled(&dialog, "Text Scale");
+        let at_two = size(&row_title);
+        gtk4::gio::prelude::ActionGroupExt::activate_action(&window, "zoom-reset", None);
+        crate::testutil::settle(&ctx);
+        let at_one = size(&row_title);
+        assert!(
+            (at_two - 2 * at_one).abs() <= 2 * gtk4::pango::SCALE,
+            "Settings text {at_two} at 2.0, {at_one} at 1.0"
+        );
+        assert_eq!(imp.config.borrow().font_scale, 1.0);
+        assert!(
+            (size(&archived) - before).abs() <= gtk4::pango::SCALE,
+            "the sidebar back at its size"
+        );
+        window.destroy();
     }
 
     /// Every button in the window is named for assistive technology and is a usable target:

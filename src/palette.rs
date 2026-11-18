@@ -36,6 +36,10 @@ use crate::theme::Theme;
 /// WCAG AA for body text: what every text colour must reach on what it is drawn on.
 pub const MIN_TEXT_CONTRAST: f64 = 4.5;
 
+/// WCAG AA for what is not text but must be seen (1.4.11): a control's outline, the focus
+/// ring, a state colour (a bar's fill, a status dot) on what it is drawn on.
+pub const MIN_NON_TEXT_CONTRAST: f64 = 3.0;
+
 /// An opaque sRGB colour, components 0..=1.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rgb(pub f64, pub f64, pub f64);
@@ -171,13 +175,15 @@ pub struct Chrome {
     pub danger_border: Rgb,
     /// Background work, links.
     pub info: Rgb,
+    /// The keyboard focus ring: opaque, and at [`MIN_NON_TEXT_CONTRAST`] on every surface.
+    pub focus: Rgb,
 }
 
 /// The system theme: each name, as an expression of the desktop theme's named colours (the ones
 /// libadwaita documents, which a `gtk.css` theme redefines). Mixes and alphas only place a role
 /// between two of the desktop's colours; none brings a colour of its own. Same names, same
 /// order as [`Chrome::named`].
-pub const SYSTEM_COLOURS: [(&str, &str); 27] = [
+pub const SYSTEM_COLOURS: [(&str, &str); 28] = [
     ("at_bg", "@window_bg_color"),
     ("at_bg_deep", "@headerbar_bg_color"),
     ("at_bg_sunken", "@view_bg_color"),
@@ -195,8 +201,11 @@ pub const SYSTEM_COLOURS: [(&str, &str); 27] = [
         "mix(@window_bg_color, @accent_bg_color, 0.28)",
     ),
     ("at_border", "alpha(@window_fg_color, 0.15)"),
-    ("at_border_strong", "alpha(@window_fg_color, 0.25)"),
-    ("at_border_hover", "alpha(@accent_color, 0.6)"),
+    // A control's outline reaches 3:1 on Adwaita's light and dark windows
+    // (`a_system_themes_controls_are_seen_on_adwaita`).
+    ("at_border_strong", "alpha(@window_fg_color, 0.55)"),
+    // Pointing at a control brightens its outline to the accent, opaque: 3:1 or more there too.
+    ("at_border_hover", "@accent_color"),
     ("at_fg_strong", "@window_fg_color"),
     ("at_fg", "@window_fg_color"),
     // Secondary text stays at 4.5:1 on Adwaita's light window, whose text is itself 80 % opaque
@@ -231,6 +240,7 @@ pub const SYSTEM_COLOURS: [(&str, &str); 27] = [
         "mix(@window_bg_color, @error_color, 0.42)",
     ),
     ("at_info", "@accent_color"),
+    ("at_focus", "@accent_color"),
 ];
 
 /// How much of a tag's colour tints its chip's ground (the rest is the row beneath). The chip
@@ -354,6 +364,7 @@ fn resolve_system() -> Chrome {
         danger_bg: c("at_danger_bg"),
         danger_border: c("at_danger_border"),
         info: c("at_info"),
+        focus: c("at_focus"),
     }
 }
 
@@ -361,6 +372,12 @@ impl Chrome {
     /// The colours of a bundled palette; `None` for the system theme, whose colours are the
     /// desktop's (see [`resolve_system`]).
     pub fn for_choice(choice: ThemeChoice) -> Option<Chrome> {
+        Self::tuned_for_choice(choice).map(Self::with_visible_controls)
+    }
+
+    /// A bundled palette with its text made readable, before what must be seen without being
+    /// text is lifted ([`Self::with_visible_controls`]).
+    fn tuned_for_choice(choice: ThemeChoice) -> Option<Chrome> {
         match concrete(choice) {
             ThemeChoice::System => None,
             ThemeChoice::AgentTerminal => Some(Self::agent_terminal().with_readable_text()),
@@ -385,6 +402,64 @@ impl Chrome {
                 }
             }),
         }
+    }
+
+    /// The surfaces a control, a focus ring or a state colour is drawn on: the window, the
+    /// header and sidebar, cards and popovers, raised and hovered surfaces.
+    fn control_grounds(&self) -> [Rgb; 4] {
+        [self.bg, self.bg_deep, self.surface, self.surface_raised]
+    }
+
+    /// The troughs a bar's fill is drawn in (style.css): the header's context bar
+    /// (`mix(@at_surface_strong, @at_border, 0.5)`), and a usage bar's (`alpha(@at_fg, 0.08)`)
+    /// in the sidebar footer and in its popover.
+    fn bar_troughs(&self) -> [Rgb; 3] {
+        let sidebar = self.bg_deep.mix(self.bg, 0.35);
+        [
+            self.surface_strong.mix(self.border, 0.5),
+            sidebar.mix(self.fg, 0.08),
+            self.surface.mix(self.fg, 0.08),
+        ]
+    }
+
+    /// What must be seen without being text lifted to [`MIN_NON_TEXT_CONTRAST`] on every
+    /// [`Self::control_grounds`] (the focus ring on the field tint too), each moved toward the
+    /// body text only as far as it must, else toward the strong text: a control's outline
+    /// (`border_strong`, and its hover a step past it), the accent (selection, toggles, the
+    /// context bar), the success, warning, danger and info colours (bars, dots, badges), and
+    /// the focus ring. Readability wins over a scheme's own values; one that already reaches
+    /// it is kept.
+    fn with_visible_controls(mut self) -> Chrome {
+        let grounds = self.control_grounds();
+        let (fg, strong) = (self.fg, self.fg_strong);
+        let lift = |c: Rgb, grounds: &[Rgb], min: f64| {
+            let toward_fg = c.readable_on_all(grounds, fg, min);
+            if toward_fg.reads_on_all(grounds, min) {
+                toward_fg
+            } else {
+                toward_fg.readable_on_all(grounds, strong, min)
+            }
+        };
+        self.border_strong = lift(self.border_strong, &grounds, MIN_NON_TEXT_CONTRAST);
+        // Pointing at a control brightens its outline: never less than the outline itself.
+        let hover_floor = MIN_NON_TEXT_CONTRAST.max(self.border_strong.contrast(self.bg) + 0.5);
+        self.border_hover = lift(self.border_hover, &grounds, hover_floor);
+        // The colours a bar fills with are seen in its trough too.
+        let filled: Vec<Rgb> = grounds.iter().chain(&self.bar_troughs()).copied().collect();
+        self.accent = lift(self.accent, &filled, MIN_NON_TEXT_CONTRAST);
+        self.success = lift(self.success, &filled, MIN_NON_TEXT_CONTRAST);
+        self.warning = lift(self.warning, &filled, MIN_NON_TEXT_CONTRAST);
+        self.danger = lift(self.danger, &filled, MIN_NON_TEXT_CONTRAST);
+        self.info = lift(self.info, &grounds, MIN_NON_TEXT_CONTRAST);
+        let ring_grounds = [
+            self.bg,
+            self.bg_deep,
+            self.surface,
+            self.surface_raised,
+            self.surface_strong,
+        ];
+        self.focus = lift(self.accent, &ring_grounds, MIN_NON_TEXT_CONTRAST);
+        self
     }
 
     /// The secondary text colours (soft, dim, faint) and the body text lifted to
@@ -442,6 +517,7 @@ impl Chrome {
             danger_bg: h(0x3a1f2b),
             danger_border: h(0x7a3b4c),
             info: h(0x7cc7ff),
+            focus: h(0xb49bff),
         }
     }
 
@@ -482,6 +558,7 @@ impl Chrome {
             danger_bg: bg.mix(danger, 0.14),
             danger_border: bg.mix(danger, 0.42),
             info,
+            focus: accent,
         }
     }
 
@@ -523,6 +600,7 @@ impl Chrome {
             danger_bg: bg.mix(danger, 0.12),
             danger_border: bg.mix(danger, 0.42),
             info,
+            focus: accent,
         }
     }
 
@@ -556,7 +634,7 @@ impl Chrome {
     }
 
     /// The names the stylesheets use, and their colours.
-    fn named(&self) -> [(&'static str, Rgb); 27] {
+    fn named(&self) -> [(&'static str, Rgb); 28] {
         [
             ("at_bg", self.bg),
             ("at_bg_deep", self.bg_deep),
@@ -585,6 +663,7 @@ impl Chrome {
             ("at_danger_bg", self.danger_bg),
             ("at_danger_border", self.danger_border),
             ("at_info", self.info),
+            ("at_focus", self.focus),
         ]
     }
 
@@ -1107,6 +1186,177 @@ mod tests {
         }
     }
 
+    /// What must be seen without being text reaches 3:1 (WCAG 1.4.11) on every surface it is
+    /// drawn on, in every bundled scheme: a control's outline and its hover, the accent, the
+    /// state colours and the focus ring.
+    #[test]
+    fn every_palettes_controls_are_seen() {
+        for choice in ThemeChoice::ALL {
+            let Some(c) = Chrome::for_choice(choice) else {
+                continue; // the desktop's own colours: see the Adwaita test below
+            };
+            let grounds = [
+                ("bg", c.bg),
+                ("bg_deep", c.bg_deep),
+                ("surface", c.surface),
+                ("raised", c.surface_raised),
+            ];
+            for (role, colour) in [
+                ("border_strong", c.border_strong),
+                ("border_hover", c.border_hover),
+                ("accent", c.accent),
+                ("success", c.success),
+                ("warning", c.warning),
+                ("danger", c.danger),
+                ("info", c.info),
+                ("focus", c.focus),
+            ] {
+                for (ground, bg) in grounds {
+                    let ratio = colour.contrast(bg);
+                    assert!(
+                        ratio >= MIN_NON_TEXT_CONTRAST,
+                        "{choice}: {role} on {ground} at {ratio:.2}:1"
+                    );
+                }
+            }
+            let ring = c.focus.contrast(c.surface_strong);
+            assert!(
+                ring >= MIN_NON_TEXT_CONTRAST,
+                "{choice}: focus on a field at {ring:.2}:1"
+            );
+            assert!(
+                c.border_hover.contrast(c.bg) >= c.border_strong.contrast(c.bg),
+                "{choice}: pointing at a control dims its outline"
+            );
+        }
+    }
+
+    /// The header's context bar (`levelbar.context-level` in style.css) and the usage bars:
+    /// each fill is seen on its trough and on the ground around it, in every bundled scheme.
+    /// Neither says its state by colour alone: the gauge and the usage meter print their
+    /// figures beside the bar.
+    #[test]
+    fn the_context_and_usage_bars_are_seen_on_their_troughs() {
+        let style = include_str!("chat/view/style.css");
+        assert!(
+            style.contains("background-color: mix(@at_surface_strong, @at_border, 0.5);"),
+            "the context bar's trough is what this test measures"
+        );
+        assert!(
+            style.contains(
+                ".usage-bar trough { min-height: 4px; min-width: 24px; background-color: \
+                 alpha(@at_fg, 0.08);"
+            ),
+            "the usage bar's trough is what this test measures"
+        );
+        for choice in ThemeChoice::ALL {
+            let Some(c) = Chrome::for_choice(choice) else {
+                continue;
+            };
+            let [trough, sidebar_trough, popover_trough] = c.bar_troughs();
+            for (state, fill) in [("ok", c.accent), ("warn", c.warning), ("hot", c.danger)] {
+                for (ground, bg) in [("trough", trough), ("header", c.bg), ("bg_deep", c.bg_deep)] {
+                    let ratio = fill.contrast(bg);
+                    assert!(
+                        ratio >= MIN_NON_TEXT_CONTRAST,
+                        "{choice}: context bar {state} on {ground} at {ratio:.2}:1"
+                    );
+                }
+            }
+            // The sidebar footer (`.thread-sidebar`) and the usage popover (a surface).
+            let sidebar = c.bg_deep.mix(c.bg, 0.35);
+            assert_eq!(sidebar_trough, sidebar.mix(c.fg, 0.08));
+            assert_eq!(popover_trough, c.surface.mix(c.fg, 0.08));
+            assert_eq!(trough, c.surface_strong.mix(c.border, 0.5));
+            for (place, trough) in [("sidebar", sidebar_trough), ("popover", popover_trough)] {
+                for (state, fill) in [
+                    ("ok", c.success),
+                    ("warn", c.warning),
+                    ("crit", c.danger),
+                    ("stale", c.fg_dim),
+                ] {
+                    let ratio = fill.contrast(trough);
+                    assert!(
+                        ratio >= MIN_NON_TEXT_CONTRAST,
+                        "{choice}: usage bar {state} in the {place} at {ratio:.2}:1"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every keyboard focus ring is drawn in `@at_focus`: the app's own rings, and libadwaita's,
+    /// whose colour the brand stylesheet replaces (libadwaita draws it half transparent).
+    #[test]
+    fn focus_rings_use_the_focus_colour() {
+        let style = include_str!("chat/view/style.css");
+        for line in style.lines().filter(|l| l.contains("outline:")) {
+            assert!(
+                !line.contains("@at_accent"),
+                "a focus ring in the accent: {line}"
+            );
+        }
+        assert!(style.contains("outline: 2px solid @at_focus;"));
+        let main = include_str!("main.rs");
+        assert!(main.contains(":focus-visible {\n            outline-color: @at_focus;"));
+    }
+
+    /// The system theme's control outline, and the same outline pointed at, reach 3:1 on
+    /// libadwaita's own light and dark windows (light text is itself 80 % opaque; the accent is
+    /// libadwaita's blue).
+    #[test]
+    fn a_system_themes_controls_are_seen_on_adwaita() {
+        let value_of = |name: &str| -> &str {
+            SYSTEM_COLOURS
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| *v)
+                .expect("a system colour")
+        };
+        // `@base` or `alpha(@base, a)`: how much of the named colour is drawn.
+        let alpha_of = |value: &str, base: &str| -> f64 {
+            if value == base {
+                return 1.0;
+            }
+            value
+                .strip_prefix(&format!("alpha({base}, "))
+                .and_then(|v| v.strip_suffix(')'))
+                .unwrap_or_else(|| panic!("{value}: not {base} or an alpha of it"))
+                .parse()
+                .expect("an alpha")
+        };
+        let outline = alpha_of(value_of("at_border_strong"), "@window_fg_color");
+        let hover = alpha_of(value_of("at_border_hover"), "@accent_color");
+        for (mode, bg, fg, fg_alpha, accent) in [
+            (
+                "light",
+                Rgb::from_hex(0xfafafb),
+                Rgb::from_hex(0x000006),
+                0.8,
+                Rgb::from_hex(0x1c71d8),
+            ),
+            (
+                "dark",
+                Rgb::from_hex(0x222226),
+                Rgb::WHITE,
+                1.0,
+                Rgb::from_hex(0x78aeed),
+            ),
+        ] {
+            let ratio = bg.mix(fg, fg_alpha * outline).contrast(bg);
+            assert!(
+                ratio >= MIN_NON_TEXT_CONTRAST,
+                "{mode}: at_border_strong at {ratio:.2}:1"
+            );
+            let pointed = bg.mix(accent, hover).contrast(bg);
+            assert!(
+                pointed >= MIN_NON_TEXT_CONTRAST,
+                "{mode}: at_border_hover at {pointed:.2}:1"
+            );
+            assert!(pointed >= ratio, "{mode}: pointing at a control dims it");
+        }
+    }
+
     /// The system theme's alphas reach AA on libadwaita's own light and dark windows (its text
     /// colour is translucent in light: rgba(0, 0, 6, 0.8) on #fafafb).
     #[test]
@@ -1308,13 +1558,44 @@ mod tests {
             ),
         ];
         for (choice, expected) in golden {
-            let c = Chrome::for_choice(choice).expect("bundled");
+            // As tuned, before the non-text lift (`lifting_controls_changes_only_what_is_not_text`),
+            // and without the focus ring, which came later.
+            let c = Chrome::tuned_for_choice(choice).expect("bundled");
             let got: Vec<String> = c
                 .named()
                 .iter()
+                .filter(|(name, _)| *name != "at_focus")
                 .map(|(_, v)| v.hex()[1..].to_owned())
                 .collect();
             assert_eq!(got, expected, "{choice}");
+        }
+    }
+
+    /// Lifting what must be seen to 3:1 moves only the outlines, the accent, the state colours
+    /// and the focus ring: every text colour and surface of every scheme stays as tuned.
+    #[test]
+    fn lifting_controls_changes_only_what_is_not_text() {
+        const LIFTED: [&str; 8] = [
+            "at_border_strong",
+            "at_border_hover",
+            "at_accent",
+            "at_success",
+            "at_warning",
+            "at_danger",
+            "at_info",
+            "at_focus",
+        ];
+        for choice in ThemeChoice::ALL {
+            let (Some(tuned), Some(applied)) =
+                (Chrome::tuned_for_choice(choice), Chrome::for_choice(choice))
+            else {
+                continue;
+            };
+            for ((name, before), (_, after)) in tuned.named().iter().zip(applied.named().iter()) {
+                if !LIFTED.contains(name) {
+                    assert_eq!(before.hex(), after.hex(), "{choice}: {name}");
+                }
+            }
         }
     }
 

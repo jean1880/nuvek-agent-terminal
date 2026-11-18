@@ -68,8 +68,10 @@
                splash-dot-bounce 1800ms ease-in-out 1400ms infinite;
 }
 
+/* Sizes relative to the window's, so the app's text scale reaches them (22pt and 10pt at the
+   default 11pt text). */
 label.splash-name {
-    font-size: 22pt;
+    font-size: 200%;
     font-weight: 800;
     letter-spacing: 0.02em;
     color: @at_fg_strong;
@@ -77,7 +79,7 @@ label.splash-name {
     animation: splash-fold-down 700ms ease-out 900ms both;
 }
 label.splash-status {
-    font-size: 10pt;
+    font-size: 91%;
     color: mix(@at_fg_soft, @at_fg_dim, 0.5);
     animation: splash-fade 600ms ease-out 1800ms both;
 }

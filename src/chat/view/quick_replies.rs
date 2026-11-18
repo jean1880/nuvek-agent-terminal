@@ -6,14 +6,13 @@
 
 use adw::prelude::*;
 
-use super::cards::{chip_flow, label, option_content, RowEvent, RowSink};
+use super::cards::{chip_flow, label, list_item, option_content, RowEvent, RowSink};
 
-/// The chips for `options` (rendered plain text, exactly what a chip puts in the composer).
+/// The chips for `options` (rendered plain text, exactly what a chip puts in the composer): a
+/// transcript row, so a list item, named by `cards::row_label` ("Quick replies").
 pub(super) fn row(options: &[String], sink: &RowSink) -> gtk4::Box {
-    let root = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+    let root = list_item(gtk4::Orientation::Vertical, 6);
     root.add_css_class("quick-replies");
-    root.set_accessible_role(gtk4::AccessibleRole::Group);
-    root.update_property(&[gtk4::accessible::Property::Label("Quick replies")]);
 
     let heading = label("Quick replies", &["quick-replies-label"]);
     heading.set_halign(gtk4::Align::Start);

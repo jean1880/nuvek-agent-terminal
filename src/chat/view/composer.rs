@@ -245,7 +245,13 @@ pub struct Composer {
 impl Composer {
     pub fn new() -> Rc<Self> {
         // The tray (hidden while empty) over the row: attach, the field, Send.
-        let root = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+        // A landmark: F6 cycles to it, and a screen reader can jump to it.
+        let root = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .spacing(6)
+            .accessible_role(gtk4::AccessibleRole::Region)
+            .build();
+        root.update_property(&[gtk4::accessible::Property::Label("Message composer")]);
         root.add_css_class("composer");
         let tray = super::tray::Tray::new();
         root.append(tray.widget());
@@ -382,6 +388,11 @@ impl Composer {
 
     pub fn grab_focus(&self) {
         self.view.grab_focus();
+    }
+
+    /// The text field, where typing goes.
+    pub fn field(&self) -> gtk4::Widget {
+        self.view.clone().upcast()
     }
 
     /// Whether the text view is its window's focus widget (tests).

@@ -89,7 +89,7 @@ fn main() -> glib::ExitCode {
     }
     // agy's PreToolUse gate: a short-lived blocking client, before logging or any GTK setup.
     if std::env::args().nth(1).as_deref() == Some("--approval-hook") {
-        approval_hook::main();
+        let _ = approval_hook::main();
         return glib::ExitCode::SUCCESS;
     }
     // A terminal conversation, not an instance: before logging, so the journal's lines do not

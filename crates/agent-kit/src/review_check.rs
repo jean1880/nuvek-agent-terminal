@@ -8,7 +8,6 @@
 //! that cannot be read is said to be unchecked, never "still there".
 
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 
 use agent_core::review::{locate, Checked, Unchecked};
@@ -60,9 +59,48 @@ fn nearest_existing(path: &Path) -> Option<PathBuf> {
     path.ancestors().find_map(|a| a.canonicalize().ok())
 }
 
+fn open_err(err: std::io::Error) -> Unchecked {
+    // With O_PATH | O_NOFOLLOW | O_DIRECTORY, Linux returns ENOTDIR on a symlink to a folder
+    // (O_PATH opens the symlink fd, then O_DIRECTORY rejects it) and ELOOP on the leaf.
+    if matches!(err.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) {
+        Unchecked::Outside
+    } else {
+        Unchecked::Unreadable
+    }
+}
+
+/// Opens `target_abs` (already resolved inside canonical `folder`), walking every component from
+/// `/` and then below `folder` with `O_NOFOLLOW` so a folder swapped for a link between the check
+/// and the open fails instead of reading outside `folder`.
+fn open_resolved_inside(folder: &Path, target_abs: &Path) -> Result<std::fs::File, Unchecked> {
+    let rel = target_abs
+        .strip_prefix(folder)
+        .map_err(|_| Unchecked::Outside)?;
+    let root_cstr = std::ffi::CString::new("/").map_err(|_| Unchecked::Outside)?;
+    let root_fd =
+        crate::local_tools::open_at(None, &root_cstr, libc::O_DIRECTORY | libc::O_PATH, 0)
+            .map_err(|_| Unchecked::Unreadable)?;
+    let folder_rel = folder.strip_prefix("/").map_err(|_| Unchecked::Outside)?;
+    let base_fd =
+        crate::local_tools::open_below(root_fd, folder_rel, libc::O_DIRECTORY | libc::O_PATH)
+            .map_err(open_err)?;
+    let fd = crate::local_tools::open_below(base_fd, rel, libc::O_RDONLY | libc::O_NONBLOCK)
+        .map_err(open_err)?;
+    Ok(std::fs::File::from(fd))
+}
+
 /// The working text of `rel` (from `top`), when the thread may read it: `Ok(None)` when it is
 /// not there.
 fn read_text(folder: &Path, top: &Path, rel: &str) -> Result<Option<String>, Unchecked> {
+    read_text_with(folder, top, rel, || {})
+}
+
+fn read_text_with(
+    folder: &Path,
+    top: &Path,
+    rel: &str,
+    before_open: impl FnOnce(),
+) -> Result<Option<String>, Unchecked> {
     let rel = plain(rel).ok_or(Unchecked::Outside)?;
     let folder = folder.canonicalize().map_err(|_| Unchecked::Unreadable)?;
     let abs = top.join(rel);
@@ -86,13 +124,10 @@ fn read_text(folder: &Path, top: &Path, rel: &str) -> Result<Option<String>, Unc
     if !target.inside {
         return Err(Unchecked::Outside);
     }
-    // Opened without following a link (the canonical path has none) and without blocking (a
-    // pipe swapped in is never waited on), then checked again as opened.
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-        .open(&target.abs)
-        .map_err(|_| Unchecked::Unreadable)?;
+    before_open();
+    // Opened component-by-component without following any link (the canonical path has none) and
+    // without blocking (a pipe swapped in is never waited on), then checked again as opened.
+    let file = open_resolved_inside(&folder, &target.abs)?;
     let meta = file.metadata().map_err(|_| Unchecked::Unreadable)?;
     if !meta.is_file() || meta.len() > MAX_BYTES {
         return Err(Unchecked::Unreadable);
@@ -266,5 +301,48 @@ mod tests {
         assert_eq!(repo_path(top, Path::new("/r"), "../a.rs"), None);
         assert_eq!(repo_path(top, Path::new("/r"), "/etc/passwd"), None);
         assert_eq!(repo_path(top, Path::new("/r"), ""), None);
+    }
+
+    #[test]
+    fn a_folder_swapped_for_a_link_after_check_is_refused() {
+        let (tmp, top, sub) = tree();
+        let dir = sub.join("pkg");
+        std::fs::create_dir(&dir).expect("dir");
+        std::fs::write(dir.join("a.rs"), "x\n").expect("write");
+        let outside = tmp.path().join("elsewhere");
+        std::fs::write(outside.join("a.rs"), "secret\n").expect("write");
+        let outcome = read_text_with(&sub, &top, "sub/pkg/a.rs", || {
+            std::fs::remove_dir_all(&dir).expect("remove dir");
+            symlink(&outside, &dir).expect("swap link");
+        });
+        assert_eq!(outcome, Err(Unchecked::Outside));
+    }
+
+    #[test]
+    fn a_parent_folder_of_a_repository_names_and_checks_card_comments() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let parent = tmp.path().join("workspace");
+        let repo = parent.join("repo-a");
+        let elsewhere = tmp.path().join("other-repo");
+        std::fs::create_dir_all(repo.join("src")).expect("dirs");
+        std::fs::create_dir_all(elsewhere.join("src")).expect("dirs");
+        crate::test_support::init_repo_at(&repo, &[("src/a.rs", b"one\n+two\n")]);
+        std::fs::write(repo.join("src/a.rs"), "one\ntwo\n").expect("write");
+        let parent_canon = parent.canonicalize().expect("canon");
+        let repo_canon = repo.canonicalize().expect("canon");
+        let elsewhere_canon = elsewhere.canonicalize().expect("canon");
+
+        assert_eq!(toplevel(&parent), None);
+        let rel = repo_path(&parent_canon, &repo_canon, "src/a.rs").expect("inside parent");
+        assert_eq!(rel, "repo-a/src/a.rs");
+        assert_eq!(repo_path(&parent_canon, &elsewhere_canon, "src/a.rs"), None);
+        assert_eq!(
+            check(
+                &parent,
+                Some(&parent_canon),
+                &[ask(&rel, 1, &[" one", "+two"])]
+            ),
+            vec![Checked::Exact]
+        );
     }
 }

@@ -3172,6 +3172,35 @@ pub(crate) mod tests {
         rig.panel.review.clear();
         done(vec![Checked::Exact]);
         assert_eq!(rig.sent.borrow().len(), 1);
+
+        // Added while its file is checked (even sorting earlier): not sent unchecked, and stays
+        // for the next review.
+        add(
+            "sub/b.rs",
+            span(Side::New, 1, &["+alpha", "+beta"]),
+            "First",
+        );
+        send.emit_clicked();
+        let (_, done) = pending.borrow_mut().take().expect("asked");
+        add(
+            "sub/a.rs",
+            span(Side::New, 2, &[" two", "+three"]),
+            "WhileChecking",
+        );
+        done(vec![Checked::Moved { start: 2, end: 3 }]);
+        assert_eq!(rig.sent.borrow().len(), 2);
+        let second = &rig.sent.borrow()[1];
+        assert!(second.contains("sub/b.rs"), "{second}");
+        assert!(!second.contains("WhileChecking"), "{second}");
+        let kept = rig.panel.review.drafts();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].path, "sub/a.rs");
+        assert_eq!(kept[0].note, "WhileChecking");
+        assert_eq!(
+            rig.panel.review.bar_view().map(|v| v.0),
+            Some("1 comment · Checked against the files: 1 moved".into())
+        );
+
         rig.window.close();
     }
 }

@@ -27,7 +27,7 @@ use agent_kit::review_check::CheckAsk;
 use agent_kit::store::ReviewDraft;
 use gtk4::glib;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 pub(super) use crate::review_popover::KEYS_NAME;
@@ -493,10 +493,16 @@ impl Review {
 
     /// The comments as the review sends them: each placed in the diff on show (a moved one with
     /// its new lines), with what the working file said of it when `checks` (by entry id) has it.
-    fn comments_checked(&self, checks: &HashMap<u64, Checked>) -> Vec<ReviewComment> {
+    /// When `only` is given, comments added afterwards (not in `only`) are left out.
+    fn comments_checked(
+        &self,
+        checks: &HashMap<u64, Checked>,
+        only: Option<&HashSet<u64>>,
+    ) -> Vec<(u64, ReviewComment)> {
         self.entries
             .borrow()
             .iter()
+            .filter(|e| only.is_none_or(|set| set.contains(&e.id)))
             .map(|e| {
                 let d = &e.draft;
                 let anchor = self.anchor(d);
@@ -504,42 +510,50 @@ impl Review {
                     (Located::Moved, Some(s)) => (s.side, s.start, s.end),
                     _ => (d.side, d.start_line, d.end_line),
                 };
-                ReviewComment {
-                    path: d.path.clone(),
-                    side,
-                    start,
-                    end,
-                    quoted: d.quoted.clone(),
-                    note: d.note.clone(),
-                    located: anchor.located,
-                    checked: checks.get(&e.id).copied(),
-                }
+                (
+                    e.id,
+                    ReviewComment {
+                        path: d.path.clone(),
+                        side,
+                        start,
+                        end,
+                        quoted: d.quoted.clone(),
+                        note: d.note.clone(),
+                        located: anchor.located,
+                        checked: checks.get(&e.id).copied(),
+                    },
+                )
             })
             .collect()
     }
 
     /// The comments as they would be sent with no file checked.
+    #[cfg(test)]
     pub(super) fn comments(&self) -> Vec<ReviewComment> {
-        self.comments_checked(&HashMap::new())
+        self.comments_checked(&HashMap::new(), None)
+            .into_iter()
+            .map(|(_, c)| c)
+            .collect()
     }
 
     /// "Send Review": with a check handler, first has each new-side comment looked for in its
     /// working file (the button spinning, nothing else sent meanwhile), then sends; without one,
-    /// sends at once. Removed lines are never looked for.
+    /// sends at once. Removed lines are never looked for. Comments added while the files are
+    /// checked stay for the next review instead of going out unchecked.
     pub(super) fn send_now(&self) {
         if self.checking.get() || self.send.borrow().is_none() || self.entries.borrow().is_empty() {
             return;
         }
+        let snapshot: HashSet<u64> = self.entries.borrow().iter().map(|e| e.id).collect();
         let Some(check) = self.check.borrow().clone() else {
-            self.deliver(&HashMap::new());
+            self.deliver(&HashMap::new(), Some(&snapshot));
             return;
         };
         let (ids, asks): (Vec<u64>, Vec<CheckAsk>) = self
-            .comments()
+            .comments_checked(&HashMap::new(), Some(&snapshot))
             .into_iter()
-            .zip(self.entries.borrow().iter().map(|e| e.id))
-            .filter(|(c, _)| c.side == Side::New)
-            .map(|(c, id)| {
+            .filter(|(_, c)| c.side == Side::New)
+            .map(|(id, c)| {
                 (
                     id,
                     CheckAsk {
@@ -552,7 +566,7 @@ impl Review {
             })
             .unzip();
         if asks.is_empty() {
-            self.deliver(&HashMap::new());
+            self.deliver(&HashMap::new(), Some(&snapshot));
             return;
         }
         self.set_checking(true);
@@ -561,14 +575,15 @@ impl Review {
             asks,
             Box::new(move |found| {
                 review.set_checking(false);
-                // By id: a comment deleted meanwhile is not sent, one added meanwhile is sent
-                // unchecked, and an answer of the wrong length checks nothing.
+                // By id: a comment deleted meanwhile is not sent, one added meanwhile stays for
+                // the next review (never sent unchecked), and an answer of the wrong length
+                // checks nothing.
                 let checks: HashMap<u64, Checked> = if found.len() == ids.len() {
                     ids.into_iter().zip(found).collect()
                 } else {
                     HashMap::new()
                 };
-                review.deliver(&checks);
+                review.deliver(&checks, Some(&snapshot));
             }),
         );
     }
@@ -598,34 +613,35 @@ impl Review {
     }
 
     /// Composes the review, with what the files said of each comment, and hands it to the
-    /// window to queue. What went is deleted; comments past the message budget stay for the
-    /// next review, and the bar says so.
-    fn deliver(&self, checks: &HashMap<u64, Checked>) {
+    /// window to queue. What went is deleted; comments past the message budget (and any added
+    /// while checking) stay for the next review, and the bar says so.
+    fn deliver(&self, checks: &HashMap<u64, Checked>, only: Option<&HashSet<u64>>) {
         let Some(send) = self.send.borrow().clone() else {
             return;
         };
-        let comments = self.comments_checked(checks);
+        let pairs = self.comments_checked(checks, only);
+        let comments: Vec<ReviewComment> = pairs.iter().map(|(_, c)| c.clone()).collect();
         let Composed { text, included } = agent_core::review::compose(&comments);
         if included == 0 {
             return;
         }
         let rechecked = recheck_words(comments[..included].iter().filter_map(|c| c.checked));
+        let sent_ids: HashSet<u64> = pairs[..included].iter().map(|(id, _)| *id).collect();
+        let not_fit = pairs.len().saturating_sub(included);
         match send(text) {
             Ok(()) => {
-                let left = {
+                {
                     let mut entries = self.entries.borrow_mut();
-                    let n = included.min(entries.len());
-                    entries.drain(..n);
-                    entries.len()
-                };
+                    entries.retain(|e| !sent_ids.contains(&e.id));
+                }
                 self.changed();
                 let mut notice = Vec::new();
-                if left > 0 {
+                if not_fit > 0 {
                     notice.push(format!(
                         "Sent {}; {} did not fit in one message and {} kept for the next review",
                         count_words(included),
-                        count_words(left),
-                        if left == 1 { "is" } else { "are" }
+                        count_words(not_fit),
+                        if not_fit == 1 { "is" } else { "are" }
                     ));
                 }
                 notice.extend(rechecked);

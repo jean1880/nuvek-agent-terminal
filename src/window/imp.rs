@@ -6714,12 +6714,10 @@ impl AgentTerminalWindow {
                 };
                 let found = blocking_or(
                     move || {
-                        let top = agent_kit::review_check::toplevel(&repo);
-                        agent_kit::review_check::check(
-                            std::path::Path::new(&folder),
-                            top.as_deref(),
-                            &asks,
-                        )
+                        let folder_path = std::path::Path::new(&folder);
+                        let top = agent_kit::review_check::toplevel(&repo)
+                            .or_else(|| folder_path.canonicalize().ok());
+                        agent_kit::review_check::check(folder_path, top.as_deref(), &asks)
                     },
                     unchecked,
                 )

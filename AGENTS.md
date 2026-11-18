@@ -112,8 +112,9 @@ Architectural mandates, standards, and workflows for this codebase.
     `@@ edit @@` fragment refused for having no numbers), `review_check` (a review's comments
     looked for in their working files at send time, blocking, run off the main thread: a file
     read only inside the thread's folder, every link followed so one that leads out is outside,
-    regular, at most 4 MiB, text; a missing one has lost its lines; `repo_path` names a card's
-    file from the thread's repository), `restore` (undo: pin, restore, contained deletion, check),
+    opened component-by-component with `O_NOFOLLOW`, regular, at most 4 MiB, text; a missing
+    one has lost its lines; `repo_path` names a card's file from the thread's repository or
+    folder), `restore` (undo: pin, restore, contained deletion, check),
     `worktree` (worktree locations, branch checks, create and clean-only
     remove), `commit` (the diff panel's commit of the ticked paths: its context, arguments and
     run), `merge` (a worktree branch merged back into its base: the read-only `preflight`, the
@@ -257,9 +258,11 @@ Architectural mandates, standards, and workflows for this codebase.
     `diff_panel/review.rs` is its comments on diff lines: the row's Comment button and
     Ctrl+Alt+M, the marks and list under a file's diff, re-anchoring on each diff shown, the
     comments the thread's file-change cards add (`ViewAction::ReviewComment`, named from the
-    panel's repository by the window off the main thread), and the review bar, whose Send Review
+    panel's repository—or the thread's folder when that holds repositories without being one—by
+    the window off the main thread), and the review bar, whose Send Review
     first has the window run `review_check` off the main thread (the button a spinner, Send and
-    Discard off; answers matched by comment id, so one deleted meanwhile is not sent), then hands
+    Discard off; answers matched by comment id, so one deleted meanwhile is not sent and one
+    added meanwhile stays for the next review), then hands
     the one message to the panel's own thread with `ChatView::submit_review`, queued behind a
     running turn, never steered into it; `review_popover.rs` is the note editor and refusal
     popovers both use, parented to a box, never a text view, which would not let go of one it

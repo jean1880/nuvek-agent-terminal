@@ -38,9 +38,10 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
 - **Fork instead of switching**: `/fork` starts a new thread with this one's history, so
   two agents can take the same problem in different directions.
 - **Fork in an isolated worktree**: **Fork in Isolated Worktree…** in a thread's context menu, or
-  `/fork worktree`, puts the fork on a new `fork/…` branch in a worktree of its own, starting
-  with the source folder's uncommitted work (never a file whose name looks like a secret), so
-  the two never edit the same files. Plain `/fork` still forks in place.
+  `/fork worktree`, puts the fork on a new `fork/…` branch at the source's commit, in a worktree
+  of its own, with the source folder's uncommitted work copied in, still uncommitted (never a
+  file whose name looks like a secret), so the two never edit the same files. Plain `/fork`
+  still forks in place.
 - **Compare forks side by side**: **Compare with Fork…** in a thread's context menu, `/compare`,
   or **Compare** on the toast after a fork opens a window with both conversations since the
   fork, lined up turn by turn, and, in a git repository, a **Changes** tab with what changed in
@@ -48,7 +49,8 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   their changes cannot be told apart).
 - **Keep the one that worked**: **Keep This One** under a column archives the other thread
   (nothing is deleted, and Undo brings it back), notes the choice in the one you kept, and
-  offers to remove the other's worktree when it is clean; its branch is always kept.
+  offers to remove the other's worktree when it has nothing uncommitted and no one else works in
+  it; its branch is always kept.
 
 ### Multi-agent environment review
 

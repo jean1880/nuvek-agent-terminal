@@ -411,12 +411,14 @@ impl AgentTerminalWindow {
             let dialog = confirm_dialog(
                 "Fork in an Isolated Worktree?",
                 &format!(
-                    "Creates branch {} in a new worktree at {}, from a snapshot of “{title}”'s \
-                     folder, and opens the fork there.\n\nThe folder's uncommitted changes and \
-                     untracked files are copied, as one commit at the start of the branch, \
-                     except files whose names look like secrets (such as .env or a key), \
-                     ignored files and very large ones. Your own branch, index, working tree \
-                     and stash are left as they are.",
+                    "Creates branch {} at the commit “{title}”'s folder is on, in a new \
+                     worktree at {}, and opens the fork there.\n\nThe folder's uncommitted \
+                     changes and untracked files are copied in as uncommitted changes: nothing \
+                     is committed for you. Files whose names look like secrets (such as .env \
+                     or a key) and files hidden from git (assume-unchanged or skip-worktree) \
+                     keep the commit's version, or are left out; ignored and very large files \
+                     are not copied. Your own branch, index, working tree and stash are left as \
+                     they are.",
                     plan.branch,
                     plan.path.display()
                 ),
@@ -434,13 +436,14 @@ impl AgentTerminalWindow {
     }
 
     /// Keep This One in `over` (a compare window): asks first, over that window, naming what
-    /// changes (Cancel is the default), then keeps `kept` over `other` and calls `kept_then`.
+    /// changes (Cancel is the default), then keeps `kept` over `other`. `reread` reads the pair
+    /// into the window again, whatever the answer (its buttons were disabled at the click).
     fn confirm_keep(
         &self,
         over: &CompareWindow,
         kept: String,
         other: String,
-        kept_then: std::boxed::Box<dyn FnOnce()>,
+        reread: std::boxed::Box<dyn FnOnce()>,
     ) {
         let kept_title = self.thread_title_of(&kept);
         let other_title = self.thread_title_of(&other);
@@ -449,10 +452,10 @@ impl AgentTerminalWindow {
             &format!(
                 "“{other_title}” is archived: it stays in the list behind Show Archived, and \
                  nothing is deleted. A notice in “{kept_title}” records the choice. If \
-                 “{other_title}” has a worktree that is clean and open in no tab, you are \
-                 offered its removal; its branch is always kept.\n\nNothing is merged: to bring \
-                 a worktree's work into its base branch, use Merge into … in that thread's diff \
-                 panel first."
+                 “{other_title}” has a worktree with nothing uncommitted in it, that no tab or \
+                 other thread is in, you are offered its removal; its branch is always \
+                 kept.\n\nNothing is merged: to bring a fork's work into its base branch, \
+                 commit it in the fork and use Merge into … in its diff panel."
             ),
             ("cancel", "Cancel"),
             ("keep", "Keep This One"),
@@ -463,36 +466,37 @@ impl AgentTerminalWindow {
         let parent = over.window().clone();
         glib::MainContext::default().spawn_local(async move {
             if !crate::dialogs::confirmed(&dialog, &parent, "keep").await {
+                reread();
                 return;
             }
-            if let Some(obj) = obj.upgrade() {
-                obj.imp().keep_fork(kept, other, kept_then);
+            match obj.upgrade() {
+                Some(obj) => obj.imp().keep_fork(kept, other, reread),
+                None => reread(),
             }
         });
     }
 
     /// Keeps `kept` over `other`, in the window that has `other` open: archiving it ends a
     /// running turn and drops an unsent message as closing does, so that is asked first.
-    fn keep_fork(&self, kept: String, other: String, kept_then: std::boxed::Box<dyn FnOnce()>) {
+    fn keep_fork(&self, kept: String, other: String, reread: std::boxed::Box<dyn FnOnce()>) {
         if let Some(owner) = super::threads::thread_owner(&other).filter(|w| w != &*self.obj()) {
-            owner.imp().keep_fork(kept, other, kept_then);
+            owner.imp().keep_fork(kept, other, reread);
             return;
         }
         if let Some(reasons) = self.row_close_reasons(&RowKey::Thread(other.clone())) {
             let id = other.clone();
-            self.confirm_stop_then(&id, reasons, move |imp| {
-                imp.keep_now(kept, other, kept_then)
-            });
+            self.confirm_stop_then(&id, reasons, move |imp| imp.keep_now(kept, other, reread));
             return;
         }
-        self.keep_now(kept, other, kept_then);
+        self.keep_now(kept, other, reread);
     }
 
-    /// [`Self::keep_fork`] once nothing more is asked: closes `other`'s page, then archives it,
-    /// records the choice and posts the notice in one store write ([`Store::keep_fork`]). A
-    /// kept thread with a live session posts the notice itself, so its open view shows it.
-    fn keep_now(&self, kept: String, other: String, kept_then: std::boxed::Box<dyn FnOnce()>) {
-        self.close_row_without_discard(&other);
+    /// [`Self::keep_fork`] once nothing more is asked: archives `other`, records the choice and
+    /// posts the notice in one store write ([`Store::keep_fork`], which checks everything again
+    /// and may refuse), and only once that has landed closes `other`'s page, says so with Undo,
+    /// and offers to remove its worktree. A kept thread with a live session writes the notice
+    /// itself, right after the transaction (so its open view shows it), not inside it.
+    fn keep_now(&self, kept: String, other: String, reread: std::boxed::Box<dyn FnOnce()>) {
         let owner = super::threads::thread_owner(&kept);
         let session = owner
             .as_ref()
@@ -508,7 +512,8 @@ impl AgentTerminalWindow {
             "keep the thread",
             move |s| s.keep_fork(&k, &o, write_notice),
             move |imp, outcome| match outcome {
-                Some(Ok(done)) => {
+                Some(Ok(agent_kit::store::KeepOutcome::Kept(done))) => {
+                    imp.close_row_without_discard(&other);
                     match (&session, &view) {
                         (Some(session), _) => session.note(done.notice.clone()),
                         // Stored already: an open view with no session shows it too.
@@ -522,18 +527,33 @@ impl AgentTerminalWindow {
                         (None, None) => {}
                     }
                     imp.reload_summaries();
-                    kept_then();
-                    let (k, o) = (kept.clone(), other.clone());
-                    imp.action_toast(
+                    reread();
+                    let keep = std::rc::Rc::new(KeepDone {
+                        kept,
+                        other,
+                        undone: std::cell::Cell::new(false),
+                        removal: std::cell::RefCell::new(None),
+                    });
+                    let held = keep.clone();
+                    let undo = imp.held_action_toast(
                         &done.notice,
                         "Undo",
                         10,
                         adw::ToastPriority::Normal,
-                        move |imp| imp.undo_keep(&k, &o),
+                        move |imp| imp.undo_keep(&held),
                     );
-                    imp.offer_kept_worktree_removal(done.worktree, done.worktree_used_by);
+                    #[cfg(test)]
+                    LAST_KEEP.with(|last| *last.borrow_mut() = Some((keep.clone(), undo)));
+                    #[cfg(not(test))]
+                    drop(undo);
+                    imp.offer_kept_worktree_removal(&keep, done.worktree, done.worktree_used_by);
+                }
+                Some(Ok(agent_kit::store::KeepOutcome::Refused(why))) => {
+                    reread();
+                    imp.show_toast(&format!("Nothing was kept: {why}"));
                 }
                 failed => {
+                    reread();
                     let error = failed.and_then(Result::err).map_or_else(
                         || "the thread store did not answer in time".to_owned(),
                         |e| e.to_string(),
@@ -544,9 +564,15 @@ impl AgentTerminalWindow {
         );
     }
 
-    /// Keep's Undo: brings `other` back and clears the record ([`Store::undo_keep_fork`]).
-    fn undo_keep(&self, kept: &str, other: &str) {
-        let (k, o) = (kept.to_owned(), other.to_owned());
+    /// Keep's Undo: takes back the offer to remove the archived thread's worktree (shown or
+    /// still being checked), then brings the thread back and clears the record
+    /// ([`Store::undo_keep_fork`]).
+    pub(super) fn undo_keep(&self, keep: &KeepDone) {
+        keep.undone.set(true);
+        if let Some(offer) = keep.removal.borrow_mut().take() {
+            offer.dismiss();
+        }
+        let (k, o) = (keep.kept.clone(), keep.other.clone());
         self.write_store_then(
             "restore the thread",
             move |s| s.undo_keep_fork(&k, &o),
@@ -566,20 +592,21 @@ impl AgentTerminalWindow {
         );
     }
 
-    /// After a Keep: offers to remove the archived thread's worktree `info` only when no listed
+    /// After a Keep: offers to remove the archived thread's worktree `info` only when no other
     /// thread works in it (`used_by` names one that does), no open tab is in it, and git says it
     /// is registered and clean ([`crate::worktree::removal_blocker`], off the main thread);
-    /// otherwise says why it is kept. The removal itself is the clean-only one, which checks the
-    /// tabs again at the click and keeps the branch.
+    /// otherwise says why it is kept. Never once `keep` is undone, and Undo dismisses an offer
+    /// already shown. Its Remove checks everything again ([`Self::remove_kept_worktree`]).
     fn offer_kept_worktree_removal(
         &self,
+        keep: &std::rc::Rc<KeepDone>,
         info: Option<crate::worktree::WorktreeInfo>,
         used_by: Option<String>,
     ) {
         let Some(info) = info else { return };
         let kept = |why: &str| format!("Its worktree ⎇ {} is kept: {why}", info.branch);
-        if let Some(title) = used_by {
-            self.show_toast(&kept(&format!("“{}” works in it", display_title(&title))));
+        if let Some(who) = used_by {
+            self.show_toast(&kept(&format!("{who} works in it")));
             return;
         }
         if self.worktree_in_use(&info.path) {
@@ -587,6 +614,7 @@ impl AgentTerminalWindow {
             return;
         }
         let obj = self.obj().downgrade();
+        let keep = std::rc::Rc::downgrade(keep);
         glib::MainContext::default().spawn_local(async move {
             let checked = info.clone();
             let blocker = off_main("the status check", move || {
@@ -595,20 +623,99 @@ impl AgentTerminalWindow {
             .await;
             let Some(obj) = obj.upgrade() else { return };
             let imp = obj.imp();
+            // Undone meanwhile (or its Undo toast gone with the window): nothing is offered.
+            let Some(keep) = keep.upgrade().filter(|k| !k.undone.get()) else {
+                return;
+            };
             match blocker {
-                Ok(None) => imp.action_toast(
-                    &format!("Worktree ⎇ {} is clean", info.branch),
-                    "Remove",
-                    10,
-                    adw::ToastPriority::Normal,
-                    move |imp| imp.remove_worktree(info.clone()),
-                ),
+                Ok(None) => {
+                    let other = keep.other.clone();
+                    let offer = imp.held_action_toast(
+                        &format!("Worktree ⎇ {} is clean", info.branch),
+                        "Remove",
+                        10,
+                        adw::ToastPriority::Normal,
+                        move |imp| imp.remove_kept_worktree(info.clone(), other.clone()),
+                    );
+                    *keep.removal.borrow_mut() = Some(offer);
+                }
                 Ok(Some(why)) | Err(why) => {
                     imp.show_toast(&format!("Its worktree ⎇ {} is kept: {why}", info.branch))
                 }
             }
         });
     }
+
+    /// The Remove of [`Self::offer_kept_worktree_removal`], at the click: refused while a tab is
+    /// in the worktree, then in one step off the main thread, so nothing can change between the
+    /// checks and the removal: `other` must still be archived, no other thread (archived ones
+    /// and delegated sub-agents included) may work in it, git must find it registered and
+    /// clean, and only then is it removed, never forced, its branch kept.
+    pub(super) fn remove_kept_worktree(&self, info: crate::worktree::WorktreeInfo, other: String) {
+        let branch = info.branch.clone();
+        let kept = move |why: &str| format!("Its worktree ⎇ {branch} is kept: {why}");
+        if self.worktree_in_use(&info.path) {
+            self.show_toast(&kept("a tab is open in it"));
+            return;
+        }
+        let obj = self.obj().downgrade();
+        glib::MainContext::default().spawn_local(async move {
+            let checked = info.clone();
+            let removed = store_job(move |store| -> Result<(), String> {
+                match store.thread_summary(&other) {
+                    Ok(Some(thread)) if thread.archived => {}
+                    Ok(_) => return Err("its thread is back in the list".to_owned()),
+                    Err(e) => return Err(format!("the thread store could not say: {e}")),
+                }
+                if let Some(who) = store
+                    .worktree_occupant(&checked.path, &other)
+                    .map_err(|e| format!("the thread store could not say: {e}"))?
+                {
+                    return Err(format!("{who} works in it"));
+                }
+                if let Some(why) = crate::worktree::removal_blocker(&checked) {
+                    return Err(why);
+                }
+                crate::worktree::remove(&checked.main_toplevel, &checked.path)
+            })
+            .await;
+            #[cfg(test)]
+            LAST_REMOVAL.with(|last| *last.borrow_mut() = Some(removed.clone()));
+            let Some(obj) = obj.upgrade() else { return };
+            let imp = obj.imp();
+            match removed {
+                Some(Ok(())) => {
+                    info!("Removed worktree {}", info.path.display());
+                    imp.show_toast(&format!(
+                        "Removed the worktree; branch {} is kept",
+                        info.branch
+                    ));
+                }
+                Some(Err(why)) => imp.show_toast(&kept(&why)),
+                None => imp.show_toast(&kept("the thread store could not be read")),
+            }
+        });
+    }
+}
+
+/// A Keep This One that landed, for its Undo and the offer to remove the archived thread's
+/// worktree: Undo takes the offer back, and none is shown once it is undone.
+pub(super) struct KeepDone {
+    kept: String,
+    other: String,
+    undone: std::cell::Cell<bool>,
+    /// The Remove offer, once shown.
+    removal: std::cell::RefCell<Option<adw::Toast>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The last Keep and its Undo toast, for the window test to drive.
+    static LAST_KEEP: std::cell::RefCell<Option<(std::rc::Rc<KeepDone>, adw::Toast)>> =
+        const { std::cell::RefCell::new(None) };
+    /// What the last Remove of a kept-over thread's worktree came to.
+    static LAST_REMOVAL: std::cell::RefCell<Option<Option<Result<(), String>>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Reads `thread` and `pairing`'s other thread off the main thread and shows them in `window`:
@@ -1265,10 +1372,14 @@ pub(super) mod tests {
     }
 
     /// Fork in Isolated Worktree, once confirmed, forks through the real path into a new
-    /// worktree made from a snapshot of the source's folder (its uncommitted work there, the
-    /// user's index and HEAD untouched), stored as a worktree thread with a baseline; then Keep
-    /// This One on the source archives the fork, never deleting it or its worktree, records the
-    /// choice and posts the notice in the source. Run from the window test (no store writer).
+    /// worktree on the source's commit with the source's work laid in uncommitted (the user's
+    /// index and HEAD untouched), stored as a worktree thread with a baseline. Keep This One,
+    /// through the compare window's button and confirmation, archives the fork, never deleting
+    /// it or its worktree, records the choice and posts the notice in the source; no removal is
+    /// offered for the dirty worktree; Undo brings the fork back. Once clean, a Keep offers the
+    /// removal and its Undo takes it back, a Remove after the Undo removes nothing, a thread in
+    /// the worktree (archived too) keeps it, and one beside it does not. Run from the window test
+    /// (no store writer).
     pub(in crate::window) fn a_fork_in_a_worktree_is_kept_and_its_pair_archived(
         window: &crate::window::AgentTerminalWindow,
     ) {
@@ -1340,7 +1451,8 @@ pub(super) mod tests {
         let commit = link.base_commit.clone().expect("a baseline");
         assert_eq!(
             git(&info.path, &["rev-parse", "HEAD"]),
-            Some(commit.clone())
+            head,
+            "the branch is the source's commit: nothing the app made is on it"
         );
         assert_eq!(
             std::fs::read_to_string(info.path.join("a.txt"))
@@ -1348,6 +1460,11 @@ pub(super) mod tests {
                 .as_deref(),
             Some("uncommitted\n"),
             "the source's uncommitted work"
+        );
+        assert_eq!(
+            git(&info.path, &["status", "--porcelain"]).as_deref(),
+            Some("M a.txt"),
+            "uncommitted in the fork too"
         );
         assert_eq!(std::fs::read(main.join(".git/index")).ok(), Some(index));
         assert_eq!(git(&main, &["rev-parse", "HEAD"]), head);
@@ -1357,8 +1474,47 @@ pub(super) mod tests {
                 == Some(commit.as_str())
         }));
 
-        // Keep the source: the fork is archived (its page closed), never deleted.
-        imp.keep_now(source.clone(), fork.clone(), std::boxed::Box::new(|| {}));
+        // Keep the source, through the compare window's button and its confirmation.
+        assert!(
+            imp.page_of_thread(&fork).is_some(),
+            "the fork's page is open"
+        );
+        let pairing = store
+            .fork_pairings(&fork)
+            .expect("pairings")
+            .into_iter()
+            .find(|p| p.other == source)
+            .expect("its source");
+        imp.open_fork_compare(&fork, pairing);
+        let compare = gtk4::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|w| w.downcast::<adw::Window>().ok())
+            .find(|w| w.has_css_class("compare-window") && w.is_visible())
+            .expect("the compare window");
+        let root: gtk4::Widget = compare.clone().upcast();
+        let keeps = || -> Vec<gtk4::Button> {
+            crate::testutil::find_all::<gtk4::Button>(&root)
+                .into_iter()
+                .filter(|b| b.label().as_deref() == Some("Keep This One"))
+                .collect()
+        };
+        assert!(
+            crate::testutil::pump_until(&ctx, 20, || keeps().len() == 2),
+            "Keep This One under both columns"
+        );
+        LAST_KEEP.with(|last| last.borrow_mut().take());
+        // The source is the first column.
+        keeps()[0].emit_clicked();
+        assert!(keeps().iter().all(|b| !b.is_sensitive()), "both disabled");
+        let dialog = || {
+            compare
+                .property::<Option<adw::Dialog>>("visible-dialog")
+                .and_then(|d| d.downcast::<adw::AlertDialog>().ok())
+        };
+        assert!(crate::testutil::pump_until(&ctx, 10, || dialog().is_some()));
+        let alert = dialog().expect("the confirmation");
+        assert_eq!(alert.default_response().as_deref(), Some("cancel"));
+        alert.emit_by_name::<()>("response", &[&"keep"]);
         assert!(
             crate::testutil::pump_until(&ctx, 20, || store
                 .thread_summary(&fork)
@@ -1367,7 +1523,11 @@ pub(super) mod tests {
                 .is_some_and(|s| s.archived)),
             "the fork is archived"
         );
-        assert!(imp.page_of_thread(&fork).is_none(), "its page closed");
+        alert.force_close();
+        assert!(
+            imp.page_of_thread(&fork).is_none(),
+            "its page closed once kept"
+        );
         let notices: Vec<String> = store
             .events(&source, None, 1000)
             .expect("events")
@@ -1403,6 +1563,109 @@ pub(super) mod tests {
             .is_some(),
             "its branch too"
         );
+        // The settled pair is read again: Kept and Archived, no more buttons.
+        assert!(
+            crate::testutil::pump_until(&ctx, 20, || keeps().is_empty()
+                && crate::testutil::label_texts(&root)
+                    .iter()
+                    .any(|t| t == "Kept")),
+            "the window shows what was decided"
+        );
+        compare.close();
+
+        // Its worktree holds the fork's uncommitted work: no removal is offered.
+        let (keep, undo) = LAST_KEEP
+            .with(|last| last.borrow_mut().take())
+            .expect("the Keep");
+        crate::testutil::pump_until(&ctx, 2, || false);
+        assert!(
+            keep.removal.borrow().is_none(),
+            "nothing offered for a dirty worktree"
+        );
+        // Undo brings the fork back.
+        undo.emit_by_name::<()>("button-clicked", &[]);
+        assert!(crate::testutil::pump_until(&ctx, 10, || store
+            .thread_summary(&fork)
+            .ok()
+            .flatten()
+            .is_some_and(|s| !s.archived)));
+
+        // Committed in the fork, the worktree is clean: Keep again offers its removal, and
+        // Undo takes the offer back. A Remove from before the Undo then removes nothing.
+        git(&info.path, &["add", "-A"]).expect("add");
+        git(&info.path, &["commit", "-qm", "the fork's work"]).expect("commit");
+        let removal = |other: &str| {
+            LAST_REMOVAL.with(|last| last.borrow_mut().take());
+            imp.remove_kept_worktree(info.clone(), other.to_owned());
+            assert!(crate::testutil::pump_until(&ctx, 20, || LAST_REMOVAL
+                .with(|last| last.borrow().is_some())));
+            LAST_REMOVAL
+                .with(|last| last.borrow_mut().take())
+                .flatten()
+                .expect("the store answered")
+        };
+        imp.keep_now(source.clone(), fork.clone(), std::boxed::Box::new(|| {}));
+        let (keep, undo) = {
+            let mut got = None;
+            assert!(crate::testutil::pump_until(&ctx, 20, || {
+                got = LAST_KEEP.with(|last| {
+                    last.borrow()
+                        .as_ref()
+                        .filter(|(k, _)| k.removal.borrow().is_some())
+                        .cloned()
+                });
+                got.is_some()
+            }));
+            got.expect("the Keep with its offer")
+        };
+        LAST_KEEP.with(|last| last.borrow_mut().take());
+        undo.emit_by_name::<()>("button-clicked", &[]);
+        assert!(keep.undone.get());
+        assert!(keep.removal.borrow().is_none(), "Undo dismissed the offer");
+        assert!(crate::testutil::pump_until(&ctx, 10, || store
+            .thread_summary(&fork)
+            .ok()
+            .flatten()
+            .is_some_and(|s| !s.archived)));
+        let why = removal(&fork).expect_err("restored: kept");
+        assert!(why.contains("back in the list"), "{why}");
+        assert!(info.path.exists());
+
+        // Archived again: a third thread working in the worktree keeps it, archived or not.
+        store.set_archived(&fork, true).expect("archive");
+        let inside = info.path.join("sub");
+        std::fs::create_dir_all(&inside).expect("dir");
+        let third = store
+            .create_thread(&inside.to_string_lossy(), Some("Third"))
+            .expect("third");
+        store.set_archived(&third, true).expect("archive");
+        let why = removal(&fork).expect_err("in use: kept");
+        assert!(why.contains("Third"), "{why}");
+        assert!(info.path.exists());
+        // One in a folder beside it is no one in it: the worktree goes, its branch stays.
+        store.delete_thread(&third).expect("delete");
+        std::fs::remove_dir(&inside).expect("rmdir");
+        let beside = format!("{}-beside", info.path.display());
+        std::fs::create_dir_all(&beside).expect("dir");
+        let unrelated = store
+            .create_thread(&beside, Some("Beside"))
+            .expect("unrelated");
+        removal(&fork).expect("removed");
+        assert!(!info.path.exists());
+        assert!(
+            git(
+                &main,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "-q",
+                    &format!("refs/heads/{}", info.branch)
+                ]
+            )
+            .is_some(),
+            "the branch is never deleted"
+        );
+        store.delete_thread(&unrelated).expect("delete");
         store.delete_thread(&fork).expect("delete");
         store.delete_thread(&source).expect("delete");
         imp.reload_summaries();

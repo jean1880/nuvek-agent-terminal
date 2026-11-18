@@ -483,7 +483,18 @@ fn keep_footer(
                     .css_classes(["compare-keep"])
                     .build();
                 let keep = keep.clone();
-                button.connect_clicked(move |_| keep(i));
+                // Both columns' buttons go insensitive at once: one Keep at a time, until the
+                // caller reads the pair again.
+                button.connect_clicked(move |button| {
+                    let mut sibling = button.parent().and_then(|grid| grid.first_child());
+                    while let Some(widget) = sibling {
+                        if widget.has_css_class("compare-keep") {
+                            widget.set_sensitive(false);
+                        }
+                        sibling = widget.next_sibling();
+                    }
+                    keep(i);
+                });
                 button.upcast()
             }
             KeepState::Kept => label("Kept", &["success", "compare-keep-state"]).upcast(),
@@ -794,6 +805,7 @@ pub(crate) mod tests {
         assert_eq!(keeps.len(), 1, "offered on the first column only");
         keeps[0].emit_clicked();
         assert_eq!(kept_column.get(), Some(0));
+        assert!(!keeps[0].is_sensitive(), "one Keep at a time");
         // Refresh asks the caller to read again, and waits for that read.
         let refresh = crate::testutil::find_all::<gtk4::Button>(&root)
             .into_iter()

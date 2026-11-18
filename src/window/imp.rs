@@ -7669,7 +7669,9 @@ impl AgentTerminalWindow {
     fn remove_worktree(&self, info: crate::worktree::WorktreeInfo) {
         // Asked again at the click: a tab may have opened there while the
         // offer was up, and git does not check who is inside a worktree.
-        // Whether it is still clean, `worktree remove` checks itself.
+        // Whether it is still clean is asked again too, in the same step as the
+        // removal: `worktree remove` refuses uncommitted and untracked files
+        // but deletes ignored ones without asking.
         if self.worktree_in_use(&info.path) {
             self.show_toast("A tab is open in that worktree now; it was kept");
             return;
@@ -7679,9 +7681,12 @@ impl AgentTerminalWindow {
             #[weak]
             obj,
             async move {
-                let (main, path) = (info.main_toplevel.clone(), info.path.clone());
+                let checked = info.clone();
                 let removed = off_main("removing the worktree", move || {
-                    crate::worktree::remove(&main, &path)
+                    if let Some(why) = crate::worktree::removal_blocker(&checked) {
+                        return Err(format!("The worktree was kept: {why}."));
+                    }
+                    crate::worktree::remove(&checked.main_toplevel, &checked.path)
                 })
                 .await;
                 match removed {

@@ -201,39 +201,79 @@ impl Pairing {
     }
 }
 
+/// Why [`settle`] wrote nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettleRefused {
+    /// The two are not a fork and its source, nor two forks of one thread (or are one thread).
+    NotAPair,
+    /// The pair is settled already.
+    Settled,
+    /// A link the pair would be recorded on already records another pair: never overwritten.
+    LinkHoldsAnotherPair,
+}
+
+impl SettleRefused {
+    /// What the user is told.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::NotAPair => {
+                "These two threads are not a fork and its source, nor two forks of one thread"
+            }
+            Self::Settled => "One of these two threads was kept over the other already",
+            Self::LinkHoldsAnotherPair => {
+                "This fork was already kept over, or kept over, another thread; its record is \
+                 not replaced"
+            }
+        }
+    }
+}
+
 /// The links to write when `kept` is kept over `other` (Keep This One), each with its fork's id
 /// and [`ForkLink::kept`] set: the fork's own link when one was forked from the other, both links
-/// when they are two forks of one source. Empty when the two are no pair, or are one thread.
+/// when they are two forks of one source. Refused when the two are no pair, are settled already,
+/// or a link to write already records another pair (which is never overwritten).
 pub fn settle(
     kept: &str,
     kept_link: Option<&ForkLink>,
     other: &str,
     other_link: Option<&ForkLink>,
-) -> Vec<(String, ForkLink)> {
+) -> Result<Vec<(String, ForkLink)>, SettleRefused> {
     if kept == other {
-        return Vec::new();
+        return Err(SettleRefused::NotAPair);
     }
     let record = Kept {
         thread: kept.to_owned(),
         over: other.to_owned(),
     };
-    let settled = |fork: &str, link: &ForkLink| {
-        (
-            fork.to_owned(),
-            ForkLink {
-                kept: Some(record.clone()),
-                ..link.clone()
-            },
-        )
+    let reversed = Kept {
+        thread: other.to_owned(),
+        over: kept.to_owned(),
     };
-    match (kept_link, other_link) {
-        (_, Some(o)) if o.source_thread == kept => vec![settled(other, o)],
-        (Some(k), _) if k.source_thread == other => vec![settled(kept, k)],
-        (Some(k), Some(o)) if k.source_thread == o.source_thread => {
-            vec![settled(kept, k), settled(other, o)]
+    let links: Vec<(&str, &ForkLink)> = match (kept_link, other_link) {
+        (_, Some(o)) if o.source_thread == kept => vec![(other, o)],
+        (Some(k), _) if k.source_thread == other => vec![(kept, k)],
+        (Some(k), Some(o)) if k.source_thread == o.source_thread => vec![(kept, k), (other, o)],
+        _ => return Err(SettleRefused::NotAPair),
+    };
+    for (_, link) in &links {
+        match &link.kept {
+            None => {}
+            Some(k) if *k == record || *k == reversed => return Err(SettleRefused::Settled),
+            Some(_) => return Err(SettleRefused::LinkHoldsAnotherPair),
         }
-        _ => Vec::new(),
     }
+    Ok(links
+        .into_iter()
+        .map(|(fork, link)| {
+            (
+                fork.to_owned(),
+                ForkLink {
+                    kept: Some(record.clone()),
+                    ..link.clone()
+                },
+            )
+        })
+        .collect())
 }
 
 /// The links to write when a [`settle`] of `kept` over `other` is undone: those of the two that
@@ -453,7 +493,7 @@ mod tests {
         let fork = link("a", 10);
         let sibling = link("a", 20);
         // A source kept over its fork, and a fork kept over its source: the fork's link.
-        let s = settle("a", None, "b", Some(&fork));
+        let s = settle("a", None, "b", Some(&fork)).expect("a pair");
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].0, "b");
         assert_eq!(
@@ -464,21 +504,54 @@ mod tests {
             })
         );
         assert_eq!(s[0].1.fork_seq, 10, "the rest of the link is kept");
-        let s = settle("b", Some(&fork), "a", None);
+        let s = settle("b", Some(&fork), "a", None).expect("a pair");
         assert_eq!(s.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(), ["b"]);
         // Two siblings: both links.
-        let s = settle("b", Some(&fork), "c", Some(&sibling));
+        let s = settle("b", Some(&fork), "c", Some(&sibling)).expect("siblings");
         assert_eq!(
             s.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
             ["b", "c"]
         );
         // No pair, or one thread: nothing.
-        assert!(settle("a", None, "x", None).is_empty());
-        assert!(settle("b", Some(&fork), "y", Some(&link("x", 1))).is_empty());
-        assert!(settle("b", Some(&fork), "b", Some(&fork)).is_empty());
+        let refused = |r| Err::<Vec<(String, ForkLink)>, _>(r);
+        assert_eq!(
+            settle("a", None, "x", None),
+            refused(SettleRefused::NotAPair)
+        );
+        assert_eq!(
+            settle("b", Some(&fork), "y", Some(&link("x", 1))),
+            refused(SettleRefused::NotAPair)
+        );
+        assert_eq!(
+            settle("b", Some(&fork), "b", Some(&fork)),
+            refused(SettleRefused::NotAPair)
+        );
 
         // Read back from either side, for this pair only.
-        let settled = settle("b", Some(&fork), "a", None).remove(0).1;
+        let settled = settle("b", Some(&fork), "a", None)
+            .expect("a pair")
+            .remove(0)
+            .1;
+        // Settled already, either way round: refused, the record left as it is.
+        assert_eq!(
+            settle("b", Some(&settled), "a", None),
+            refused(SettleRefused::Settled)
+        );
+        assert_eq!(
+            settle("a", None, "b", Some(&settled)),
+            refused(SettleRefused::Settled)
+        );
+        // A link that records another pair is never overwritten: the fork kept over its source
+        // cannot then be kept over a sibling, nor the sibling over it.
+        assert_eq!(
+            settle("b", Some(&settled), "c", Some(&sibling)),
+            refused(SettleRefused::LinkHoldsAnotherPair)
+        );
+        assert_eq!(
+            settle("c", Some(&sibling), "b", Some(&settled)),
+            refused(SettleRefused::LinkHoldsAnotherPair)
+        );
+        assert!(!SettleRefused::LinkHoldsAnotherPair.reason().is_empty());
         let from_fork = Pairing {
             other: "a".into(),
             relation: Relation::Source,
@@ -498,7 +571,10 @@ mod tests {
             Some("b")
         );
         // The same link settled against a sibling says nothing of the source.
-        let over_sibling = settle("b", Some(&fork), "c", Some(&sibling)).remove(0).1;
+        let over_sibling = settle("b", Some(&fork), "c", Some(&sibling))
+            .expect("siblings")
+            .remove(0)
+            .1;
         assert_eq!(from_fork.kept("b", Some(&over_sibling), None), None);
         let siblings = Pairing {
             other: "c".into(),

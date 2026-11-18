@@ -38,7 +38,7 @@ mod schema_v8;
 mod search;
 mod spend;
 
-pub use compare::{kept_notice, CompareColumn, ForkColumns, KeptFork};
+pub use compare::{kept_notice, CompareColumn, ForkColumns, KeepOutcome, KeptFork};
 pub use preflight::{BACKUP_DIR, PRE_V4_BACKUP_KEY};
 pub use review::ReviewDraft;
 pub use search::{

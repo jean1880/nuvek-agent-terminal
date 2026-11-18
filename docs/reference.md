@@ -181,33 +181,46 @@ it cannot be used. A dialog shows the branch and the folder first: the branch is
 `fork/<words of the thread's title>-<n>`, with the first number free, and the folder goes where
 worktrees go (beside the repository, or under **Worktree Folder** in Settings → Git).
 
-The worktree is made from the fork's baseline (above), not from HEAD: its branch starts at a
-commit, on top of the source's HEAD, holding the folder's uncommitted changes and untracked files
-as they were, so the fork starts with the source's work in progress. Untracked files whose names
-look like secrets (`.env`, keys), files over 5 MiB, nested repositories and ignored files are not
-copied. Your own index, HEAD, branch, working tree and stash are left exactly as they were. The
-snapshot is taken whether or not **Checkpoint Each Turn** is on, since it is what carries the
-work across. The fork opens in the same folder inside the worktree as the source was in, as a
-worktree thread (its diff panel offers **Merge into …** the source's branch), in the source's
-safe mode, never dangerous permissive mode.
+The branch starts at the commit the source's folder is on (the dialog's plan is refused if the
+folder moved to another commit or branch since; a branch name taken meanwhile is replaced by the
+next free one), so nothing the app made is ever on it. The fork's baseline (above) is then laid
+into the new worktree as uncommitted changes: modified, deleted and new files as the source's
+folder had them, nothing staged, nothing committed, so the fork starts with the source's work in
+progress and you commit it, in the fork, when you choose. Untracked files whose names look like
+secrets (`.env`, keys), files over 5 MiB, nested repositories and ignored files are not copied;
+tracked files whose names look like secrets, and files your index marks assume-unchanged or
+skip-worktree, keep the commit's version (or are left out when the commit has none). Your own
+index, HEAD, branch, working tree and stash are left exactly as they were. The snapshot is taken
+whether or not **Checkpoint Each Turn** is on, since it is what carries the work across. The fork
+opens in the same folder inside the worktree as the source was in, as a worktree thread (its
+diff panel offers **Merge into …** the source's branch once its work is committed), in the
+source's safe mode, never dangerous permissive mode. If the thread cannot be stored once the
+worktree is made, the message names the worktree and branch left behind.
 
 #### Keep This One
 
-Under each column of the **Transcripts** tab, **Keep This One** settles the pair. After a
-confirmation naming what changes (**Cancel** is the default), it archives the other thread
-(closing its page; a running turn or an unsent message is asked about first, as for **Archive**),
-records which was kept in the fork's link (both links, for two forks of one thread), and adds a
-notice to the one kept: "Kept over “…”, which is archived". Nothing is deleted and nothing is
-merged: to bring a worktree's work into its base branch, use **Merge into …** first. The toast's
-**Undo** brings the other thread back and clears the record (the notice stays). Once settled, the
-window shows **Kept** and **Archived** instead of the buttons; a pair where one thread is gone or
-archived already offers nothing.
+Under each column of the **Transcripts** tab, **Keep This One** settles the pair. A click disables
+both buttons; after a confirmation naming what changes (**Cancel** is the default), it archives the
+other thread, records which was kept in the fork's link (both links, for two forks of one thread),
+and adds a notice to the one kept: "Kept over “…”, which is archived". All of that is one store
+write, checked again as it is made: it is refused, writing nothing and saying why, when either
+thread is archived already, the pair was settled already, or a link would lose the record of
+another pair. Only once it has landed does the other thread's page close (a running turn or an
+unsent message is asked about first, as for **Archive**). Nothing is deleted and nothing is
+merged: to bring a fork's work into its base branch, commit it in the fork and use **Merge into
+…**. The toast's **Undo** brings the other thread back and clears the record (the notice stays).
+Once settled, the window shows **Kept** and **Archived** instead of the buttons; a pair where one
+thread is gone or archived already offers nothing.
 
 When the archived thread was opened in a worktree, its removal is offered (a toast with
-**Remove**) only if no thread still in the list works in it, no open tab is in it, and git says it
-is still that branch's worktree with nothing uncommitted, untracked or ignored in it; otherwise the
-toast says why it is kept. Removal is `git worktree remove` without `--force`, and the branch is
-never deleted.
+**Remove**) only if no other thread works in it (archived ones and delegated sub-agents included,
+links resolved), no open tab is in it, and git says it is still that branch's worktree with
+nothing uncommitted, untracked or ignored in it; otherwise the toast says why it is kept. A fork
+in its own worktree starts with uncommitted work, so its removal is offered only once that is
+committed. **Undo** takes the offer back, shown or not. **Remove** checks everything again at the
+click, in one step with the removal: the thread must still be archived, no other thread in it,
+no tab in it, and git must still find it clean. Removal is `git worktree remove` without
+`--force`, and the branch is never deleted.
 
 ### Pinning threads
 

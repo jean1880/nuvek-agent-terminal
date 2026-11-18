@@ -27,9 +27,17 @@ pub struct KeptFork {
     pub notice: String,
     /// The worktree the archived thread was opened in, if it was.
     pub worktree: Option<crate::worktree::WorktreeInfo>,
-    /// The title of a thread still in the list (not archived) that works in that worktree:
-    /// its removal is then not offered.
+    /// Who else works in that worktree ([`Store::worktree_occupant`]), quoted: its removal is
+    /// then not offered.
     pub worktree_used_by: Option<String>,
+}
+
+/// [`Store::keep_fork`]'s answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeepOutcome {
+    Kept(KeptFork),
+    /// Nothing was written, and why (said to the user).
+    Refused(String),
 }
 
 /// The notice Keep This One writes into the kept thread, naming the archived one by its stored
@@ -179,27 +187,37 @@ impl Store {
     /// transaction. `other` is archived (never deleted), the pair's links record the choice
     /// ([`settle`]), and, with `write_notice`, the kept thread gets a notice saying so, through
     /// the store's scrubbing like any event (without it, the caller's live session writes
-    /// [`KeptFork::notice`] itself). Refused, writing nothing, for two threads that are no pair.
-    pub fn keep_fork(&self, kept: &str, other: &str, write_notice: bool) -> Result<KeptFork> {
+    /// [`KeptFork::notice`] itself, after this transaction). Everything is checked again inside
+    /// the transaction, and [`KeepOutcome::Refused`], writing nothing, when the two are no pair,
+    /// either is archived already, the pair is settled already, or a link would lose another
+    /// pair's record. A thread that is gone (or hidden) is [`StoreError::NotFound`].
+    pub fn keep_fork(&self, kept: &str, other: &str, write_notice: bool) -> Result<KeepOutcome> {
         self.atomically(|s| {
-            let title = |thread: &str| -> Result<String> {
+            let summary = |thread: &str| -> Result<ThreadSummary> {
                 s.thread_summary(thread)?
                     .filter(|_| !s.is_hidden_child_thread(thread).unwrap_or(true))
-                    .map(|t| t.title)
                     .ok_or_else(|| StoreError::NotFound(format!("thread {thread}")))
             };
-            title(kept)?;
-            let other_title = title(other)?;
+            let kept_summary = summary(kept)?;
+            let other_summary = summary(other)?;
+            if let Some(archived) = [&kept_summary, &other_summary]
+                .into_iter()
+                .find(|t| t.archived)
+            {
+                let title = archived.title.trim();
+                return Ok(KeepOutcome::Refused(if title.is_empty() {
+                    "One of these two threads is archived already".to_owned()
+                } else {
+                    format!("“{title}” is archived already")
+                }));
+            }
+            let other_title = other_summary.title;
             let kept_link = s.fork_link(kept)?;
             let other_link = s.fork_link(other)?;
-            let links = settle(kept, kept_link.as_ref(), other, other_link.as_ref());
-            if links.is_empty() {
-                return Err(StoreError::Failed(
-                    "These two threads are not a fork and its source, nor two forks of one \
-                     thread"
-                        .to_owned(),
-                ));
-            }
+            let links = match settle(kept, kept_link.as_ref(), other, other_link.as_ref()) {
+                Ok(links) => links,
+                Err(refused) => return Ok(KeepOutcome::Refused(refused.reason().to_owned())),
+            };
             s.set_archived(other, true)?;
             for (fork, link) in &links {
                 s.set_meta(&thread_fork_key(fork), &link.to_json())?;
@@ -218,18 +236,48 @@ impl Store {
             let worktree = s.thread_attributes(other)?.worktree;
             let worktree_used_by = match &worktree {
                 None => None,
-                Some(info) => s
-                    .list_threads(false)?
-                    .into_iter()
-                    .find(|t| t.id != other && Path::new(&t.cwd).starts_with(&info.path))
-                    .map(|t| t.title),
+                Some(info) => s.worktree_occupant(&info.path, other)?,
             };
-            Ok(KeptFork {
+            Ok(KeepOutcome::Kept(KeptFork {
                 notice,
                 worktree,
                 worktree_used_by,
-            })
+            }))
         })
+    }
+
+    /// Who, other than thread `except`, works in the folder `path` or below it: any thread,
+    /// archived or not, and a delegated sub-agent's hidden one too, paths compared once links
+    /// are resolved. Its title (or what it is, for one with none), or `None`.
+    pub fn worktree_occupant(&self, path: &Path, except: &str) -> Result<Option<String>> {
+        let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let root = canonical(path);
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, title, cwd FROM threads ORDER BY rowid")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, title, cwd) = row?;
+            if id == except || !canonical(Path::new(&cwd)).starts_with(&root) {
+                continue;
+            }
+            let title = title.unwrap_or_default();
+            let title = title.trim();
+            return Ok(Some(if self.is_hidden_child_thread(&id)? {
+                "a delegated sub-agent".to_owned()
+            } else if title.is_empty() {
+                "another thread".to_owned()
+            } else {
+                format!("“{title}”")
+            }));
+        }
+        Ok(None)
     }
 
     /// Undoes [`Self::keep_fork`] of `kept` over `other`: brings `other` back and clears the
@@ -508,15 +556,26 @@ mod tests {
         );
         placed(&s, "lone", &main_s, "Unrelated", None, None);
 
+        let refused = |outcome: KeepOutcome| match outcome {
+            KeepOutcome::Refused(why) => why,
+            KeepOutcome::Kept(k) => panic!("kept: {k:?}"),
+        };
+        let took = |outcome: KeepOutcome| match outcome {
+            KeepOutcome::Kept(k) => k,
+            KeepOutcome::Refused(why) => panic!("refused: {why}"),
+        };
         // Two threads that are no pair: refused, and nothing is written.
-        assert!(s.keep_fork("src", "lone", true).is_err());
-        assert!(s.keep_fork("src", "src", true).is_err());
+        assert!(refused(s.keep_fork("src", "lone", true).unwrap()).contains("not a fork"));
+        refused(s.keep_fork("src", "src", true).unwrap());
         assert!(s.keep_fork("src", "missing", true).is_err());
         assert!(!s.thread_summary("lone").unwrap().unwrap().archived);
         assert!(notices(&s, "src").is_empty());
 
+        // The fork's worktree holds the uncommitted work copied in: removal is not offered.
+        assert!(removal_blocker(&info).is_some());
+
         // Keep the source: the fork is archived, never deleted, and the pair records it.
-        let kept = s.keep_fork("src", "fork", true).expect("kept");
+        let kept = took(s.keep_fork("src", "fork", true).expect("kept"));
         let fork = s.thread_summary("fork").unwrap().expect("never deleted");
         assert!(fork.archived);
         assert!(!s.thread_summary("src").unwrap().unwrap().archived);
@@ -548,9 +607,16 @@ mod tests {
             );
         }
 
-        // Its worktree is clean as made: removal may be offered. Worked in, never: git refuses
-        // too, and the branch is never deleted.
-        assert_eq!(removal_blocker(&info), None);
+        // Settled, or with one side archived: refused again inside the transaction, so a second
+        // click (or a second window) writes nothing more.
+        assert!(refused(s.keep_fork("src", "fork", true).unwrap()).contains("archived"));
+        assert!(refused(s.keep_fork("fork", "src", true).unwrap()).contains("archived"));
+        s.set_archived("fork", false).unwrap();
+        assert!(refused(s.keep_fork("fork", "src", true).unwrap()).contains("already"));
+        s.set_archived("fork", true).unwrap();
+        assert_eq!(notices(&s, "src").len(), 1);
+
+        // Worked in, its worktree is never removed: git refuses too, and the branch stays.
         std::fs::write(info.path.join("fork-only.txt"), "unsaved\n").expect("write");
         assert!(removal_blocker(&info).is_some());
         assert!(remove(&main, &info.path).is_err(), "never forced");
@@ -570,14 +636,50 @@ mod tests {
         assert_eq!(s.fork_link("fork").unwrap(), Some(link.clone()));
         assert_eq!(notices(&s, "src").len(), 1);
 
-        // Keeping the fork instead, the source is archived; a thread still listed in the
-        // archived one's worktree is named, so its removal is not offered.
+        // Who else is in the archived one's worktree is named, archived or not, and a folder
+        // beside it is no one: a sibling fork kept over it, working in it, blocks its removal.
+        assert_eq!(s.worktree_occupant(&info.path, "fork").unwrap(), None);
+        placed(
+            &s,
+            "beside",
+            &format!("{}-other", info.path.display()),
+            "Beside",
+            None,
+            None,
+        );
+        assert_eq!(s.worktree_occupant(&info.path, "fork").unwrap(), None);
         placed(&s, "src2", &fork_s, "Also here", Some(link.clone()), None);
-        let kept = s.keep_fork("src2", "fork", false).expect("siblings");
-        assert_eq!(kept.worktree_used_by.as_deref(), Some("Also here"));
+        let kept = took(s.keep_fork("src2", "fork", false).expect("siblings"));
+        assert_eq!(kept.worktree_used_by.as_deref(), Some("“Also here”"));
         assert!(notices(&s, "src2").is_empty(), "the live session writes it");
+        s.set_archived("src2", true).unwrap();
+        assert_eq!(
+            s.worktree_occupant(&info.path, "fork").unwrap().as_deref(),
+            Some("“Also here”"),
+            "an archived thread in it still counts"
+        );
+        // Through a link to the worktree, too.
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&info.path, &alias).expect("link");
+        let other_store = Store::open_in_memory().expect("store");
+        placed(
+            &other_store,
+            "linked",
+            &alias.to_string_lossy(),
+            "Linked",
+            None,
+            None,
+        );
+        assert_eq!(
+            other_store
+                .worktree_occupant(&info.path, "x")
+                .unwrap()
+                .as_deref(),
+            Some("“Linked”")
+        );
+        s.set_archived("src2", false).unwrap();
         s.undo_keep_fork("src2", "fork").expect("undo");
-        let kept = s.keep_fork("fork", "src", true).expect("fork kept");
+        let kept = took(s.keep_fork("fork", "src", true).expect("fork kept"));
         assert!(s.thread_summary("src").unwrap().unwrap().archived);
         assert_eq!(kept.worktree, None, "the source has no worktree");
         assert_eq!(notices(&s, "fork"), ["Kept over “Plan”, which is archived"]);

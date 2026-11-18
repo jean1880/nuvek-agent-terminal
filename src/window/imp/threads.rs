@@ -1911,12 +1911,26 @@ pub(super) struct NewThread {
     pub(super) worktree: Option<crate::worktree::WorktreeInfo>,
     /// Where a fork came from (Fork thread, `/fork`), kept with it; `None` for anything else.
     pub(super) fork: Option<agent_core::fork_compare::ForkLink>,
+    /// What was made for the thread that stays if it cannot be stored (a fork's worktree and
+    /// branch), said with the failure and logged.
+    pub(super) left_behind: Option<String>,
+}
+
+/// What a fork's worktree `info` leaves behind when no thread comes of it.
+pub(super) fn fork_worktree_left_behind(info: &crate::worktree::WorktreeInfo) -> String {
+    format!(
+        "The fork's worktree {} on branch {} was made and is left as it is; remove it with \
+         `git worktree remove` if you do not want it (the branch stays until you delete it).",
+        info.path.display(),
+        info.branch
+    )
 }
 
 impl NewThread {
     pub(super) fn new(driver: Driver) -> Self {
         Self {
             driver,
+            left_behind: None,
             notice: None,
             dir: None,
             here: None,
@@ -7097,6 +7111,19 @@ impl AgentTerminalWindow {
         priority: adw::ToastPriority,
         on_click: impl Fn(&Self) + 'static,
     ) {
+        self.held_action_toast(title, button, timeout, priority, on_click);
+    }
+
+    /// [`Self::action_toast`], returning the toast, so the caller can dismiss it (shown or still
+    /// queued) once what it offers no longer holds.
+    pub(super) fn held_action_toast(
+        &self,
+        title: &str,
+        button: &str,
+        timeout: u32,
+        priority: adw::ToastPriority,
+        on_click: impl Fn(&Self) + 'static,
+    ) -> adw::Toast {
         let toast = adw::Toast::builder()
             .title(title)
             .use_markup(false)
@@ -7110,7 +7137,8 @@ impl AgentTerminalWindow {
                 on_click(window.imp());
             }
         });
-        self.add_toast(toast);
+        self.add_toast(toast.clone());
+        toast
     }
 
     /// Shows `title` (plain text) until the caller dismisses the returned toast: work that
@@ -7839,9 +7867,9 @@ impl AgentTerminalWindow {
             .await;
             // A fork's baseline: the source's folder as it is now, right after the fork point
             // was read (no window is held meanwhile). In a worktree of its own, that snapshot is
-            // what the worktree's branch starts at, taken whether or not checkpoints are on: it
-            // is what carries the source's uncommitted work across.
-            let mut made = None;
+            // what is laid into the new worktree as uncommitted changes, taken whether or not
+            // checkpoints are on: it is what carries the source's uncommitted work across.
+            let mut made: Option<crate::worktree::ForkWorktree> = None;
             let baseline = match (&dir, &loaded, worktree) {
                 (Some(dir), Some(Ok(_)), Some(plan)) => {
                     let source = dir.clone();
@@ -7873,7 +7901,14 @@ impl AgentTerminalWindow {
                 }
                 _ => None,
             };
-            let Some(obj) = obj.upgrade() else { return };
+            // What a fork made in its own worktree leaves behind if no thread comes of it.
+            let left_behind = made.as_ref().map(|m| fork_worktree_left_behind(&m.info));
+            let Some(obj) = obj.upgrade() else {
+                if let Some(left) = &left_behind {
+                    warn!("The window closed before the fork's thread was made. {left}");
+                }
+                return;
+            };
             let imp = obj.imp();
             let (handoff, loaded, fork_seq) = match loaded {
                 Some(Ok(value)) => value,
@@ -7895,10 +7930,11 @@ impl AgentTerminalWindow {
                 ..agent_core::fork_compare::ForkLink::new(&thread, fork_seq)
             });
             if let Some(made) = &made {
-                if !made.baseline.skipped.is_empty() {
+                if !made.baseline.skipped.is_empty() || !made.from_head.is_empty() {
                     info!(
-                        "The fork's worktree left out {} untracked path(s)",
-                        made.baseline.skipped.len()
+                        "The fork's worktree left out {} untracked path(s) and took {} from HEAD",
+                        made.baseline.skipped.len(),
+                        made.from_head.len()
                     );
                 }
             }
@@ -7912,6 +7948,7 @@ impl AgentTerminalWindow {
             imp.create_chat_thread(NewThread {
                 dir,
                 worktree,
+                left_behind,
                 model: settings.model,
                 effort: settings.effort,
                 mode: settings.mode,
@@ -8187,8 +8224,17 @@ impl AgentTerminalWindow {
             profile_id,
             worktree,
             fork,
+            left_behind,
             ..
         } = new;
+        // A failure says what stays of what was made for the thread (and the log keeps it).
+        let failed = move |e: &dyn std::fmt::Display| match &left_behind {
+            Some(left) => {
+                warn!("A thread could not be created ({e}). {left}");
+                format!("{e}\n\n{left}")
+            }
+            None => e.to_string(),
+        };
         let store = app_handle();
         // A Local thread opened without a server of its own is pinned to a ready one now, so it
         // keeps that server rather than the first one switched on.
@@ -8217,7 +8263,7 @@ impl AgentTerminalWindow {
         }) {
             Ok(ids) => ids,
             Err(e) => {
-                present_message(&self.obj(), "Cannot Create a Thread", &e.to_string());
+                present_message(&self.obj(), "Cannot Create a Thread", &failed(&e));
                 return None;
             }
         };
@@ -8257,7 +8303,7 @@ impl AgentTerminalWindow {
         if store.writer().is_none() {
             // In place (memory-only store, tests): the page opens at once.
             if let Err(e) = store.reader().atomically(record) {
-                present_message(&self.obj(), "Cannot Create a Thread", &e.to_string());
+                present_message(&self.obj(), "Cannot Create a Thread", &failed(&e));
                 return None;
             }
             info!("New {} thread in {cwd}", driver.info().label);
@@ -8271,7 +8317,7 @@ impl AgentTerminalWindow {
                 info!("New {} thread in {cwd}", driver.info().label);
                 imp.open_created(&thread, created);
             }
-            Some(Err(e)) => present_message(&imp.obj(), "Cannot Create a Thread", &e.to_string()),
+            Some(Err(e)) => present_message(&imp.obj(), "Cannot Create a Thread", &failed(&e)),
             None => {
                 present_message(
                     &imp.obj(),

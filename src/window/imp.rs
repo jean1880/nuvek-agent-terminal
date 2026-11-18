@@ -9,6 +9,7 @@ mod diffs;
 mod editor_prefs;
 mod environment_review;
 mod fork_compare;
+mod merge;
 mod pack_animation;
 mod remote;
 mod setup;
@@ -431,6 +432,9 @@ struct TabState {
     /// ended once this has been quiet for [`CHECKPOINT_QUIET`]. Kept apart
     /// from `screen_dirty`, which the quota poll consumes.
     last_output: std::rc::Rc<std::cell::Cell<std::time::Instant>>,
+    /// When the tab's terminal (a terminal page, or a thread's drawer) last changed on screen:
+    /// only its output, never a turn's end, so a merge can tell a shell at work from one idle.
+    terminal_output: std::rc::Rc<std::cell::Cell<Option<std::time::Instant>>>,
     checkpoint: CheckpointTrack,
     /// What changed in this tab's repository, beside the terminal.
     diff_panel: DiffPanel,
@@ -1190,6 +1194,30 @@ fn spawn_with_exact_env(
         None::<&gtk4::gio::Cancellable>,
         done,
     );
+}
+
+/// When `terminal` last changed on screen, kept from now on: `None` until it first does.
+fn watch_terminal_output(
+    terminal: &Terminal,
+) -> std::rc::Rc<std::cell::Cell<Option<std::time::Instant>>> {
+    let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+    let stamp = std::rc::Rc::clone(&seen);
+    terminal.connect_contents_changed(move |_| stamp.set(Some(std::time::Instant::now())));
+    seen
+}
+
+/// Whether a job other than `terminal`'s shell holds it in the foreground
+/// ([`merge::foreground_job`] on its pty). A build without terminals has none.
+#[cfg(feature = "terminal")]
+fn terminal_runs_a_job(terminal: &Terminal) -> bool {
+    terminal
+        .pty()
+        .is_some_and(|pty| merge::foreground_job(&pty.fd()))
+}
+
+#[cfg(not(feature = "terminal"))]
+fn terminal_runs_a_job(_terminal: &Terminal) -> bool {
+    false
 }
 
 /// Switches `stack` off its loading screen as soon as `terminal` prints anything, then
@@ -3663,6 +3691,7 @@ impl AgentTerminalWindow {
             .build();
         let screen_dirty = std::rc::Rc::new(std::cell::Cell::new(true));
         let last_output = std::rc::Rc::new(std::cell::Cell::new(std::time::Instant::now()));
+        let terminal_output = watch_terminal_output(&terminal);
         terminal.connect_contents_changed(glib::clone!(
             #[strong]
             screen_dirty,
@@ -3779,6 +3808,7 @@ impl AgentTerminalWindow {
             quota_notified: false,
             bell_pending: false,
             last_output,
+            terminal_output,
             checkpoint: CheckpointTrack::default(),
             diff_panel: diff_panel.clone(),
             worktree: None,
@@ -6628,6 +6658,14 @@ impl AgentTerminalWindow {
             view.submit_review(&text)
         });
 
+        // "Merge into …" on a worktree tab: the preview, then the merge once confirmed.
+        let root = panel.root.clone();
+        panel.connect_merge(move || {
+            if let Some(obj) = window_of(&root) {
+                obj.imp().merge_from_panel(&root);
+            }
+        });
+
         // "Open in …" on a file row.
         let root = panel.root.clone();
         panel.connect_open(move |file| {
@@ -6727,7 +6765,7 @@ impl AgentTerminalWindow {
 
     /// Recomputes `page`'s diff off the main thread, if its panel is showing.
     fn refresh_diff(&self, page: &adw::TabPage) {
-        let Some((dir, key, thread_id, panel)) = self
+        let Some((dir, key, thread_id, panel, worktree)) = self
             .with_page_tab(page, |t| {
                 t.remote.is_none().then(|| {
                     (
@@ -6735,6 +6773,10 @@ impl AgentTerminalWindow {
                         t.key,
                         t.chat.as_ref().map(|c| c.thread.clone()),
                         t.diff_panel.clone(),
+                        t.worktree.as_ref().map(|w| super::diff_panel::MergeOffer {
+                            branch: w.branch.clone(),
+                            base: w.base.clone(),
+                        }),
                     )
                 })
             })
@@ -6819,6 +6861,7 @@ impl AgentTerminalWindow {
             }
             panel.show_commit(generation, in_repo.then_some(repo_dir), op);
             panel.show_pr(generation, pr);
+            panel.show_merge(generation, worktree.filter(|_| in_repo));
         });
     }
 
@@ -7413,20 +7456,24 @@ impl AgentTerminalWindow {
                 let name = branch.text().trim().to_string();
                 let start = base.text().trim().to_string();
                 let path = crate::worktree::default_path(&main, &name, root.as_deref());
-                let info = crate::worktree::WorktreeInfo {
+                let mut info = crate::worktree::WorktreeInfo {
                     path: path.clone(),
                     branch: name.clone(),
                     main_toplevel: main.clone(),
+                    base: None,
                 };
-                // Checked again: the repository may have moved on since.
+                // Checked again: the repository may have moved on since. The branch it starts
+                // from is kept, for "Merge into …" to merge back into.
                 let created = off_main("creating the worktree", move || {
                     crate::worktree::check_new_branch(&main, &name)?;
+                    let based_on = crate::worktree::base_branch(&main, &start);
                     let commit = crate::worktree::resolve_base(&main, &start)?;
-                    crate::worktree::add(&main, &name, &path, &commit)
+                    crate::worktree::add(&main, &name, &path, &commit).map(|()| based_on)
                 })
                 .await;
                 match created {
-                    Ok(()) => {
+                    Ok(based_on) => {
+                        info.base = based_on;
                         info!(
                             "Created worktree {} on {}",
                             info.path.display(),
@@ -7457,6 +7504,8 @@ impl AgentTerminalWindow {
                 };
                 if let Some(page) = page {
                     page.set_tooltip(&tab_tooltip(Some(&info.branch), None));
+                    // Its first refresh ran before it knew its worktree: the merge bar follows.
+                    self.refresh_diff(&page);
                 }
             }
             // A thread carries its worktree through its creation (stored with it), so its page
@@ -9184,6 +9233,8 @@ mod tests {
         super::super::diff_panel::tests::comments_are_kept_anchored_and_sent_as_one_review();
         super::super::diff_panel::tests::review_rows_budget_and_loading();
         commit::tests::the_commit_dialog_follows_its_message();
+        super::super::diff_panel::tests::the_merge_bar_shows_only_for_a_worktree();
+        merge::tests::the_merge_dialog_refuses_what_it_must();
         crate::chat::view::tests::ui_checks();
         crate::chat::view::tests::diff_ui_checks();
         crate::chat::view::tests::reasoning_ui_checks();
@@ -9422,6 +9473,50 @@ mod tests {
         });
         dialog.close();
         crate::testutil::pump_until(&ctx, 5, || closed.get());
+        window.destroy();
+    }
+
+    /// The merge preview over a shown window opens (under libadwaita 1.5 only on its second
+    /// frame, so this waits for it), and closing it, as Escape or a press outside does, answers
+    /// Cancel: nothing runs.
+    #[test]
+    #[ignore = "presents a dialog on a shown window; run on a private display"]
+    fn the_merge_preview_opens_and_closing_it_cancels() {
+        init_gtk();
+        crate::testutil::adw_init().expect("adw init");
+        crate::icons::register();
+        crate::load_css();
+        let app = crate::window::imp::test_support::test_app("org.test.MergePreview", false);
+        let window = super::super::AgentTerminalWindow::new(&app);
+        let imp = window.imp();
+        for p in imp.config.borrow_mut().profiles.iter_mut() {
+            p.command = format!("/nonexistent/{}", p.command);
+        }
+        let ctx = glib::MainContext::default();
+        crate::testutil::pump_until(&ctx, 20, || !imp.detecting.get());
+        imp.finish_shell(None);
+        imp.reveal_shell();
+        window.present();
+        crate::testutil::settle(&ctx);
+
+        let plan = merge::tests::plan();
+        let parts = merge::merge_dialog(&plan, &Default::default());
+        let answer = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+        parts.dialog.connect_response(None, {
+            let answer = answer.clone();
+            move |_, response| *answer.borrow_mut() = Some(response.to_owned())
+        });
+        parts.dialog.present(Some(&window));
+        assert!(
+            crate::testutil::pump_until_dialog_open(&ctx, parts.dialog.upcast_ref(), 5),
+            "the preview opened"
+        );
+        parts.dialog.close();
+        assert!(
+            crate::testutil::pump_until(&ctx, 5, || answer.borrow().is_some()),
+            "the preview answered"
+        );
+        assert_eq!(answer.borrow().as_deref(), Some("cancel"));
         window.destroy();
     }
 
@@ -9830,12 +9925,29 @@ mod tests {
             .iter()
             .find_map(|t| t.chat.as_ref().map(|_| t.diff_panel.clone()))
             .expect("a thread's diff panel");
+        // A worktree tab's merge bar, shown, so its button is audited too.
+        let generation = panel.begin();
+        panel.show_merge(
+            generation,
+            Some(super::super::diff_panel::MergeOffer {
+                branch: "feat/audit".into(),
+                base: Some("main".into()),
+            }),
+        );
         panel.pop_out(window.upcast_ref(), "Button audit");
         crate::testutil::settle(&ctx);
         assert!(panel.is_detached(), "the panel is in its own window");
         assert!(
             audit("popped-out diff panel", panel.content.upcast_ref()) > 0,
             "the popped-out panel's buttons were walked"
+        );
+        assert!(
+            crate::testutil::audited_buttons(panel.content.upcast_ref())
+                .iter()
+                .any(|b| b
+                    .tooltip_text()
+                    .is_some_and(|t| t.starts_with("Preview merging"))),
+            "the merge bar's button is audited"
         );
         panel.dock();
         crate::testutil::settle(&ctx);

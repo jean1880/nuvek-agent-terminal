@@ -899,6 +899,13 @@ impl ChatTab {
             || self.rebinding
     }
 
+    /// Whether a merge into the checkout this thread works in must wait for it: anything that
+    /// holds suspension ([`Self::holds_suspension`]: work, a start, a prompt, handoff or switch
+    /// waiting), or its session starting.
+    pub(super) fn holds_merge(&self) -> bool {
+        self.holds_suspension() || self.slot.get().is_some_and(|s| s.lifecycle().starting)
+    }
+
     /// Where this thread's agent process is, for its sidebar row ([`thread_activity`]): the page
     /// being built or its session started count as starting.
     fn activity(&self) -> Option<ThreadActivity> {
@@ -5849,7 +5856,7 @@ impl AgentTerminalWindow {
         };
         self.tabs.borrow_mut().push(TabState {
             page: page.clone(),
-            terminal,
+            terminal: terminal.clone(),
             dir: summary.cwd.clone(),
             stack,
             exit_bar,
@@ -5868,6 +5875,8 @@ impl AgentTerminalWindow {
             quota_notified: false,
             bell_pending: false,
             last_output: std::rc::Rc::new(std::cell::Cell::new(std::time::Instant::now())),
+            // The drawer's shell: its output alone, apart from the turn's end in `last_output`.
+            terminal_output: super::watch_terminal_output(&terminal),
             checkpoint: CheckpointTrack::default(),
             diff_panel: diff_panel.clone(),
             worktree: None,
@@ -6191,6 +6200,9 @@ impl AgentTerminalWindow {
             .flatten();
         if let Some(branch) = worktree_branch {
             page.set_tooltip(&tab_tooltip(Some(&branch), None));
+            // The page's first refresh ran before it knew its worktree: an open panel shows its
+            // merge bar now.
+            self.refresh_diff(page);
         }
         self.with_page_chat_mut(page, |chat| {
             chat.view = Some(view.clone());
@@ -8165,6 +8177,8 @@ impl AgentTerminalWindow {
         }
         if let Some(branch) = branch {
             page.set_tooltip(&tab_tooltip(Some(&branch), None));
+            // Its first refresh ran before it knew its worktree: the merge bar follows it.
+            self.refresh_diff(&page);
         }
         self.open_thread(thread, true);
         match notice {
@@ -12843,12 +12857,28 @@ pub(super) mod tests {
             ..crate::config::new_agent_profile(Driver::Claude)
         });
         let tree = tempfile::tempdir().unwrap();
+        // A repository, so the diff panel (open by default here) has something to show, and
+        // with it the merge bar of a worktree tab.
+        agent_kit::test_support::init_repo_at(tree.path(), &[("a.txt", b"a\n")]);
+        imp.config.borrow_mut().diff_panel_visible = true;
+        // Wide enough that the small-window breakpoint leaves the panel on show.
+        window.set_default_size(1400, 900);
+        window.present();
         let info = crate::worktree::WorktreeInfo {
             path: tree.path().to_path_buf(),
             branch: "feat/x".into(),
             main_toplevel: tree.path().join("main"),
+            base: Some("main".into()),
         };
         let dir = tree.path().to_string_lossy().into_owned();
+        let merge_bar = || {
+            imp.tabs
+                .borrow()
+                .iter()
+                .find(|t| t.chat.is_some())
+                .and_then(|t| t.diff_panel.merge_view())
+                .map(|v| v.1)
+        };
         assert!(
             imp.create_chat_thread(NewThread {
                 dir: Some(dir.clone()),
@@ -12876,6 +12906,23 @@ pub(super) mod tests {
         assert_eq!(worktree.as_ref(), Some(&info));
         assert_eq!(profile.as_deref(), Some("claude-work"));
         assert!(tooltip.is_some_and(|t| t.contains("feat/x")));
+        // The panel was open before the page knew its worktree: the merge bar still shows.
+        assert!(
+            pump_until(&ctx, 10, || merge_bar().as_deref()
+                == Some("Merge into main…")),
+            "the new worktree thread's merge bar: {:?}, panel {:?}",
+            merge_bar(),
+            imp.tabs
+                .borrow()
+                .iter()
+                .find(|t| t.chat.is_some())
+                .map(|t| (
+                    t.diff_panel.is_shown(),
+                    t.in_repo,
+                    t.worktree.is_some(),
+                    t.repo_dir()
+                ))
+        );
 
         // Closed and reopened: the page starts without them and gets them from the store.
         let view = imp.tab_view.borrow().clone().unwrap();
@@ -12885,6 +12932,12 @@ pub(super) mod tests {
         assert!(pump_until(&ctx, 10, || attributes().is_some_and(
             |(_, w, p, _)| w.as_ref() == Some(&info) && p.as_deref() == Some("claude-work")
         )));
+        assert!(
+            pump_until(&ctx, 10, || merge_bar().as_deref()
+                == Some("Merge into main…")),
+            "the reopened worktree thread's merge bar: {:?}",
+            merge_bar()
+        );
 
         // Two resumes of one native session: one thread, the one already holding it.
         let threads = || reader.list_threads(true).unwrap().len();
@@ -13028,6 +13081,7 @@ pub(super) mod tests {
             path: "/w/tree".into(),
             branch: "feat/x".into(),
             main_toplevel: "/w/main".into(),
+            base: Some("main".into()),
         };
         let spec = DiscardedThread {
             driver: Driver::Codex,
@@ -13669,6 +13723,7 @@ pub(super) mod tests {
             path: tree.path().to_path_buf(),
             branch: "feat/y".into(),
             main_toplevel: tree.path().join("main"),
+            base: Some("main".into()),
         };
         let handle = app_handle();
         let ids = NewThreadIds {

@@ -16,6 +16,11 @@ pub struct WorktreeInfo {
     pub branch: String,
     /// The main working tree, which owns the worktree.
     pub main_toplevel: PathBuf,
+    /// The branch the worktree was started from, which "Merge into …" merges back into. `None`
+    /// for a worktree started from a commit or a tag, or made before it was recorded: the main
+    /// checkout's branch is used then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
 }
 
 /// A branch name as a directory name: `feat/x` becomes `feat-x`.
@@ -55,6 +60,13 @@ pub fn precheck_name(name: &str, what: &str) -> Result<(), String> {
     }
     if name.starts_with('-') {
         return Err(format!("A {what} cannot start with '-'"));
+    }
+    // A name is shown in dialogs and commands: one that can hide or reorder text there is no
+    // name to show for what will run.
+    if agent_core::text::has_control_or_bidi(name, &[]) {
+        return Err(format!(
+            "A {what} cannot hold control, direction or invisible characters"
+        ));
     }
     Ok(())
 }
@@ -151,6 +163,32 @@ pub fn resolve_base(repo: &Path, base: &str) -> Result<String, String> {
         ));
     }
     Ok(commit)
+}
+
+/// The local branch a worktree started from `start` (as typed: `HEAD`, a branch, a tag or a
+/// commit) is based on: `start` itself when it names a local branch, the main checkout's branch
+/// for `HEAD`, and `None` otherwise.
+pub fn base_branch(repo: &Path, start: &str) -> Option<String> {
+    let start = start.trim();
+    if start == "HEAD" {
+        return current_branch(repo);
+    }
+    if precheck_name(start, "base").is_err() {
+        return None;
+    }
+    let out = git_output(
+        repo,
+        [
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{start}"),
+        ],
+        &[],
+        QUERY_TIMEOUT_SECS,
+    )
+    .ok()?;
+    out.status.success().then(|| start.to_owned())
 }
 
 /// Creates `branch` at `base` (a commit id from [`resolve_base`]) in a new
@@ -306,6 +344,9 @@ mod tests {
         assert!(precheck_name("-f", "branch name").is_err());
         assert!(precheck_name("  ", "branch name").is_err());
         assert!(precheck_name("feat/x", "branch name").is_ok());
+        for hidden in ["feat\u{202E}x", "a\nb", "a\u{200B}b", "x\u{7}"] {
+            assert!(precheck_name(hidden, "branch name").is_err(), "{hidden:?}");
+        }
     }
 
     #[test]
@@ -329,9 +370,23 @@ mod tests {
             path: PathBuf::from("/r/.main.worktrees/feat-x"),
             branch: "feat/x".into(),
             main_toplevel: PathBuf::from("/r/main"),
+            base: Some("main".into()),
         };
         let json = serde_json::to_string(&info).unwrap();
         assert_eq!(serde_json::from_str::<WorktreeInfo>(&json).unwrap(), info);
+    }
+
+    #[test]
+    fn worktree_info_without_base_round_trips() {
+        // As stored before the base was recorded.
+        let json = r#"{"path":"/r/wt","branch":"feat/x","main_toplevel":"/r/main"}"#;
+        let info: WorktreeInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.base, None);
+        assert_eq!(
+            serde_json::to_string(&info).unwrap(),
+            json,
+            "no base, no key"
+        );
     }
 
     mod repo {
@@ -373,7 +428,12 @@ mod tests {
                 path: path.clone(),
                 branch: "feat/x".into(),
                 main_toplevel: main.clone(),
+                base: base_branch(&main, "main"),
             };
+            assert_eq!(info.base.as_deref(), Some("main"));
+            assert_eq!(base_branch(&main, "HEAD").as_deref(), Some("main"));
+            assert_eq!(base_branch(&main, &base), None, "a commit is no branch");
+            assert_eq!(base_branch(&main, "-main"), None);
             assert_eq!(is_registered(&info), Ok(true));
             let other = WorktreeInfo {
                 branch: "feat/other".into(),

@@ -246,6 +246,33 @@ pub fn pr_words(outcome: &Result<PrOutcome, String>) -> PrWords {
     }
 }
 
+/// What the "Merge into …" bar of a worktree tab names: the worktree's branch, and the branch it
+/// merges back into (`None`: not recorded, so the main checkout's branch at merge time).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeOffer {
+    pub branch: String,
+    pub base: Option<String>,
+}
+
+impl MergeOffer {
+    /// The line beside the button, and the button's label.
+    pub fn words(&self) -> (String, String) {
+        match &self.base {
+            Some(base) => (
+                format!("Worktree branch {} → {base}", self.branch),
+                format!("Merge into {base}…"),
+            ),
+            None => (
+                format!(
+                    "Worktree branch {} → the main checkout's branch",
+                    self.branch
+                ),
+                "Merge Back…".to_owned(),
+            ),
+        }
+    }
+}
+
 /// A file the user asked to open in the external diff tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenFile {
@@ -390,6 +417,7 @@ type OpenHandler = Rc<dyn Fn(OpenFile)>;
 type EditHandler = Rc<dyn Fn(EditFile)>;
 type PrHandler = Rc<dyn Fn(PrState)>;
 type CommitHandler = Rc<dyn Fn(CommitAsk)>;
+type MergeHandler = Rc<dyn Fn()>;
 /// A row's tick box, held weakly (its row owns it), with the row's path.
 type Tick = (glib::WeakRef<gtk4::CheckButton>, String);
 type PopHandler = Rc<dyn Fn()>;
@@ -637,6 +665,18 @@ pub struct DiffPanel {
     commit: CommitBar,
     /// The comments on diff lines and the review bar under the diff, above the commit bar.
     review: review::Review,
+    /// The "Merge into …" bar of a worktree tab, under the PR bar.
+    merge_bar: gtk4::Box,
+    merge_status: gtk4::Label,
+    merge_button: gtk4::Button,
+    merge_label: gtk4::Label,
+    merge_face: gtk4::Stack,
+    merge_spinner: gtk4::Spinner,
+    /// A merge is running (`set_merging`).
+    merging: Rc<Cell<bool>>,
+    /// "Merge into …" was pressed and its dialog is not up yet (`set_merge_preparing`).
+    merge_preparing: Rc<Cell<bool>>,
+    merge_handler: Rc<RefCell<Option<MergeHandler>>>,
     base: gtk4::DropDown,
     /// The base the refresh in flight was started with.
     begun_base: Rc<Cell<DiffBase>>,
@@ -770,6 +810,48 @@ impl DiffPanel {
         pr_bar.append(&pr_status);
         pr_bar.append(&pr_button);
 
+        // A worktree tab's way back: merge its branch into the branch it started from, after a
+        // preview. Text only, like every bar button that runs git.
+        let merge_status = gtk4::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .wrap(true)
+            .wrap_mode(gtk4::pango::WrapMode::WordChar)
+            .css_classes(["dim-label", "caption"])
+            .build();
+        let merge_label = gtk4::Label::new(Some("Merge Back…"));
+        let merge_busy = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(6)
+            .halign(gtk4::Align::Center)
+            .build();
+        let merge_spinner = gtk4::Spinner::new();
+        merge_busy.append(&merge_spinner);
+        merge_busy.append(&gtk4::Label::new(Some("Merging…")));
+        let merge_face = gtk4::Stack::builder()
+            .transition_type(gtk4::StackTransitionType::Crossfade)
+            .build();
+        merge_face.add_named(&merge_label, Some("idle"));
+        merge_face.add_named(&merge_busy, Some("busy"));
+        let merge_button = gtk4::Button::builder()
+            .child(&merge_face)
+            .valign(gtk4::Align::Center)
+            .css_classes(["pill", "diff-merge"])
+            .tooltip_text("Preview merging this worktree's branch back, then merge it")
+            .build();
+        merge_button.update_property(&[gtk4::accessible::Property::Label("Merge Back…")]);
+        let merge_bar = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(8)
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(8)
+            .margin_end(8)
+            .visible(false)
+            .build();
+        merge_bar.append(&merge_status);
+        merge_bar.append(&merge_button);
+
         let retry = gtk4::Button::builder()
             .label("Retry")
             .halign(gtk4::Align::Center)
@@ -847,6 +929,13 @@ impl DiffPanel {
             .build();
         content.append(&pr_separator);
         content.append(&pr_bar);
+        let merge_separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        merge_bar
+            .bind_property("visible", &merge_separator, "visible")
+            .sync_create()
+            .build();
+        content.append(&merge_separator);
+        content.append(&merge_bar);
         // No width request: the paned lets the panel narrow in a small window. MIN_WIDTH is only
         // the floor for a width the user drags it to.
         let root = gtk4::Box::builder()
@@ -872,6 +961,15 @@ impl DiffPanel {
             pr_handler: Rc::new(RefCell::new(None)),
             commit,
             review,
+            merge_bar,
+            merge_status,
+            merge_button,
+            merge_label,
+            merge_face,
+            merge_spinner,
+            merging: Rc::new(Cell::new(false)),
+            merge_preparing: Rc::new(Cell::new(false)),
+            merge_handler: Rc::new(RefCell::new(None)),
             base,
             begun_base: Rc::new(Cell::new(DiffBase::default())),
             summary,
@@ -992,6 +1090,20 @@ impl DiffPanel {
             }
             bar.syncing.set(false);
             bar.sync(pushing.get());
+        });
+        let handler = Rc::clone(&panel.merge_handler);
+        let (merging, preparing) = (Rc::clone(&panel.merging), Rc::clone(&panel.merge_preparing));
+        panel.merge_button.connect_clicked(move |button| {
+            let Some(handler) = handler.borrow().clone() else {
+                return;
+            };
+            if merging.get() || preparing.get() {
+                return;
+            }
+            // Off until the window has its dialog up (or has said why not).
+            preparing.set(true);
+            button.set_sensitive(false);
+            handler();
         });
         let handler = Rc::clone(&panel.pop_handler);
         panel.pop.connect_clicked(move |_| {
@@ -1210,6 +1322,75 @@ impl DiffPanel {
     /// Calls `send` with the composed review when "Send Review" is clicked; `Err` is shown.
     pub fn connect_send_review(&self, send: impl Fn(String) -> Result<(), String> + 'static) {
         self.review.set_send(Rc::new(send));
+    }
+
+    /// Calls `merge` when "Merge into …" is clicked.
+    pub fn connect_merge(&self, merge: impl Fn() + 'static) {
+        *self.merge_handler.borrow_mut() = Some(Rc::new(merge));
+    }
+
+    /// Shows, from a refresh, the "Merge into …" bar of a worktree tab (`None`: no bar), unless a
+    /// newer refresh has started.
+    pub fn show_merge(&self, generation: u64, offer: Option<MergeOffer>) {
+        if !self.generation.is_current(generation) {
+            return;
+        }
+        let Some(offer) = offer else {
+            self.merge_bar.set_visible(false);
+            return;
+        };
+        let (status, button) = offer.words();
+        self.merge_status.set_text(&status);
+        self.merge_status.set_tooltip_text(Some(&status));
+        self.merge_label.set_text(&button);
+        self.merge_button
+            .update_property(&[gtk4::accessible::Property::Label(&button)]);
+        self.sync_merge();
+        self.merge_bar.set_visible(true);
+    }
+
+    fn sync_merge(&self) {
+        self.merge_button
+            .set_sensitive(!self.merging.get() && !self.merge_preparing.get());
+    }
+
+    /// While a merge runs, its button spins and says so, and cannot be pressed again.
+    pub fn set_merging(&self, merging: bool) {
+        self.merging.set(merging);
+        self.merge_face
+            .set_visible_child_name(if merging { "busy" } else { "idle" });
+        if merging {
+            self.merge_spinner.start();
+        } else {
+            self.merge_spinner.stop();
+        }
+        self.sync_merge();
+    }
+
+    /// Ends (or starts) the wait between a "Merge into …" press and its dialog being up.
+    pub fn set_merge_preparing(&self, preparing: bool) {
+        self.merge_preparing.set(preparing);
+        self.sync_merge();
+    }
+
+    /// The merge bar's status, button label, whether it can be pressed and whether a merge is
+    /// running, when it is shown (tests).
+    #[cfg(test)]
+    pub fn merge_view(&self) -> Option<(String, String, bool, bool)> {
+        self.merge_bar.is_visible().then(|| {
+            (
+                self.merge_status.text().to_string(),
+                self.merge_label.text().to_string(),
+                self.merge_button.is_sensitive(),
+                self.merge_face.visible_child_name().as_deref() == Some("busy"),
+            )
+        })
+    }
+
+    /// Presses "Merge into …" (tests).
+    #[cfg(test)]
+    pub fn press_merge(&self) {
+        self.merge_button.emit_clicked();
     }
 
     /// Calls `commit` with the chosen files when "Commit…" is clicked.
@@ -1974,6 +2155,68 @@ pub(crate) mod tests {
     /// Uncommitted view of a repository with changes, the ticks survive a refresh, untick-all
     /// turns Commit off, a merge or a push in flight turns it off with the reason, a refresh
     /// mid-commit keeps it busy, and Commit hands over the ticked files.
+    #[test]
+    fn the_merge_bar_names_the_base_or_says_it_is_not_recorded() {
+        let named = MergeOffer {
+            branch: "feat/x".into(),
+            base: Some("main".into()),
+        };
+        assert_eq!(
+            named.words(),
+            (
+                "Worktree branch feat/x → main".to_owned(),
+                "Merge into main…".to_owned()
+            )
+        );
+        let unnamed = MergeOffer {
+            base: None,
+            ..named
+        };
+        assert_eq!(unnamed.words().1, "Merge Back…");
+        assert!(unnamed.words().0.ends_with("the main checkout's branch"));
+    }
+
+    /// GTK: run from the window's construction test. The bar shows only for a worktree; one
+    /// press asks once, and the button stays off until the dialog is up and while a merge runs.
+    pub(crate) fn the_merge_bar_shows_only_for_a_worktree() {
+        let panel = DiffPanel::new(&crate::theme::Theme::diff_colours(Default::default()));
+        let presses = Rc::new(Cell::new(0));
+        let seen = Rc::clone(&presses);
+        panel.connect_merge(move || seen.set(seen.get() + 1));
+        let generation = panel.begin();
+        panel.show_merge(generation, None);
+        assert_eq!(panel.merge_view(), None, "not a worktree: no bar");
+        let offer = MergeOffer {
+            branch: "feat/x".into(),
+            base: Some("main".into()),
+        };
+        // A stale refresh changes nothing.
+        let newer = panel.begin();
+        panel.show_merge(generation, Some(offer.clone()));
+        assert_eq!(panel.merge_view(), None);
+        panel.show_merge(newer, Some(offer));
+        assert_eq!(
+            panel.merge_view(),
+            Some((
+                "Worktree branch feat/x → main".to_owned(),
+                "Merge into main…".to_owned(),
+                true,
+                false
+            ))
+        );
+        panel.press_merge();
+        panel.press_merge();
+        assert_eq!(presses.get(), 1, "one press, one dialog");
+        assert_eq!(panel.merge_view().map(|v| v.2), Some(false));
+        panel.set_merge_preparing(false);
+        panel.set_merging(true);
+        assert_eq!(panel.merge_view().map(|v| (v.2, v.3)), Some((false, true)));
+        panel.press_merge();
+        assert_eq!(presses.get(), 1, "not while a merge runs");
+        panel.set_merging(false);
+        assert_eq!(panel.merge_view().map(|v| (v.2, v.3)), Some((true, false)));
+    }
+
     pub(crate) fn the_commit_bar_follows_the_view_and_the_ticks() {
         let panel = DiffPanel::new(&crate::theme::Theme::diff_colours(Default::default()));
         let asked = Rc::new(RefCell::new(None));

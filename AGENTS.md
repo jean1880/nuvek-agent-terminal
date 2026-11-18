@@ -108,7 +108,8 @@ Architectural mandates, standards, and workflows for this codebase.
     later diff: exact, moved once, or gone, never a guess), `restore` (undo: pin, restore, contained deletion, check),
     `worktree` (worktree locations, branch checks, create and clean-only
     remove), `commit` (the diff panel's commit of the ticked paths: its context, arguments and
-    run), `github` (a branch's pull-request state, the compare URL, the unforced push; it also gives
+    run), `merge` (a worktree branch merged back into its base: the read-only `preflight`, the
+    one `commands` list the preview shows and the merge runs, and the abort-only `merge`), `github` (a branch's pull-request state, the compare URL, the unforced push; it also gives
     a thread's subtitle its branch, shown only for a repository on GitHub),
     `handoff` (hand-off briefs, session readers, quota detection),
     `sessions` (`SessionFormat`, session IDs, transcript lookup and listing),
@@ -232,14 +233,17 @@ Architectural mandates, standards, and workflows for this codebase.
     `sidebar_model::snippet_markup`, which escapes every character and makes only the match
     markers bold), `window/sidebar_model.rs` (pure sidebar logic: sections, the `SearchQuery`
     filter on titles, folders and tags, tag chips and the Tags dialog's choices),
-    `window/imp/commit.rs` (the diff panel's commit dialog and flow), `window/compare.rs` (the
+    `window/imp/commit.rs` (the diff panel's commit dialog and flow), `window/imp/merge.rs` (a
+    worktree tab's merge preview, the base checkout's open tabs it refuses or warns about, the
+    merge and its result), `window/compare.rs` (the
     compare window: an `adw::Window` of its own, never a page or a `TabState`, that only reads;
     it holds itself until closed or destroyed with its parent, so no caller keeps it;
     a spinner until its first read, a generation so only the newest read draws, Refresh, replies
     as guarded markdown; it knows nothing of forks), `window/imp/fork_compare.rs` (Compare with
     Fork…, `/compare` and the fork toast's Compare: the pairings and the picker, then each
     column read through `store_job`), `window/diff_panel.rs` (the
-    diff panel's widgets, its file tick boxes, "Commit…" and "Open a PR" bars; it pops out into
+    diff panel's widgets, its file tick boxes, "Commit…", "Open a PR" and "Merge into …" bars;
+    it pops out into
     its own window, keeping its
     place, hidden, as its identity, and docks back when that window closes or its page leaves;
     `diff_panel/review.rs` is its comments on diff lines: the row's Comment button and
@@ -299,7 +303,8 @@ Architectural mandates, standards, and workflows for this codebase.
   Clean up every process you start.
 - **Worktrees are never removed by force**: removal is offered only for a
   clean worktree that no open tab is in, runs `git worktree remove` without
-  `--force`, and never deletes the branch. Names reaching git are refused if
+  `--force`, and never deletes the branch (a merge back neither: it gives the user the
+  `git branch -D` command to run). Names reaching git are refused if
   they start with `-`, and paths follow `--`.
 - **Uninstall removes everything the app put there, and only that**: `agent-terminal
   --uninstall` (also `make uninstall` and Settings → General) asks whether to remove the
@@ -315,10 +320,11 @@ Architectural mandates, standards, and workflows for this codebase.
   private index file under the git dir, and are recorded only as refs under
   `refs/agent-terminal/`, created with an empty old value so none is
   overwritten. The user's index, HEAD, working tree and stash are left
-  exactly as they were, except a commit the user confirms in the diff panel;
+  exactly as they were, except a commit the user confirms in the diff panel and a merge back
+  from a worktree thread the user confirms after its preview;
   `agent-kit`'s `git::tests::repo` proves it, including with a split
-  index and in a linked worktree. That commit (`agent-kit`'s `commit`, the one place the app
-  writes the user's index or HEAD) shares no code path with checkpoints and never uses a
+  index and in a linked worktree. That commit (`agent-kit`'s `commit`, one of the two places the
+  app writes the user's index or HEAD) shares no code path with checkpoints and never uses a
   private index: on an explicit click, after a dialog showing the exact commands, it stages and
   commits only the ticked paths (`git --literal-pathspecs add -A -- <paths>`, then `commit -m
   <message> -- <paths>`), so what the user staged elsewhere stays staged. Hooks, signing and
@@ -331,7 +337,36 @@ Architectural mandates, standards, and workflows for this codebase.
   and not a submodule (`add -A` would take the folder whole). Names not valid UTF-8 cannot be
   ticked. Each step runs in a process group of its own (`exec::run_command_in_group`), killed
   whole on timeout before git is reaped, so no hook or helper outlives it. `commit::tests` prove these, and that
-  `refs/agent-terminal/*` is untouched. Every git call strips inherited
+  `refs/agent-terminal/*` is untouched. The merge back (`agent-kit`'s `merge`, the other
+  place) writes the base branch, index and working tree of the checkout that has the base
+  checked out, and only there: on an explicit click, after a dialog that reads everything first
+  (`preflight`: both tips, ahead and behind, a `git merge-tree --write-tree` prediction that is
+  "unknown" when git cannot make it, the hooks that run and their folder, the linked worktrees)
+  and shows the exact command, its settings and its folder (`commands`, the one list the merge
+  runs), it runs `git merge --no-ff --no-edit -m "Merge branch '<branch>'" -- <commit>`: the
+  exact commit the preview read (so no tag of the name, nor a commit made since, is taken), with
+  `branch.<base>.mergeOptions` unset and `merge.ff`, `merge.log` and `merge.autoStash` false for
+  that command, passed through git's configuration environment (`GIT_CONFIG_COUNT`, keys taken
+  whole, so a branch named with `=` is no escape; `GIT_CONFIG_PARAMETERS` set empty), never with
+  `--force`, `--no-verify`, `-X` or `-s`. Names with control, direction or invisible characters
+  are refused (`precheck_name`). It refuses a worktree with uncommitted or untracked files, a base
+  checkout with uncommitted changes, on another branch, detached or mid-operation, a predicted
+  conflict, nothing to merge, this thread or anything in the base checkout working or about to
+  (`window/imp/merge.rs`: open tabs in any window, paths resolved, other linked worktrees nested
+  in it excluded, a thread's start, pending prompt or switch, a terminal page's or thread
+  drawer's recent output or a foreground job other than its shell, live delegated sub-agents by
+  their folder; an idle one only warns), another tab open in this worktree or one of this
+  thread's sub-agents working there, and either tip, the base branch or the hooks that would run
+  changed since the preview (read again just before it runs, and the tabs again at the click).
+  Exit 0 counts only when nothing is in progress and HEAD is a new commit whose parents are the
+  two shown. A merge git recorded as in progress (`MERGE_HEAD`) that stops part-way is undone
+  with `git merge --abort`, and nothing else is ever undone: every other failure leaves the
+  checkout exactly as git left it (nothing can tell what git wrote from the user's own changes
+  made meanwhile), saying what state it is in and the commands the user can run, a discarding
+  one said to discard; a left `index.lock` is never taken as restored. Failure text is redacted,
+  the timeout says a prompting hook or signing cannot be answered from the app, and each step
+  runs in its own process group like the commit. It never deletes the branch or the worktree.
+  `merge::tests` prove these. Every git call strips inherited
   `GIT_DIR`-style variables and sets `GIT_OPTIONAL_LOCKS=0`. Untracked files
   whose names look like secrets are never captured.
 - **Hand-off briefs are the terminal's, not the CLI's**: a CLI out of quota

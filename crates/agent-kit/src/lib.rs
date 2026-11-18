@@ -26,6 +26,7 @@ pub mod local_mcp;
 pub mod local_tools;
 pub mod mcp_guardian;
 pub mod mcp_transport;
+pub mod merge;
 pub mod native;
 pub mod paths;
 pub mod provider_key;

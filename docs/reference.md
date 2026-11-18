@@ -191,7 +191,9 @@ secrets (`.env`, keys), files over 5 MiB, nested repositories and ignored files 
 tracked files whose names look like secrets, and files your index marks assume-unchanged or
 skip-worktree (submodules included), keep the commit's version (or are left out when the commit
 has none). The fork's baseline is what was laid in, so a fresh fork's **Changes** show nothing and
-its ref keeps none of the files that were not copied. Your own
+its ref keeps none of the files that were not copied. The files it took from the commit are left
+out of both sides' **Changes** (the baseline has the commit's content there, not what the folder
+had), and the tab says how many. Your own
 index, HEAD, branch, working tree and stash are left exactly as they were. The snapshot is taken
 whether or not **Checkpoint Each Turn** is on, since it is what carries the work across. The fork
 opens in the same folder inside the worktree as the source was in, as a worktree thread (its

@@ -11,7 +11,18 @@ pub fn run_command(
     name: &str,
     timeout_secs: u64,
 ) -> Result<std::process::Output, String> {
-    run(cmd, name, timeout_secs, false)
+    run(cmd, name, timeout_secs, false, None)
+}
+
+/// [`run_command`] with `input` written to the command's stdin (from a thread of its own, so a
+/// command that writes before it reads never deadlocks), then closed.
+pub fn run_command_with_input(
+    cmd: std::process::Command,
+    name: &str,
+    timeout_secs: u64,
+    input: Vec<u8>,
+) -> Result<std::process::Output, String> {
+    run(cmd, name, timeout_secs, false, Some(input))
 }
 
 /// [`run_command`] for a command whose own children must not outlive a timeout (the hooks and
@@ -23,7 +34,7 @@ pub fn run_command_in_group(
     name: &str,
     timeout_secs: u64,
 ) -> Result<std::process::Output, String> {
-    run(cmd, name, timeout_secs, true)
+    run(cmd, name, timeout_secs, true, None)
 }
 
 fn run(
@@ -31,8 +42,9 @@ fn run(
     name: &str,
     timeout_secs: u64,
     group: bool,
+    input: Option<Vec<u8>>,
 ) -> Result<std::process::Output, String> {
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,15 +52,26 @@ fn run(
     use std::time::{Duration, Instant};
 
     let command = name;
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+    cmd.stdin(if input.is_some() {
+        std::process::Stdio::piped()
+    } else {
+        std::process::Stdio::null()
+    })
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
     if group {
         cmd.process_group(0);
     }
     let mut child = cmd
         .spawn()
         .map_err(|err| format!("Could not run {command}: {err}"))?;
+    // Written from a thread of its own, then closed: a command that stops reading (it failed,
+    // or it was killed on timeout) only ends the write, never blocks this one.
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+        });
+    }
 
     // Each pipe is drained on its own thread into a shared buffer, and the
     // thread says when it reached end-of-file. Waiting on that signal with a

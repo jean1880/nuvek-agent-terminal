@@ -448,6 +448,20 @@ pub struct ForkWorktree {
     pub from_head: Vec<String>,
 }
 
+/// Refuses `baseline` unless HEAD, read again once the snapshot was taken, is still the commit
+/// `plan` starts the fork's branch at.
+fn snapshot_of_plan(baseline: &crate::git::ForkBaseline, plan: &ForkPlan) -> Result<(), String> {
+    if baseline.head.as_deref() == Some(plan.head.as_str()) {
+        Ok(())
+    } else {
+        Err(
+            "The thread's folder moved to another commit while its work was being copied; \
+             fork again to plan it afresh"
+                .to_owned(),
+        )
+    }
+}
+
 /// Makes the worktree `plan` names for a fork of the thread in `source`. The source must still be
 /// at the HEAD commit and branch planned (else refused, nothing made); a branch name taken since
 /// is planned again once (the next free name). Then a snapshot of the source's working tree is
@@ -487,6 +501,9 @@ pub fn add_fork(source: &Path, plan: &ForkPlan) -> Result<ForkWorktree, String> 
             return Err("The thread's folder is not in a git repository".to_owned())
         }
     };
+    // HEAD may have moved while the snapshot was taken: its work would then be another
+    // commit's, laid on top of the planned one.
+    snapshot_of_plan(&baseline, plan)?;
     add(&plan.main_toplevel, &branch, &path, &plan.head)?;
     let laid = crate::git::lay_in_fork_worktree(source, &path, &baseline.tree).map_err(|e| {
         format!(
@@ -746,7 +763,7 @@ mod tests {
         assert_eq!(ours, [format!("refs/agent-terminal/fork/{thread}")]);
         // The baseline is what was laid in: a fresh fork shows no change against it, and what
         // its ref keeps holds HEAD's content where the fork took it, never the source's secret.
-        match crate::git::fork_changes(wt, Some(&fork.baseline.tree)).unwrap() {
+        match crate::git::fork_changes(wt, Some(&fork.baseline.tree), &fork.from_head).unwrap() {
             crate::git::ForkChanges::Ready { diff, .. } => assert!(
                 diff.stats.is_empty(),
                 "a fresh fork changed nothing: {:?}",
@@ -772,6 +789,27 @@ mod tests {
             pinned_files.lines().any(|f| f == "new.txt"),
             "the work it did copy is there: {pinned_files}"
         );
+        // The source side, against that baseline: the files the fork took from HEAD differ
+        // from what the source still has, which says nothing about either side, so they are
+        // left out of its diff; a real change since the fork still shows.
+        let side = |not_compared: &[String]| -> Vec<String> {
+            match crate::git::fork_changes(&main, Some(&fork.baseline.tree), not_compared).unwrap()
+            {
+                crate::git::ForkChanges::Ready { diff, .. } => {
+                    diff.stats.into_iter().map(|s| s.path).collect()
+                }
+                other => panic!("expected changes, got {other:?}"),
+            }
+        };
+        let raw = side(&[]);
+        assert!(raw.iter().any(|p| p == ".env"), "{raw:?}");
+        assert!(
+            side(&fork.from_head).is_empty(),
+            "a fresh fork's source changed nothing"
+        );
+        fs::write(main.join("b.txt"), "after the fork\n").unwrap();
+        assert_eq!(side(&fork.from_head), ["b.txt"]);
+        fs::write(main.join("b.txt"), "b\n").unwrap();
         // The next plan for the same title takes the next number.
         let next = plan_fork(&main, "Try the --other way", None).unwrap();
         assert_eq!(next.branch, "fork/try-the-other-way-2");
@@ -844,6 +882,102 @@ mod tests {
             "no change to a submodule: {status}"
         );
         assert!(status.contains("a.txt"), "{status}");
+    }
+
+    /// Hundreds of paths hidden from git (a sparse checkout, say) cost a bounded number of git
+    /// processes, never two a path.
+    #[test]
+    fn a_fork_with_many_hidden_paths_copies_them_in_a_bounded_number_of_git_calls() {
+        use crate::test_support::{git as sh, git_or_skip, init_repo_at};
+        if !git_or_skip() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("work/main");
+        std::fs::create_dir_all(main.join("many")).unwrap();
+        let names: Vec<String> = (0..300).map(|i| format!("many/f{i}.txt")).collect();
+        for name in &names {
+            std::fs::write(main.join(name), "committed\n").unwrap();
+        }
+        init_repo_at(&main, &[("a.txt", b"a\n")]);
+        let main = main.canonicalize().unwrap();
+        let mut args = vec!["update-index", "--skip-worktree", "--"];
+        args.extend(names.iter().map(String::as_str));
+        sh(&main, &args);
+        for name in &names {
+            std::fs::write(main.join(name), "hidden edit\n").unwrap();
+        }
+        let plan = plan_fork(&main, "many", None).unwrap();
+        let before = crate::git::GIT_CALLS.with(std::cell::Cell::get);
+        let fork = add_fork(&main, &plan).unwrap();
+        let calls = crate::git::GIT_CALLS.with(std::cell::Cell::get) - before;
+        assert!(
+            calls < 60,
+            "{calls} git processes for {} paths",
+            names.len()
+        );
+        assert_eq!(fork.from_head.len(), names.len());
+        let wt = &fork.info.path;
+        assert_eq!(
+            std::fs::read_to_string(wt.join("many/f299.txt")).unwrap(),
+            "committed\n",
+            "HEAD's content, never the hidden edit"
+        );
+        assert_eq!(sh(wt, &["status", "--porcelain"]), "", "nothing changed");
+    }
+
+    /// Laying a fork's work in writes only a worktree of its own: a folder inside the user's
+    /// checkout, or the checkout itself, is refused before anything is written.
+    #[test]
+    fn laying_a_forks_work_in_refuses_anything_but_a_worktree_of_its_own() {
+        use crate::test_support::git as sh;
+        use std::fs;
+        let Some((_tmp, main)) = repo_with_work() else {
+            return;
+        };
+        let baseline = match crate::git::take_fork_baseline(&main).unwrap() {
+            crate::git::BaselineOutcome::Taken(b) => b,
+            other => panic!("expected a baseline, got {other:?}"),
+        };
+        let state = || {
+            (
+                fs::read(main.join(".git/index")).unwrap(),
+                fs::read_to_string(main.join("a.txt")).unwrap(),
+                main.join("new.txt").exists(),
+                sh(&main, &["rev-parse", "HEAD"]),
+            )
+        };
+        let before = state();
+        for target in [main.join("sub"), main.clone()] {
+            let err = crate::git::lay_in_fork_worktree(&main, &target, &baseline.tree).unwrap_err();
+            assert!(err.contains("not a worktree of its own"), "{err}");
+            assert_eq!(state(), before, "{}", target.display());
+        }
+    }
+
+    /// A snapshot is of the planned commit only while HEAD is still that commit once it is taken.
+    #[test]
+    fn a_snapshot_taken_after_head_moved_is_refused() {
+        let plan = ForkPlan {
+            main_toplevel: PathBuf::from("/r"),
+            branch: "fork/x-1".into(),
+            path: PathBuf::from("/r/.wt/fork-x-1"),
+            base: Some("main".into()),
+            head: "a".repeat(40),
+            slug: "x".into(),
+            root: None,
+        };
+        let taken = |head: Option<String>| crate::git::ForkBaseline {
+            toplevel: PathBuf::from("/r"),
+            tree: "b".repeat(40),
+            commit: "c".repeat(40),
+            skipped: Vec::new(),
+            head,
+        };
+        assert!(snapshot_of_plan(&taken(Some("a".repeat(40))), &plan).is_ok());
+        let err = snapshot_of_plan(&taken(Some("d".repeat(40))), &plan).unwrap_err();
+        assert!(err.contains("moved"), "{err}");
+        assert!(snapshot_of_plan(&taken(None), &plan).is_err());
     }
 
     #[test]

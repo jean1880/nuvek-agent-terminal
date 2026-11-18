@@ -72,6 +72,9 @@ pub struct ForkBaseline {
     pub commit: String,
     /// Untracked files left out, as a checkpoint leaves them out.
     pub skipped: Vec<Skipped>,
+    /// HEAD as read again once the snapshot was taken (`None` before the first commit): a
+    /// caller that needs the snapshot to be of one commit compares it with what it planned.
+    pub head: Option<String>,
 }
 
 /// What [`take_fork_baseline`] did.
@@ -120,6 +123,7 @@ pub fn take_fork_baseline(dir: &Path) -> Result<BaselineOutcome, String> {
         SnapshotOutcome::Busy => return Ok(BaselineOutcome::Busy),
         SnapshotOutcome::Taken(snapshot) => snapshot,
     };
+    let head = resolve(&repo, "HEAD")?;
     let commit = commit_tree(
         &repo,
         &snapshot.tree,
@@ -131,6 +135,7 @@ pub fn take_fork_baseline(dir: &Path) -> Result<BaselineOutcome, String> {
         tree: snapshot.tree,
         commit,
         skipped: snapshot.skipped,
+        head,
     }))
 }
 
@@ -224,38 +229,100 @@ fn head_only_paths(source: &Path, worktree: &Path, tree: &str) -> Result<Vec<OsS
         .collect())
 }
 
-/// One entry of `ls-tree -z` (`<mode> <type> <oid>\t<path>`) as the mode and object id of a file,
-/// a link or a submodule (gitlink) at exactly `path`, its bytes compared whole; `None` for
-/// anything else.
-fn tree_entry(entry: &[u8], path: &[u8]) -> Option<(String, String)> {
+/// One entry of `ls-tree -z` (`<mode> <type> <oid>\t<path>`) as its path's bytes, whole, and the
+/// mode and object id of a file, a link or a submodule (gitlink); `None` for anything else.
+fn tree_entry(entry: &[u8]) -> Option<(&[u8], String, String)> {
     let tab = entry.iter().position(|b| *b == b'\t')?;
     let (meta, name) = (&entry[..tab], &entry[tab + 1..]);
-    if name != path {
-        return None;
-    }
     let meta = std::str::from_utf8(meta).ok()?;
     match meta.split(' ').collect::<Vec<_>>().as_slice() {
         [mode, "blob", oid] | [mode @ "160000", "commit", oid] if is_object_id(oid) => {
-            Some(((*mode).to_owned(), (*oid).to_owned()))
+            Some((name, (*mode).to_owned(), (*oid).to_owned()))
         }
         _ => None,
     }
 }
 
-/// HEAD's entry for `path` in the repository of `dir` ([`tree_entry`]).
-fn head_entry(dir: &Path, path: &OsStr) -> Result<Option<(String, String)>, String> {
-    let args: [&OsStr; 6] = [
-        OsStr::new("--literal-pathspecs"),
-        OsStr::new("ls-tree"),
-        OsStr::new("-z"),
-        OsStr::new("HEAD"),
-        OsStr::new("--"),
-        path,
-    ];
-    let out = git_raw(dir, args, &[], SNAPSHOT_TIMEOUT_SECS)?;
-    Ok(out
-        .split(|b| *b == 0)
-        .find_map(|entry| tree_entry(entry, path.as_bytes())))
+/// `tree` with each of `paths` set to what tree-ish `from` has there (removed where it has none,
+/// or has a folder), made in a private index of `repo`'s git directory, so nothing of the
+/// user's is touched. Bounded whatever the number of paths: one `ls-tree` per chunk of paths
+/// (the snapshot's chunking), one `update-index --index-info` fed on stdin, one `write-tree`.
+fn with_entries_from(
+    repo: &RepoInfo,
+    tree: &str,
+    from: &str,
+    paths: &[OsString],
+) -> Result<String, String> {
+    if paths.is_empty() {
+        return Ok(tree.to_owned());
+    }
+    let dir = repo.toplevel.as_path();
+    let work = repo.git_dir.join("agent-terminal");
+    std::fs::create_dir_all(&work)
+        .map_err(|err| format!("could not create {}: {err}", work.display()))?;
+    let scratch = ScratchIndex(work.join(format!("index-{}", snapshot_tag("entries"))));
+    let env = [("GIT_INDEX_FILE", scratch.0.as_os_str())];
+    let config = || SNAPSHOT_CONFIG.iter().map(OsString::from);
+    git_raw(
+        dir,
+        config().chain(["read-tree", tree].map(OsString::from)),
+        &env,
+        LAY_IN_TIMEOUT_SECS,
+    )?;
+    // A mode of 0 removes the path; its object id must still be one of the right length.
+    let removed = "0".repeat(tree.len());
+    let mut input = Vec::new();
+    for batch in super::update_index_batches(paths) {
+        let listed = git_raw(
+            dir,
+            ["--literal-pathspecs", "ls-tree", "-r", "-z", from, "--"]
+                .map(OsString::from)
+                .into_iter()
+                .chain(batch.iter().cloned()),
+            &[],
+            LAY_IN_TIMEOUT_SECS,
+        )?;
+        let found: std::collections::HashMap<&[u8], (String, String)> = listed
+            .split(|b| *b == 0)
+            .filter_map(tree_entry)
+            .map(|(name, mode, oid)| (name, (mode, oid)))
+            .collect();
+        for path in batch {
+            let path = path.as_bytes();
+            let line = match found.get(path) {
+                Some((mode, oid)) => format!("{mode} {oid}\t"),
+                None => format!("0 {removed}\t"),
+            };
+            input.extend_from_slice(line.as_bytes());
+            input.extend_from_slice(path);
+            input.push(0);
+        }
+    }
+    super::git_raw_with_input(
+        dir,
+        config().chain(["update-index", "-z", "--index-info"].map(OsString::from)),
+        &env,
+        LAY_IN_TIMEOUT_SECS,
+        input,
+    )?;
+    let written = git_raw(
+        dir,
+        config().chain([OsString::from("write-tree")]),
+        &env,
+        LAY_IN_TIMEOUT_SECS,
+    )?;
+    Ok(String::from_utf8_lossy(&written).trim().to_owned())
+}
+
+/// Whether `fork` (discovered from `worktree`) is a working tree of its own at exactly that
+/// folder, with a git directory that is not `source`'s: what the commands that rewrite a working
+/// tree and its index check first, so they never reach the user's checkout.
+fn is_separate_worktree(fork: &RepoInfo, worktree: &Path, source: &RepoInfo) -> bool {
+    let canonical = |p: &Path| p.canonicalize().ok();
+    canonical(&fork.toplevel).is_some()
+        && canonical(&fork.toplevel) == canonical(worktree)
+        && canonical(&fork.git_dir) != canonical(&source.git_dir)
+        && canonical(&fork.toplevel) != canonical(&source.toplevel)
 }
 
 /// What [`lay_in_fork_worktree`] laid in.
@@ -292,63 +359,20 @@ pub fn lay_in_fork_worktree(source: &Path, worktree: &Path, tree: &str) -> Resul
     let fork = discover(worktree)
         .map_err(not_copied)?
         .ok_or_else(|| not_copied("the new worktree is not a git working tree".to_owned()))?;
+    // Only a working tree of its own, at exactly that folder, is ever rewritten: never the
+    // user's checkout, nor a folder inside it.
+    if !is_separate_worktree(&fork, worktree, &source) {
+        return Err(not_copied(format!(
+            "{} is not a worktree of its own (its working tree is {}), so nothing was written \
+             there",
+            worktree.display(),
+            fork.toplevel.display()
+        )));
+    }
     let head_only = head_only_paths(&source.toplevel, &fork.toplevel, tree).map_err(not_copied)?;
     let dir = fork.toplevel.as_path();
     // The tree to lay in, made in a private index of the fork's own git directory.
-    let laid = if head_only.is_empty() {
-        tree.to_owned()
-    } else {
-        let work = fork.git_dir.join("agent-terminal");
-        std::fs::create_dir_all(&work)
-            .map_err(|err| not_copied(format!("could not create {}: {err}", work.display())))?;
-        let scratch = ScratchIndex(work.join(format!("index-{}", snapshot_tag("forkwt"))));
-        let env = [("GIT_INDEX_FILE", scratch.0.as_os_str())];
-        let private = |args: &[&OsStr], timeout: u64| {
-            git_raw(
-                dir,
-                SNAPSHOT_CONFIG
-                    .iter()
-                    .map(OsStr::new)
-                    .chain(args.iter().copied()),
-                &env,
-                timeout,
-            )
-        };
-        private(
-            &[OsStr::new("read-tree"), OsStr::new(tree)],
-            LAY_IN_TIMEOUT_SECS,
-        )
-        .map_err(not_copied)?;
-        for path in &head_only {
-            match head_entry(dir, path).map_err(not_copied)? {
-                Some((mode, oid)) => private(
-                    &[
-                        OsStr::new("update-index"),
-                        OsStr::new("--add"),
-                        OsStr::new("--replace"),
-                        OsStr::new("--cacheinfo"),
-                        OsStr::new(&mode),
-                        OsStr::new(&oid),
-                        path,
-                    ],
-                    SNAPSHOT_TIMEOUT_SECS,
-                ),
-                None => private(
-                    &[
-                        OsStr::new("update-index"),
-                        OsStr::new("--force-remove"),
-                        OsStr::new("--"),
-                        path,
-                    ],
-                    SNAPSHOT_TIMEOUT_SECS,
-                ),
-            }
-            .map_err(not_copied)?;
-        }
-        let written =
-            private(&[OsStr::new("write-tree")], LAY_IN_TIMEOUT_SECS).map_err(not_copied)?;
-        String::from_utf8_lossy(&written).trim().to_owned()
-    };
+    let laid = with_entries_from(&fork, tree, "HEAD", &head_only).map_err(not_copied)?;
     let commit = commit_tree(&fork, &laid, fork.head.as_deref(), &baseline_message(&[]))
         .map_err(not_copied)?;
     // The working tree to the snapshot, then the index back to HEAD: the work is uncommitted.
@@ -392,8 +416,14 @@ pub enum ForkChanges {
 
 /// What changed in the working tree `dir` is in since `base_tree` (a fork's baseline): a fresh
 /// snapshot (as [`take_fork_baseline`] takes one, touching nothing of the user's) diffed tree to
-/// tree against it.
-pub fn fork_changes(dir: &Path, base_tree: Option<&str>) -> Result<ForkChanges, String> {
+/// tree against it. The paths in `not_compared` (those a fork in its own worktree took from
+/// HEAD: [`LaidIn::from_head`]) are left out of the diff: the baseline holds HEAD's content
+/// there, not what the folder had, so a difference there says nothing about the fork.
+pub fn fork_changes(
+    dir: &Path,
+    base_tree: Option<&str>,
+    not_compared: &[String],
+) -> Result<ForkChanges, String> {
     if !dir.is_dir() {
         return Ok(ForkChanges::Unavailable(
             "The thread's folder no longer exists".to_owned(),
@@ -429,6 +459,9 @@ pub fn fork_changes(dir: &Path, base_tree: Option<&str>) -> Result<ForkChanges, 
             ))
         }
     };
+    // What the baseline holds at the paths not compared, on this side too: no difference there.
+    let skipped: Vec<OsString> = not_compared.iter().map(OsString::from).collect();
+    let now = with_entries_from(&repo, &now, base, &skipped)?;
     let diff = diff_trees(&repo, base, &now)?;
     Ok(ForkChanges::Ready {
         toplevel: repo.toplevel,
@@ -656,7 +689,7 @@ mod tests {
         }
         // And the diff since the fork never brings it in either.
         fs::write(dir.join("later.pem"), "pem\n").unwrap();
-        let (_, diff) = ready(fork_changes(dir, Some(&baseline.tree)).unwrap());
+        let (_, diff) = ready(fork_changes(dir, Some(&baseline.tree), &[]).unwrap());
         assert!(diff.stats.is_empty(), "{:?}", paths(&diff));
     }
 
@@ -674,7 +707,7 @@ mod tests {
             BaselineOutcome::NotRepo
         );
         assert_eq!(
-            fork_changes(plain.path(), None).unwrap(),
+            fork_changes(plain.path(), None, &[]).unwrap(),
             ForkChanges::NotRepo
         );
     }
@@ -697,7 +730,7 @@ mod tests {
         fs::write(dir.join("a.txt"), "after the fork\n").unwrap();
         fs::write(dir.join("c.txt"), "new\n").unwrap();
         let before = user_state(dir);
-        let (toplevel, diff) = ready(fork_changes(dir, Some(&baseline.tree)).unwrap());
+        let (toplevel, diff) = ready(fork_changes(dir, Some(&baseline.tree), &[]).unwrap());
         assert_eq!(
             user_state(dir),
             before,
@@ -720,15 +753,15 @@ mod tests {
         // A starting point that is not in the repository says so; none says why.
         let missing = "1".repeat(40);
         assert!(matches!(
-            fork_changes(dir, Some(&missing)).unwrap(),
+            fork_changes(dir, Some(&missing), &[]).unwrap(),
             ForkChanges::Unavailable(why) if why.contains("not in this folder's repository")
         ));
         assert!(matches!(
-            fork_changes(dir, None).unwrap(),
+            fork_changes(dir, None, &[]).unwrap(),
             ForkChanges::Unavailable(why) if why.contains("No starting point")
         ));
         assert!(matches!(
-            fork_changes(&dir.join("gone"), Some(&baseline.tree)).unwrap(),
+            fork_changes(&dir.join("gone"), Some(&baseline.tree), &[]).unwrap(),
             ForkChanges::Unavailable(why) if why.contains("no longer exists")
         ));
     }
@@ -742,7 +775,7 @@ mod tests {
             .map(|i| format!("line {i}\n"))
             .collect();
         fs::write(dir.join("big.txt"), big).unwrap();
-        let (_, diff) = ready(fork_changes(dir, Some(&baseline.tree)).unwrap());
+        let (_, diff) = ready(fork_changes(dir, Some(&baseline.tree), &[]).unwrap());
         assert_eq!(paths(&diff), ["big.txt"]);
         assert!(diff.omitted_lines > 0, "the text is cut");
         assert!(diff.text.lines().count() <= crate::diff::MAX_DIFF_LINES);
@@ -768,8 +801,8 @@ mod tests {
         );
         fs::write(dir.join("main.txt"), "main side\n").unwrap();
         fs::write(wt.join("side.txt"), "worktree side\n").unwrap();
-        let (main_top, main) = ready(fork_changes(dir, Some(&baseline.tree)).unwrap());
-        let (wt_top, side) = ready(fork_changes(&wt, Some(&baseline.tree)).unwrap());
+        let (main_top, main) = ready(fork_changes(dir, Some(&baseline.tree), &[]).unwrap());
+        let (wt_top, side) = ready(fork_changes(&wt, Some(&baseline.tree), &[]).unwrap());
         assert_ne!(main_top, wt_top, "two folders, told apart");
         assert_eq!(paths(&main), ["main.txt"]);
         // The worktree started at HEAD, without the main checkout's uncommitted edit.

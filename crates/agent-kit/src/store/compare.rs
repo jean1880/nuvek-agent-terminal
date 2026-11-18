@@ -27,9 +27,6 @@ pub struct KeptFork {
     pub notice: String,
     /// The worktree the archived thread was opened in, if it was.
     pub worktree: Option<crate::worktree::WorktreeInfo>,
-    /// Who else works in that worktree ([`Store::worktree_occupant`]), quoted: its removal is
-    /// then not offered.
-    pub worktree_used_by: Option<String>,
 }
 
 /// [`Store::keep_fork`]'s answer.
@@ -69,6 +66,8 @@ pub struct ForkColumns {
     pub bases: [Option<String>; 2],
     /// The thread kept over the other, when the pair was settled with Keep This One.
     pub kept: Option<String>,
+    /// The paths each column's changes leave out ([`ForkLink::not_compared`]).
+    pub not_compared: [Vec<String>; 2],
 }
 
 impl Store {
@@ -180,6 +179,7 @@ impl Store {
             columns,
             bases: pairing.bases(own.as_ref(), other.as_ref()),
             kept: pairing.kept(thread, own.as_ref(), other.as_ref()),
+            not_compared: pairing.not_compared(own.as_ref(), other.as_ref()),
         })
     }
 
@@ -233,16 +233,10 @@ impl Store {
                     }),
                 )?;
             }
+            // Who else works in the worktree is asked afterwards, never in here: it resolves
+            // every thread's folder, and a hung mount would hold every store write behind it.
             let worktree = s.thread_attributes(other)?.worktree;
-            let worktree_used_by = match &worktree {
-                None => None,
-                Some(info) => s.worktree_occupant(&info.path, other)?,
-            };
-            Ok(KeepOutcome::Kept(KeptFork {
-                notice,
-                worktree,
-                worktree_used_by,
-            }))
+            Ok(KeepOutcome::Kept(KeptFork { notice, worktree }))
         })
     }
 
@@ -583,7 +577,7 @@ mod tests {
         assert_eq!(notices(&s, "src"), std::slice::from_ref(&kept.notice));
         assert!(notices(&s, "fork").is_empty());
         assert_eq!(kept.worktree.as_ref(), Some(&info));
-        assert_eq!(kept.worktree_used_by, None);
+        assert_eq!(s.worktree_occupant(&info.path, "fork").unwrap(), None);
         let settled = s.fork_link("fork").unwrap().expect("link");
         assert_eq!(
             settled.kept,
@@ -649,8 +643,11 @@ mod tests {
         );
         assert_eq!(s.worktree_occupant(&info.path, "fork").unwrap(), None);
         placed(&s, "src2", &fork_s, "Also here", Some(link.clone()), None);
-        let kept = took(s.keep_fork("src2", "fork", false).expect("siblings"));
-        assert_eq!(kept.worktree_used_by.as_deref(), Some("“Also here”"));
+        took(s.keep_fork("src2", "fork", false).expect("siblings"));
+        assert_eq!(
+            s.worktree_occupant(&info.path, "fork").unwrap().as_deref(),
+            Some("“Also here”")
+        );
         assert!(notices(&s, "src2").is_empty(), "the live session writes it");
         s.set_archived("src2", true).unwrap();
         assert_eq!(

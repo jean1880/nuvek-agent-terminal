@@ -126,7 +126,11 @@ Architectural mandates, standards, and workflows for this codebase.
     content (a submodule's gitlink too) through a private index with the snapshot's config
     overrides, so nothing of the app's lands on a branch and no such file is copied; what it
     laid in, recorded as a commit (`LaidIn`), is the fork's baseline and what its ref keeps,
-    never the raw snapshot), `diff` (diff bases, numstat, line classification,
+    never the raw snapshot; it writes only a worktree of its own (its canonical toplevel the
+    worktree, its git dir not the source's), and sets the HEAD-kept paths in a bounded number of
+    git processes, `with_entries_from`: an `ls-tree` per chunk and one `update-index -z
+    --index-info` on stdin; those paths go in `ForkLink::not_compared`, which `fork_changes`
+    leaves out of both sides' diffs and the Changes tab counts), `diff` (diff bases, numstat, line classification,
     truncation, the hunk line map, a selection's comment span and a comment's anchor in a
     later diff: exact, moved once, or gone, never a guess; `card_files`/`card_comment_span`, a
     file-change card's diff of several files cut by its headers, one file a comment, and an
@@ -304,7 +308,9 @@ Architectural mandates, standards, and workflows for this codebase.
     `off_main`; two sides in one folder are one diff under a note saying their changes cannot be
     told apart; and the fork's baseline: taken by Fork thread off the main thread, unless
     checkpoints are off, right after the fork point is read, its ref kept once the fork is
-    stored and dropped when the fork is deleted; Fork in Isolated Worktree… and `/fork worktree`,
+    stored and dropped when the fork is deleted, through its main checkout when it was a fork in
+    its own worktree (`stored_baseline`: the worktree may be gone by then); Fork in Isolated
+    Worktree… and `/fork worktree`,
     which plan the worktree off the main thread, ask, then fork into it as a worktree thread,
     taking the snapshot whatever the checkpoint setting, while plain `/fork` forks in place as
     before, a failure after the worktree is made naming the worktree and branch left behind

@@ -7981,6 +7981,11 @@ impl AgentTerminalWindow {
             let fork = (!compact).then(|| agent_core::fork_compare::ForkLink {
                 base_tree: baseline.as_ref().map(|b| b.tree.clone()),
                 base_commit: baseline.as_ref().map(|b| b.commit.clone()),
+                // What a fork in its own worktree took from HEAD: never compared, on either side.
+                not_compared: made
+                    .as_ref()
+                    .map(|m| m.from_head.clone())
+                    .unwrap_or_default(),
                 ..agent_core::fork_compare::ForkLink::new(&thread, fork_seq)
             });
             if let Some(made) = &made {

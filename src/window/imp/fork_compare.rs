@@ -82,11 +82,18 @@ pub(super) fn keep_fork_baseline(dir: PathBuf, thread: String, commit: String) {
     });
 }
 
-/// The folder and baseline commit of fork `thread`, read before it is deleted.
+/// The folder whose repository holds fork `thread`'s baseline ref, and that baseline's commit,
+/// read before it is deleted. A fork in its own worktree names its main checkout, which stays
+/// when the worktree is removed (refs are the whole repository's); any other, its own folder.
+/// Read from the store only: nothing here asks the filesystem.
 pub(super) fn stored_baseline(store: &Store, thread: &str) -> Option<(String, String)> {
     let commit = store.fork_link(thread).ok().flatten()?.base_commit?;
-    let cwd = store.thread_summary(thread).ok().flatten()?.cwd;
-    Some((cwd, commit))
+    let worktree = store.thread_attributes(thread).ok()?.worktree;
+    let dir = match worktree {
+        Some(info) => info.main_toplevel.to_string_lossy().into_owned(),
+        None => store.thread_summary(thread).ok().flatten()?.cwd,
+    };
+    Some((dir, commit))
 }
 
 /// Deletes deleted fork `thread`'s baseline ref in the repository of `dir`, off the main
@@ -103,19 +110,25 @@ pub(super) fn drop_fork_baseline(dir: String, thread: String, commit: String) {
     });
 }
 
-/// Each side's changes since its baseline (blocking), and whether the two are in one folder. Two
-/// sides in one folder with one baseline are read once.
-fn read_changes(dirs: [Option<String>; 2], bases: [Option<String>; 2]) -> (Vec<ForkChanges>, bool) {
-    let side = |dir: Option<&str>, base: Option<&str>| match dir {
+/// Each side's changes since its baseline (blocking), leaving out each side's paths
+/// `not_compared`, and whether the two are in one folder. Two sides in one folder with one
+/// baseline are read once.
+fn read_changes(
+    dirs: [Option<String>; 2],
+    bases: [Option<String>; 2],
+    not_compared: &[Vec<String>; 2],
+) -> (Vec<ForkChanges>, bool) {
+    let side = |dir: Option<&str>, base: Option<&str>, skip: &[String]| match dir {
         None => ForkChanges::Unavailable("This thread no longer exists".to_owned()),
-        Some(dir) => crate::git::fork_changes(Path::new(dir), base)
+        Some(dir) => crate::git::fork_changes(Path::new(dir), base, skip)
             .unwrap_or_else(|e| ForkChanges::Unavailable(agent_core::redact::redact(&e))),
     };
-    let first = side(dirs[0].as_deref(), bases[0].as_deref());
-    let second = if dirs[0] == dirs[1] && bases[0] == bases[1] {
+    let first = side(dirs[0].as_deref(), bases[0].as_deref(), &not_compared[0]);
+    let second = if dirs[0] == dirs[1] && bases[0] == bases[1] && not_compared[0] == not_compared[1]
+    {
         first.clone()
     } else {
-        side(dirs[1].as_deref(), bases[1].as_deref())
+        side(dirs[1].as_deref(), bases[1].as_deref(), &not_compared[1])
     };
     let top = |c: &ForkChanges| match c {
         ForkChanges::Ready { toplevel, .. } => Some(toplevel.clone()),
@@ -126,9 +139,32 @@ fn read_changes(dirs: [Option<String>; 2], bases: [Option<String>; 2]) -> (Vec<F
     (vec![first, second], shared)
 }
 
+/// What the Changes tab says of the files left out of the comparison: those a fork in its own
+/// worktree took from HEAD, `count` of them (the most either side leaves out).
+pub(super) fn not_compared_note(count: usize) -> Option<String> {
+    match count {
+        0 => None,
+        1 => Some(
+            "1 file the fork took from the commit rather than from the folder (a secret-looking \
+             name, or a file hidden from git) is not compared."
+                .to_owned(),
+        ),
+        n => Some(format!(
+            "{n} files the fork took from the commit rather than from the folder \
+             (secret-looking names, or files hidden from git) are not compared."
+        )),
+    }
+}
+
 /// The Changes tab for sides headed `headings`, read as `sides`; `shared` when they are in one
 /// folder, which the note says: one column then stands for both when they share a baseline too.
-fn changes_content(headings: &[String], sides: Vec<ForkChanges>, shared: bool) -> ChangesContent {
+/// `not_compared` files left out are said in the note as well.
+fn changes_content(
+    headings: &[String],
+    sides: Vec<ForkChanges>,
+    shared: bool,
+    not_compared: usize,
+) -> ChangesContent {
     let state = |c: ForkChanges| match c {
         ForkChanges::NotRepo => ChangesState::NotRepo,
         ForkChanges::Unavailable(why) => ChangesState::Unavailable(why),
@@ -139,7 +175,12 @@ fn changes_content(headings: &[String], sides: Vec<ForkChanges>, shared: bool) -
         sides.as_slice(),
         [ForkChanges::Ready { diff: a, .. }, ForkChanges::Ready { diff: b, .. }] if a.from == b.from
     );
-    let note = shared.then(|| SHARED_FOLDER.to_owned());
+    let notes: Vec<String> = shared
+        .then(|| SHARED_FOLDER.to_owned())
+        .into_iter()
+        .chain(not_compared_note(not_compared))
+        .collect();
+    let note = (!notes.is_empty()).then(|| notes.join("\n\n"));
     if shared && one_baseline {
         let first = sides.into_iter().next().map(state);
         return ChangesContent {
@@ -542,7 +583,7 @@ impl AgentTerminalWindow {
                     LAST_KEEP.with(|last| *last.borrow_mut() = Some((keep.clone(), undo)));
                     #[cfg(not(test))]
                     drop(undo);
-                    imp.offer_kept_worktree_removal(&keep, done.worktree, done.worktree_used_by);
+                    imp.offer_kept_worktree_removal(&keep, done.worktree);
                 }
                 Some(Ok(agent_kit::store::KeepOutcome::Refused(why))) => {
                     reread.now();
@@ -588,35 +629,38 @@ impl AgentTerminalWindow {
         );
     }
 
-    /// After a Keep: offers to remove the archived thread's worktree `info` only when no other
-    /// thread works in it (`used_by` names one that does), no open tab is in it, and git says it
-    /// is registered and clean ([`crate::worktree::removal_blocker`], off the main thread);
-    /// otherwise says why it is kept. Never once `keep` is undone, and Undo dismisses an offer
-    /// already shown. Its Remove checks everything again ([`Self::remove_kept_worktree`]).
+    /// After a Keep: offers to remove the archived thread's worktree `info` only when no open
+    /// tab is in it, no other thread works in it ([`Store::worktree_occupant`], asked here in a
+    /// `store_job`, never inside the Keep's own write), and git says it is registered and clean
+    /// ([`crate::worktree::removal_blocker`]); otherwise says why it is kept. Never once `keep`
+    /// is undone, and Undo dismisses an offer already shown. Its Remove checks everything again
+    /// ([`Self::remove_kept_worktree`]).
     fn offer_kept_worktree_removal(
         &self,
         keep: &std::rc::Rc<KeepDone>,
         info: Option<crate::worktree::WorktreeInfo>,
-        used_by: Option<String>,
     ) {
         let Some(info) = info else { return };
-        let kept = |why: &str| format!("Its worktree ⎇ {} is kept: {why}", info.branch);
-        if let Some(who) = used_by {
-            self.show_toast(&kept(&format!("{who} works in it")));
-            return;
-        }
         let dirs = self.open_tab_dirs();
         let obj = self.obj().downgrade();
+        let other = keep.other.clone();
         let keep = std::rc::Rc::downgrade(keep);
         glib::MainContext::default().spawn_local(async move {
             let checked = info.clone();
-            let blocker = off_main("the status check", move || {
+            let blocker = store_job(move |store| -> Result<Option<String>, String> {
                 if crate::worktree::any_inside(&dirs, &checked.path) {
                     return Ok(Some("a tab is open in it".to_owned()));
                 }
+                if let Some(who) = store
+                    .worktree_occupant(&checked.path, &other)
+                    .map_err(|e| format!("the thread store could not say who is in it: {e}"))?
+                {
+                    return Ok(Some(format!("{who} works in it")));
+                }
                 Ok(crate::worktree::removal_blocker(&checked))
             })
-            .await;
+            .await
+            .unwrap_or_else(|| Err("the thread store could not be read".to_owned()));
             let Some(obj) = obj.upgrade() else { return };
             let imp = obj.imp();
             // Undone meanwhile (or its Undo toast gone with the window): nothing is offered.
@@ -762,6 +806,7 @@ fn load_fork_compare(window: &CompareWindow, thread: String, pairing: Pairing) {
             columns,
             bases,
             kept,
+            not_compared,
         } = match read {
             Some(Ok(read)) => read,
             Some(Err(why)) => {
@@ -788,12 +833,17 @@ fn load_fork_compare(window: &CompareWindow, thread: String, pairing: Pairing) {
             dirs.first().cloned().flatten(),
             dirs.get(1).cloned().flatten(),
         ];
-        let sides = off_main("the fork comparison", move || Ok(read_changes(dirs, bases))).await;
+        let left_out = not_compared.iter().map(Vec::len).max().unwrap_or(0);
+        let sides = off_main("the fork comparison", move || {
+            Ok(read_changes(dirs, bases, &not_compared))
+        })
+        .await;
         let Some(window) = weak.upgrade() else { return };
         match sides {
-            Ok((sides, shared)) => {
-                window.show_changes(changes, &changes_content(&headings, sides, shared))
-            }
+            Ok((sides, shared)) => window.show_changes(
+                changes,
+                &changes_content(&headings, sides, shared, left_out),
+            ),
             Err(why) => window.show_changes_error(changes, &why),
         }
     });
@@ -873,6 +923,7 @@ pub(super) mod tests {
                 ready("/b", "base", &["y.rs", "z.rs"]),
             ],
             false,
+            0,
         );
         assert_eq!(content.note, None);
         assert_eq!(content.columns.len(), 2);
@@ -889,13 +940,14 @@ pub(super) mod tests {
                 ForkChanges::Unavailable("git is busy".into()),
             ],
             false,
+            0,
         );
         assert_eq!(
             content.columns[1].state,
             ChangesState::Unavailable("git is busy".into())
         );
         assert!(crate::window::compare::changed_in_all(&content.columns).is_empty());
-        let content = changes_content(&headings, vec![ForkChanges::NotRepo; 2], false);
+        let content = changes_content(&headings, vec![ForkChanges::NotRepo; 2], false, 0);
         assert!(content
             .columns
             .iter()
@@ -912,6 +964,7 @@ pub(super) mod tests {
                 ready("/w", "base", &["x.rs"]),
             ],
             true,
+            0,
         );
         assert_eq!(content.note.as_deref(), Some(SHARED_FOLDER));
         assert_eq!(content.columns.len(), 1, "one folder, one diff");
@@ -926,23 +979,56 @@ pub(super) mod tests {
             &headings,
             vec![ready("/w", "one", &["x.rs"]), ready("/w", "two", &["x.rs"])],
             true,
+            0,
         );
         assert!(content.shared);
         assert_eq!(content.note.as_deref(), Some(SHARED_FOLDER));
         assert_eq!(content.columns.len(), 2);
     }
 
+    /// Files a fork in its own worktree took from the commit are left out of the comparison,
+    /// and the tab says how many.
+    #[test]
+    fn files_kept_from_the_commit_are_said_not_compared() {
+        let headings = ["A".to_owned(), "B".to_owned()];
+        let content = changes_content(
+            &headings,
+            vec![ready("/a", "base", &["x.rs"]), ready("/b", "base", &[])],
+            false,
+            3,
+        );
+        assert_eq!(content.note, not_compared_note(3));
+        assert!(content
+            .note
+            .as_deref()
+            .is_some_and(|n| n.starts_with("3 files") && n.ends_with("are not compared.")));
+        let shared = changes_content(
+            &headings,
+            vec![
+                ready("/w", "base", &["x.rs"]),
+                ready("/w", "base", &["x.rs"]),
+            ],
+            true,
+            1,
+        );
+        let note = shared.note.expect("both notes");
+        assert!(note.starts_with(SHARED_FOLDER), "{note}");
+        assert!(note.ends_with("is not compared."), "{note}");
+        assert_eq!(not_compared_note(0), None);
+    }
+
     #[test]
     fn a_thread_that_is_gone_or_a_side_in_the_same_folder_is_read_as_such() {
         let plain = tempfile::tempdir().expect("dir");
         let dir = plain.path().to_string_lossy().into_owned();
-        let (sides, shared) = read_changes([Some(dir.clone()), None], [None, None]);
+        let none = [Vec::new(), Vec::new()];
+        let (sides, shared) = read_changes([Some(dir.clone()), None], [None, None], &none);
         assert!(!shared);
         assert_eq!(
             sides[1],
             ForkChanges::Unavailable("This thread no longer exists".into())
         );
-        let (sides, shared) = read_changes([Some(dir.clone()), Some(dir)], [None, None]);
+        let (sides, shared) = read_changes([Some(dir.clone()), Some(dir)], [None, None], &none);
         assert!(shared, "one folder, whether or not it is a repository");
         assert_eq!(sides[0], sides[1]);
     }
@@ -1534,7 +1620,9 @@ pub(super) mod tests {
         let keeps = || -> Vec<gtk4::Button> {
             crate::testutil::find_all::<gtk4::Button>(&root)
                 .into_iter()
-                .filter(|b| b.label().as_deref() == Some("Keep This One"))
+                .filter(|b| {
+                    b.has_css_class("compare-keep") && b.label().as_deref() == Some("Keep This One")
+                })
                 .collect()
         };
         assert!(
@@ -1552,6 +1640,11 @@ pub(super) mod tests {
         };
         assert!(crate::testutil::pump_until(&ctx, 10, || dialog().is_some()));
         let alert = dialog().expect("the confirmation");
+        assert!(crate::testutil::pump_until_dialog_open(
+            &ctx,
+            alert.upcast_ref(),
+            10
+        ));
         assert_eq!(alert.default_response().as_deref(), Some("cancel"));
         alert.emit_by_name::<()>("response", &[&"keep"]);
         assert!(
@@ -1661,7 +1754,13 @@ pub(super) mod tests {
                 .and_then(|d| d.downcast::<adw::AlertDialog>().ok())
         };
         assert!(crate::testutil::pump_until(&ctx, 10, || question().is_some()));
-        question().expect("the stop question").close();
+        let stop = question().expect("the stop question");
+        assert!(crate::testutil::pump_until_dialog_open(
+            &ctx,
+            stop.upcast_ref(),
+            10
+        ));
+        stop.close();
         assert!(
             crate::testutil::pump_until(&ctx, 10, || reread.get() == 2),
             "declined: read again"
@@ -1794,7 +1893,19 @@ pub(super) mod tests {
             "the branch is never deleted"
         );
         store.delete_thread(&unrelated).expect("delete");
-        store.delete_thread(&fork).expect("delete");
+        // Its worktree is gone, so its own folder is too: deleting the archived fork still
+        // drops its baseline ref, through the main checkout.
+        assert!(!Path::new(&cwd).exists());
+        imp.reload_summaries();
+        imp.delete_thread_now(&fork);
+        assert!(
+            crate::testutil::pump_until(&ctx, 20, || git(
+                &main,
+                &["for-each-ref", "refs/agent-terminal"]
+            )
+            .is_some_and(|s| s.is_empty())),
+            "the baseline went with its fork"
+        );
         store.delete_thread(&source).expect("delete");
         imp.reload_summaries();
     }

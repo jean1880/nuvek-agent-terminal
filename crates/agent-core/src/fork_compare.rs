@@ -43,6 +43,41 @@ pub struct ForkLink {
         deserialize_with = "lenient_kept"
     )]
     pub kept: Option<Kept>,
+    /// The paths a fork in its own worktree took from HEAD rather than from the source's folder
+    /// (secret-looking names, files hidden from git): its baseline holds HEAD's content there,
+    /// so neither side's changes are compared at them. Read leniently: anything but a list of
+    /// plain relative paths reads as none of them.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "lenient_paths"
+    )]
+    pub not_compared: Vec<String>,
+}
+
+/// Most paths a [`ForkLink::not_compared`] keeps (a larger list reads as none).
+const MAX_NOT_COMPARED: usize = 100_000;
+
+/// A stored [`ForkLink::not_compared`]: the strings of a list that are git-valid relative
+/// paths (no empty, `.`, `..` or `.git` component, and no NUL); none at all for anything that is
+/// not a list, or too long a one.
+fn lenient_paths<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    let Some(list) = value.as_array().filter(|l| l.len() <= MAX_NOT_COMPARED) else {
+        return Ok(Vec::new());
+    };
+    Ok(list
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .filter(|p| {
+            !p.is_empty()
+                && !p.contains('\0')
+                && !p
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "." || part == ".." || part == ".git")
+        })
+        .map(str::to_owned)
+        .collect())
 }
 
 /// A settled pair: `thread` was kept and `over` archived (Keep This One).
@@ -100,6 +135,8 @@ impl ForkLink {
         if !(valid(&link.base_tree) && valid(&link.base_commit)) {
             link.base_tree = None;
             link.base_commit = None;
+            // Paths not compared against a baseline that is gone mean nothing.
+            link.not_compared.clear();
         }
         Some(link)
     }
@@ -175,6 +212,22 @@ impl Pairing {
             // The other one is.
             Relation::Fork => [base(other), base(other)],
             Relation::Sibling => [base(own), base(other)],
+        }
+    }
+
+    /// The paths each of [`Self::sides`] is not compared at ([`ForkLink::not_compared`]), in the
+    /// same order and from the same links as [`Self::bases`].
+    pub fn not_compared(
+        &self,
+        own: Option<&ForkLink>,
+        other: Option<&ForkLink>,
+    ) -> [Vec<String>; 2] {
+        let paths =
+            |link: Option<&ForkLink>| link.map(|l| l.not_compared.clone()).unwrap_or_default();
+        match self.relation {
+            Relation::Source => [paths(own), paths(own)],
+            Relation::Fork => [paths(other), paths(other)],
+            Relation::Sibling => [paths(own), paths(other)],
         }
     }
 
@@ -486,6 +539,76 @@ mod tests {
             .to_string();
             assert_eq!(ForkLink::parse(&json), Some(link("src", 3)), "{json}");
         }
+    }
+
+    #[test]
+    fn paths_not_compared_round_trip_read_leniently_and_go_to_both_sides_of_a_fork() {
+        let l = ForkLink {
+            not_compared: vec![".env".into(), "keys/a.pem".into()],
+            ..based("src", 3, TREE)
+        };
+        assert_eq!(ForkLink::parse(&l.to_json()), Some(l.clone()));
+        assert!(
+            !based("src", 3, TREE).to_json().contains("not_compared"),
+            "an empty list is not written"
+        );
+        let with = |value: serde_json::Value| {
+            let json = serde_json::json!({
+                "source_thread": "src",
+                "fork_seq": 3,
+                "base_tree": TREE,
+                "base_commit": COMMIT,
+                "not_compared": value,
+            })
+            .to_string();
+            ForkLink::parse(&json)
+                .expect("the link is kept")
+                .not_compared
+        };
+        assert!(with(serde_json::json!("not a list")).is_empty());
+        assert!(with(serde_json::json!(7)).is_empty());
+        assert_eq!(
+            with(serde_json::json!([
+                ".env",
+                3,
+                "/abs",
+                "../up",
+                "a/../b",
+                ".",
+                "./.env",
+                "a//b",
+                "a/",
+                ".git/HEAD",
+                "a/.git/x",
+                "",
+                "ok/x"
+            ])),
+            [".env", "ok/x"]
+        );
+        // With no baseline they mean nothing, and are dropped with it.
+        let json = serde_json::json!({
+            "source_thread": "src",
+            "fork_seq": 3,
+            "not_compared": [".env"],
+        })
+        .to_string();
+        assert!(ForkLink::parse(&json).unwrap().not_compared.is_empty());
+        // A fork and its source both leave out the fork's paths; siblings each their own.
+        let p = |relation, other: &str| Pairing {
+            other: other.to_owned(),
+            relation,
+            fork_seq: 3,
+        };
+        let both = [l.not_compared.clone(), l.not_compared.clone()];
+        assert_eq!(
+            p(Relation::Source, "src").not_compared(Some(&l), None),
+            both
+        );
+        assert_eq!(p(Relation::Fork, "f").not_compared(None, Some(&l)), both);
+        assert_eq!(
+            p(Relation::Sibling, "s").not_compared(Some(&l), None),
+            [l.not_compared.clone(), Vec::new()]
+        );
     }
 
     #[test]

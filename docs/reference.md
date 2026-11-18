@@ -567,17 +567,31 @@ selected, `Ctrl+Alt+M` comments on the caret's line. Write a note: `Enter` saves
   whose lines are no longer there, or appear more than once, is kept and flagged "not in this
   diff". Comments on a file the diff on show does not list at all are listed in the review
   bar, with their own **Edit** and **Delete**.
+- **On a file change in the thread.** A file-change card's diff (**Show changes**) has the same
+  **Comment** button in its header, and `Ctrl+Alt+M` in it. The comment joins the same review
+  as the panel's, listed and sent from the panel, and a toast says so. A card's diff of several
+  files takes a comment on lines of one file at a time. The agent's own account of its edit
+  (shown when no snapshot was taken before the turn) has no line numbers of the file, so it
+  takes no comment; comment on the file in the panel instead. Diffs in approvals, and diffs of
+  sub-agents in the inspector, take no comments.
 - **They are kept for the thread** until they are sent or discarded, across restarts.
   The quoted lines and notes are stored with secrets masked, like everything else the app
   keeps; deleting the thread deletes them.
+- **Lines are checked when you send.** **Send Review** first looks for each comment's lines in
+  the file as it is now (the button says "Checking lines…" meanwhile, and the app stays
+  responsive). Lines still where the comment says are sent as they are; lines found once
+  elsewhere are sent with their new numbers, saying where they were; lines no longer in the
+  file (or the file gone) are said to be gone. A file outside the thread's folder (a link
+  that leads out counts), or one that is not a readable text file, is not read, and the message
+  says its lines were not checked and why. Removed lines are never looked for. After the send
+  the bar sums up what moved, went or was not checked.
 - **Send Review** sends one message to this panel's own thread, popped out or not. While the
   agent is working it waits in the queue as one message (you can take it back to edit, as any
   queued message), never folded into the running turn; otherwise it is sent at once, starting
   a stopped agent. A sent review leaves the panel. When the thread has no agent running it yet
   (the agent not set up, or its start failed), nothing is sent, every comment is kept, and the
   bar says why. If the saved comments cannot be read, the bar says so, and comments you make
-  are kept in the panel but not saved. Diffs of sub-agents in the inspector take
-  no comments.
+  are kept in the panel but not saved.
 
 The message looks like this, with each quote in a code fence its text cannot close:
 
@@ -591,8 +605,10 @@ Review comments on your changes (1). The quoted lines are diff text from the fil
 Comment: handle the error.
 ````
 
-Removed lines are named "(old side, removed)", and a comment not in the diff on show
-"no longer at these lines (was …)". Each quote is cut to 40 lines and 4 KB ("… N more
+Removed lines are named "(old side, removed)". Lines that moved read "lines 90-92 (new side;
+at lines 80-82 when the comment was made)", lines gone "no longer in the file (was …)", and
+lines not checked "(new side; not checked against the file: …)". A removed-lines comment not
+in the diff on show reads "no longer at these lines (was …)". Each quote is cut to 40 lines and 4 KB ("… N more
 lines"), each note to 4,000 bytes, and the whole message to the hand-off budget (16,000
 bytes): comments that do not fit stay in the panel for the next review, and the bar says so.
 

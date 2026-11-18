@@ -1229,6 +1229,8 @@ impl TranscriptView {
     fn build_tree(&self, model: &Transcript, id: &str) -> Option<gtk4::Widget> {
         let item = model.get(id)?;
         let row = Row::build(item, &self.sink);
+        // The thread's own cards take review comments; a sub-agent's, in the inspector, never.
+        row.allow_comments();
         let widget = row.widget();
         if let Some(children) = row.children_box() {
             let from = if self.uncapped.borrow().contains(id) {

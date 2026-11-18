@@ -6688,8 +6688,8 @@ impl AgentTerminalWindow {
         });
 
         // Before a review is composed, each comment's lines are looked for in the working file,
-        // off the main thread: only files inside the thread's folder, in the repository the
-        // panel shows (else the tab's).
+        // off the main thread: only files inside the thread's folder, against the panel's repo for
+        // diff-panel comments and the thread's folder/repo for file-change-card comments.
         let weak_root = panel.root.downgrade();
         panel.connect_review_check(move |asks, done| {
             let place = weak_root.upgrade().and_then(|root| {
@@ -6715,9 +6715,19 @@ impl AgentTerminalWindow {
                 let found = blocking_or(
                     move || {
                         let folder_path = std::path::Path::new(&folder);
-                        let top = agent_kit::review_check::toplevel(&repo)
+                        let folder_top = agent_kit::review_check::toplevel(folder_path);
+                        let card_top = folder_top
+                            .clone()
                             .or_else(|| folder_path.canonicalize().ok());
-                        agent_kit::review_check::check(folder_path, top.as_deref(), &asks)
+                        let panel_top = folder_top
+                            .or_else(|| agent_kit::review_check::toplevel(&repo))
+                            .or_else(|| card_top.clone());
+                        agent_kit::review_check::check_in(
+                            folder_path,
+                            panel_top.as_deref(),
+                            card_top.as_deref(),
+                            &asks,
+                        )
                     },
                     unchecked,
                 )

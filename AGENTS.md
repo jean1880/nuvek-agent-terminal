@@ -258,10 +258,13 @@ Architectural mandates, standards, and workflows for this codebase.
     `diff_panel/review.rs` is its comments on diff lines: the row's Comment button and
     Ctrl+Alt+M, the marks and list under a file's diff, re-anchoring on each diff shown, the
     comments the thread's file-change cards add (`ViewAction::ReviewComment`, named from the
-    panel's repository—or the thread's folder when that holds repositories without being one—by
+    thread's folder—or repository—by
     the window off the main thread), and the review bar, whose Send Review
-    first has the window run `review_check` off the main thread (the button a spinner, Send and
-    Discard off; answers matched by comment id, so one deleted meanwhile is not sent and one
+    first has the window run `review_check::check_in` off the main thread (panel comments against
+    the panel's repository, card comments against the thread's folder/repository; the button a
+    spinner, Send and
+    Discard off; answers matched by comment id against the snapshotted anchored lines, so one
+    deleted meanwhile is not sent, a panel refresh cannot shift asked lines, and one
     added meanwhile stays for the next review), then hands
     the one message to the panel's own thread with `ChatView::submit_review`, queued behind a
     running turn, never steered into it; `review_popover.rs` is the note editor and refusal

@@ -3201,6 +3201,23 @@ pub(crate) mod tests {
             Some("1 comment · Checked against the files: 1 moved".into())
         );
 
+        // A panel refresh landing while files are checked cannot shift the lines that were asked
+        // about out from under the reply.
+        rig.panel.review.clear();
+        let generation = rig.panel.begin();
+        rig.panel.show(generation, one_file("a.rs", 10, "new one"));
+        rig.comment(5, 5, "BeforeRefresh");
+        send.emit_clicked();
+        let (asks, done) = pending.borrow_mut().take().expect("asked");
+        assert!(!asks[0].from_card);
+        let generation = rig.panel.begin();
+        rig.panel.show(generation, one_file("b.rs", 1, "x"));
+        done(vec![Checked::Exact]);
+        assert_eq!(rig.sent.borrow().len(), 3);
+        let third = &rig.sent.borrow()[2];
+        assert!(third.contains("a.rs, line 10 (new side)\n"), "{third}");
+        assert!(third.contains("BeforeRefresh"), "{third}");
+
         rig.window.close();
     }
 }

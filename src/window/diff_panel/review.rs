@@ -492,13 +492,14 @@ impl Review {
     }
 
     /// The comments as the review sends them: each placed in the diff on show (a moved one with
-    /// its new lines), with what the working file said of it when `checks` (by entry id) has it.
-    /// When `only` is given, comments added afterwards (not in `only`) are left out.
+    /// its new lines), with whether it came from a card and what the working file said of it when
+    /// `checks` (by entry id) has it. When `only` is given, comments added afterwards (not in
+    /// `only`) are left out.
     fn comments_checked(
         &self,
         checks: &HashMap<u64, Checked>,
         only: Option<&HashSet<u64>>,
-    ) -> Vec<(u64, ReviewComment)> {
+    ) -> Vec<(u64, bool, ReviewComment)> {
         self.entries
             .borrow()
             .iter()
@@ -512,6 +513,7 @@ impl Review {
                 };
                 (
                     e.id,
+                    d.diff_base == agent_core::review::CARD_BASE,
                     ReviewComment {
                         path: d.path.clone(),
                         side,
@@ -532,28 +534,34 @@ impl Review {
     pub(super) fn comments(&self) -> Vec<ReviewComment> {
         self.comments_checked(&HashMap::new(), None)
             .into_iter()
-            .map(|(_, c)| c)
+            .map(|(_, _, c)| c)
             .collect()
     }
 
     /// "Send Review": with a check handler, first has each new-side comment looked for in its
     /// working file (the button spinning, nothing else sent meanwhile), then sends; without one,
     /// sends at once. Removed lines are never looked for. Comments added while the files are
-    /// checked stay for the next review instead of going out unchecked.
+    /// checked stay for the next review instead of going out unchecked, and a diff refresh
+    /// landing meanwhile never shifts the lines the check verified.
     pub(super) fn send_now(&self) {
         if self.checking.get() || self.send.borrow().is_none() || self.entries.borrow().is_empty() {
             return;
         }
         let snapshot: HashSet<u64> = self.entries.borrow().iter().map(|e| e.id).collect();
+        let snapped: Vec<(u64, ReviewComment)> = self
+            .comments_checked(&HashMap::new(), Some(&snapshot))
+            .into_iter()
+            .map(|(id, _, c)| (id, c))
+            .collect();
         let Some(check) = self.check.borrow().clone() else {
-            self.deliver(&HashMap::new(), Some(&snapshot));
+            self.deliver(&HashMap::new(), snapped);
             return;
         };
         let (ids, asks): (Vec<u64>, Vec<CheckAsk>) = self
             .comments_checked(&HashMap::new(), Some(&snapshot))
             .into_iter()
-            .filter(|(_, c)| c.side == Side::New)
-            .map(|(id, c)| {
+            .filter(|(_, _, c)| c.side == Side::New)
+            .map(|(id, from_card, c)| {
                 (
                     id,
                     CheckAsk {
@@ -561,12 +569,13 @@ impl Review {
                         start: c.start,
                         end: c.end,
                         quoted: c.quoted,
+                        from_card,
                     },
                 )
             })
             .unzip();
         if asks.is_empty() {
-            self.deliver(&HashMap::new(), Some(&snapshot));
+            self.deliver(&HashMap::new(), snapped);
             return;
         }
         self.set_checking(true);
@@ -583,7 +592,7 @@ impl Review {
                 } else {
                     HashMap::new()
                 };
-                review.deliver(&checks, Some(&snapshot));
+                review.deliver(&checks, snapped);
             }),
         );
     }
@@ -615,11 +624,24 @@ impl Review {
     /// Composes the review, with what the files said of each comment, and hands it to the
     /// window to queue. What went is deleted; comments past the message budget (and any added
     /// while checking) stay for the next review, and the bar says so.
-    fn deliver(&self, checks: &HashMap<u64, Checked>, only: Option<&HashSet<u64>>) {
+    fn deliver(&self, checks: &HashMap<u64, Checked>, snapped: Vec<(u64, ReviewComment)>) {
         let Some(send) = self.send.borrow().clone() else {
             return;
         };
-        let pairs = self.comments_checked(checks, only);
+        let live_notes: HashMap<u64, String> = self
+            .entries
+            .borrow()
+            .iter()
+            .map(|e| (e.id, e.draft.note.clone()))
+            .collect();
+        let pairs: Vec<(u64, ReviewComment)> = snapped
+            .into_iter()
+            .filter_map(|(id, mut comment)| {
+                comment.note = live_notes.get(&id)?.clone();
+                comment.checked = checks.get(&id).copied();
+                Some((id, comment))
+            })
+            .collect();
         let comments: Vec<ReviewComment> = pairs.iter().map(|(_, c)| c.clone()).collect();
         let Composed { text, included } = agent_core::review::compose(&comments);
         if included == 0 {

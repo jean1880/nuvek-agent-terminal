@@ -7643,20 +7643,13 @@ impl AgentTerminalWindow {
     }
 
     /// A comment written on one of `thread`'s file-change cards joins the thread's review, the
-    /// one its diff panel lists and sends. The card's file is named, off the main thread, as the
-    /// panel names files (from the root of the repository the panel shows, or from the thread's
-    /// folder when that folder holds repositories without being one itself); a file outside both
-    /// takes no comment, and the toast says so.
+    /// one its diff panel lists and sends. The card's file is named, off the main thread, from
+    /// the thread's repository, or from the thread's folder when that folder holds repositories
+    /// without being one itself; a file outside both takes no comment, and the toast says so.
     fn add_card_comment(&self, thread: &str, comment: crate::chat::view::CardComment) {
-        let Some((panel, folder, repo)) = self
+        let Some((panel, folder)) = self
             .with_thread_tab(thread, |t| {
-                (t.remote.is_none()).then(|| {
-                    let repo = t
-                        .diff_panel
-                        .shown_repo()
-                        .unwrap_or_else(|| t.repo_dir().into());
-                    (t.diff_panel.clone(), t.dir.clone(), repo)
-                })
+                (t.remote.is_none()).then(|| (t.diff_panel.clone(), t.dir.clone()))
             })
             .flatten()
         else {
@@ -7668,8 +7661,9 @@ impl AgentTerminalWindow {
             let (root, rel) = (comment.root.clone(), comment.place.path.clone());
             let path = blocking_or(
                 move || {
-                    let top = agent_kit::review_check::toplevel(&repo)
-                        .or_else(|| std::path::Path::new(&folder).canonicalize().ok())?;
+                    let folder_path = std::path::Path::new(&folder);
+                    let top = agent_kit::review_check::toplevel(folder_path)
+                        .or_else(|| folder_path.canonicalize().ok())?;
                     agent_kit::review_check::repo_path(&top, &root, &rel)
                 },
                 None,

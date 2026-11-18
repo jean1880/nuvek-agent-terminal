@@ -170,7 +170,9 @@ fn new_side_rows(quoted: &[String]) -> Vec<(char, &str)> {
 /// an old-side comment has, and those are never relocated.
 pub fn locate(file: &str, start: u32, end: u32, quoted: &[String]) -> Checked {
     let want = new_side_rows(quoted);
-    let span = end.checked_sub(start).map(|d| d as usize + 1);
+    let span = end
+        .checked_sub(start)
+        .and_then(|d| (d as usize).checked_add(1));
     if want.is_empty() || start == 0 || span != Some(want.len()) {
         return Checked::Unchecked(Unchecked::Split);
     }

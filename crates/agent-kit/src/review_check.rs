@@ -18,13 +18,16 @@ pub const MAX_BYTES: u64 = crate::filediff::MAX_FILE_BYTES;
 /// One new-side comment to look for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckAsk {
-    /// Relative to the repository root, as the diff named it.
+    /// Relative to the repository root (or the thread's folder when that folder holds
+    /// repositories without being one itself).
     pub path: String,
     /// 1-based, inclusive, on the new side.
     pub start: u32,
     pub end: u32,
     /// The diff rows chosen, prefixes kept, as the draft keeps them (redacted).
     pub quoted: Vec<String>,
+    /// Whether this comment came from a file-change card (`true`) or the Changes panel (`false`).
+    pub from_card: bool,
 }
 
 /// The canonical root of the repository `dir` is in, or `None`. Runs git.
@@ -148,15 +151,27 @@ fn read_text_with(
 /// `top` the root of the repository the paths are named from (`None`: there is none, and
 /// nothing is checked).
 pub fn check(folder: &Path, top: Option<&Path>, asks: &[CheckAsk]) -> Vec<Checked> {
-    let Some(top) = top else {
-        return vec![Checked::Unchecked(Unchecked::NoRepository); asks.len()];
-    };
-    let mut read: std::collections::HashMap<&str, Result<Option<String>, Unchecked>> =
+    check_in(folder, top, top, asks)
+}
+
+/// Like [`check`], when card comments (`from_card: true`) and Changes-panel comments (`from_card:
+/// false`) may be named from different roots (e.g. a thread in a parent folder holding several
+/// repositories: cards name from `folder`, while the panel may show one child repository).
+pub fn check_in(
+    folder: &Path,
+    panel_top: Option<&Path>,
+    card_top: Option<&Path>,
+    asks: &[CheckAsk],
+) -> Vec<Checked> {
+    let mut read: std::collections::HashMap<(bool, &str), Result<Option<String>, Unchecked>> =
         std::collections::HashMap::new();
     asks.iter()
         .map(|ask| {
+            let Some(top) = (if ask.from_card { card_top } else { panel_top }) else {
+                return Checked::Unchecked(Unchecked::NoRepository);
+            };
             let text = read
-                .entry(ask.path.as_str())
+                .entry((ask.from_card, ask.path.as_str()))
                 .or_insert_with(|| read_text(folder, top, &ask.path));
             match text {
                 Ok(Some(text)) => locate(text, ask.start, ask.end, &ask.quoted),
@@ -178,6 +193,7 @@ mod tests {
             start,
             end: start + quoted.len() as u32 - 1,
             quoted: quoted.iter().map(|s| (*s).to_owned()).collect(),
+            from_card: false,
         }
     }
 
@@ -316,33 +332,58 @@ mod tests {
             symlink(&outside, &dir).expect("swap link");
         });
         assert_eq!(outcome, Err(Unchecked::Outside));
+
+        // Swapping the leaf file itself for a symlink to outside is also refused.
+        std::fs::write(sub.join("leaf.rs"), "x\n").expect("write");
+        let leaf_outcome = read_text_with(&sub, &top, "sub/leaf.rs", || {
+            std::fs::remove_file(sub.join("leaf.rs")).expect("remove");
+            symlink(outside.join("a.rs"), sub.join("leaf.rs")).expect("swap leaf");
+        });
+        assert_eq!(leaf_outcome, Err(Unchecked::Outside));
     }
 
     #[test]
     fn a_parent_folder_of_a_repository_names_and_checks_card_comments() {
         let tmp = tempfile::tempdir().expect("tmp");
         let parent = tmp.path().join("workspace");
-        let repo = parent.join("repo-a");
+        let repo_a = parent.join("repo-a");
+        let repo_b = parent.join("repo-b");
         let elsewhere = tmp.path().join("other-repo");
-        std::fs::create_dir_all(repo.join("src")).expect("dirs");
+        std::fs::create_dir_all(repo_a.join("src")).expect("dirs");
+        std::fs::create_dir_all(repo_b.join("src")).expect("dirs");
         std::fs::create_dir_all(elsewhere.join("src")).expect("dirs");
-        crate::test_support::init_repo_at(&repo, &[("src/a.rs", b"one\n+two\n")]);
-        std::fs::write(repo.join("src/a.rs"), "one\ntwo\n").expect("write");
+        crate::test_support::init_repo_at(&repo_a, &[("src/a.rs", b"one\n"), ("src/c.rs", b"c\n")]);
+        crate::test_support::init_repo_at(&repo_b, &[("src/b.rs", b"b\n")]);
+        std::fs::write(repo_a.join("src/a.rs"), "one\ntwo\n").expect("write");
+        std::fs::write(repo_a.join("src/c.rs"), "c\nd\n").expect("write");
+        std::fs::write(repo_b.join("src/b.rs"), "b\nbb\n").expect("write");
         let parent_canon = parent.canonicalize().expect("canon");
-        let repo_canon = repo.canonicalize().expect("canon");
+        let repo_a_canon = repo_a.canonicalize().expect("canon");
+        let repo_b_canon = repo_b.canonicalize().expect("canon");
         let elsewhere_canon = elsewhere.canonicalize().expect("canon");
 
         assert_eq!(toplevel(&parent), None);
-        let rel = repo_path(&parent_canon, &repo_canon, "src/a.rs").expect("inside parent");
-        assert_eq!(rel, "repo-a/src/a.rs");
+        let rel_a = repo_path(&parent_canon, &repo_a_canon, "src/a.rs").expect("inside parent");
+        let rel_b = repo_path(&parent_canon, &repo_b_canon, "src/b.rs").expect("inside parent");
+        assert_eq!(rel_a, "repo-a/src/a.rs");
+        assert_eq!(rel_b, "repo-b/src/b.rs");
         assert_eq!(repo_path(&parent_canon, &elsewhere_canon, "src/a.rs"), None);
+
+        let mut card_a = ask(&rel_a, 1, &[" one", "+two"]);
+        card_a.from_card = true;
+        let mut card_b = ask(&rel_b, 1, &[" b", "+bb"]);
+        card_b.from_card = true;
+        let panel_a = ask("src/c.rs", 1, &[" c", "+d"]);
+        // Even when the Changes panel shows repo-a, card comments across repo-a and repo-b
+        // check against the parent folder while the panel comment checks against repo-a.
         assert_eq!(
-            check(
+            check_in(
                 &parent,
+                Some(&repo_a_canon),
                 Some(&parent_canon),
-                &[ask(&rel, 1, &[" one", "+two"])]
+                &[card_a, card_b, panel_a]
             ),
-            vec![Checked::Exact]
+            vec![Checked::Exact, Checked::Exact, Checked::Exact]
         );
     }
 }

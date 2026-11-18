@@ -1862,7 +1862,13 @@ impl ToolCard {
         wrapping(&error);
         error.set_selectable(true);
         let error_box = Section::new("Error", &error);
-        let children = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+        // The nested rows are list items: their container is the list that holds them.
+        let children = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .spacing(8)
+            .accessible_role(gtk4::AccessibleRole::List)
+            .build();
+        children.update_property(&[gtk4::accessible::Property::Label("Sub-agent steps")]);
         children.add_css_class("card-children");
         let media = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         media.set_visible(false);

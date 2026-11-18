@@ -13261,6 +13261,11 @@ pub(super) mod tests {
         assert_eq!(imp.cycle_region(true), Some("transcript"));
         assert!(!split.shows_sidebar(), "the overlay was closed");
         crate::testutil::settle(&ctx);
+        assert_eq!(
+            imp.region_of_focus(),
+            Some("transcript"),
+            "the focus is in the transcript once the overlay is gone"
+        );
         assert_eq!(names().first(), Some(&"transcript"), "{:?}", names());
         split.set_collapsed(false);
         split.set_show_sidebar(true);
@@ -13332,6 +13337,10 @@ pub(super) mod tests {
         let keyboard = match XKeyboard::open(&window) {
             Ok(keyboard) => keyboard,
             Err(why) => {
+                assert!(
+                    !crate::testutil::real_keys_required(),
+                    "no real key presses on this CI display (libxtst6 must be installed): {why}"
+                );
                 eprintln!("SKIPPED: no real key presses on this display: {why}");
                 window.destroy();
                 return;

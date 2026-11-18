@@ -459,6 +459,18 @@ pub fn require_virtual_display() {
     );
 }
 
+/// Whether a display test that cannot press real keys must fail rather than skip: on CI (the
+/// `CI` variable set and not `false`/`0`/empty) a missing libXtst is a broken runner, and a
+/// skip would let the keyboard path go untested unnoticed. A developer machine without
+/// libXtst keeps the skip.
+pub fn real_keys_required() -> bool {
+    real_keys_required_for(std::env::var("CI").ok().as_deref())
+}
+
+fn real_keys_required_for(ci: Option<&str>) -> bool {
+    ci.is_some_and(|v| !matches!(v.trim(), "" | "0") && !v.trim().eq_ignore_ascii_case("false"))
+}
+
 /// `gtk4::init()` for tests: the one way a test initialises GTK, behind
 /// [`require_virtual_display`].
 pub fn gtk_init() -> Result<(), glib::BoolError> {
@@ -907,5 +919,20 @@ mod guard_tests {
             "initialise GTK through testutil::gtk_init / adw_init / native_init:\n{}",
             bad.join("\n")
         );
+    }
+}
+
+#[cfg(test)]
+mod real_keys_tests {
+    use super::real_keys_required_for;
+
+    #[test]
+    fn real_keys_are_required_only_on_ci() {
+        assert!(real_keys_required_for(Some("true")));
+        assert!(real_keys_required_for(Some("1")));
+        assert!(!real_keys_required_for(None));
+        assert!(!real_keys_required_for(Some("")));
+        assert!(!real_keys_required_for(Some("false")));
+        assert!(!real_keys_required_for(Some("0")));
     }
 }

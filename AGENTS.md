@@ -20,7 +20,7 @@ Architectural mandates, standards, and workflows for this codebase.
   closes, and leaving an overlaid sidebar hides it once another region has the focus (never
   when none took it). A new pane needs a role, a label and an entry there. Display tests press
   real keys through `testutil::XKeyboard` (XTest, libXtst loaded with `dlopen`; a test without
-  it says so and skips). The text scale (`font_scale`) is the whole app's: one provider,
+  it says so and skips on a developer machine, and fails on CI, where `libxtst6` is installed). The text scale (`font_scale`) is the whole app's: one provider,
   `style::set_text_scale` (`window { font-size: N% }`), so app CSS font sizes are relative, never
   `pt`/`px`; it is held to `style::TEXT_SCALE_RANGE` wherever it comes in (the setting, a zoom,
   `TerminalConfig::normalize` on every load and reload). Every transcript row's root is a

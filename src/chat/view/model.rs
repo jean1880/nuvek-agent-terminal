@@ -2161,9 +2161,10 @@ impl Transcript {
                 };
                 if matches!(kind, ItemKind::AssistantMessage | ItemKind::Reasoning) {
                     // The text that was open is done: a new block of text began.
+                    let new_parent = parent.clone().filter(|p| self.items.contains_key(p));
                     if let Some(prev) = self.open_text.replace(id.clone()) {
                         if prev != id {
-                            out.extend(self.finish_text(&prev));
+                            out.extend(self.finish_text_beside(&prev, new_parent.as_ref()));
                         }
                     }
                 }
@@ -2657,6 +2658,21 @@ impl Transcript {
         vec![Change::Added(id)]
     }
 
+    /// Finishes `id` only when it sits under the same parent as the block that just began: a
+    /// sub-agent's stream (or a background one's) interleaves with the main reply and with
+    /// other sub-agents, and none of those ends another's text.
+    fn finish_text_beside(&mut self, id: &str, new_parent: Option<&ItemId>) -> Vec<Change> {
+        let same = self
+            .items
+            .get(id)
+            .is_some_and(|item| item.parent.as_ref() == new_parent);
+        if same {
+            self.finish_text(id)
+        } else {
+            Vec::new()
+        }
+    }
+
     fn finish_text(&mut self, id: &str) -> Vec<Change> {
         match self.items.get_mut(id).map(|i| &mut i.body) {
             Some(Body::Assistant { streaming, .. } | Body::Reasoning { streaming, .. })
@@ -2711,7 +2727,7 @@ impl Transcript {
         // The text that was open is done: a new block of text began.
         if let Some(prev) = self.open_text.replace(id.clone()) {
             if prev != id {
-                out.extend(self.finish_text(&prev));
+                out.extend(self.finish_text_beside(&prev, None));
             }
         }
         out.push(Change::Added(id.clone()));
@@ -4201,6 +4217,44 @@ mod tests {
         assert_eq!(text(&t), "Hello, world");
         // An identical snapshot is not a change.
         assert!(t.apply(&snap, Driver::Claude).is_empty());
+    }
+
+    #[test]
+    fn interleaved_parented_streams_each_stay_streaming_until_their_own_completion() {
+        let mut t = Transcript::new();
+        let streaming = |t: &Transcript, id: &str| match t.get(id).map(|i| &i.body) {
+            Some(Body::Assistant { streaming, .. }) => *streaming,
+            other => panic!("unexpected {other:?}"),
+        };
+        t.apply(&started("a", ItemKind::Subagent, None), Driver::Claude);
+        t.apply(&started("b", ItemKind::Subagent, None), Driver::Claude);
+        t.apply(
+            &started("ma", ItemKind::AssistantMessage, Some("a")),
+            Driver::Claude,
+        );
+        t.apply(
+            &started("mb", ItemKind::AssistantMessage, Some("b")),
+            Driver::Claude,
+        );
+        t.apply(
+            &delta(Some("ma"), StreamKind::Assistant, "x"),
+            Driver::Claude,
+        );
+        assert!(streaming(&t, "ma"), "another sub-agent's block began");
+        assert!(streaming(&t, "mb"));
+        t.apply(
+            &started("main", ItemKind::AssistantMessage, None),
+            Driver::Claude,
+        );
+        assert!(streaming(&t, "ma"), "the main reply began");
+        assert!(streaming(&t, "mb"));
+        let done = |id: &str| Envelope::item_completed(id, ItemStatus::Completed, None, None);
+        t.apply(&done("ma"), Driver::Claude);
+        assert!(!streaming(&t, "ma"));
+        assert!(streaming(&t, "mb"));
+        t.apply(&done("mb"), Driver::Claude);
+        assert!(!streaming(&t, "mb"));
+        assert!(streaming(&t, "main"));
     }
 
     #[test]

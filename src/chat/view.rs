@@ -2441,6 +2441,7 @@ pub(crate) mod tests {
                 .filter_map(|id| model.get(id).map(|i| (id.clone(), i.body.clone())))
                 .collect()
         };
+        let mut nested = 0;
         let mut kinds = std::collections::HashSet::new();
         for (id, body) in &rows {
             let name = row_label(body);
@@ -2460,8 +2461,25 @@ pub(crate) mod tests {
                 gtk4::test_accessible_has_role(&widget, gtk4::AccessibleRole::ListItem),
                 "{name}: not a list item"
             );
+            // A card's nested steps are list items: their container is a named list.
+            if let Some(children) = inner
+                .transcript
+                .with_row(id, |row| row.children_box().cloned())
+                .flatten()
+            {
+                nested += 1;
+                assert!(
+                    gtk4::test_accessible_has_role(&children, gtk4::AccessibleRole::List),
+                    "{name}: its steps are not a list"
+                );
+                assert!(
+                    crate::testutil::has_accessible_label(children.upcast_ref(), "Sub-agent steps"),
+                    "{name}: its steps are not named"
+                );
+            }
             kinds.insert(name.split(':').next().unwrap_or_default().to_owned());
         }
+        assert!(nested > 0, "no card with a steps container was built");
         for author in ["You", "Claude", "Tool"] {
             assert!(kinds.contains(author), "no row named {author}: {kinds:?}");
         }

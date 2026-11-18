@@ -205,6 +205,13 @@ impl AgentTerminalWindow {
                 if region.name != "sidebar" {
                     if let Some(split) = overlaid.as_ref() {
                         split.set_show_sidebar(false);
+                        // Hiding the overlay can hand the focus on to whatever the window
+                        // picks; the region chosen is where it belongs.
+                        let held = gtk4::prelude::GtkWindowExt::focus(&*self.obj())
+                            .is_some_and(|f| region.holds(&f));
+                        if !held {
+                            region.focus();
+                        }
                     }
                 }
                 return Some(region.name);

@@ -11,6 +11,7 @@ mod environment_review;
 mod fork_compare;
 mod merge;
 mod pack_animation;
+mod prompts_prefs;
 mod remote;
 mod setup;
 mod spending;
@@ -1450,6 +1451,9 @@ pub struct AgentTerminalWindow {
     /// The settings dialog's font-scale spin, while it is open, so zooming
     /// from the keyboard keeps it in step instead of leaving it stale.
     font_scale_spin: RefCell<glib::WeakRef<gtk4::SpinButton>>,
+    /// Redraws the settings dialog's Saved Prompts group from the config, while it is open (it
+    /// holds the group weakly): run when a reload of the file changed the saved prompts.
+    saved_prompts_redraw: RefCell<Option<std::rc::Rc<dyn Fn()>>>,
     /// The profile resolved at startup, cached so opening a new tab does not
     /// re-run resolution (which may block on an interactive shell) on the UI
     /// thread. Refreshed when the selected profile changes.
@@ -1812,6 +1816,10 @@ impl AgentTerminalWindow {
     /// Applies config.json as it now stands on disk, if something other than
     /// this process changed it.
     fn reload_config_from_disk(&self) {
+        // An edit made in the app but not yet written would be lost under the file's version:
+        // write it first (a file changed meanwhile is kept beside it as a copy), so the reload
+        // reads what the app holds.
+        self.for_each_window(|window| window.flush_pending_save());
         let change = self.config.borrow().check_disk();
         let new = match change {
             crate::config::DiskChange::Unchanged => return,
@@ -1828,15 +1836,25 @@ impl AgentTerminalWindow {
         };
 
         info!("Settings file changed on disk; applying it");
-        let (profiles_changed, clear_changed, theme_changed) = {
+        let (profiles_changed, clear_changed, theme_changed, prompts_changed) = {
             let old = self.config.borrow();
             (
                 old.default_profile != new.default_profile || old.profiles != new.profiles,
                 old.clear_env != new.clear_env,
                 old.theme != new.theme || old.theme_pair() != new.theme_pair(),
+                old.saved_prompts != new.saved_prompts,
             )
         };
         *self.config.borrow_mut() = *new;
+        if prompts_changed {
+            // An open Saved Prompts group would otherwise show, and edit, the old list.
+            self.for_each_window(|window| {
+                let redraw = window.saved_prompts_redraw.borrow().clone();
+                if let Some(redraw) = redraw {
+                    redraw();
+                }
+            });
+        }
         self.refresh_local_contexts();
         if clear_changed {
             // An agent's env file is read against these patterns: read them again, at once, so a
@@ -5426,6 +5444,7 @@ impl AgentTerminalWindow {
         let replies = adw::PreferencesGroup::builder().title("Replies").build();
         replies.add(&quick_replies_row);
         general.add(&replies);
+        general.add(&self.saved_prompts_group());
         general.add(&self.spending_group());
         general.add(&self.remote_machines_group());
         general.add(&self.uninstall_group());
@@ -10174,6 +10193,7 @@ mod tests {
         diff_prefs::tests::the_diff_tool_group_saves_only_what_is_valid(window);
         editor_prefs::tests::the_group_saves_only_what_is_valid_and_applies_live(window);
         remote::tests::the_remote_machines_group_saves_only_valid_aliases(window);
+        prompts_prefs::tests::the_saved_prompts_group_saves_only_what_is_valid(window);
         threads::message_search::tests::message_search_finds_and_opens_a_hit(window);
         spending::tests::the_spending_dialog_shows_and_keeps_what_turns_cost(window);
         spending::tests::the_spending_group_saves_only_valid_amounts(window);

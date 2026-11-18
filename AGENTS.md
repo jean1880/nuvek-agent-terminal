@@ -107,7 +107,8 @@ Architectural mandates, standards, and workflows for this codebase.
     truncation, the hunk line map, a selection's comment span and a comment's anchor in a
     later diff: exact, moved once, or gone, never a guess), `restore` (undo: pin, restore, contained deletion, check),
     `worktree` (worktree locations, branch checks, create and clean-only
-    remove), `commit` (the diff panel's commit of the ticked paths: its context, arguments and
+    remove; `head_branch`, a folder's branch or why there is none, for a saved prompt's
+    `{branch}`), `commit` (the diff panel's commit of the ticked paths: its context, arguments and
     run), `merge` (a worktree branch merged back into its base: the read-only `preflight`, the
     one `commands` list the preview shows and the merge runs, and the abort-only `merge`), `github` (a branch's pull-request state, the compare URL, the unforced push; it also gives
     a thread's subtitle its branch, shown only for a repository on GitHub),
@@ -223,6 +224,13 @@ Architectural mandates, standards, and workflows for this codebase.
     `spend::parse_budget` accepts them; and the budget check, started by a metered turn or a
     new extra-usage reading, run once at a time, its toasts what the writer recorded as due), `window/imp/remote.rs` (Settings →
     General → Remote Machines and the New Terminal Thread on Another Machine dialog),
+    `window/imp/prompts_prefs.rs` (Settings → General → Saved Prompts: each field saved when
+    committed and only when `saved_prompts::name_problem`/`validate_body`/`folder_problem` accept
+    it, through `TerminalConfig::set_saved_prompt_*`; Add takes a whole valid prompt
+    (`candidate_problem`); an invalid entry already in the file is listed with its problem and
+    kept, never dropped; Delete offers Undo, which puts it back exactly, or is refused when the
+    name now clashes or the list is full; a reload of the file that changes the prompts redraws
+    an open group, after pending in-app saves are written),
     `window/imp/threads/message_search.rs` (the sidebar's "In Messages" section, behind the
     toggle beside its search entry: `Store::search` through `store_job` after typing pauses, a
     generation counter so only the newest search draws, "Search is unavailable" never shown as
@@ -413,7 +421,8 @@ Architectural mandates, standards, and workflows for this codebase.
   fork, compact-by-handoff, brief) goes through `agent_core::redact` and the
   handoff budget. A new store write or injected prompt must take the same path. A saved
   prompt's placeholder values (`{file}`, `{selection}`, `{folder}`, `{branch}`) are redacted
-  when they are given to `saved_prompts::Values` (a selection before it is cut to 8 KB);
+  when they are given to `saved_prompts::Values` (a selection before it is cut to 8 KB),
+  after their control, bidi and zero-width characters are taken out;
   the expanded text only fills the draft, never sends, and is then the user's own prompt.
   Terminal text sent to a thread ("Send Selection" or "Send Last Output", from a drawer or a
   terminal page, a remote one included) goes through `terminal_excerpt::format_excerpt`: only
@@ -422,6 +431,11 @@ Architectural mandates, standards, and workflows for this codebase.
   instructions" label. It only fills a draft, never sends, and a terminal page's target is the
   thread last shown in its window (`last_chat_key`), never one opened for it; with none the
   actions are disabled.
+  `{branch}` is read off the main thread (`ComposerHost::saved_branch_reader`, run by
+  `gio::spawn_blocking`); the composer keeps the typed `/name` until it answers and uses the
+  answer only if the draft is unchanged and no other prompt was chosen meanwhile
+  (`saved_seq`). No repository, a detached HEAD or a failed read leaves `{branch}` to fill,
+  with a toast saying why.
   A thread's tag is shown on every row, so one that redaction would change is refused (by the
   Tags dialog and again by `Store::set_tags`), never stored masked; tags are never injected
   into a prompt or a hand-off.

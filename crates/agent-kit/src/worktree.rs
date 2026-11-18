@@ -110,6 +110,42 @@ pub fn current_branch(dir: &Path) -> Option<String> {
     (out.status.success() && !branch.is_empty()).then_some(branch)
 }
 
+/// What a folder's HEAD is, as [`head_branch`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadBranch {
+    /// The branch checked out (an unborn one included).
+    Branch(String),
+    /// HEAD names a commit, not a branch.
+    Detached,
+    /// The folder is in no repository.
+    NotRepository,
+    /// git could not be asked, or gave no answer that says.
+    Unknown,
+}
+
+/// The branch `dir` has checked out, or why there is none. Blocking (one `git symbolic-ref`,
+/// through [`git_output`]: redirecting variables removed, no optional locks); call it off the
+/// main thread.
+pub fn head_branch(dir: &Path) -> HeadBranch {
+    let Ok(out) = git_output(
+        dir,
+        ["symbolic-ref", "-q", "--short", "HEAD"],
+        &[],
+        QUERY_TIMEOUT_SECS,
+    ) else {
+        return HeadBranch::Unknown;
+    };
+    let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    match out.status.code() {
+        Some(0) if !branch.is_empty() => HeadBranch::Branch(branch),
+        // `-q`: a HEAD that is not a symbolic ref exits 1, silently.
+        Some(1) => HeadBranch::Detached,
+        // Outside any repository git dies with 128 ("not a git repository").
+        Some(128) => HeadBranch::NotRepository,
+        _ => HeadBranch::Unknown,
+    }
+}
+
 /// Whether `branch` is a valid, unused name for a new branch.
 pub fn check_new_branch(repo: &Path, branch: &str) -> Result<(), String> {
     precheck_name(branch, "branch name")?;
@@ -404,6 +440,29 @@ mod tests {
             fs::create_dir_all(&main).unwrap();
             init_repo_at(&main, &[("a.txt", b"a\n"), (".gitignore", b"build/\n")]);
             Some((tmp, main))
+        }
+
+        #[test]
+        fn head_branch_names_the_branch_or_says_why_there_is_none() {
+            let Some((tmp, main)) = new_repo() else {
+                return;
+            };
+            let branch = sh(&main, &["symbolic-ref", "--short", "HEAD"]);
+            assert_eq!(head_branch(&main), HeadBranch::Branch(branch));
+            // From a folder inside the repository too.
+            fs::create_dir_all(main.join("sub")).unwrap();
+            assert!(matches!(
+                head_branch(&main.join("sub")),
+                HeadBranch::Branch(_)
+            ));
+            sh(&main, &["checkout", "-q", "--detach"]);
+            assert_eq!(head_branch(&main), HeadBranch::Detached);
+            // A plain folder: no repository (the temp root is outside any).
+            let plain = tmp.path().join("plain");
+            fs::create_dir_all(&plain).unwrap();
+            assert_eq!(head_branch(&plain), HeadBranch::NotRepository);
+            // A folder that is not there cannot be asked.
+            assert_eq!(head_branch(&tmp.path().join("gone")), HeadBranch::Unknown);
         }
 
         #[test]

@@ -140,10 +140,10 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   stored or sent, are kept only on your machine, and are removed a day after no thread uses them.
 - **Saved prompts.** Instructions you repeat ("review {file} for race conditions") are listed
   after `/` in the composer, marked *prompt*. Choosing one puts its text in the draft, with
-  `{file}`, `{selection}` and `{folder}` filled in from the thread, and the first placeholder
-  it could not fill selected; nothing is sent until you press Enter. It works the same for
-  every agent. Saved prompts are kept in the settings file for now; see the
-  [reference](reference.md#saved-prompts).
+  `{file}`, `{branch}`, `{selection}` and `{folder}` filled in from the thread, and the first
+  placeholder it could not fill selected; nothing is sent until you press Enter. It works the
+  same for every agent. Add, edit, copy and delete them in Settings → General → Saved Prompts,
+  and limit one to a folder; see the [reference](reference.md#saved-prompts).
 - **Quick replies.** When a Codex or Antigravity reply ends with a question and a short
   list of choices, the choices appear under it; one click puts the answer in the composer,
   ready to send or edit. Turn them off from the replies themselves or in Settings → General.

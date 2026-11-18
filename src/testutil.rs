@@ -399,6 +399,31 @@ pub fn label_texts(root: &gtk4::Widget) -> Vec<String> {
         .collect()
 }
 
+/// Whether `widget`'s accessible label is exactly `label`, as GTK's own test check reads it.
+pub fn has_accessible_label(widget: &gtk4::Widget, label: &str) -> bool {
+    use gtk4::glib::translate::ToGlibPtr;
+    use gtk4::prelude::*;
+    let Ok(label) = std::ffi::CString::new(label) else {
+        return false;
+    };
+    let accessible = widget.upcast_ref::<gtk4::Accessible>();
+    // SAFETY: `accessible` is a live GtkAccessible for the call, the property takes one
+    // NUL-terminated string, and a non-NULL result is a newly allocated message we free.
+    unsafe {
+        let message = gtk4::ffi::gtk_test_accessible_check_property(
+            accessible.to_glib_none().0,
+            gtk4::ffi::GTK_ACCESSIBLE_PROPERTY_LABEL,
+            label.as_ptr(),
+        );
+        if message.is_null() {
+            true
+        } else {
+            gtk4::glib::ffi::g_free(message.cast());
+            false
+        }
+    }
+}
+
 /// The marker `make` sets (`DISPLAY_ENV`) for a run on its private Xvfb display and D-Bus session.
 pub const VIRTUAL_DISPLAY_MARKER: &str = "AGENT_TERMINAL_TEST_DISPLAY";
 

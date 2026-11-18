@@ -115,6 +115,11 @@ pub(super) mod tests {
             Driver::Claude,
             crate::availability::Availability::Ready("/nonexistent/claude".into()),
         );
+        // The window rescans when it regains focus (a dialog closing gives it back) once the
+        // last scan is a minute old, and a test's scan finds every agent missing: count this as
+        // a fresh scan so the agent set here stays ready through the check, however long the
+        // window test ran before it.
+        availability.mark_scan_started();
         let target = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
         let dir = target.path().to_string_lossy().into_owned();

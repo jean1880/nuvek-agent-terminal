@@ -725,6 +725,15 @@ on a light background are darkened until they do: the accent and status colours 
 window and the added, removed and hunk lines of a diff are never paler than a 4.5:1
 contrast, and Solarized Light's text is `#586e75`.
 
+In every bundled scheme, what you must see without it being text reaches a 3:1 contrast on
+everything it is drawn on: the outline of the message box, buttons and menus, the accent,
+the colours of the context and usage bars and of status dots, and the keyboard focus ring,
+which is opaque (libadwaita's own is half transparent). Where a scheme's own colour falls
+short it is brightened (or, in a light scheme, darkened) just enough. With **Use System
+Theme** the outlines are drawn from your desktop's text colour at the same contrast on
+Adwaita, and the rest are your desktop's own. No state is shown by colour alone: the bars
+print their figures beside them, and a diff's lines keep their `+` and `-`.
+
 ### Accessibility
 
 **Announcements.** With a screen reader such as Orca running, the window tells it when something

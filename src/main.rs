@@ -460,6 +460,11 @@ fn load_css() {
         window {
             background-color: @at_bg;
         }
+        /* Every keyboard focus ring, libadwaita's included (it draws it half transparent):
+           opaque, and at 3:1 on every surface (palette.rs: `every_palettes_controls_are_seen`). */
+        :focus-visible {
+            outline-color: @at_focus;
+        }
         headerbar {
             background-color: @at_bg_deep;
             color: @at_fg;

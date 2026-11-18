@@ -1048,7 +1048,10 @@ epoch field) in `make package` and `packaging/build-deb.sh`; the rpm has `epoch 
   `theme_light`/`theme_dark` (`ThemePair`, each slot only its polarity, a wrong one loading as
   the slot's default) matching `StyleManager::is_dark`, never forces the colour scheme, and
   swaps members through the same watch as System (`palette::desktop_changed`); every lookup by
-  choice resolves it first (`palette::concrete`, `palette::in_effect`).
+  choice resolves it first (`palette::concrete`, `palette::in_effect`). Every bundled scheme's
+  outlines, accent, state colours and focus ring are lifted to 3:1 on every surface
+  (`Chrome::with_visible_controls`, `every_palettes_controls_are_seen`); `@at_focus` is the one
+  focus-ring colour, libadwaita's ring included.
 - If you modify startup/detection logic, update and run the tests in `utils.rs`.
 - Deployment-specific behaviour belongs in config, not in the binary. Anything
   that reads a path or runs a command particular to one machine should be an

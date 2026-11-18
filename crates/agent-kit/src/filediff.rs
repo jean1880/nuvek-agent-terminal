@@ -333,6 +333,10 @@ pub struct Shown {
     pub clipped: bool,
     /// The files the edit names, as the agent named them.
     pub files: Vec<String>,
+    /// The repository root (canonical) every file header of `text` names its file from, when
+    /// there is one: a diff against the turn's baseline, or against HEAD in one repository.
+    /// `None` for the agent's own edit, whose paths are as it named them.
+    pub root: Option<PathBuf>,
 }
 
 /// The diff of a file-change item whose tool input is `input`. With a `base`, each named file is
@@ -402,8 +406,13 @@ pub fn shown_for_item_in(
             Some((text, clipped))
         }
     });
-    let (text, origin, clipped) = match from_checkpoint {
-        Some((text, clipped)) => (text, Origin::Checkpoint, clipped),
+    let (text, origin, clipped, root) = match from_checkpoint {
+        Some((text, clipped)) => (
+            text,
+            Origin::Checkpoint,
+            clipped,
+            base.map(|b| b.toplevel.clone()),
+        ),
         None => {
             let agent_text = preview.iter().map(|e| e.diff.as_str()).collect::<String>();
             if !agent_text.is_empty() {
@@ -411,10 +420,13 @@ pub fn shown_for_item_in(
                     agent_text,
                     Origin::AgentEdit,
                     preview.iter().any(|edit| edit.clipped),
+                    None,
                 )
             } else if !files.is_empty() {
                 let mut fallback = String::new();
                 let mut clipped = false;
+                // The one repository every file was diffed in against its HEAD, if there is one.
+                let mut roots: Vec<Option<PathBuf>> = Vec::new();
                 for path in &files {
                     let full = resolve_file_path(path);
                     let mut file_handled = false;
@@ -432,11 +444,13 @@ pub fn shown_for_item_in(
                                     fallback.push_str(&d.diff);
                                     clipped |= d.clipped;
                                     file_handled = true;
+                                    roots.push(repo.toplevel.canonicalize().ok());
                                 }
                             }
                         }
                     }
                     if !file_handled {
+                        roots.push(None);
                         if let Some(bytes) = read_capped(&full, editdiff::MAX_SIDE_BYTES) {
                             if !bytes.is_empty() && !is_binary(&bytes) {
                                 let content = String::from_utf8_lossy(&bytes);
@@ -448,7 +462,15 @@ pub fn shown_for_item_in(
                     }
                 }
                 if !fallback.is_empty() {
-                    (fallback, Origin::Checkpoint, clipped)
+                    let root = match roots.split_first() {
+                        Some((Some(first), rest))
+                            if rest.iter().all(|r| r.as_ref() == Some(first)) =>
+                        {
+                            Some(first.clone())
+                        }
+                        _ => None,
+                    };
+                    (fallback, Origin::Checkpoint, clipped, root)
                 } else {
                     return Err(format!("No diff is available for {}", files.join(", ")));
                 }
@@ -468,6 +490,7 @@ pub fn shown_for_item_in(
         omitted_lines,
         clipped,
         files,
+        root,
     })
 }
 
@@ -760,10 +783,14 @@ mod tests {
         );
         assert!(shown.text.contains("-two\n+TWO\n"));
         assert_eq!(shown.omitted_lines, 0);
+        // Its headers name the file from the repository's root, which it says.
+        assert_eq!(shown.root.as_deref(), Some(base.toplevel.as_path()));
 
-        // No baseline: the agent's own old/new strings, as an `@@ edit @@` fragment.
+        // No baseline: the agent's own old/new strings, as an `@@ edit @@` fragment, whose
+        // paths are the agent's own: no root.
         let fallback = shown_for_item(None, &input).expect("fallback");
         assert_eq!(fallback.origin, Origin::AgentEdit);
+        assert_eq!(fallback.root, None);
         assert!(
             fallback.text.contains("@@ edit @@\n-two\n+TWO\n"),
             "{}",

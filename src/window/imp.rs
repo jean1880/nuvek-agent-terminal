@@ -196,7 +196,7 @@ const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
             <child>
               <object class="GtkShortcutsShortcut">
                 <property name="accelerator">&lt;Primary&gt;&lt;Alt&gt;M</property>
-                <property name="title">Comment on the Selected Diff Lines (in the Changes Panel)</property>
+                <property name="title">Comment on the Selected Diff Lines (in the Changes Panel or a File Change)</property>
               </object>
             </child>
             <child>
@@ -585,6 +585,27 @@ async fn thread_enclosing_repo(thread: String) -> Option<Option<std::path::PathB
 
 /// Where the external diff tool runs for a panel file: the top of `dir`'s repository, else of
 /// the file's, else `dir` itself. Blocking: run it off the main thread.
+/// Binds `panel`'s comments to its tab's `thread`, the first time reading the thread's saved
+/// ones off the main thread (nothing is written over them until that read has answered).
+fn bind_review(panel: &DiffPanel, thread: &str) {
+    if !panel.bind_review(thread) {
+        return;
+    }
+    let loader = panel.clone();
+    let thread = thread.to_owned();
+    glib::MainContext::default().spawn_local(async move {
+        let owned = thread.clone();
+        match threads::store_job(move |s| s.review_drafts(&owned)).await {
+            Some(Ok(drafts)) => loader.restore_review(&thread, drafts),
+            Some(Err(e)) => {
+                warn!("Could not read the review comments: {e}");
+                loader.review_load_failed(&thread);
+            }
+            None => loader.review_load_failed(&thread),
+        }
+    });
+}
+
 fn diff_tool_working_dir(dir: &str, file: &str) -> std::path::PathBuf {
     if let Ok(Some(repo)) = crate::git::discover(std::path::Path::new(dir)) {
         repo.toplevel
@@ -1579,6 +1600,7 @@ impl ObjectImpl for AgentTerminalWindow {
         self.start_checkpoint_watch();
         self.watch_focus();
         self.report_config_problem();
+        self.flush_pending_spending_warnings();
         // Every dialog shown here closes on a press outside it, as Escape does.
         crate::dialogs::close_dialogs_on_outside_click(&*self.obj());
     }
@@ -6699,6 +6721,55 @@ impl AgentTerminalWindow {
             }
         });
 
+        // Before a review is composed, each comment's lines are looked for in the working file,
+        // off the main thread: only files inside the thread's folder, against the panel's repo for
+        // diff-panel comments and the thread's folder/repo for file-change-card comments.
+        let weak_root = panel.root.downgrade();
+        panel.connect_review_check(move |asks, done| {
+            let place = weak_root.upgrade().and_then(|root| {
+                window_of(&root)?.imp().tab_by_panel(&root, |t| {
+                    let repo = t
+                        .diff_panel
+                        .shown_repo()
+                        .unwrap_or_else(|| t.repo_dir().into());
+                    (t.dir.clone(), repo)
+                })
+            });
+            glib::MainContext::default().spawn_local(async move {
+                let unchecked = vec![
+                    agent_core::review::Checked::Unchecked(
+                        agent_core::review::Unchecked::NoRepository
+                    );
+                    asks.len()
+                ];
+                let Some((folder, repo)) = place else {
+                    done(unchecked);
+                    return;
+                };
+                let found = blocking_or(
+                    move || {
+                        let folder_path = std::path::Path::new(&folder);
+                        let folder_top = agent_kit::review_check::toplevel(folder_path);
+                        let card_top = folder_top
+                            .clone()
+                            .or_else(|| folder_path.canonicalize().ok());
+                        let panel_top = folder_top
+                            .or_else(|| agent_kit::review_check::toplevel(&repo))
+                            .or_else(|| card_top.clone());
+                        agent_kit::review_check::check_in(
+                            folder_path,
+                            panel_top.as_deref(),
+                            card_top.as_deref(),
+                            &asks,
+                        )
+                    },
+                    unchecked,
+                )
+                .await;
+                done(found);
+            });
+        });
+
         // "Open in …" on a file row.
         let root = panel.root.clone();
         panel.connect_open(move |file| {
@@ -6823,21 +6894,8 @@ impl AgentTerminalWindow {
             return;
         }
         // A thread's panel takes comments; its saved ones are read once, off the main thread.
-        if let Some(thread) = thread_id.clone() {
-            if panel.bind_review(&thread) {
-                let loader = panel.clone();
-                glib::MainContext::default().spawn_local(async move {
-                    let owned = thread.clone();
-                    match threads::store_job(move |s| s.review_drafts(&owned)).await {
-                        Some(Ok(drafts)) => loader.restore_review(&thread, drafts),
-                        Some(Err(e)) => {
-                            warn!("Could not read the review comments: {e}");
-                            loader.review_load_failed(&thread);
-                        }
-                        None => loader.review_load_failed(&thread),
-                    }
-                });
-            }
+        if let Some(thread) = thread_id.as_deref() {
+            bind_review(&panel, thread);
         }
         let base = panel.base();
         let generation = panel.begin();
@@ -9276,6 +9334,7 @@ mod tests {
         super::super::diff_panel::tests::the_commit_bar_follows_the_view_and_the_ticks();
         super::super::diff_panel::tests::comments_are_kept_anchored_and_sent_as_one_review();
         super::super::diff_panel::tests::review_rows_budget_and_loading();
+        super::super::diff_panel::tests::card_comments_join_the_review_and_are_checked_when_sent();
         commit::tests::the_commit_dialog_follows_its_message();
         super::super::diff_panel::tests::the_merge_bar_shows_only_for_a_worktree();
         merge::tests::the_merge_dialog_refuses_what_it_must();

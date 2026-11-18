@@ -1686,9 +1686,73 @@ impl Transcript {
         changed
     }
 
+    /// Whether the tool item `id`, or a sub-agent it runs under, is background work: a call that
+    /// returned while it works on (`run_in_background`, a listed background task) or a worker
+    /// with its own lifecycle. Such work outlives a turn that failed or was stopped.
+    fn in_background(&self, id: &str) -> bool {
+        let mut at = Some(id.to_owned());
+        while let Some(id) = at {
+            let Some(item) = self.items.get(&id) else {
+                return false;
+            };
+            if let Body::Tool(tool) = &item.body {
+                let input: Option<Value> = tool
+                    .input
+                    .clone()
+                    .filter(|i| i.as_object().is_some_and(|o| !o.is_empty()))
+                    .or_else(|| serde_json::from_str(&tool.input_text).ok());
+                let field = |key: &str| input.as_ref().and_then(|i| i.get(key));
+                if field("run_in_background").and_then(Value::as_bool) == Some(true)
+                    || field("worker_state").is_some()
+                    || self.worker_ids.contains(&id)
+                    || self
+                        .background
+                        .iter()
+                        .any(|task| task.id == id || task.tool_use_id.as_deref() == Some(&id))
+                {
+                    return true;
+                }
+            }
+            at = item.parent.clone();
+        }
+        false
+    }
+
+    /// Ends what a turn that failed or was stopped, or a session that exited, leaves open:
+    /// streaming text stops streaming, and a tool still Running becomes Interrupted (its card's
+    /// spinner stops, as a replayed thread's does in [`Self::settle_stale`]), so no row stays
+    /// busy. With `keep_background`, background work and its steps are left running: they
+    /// outlive the turn. The changed items, in order.
+    fn settle_open(&mut self, keep_background: bool) -> Vec<Change> {
+        let mut ids: Vec<ItemId> = self
+            .items
+            .iter()
+            .filter(|(_, item)| match &item.body {
+                Body::Assistant { streaming, .. } | Body::Reasoning { streaming, .. } => *streaming,
+                Body::Tool(t) => t.status == ToolStatus::Running,
+                _ => false,
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        if keep_background {
+            ids.retain(|id| !self.in_background(id));
+        }
+        ids.sort();
+        for id in &ids {
+            match self.items.get_mut(id).map(|i| &mut i.body) {
+                Some(Body::Assistant { streaming, .. } | Body::Reasoning { streaming, .. }) => {
+                    *streaming = false;
+                }
+                Some(Body::Tool(t)) => t.status = ToolStatus::Interrupted,
+                _ => {}
+            }
+        }
+        ids.into_iter().map(Change::Updated).collect()
+    }
+
     /// A sub-agent that finished cannot finish its own steps any more: one still Running (its
     /// completion was lost) becomes Interrupted, as [`Self::settle_stale`] settles them, so its
-    /// spinner stops. Only its direct tool steps: a nested sub-agent still running keeps its own
+    /// spinner stops, and its text that was still streaming stops. Only its direct steps: a nested sub-agent still running keeps its own
     /// steps. A background sub-agent (its call returns while it works on) and a worker with its
     /// own lifecycle are left alone. The changed steps.
     fn settle_finished_subagent(&mut self, id: &str) -> Vec<Change> {
@@ -1704,6 +1768,7 @@ impl Transcript {
         let input: Option<Value> = tool
             .input
             .clone()
+            .filter(|i| i.as_object().is_some_and(|o| !o.is_empty()))
             .or_else(|| serde_json::from_str(&tool.input_text).ok());
         let field = |key: &str| input.as_ref().and_then(|i| i.get(key));
         let in_background = field("run_in_background").and_then(Value::as_bool) == Some(true)
@@ -1716,11 +1781,23 @@ impl Transcript {
         }
         let mut out = Vec::new();
         for child in item.children.clone() {
-            if let Some(Body::Tool(step)) = self.items.get_mut(&child).map(|c| &mut c.body) {
-                if step.status == ToolStatus::Running && step.kind != ItemKind::Subagent {
-                    step.status = ToolStatus::Interrupted;
+            match self.items.get_mut(&child).map(|c| &mut c.body) {
+                Some(Body::Tool(step)) => {
+                    if step.status == ToolStatus::Running && step.kind != ItemKind::Subagent {
+                        step.status = ToolStatus::Interrupted;
+                        out.push(Change::Updated(child));
+                    }
+                }
+                Some(Body::Assistant { streaming, .. } | Body::Reasoning { streaming, .. })
+                    if *streaming =>
+                {
+                    *streaming = false;
+                    if self.open_text.as_deref() == Some(child.as_str()) {
+                        self.open_text = None;
+                    }
                     out.push(Change::Updated(child));
                 }
+                _ => {}
             }
         }
         out
@@ -1877,6 +1954,8 @@ impl Transcript {
                     out.push(Change::Workers);
                     out.push(Change::Running);
                 }
+                // Nothing it was writing or running goes on: no row stays busy.
+                out.extend(self.settle_open(false));
                 // A dead session runs nothing in the background either.
                 if self.running || !self.background.is_empty() {
                     self.running = false;
@@ -1933,8 +2012,31 @@ impl Transcript {
                 } else if outcome_changed {
                     out.push(Change::Running);
                 }
-                if let Some(id) = self.open_text.take() {
-                    out.extend(self.finish_text(&id));
+                // Every block of text still streaming ends with the turn, not only the newest:
+                // interleaved streams leave older ones open. A background sub-agent's text is
+                // its own and goes on streaming.
+                self.open_text = None;
+                let mut streaming: Vec<ItemId> = self
+                    .items
+                    .iter()
+                    .filter(|(_, item)| {
+                        matches!(
+                            item.body,
+                            Body::Assistant {
+                                streaming: true,
+                                ..
+                            } | Body::Reasoning {
+                                streaming: true,
+                                ..
+                            }
+                        )
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                streaming.retain(|id| !self.in_background(id));
+                streaming.sort();
+                for id in &streaming {
+                    out.extend(self.finish_text(id));
                 }
                 // A stopped turn can no longer take an answer: whatever it was still asking (a
                 // question, an approval, a form) expires, so nothing waits forever. Only a stop:
@@ -1942,6 +2044,11 @@ impl Transcript {
                 // turn that completed or failed and still ask, and those requests stay live.
                 if *state == TurnState::Interrupted {
                     out.extend(self.expire_requests().into_iter().map(Change::Updated));
+                }
+                // A turn that failed or was stopped finishes nothing it left open, bar the
+                // background work that outlives it: those rows stop streaming and running.
+                if *state != TurnState::Completed {
+                    out.extend(self.settle_open(true));
                 }
                 match state {
                     TurnState::Completed => {}
@@ -2087,7 +2194,13 @@ impl Transcript {
                     }),
                 };
                 if matches!(kind, ItemKind::AssistantMessage | ItemKind::Reasoning) {
-                    self.open_text = Some(id.clone());
+                    // The text that was open is done: a new block of text began.
+                    let new_parent = parent.clone().filter(|p| self.items.contains_key(p));
+                    if let Some(prev) = self.open_text.replace(id.clone()) {
+                        if prev != id {
+                            out.extend(self.finish_text_beside(&prev, new_parent.as_ref()));
+                        }
+                    }
                 }
                 out.push(Change::Added(self.insert(id, body, parent.clone())));
             }
@@ -2579,6 +2692,21 @@ impl Transcript {
         vec![Change::Added(id)]
     }
 
+    /// Finishes `id` only when it sits under the same parent as the block that just began: a
+    /// sub-agent's stream (or a background one's) interleaves with the main reply and with
+    /// other sub-agents, and none of those ends another's text.
+    fn finish_text_beside(&mut self, id: &str, new_parent: Option<&ItemId>) -> Vec<Change> {
+        let same = self
+            .items
+            .get(id)
+            .is_some_and(|item| item.parent.as_ref() == new_parent);
+        if same {
+            self.finish_text(id)
+        } else {
+            Vec::new()
+        }
+    }
+
     fn finish_text(&mut self, id: &str) -> Vec<Change> {
         match self.items.get_mut(id).map(|i| &mut i.body) {
             Some(Body::Assistant { streaming, .. } | Body::Reasoning { streaming, .. })
@@ -2609,8 +2737,19 @@ impl Transcript {
             if let Some(open) = &self.open_text {
                 let matches = matches!(
                     (stream, self.items.get(open).map(|i| &i.body)),
-                    (StreamKind::Assistant, Some(Body::Assistant { .. }))
-                        | (StreamKind::Reasoning, Some(Body::Reasoning { .. }))
+                    (
+                        StreamKind::Assistant,
+                        Some(Body::Assistant {
+                            streaming: true,
+                            ..
+                        })
+                    ) | (
+                        StreamKind::Reasoning,
+                        Some(Body::Reasoning {
+                            streaming: true,
+                            ..
+                        })
+                    )
                 );
                 if matches {
                     return Some(open.clone());
@@ -2630,7 +2769,12 @@ impl Transcript {
         };
         let id = env.item.clone().unwrap_or_else(|| self.next_id("text"));
         let id = self.insert(id, body, None);
-        self.open_text = Some(id.clone());
+        // The text that was open is done: a new block of text began.
+        if let Some(prev) = self.open_text.replace(id.clone()) {
+            if prev != id {
+                out.extend(self.finish_text_beside(&prev, None));
+            }
+        }
         out.push(Change::Added(id.clone()));
         Some(id)
     }
@@ -2808,6 +2952,98 @@ mod tests {
             output: Some(output.to_owned()),
             error: (status == ItemStatus::Failed).then(|| output.to_owned()),
         }
+    }
+
+    /// A stopped or failed turn, or an exited session, leaves no row growing: open text stops
+    /// streaming and running tools become Interrupted, each reported as an update, so its row
+    /// stops being busy. Background work outlives the turn, not the session. A new block of
+    /// text ends the one before it.
+    #[test]
+    fn nothing_stays_open_after_a_stop_a_failure_or_an_exit() {
+        use crate::chat::view::cards::row_busy;
+        let busy = |t: &Transcript, id: &str| row_busy(&t.get(id).expect(id).body);
+        let open = |t: &mut Transcript, n: usize| {
+            t.apply(&ev(Event::TurnStarted { model: None }), Driver::Claude);
+            let reply = format!("reply{n}");
+            t.apply(
+                &Envelope::item_started(&reply, ItemKind::AssistantMessage, "", None, None),
+                Driver::Claude,
+            );
+            t.apply(
+                &Envelope::delta(&reply, StreamKind::Assistant, "so far"),
+                Driver::Claude,
+            );
+            for (id, input) in [
+                (format!("tool{n}"), None),
+                (
+                    format!("bg{n}"),
+                    Some(json!({"command": "sleep 9", "run_in_background": true})),
+                ),
+            ] {
+                t.apply(
+                    &ev(tool_start(ItemKind::Command, "run", input)).item(&id),
+                    Driver::Claude,
+                );
+            }
+            for id in [&reply, &format!("tool{n}"), &format!("bg{n}")] {
+                assert!(busy(t, id), "{id}");
+            }
+        };
+        let mut t = Transcript::new();
+        for (n, state) in [TurnState::Interrupted, TurnState::Failed]
+            .into_iter()
+            .enumerate()
+        {
+            open(&mut t, n);
+            let changes = t.apply(&Envelope::turn_completed(state, None), Driver::Claude);
+            for id in [format!("reply{n}"), format!("tool{n}")] {
+                assert!(!busy(&t, &id), "{id} after {state:?}");
+                assert!(changes.contains(&Change::Updated(id.clone())), "{id}");
+            }
+            assert!(busy(&t, &format!("bg{n}")), "background work goes on");
+        }
+        let Some(Body::Tool(tool)) = t.get("tool0").map(|i| &i.body) else {
+            panic!("no tool");
+        };
+        assert_eq!(tool.status, ToolStatus::Interrupted);
+
+        open(&mut t, 2);
+        let changes = t.apply(
+            &ev(Event::SessionExited {
+                code: None,
+                expected: true,
+            }),
+            Driver::Claude,
+        );
+        for id in ["reply2", "tool2", "bg0", "bg1", "bg2"] {
+            assert!(!busy(&t, id), "{id} after the exit");
+            assert!(changes.contains(&Change::Updated(id.to_owned())), "{id}");
+        }
+
+        // Reasoning, then a reply: the reasoning is done.
+        t.apply(&ev(Event::TurnStarted { model: None }), Driver::Claude);
+        t.apply(
+            &Envelope::item_started("think", ItemKind::Reasoning, "", None, None),
+            Driver::Claude,
+        );
+        assert!(busy(&t, "think"));
+        let changes = t.apply(
+            &Envelope::item_started("say", ItemKind::AssistantMessage, "", None, None),
+            Driver::Claude,
+        );
+        assert!(!busy(&t, "think"));
+        assert!(changes.contains(&Change::Updated("think".to_owned())));
+        assert!(busy(&t, "say"));
+        // Text with no item of its own opens one, ending the open reply.
+        let changes = t.apply(
+            &ev(Event::ContentDelta {
+                stream: StreamKind::Reasoning,
+                text: "more".into(),
+            }),
+            Driver::Claude,
+        );
+        assert!(!busy(&t, "say"));
+        assert!(changes.contains(&Change::Updated("say".to_owned())));
     }
 
     #[test]
@@ -4026,6 +4262,194 @@ mod tests {
         assert_eq!(text(&t), "Hello, world");
         // An identical snapshot is not a change.
         assert!(t.apply(&snap, Driver::Claude).is_empty());
+    }
+
+    #[test]
+    fn interleaved_parented_streams_each_stay_streaming_until_their_own_completion() {
+        let mut t = Transcript::new();
+        let streaming = |t: &Transcript, id: &str| match t.get(id).map(|i| &i.body) {
+            Some(Body::Assistant { streaming, .. }) => *streaming,
+            other => panic!("unexpected {other:?}"),
+        };
+        t.apply(&started("a", ItemKind::Subagent, None), Driver::Claude);
+        t.apply(&started("b", ItemKind::Subagent, None), Driver::Claude);
+        t.apply(
+            &started("ma", ItemKind::AssistantMessage, Some("a")),
+            Driver::Claude,
+        );
+        t.apply(
+            &started("mb", ItemKind::AssistantMessage, Some("b")),
+            Driver::Claude,
+        );
+        t.apply(
+            &delta(Some("ma"), StreamKind::Assistant, "x"),
+            Driver::Claude,
+        );
+        assert!(streaming(&t, "ma"), "another sub-agent's block began");
+        assert!(streaming(&t, "mb"));
+        t.apply(
+            &started("main", ItemKind::AssistantMessage, None),
+            Driver::Claude,
+        );
+        assert!(streaming(&t, "ma"), "the main reply began");
+        assert!(streaming(&t, "mb"));
+        let done = |id: &str| Envelope::item_completed(id, ItemStatus::Completed, None, None);
+        t.apply(&done("ma"), Driver::Claude);
+        assert!(!streaming(&t, "ma"));
+        assert!(streaming(&t, "mb"));
+        t.apply(&done("mb"), Driver::Claude);
+        assert!(!streaming(&t, "mb"));
+        assert!(streaming(&t, "main"));
+    }
+
+    fn is_streaming(t: &Transcript, id: &str) -> bool {
+        match t.get(id).map(|i| &i.body) {
+            Some(Body::Assistant { streaming, .. } | Body::Reasoning { streaming, .. }) => {
+                *streaming
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_completed_turn_finishes_an_implicit_block_a_parented_block_displaced() {
+        let mut t = Transcript::new();
+        t.apply(&started("a", ItemKind::Subagent, None), Driver::Claude);
+        let changes = t.apply(&delta(None, StreamKind::Assistant, "x"), Driver::Claude);
+        let Change::Added(implicit) = &changes[0] else {
+            panic!("expected Added, got {changes:?}")
+        };
+        let implicit = implicit.clone();
+        t.apply(
+            &started("sa", ItemKind::AssistantMessage, Some("a")),
+            Driver::Claude,
+        );
+        assert!(is_streaming(&t, &implicit), "a sub-agent's block began");
+        let changes = t.apply(&finish_turn(TurnState::Completed), Driver::Claude);
+        assert!(!is_streaming(&t, &implicit));
+        assert!(!is_streaming(&t, "sa"));
+        assert!(changes.contains(&Change::Updated(implicit)));
+        assert!(changes.contains(&Change::Updated("sa".into())));
+    }
+
+    #[test]
+    fn a_completed_turn_finishes_a_sibling_stream_the_main_reply_displaced() {
+        let mut t = Transcript::new();
+        t.apply(&started("a", ItemKind::Subagent, None), Driver::Claude);
+        t.apply(&started("b", ItemKind::Subagent, None), Driver::Claude);
+        for (id, kind, parent) in [
+            ("s1", ItemKind::AssistantMessage, Some("a")),
+            ("r1", ItemKind::Reasoning, Some("b")),
+            ("main", ItemKind::AssistantMessage, None),
+            ("s2", ItemKind::AssistantMessage, Some("a")),
+        ] {
+            t.apply(&started(id, kind, parent), Driver::Claude);
+        }
+        assert!(is_streaming(&t, "s1"));
+        assert!(is_streaming(&t, "r1"));
+        let changes = t.apply(&finish_turn(TurnState::Completed), Driver::Claude);
+        for id in ["s1", "r1", "main", "s2"] {
+            assert!(!is_streaming(&t, id), "{id}");
+            assert!(changes.contains(&Change::Updated(id.into())), "{id}");
+        }
+    }
+
+    #[test]
+    fn a_turn_that_ends_leaves_a_background_subagents_text_streaming() {
+        for state in [
+            TurnState::Completed,
+            TurnState::Failed,
+            TurnState::Interrupted,
+        ] {
+            let mut t = Transcript::new();
+            for id in ["bg", "bg2"] {
+                let background = Envelope::item_started(
+                    id,
+                    ItemKind::Subagent,
+                    "Agent",
+                    Some(serde_json::json!({ "run_in_background": true })),
+                    None,
+                );
+                t.apply(&background, Driver::Claude);
+            }
+            t.apply(
+                &started("bgt", ItemKind::AssistantMessage, Some("bg")),
+                Driver::Claude,
+            );
+            t.apply(
+                &started("bgr", ItemKind::Reasoning, Some("bg2")),
+                Driver::Claude,
+            );
+            // Also a sub-agent tracked via BackgroundTasks without `run_in_background` in input.
+            t.apply(&started("listed", ItemKind::Subagent, None), Driver::Claude);
+            t.apply(
+                &Envelope::new(Event::BackgroundTasks {
+                    tasks: vec![BackgroundTask {
+                        id: "task-1".into(),
+                        kind: BackgroundTaskKind::Agent,
+                        description: Some("bg".into()),
+                        tool_use_id: Some("listed".into()),
+                    }],
+                }),
+                Driver::Claude,
+            );
+            t.apply(
+                &started("lt", ItemKind::AssistantMessage, Some("listed")),
+                Driver::Claude,
+            );
+            t.apply(&finish_turn(state), Driver::Claude);
+            for id in ["bgt", "bgr", "lt"] {
+                assert!(is_streaming(&t, id), "{state:?}: {id}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_finished_subagent_stops_its_streaming_text() {
+        let mut t = Transcript::new();
+        t.apply(&started("a", ItemKind::Subagent, None), Driver::Claude);
+        t.apply(
+            &started("ta", ItemKind::AssistantMessage, Some("a")),
+            Driver::Claude,
+        );
+        t.apply(
+            &started("main", ItemKind::AssistantMessage, None),
+            Driver::Claude,
+        );
+        t.apply(
+            &started("r", ItemKind::Reasoning, Some("a")),
+            Driver::Claude,
+        );
+        // Nested still-running sub-agent keeps its own streaming text.
+        t.apply(
+            &started("nested", ItemKind::Subagent, Some("a")),
+            Driver::Claude,
+        );
+        t.apply(
+            &started("nt", ItemKind::AssistantMessage, Some("nested")),
+            Driver::Claude,
+        );
+        assert!(is_streaming(&t, "ta"));
+        assert!(is_streaming(&t, "r"));
+        let changes = t.apply(
+            &Envelope::item_completed("a", ItemStatus::Completed, None, None),
+            Driver::Claude,
+        );
+        assert!(!is_streaming(&t, "ta"));
+        assert!(!is_streaming(&t, "r"));
+        assert!(changes.contains(&Change::Updated("ta".into())));
+        assert!(changes.contains(&Change::Updated("r".into())));
+        assert!(is_streaming(&t, "main"), "the main reply is not its own");
+        assert!(
+            is_streaming(&t, "nt"),
+            "a nested running sub-agent keeps its stream"
+        );
+        // An item-less delta afterwards must open a new block rather than writing into closed `r`.
+        let extra = t.apply(&delta(None, StreamKind::Reasoning, "new"), Driver::Claude);
+        assert!(
+            matches!(extra.first(), Some(Change::Added(id)) if id != "r"),
+            "{extra:?}"
+        );
     }
 
     #[test]

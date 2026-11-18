@@ -741,6 +741,69 @@ on a light background are darkened until they do: the accent and status colours 
 window and the added, removed and hunk lines of a diff are never paler than a 4.5:1
 contrast, and Solarized Light's text is `#586e75`.
 
+In every bundled scheme, what you must see without it being text reaches a 3:1 contrast on
+everything it is drawn on: the outline of the message box, buttons and menus, the accent,
+the colours of the context and usage bars and of status dots, and the keyboard focus ring,
+which is opaque (libadwaita's own is half transparent). Where a scheme's own colour falls
+short it is brightened (or, in a light scheme, darkened) just enough. With **Use System
+Theme** the outlines are drawn from your desktop's text colour at the same contrast on
+Adwaita, and the rest are your desktop's own. No state is shown by colour alone: the bars
+print their figures beside them, and a diff's lines keep their `+` and `-`.
+
+### Accessibility
+
+**Announcements.** With a screen reader such as Orca running, the window tells it when something
+happens in a thread that you would otherwise have to look for:
+
+| What happened | Said | How |
+|---|---|---|
+| A turn finished (sub-agents and background commands done too) | "Reply finished." or "“Title” finished." | politely, after what it is reading |
+| A turn failed, or an error arrived | "Turn failed: …" or "Error: …", the first line of the error | politely |
+| The agent hit its usage limit, or stopped unexpectedly | a short sentence naming the thread | politely |
+| An approval, a question or a tool's form is waiting | "Approval needed: …", "The agent has a question." | at once, as an alert |
+
+A thread you are looking at is not named; another thread is named by its title. A turn you
+stopped yourself says nothing. When a desktop notification already announced the same thing (a
+thread out of sight asking for approval, or finishing with **Notify When an Agent Finishes**
+on), the window says nothing more, so nothing is read twice. Several things happening at once
+are read as one announcement: at most three of them, then how many more ("And 4 more."). The
+text is short, has secrets masked like everything the app stores, and is never saved. A window
+that is closing says nothing more, not even what was waiting to be said.
+
+Turn it off with Settings → General → Notifications → **Announce Events to Screen Readers**
+(`announce_events` in the config file).
+
+**Text size.** Settings → General → Appearance → **Text Scale** (or Ctrl+= and Ctrl+-, and
+Ctrl+0 to reset) sets the size of all the app's text: threads, the thread list, menus,
+Settings and every other dialog, and the terminals. It applies at once, to every window, and
+is kept as `font_scale`, from 0.5× to 3×: a value outside that written into the config file
+by hand is read as the nearest end of it. At 2× the window needs to be at least 600 by 400
+pixels for every control to fit.
+
+**Moving around.** F6 moves the keyboard focus to the next part of the window, and Shift+F6
+to the previous one, wrapping round: the thread list, the transcript (its newest message),
+the message box, the terminal drawer while it is open, and the Changes panel while it is
+docked. Tab goes through them in the same order. F6 works wherever the focus is, a pane
+divider included, except in a terminal (a terminal page or the drawer): there F6 belongs to
+the program running there (mc, htop, vim), so Ctrl+F6 and Ctrl+Shift+F6 do the same from
+anywhere. F6 does nothing while a dialog such as Settings is open, and leaving a thread list
+laid over a narrow window closes it once the focus has moved, so the focus never goes behind
+it (with nowhere else to go, the list stays open). Each is a landmark a screen reader can jump
+to, named "Threads", "Transcript", "Message composer", "Terminal drawer" and "Changes"; the
+sub-agent shelf and the approval bar above the message box are named groups. A request for
+approval that arrives while you type never takes the focus away from the message box: its
+alert is read, and the approval bar's **Jump to card in transcript** button takes you to its
+card.
+
+**The transcript.** A screen reader reads the transcript as a list named "Messages", one
+item per message, step or request, each named for who wrote it or what it is: "You",
+"Claude" (or the agent that replied), "Reasoning", "Tool: cargo test", "Approval request",
+"Question", "Form request", "Error", "Notice", "Compaction", "Now Claude" (a switch),
+"Quick replies", and a plan by its title ("Plan", "Completed plan"…). A reply still streaming in, or a tool still running, is marked busy until
+it is done, or until the turn is stopped or fails or the agent exits: a tool cut off that way
+shows as **Interrupted** (a command left running in the background goes on until the agent
+exits).
+
 ### Sending terminal output to a thread
 
 Right-click a terminal (or press the Menu key or Shift+F10 in it) for two items:

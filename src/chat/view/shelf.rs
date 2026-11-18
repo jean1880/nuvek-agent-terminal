@@ -191,7 +191,14 @@ pub struct ShelfStack {
 
 impl ShelfStack {
     pub fn new() -> Rc<Self> {
-        let widget = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        // A group a screen reader names: what runs beside the turn.
+        let widget = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .accessible_role(gtk4::AccessibleRole::Group)
+            .build();
+        widget.update_property(&[gtk4::accessible::Property::Label(
+            "Sub-agents and background work",
+        )]);
         widget.add_css_class("shelf-stack");
         // The frame's rounded corners clip the shelves' own headers.
         widget.set_overflow(gtk4::Overflow::Hidden);

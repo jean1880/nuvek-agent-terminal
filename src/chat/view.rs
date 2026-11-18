@@ -162,7 +162,6 @@ mod imp {
     pub struct ChatView {
         pub(super) inner: RefCell<Option<Rc<Inner>>>,
         pub(super) toasts: RefCell<Option<adw::ToastOverlay>>,
-        pub(super) text_style: RefCell<Option<(gdk::Display, gtk4::CssProvider, String)>>,
     }
 
     #[glib::object_subclass]
@@ -174,9 +173,6 @@ mod imp {
 
     impl ObjectImpl for ChatView {
         fn dispose(&self) {
-            if let Some((display, provider, _)) = self.text_style.borrow_mut().take() {
-                gtk4::style_context_remove_provider_for_display(&display, &provider);
-            }
             if let Some(inner) = self.inner.borrow_mut().take() {
                 inner.composer.dispose();
                 inner.disconnect_models();
@@ -528,6 +524,24 @@ impl ChatView {
         self.imp().inner.borrow().clone()
     }
 
+    /// The thread's regions for F6: the transcript and the message box, and the box's text
+    /// field, which takes the focus.
+    pub fn region_widgets(&self) -> Option<(gtk4::Widget, gtk4::Widget, gtk4::Widget)> {
+        let inner = self.inner()?;
+        Some((
+            inner.transcript.widget().clone().upcast(),
+            inner.composer.widget().clone().upcast(),
+            inner.composer.field(),
+        ))
+    }
+
+    /// The sub-agent and background shelves' card (tests).
+    #[cfg(test)]
+    pub(crate) fn shelf_widget(&self) -> Option<gtk4::Widget> {
+        self.inner()
+            .map(|inner| inner.shelves.widget.clone().upcast())
+    }
+
     /// Where this thread's toasts go: over the transcript, so one never covers the shelves or
     /// the composer.
     pub fn toast_overlay(&self) -> Option<adw::ToastOverlay> {
@@ -852,29 +866,12 @@ impl ChatView {
         }
     }
 
-    /// Scale chat content and controls without changing the desktop theme or other windows.
+    /// Scales the app's text (the one app-wide scale, [`crate::style::set_text_scale`]: this
+    /// view, the sidebar, Settings and every dialog alike), and moves this view's header
+    /// breakpoints with it.
     pub fn set_text_scale(&self, scale: f64) {
-        let scale = if scale.is_finite() {
-            scale.clamp(0.5, 3.0)
-        } else {
-            1.0
-        };
-        let display = self.display();
-        let mut style = self.imp().text_style.borrow_mut();
-        let (_, provider, class) = style.get_or_insert_with(|| {
-            static NEXT_SCALE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-            let id = NEXT_SCALE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let class = format!("chat-scale-{id}");
-            self.add_css_class(&class);
-            let provider = gtk4::CssProvider::new();
-            gtk4::style_context_add_provider_for_display(
-                &display,
-                &provider,
-                gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 2,
-            );
-            (display, provider, class)
-        });
-        provider.load_from_data(&format!(".{class} {{ font-size: {scale}em; }}"));
+        let scale = crate::style::clamp_text_scale(scale);
+        crate::style::set_text_scale(scale);
         if let Some(inner) = self.inner() {
             inner.header.set_text_scale(scale);
         }
@@ -2298,6 +2295,317 @@ pub(crate) mod tests {
         }
     }
 
+    /// Every kind of transcript row, built as the transcript builds it, is a list item named
+    /// by `row_label`: notices, dividers, errors, requests, quick replies and plans as much as
+    /// messages and tools.
+    #[test]
+    #[ignore = "constructs GTK widgets; run on a private display"]
+    fn every_kind_of_transcript_row_is_a_named_list_item() {
+        use agent_core::event::{Decision, PlanStep, StepStatus, TurnState};
+        use model::{Body, Item};
+        let _ctx = native_init();
+        let sink: cards::RowSink = std::rc::Rc::new(|_| {});
+        let bodies = vec![
+            Body::User {
+                text: "Fix it".into(),
+                queued: true,
+                attachments: Vec::new(),
+            },
+            Body::Assistant {
+                text: "On it".into(),
+                driver: Driver::Codex,
+                streaming: false,
+                images: Vec::new(),
+            },
+            Body::new_reasoning(),
+            Body::Tool(model::Tool {
+                kind: agent_core::event::ItemKind::Command,
+                title: "cargo test".into(),
+                input: None,
+                input_text: String::new(),
+                output: String::new(),
+                error: None,
+                status: model::ToolStatus::Completed,
+                reported_model: None,
+                images: Vec::new(),
+            }),
+            Body::Notice {
+                text: "Heads up".into(),
+                tone: model::Tone::Warning,
+            },
+            Body::Compaction {
+                manual: true,
+                before: 90_000,
+                after: Some(12_000),
+            },
+            Body::TurnError {
+                message: "boom".into(),
+            },
+            Body::Switch {
+                driver: Driver::Claude,
+                model: Some("opus".into()),
+                agent_changed: true,
+                returned: false,
+            },
+            Body::Approval(model::Approval {
+                request: "a1".into(),
+                tool: "Bash".into(),
+                title: Some("Run cargo test".into()),
+                input: serde_json::Value::Null,
+                reason: None,
+                options: vec![Decision::Allow, Decision::Deny],
+                state: model::ApprovalState::Pending,
+                remembers: None,
+            }),
+            Body::Question(model::QuestionCard {
+                request: "q1".into(),
+                questions: Vec::new(),
+                state: model::QuestionState::Pending,
+            }),
+            Body::Form(model::FormCard {
+                request: "f1".into(),
+                server: "docs".into(),
+                message: "Sign in".into(),
+                form: agent_core::form::Form::Link {
+                    url: "https://example.com/login".into(),
+                },
+                state: model::FormState::Pending,
+                refused: false,
+            }),
+            Body::QuickReplies(model::QuickReplies {
+                request: "reply:a2".into(),
+                options: vec!["Yes".into(), "No".into()],
+            }),
+            Body::Plan {
+                steps: vec![PlanStep {
+                    text: "Build".into(),
+                    status: StepStatus::InProgress,
+                }],
+                outcome: Some(TurnState::Interrupted),
+            },
+        ];
+        for (n, body) in bodies.into_iter().enumerate() {
+            let item = Item {
+                id: format!("row-{n}"),
+                body,
+                expanded: false,
+                parent: None,
+                children: Vec::new(),
+            };
+            let row = cards::Row::build(&item, &sink);
+            let widget = row.widget();
+            let name = cards::row_label(&item.body);
+            assert!(
+                gtk4::test_accessible_has_role(&widget, gtk4::AccessibleRole::ListItem),
+                "{name}: not a list item"
+            );
+            assert!(
+                crate::testutil::has_accessible_label(&widget, &name),
+                "{n}: not named {name:?}"
+            );
+        }
+    }
+
+    /// The transcript is a list a screen reader steps through: each message, step and request
+    /// is a list item, named by its author or kind ("You", "Claude", "Tool: …"), and a reply
+    /// streaming in or a tool at work is busy until it is done.
+    #[test]
+    #[ignore = "constructs GTK widgets; run on a private display"]
+    fn transcript_rows_are_list_items_named_by_their_author() {
+        use agent_core::event::{Envelope, Event, ItemKind, ItemStatus, StreamKind, TurnState};
+        use cards::{row_busy, row_label};
+        let ctx = native_init();
+        let view = ChatView::new(StubBackend::new(Driver::Claude));
+        let window = gtk4::Window::new();
+        window.set_default_size(900, 700);
+        window.set_child(Some(&view));
+        window.present();
+        view.replay(&demo::DemoBackend::script_envelopes());
+        while ctx.iteration(false) {}
+        let inner = view.inner().expect("inner");
+        let (transcript, _, _) = view.region_widgets().expect("regions");
+        let list = crate::testutil::descendants(&transcript)
+            .into_iter()
+            .find(|w| w.has_css_class("transcript"))
+            .expect("the message list");
+        assert!(gtk4::test_accessible_has_role(
+            &list,
+            gtk4::AccessibleRole::List
+        ));
+
+        let rows: Vec<(String, model::Body)> = {
+            let model = inner.model.borrow();
+            model
+                .order()
+                .iter()
+                .filter_map(|id| model.get(id).map(|i| (id.clone(), i.body.clone())))
+                .collect()
+        };
+        let mut nested = 0;
+        let mut kinds = std::collections::HashSet::new();
+        for (id, body) in &rows {
+            let name = row_label(body);
+            let Some(widget) = inner.transcript.with_row(id, cards::Row::widget) else {
+                continue; // not built: outside the window of rows
+            };
+            assert!(
+                crate::testutil::has_accessible_label(&widget, &name),
+                "{id}: not named {name:?}"
+            );
+            assert!(
+                crate::testutil::has_accessible_busy(&widget, row_busy(body)),
+                "{name}: not busy={}",
+                row_busy(body)
+            );
+            assert!(
+                gtk4::test_accessible_has_role(&widget, gtk4::AccessibleRole::ListItem),
+                "{name}: not a list item"
+            );
+            // A card's nested steps are list items: their container is a named list.
+            if let Some(children) = inner
+                .transcript
+                .with_row(id, |row| row.children_box().cloned())
+                .flatten()
+            {
+                nested += 1;
+                assert!(
+                    gtk4::test_accessible_has_role(&children, gtk4::AccessibleRole::List),
+                    "{name}: its steps are not a list"
+                );
+                assert!(
+                    crate::testutil::has_accessible_label(children.upcast_ref(), "Sub-agent steps"),
+                    "{name}: its steps are not named"
+                );
+            }
+            kinds.insert(name.split(':').next().unwrap_or_default().to_owned());
+        }
+        assert!(nested > 0, "no card with a steps container was built");
+        for author in ["You", "Claude", "Tool"] {
+            assert!(kinds.contains(author), "no row named {author}: {kinds:?}");
+        }
+
+        // What the row's widget says: its name and whether it is busy, as a screen reader
+        // reads them.
+        let says = |id: &str, name: &str, busy: bool| {
+            while ctx.iteration(false) {}
+            let widget = inner
+                .transcript
+                .with_row(id, cards::Row::widget)
+                .unwrap_or_else(|| panic!("{id}: no row"));
+            assert!(
+                crate::testutil::has_accessible_label(&widget, name),
+                "{id}: not named {name:?}"
+            );
+            assert!(
+                crate::testutil::has_accessible_busy(&widget, busy),
+                "{id}: not busy={busy}"
+            );
+        };
+        // A reply streaming in and a running tool, in a turn of their own.
+        let start = |reply: &str, tool: &str, input: Option<serde_json::Value>| {
+            view.apply(&Envelope::new(Event::TurnStarted { model: None }));
+            view.apply(&Envelope::item_started(
+                reply,
+                ItemKind::AssistantMessage,
+                "",
+                None,
+                None,
+            ));
+            view.apply(&Envelope::delta(
+                reply,
+                StreamKind::Assistant,
+                "Working on it",
+            ));
+            view.apply(&Envelope::item_started(
+                tool,
+                ItemKind::Command,
+                "cargo test",
+                input,
+                None,
+            ));
+            says(reply, "Claude", true);
+            says(tool, "Tool: cargo test", true);
+        };
+
+        // Done, neither is busy.
+        start("live-reply", "live-tool", None);
+        view.apply(&Envelope::item_completed(
+            "live-reply",
+            ItemStatus::Completed,
+            None,
+            None,
+        ));
+        view.apply(&Envelope::item_completed(
+            "live-tool",
+            ItemStatus::Completed,
+            Some("ok"),
+            None,
+        ));
+        says("live-reply", "Claude", false);
+        says("live-tool", "Tool: cargo test", false);
+        view.apply(&Envelope::turn_completed(TurnState::Completed, None));
+
+        // Stopped, or failed, with neither finished: both settle, the tool shown interrupted.
+        // A command run in the background outlives a failed turn and stays busy.
+        let tool_status = |id: &str| match &inner.model.borrow().get(id).expect(id).body {
+            model::Body::Tool(t) => t.status,
+            other => panic!("{id}: {other:?}"),
+        };
+        for (n, state) in [TurnState::Interrupted, TurnState::Failed]
+            .into_iter()
+            .enumerate()
+        {
+            let (reply, tool, bg) = (format!("r{n}"), format!("t{n}"), format!("bg{n}"));
+            start(&reply, &tool, None);
+            view.apply(&Envelope::item_started(
+                &bg,
+                ItemKind::Command,
+                "cargo build",
+                Some(serde_json::json!({"command": "cargo build", "run_in_background": true})),
+                None,
+            ));
+            view.apply(&Envelope::turn_completed(state, Some("boom")));
+            says(&reply, "Claude", false);
+            says(&tool, "Tool: cargo test", false);
+            assert_eq!(tool_status(&tool), model::ToolStatus::Interrupted);
+            says(&bg, "Tool: cargo build", true);
+        }
+
+        // The session exits mid-turn: nothing goes on, background work included.
+        start("exit-reply", "exit-tool", None);
+        view.apply(&Envelope::new(Event::SessionExited {
+            code: Some(1),
+            expected: false,
+        }));
+        says("exit-reply", "Claude", false);
+        says("exit-tool", "Tool: cargo test", false);
+        says("bg1", "Tool: cargo build", false);
+
+        // Reasoning is done once the reply after it begins.
+        view.apply(&Envelope::new(Event::TurnStarted { model: None }));
+        view.apply(&Envelope::item_started(
+            "think",
+            ItemKind::Reasoning,
+            "",
+            None,
+            None,
+        ));
+        view.apply(&Envelope::delta("think", StreamKind::Reasoning, "Hmm"));
+        says("think", "Reasoning", true);
+        view.apply(&Envelope::item_started(
+            "answer",
+            ItemKind::AssistantMessage,
+            "",
+            None,
+            None,
+        ));
+        says("think", "Reasoning", false);
+        says("answer", "Claude", true);
+        view.apply(&Envelope::turn_completed(TurnState::Completed, None));
+        says("answer", "Claude", false);
+        window.destroy();
+    }
+
     #[test]
     #[ignore = "constructs GTK widgets; run on a private display"]
     fn a_saved_prompt_fills_its_placeholders_from_the_thread() {
@@ -2861,6 +3169,94 @@ pub(crate) mod tests {
                 STYLE.contains(&format!("{class}:focus-visible")),
                 "{class} has no :focus-visible rule"
             );
+        }
+    }
+
+    /// A button filled with a colour the focus ring may equal (the accent) draws its ring
+    /// outside itself, on the surface around it, never inset on its own fill: in the chat's
+    /// stylesheet and in the global one (main.rs), whose `button.suggested-action` fill reaches
+    /// every dialog, popover and page. A ring covers a fill only when its selector is the
+    /// fill's own or a wider one: one compound selector the fill's last compound includes
+    /// (`button.suggested-action` covers `.chat-view button.suggested-action`, `.send-button`
+    /// covers `button.send-button`; never the reverse).
+    #[test]
+    fn a_filled_button_rings_outside_its_fill() {
+        // (selectors, body) of every rule in both stylesheets, comments dropped.
+        let mut css = String::new();
+        for sheet in [STYLE, crate::GLOBAL_CSS] {
+            let mut rest = sheet;
+            while let Some((before, after)) = rest.split_once("/*") {
+                css.push_str(before);
+                rest = after.split_once("*/").map_or("", |(_, tail)| tail);
+            }
+            css.push_str(rest);
+        }
+        let rules: Vec<(String, String)> = css
+            .split('}')
+            .filter_map(|rule| rule.split_once('{'))
+            .map(|(sel, body)| (sel.trim().to_owned(), body.to_owned()))
+            .collect();
+        let filled: Vec<String> = rules
+            .iter()
+            .filter(|(sel, body)| {
+                !sel.contains(':')
+                    && (body.contains("background-color: @at_accent;")
+                        || body.contains("background: @at_accent;"))
+            })
+            .flat_map(|(sel, _)| {
+                sel.split(',')
+                    .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|sel| sel.contains("button"))
+            .collect();
+        for wanted in ["button.send-button", "button.suggested-action"] {
+            assert!(filled.iter().any(|s| s == wanted), "{wanted}: {filled:?}");
+        }
+        // A compound selector's element name (empty for any) and its classes.
+        fn compound(sel: &str) -> (&str, std::collections::BTreeSet<&str>) {
+            let mut parts = sel.split('.');
+            let element = parts.next().unwrap_or_default();
+            (element, parts.collect())
+        }
+        let covers = |ring: &str, fill: &str| {
+            if ring == fill {
+                return true;
+            }
+            if ring.contains(' ') {
+                return false;
+            }
+            let last = fill.rsplit(' ').next().unwrap_or(fill);
+            let ((ring_element, ring_classes), (fill_element, fill_classes)) =
+                (compound(ring), compound(last));
+            (ring_element.is_empty() || ring_element == fill_element)
+                && ring_classes.is_subset(&fill_classes)
+        };
+        for fill in filled {
+            // Every rule whose ring reaches the fill and places it (the bare `:focus-visible`
+            // that only colours every ring places none).
+            let offsets: Vec<&str> = rules
+                .iter()
+                .filter(|(sel, _)| {
+                    sel.split(',').any(|s| {
+                        let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+                        s.strip_suffix(":focus-visible")
+                            .is_some_and(|ring| !ring.is_empty() && covers(ring, &fill))
+                    })
+                })
+                .filter_map(|(_, body)| {
+                    body.split(';')
+                        .find_map(|d| d.trim().strip_prefix("outline-offset:"))
+                        .map(str::trim)
+                })
+                .collect();
+            assert!(!offsets.is_empty(), "{fill}: no focus ring covers it");
+            for offset in offsets {
+                assert!(
+                    !offset.starts_with('-') && offset != "0" && offset != "0px",
+                    "{fill}: its ring is drawn on its own fill ({offset})"
+                );
+            }
         }
     }
 

@@ -456,10 +456,23 @@ fn load_css() {
     // The agents' colours (`@brand_claude`…), which no theme changes.
     brand::install();
     let provider = CssProvider::new();
-    provider.load_from_data(&[
-        "
+    provider.load_from_data(&[GLOBAL_CSS, &palette::tag_chip_css()].concat());
+    gtk4::style_context_add_provider_for_display(
+        &gdk::Display::default().expect("Could not connect to a display."),
+        &provider,
+        STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+}
+
+/// The app's global stylesheet, which [`load_css`] loads with the tag chips' colours.
+pub(crate) const GLOBAL_CSS: &str = "
         window {
             background-color: @at_bg;
+        }
+        /* Every keyboard focus ring, libadwaita's included (it draws it half transparent):
+           opaque, and at 3:1 on every surface (palette.rs: `every_palettes_controls_are_seen`). */
+        :focus-visible {
+            outline-color: @at_focus;
         }
         headerbar {
             background-color: @at_bg_deep;
@@ -478,10 +491,30 @@ fn load_css() {
         .terminal-container {
             padding: 10px;
         }
+        /* Font sizes are relative (to 11pt text: 24pt is 218%), so the app's text scale, set
+           on every window (`style::set_text_scale`), reaches them. Libadwaita 1.5 (Ubuntu 24.04)
+           also sets its typography classes in pt, which would block the window's percentage scale;
+           relative sizes here let the scale reach every label on 1.5 too. */
         .title-1 {
-            font-size: 24pt;
+            font-size: 218%;
             font-weight: bold;
             color: @at_accent;
+        }
+        .title-2, .title-3 {
+            font-size: 136%;
+        }
+        .title-4 {
+            font-size: 118%;
+        }
+        .caption, .caption-heading {
+            font-size: 82%;
+        }
+        statuspage > scrolledwindow > viewport > box > clamp > box > .title {
+            font-size: 181%;
+        }
+        statuspage.compact > scrolledwindow > viewport > box > clamp > box > .title,
+        statuspage.spinner > scrolledwindow > viewport > box > clamp > box > .title {
+            font-size: 136%;
         }
         .command-text {
             font-family: monospace;
@@ -501,13 +534,19 @@ fn load_css() {
         button.suggested-action:hover {
             background-color: @at_accent_hover;
         }
+        /* Filled with the accent, which the focus colour may equal: the ring goes outside it,
+           on the surface around it, where the focus colour reads at 3:1. */
+        button.suggested-action:focus-visible {
+            outline: 2px solid @at_focus;
+            outline-offset: 2px;
+        }
         .loading-text {
-            font-size: 16pt;
+            font-size: 145%;
             font-weight: bold;
             color: @at_fg;
         }
         .loading-subtext {
-            font-size: 11pt;
+            font-size: 100%;
             color: @at_fg_soft;
         }
         .exit-bar {
@@ -564,7 +603,7 @@ fn load_css() {
         }
         .update-dot {
             color: @at_warning;
-            font-size: 9px;
+            font-size: 61%;
             margin: 3px 3px 0 0;
         }
         .thread-list row.active-divider {
@@ -658,7 +697,7 @@ fn load_css() {
             color: @at_fg;
         }
         headerbar .subtitle {
-            font-size: 9pt;
+            font-size: 82%;
             color: @at_fg_soft;
         }
         /* The closing screen: the animation and one calm line below it. */
@@ -667,10 +706,10 @@ fn load_css() {
         }
         .closing-step {
             color: @at_fg_soft;
-            font-size: 11pt;
+            font-size: 100%;
         }
         button.closing-quit {
-            font-size: 9.5pt;
+            font-size: 86%;
             color: @at_fg_dim;
             padding: 2px 10px;
             min-height: 0;
@@ -678,17 +717,7 @@ fn load_css() {
         button.closing-quit:hover {
             color: @at_fg;
         }
-        ",
-        &palette::tag_chip_css(),
-    ]
-    .concat()
-    );
-    gtk4::style_context_add_provider_for_display(
-        &gdk::Display::default().expect("Could not connect to a display."),
-        &provider,
-        STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
-}
+        ";
 
 #[cfg(test)]
 mod brand_css_tests {

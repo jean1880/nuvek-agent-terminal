@@ -776,7 +776,7 @@ pub(super) struct ChatTab {
     pub(super) view: Option<ChatView>,
     building: bool,
     /// The drawer: the paned's end child, hidden until toggled.
-    drawer: gtk4::Box,
+    pub(super) drawer: gtk4::Box,
     drawer_paned: gtk4::Paned,
     drawer_started: bool,
     rate_banner: adw::Banner,
@@ -3902,10 +3902,13 @@ impl AgentTerminalWindow {
 
     fn build_sidebar(&self) -> Rc<Sidebar> {
         let obj = self.obj();
+        // A landmark a screen reader can jump to (F6 cycles to it too).
         let root = Box::builder()
             .orientation(Orientation::Vertical)
             .css_classes(["thread-sidebar"])
+            .accessible_role(gtk4::AccessibleRole::Navigation)
             .build();
+        root.update_property(&[gtk4::accessible::Property::Label("Threads")]);
         let top = Box::builder()
             .orientation(Orientation::Horizontal)
             .spacing(6)
@@ -3928,6 +3931,7 @@ impl AgentTerminalWindow {
             .selection_mode(gtk4::SelectionMode::Single)
             .css_classes(["navigation-sidebar", "thread-list"])
             .build();
+        list.update_property(&[gtk4::accessible::Property::Label("Thread list")]);
         // Until the first load lands (`refresh_sidebar`), rows in the shape of the real ones.
         let placeholder = loading::sidebar_rows();
         list.set_placeholder(Some(&placeholder));
@@ -5724,7 +5728,9 @@ impl AgentTerminalWindow {
             .orientation(Orientation::Vertical)
             .visible(false)
             .css_classes(["terminal-drawer"])
+            .accessible_role(gtk4::AccessibleRole::Region)
             .build();
+        drawer.update_property(&[gtk4::accessible::Property::Label("Terminal drawer")]);
         drawer.append(&search_bar);
         drawer.append(&stack);
 
@@ -6641,6 +6647,11 @@ impl AgentTerminalWindow {
         // Set by the arms below, acted on after the tab borrow is released.
         let mut ask: Option<(adw::TabPage, bool)> = None; // (page, is a question)
         let mut withdraw_ask = false;
+        // For the screen reader: a desktop notification already said it, and a finished turn
+        // finishes the thread. The thread's title, as its page shows it.
+        let mut notified = false;
+        let mut finished_thread = true;
+        let title_now: String;
         // Switched in place to another agent, and that agent has started: the profile the thread
         // was opened with is no longer its agent's, so it follows the new agent's default (stored,
         // for a reopen). Not before: a switch whose agent never starts rolls back, and the old
@@ -6666,6 +6677,7 @@ impl AgentTerminalWindow {
                 return;
             };
             let page = tab.page.clone();
+            title_now = display_title(&page.title()).to_owned();
             let last_output = tab.last_output.clone();
             let Some(chat) = tab.chat.as_mut() else {
                 return;
@@ -6754,6 +6766,8 @@ impl AgentTerminalWindow {
                         chat.rate_limited = true;
                     }
                     if chat.rate_limited {
+                        // The limit was the news, not a finished reply.
+                        finished_thread = false;
                         After::RateLimited(chat.rate_banner.clone(), driver)
                     } else {
                         // With sub-agents or background commands still going the thread is not
@@ -6776,10 +6790,10 @@ impl AgentTerminalWindow {
                         chat.finish_held = !finished && !stopped;
                         // The turn's end is "output went quiet" for the checkpoint bookkeeping.
                         last_output.set(std::time::Instant::now());
-                        After::TurnDone {
-                            page,
-                            notify: finished && r.notify && !stopped,
-                        }
+                        let notify = finished && r.notify && !stopped;
+                        notified = notify;
+                        finished_thread = finished;
+                        After::TurnDone { page, notify }
                     }
                 }
                 Event::BackgroundTasks { tasks } => {
@@ -6820,6 +6834,7 @@ impl AgentTerminalWindow {
                     chat.approval = true;
                     let r = react(Attention::Asked, in_view, focused, false);
                     chat.unread |= r.unread;
+                    notified = r.notify;
                     if r.notify {
                         // A tool server's form is a question for the user, not an approval.
                         let question = matches!(
@@ -6908,6 +6923,13 @@ impl AgentTerminalWindow {
                 other => other,
             }
         };
+        self.announce_event(
+            &env.event,
+            &title_now,
+            in_view && focused,
+            notified,
+            finished_thread,
+        );
         if withdraw_ask {
             if let Some(app) = self.obj().application() {
                 app.withdraw_notification(&approval_notification_id(thread));
@@ -7033,11 +7055,26 @@ impl AgentTerminalWindow {
                 self.config.borrow().notify_on_bell,
             );
             chat.unread |= r.unread;
-            Some(r.notify.then_some(page))
+            Some((
+                display_title(&page.title()).to_owned(),
+                r.notify.then_some(page),
+            ))
         });
-        let Some(page) = due.flatten() else {
+        let Some((title, page)) = due.flatten() else {
             return;
         };
+        self.announce_event(
+            &agent_core::event::Envelope::turn_completed(
+                agent_core::event::TurnState::Completed,
+                None,
+            )
+            .event,
+            &title,
+            in_view && focused,
+            page.is_some(),
+            true,
+        );
+        // The list and the unread mark follow whether or not a notification goes out.
         if in_view && focused {
             let id = thread.to_owned();
             self.write_store("mark the thread read", move |s| s.mark_read(&id));
@@ -12937,6 +12974,685 @@ pub(super) mod tests {
             None,
             "cleared in the store too"
         );
+        window.destroy();
+        crate::testutil::settle(&ctx);
+    }
+
+    /// Opens a Claude thread titled `title` in `dir` whose agent starts and stays silent (a
+    /// script in `dir` that sleeps), so only the events a test sends reach the window. Returns
+    /// its id; the thread is the window's current one.
+    fn open_quiet_thread(imp: &AgentTerminalWindow, dir: &std::path::Path, title: &str) -> String {
+        let agent = dir.join("quiet-agent");
+        std::fs::write(&agent, "#!/bin/sh\nexec sleep 600\n").unwrap();
+        std::fs::set_permissions(&agent, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let profile = Profile {
+            id: "claude-quiet".into(),
+            name: "Claude".into(),
+            command: agent.to_string_lossy().into_owned(),
+            ..crate::config::new_agent_profile(Driver::Claude)
+        };
+        {
+            let mut config = imp.config.borrow_mut();
+            config
+                .profiles
+                .retain(|p| profile_driver(p) != Some(Driver::Claude));
+            config.profiles.insert(0, profile.clone());
+        }
+        RESOLVED.with(|r| {
+            r.borrow_mut().insert(
+                (profile.command.clone(), profile.env_file.clone()),
+                ResolvedAgent {
+                    program: Some(profile.command.clone()),
+                    env: Vec::new(),
+                    env_failed: false,
+                },
+            )
+        });
+        AgentAvailability::shared()
+            .set(Driver::Claude, Availability::Ready(profile.command.clone()));
+        imp.create_chat_thread(NewThread {
+            dir: Some(dir.to_string_lossy().into_owned()),
+            title: Some(title.into()),
+            profile_id: Some("claude-quiet".into()),
+            ..NewThread::new(Driver::Claude)
+        })
+        .expect("opened in place");
+        imp.current_thread().expect("its page")
+    }
+
+    /// F6 and Shift+F6 move between the regions shown, in order, wrapping round; Tab goes
+    /// through them in the same order (sidebar, transcript, shelf, message box, drawer). An
+    /// approval that arrives while the message box has focus leaves it there. Each region is
+    /// a landmark with a role and a name.
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    fn f6_cycles_regions_and_tab_follows_their_order() {
+        use crate::testutil::pump_until;
+        crate::testutil::gtk_init().unwrap();
+        crate::testutil::adw_init().unwrap();
+        crate::icons::register();
+        crate::load_css();
+        crate::window::imp::SPAWN_TERMINAL_PAGES.with(|s| s.set(false));
+        let app = crate::window::imp::test_support::test_app("org.test.FocusRegions", true);
+        CHAT_RESTORED.with(|done| done.set(true));
+        let ctx = glib::MainContext::default();
+        let window = crate::window::imp::test_support::test_window(&app, &ctx);
+        window.set_default_size(1200, 800);
+        window.present();
+        assert!(pump_until(&ctx, 5, || window.is_realized()));
+        let imp = window.imp();
+        assert!(pump_until(&ctx, 20, || !imp.detecting.get()));
+        imp.finish_shell(None);
+        imp.reveal_shell();
+        let dir = tempfile::tempdir().unwrap();
+        let thread = open_quiet_thread(imp, dir.path(), "Regions");
+        assert!(pump_until(&ctx, 10, || imp
+            .with_chat(&thread, |c| c.view.is_some())
+            .unwrap_or(false)));
+        let view = imp
+            .with_chat(&thread, |c| c.view.clone())
+            .flatten()
+            .unwrap();
+        view.replay(&crate::chat::view::demo::DemoBackend::script_envelopes());
+        // A sub-agent at work, so its shelf shows.
+        view.apply(&Envelope::new(Event::TurnStarted { model: None }));
+        view.apply(&Envelope::new(Event::WorkersUpdated {
+            workers: vec![agent_core::event::WorkerSnapshot {
+                id: "w1".into(),
+                name: Some("Reviewer".into()),
+                task: Some("Review the change".into()),
+                state: agent_core::event::WorkerState::Running,
+                activity: None,
+                delegation: None,
+            }],
+            waiting_for: Vec::new(),
+        }));
+        imp.split_view
+            .borrow()
+            .as_ref()
+            .expect("the split view")
+            .set_show_sidebar(true);
+        gtk4::gio::prelude::ActionGroupExt::activate_action(&window, "toggle-drawer", None);
+        let shelf = view.shelf_widget().expect("the shelf");
+        let names =
+            || -> Vec<&'static str> { imp.focus_regions().iter().map(|r| r.name).collect() };
+        assert!(
+            pump_until(&ctx, 10, || names()
+                == ["sidebar", "transcript", "composer", "terminal"]
+                && shelf.is_mapped()),
+            "{:?}, shelf mapped: {}",
+            names(),
+            shelf.is_mapped()
+        );
+
+        // Landmarks: each region has a role and a name.
+        let (transcript, composer, field) = view.region_widgets().unwrap();
+        let sidebar: gtk4::Widget = imp.sidebar.borrow().as_ref().unwrap().root.clone().upcast();
+        let page = imp.page_of_thread(&thread).expect("the thread's page");
+        let drawer = imp
+            .with_page_tab(&page, |t| t.terminal.clone().upcast::<gtk4::Widget>())
+            .expect("the drawer's terminal");
+        let drawer_box = std::iter::successors(drawer.parent(), |w| w.parent())
+            .find(|w| w.has_css_class("terminal-drawer"))
+            .expect("the drawer box");
+        for (widget, role, name) in [
+            (&sidebar, gtk4::AccessibleRole::Navigation, "Threads"),
+            (&transcript, gtk4::AccessibleRole::Region, "Transcript"),
+            (
+                &shelf,
+                gtk4::AccessibleRole::Group,
+                "Sub-agents and background work",
+            ),
+            (&composer, gtk4::AccessibleRole::Region, "Message composer"),
+            (&drawer_box, gtk4::AccessibleRole::Region, "Terminal drawer"),
+        ] {
+            assert!(gtk4::test_accessible_has_role(widget, role), "{name}");
+            assert!(
+                gtk4::test_accessible_has_property(widget, gtk4::AccessibleProperty::Label),
+                "{name}"
+            );
+        }
+
+        // F6 forward from nowhere, round and back to the start; Shift+F6 backwards.
+        let focus = || gtk4::prelude::GtkWindowExt::focus(&window);
+        gtk4::prelude::GtkWindowExt::set_focus(&window, None::<&gtk4::Widget>);
+        let mut went = Vec::new();
+        for _ in 0..5 {
+            went.push(imp.cycle_region(true).unwrap_or("none"));
+        }
+        assert_eq!(
+            went,
+            ["sidebar", "transcript", "composer", "terminal", "sidebar"]
+        );
+        assert!(focus().is_some_and(|f| f == sidebar || f.is_ancestor(&sidebar)));
+        assert_eq!(imp.cycle_region(false), Some("terminal"));
+        assert_eq!(imp.cycle_region(false), Some("composer"));
+        assert_eq!(
+            focus().as_ref(),
+            Some(&field),
+            "the message box's text field"
+        );
+        // Through the accelerator, as a key press reaches it.
+        gtk4::gio::prelude::ActionGroupExt::activate_action(&window, "focus-next-region", None);
+        assert!(focus().is_some_and(|f| f == drawer || f.is_ancestor(&drawer)));
+
+        // An approval arriving while typing leaves the focus in the message box.
+        view.focus_composer();
+        view.set_draft("half a thought");
+        assert!(view.composer_is_focus());
+        view.apply(
+            &Envelope::new(Event::ApprovalRequested {
+                tool: "Bash".into(),
+                title: Some("Run cargo test".into()),
+                input: serde_json::json!({"command": "cargo test"}),
+                reason: None,
+                options: vec![
+                    agent_core::event::Decision::Allow,
+                    agent_core::event::Decision::Deny,
+                ],
+                response: agent_core::event::ResponseCapability::Live,
+                remembers: None,
+            })
+            .request("req-1"),
+        );
+        crate::testutil::settle(&ctx);
+        assert!(
+            view.composer_is_focus(),
+            "the approval did not take the focus"
+        );
+
+        // Tab from the sidebar's row: each region is first entered in this order.
+        let order = [
+            ("sidebar", sidebar.clone()),
+            ("transcript", transcript.clone()),
+            ("shelf", shelf.clone()),
+            ("composer", composer.clone()),
+            ("drawer", drawer_box.clone()),
+        ];
+        for _ in 0..5 {
+            if focus().is_some_and(|f| f == sidebar || f.is_ancestor(&sidebar)) {
+                break;
+            }
+            imp.cycle_region(true);
+        }
+        let mut entered: Vec<&str> = Vec::new();
+        for _ in 0..3000 {
+            if let Some(f) = focus() {
+                if let Some((name, _)) = order
+                    .iter()
+                    .find(|(_, root)| &f == root || f.is_ancestor(root))
+                {
+                    if !entered.contains(name) {
+                        entered.push(name);
+                    }
+                }
+            }
+            if entered.len() == order.len() {
+                break;
+            }
+            window.child_focus(gtk4::DirectionType::TabForward);
+        }
+        assert_eq!(
+            entered,
+            order.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            "Tab order"
+        );
+
+        // The drawer's search entry is in the drawer: Shift+F6 from it goes to the message box,
+        // not into the drawer's own terminal.
+        let bar = crate::testutil::descendants(&drawer_box)
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk4::SearchBar>().ok())
+            .expect("the drawer's search bar");
+        bar.set_search_mode(true);
+        let entry = crate::testutil::descendants(bar.upcast_ref())
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk4::SearchEntry>().ok())
+            .expect("its entry");
+        assert!(pump_until(&ctx, 5, || entry.is_mapped()));
+        assert!(entry.grab_focus());
+        assert_eq!(imp.cycle_region(false), Some("composer"));
+        bar.set_search_mode(false);
+
+        // A dialog keeps the focus: F6 has nowhere to go, and the key goes on unhandled.
+        let dialog = adw::AlertDialog::new(Some("Sure?"), None);
+        dialog.add_response("cancel", "Cancel");
+        dialog.present(Some(&window));
+        assert!(pump_until(&ctx, 5, || window.visible_dialog().is_some()));
+        crate::testutil::settle(&ctx);
+        assert!(imp.focus_regions().is_empty());
+        assert_eq!(imp.cycle_region(true), None);
+        assert_eq!(imp.cycle_region(false), None);
+        assert!(
+            focus().is_none_or(
+                |f| f.is_ancestor(&dialog) || &f == dialog.upcast_ref::<gtk4::Widget>()
+            ),
+            "focus left the dialog: {:?}",
+            focus()
+        );
+        dialog.force_close();
+        assert!(pump_until(&ctx, 5, || window.visible_dialog().is_none()));
+
+        // A sidebar laid over the thread (a narrow window): leaving it closes it, so focus is
+        // never behind it; once hidden it is not a region.
+        let split = imp.split_view.borrow().clone().expect("the split view");
+        split.set_collapsed(true);
+        split.set_show_sidebar(true);
+        crate::testutil::settle(&ctx);
+        assert!(sidebar.grab_focus() || sidebar.child_focus(gtk4::DirectionType::TabForward));
+        assert!(focus().is_some_and(|f| f == sidebar || f.is_ancestor(&sidebar)));
+        // No other region can take the focus: the sidebar stays shown, and keeps it.
+        transcript.set_can_focus(false);
+        field.set_sensitive(false);
+        drawer.set_sensitive(false);
+        assert_eq!(names(), ["sidebar", "transcript", "composer"]);
+        assert_eq!(imp.cycle_region(true), None);
+        assert_eq!(imp.cycle_region(false), None);
+        assert!(
+            split.shows_sidebar(),
+            "the overlay was closed with nothing to go to"
+        );
+        assert!(focus().is_some_and(|f| f == sidebar || f.is_ancestor(&sidebar)));
+        transcript.set_can_focus(true);
+        field.set_sensitive(true);
+        drawer.set_sensitive(true);
+        crate::testutil::settle(&ctx);
+        assert_eq!(imp.cycle_region(true), Some("transcript"));
+        assert!(!split.shows_sidebar(), "the overlay was closed");
+        crate::testutil::settle(&ctx);
+        assert_eq!(
+            imp.region_of_focus(),
+            Some("transcript"),
+            "the focus is in the transcript once the overlay is gone"
+        );
+        assert_eq!(names().first(), Some(&"transcript"), "{:?}", names());
+        split.set_collapsed(false);
+        split.set_show_sidebar(true);
+        crate::testutil::settle(&ctx);
+
+        // Closing: nothing to cycle.
+        imp.closing_started.set(true);
+        assert!(imp.focus_regions().is_empty());
+        imp.closing_started.set(false);
+        window.destroy();
+        crate::testutil::settle(&ctx);
+    }
+
+    /// A real F6 key press, from the X server through every widget's handling, moves the focus
+    /// between regions from inside the thread's panes (each a `GtkPaned`, which binds F6
+    /// itself), and Shift+F6 back; in a terminal the key is the terminal program's: it reaches
+    /// the terminal, and the focus stays there.
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    #[cfg(feature = "terminal")]
+    fn a_real_f6_press_moves_regions_and_is_left_to_a_terminal() {
+        use crate::testutil::{keysym, pump_until, XKeyboard};
+        use std::{cell::RefCell, rc::Rc};
+        use vte4::prelude::*;
+        crate::testutil::gtk_init().unwrap();
+        crate::testutil::adw_init().unwrap();
+        crate::icons::register();
+        crate::load_css();
+        crate::window::imp::SPAWN_TERMINAL_PAGES.with(|s| s.set(false));
+        let app = crate::window::imp::test_support::test_app("org.test.RealF6", true);
+        CHAT_RESTORED.with(|done| done.set(true));
+        let ctx = glib::MainContext::default();
+        let window = crate::window::imp::test_support::test_window(&app, &ctx);
+        window.set_default_size(1200, 800);
+        window.present();
+        assert!(pump_until(&ctx, 5, || window.is_realized()));
+        let imp = window.imp();
+        assert!(pump_until(&ctx, 20, || !imp.detecting.get()));
+        imp.finish_shell(None);
+        imp.reveal_shell();
+        let dir = tempfile::tempdir().unwrap();
+        let thread = open_quiet_thread(imp, dir.path(), "Real F6");
+        assert!(pump_until(&ctx, 10, || imp
+            .with_chat(&thread, |c| c.view.is_some())
+            .unwrap_or(false)));
+        let view = imp
+            .with_chat(&thread, |c| c.view.clone())
+            .flatten()
+            .unwrap();
+        view.replay(&crate::chat::view::demo::DemoBackend::script_envelopes());
+        imp.split_view
+            .borrow()
+            .as_ref()
+            .expect("the split view")
+            .set_show_sidebar(true);
+        gtk4::gio::prelude::ActionGroupExt::activate_action(&window, "toggle-drawer", None);
+        let names =
+            || -> Vec<&'static str> { imp.focus_regions().iter().map(|r| r.name).collect() };
+        assert!(
+            pump_until(&ctx, 10, || names()
+                == ["sidebar", "transcript", "composer", "terminal"]),
+            "{:?}",
+            names()
+        );
+        let page = imp.page_of_thread(&thread).expect("the thread's page");
+        let terminal = imp
+            .with_page_tab(&page, |t| t.terminal.clone())
+            .expect("the drawer's terminal");
+        let keyboard = match XKeyboard::open(&window) {
+            Ok(keyboard) => keyboard,
+            Err(why) => {
+                assert!(
+                    !crate::testutil::real_keys_required(),
+                    "no real key presses on this CI display (libxtst6 must be installed): {why}"
+                );
+                eprintln!("SKIPPED: no real key presses on this display: {why}");
+                window.destroy();
+                return;
+            }
+        };
+        let press = |shift: bool, to: &str| {
+            let from = imp.region_of_focus();
+            keyboard.tap(keysym::F6, shift);
+            assert!(
+                pump_until(&ctx, 5, || imp.region_of_focus() == Some(to)),
+                "{} from {from:?} went to {:?}, not {to}",
+                if shift { "Shift+F6" } else { "F6" },
+                imp.region_of_focus()
+            );
+        };
+
+        // From the message box (in the drawer's pane) back to the transcript, and forward again.
+        view.focus_composer();
+        assert!(pump_until(&ctx, 5, || imp.region_of_focus() == Some("composer")));
+        press(true, "transcript");
+        press(false, "composer");
+        press(false, "terminal");
+
+        // In the terminal F6 is its program's: the window lets it through to the terminal.
+        let reached: Rc<RefCell<Vec<bool>>> = Rc::default();
+        let probe = gtk4::EventControllerKey::new();
+        probe.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let seen = reached.clone();
+        probe.connect_key_pressed(move |_, key, _, state| {
+            if let Some(forward) = super::super::regions::region_key(key, state) {
+                seen.borrow_mut().push(forward);
+            }
+            glib::Propagation::Proceed
+        });
+        terminal.add_controller(probe);
+        let committed: Rc<RefCell<String>> = Rc::default();
+        let sent = committed.clone();
+        terminal.connect_commit(move |_, text, _| sent.borrow_mut().push_str(text));
+        keyboard.tap(keysym::F6, false);
+        keyboard.tap(keysym::F6, true);
+        assert!(
+            pump_until(&ctx, 5, || reached.borrow().len() == 2),
+            "the terminal had {:?}",
+            reached.borrow()
+        );
+        assert_eq!(*reached.borrow(), [true, false]);
+        assert!(
+            pump_until(&ctx, 5, || committed.borrow().contains("\u{1b}[17~")),
+            "the terminal sent {:?}",
+            committed.borrow()
+        );
+        assert_eq!(imp.region_of_focus(), Some("terminal"));
+        assert!(gtk4::prelude::GtkWindowExt::focus(&window)
+            .is_some_and(|f| &f == terminal.upcast_ref::<gtk4::Widget>()));
+
+        // The accelerators' action still leaves it.
+        gtk4::gio::prelude::ActionGroupExt::activate_action(&window, "focus-next-region", None);
+        assert_eq!(imp.region_of_focus(), Some("sidebar"));
+        window.destroy();
+        crate::testutil::settle(&ctx);
+    }
+
+    /// A thread's turn end reaches the window's polite live region, an approval its alert
+    /// region, both once the main loop is idle. The same words again are still a change a
+    /// screen reader sees, and with announcements off nothing changes.
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    fn live_region_updates_on_turn_end() {
+        crate::testutil::gtk_init().unwrap();
+        crate::testutil::adw_init().unwrap();
+        crate::icons::register();
+        let app = crate::window::imp::test_support::test_app("org.test.LiveRegion", true);
+        CHAT_RESTORED.with(|done| done.set(true));
+        let ctx = glib::MainContext::default();
+        let window = crate::window::imp::test_support::test_window(&app, &ctx);
+        let imp = window.imp();
+        let dir = tempfile::tempdir().unwrap();
+        let thread = open_quiet_thread(imp, dir.path(), "Live regions");
+        window.present();
+        crate::testutil::settle(&ctx);
+
+        let (status, alert) = imp.live_region_labels();
+        assert!(gtk4::test_accessible_has_role(
+            &status,
+            gtk4::AccessibleRole::Status
+        ));
+        assert!(gtk4::test_accessible_has_role(
+            &alert,
+            gtk4::AccessibleRole::Alert
+        ));
+        assert_eq!(imp.live_region_texts(), (String::new(), String::new()));
+        let changes = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = changes.clone();
+        status.connect_label_notify(move |_| seen.set(seen.get() + 1));
+
+        let turn = |state| {
+            imp.on_thread_envelope(
+                &thread,
+                Driver::Claude,
+                &Envelope::new(Event::TurnStarted { model: None }),
+            );
+            imp.on_thread_envelope(
+                &thread,
+                Driver::Claude,
+                &Envelope::turn_completed(state, None),
+            );
+        };
+        turn(agent_core::event::TurnState::Completed);
+        // Not before the main loop is idle: announcements are joined and shown there.
+        assert_eq!(imp.live_region_texts().0, "");
+        assert!(
+            crate::testutil::pump_until(&ctx, 5, || imp
+                .live_region_texts()
+                .0
+                .ends_with("finished.")),
+            "{:?}",
+            imp.live_region_texts()
+        );
+        let said = imp.live_region_texts().0;
+        assert!(
+            said == "Reply finished." || said == "“Live regions” finished.",
+            "{said}"
+        );
+
+        // The screen reader reads the region's accessible name, which is its text.
+        assert!(crate::testutil::has_accessible_label(
+            status.upcast_ref(),
+            &said
+        ));
+
+        // The same words again: cleared first, so the screen reader sees a change.
+        let before = changes.get();
+        turn(agent_core::event::TurnState::Completed);
+        assert!(
+            crate::testutil::pump_until(&ctx, 5, || changes.get() >= before + 2),
+            "{} → {}",
+            before,
+            changes.get()
+        );
+        assert_eq!(imp.live_region_texts().0, said);
+
+        // An approval is an alert. Out of sight it is a desktop notification, which says it.
+        let approval = Event::ApprovalRequested {
+            tool: "Bash".into(),
+            title: Some("Run cargo test".into()),
+            input: serde_json::Value::Null,
+            reason: None,
+            options: vec![
+                agent_core::event::Decision::Allow,
+                agent_core::event::Decision::Deny,
+            ],
+            response: agent_core::event::ResponseCapability::Live,
+            remembers: None,
+        };
+        let looking = window.is_active() && imp.current_thread().as_deref() == Some(&thread);
+        imp.on_thread_envelope(&thread, Driver::Claude, &Envelope::new(approval));
+        crate::testutil::settle(&ctx);
+        if looking {
+            assert_eq!(
+                imp.live_region_texts().1,
+                "Approval needed: Run cargo test."
+            );
+        } else {
+            assert_eq!(imp.live_region_texts().1, "");
+        }
+        // Whatever the display makes of the window's focus, the path a looked-at thread takes
+        // reaches the alert region: shown at idle, ahead of any polite text.
+        let before = imp.live_region_texts().1;
+        let other = Event::ApprovalRequested {
+            tool: "Bash".into(),
+            title: Some("Run cargo clippy".into()),
+            input: serde_json::Value::Null,
+            reason: None,
+            options: vec![agent_core::event::Decision::Allow],
+            response: agent_core::event::ResponseCapability::Live,
+            remembers: None,
+        };
+        imp.announce_event(&other, "Live regions", true, false, true);
+        assert_eq!(imp.live_region_texts().1, before, "not before idle");
+        assert!(
+            crate::testutil::pump_until(&ctx, 5, || imp.live_region_texts().1
+                == "Approval needed: Run cargo clippy."),
+            "{:?}",
+            imp.live_region_texts()
+        );
+        assert!(crate::testutil::has_accessible_label(
+            alert.upcast_ref(),
+            "Approval needed: Run cargo clippy."
+        ));
+
+        // A burst is one update: three read, the rest counted.
+        for i in 0..10 {
+            imp.announce_event(
+                &Envelope::turn_completed(agent_core::event::TurnState::Completed, None).event,
+                &format!("Thread {i}"),
+                false,
+                false,
+                true,
+            );
+        }
+        let before = changes.get();
+        assert!(
+            crate::testutil::pump_until(&ctx, 5, || imp
+                .live_region_texts()
+                .0
+                .ends_with("And 7 more.")),
+            "{:?}",
+            imp.live_region_texts()
+        );
+        assert_eq!(
+            imp.live_region_texts().0,
+            "“Thread 0” finished. “Thread 1” finished. “Thread 2” finished. And 7 more."
+        );
+        assert!(changes.get() <= before + 2, "one update for the burst");
+        assert!(!imp.live_region_queued());
+        let said = imp.live_region_texts().0;
+
+        // Closing: nothing is queued, and what waited when it began is not said.
+        let waiting = Event::ApprovalRequested {
+            tool: "Bash".into(),
+            title: Some("Run cargo fmt".into()),
+            input: serde_json::Value::Null,
+            reason: None,
+            options: vec![agent_core::event::Decision::Allow],
+            response: agent_core::event::ResponseCapability::Live,
+            remembers: None,
+        };
+        imp.announce_event(&waiting, "Live regions", true, false, true);
+        assert!(imp.live_region_queued());
+        imp.closing_started.set(true);
+        let before = changes.get();
+        imp.announce_event(
+            &Envelope::turn_completed(agent_core::event::TurnState::Failed, None).event,
+            "Closing",
+            false,
+            false,
+            true,
+        );
+        crate::testutil::settle(&ctx);
+        assert!(!imp.live_region_queued());
+        assert_eq!(changes.get(), before);
+        assert_eq!(imp.live_region_texts().0, said);
+        assert_eq!(
+            imp.live_region_texts().1,
+            "Approval needed: Run cargo clippy."
+        );
+        imp.closing_started.set(false);
+
+        // Off: nothing is queued, nothing changes.
+        imp.config.borrow_mut().announce_events = false;
+        let before = changes.get();
+        turn(agent_core::event::TurnState::Failed);
+        assert!(!imp.live_region_queued());
+        crate::testutil::settle(&ctx);
+        assert_eq!(changes.get(), before);
+        assert_eq!(imp.live_region_texts().0, said);
+        window.destroy();
+        crate::testutil::settle(&ctx);
+    }
+
+    /// A turn that ends while background work still runs is finished once that work goes: the
+    /// thread is marked (unread, or read when looked at) and its sidebar row redrawn, with the
+    /// default settings too, where no desktop notification goes out for a finished turn.
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    fn a_held_finish_redraws_the_sidebar_without_a_notification() {
+        use agent_core::event::{BackgroundTask, BackgroundTaskKind, TurnState};
+        crate::testutil::gtk_init().unwrap();
+        crate::testutil::adw_init().unwrap();
+        crate::icons::register();
+        let app = crate::window::imp::test_support::test_app("org.test.HeldFinish", true);
+        CHAT_RESTORED.with(|done| done.set(true));
+        let ctx = glib::MainContext::default();
+        let window = crate::window::imp::test_support::test_window(&app, &ctx);
+        let imp = window.imp();
+        assert!(!imp.config.borrow().notify_on_bell, "the default");
+        let dir = tempfile::tempdir().unwrap();
+        let thread = open_quiet_thread(imp, dir.path(), "Held finish");
+        window.present();
+        crate::testutil::settle(&ctx);
+
+        let send = |event| imp.on_thread_envelope(&thread, Driver::Claude, &Envelope::new(event));
+        let tasks = |n: usize| Event::BackgroundTasks {
+            tasks: (0..n)
+                .map(|i| BackgroundTask {
+                    id: format!("t{i}"),
+                    kind: BackgroundTaskKind::Shell,
+                    description: Some("cargo build".into()),
+                    tool_use_id: None,
+                })
+                .collect(),
+        };
+        send(Event::TurnStarted { model: None });
+        send(tasks(1));
+        imp.on_thread_envelope(
+            &thread,
+            Driver::Claude,
+            &Envelope::turn_completed(TurnState::Completed, None),
+        );
+        assert_eq!(imp.with_chat(&thread, |c| c.finish_held), Some(true));
+        crate::testutil::settle(&ctx);
+        // The work ends: the release is queued for idle. Run it here, so only it is counted.
+        send(tasks(0));
+        let before = SIDEBAR_REFRESHES.load(std::sync::atomic::Ordering::Relaxed);
+        imp.release_held_finish(&thread);
+        let after = SIDEBAR_REFRESHES.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(imp.with_chat(&thread, |c| c.finish_held), Some(false));
+        assert!(
+            after > before,
+            "the sidebar was redrawn: {before} → {after}"
+        );
+        crate::testutil::settle(&ctx);
         window.destroy();
         crate::testutil::settle(&ctx);
     }

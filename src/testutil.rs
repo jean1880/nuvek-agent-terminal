@@ -424,6 +424,28 @@ pub fn has_accessible_label(widget: &gtk4::Widget, label: &str) -> bool {
     }
 }
 
+/// Whether `widget`'s accessible busy state is `busy`, as GTK's own test check reads it.
+pub fn has_accessible_busy(widget: &gtk4::Widget, busy: bool) -> bool {
+    use gtk4::glib::translate::ToGlibPtr;
+    use gtk4::prelude::*;
+    let accessible = widget.upcast_ref::<gtk4::Accessible>();
+    // SAFETY: `accessible` is a live GtkAccessible for the call, the busy state takes one
+    // gboolean, and a non-NULL result is a newly allocated message we free.
+    unsafe {
+        let message = gtk4::ffi::gtk_test_accessible_check_state(
+            accessible.to_glib_none().0,
+            gtk4::ffi::GTK_ACCESSIBLE_STATE_BUSY,
+            gtk4::glib::ffi::gboolean::from(busy),
+        );
+        if message.is_null() {
+            true
+        } else {
+            gtk4::glib::ffi::g_free(message.cast());
+            false
+        }
+    }
+}
+
 /// The marker `make` sets (`DISPLAY_ENV`) for a run on its private Xvfb display and D-Bus session.
 pub const VIRTUAL_DISPLAY_MARKER: &str = "AGENT_TERMINAL_TEST_DISPLAY";
 
@@ -435,6 +457,18 @@ pub fn require_virtual_display() {
         "GTK tests open windows: run them through `make test` / `make test-one T=...`, which use \
          a private Xvfb display ({VIRTUAL_DISPLAY_MARKER}=xvfb is not set)"
     );
+}
+
+/// Whether a display test that cannot press real keys must fail rather than skip: on CI (the
+/// `CI` variable set and not `false`/`0`/empty) a missing libXtst is a broken runner, and a
+/// skip would let the keyboard path go untested unnoticed. A developer machine without
+/// libXtst keeps the skip.
+pub fn real_keys_required() -> bool {
+    real_keys_required_for(std::env::var("CI").ok().as_deref())
+}
+
+fn real_keys_required_for(ci: Option<&str>) -> bool {
+    ci.is_some_and(|v| !matches!(v.trim(), "" | "0") && !v.trim().eq_ignore_ascii_case("false"))
 }
 
 /// `gtk4::init()` for tests: the one way a test initialises GTK, behind
@@ -682,6 +716,143 @@ pub fn icon_only_without_label(root: &gtk4::Widget) -> Vec<String> {
     out
 }
 
+/// The X keysyms [`XKeyboard::tap`] presses.
+pub mod keysym {
+    pub const F6: u64 = 0xffc3;
+    pub const SHIFT_L: u64 = 0xffe1;
+}
+
+/// A keyboard on a window's X display, for display tests that need a real key press: the key
+/// goes through the X server's XTest extension and comes back the whole way a real one does
+/// (the window's capture phase, the focused widget, then each ancestor's bubble phase and key
+/// bindings). libXtst and the GDK/Xlib calls are looked up at run time with `dlopen`/`dlsym`,
+/// only by the test that asks, so nothing here is linked into any binary.
+#[cfg(target_os = "linux")]
+pub struct XKeyboard {
+    xdisplay: *mut std::ffi::c_void,
+    xid: std::ffi::c_ulong,
+    keycode: unsafe extern "C" fn(*mut std::ffi::c_void, std::ffi::c_ulong) -> u8,
+    set_focus: unsafe extern "C" fn(
+        *mut std::ffi::c_void,
+        std::ffi::c_ulong,
+        std::ffi::c_int,
+        std::ffi::c_ulong,
+    ) -> std::ffi::c_int,
+    flush: unsafe extern "C" fn(*mut std::ffi::c_void) -> std::ffi::c_int,
+    fake: unsafe extern "C" fn(
+        *mut std::ffi::c_void,
+        std::ffi::c_uint,
+        std::ffi::c_int,
+        std::ffi::c_ulong,
+    ) -> std::ffi::c_int,
+    /// The window, kept alive while its X window id is used.
+    _window: gtk4::Window,
+}
+
+#[cfg(target_os = "linux")]
+impl XKeyboard {
+    /// The keyboard for `window` (realized, on the X11 test display), or why there is none: not
+    /// X11, libXtst not installed (`libXtst.so.6`), or no XTest on the display. A test given
+    /// `Err` says so and skips what needs the keyboard.
+    pub fn open(window: &impl gtk4::prelude::IsA<gtk4::Window>) -> Result<Self, String> {
+        use gtk4::glib::translate::ToGlibPtr;
+        use gtk4::prelude::*;
+        use std::ffi::{c_int, c_ulong, c_void, CStr};
+
+        /// `name` from the library `lib` (already loaded, or loaded now), as a `T`.
+        ///
+        /// SAFETY: `T` must be the function pointer type the library declares for `name`.
+        unsafe fn symbol<T: Copy>(lib: &CStr, name: &CStr) -> Result<T, String> {
+            let handle = libc::dlopen(lib.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+            if handle.is_null() {
+                return Err(format!("{} is not installed", lib.to_string_lossy()));
+            }
+            let found = libc::dlsym(handle, name.as_ptr());
+            if found.is_null() {
+                return Err(format!(
+                    "{} has no {}",
+                    lib.to_string_lossy(),
+                    name.to_string_lossy()
+                ));
+            }
+            Ok(std::mem::transmute_copy(&found))
+        }
+        type QueryExtension = unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_int,
+            *mut c_int,
+            *mut c_int,
+            *mut c_int,
+        ) -> c_int;
+        type XDisplayOf = unsafe extern "C" fn(*mut gtk4::gdk::ffi::GdkDisplay) -> *mut c_void;
+        type XidOf = unsafe extern "C" fn(*mut gtk4::gdk::ffi::GdkSurface) -> c_ulong;
+
+        let window: &gtk4::Window = window.upcast_ref();
+        let display = WidgetExt::display(window);
+        if display.type_().name() != "GdkX11Display" {
+            return Err(format!(
+                "the display is {}, not X11",
+                display.type_().name()
+            ));
+        }
+        let surface = NativeExt::surface(window).ok_or("the window is not realized")?;
+        let (gtk, x11, xtst) = (c"libgtk-4.so.1", c"libX11.so.6", c"libXtst.so.6");
+        // SAFETY: each symbol is given the type its library declares; the display and surface
+        // are live X11 GDK objects, and this runs on the main thread that owns the connection.
+        unsafe {
+            let query: QueryExtension = symbol(xtst, c"XTestQueryExtension")?;
+            let fake = symbol(xtst, c"XTestFakeKeyEvent")?;
+            let xdisplay_of: XDisplayOf = symbol(gtk, c"gdk_x11_display_get_xdisplay")?;
+            let xid_of: XidOf = symbol(gtk, c"gdk_x11_surface_get_xid")?;
+            let xdisplay = xdisplay_of(display.to_glib_none().0);
+            if xdisplay.is_null() {
+                return Err("no X connection".into());
+            }
+            let (mut event, mut error, mut major, mut minor) = (0, 0, 0, 0);
+            if query(xdisplay, &mut event, &mut error, &mut major, &mut minor) == 0 {
+                return Err("the display has no XTest extension".into());
+            }
+            Ok(Self {
+                xdisplay,
+                xid: xid_of(surface.to_glib_none().0),
+                keycode: symbol(x11, c"XKeysymToKeycode")?,
+                set_focus: symbol(x11, c"XSetInputFocus")?,
+                flush: symbol(x11, c"XFlush")?,
+                fake,
+                _window: window.clone(),
+            })
+        }
+    }
+
+    /// Presses and releases `keysym`, with Shift held when `shift`, after giving the window the
+    /// X input focus (no window manager runs on the test display to give it). Only sends the
+    /// events: pump the main loop until what the key does is seen.
+    pub fn tap(&self, keysym: u64, shift: bool) {
+        use std::ffi::{c_uint, c_ulong};
+        // SAFETY: the pointers came from `open` for a display and window still alive (the
+        // window is held), and this runs on the main thread that owns the connection.
+        unsafe {
+            // RevertToParent, CurrentTime.
+            (self.set_focus)(self.xdisplay, self.xid, 2, 0);
+            let code = |sym: u64| -> c_uint {
+                let code = (self.keycode)(self.xdisplay, sym as c_ulong);
+                assert!(code != 0, "no key makes keysym {sym:#x}");
+                c_uint::from(code)
+            };
+            let (key, shift_key) = (code(keysym), code(keysym::SHIFT_L));
+            if shift {
+                (self.fake)(self.xdisplay, shift_key, 1, 0);
+            }
+            (self.fake)(self.xdisplay, key, 1, 0);
+            (self.fake)(self.xdisplay, key, 0, 0);
+            if shift {
+                (self.fake)(self.xdisplay, shift_key, 0, 0);
+            }
+            (self.flush)(self.xdisplay);
+        }
+    }
+}
+
 /// Runs the loop until nothing has happened for 100 ms (layout, scrolling and idle work have
 /// finished), giving up after 1 s (a spinner never goes quiet). A bounded poll on quiescence, not a fixed sleep.
 pub fn settle(ctx: &glib::MainContext) {
@@ -748,5 +919,20 @@ mod guard_tests {
             "initialise GTK through testutil::gtk_init / adw_init / native_init:\n{}",
             bad.join("\n")
         );
+    }
+}
+
+#[cfg(test)]
+mod real_keys_tests {
+    use super::real_keys_required_for;
+
+    #[test]
+    fn real_keys_are_required_only_on_ci() {
+        assert!(real_keys_required_for(Some("true")));
+        assert!(real_keys_required_for(Some("1")));
+        assert!(!real_keys_required_for(None));
+        assert!(!real_keys_required_for(Some("")));
+        assert!(!real_keys_required_for(Some("false")));
+        assert!(!real_keys_required_for(Some("0")));
     }
 }

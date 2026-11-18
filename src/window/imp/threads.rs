@@ -1765,7 +1765,12 @@ impl NewThreadSpec {
 pub(super) enum CreationNotice {
     New,
     /// A fork, and where it came from (also kept with the thread): its toast offers Compare.
-    Fork(agent_core::fork_compare::ForkLink),
+    Fork {
+        link: agent_core::fork_compare::ForkLink,
+        /// The working tree its baseline was taken in, where the baseline's ref goes once the
+        /// thread is stored.
+        baseline_in: Option<std::path::PathBuf>,
+    },
     Compact(String),
 }
 
@@ -5227,6 +5232,7 @@ impl AgentTerminalWindow {
             "discard a blank thread",
             // What it was stored with, once deleted; None when the store found something in it.
             move |s| {
+                let baseline = super::fork_compare::stored_baseline(s, &id);
                 let stored = StoredChoices {
                     model: s.thread_summary(&id)?.and_then(|t| t.model),
                     attributes: s.thread_attributes(&id)?,
@@ -5234,11 +5240,14 @@ impl AgentTerminalWindow {
                         s.events(&id, None, REPLAY_LIMIT)?.iter().map(|(_, e)| e),
                     ),
                 };
-                Ok(s.delete_if_blank(&id)?.then_some(stored))
+                Ok(s.delete_if_blank(&id)?.then_some((stored, baseline)))
             },
             move |imp, outcome| {
-                if let Some(Ok(Some(stored))) = outcome {
+                if let Some(Ok(Some((stored, baseline)))) = outcome {
                     info!("Discarded blank thread {thread}");
+                    if let Some((cwd, commit)) = baseline {
+                        super::fork_compare::drop_fork_baseline(cwd, thread, commit);
+                    }
                     imp.offer_undo_discard(spec.with_stored(stored, live));
                 }
             },
@@ -7734,6 +7743,8 @@ impl AgentTerminalWindow {
             format!("“{title}”")
         };
         let mode = self.thread_carry_settings(thread).mode;
+        // A fork's baseline is a checkpoint of its own: none with checkpoints switched off.
+        let takes_baseline = !compact && self.config.borrow().checkpoints;
         let (obj, thread) = (self.obj().downgrade(), thread.to_owned());
         glib::MainContext::default().spawn_local(async move {
             let loaded = store_job({
@@ -7750,6 +7761,14 @@ impl AgentTerminalWindow {
                 }
             })
             .await;
+            // A fork's baseline: the source's folder as it is now, right after the fork point
+            // was read (no window is held meanwhile).
+            let baseline = match (&dir, &loaded) {
+                (Some(dir), Some(Ok(_))) if takes_baseline => {
+                    super::fork_compare::fork_baseline(dir.clone()).await
+                }
+                _ => None,
+            };
             let Some(obj) = obj.upgrade() else { return };
             let imp = obj.imp();
             let (handoff, loaded, fork_seq) = match loaded {
@@ -7767,8 +7786,9 @@ impl AgentTerminalWindow {
             let profile_id = profile_id.or_else(|| carried_stored_profile(&loaded, driver));
             // Only a fork is linked to its source: a compaction replaces its thread.
             let fork = (!compact).then(|| agent_core::fork_compare::ForkLink {
-                source_thread: thread.clone(),
-                fork_seq,
+                base_tree: baseline.as_ref().map(|b| b.tree.clone()),
+                base_commit: baseline.as_ref().map(|b| b.commit.clone()),
+                ..agent_core::fork_compare::ForkLink::new(&thread, fork_seq)
             });
             imp.create_chat_thread(NewThread {
                 dir,
@@ -7778,7 +7798,10 @@ impl AgentTerminalWindow {
                 handoff: Some((handoff, source)),
                 profile_id,
                 notice: Some(match &fork {
-                    Some(link) => CreationNotice::Fork(link.clone()),
+                    Some(link) => CreationNotice::Fork {
+                        link: link.clone(),
+                        baseline_in: baseline.map(|b| b.toplevel),
+                    },
                     None => CreationNotice::Compact(thread),
                 }),
                 fork,
@@ -8185,7 +8208,10 @@ impl AgentTerminalWindow {
             Some(CreationNotice::New) => {
                 self.show_toast("New thread: kept the model and safe mode")
             }
-            Some(CreationNotice::Fork(link)) => {
+            Some(CreationNotice::Fork { link, baseline_in }) => {
+                if let (Some(dir), Some(commit)) = (baseline_in, link.base_commit.clone()) {
+                    super::fork_compare::keep_fork_baseline(dir, thread.to_owned(), commit);
+                }
                 let fork = thread.to_owned();
                 self.action_toast(
                     "Forked thread: kept the model, effort and safe mode",

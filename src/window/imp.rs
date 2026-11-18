@@ -10199,6 +10199,7 @@ mod tests {
         spending::tests::the_spending_group_saves_only_valid_amounts(window);
         spending::tests::a_metered_turn_warns_once_through_the_window(window);
         fork_compare::tests::a_fork_is_linked_and_compared_side_by_side(window);
+        fork_compare::tests::a_forks_files_are_compared_against_its_baseline(window);
     }
 
     /// A folder outside any repository has nothing to diff: no Changes toggle, no shortcut.

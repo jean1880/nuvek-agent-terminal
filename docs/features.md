@@ -39,7 +39,9 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   two agents can take the same problem in different directions.
 - **Compare forks side by side**: **Compare with Fork…** in a thread's context menu, `/compare`,
   or **Compare** on the toast after a fork opens a window with both conversations since the
-  fork, lined up turn by turn.
+  fork, lined up turn by turn, and, in a git repository, a **Changes** tab with what changed in
+  each thread's folder since the fork (two threads sharing one folder show one diff, since
+  their changes cannot be told apart).
 
 ### Multi-agent environment review
 
@@ -226,6 +228,9 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
 - **Turn checkpoints**: in a git repository, the working tree is snapshotted into
   hidden refs when a turn ends. Your branch, index and stash stay as they were.
   See [Turn checkpoints](reference.md#turn-checkpoints).
+- **Fork baselines**: a fork snapshots its source's working tree the same way, under its own
+  hidden ref, so the compare window can show each side's changes since the fork. It goes with
+  the fork. See [Changes since the fork](reference.md#changes-since-the-fork).
 - **Diff panel** (`Ctrl+Shift+D`): uncommitted work, the last turn, everything since
   the thread opened, or the target branch, with files grouped under their folder and each
   file's diff on its own row. Open any file in your own diff tool, or in your editor at the

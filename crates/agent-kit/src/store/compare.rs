@@ -26,6 +26,15 @@ pub struct CompareColumn {
     pub entries: Vec<Entry>,
 }
 
+/// A fork comparison's two columns and the baseline each is compared against
+/// ([`Store::fork_columns`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkColumns {
+    pub columns: Vec<CompareColumn>,
+    /// The baseline tree of each column, when the fork has one.
+    pub bases: [Option<String>; 2],
+}
+
 impl Store {
     /// Where `thread` was forked from, if it is a fork. A malformed value is ignored (with a
     /// warning): the thread is then compared with nothing through it.
@@ -121,6 +130,21 @@ impl Store {
         Ok(out)
     }
 
+    /// What a comparison of `thread` with `pairing`'s other thread reads, in one snapshot: each
+    /// side's column ([`Self::compare_columns`] of [`Pairing::sides`]) and the baseline tree it
+    /// is compared against ([`Pairing::bases`]), in the same order.
+    pub fn fork_columns(&self, thread: &str, pairing: &Pairing) -> Result<ForkColumns> {
+        let snapshot = self.scope(rusqlite::TransactionBehavior::Deferred)?;
+        let columns = self.compare_columns(&pairing.sides(thread))?;
+        let own = self.fork_link(thread)?;
+        let other = self.fork_link(&pairing.other)?;
+        snapshot.commit()?;
+        Ok(ForkColumns {
+            columns,
+            bases: pairing.bases(own.as_ref(), other.as_ref()),
+        })
+    }
+
     /// `thread`'s prompts, replies and tool calls whose first event came after `after`.
     fn compare_entries(&self, thread: &str, after: i64) -> Result<Vec<Entry>> {
         Ok(self
@@ -154,10 +178,7 @@ mod tests {
     use super::*;
 
     fn link(source: &str, seq: i64) -> ForkLink {
-        ForkLink {
-            source_thread: source.to_owned(),
-            fork_seq: seq,
-        }
+        ForkLink::new(source, seq)
     }
 
     /// A thread whose record carries `fork`.
@@ -210,6 +231,45 @@ mod tests {
             s.fork_links().unwrap(),
             [("fork".to_owned(), link("src", 7))],
             "an unreadable link is left out of the list too"
+        );
+    }
+
+    #[test]
+    fn a_baseline_is_kept_with_the_link_and_an_earlier_builds_link_has_none() {
+        let s = Store::open_in_memory().expect("store");
+        let tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let based = ForkLink {
+            base_tree: Some(tree.into()),
+            base_commit: Some(commit.into()),
+            ..link("src", 2)
+        };
+        thread(&s, "src", None);
+        thread(&s, "fork", Some(based.clone()));
+        thread(&s, "old", None);
+        // What a build before baselines wrote.
+        s.set_meta(
+            &thread_fork_key("old"),
+            r#"{"source_thread":"src","fork_seq":2}"#,
+        )
+        .unwrap();
+        assert_eq!(s.fork_link("fork").unwrap(), Some(based));
+        assert_eq!(s.fork_link("old").unwrap(), Some(link("src", 2)));
+        // Seen from the source, the fork's baseline is both sides'; a sibling with none has none.
+        let pairings = s.fork_pairings("src").unwrap();
+        let fork = pairings.iter().find(|p| p.other == "fork").expect("fork");
+        let read = s.fork_columns("src", fork).unwrap();
+        assert_eq!(read.bases, [Some(tree.into()), Some(tree.into())]);
+        assert_eq!(read.columns.len(), 2);
+        let sibling = s
+            .fork_pairings("fork")
+            .unwrap()
+            .into_iter()
+            .find(|p| p.other == "old")
+            .expect("sibling");
+        assert_eq!(
+            s.fork_columns("fork", &sibling).unwrap().bases,
+            [Some(tree.into()), None]
         );
     }
 

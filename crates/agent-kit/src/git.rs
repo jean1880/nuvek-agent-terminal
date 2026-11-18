@@ -17,6 +17,12 @@ use std::process::Command;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
+mod fork;
+pub use fork::{
+    drop_fork_baseline, fork_changes, fork_ref, is_fork_ref, keep_fork_baseline,
+    take_fork_baseline, BaselineOutcome, ForkBaseline, ForkChanges, FORK_REF_ROOT,
+};
+
 /// Timeout for read-only queries.
 pub const QUERY_TIMEOUT_SECS: u64 = 5;
 /// Timeout for each step of a snapshot. `add -u` hashes every changed file.
@@ -726,7 +732,8 @@ pub fn checkpoints_of(entries: &[RefEntry], key: u64) -> Vec<(u32, &RefEntry)> {
 }
 
 /// Refs to delete: any older than `cutoff` (seconds since the epoch), plus
-/// tab `key`'s oldest checkpoints beyond `max_per_tab`.
+/// tab `key`'s oldest checkpoints beyond `max_per_tab`. A fork's baseline
+/// ([`fork_ref`]) is never among them: it lives as long as its thread.
 pub fn refs_to_prune(
     entries: &[RefEntry],
     key: u64,
@@ -735,7 +742,7 @@ pub fn refs_to_prune(
 ) -> Vec<String> {
     let mut doomed: Vec<String> = entries
         .iter()
-        .filter(|e| e.time < cutoff)
+        .filter(|e| e.time < cutoff && !is_fork_ref(&e.refname))
         .map(|e| e.refname.clone())
         .collect();
     let own = checkpoints_of(entries, key);
@@ -1079,33 +1086,42 @@ pub fn tab_diff(dir: &Path, key: u64, base: crate::diff::DiffBase) -> Result<Dif
         }
     };
 
+    let mut diff = diff_trees(&repo, &from, &to)?;
+    // Undo goes back to the diff's left side. Not offered for Uncommitted or TargetBranch,
+    // where that would throw away unstaged or branch work.
+    diff.undo_to =
+        (base != DiffBase::Uncommitted && base != DiffBase::TargetBranch).then(|| from.clone());
+    diff.to_checkpoint = (base == DiffBase::LastTurn).then(|| to.clone());
+    Ok(DiffOutcome::Ready(diff))
+}
+
+/// The diff from tree (or commit) `from` to `to` in `repo`: its file stats, and its text cut
+/// to the panel's caps ([`crate::diff::truncate`]), or not fetched at all past
+/// [`MAX_FETCHED_DIFF_LINES`]. Git's own diff only ([`DIFF`]: no external diff, no textconv
+/// filter). Offers no Undo and names no checkpoint. Blocking.
+pub fn diff_trees(repo: &RepoInfo, from: &str, to: &str) -> Result<TabDiff, String> {
     let numstat = git_raw(
         &repo.toplevel,
-        DIFF.iter().copied().chain(["--numstat", "-z", &from, &to]),
+        DIFF.iter().copied().chain(["--numstat", "-z", from, to]),
         &[],
         SNAPSHOT_TIMEOUT_SECS,
     )?;
     let stats = crate::diff::parse_numstat(&numstat);
-    // Undo goes back to the diff's left side. Not offered for Uncommitted or TargetBranch,
-    // where that would throw away unstaged or branch work.
-    let undo_to =
-        (base != DiffBase::Uncommitted && base != DiffBase::TargetBranch).then(|| from.clone());
-    let to_checkpoint = (base == DiffBase::LastTurn).then(|| to.clone());
     let (_, added, deleted) = crate::diff::totals(&stats);
     if added + deleted > MAX_FETCHED_DIFF_LINES {
-        return Ok(DiffOutcome::Ready(TabDiff {
+        return Ok(TabDiff {
             stats,
             text: String::new(),
             omitted_lines: 0,
             too_large: true,
-            undo_to,
-            from,
-            to_checkpoint,
-        }));
+            undo_to: None,
+            from: from.to_owned(),
+            to_checkpoint: None,
+        });
     }
     let raw = git_raw(
         &repo.toplevel,
-        DIFF.iter().copied().chain([from.as_str(), to.as_str()]),
+        DIFF.iter().copied().chain([from, to]),
         &[],
         SNAPSHOT_TIMEOUT_SECS,
     )?;
@@ -1115,15 +1131,15 @@ pub fn tab_diff(dir: &Path, key: u64, base: crate::diff::DiffBase) -> Result<Dif
         crate::diff::MAX_DIFF_BYTES,
         crate::diff::MAX_DIFF_LINES,
     );
-    Ok(DiffOutcome::Ready(TabDiff {
+    Ok(TabDiff {
         stats,
         text: kept.to_string(),
         omitted_lines,
         too_large: false,
-        undo_to,
-        from,
-        to_checkpoint,
-    }))
+        undo_to: None,
+        from: from.to_owned(),
+        to_checkpoint: None,
+    })
 }
 
 #[cfg(test)]

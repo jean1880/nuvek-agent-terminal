@@ -135,9 +135,38 @@ The model's reasoning and the app's notices are not shown. The first 100 rows ar
 each entry at most 16 KB of text; the window says what it leaves out. **Refresh** (the header's
 button) reads both threads again.
 
-The link is a `thread_fork:<thread>` entry in the store's metadata, holding only the source's id
-and a sequence number. It goes when the fork is deleted; deleting the source leaves the forks
-comparable with each other. File changes are not compared yet.
+The link is a `thread_fork:<thread>` entry in the store's metadata, holding only the source's id,
+a sequence number and, in a git repository, the ids of the fork's baseline (below). It goes when
+the fork is deleted; deleting the source leaves the forks comparable with each other.
+
+#### Changes since the fork
+
+When the source's folder is in a git repository, forking it also takes a **baseline**: a snapshot
+of the folder's working tree as it is at the fork, staged or not, with untracked files that are
+not ignored. It is taken as a turn checkpoint is (see [Turn checkpoints](#turn-checkpoints)):
+through a private index, leaving your index, HEAD, branch, working tree and stash exactly as they
+were, and leaving out untracked files whose names look like secrets, files over 5 MiB and nested
+repositories. It is kept by a ref, `refs/agent-terminal/fork/<fork's id>`, which checkpoint
+pruning never removes; it goes when the fork is deleted (only while it still points where the
+fork left it), and with every other `refs/agent-terminal/*` ref at uninstall. A fork made with
+**Checkpoint Each Turn** off (Settings → Git), while git was busy in the folder (another git
+command holding its index), outside a repository, or by an earlier version has no baseline, and
+its window says so.
+
+The window's **Changes** tab (beside **Transcripts**, in its header) shows, for each thread, what
+changed in its folder between the baseline and now: the files under a heading per folder, each
+opening to its diff, and the totals above them, as in the diff panel but read only. Files changed
+on both sides are named above the columns. A fork and its source are both compared against the
+fork's baseline; two forks of one thread each against their own. The diffs are git's own, file
+tree to file tree: no external diff tool or textconv filter set in git's configuration runs, and
+they are cut as the diff panel's are (1 MiB or 20,000 lines of text; past 200,000 changed lines the
+file list only). **Refresh** reads them again.
+
+**Two threads in one folder.** A fork opens in its source's folder, so both threads change the
+same files, and git cannot tell which thread changed what. The tab then says so and shows one
+diff for the folder: everything that changed there since the fork, by either thread (or by you).
+It tells you what the two threads did together, not which one did it; the transcripts are what
+tell them apart.
 
 ### Pinning threads
 

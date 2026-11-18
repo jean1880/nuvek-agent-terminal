@@ -885,19 +885,29 @@ impl AgentTerminalWindow {
             || crate::delegation::supervisor().is_some_and(|s| s.root_has_live_children(thread));
         self.close_row_without_discard(thread);
         let id = thread.to_owned();
-        // Already gone (deleted elsewhere meanwhile) is deleted too.
+        let thread_id = thread.to_owned();
+        // Already gone (deleted elsewhere meanwhile) is deleted too. A fork's baseline (its
+        // folder and commit, read before the thread goes) goes with it once it is deleted.
         self.write_store_then(
             "delete the thread",
-            move |s| match s.delete_thread(&id) {
-                Err(agent_kit::store::StoreError::NotFound(_)) => Ok(()),
-                done => done,
+            move |s| {
+                let baseline = super::fork_compare::stored_baseline(s, &id);
+                match s.delete_thread(&id) {
+                    Err(agent_kit::store::StoreError::NotFound(_)) => Ok(None),
+                    Ok(()) => Ok(baseline),
+                    Err(e) => Err(e),
+                }
             },
             move |imp, outcome| {
                 let outcome = outcome.map(|r| r.map_err(|e| e.to_string()));
-                if matches!(outcome, Some(Ok(()))) {
+                if let Some(Ok(baseline)) = &outcome {
                     // Its images go with it, once no other thread refers to them.
                     super::threads::sweep_images();
+                    if let Some((dir, commit)) = baseline.clone() {
+                        super::fork_compare::drop_fork_baseline(dir, thread_id.clone(), commit);
+                    }
                 }
+                let outcome = outcome.map(|r| r.map(|_| ()));
                 imp.show_write_notice(delete_notice(stopped, outcome), |_| {});
             },
         );

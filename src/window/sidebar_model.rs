@@ -1021,6 +1021,8 @@ pub enum ThreadAction {
         effort: Option<String>,
     },
     Fork(String),
+    /// Forks the thread into a new worktree made from a snapshot of its folder.
+    ForkInWorktree(String),
     /// Opens a window reading the thread beside a fork of it, its source or a sibling fork.
     CompareForks(String),
     Compact(String),
@@ -1077,6 +1079,7 @@ impl ThreadAction {
                 effort,
             } => full("switch", thread, *driver, model, effort),
             Self::Fork(t) => simple("fork", t),
+            Self::ForkInWorktree(t) => simple("fork-worktree", t),
             Self::CompareForks(t) => simple("compare-forks", t),
             Self::Compact(t) => simple("compact", t),
             Self::Rename(t) => simple("rename", t),
@@ -1127,6 +1130,7 @@ impl ThreadAction {
                 effort,
             }),
             "fork" => simple(Self::Fork(thread)),
+            "fork-worktree" => simple(Self::ForkInWorktree(thread)),
             "compare-forks" => simple(Self::CompareForks(thread)),
             "compact" => simple(Self::Compact(thread)),
             "rename" => simple(Self::Rename(thread)),
@@ -1338,6 +1342,11 @@ pub fn thread_menu(input: &ThreadMenuInput) -> Vec<MenuEntry> {
                 MenuEntry::Item {
                     label: "Fork thread".to_owned(),
                     action: ThreadAction::Fork(thread.clone()),
+                    enabled: input.has_messages,
+                },
+                MenuEntry::Item {
+                    label: "Fork in Isolated Worktree…".to_owned(),
+                    action: ThreadAction::ForkInWorktree(thread.clone()),
                     enabled: input.has_messages,
                 },
             ]
@@ -2155,6 +2164,7 @@ mod tests {
             labels(false),
             [
                 "Fork thread",
+                "Fork in Isolated Worktree…",
                 "Compact into a new thread",
                 "Rename…",
                 "Pin to Top",
@@ -2171,6 +2181,7 @@ mod tests {
             labels(true),
             [
                 "Fork thread",
+                "Fork in Isolated Worktree…",
                 "Compact into a new thread",
                 "Rename…",
                 "Pin to Top",
@@ -2201,6 +2212,7 @@ mod tests {
                 effort: None,
             },
             ThreadAction::Fork("t".into()),
+            ThreadAction::ForkInWorktree("t".into()),
             ThreadAction::CompareForks("t".into()),
             ThreadAction::Compact("t".into()),
             ThreadAction::Rename("t".into()),
@@ -2234,6 +2246,8 @@ mod tests {
             "delete\u{1f}",
             "bogus\u{1f}t",
             "delete\u{1f}t\u{1f}extra",
+            "fork-worktree\u{1f}",
+            "fork-worktree\u{1f}t\u{1f}x",
             "continue\u{1f}t\u{1f}nope\u{1f}\u{1f}",
             "continue\u{1f}t\u{1f}claude",
         ] {
@@ -2656,6 +2670,11 @@ mod tests {
             let at = |label: &str| labels.iter().position(|l| l == label);
             assert_eq!(
                 at("Compare with Fork…"),
+                at("Fork in Isolated Worktree…").map(|i| i + 1),
+                "beside the fork entries"
+            );
+            assert_eq!(
+                at("Fork in Isolated Worktree…"),
                 at("Fork thread").map(|i| i + 1),
                 "beside Fork thread"
             );

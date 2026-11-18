@@ -20,7 +20,8 @@ use tracing::{debug, info, warn};
 mod fork;
 pub use fork::{
     drop_fork_baseline, fork_changes, fork_ref, is_fork_ref, keep_fork_baseline,
-    take_fork_baseline, BaselineOutcome, ForkBaseline, ForkChanges, FORK_REF_ROOT,
+    lay_in_fork_worktree, take_fork_baseline, BaselineOutcome, ForkBaseline, ForkChanges, LaidIn,
+    FORK_REF_ROOT,
 };
 
 /// Timeout for read-only queries.
@@ -99,7 +100,36 @@ where
     for (name, value) in env {
         cmd.env(name, value);
     }
+    #[cfg(test)]
+    GIT_CALLS.with(|n| n.set(n.get() + 1));
     cmd
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many git processes this thread has started (tests bound what a step costs).
+    pub(crate) static GIT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`git_raw`] with `input` on git's stdin (`--index-info`, `--stdin` and the like).
+pub fn git_raw_with_input<I, S>(
+    dir: &Path,
+    args: I,
+    env: &[(&str, &OsStr)],
+    timeout_secs: u64,
+    input: Vec<u8>,
+) -> Result<Vec<u8>, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let output =
+        crate::exec::run_command_with_input(command(dir, args, env), "git", timeout_secs, input)?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(failure_message(&output.stderr))
+    }
 }
 
 /// Runs git in `dir` and returns its output whatever the exit status.

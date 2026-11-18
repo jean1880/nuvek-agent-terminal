@@ -852,7 +852,7 @@ pub(super) struct ChatTab {
     rate_limited: bool,
     pub(super) unread: bool,
     /// A "stop and close?" question is already on screen for this thread.
-    confirming_close: bool,
+    pub(super) confirming_close: bool,
     /// A "stop and switch?" question is already on screen for this thread.
     confirming_switch: bool,
     /// The user message item awaiting its text, for the title of an untitled thread.
@@ -1439,6 +1439,11 @@ thread_local! {
     /// Threads whose page is closing for a delete or an archive: their detach discards nothing
     /// and offers no Undo ([`AgentTerminalWindow::close_row_without_discard`]).
     static NO_DISCARD: RefCell<std::collections::HashSet<String>> =
+        RefCell::new(std::collections::HashSet::new());
+    /// Threads whose page is closing for a Keep This One: their detach offers no removal of
+    /// their worktree, since the Keep makes its own offer, which its Undo can take back
+    /// ([`AgentTerminalWindow::close_row_for_keep`]).
+    static NO_WORKTREE_OFFER: RefCell<std::collections::HashSet<String>> =
         RefCell::new(std::collections::HashSet::new());
     /// The last session's open threads, as `restore_open_threads` read them before any page
     /// opened, while the empty state offers to reopen them. `None` once reopened or when there
@@ -2052,12 +2057,60 @@ pub(super) struct NewThread {
     pub(super) worktree: Option<crate::worktree::WorktreeInfo>,
     /// Where a fork came from (Fork thread, `/fork`), kept with it; `None` for anything else.
     pub(super) fork: Option<agent_core::fork_compare::ForkLink>,
+    /// What was made for the thread that stays if it never opens (a fork's worktree and
+    /// branch): said with any failure shown, and logged on every path that drops it.
+    pub(super) left_behind: LeftBehind,
+}
+
+/// What was made for a new thread that stays if the thread never opens (a fork's worktree and
+/// branch). Every failure shown says it ([`Self::said`]), and a guard still armed when dropped
+/// logs it, so no path that ends early (the window closing, the folder refused, the store
+/// failing or answering late) loses it; [`Self::disarm`] once the thread opens.
+#[derive(Default)]
+pub(super) struct LeftBehind(Option<String>);
+
+impl LeftBehind {
+    /// What a fork's worktree `info` leaves behind when no thread comes of it.
+    pub(super) fn fork_worktree(info: &crate::worktree::WorktreeInfo) -> Self {
+        Self(Some(format!(
+            "The fork's worktree {} on branch {} was made and is left as it is; remove it with \
+             `git worktree remove` if you do not want it (the branch stays until you delete it).",
+            info.path.display(),
+            info.branch
+        )))
+    }
+
+    pub(super) fn note(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+
+    /// `text`, then what is left behind.
+    pub(super) fn said(&self, text: &str) -> String {
+        match &self.0 {
+            Some(left) => format!("{text}\n\n{left}"),
+            None => text.to_owned(),
+        }
+    }
+
+    /// The thread opened: nothing was left behind.
+    pub(super) fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for LeftBehind {
+    fn drop(&mut self) {
+        if let Some(left) = self.0.take() {
+            warn!("A new thread did not open. {left}");
+        }
+    }
 }
 
 impl NewThread {
     pub(super) fn new(driver: Driver) -> Self {
         Self {
             driver,
+            left_behind: LeftBehind::default(),
             notice: None,
             dir: None,
             here: None,
@@ -5526,6 +5579,19 @@ impl AgentTerminalWindow {
         NO_DISCARD.with(|d| d.borrow_mut().remove(thread));
     }
 
+    /// [`Self::close_row_without_discard`] for a Keep This One: the detach makes no offer to
+    /// remove the thread's worktree either, so the Keep's own offer is the only one.
+    pub(super) fn close_row_for_keep(&self, thread: &str) {
+        NO_WORKTREE_OFFER.with(|d| d.borrow_mut().insert(thread.to_owned()));
+        self.close_row_without_discard(thread);
+        NO_WORKTREE_OFFER.with(|d| d.borrow_mut().remove(thread));
+    }
+
+    /// Whether the page of `thread`, detaching now, must not offer to remove its worktree.
+    pub(super) fn worktree_offer_suppressed(thread: &str) -> bool {
+        NO_WORKTREE_OFFER.with(|d| d.borrow().contains(thread))
+    }
+
     /// The "Empty thread discarded" toast, whose Undo creates the thread again from `spec`.
     fn offer_undo_discard(&self, spec: DiscardedThread) {
         self.action_toast(
@@ -7836,6 +7902,19 @@ impl AgentTerminalWindow {
         priority: adw::ToastPriority,
         on_click: impl Fn(&Self) + 'static,
     ) {
+        self.held_action_toast(title, button, timeout, priority, on_click);
+    }
+
+    /// [`Self::action_toast`], returning the toast, so the caller can dismiss it (shown or still
+    /// queued) once what it offers no longer holds.
+    pub(super) fn held_action_toast(
+        &self,
+        title: &str,
+        button: &str,
+        timeout: u32,
+        priority: adw::ToastPriority,
+        on_click: impl Fn(&Self) + 'static,
+    ) -> adw::Toast {
         let toast = adw::Toast::builder()
             .title(title)
             .use_markup(false)
@@ -7849,7 +7928,8 @@ impl AgentTerminalWindow {
                 on_click(window.imp());
             }
         });
-        self.add_toast(toast);
+        self.add_toast(toast.clone());
+        toast
     }
 
     /// Shows `title` (plain text) until the caller dismisses the returned toast: work that
@@ -8399,6 +8479,10 @@ impl AgentTerminalWindow {
                 self.when_not_busy(thread, move |imp| imp.continue_rate_limited(&id));
             }
             ViewAction::Fork => self.fork_thread(thread, slot.driver(), dir, false),
+            ViewAction::ForkInWorktree => match dir {
+                Some(dir) => self.fork_in_worktree(thread, slot.driver(), dir),
+                None => self.show_toast("This thread has no folder to fork from"),
+            },
             ViewAction::CompareForks => self.compare_with_fork(thread),
             ViewAction::CompactByHandoff => self.fork_thread(thread, slot.driver(), dir, true),
             ViewAction::Rewind => {
@@ -8530,9 +8614,33 @@ impl AgentTerminalWindow {
             settings.model,
             settings.effort,
             compact,
+            None,
         );
     }
 
+    /// Fork in Isolated Worktree, once confirmed: as [`Self::fork_thread`], but the fork opens in
+    /// the new worktree `plan` names, made from a snapshot of the source's folder taken right
+    /// after the fork point is read (that snapshot is the fork's baseline too).
+    pub(super) fn fork_thread_into(
+        &self,
+        thread: &str,
+        driver: Driver,
+        dir: String,
+        plan: crate::worktree::ForkPlan,
+    ) {
+        let settings = self.thread_carry_settings(thread);
+        self.fork_thread_with(
+            thread,
+            driver,
+            Some(dir),
+            settings.model,
+            settings.effort,
+            false,
+            Some(plan),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn fork_thread_with(
         &self,
         thread: &str,
@@ -8541,6 +8649,7 @@ impl AgentTerminalWindow {
         model: Option<String>,
         effort: Option<String>,
         compact: bool,
+        worktree: Option<crate::worktree::ForkPlan>,
     ) {
         let (title, source_driver, source_profile) = self
             .with_chat(thread, |c| {
@@ -8575,14 +8684,51 @@ impl AgentTerminalWindow {
             })
             .await;
             // A fork's baseline: the source's folder as it is now, right after the fork point
-            // was read (no window is held meanwhile).
-            let baseline = match (&dir, &loaded) {
-                (Some(dir), Some(Ok(_))) if takes_baseline => {
+            // was read (no window is held meanwhile). In a worktree of its own, that snapshot is
+            // what is laid into the new worktree as uncommitted changes, taken whether or not
+            // checkpoints are on: it is what carries the source's uncommitted work across.
+            let mut made: Option<crate::worktree::ForkWorktree> = None;
+            let baseline = match (&dir, &loaded, worktree) {
+                (Some(dir), Some(Ok(_)), Some(plan)) => {
+                    let source = dir.clone();
+                    let created = off_main("creating the fork's worktree", move || {
+                        crate::worktree::add_fork(std::path::Path::new(&source), &plan)
+                    })
+                    .await;
+                    match created {
+                        Ok(fork) => {
+                            info!(
+                                "Created worktree {} on {} for a fork",
+                                fork.info.path.display(),
+                                fork.info.branch
+                            );
+                            let baseline = fork.baseline.clone();
+                            made = Some(fork);
+                            Some(baseline)
+                        }
+                        Err(e) => {
+                            if let Some(obj) = obj.upgrade() {
+                                present_message(&obj, "Could Not Fork into a Worktree", &e);
+                            }
+                            return;
+                        }
+                    }
+                }
+                (Some(dir), Some(Ok(_)), None) if takes_baseline => {
                     super::fork_compare::fork_baseline(dir.clone()).await
                 }
                 _ => None,
             };
-            let Some(obj) = obj.upgrade() else { return };
+            // What a fork made in its own worktree leaves behind if no thread comes of it: from
+            // here on, every path that ends without opening the thread logs it (and shows it,
+            // where it shows a failure).
+            let left_behind = made
+                .as_ref()
+                .map(|m| LeftBehind::fork_worktree(&m.info))
+                .unwrap_or_default();
+            let Some(obj) = obj.upgrade() else {
+                return;
+            };
             let imp = obj.imp();
             let (handoff, loaded, fork_seq) = match loaded {
                 Some(Ok(value)) => value,
@@ -8601,10 +8747,33 @@ impl AgentTerminalWindow {
             let fork = (!compact).then(|| agent_core::fork_compare::ForkLink {
                 base_tree: baseline.as_ref().map(|b| b.tree.clone()),
                 base_commit: baseline.as_ref().map(|b| b.commit.clone()),
+                // What a fork in its own worktree took from HEAD: never compared, on either side.
+                not_compared: made
+                    .as_ref()
+                    .map(|m| m.from_head.clone())
+                    .unwrap_or_default(),
                 ..agent_core::fork_compare::ForkLink::new(&thread, fork_seq)
             });
+            if let Some(made) = &made {
+                if !made.baseline.skipped.is_empty() || !made.from_head.is_empty() {
+                    info!(
+                        "The fork's worktree left out {} untracked path(s) and took {} from HEAD",
+                        made.baseline.skipped.len(),
+                        made.from_head.len()
+                    );
+                }
+            }
+            let (dir, worktree) = match made {
+                Some(made) => (
+                    Some(made.dir.to_string_lossy().into_owned()),
+                    Some(made.info),
+                ),
+                None => (dir, None),
+            };
             imp.create_chat_thread(NewThread {
                 dir,
+                worktree,
+                left_behind,
                 model: settings.model,
                 effort: settings.effort,
                 mode: settings.mode,
@@ -8781,15 +8950,17 @@ impl AgentTerminalWindow {
     /// mount), says what it must (a picked folder gone, a missing starting directory), then runs
     /// `then` with the folder, and returns `None`. Only a test without a store writer resolves in
     /// place, so its page comes back at once: `then`'s result. A production store without a
-    /// writer (it failed to open or start) still resolves off the main thread.
+    /// writer (it failed to open or start) still resolves off the main thread. `note` (what
+    /// was made for the thread and stays: [`LeftBehind`]) is said with any refusal.
     fn with_new_thread_dir<R: 'static>(
         &self,
         folders: ThreadFolders,
         what: &'static str,
+        note: Option<String>,
         then: impl FnOnce(&Self, String) -> Option<R> + 'static,
     ) -> Option<R> {
         if cfg!(test) && app_handle().writer().is_none() {
-            let cwd = self.use_new_thread_dir(folders.resolve(), what)?;
+            let cwd = self.use_new_thread_dir(folders.resolve(), what, note.as_deref())?;
             return then(self, cwd);
         }
         let obj = self.obj().downgrade();
@@ -8801,10 +8972,12 @@ impl AgentTerminalWindow {
                 return;
             }
             let Ok(resolved) = resolved else {
-                present_message(&obj, what, "Checking the folder failed.");
+                let failed = "Checking the folder failed.";
+                let body = note.map_or_else(|| failed.to_owned(), |n| format!("{failed}\n\n{n}"));
+                present_message(&obj, what, &body);
                 return;
             };
-            if let Some(cwd) = imp.use_new_thread_dir(resolved, what) {
+            if let Some(cwd) = imp.use_new_thread_dir(resolved, what, note.as_deref()) {
                 then(imp, cwd);
             }
         });
@@ -8812,11 +8985,13 @@ impl AgentTerminalWindow {
     }
 
     /// The folder a new thread starts in, once resolved: a picked folder that is gone is
-    /// refused with a dialog, and a missing starting directory is said in a toast.
+    /// refused with a dialog (saying `note` too), and a missing starting directory is said in a
+    /// toast.
     fn use_new_thread_dir(
         &self,
         resolved: Result<crate::utils::NewThreadDir, String>,
         what: &str,
+        note: Option<&str>,
     ) -> Option<String> {
         match resolved {
             Ok(found) => {
@@ -8827,11 +9002,9 @@ impl AgentTerminalWindow {
             }
             Err(gone) => {
                 warn!("New thread refused: {gone} no longer exists");
-                present_message(
-                    &self.obj(),
-                    what,
-                    &format!("Folder {gone} no longer exists."),
-                );
+                let refused = format!("Folder {gone} no longer exists.");
+                let body = note.map_or_else(|| refused.clone(), |n| format!("{refused}\n\n{n}"));
+                present_message(&self.obj(), what, &body);
                 None
             }
         }
@@ -8890,7 +9063,9 @@ impl AgentTerminalWindow {
             new.here.take(),
             new.profile_id.as_deref(),
         );
-        self.with_new_thread_dir(folders, "Cannot Create a Thread", move |imp, cwd| {
+        // A thread that never opens drops `new`, whose `left_behind` then logs what stays.
+        let note = new.left_behind.note().map(str::to_owned);
+        self.with_new_thread_dir(folders, "Cannot Create a Thread", note, move |imp, cwd| {
             imp.store_new_thread(new, cwd)
         })
     }
@@ -8918,8 +9093,12 @@ impl AgentTerminalWindow {
             profile_id,
             worktree,
             fork,
+            mut left_behind,
             ..
         } = new;
+        // A failure says what stays of what was made for the thread; the guard logs it when it
+        // goes, unless the thread opened.
+        let failed = |left: &LeftBehind, e: &dyn std::fmt::Display| left.said(&e.to_string());
         let store = app_handle();
         // A Local thread opened without a server of its own is pinned to a ready one now, so it
         // keeps that server rather than the first one switched on.
@@ -8953,7 +9132,11 @@ impl AgentTerminalWindow {
         }) {
             Ok(ids) => ids,
             Err(e) => {
-                present_message(&self.obj(), "Cannot Create a Thread", &e.to_string());
+                present_message(
+                    &self.obj(),
+                    "Cannot Create a Thread",
+                    &failed(&left_behind, &e),
+                );
                 return None;
             }
         };
@@ -8993,10 +9176,15 @@ impl AgentTerminalWindow {
         if store.writer().is_none() {
             // In place (memory-only store, tests): the page opens at once.
             if let Err(e) = store.reader().atomically(record) {
-                present_message(&self.obj(), "Cannot Create a Thread", &e.to_string());
+                present_message(
+                    &self.obj(),
+                    "Cannot Create a Thread",
+                    &failed(&left_behind, &e),
+                );
                 return None;
             }
             info!("New {} thread in {cwd}", driver.info().label);
+            left_behind.disarm();
             return self.open_created(&thread, created);
         }
         // Stored by the writer first, and the page opens only once it is: a thread that could
@@ -9005,15 +9193,22 @@ impl AgentTerminalWindow {
         self.write_store_then("create a thread", record, move |imp, stored| match stored {
             Some(Ok(())) => {
                 info!("New {} thread in {cwd}", driver.info().label);
+                left_behind.disarm();
                 imp.open_created(&thread, created);
             }
-            Some(Err(e)) => present_message(&imp.obj(), "Cannot Create a Thread", &e.to_string()),
+            Some(Err(e)) => present_message(
+                &imp.obj(),
+                "Cannot Create a Thread",
+                &failed(&left_behind, &e),
+            ),
             None => {
                 present_message(
                     &imp.obj(),
                     "The Thread Is Not Ready Yet",
-                    "The thread store is far behind. The thread may still be saved: it \
-                     will show in the list once it is.",
+                    &left_behind.said(
+                        "The thread store is far behind. The thread may still be saved: it \
+                         will show in the list once it is.",
+                    ),
                 );
             }
         });
@@ -9107,10 +9302,15 @@ impl AgentTerminalWindow {
     pub(super) fn resume_as_thread(&self, driver: Driver, native_id: &str, dir: Option<String>) {
         let folders = self.thread_folders(driver, None, dir, None);
         let native = native_id.to_owned();
-        self.with_new_thread_dir(folders, "Cannot Resume the Session", move |imp, cwd| {
-            imp.store_resumed_thread(driver, native, cwd);
-            Some(())
-        });
+        self.with_new_thread_dir(
+            folders,
+            "Cannot Resume the Session",
+            None,
+            move |imp, cwd| {
+                imp.store_resumed_thread(driver, native, cwd);
+                Some(())
+            },
+        );
     }
 
     /// [`Self::resume_as_thread`] once its folder is known: checked and created in one unit on

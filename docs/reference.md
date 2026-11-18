@@ -106,12 +106,13 @@ Fields are only ever added within a version; removing or renaming one raises `ve
 
 ### Comparing forks
 
-A fork (**Fork thread** in a thread's context menu, or `/fork`) remembers the thread it came from
+A fork (**Fork thread** or **Fork in Isolated Worktree…** in a thread's context menu, or `/fork`)
+remembers the thread it came from
 and where that thread was at the fork: the last event stored. Only a fork does; a compaction, a
 **Continue in** and an agent switch do not. Threads forked before this was recorded have no link
 and cannot be compared.
 
-**Compare with Fork…** appears in the first section of the context menu, after **Fork thread**,
+**Compare with Fork…** appears in the first section of the context menu, after the fork entries,
 for a fork whose source still exists, a thread that has a fork, and a fork with sibling forks of
 the same thread (archived threads included). `/compare` does the same from the composer, and the
 toast after a fork offers **Compare** with its source. With one thread to compare with, the window
@@ -136,7 +137,8 @@ each entry at most 16 KB of text; the window says what it leaves out. **Refresh*
 button) reads both threads again.
 
 The link is a `thread_fork:<thread>` entry in the store's metadata, holding only the source's id,
-a sequence number and, in a git repository, the ids of the fork's baseline (below). It goes when
+a sequence number, in a git repository the ids of the fork's baseline (below), and, once the
+pair is settled with **Keep This One**, the ids of the thread kept and the one archived. It goes when
 the fork is deleted; deleting the source leaves the forks comparable with each other.
 
 #### Changes since the fork
@@ -166,7 +168,65 @@ file list only). **Refresh** reads them again.
 same files, and git cannot tell which thread changed what. The tab then says so and shows one
 diff for the folder: everything that changed there since the fork, by either thread (or by you).
 It tells you what the two threads did together, not which one did it; the transcripts are what
-tell them apart.
+tell them apart. A fork in its own worktree (below) avoids this.
+
+#### Forking into an isolated worktree
+
+**Fork in Isolated Worktree…** (the context menu, after **Fork thread**) and `/fork worktree` fork
+the thread as **Fork thread** does, but into a new worktree, so the fork and its source never edit
+the same files. `/fork` with no option forks in place, as it always has; any other option is
+refused with a note. The folder must be in a git repository (a submodule or a separate git
+directory is refused, as for **New Thread in Isolated Git Worktree**), and the app says why when
+it cannot be used. A dialog shows the branch and the folder first: the branch is
+`fork/<words of the thread's title>-<n>`, with the first number free, and the folder goes where
+worktrees go (beside the repository, or under **Worktree Folder** in Settings → Git).
+
+The branch starts at the commit the source's folder is on (the dialog's plan is refused if the
+folder moved to another commit or branch since; a branch name taken meanwhile is replaced by the
+next free one), so nothing the app made is ever on it. The fork's baseline (above) is then laid
+into the new worktree as uncommitted changes: modified, deleted and new files as the source's
+folder had them, nothing staged, nothing committed, so the fork starts with the source's work in
+progress and you commit it, in the fork, when you choose. Untracked files whose names look like
+secrets (`.env`, keys), files over 5 MiB, nested repositories and ignored files are not copied;
+tracked files whose names look like secrets, and files your index marks assume-unchanged or
+skip-worktree (submodules included), keep the commit's version (or are left out when the commit
+has none). The fork's baseline is what was laid in, so a fresh fork's **Changes** show nothing and
+its ref keeps none of the files that were not copied. The files it took from the commit are left
+out of both sides' **Changes** (the baseline has the commit's content there, not what the folder
+had), and the tab says how many. Your own
+index, HEAD, branch, working tree and stash are left exactly as they were. The snapshot is taken
+whether or not **Checkpoint Each Turn** is on, since it is what carries the work across. The fork
+opens in the same folder inside the worktree as the source was in, as a worktree thread (its
+diff panel offers **Merge into …** the source's branch once its work is committed), in the
+source's safe mode, never dangerous permissive mode. If the thread cannot be stored once the
+worktree is made, the message names the worktree and branch left behind.
+
+#### Keep This One
+
+Under each column of the **Transcripts** tab, **Keep This One** settles the pair. A click disables
+both buttons; after a confirmation naming what changes (**Cancel** is the default), it archives the
+other thread, records which was kept in the fork's link (both links, for two forks of one thread),
+and adds a notice to the one kept: "Kept over “…”, which is archived". All of that is one store
+write, checked again as it is made: it is refused, writing nothing and saying why, when either
+thread is archived already, the pair was settled already, or a link would lose the record of
+another pair. Only once it has landed does the other thread's page close (a running turn or an
+unsent message is asked about first, as for **Archive**). Nothing is deleted and nothing is
+merged: to bring a fork's work into its base branch, commit it in the fork and use **Merge into
+…**. The toast's **Undo** brings the other thread back and clears the record (the notice stays).
+Once settled, the window shows **Kept** and **Archived** instead of the buttons; a pair where one
+thread is gone or archived already offers nothing.
+
+When the archived thread was opened in a worktree, its removal is offered (a toast with
+**Remove**) only if no other thread works in it (archived ones and delegated sub-agents included,
+links resolved), no open tab is in it, and git says it is still that branch's worktree with
+nothing uncommitted, untracked or ignored in it; otherwise the toast says why it is kept. A fork
+in its own worktree starts with uncommitted work, so its removal is offered only once that is
+committed. It is the only offer: closing the thread's page for the Keep makes none of its own.
+**Undo** takes the offer back, shown or not. **Remove** checks everything again at the click, in
+one step with the removal: the thread must still be archived, no other thread in it, no tab in it
+(folders compared with links resolved), and git must still find it clean. The **Remove** offered
+when any worktree tab closes checks the same, except the archiving. Removal is `git worktree
+remove` without `--force`, and the branch is never deleted.
 
 ### Pinning threads
 

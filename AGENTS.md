@@ -129,7 +129,13 @@ Architectural mandates, standards, and workflows for this codebase.
     that is not two object ids is dropped, never the link; and
     `pairings`: a thread pairs with its source, its forks and its source's other forks, a fork of
     a fork with its own source only, never a thread that is gone; `Pairing::bases`: a fork and
-    its source share the fork's baseline, two siblings each have their own) and `a11y_announce`
+    its source share the fork's baseline, two siblings each have their own; Keep This One's
+    record, `ForkLink::kept` (`Kept`: the thread kept and the one archived, read leniently, so
+    anything but two distinct ids reads as none, never losing the link), written by `settle` on
+    the fork's link, both for two siblings (`SettleRefused` for no pair, a pair settled already,
+    or a link holding another pair's record, which is never overwritten), cleared by `unsettle`,
+    and read by `Pairing::kept` only when it names exactly that pair; `branch_slug`, a fork
+    worktree's branch words) and `a11y_announce`
     (what a screen reader is told of an event, given whether the user was looking and whether a
     desktop notification already said it: an exhaustive match, so a new `Event` variant must
     decide; each part redacted, cut short, never stored, through `plain`, which transcript rows'
@@ -147,7 +153,18 @@ Architectural mandates, standards, and workflows for this codebase.
     working tree as a checkpoint does, `keep_fork_baseline` points
     `refs/agent-terminal/fork/<thread>` at it once the fork is stored, `drop_fork_baseline`
     deletes it with the fork only while it still points there, and `fork_changes` diffs a fresh
-    snapshot of a side's folder against it; checkpoint pruning never takes a fork ref), `diff` (diff bases, numstat, line classification,
+    snapshot of a side's folder against it; checkpoint pruning never takes a fork ref;
+    `lay_in_fork_worktree` lays a baseline's tree into a fresh fork worktree as uncommitted
+    changes only, `read-tree -u --reset` then `reset -q` there, the paths whose names look like
+    secrets and those the source's index marks assume-unchanged or skip-worktree taking HEAD's
+    content (a submodule's gitlink too) through a private index with the snapshot's config
+    overrides, so nothing of the app's lands on a branch and no such file is copied; what it
+    laid in, recorded as a commit (`LaidIn`), is the fork's baseline and what its ref keeps,
+    never the raw snapshot; it writes only a worktree of its own (its canonical toplevel the
+    worktree, its git dir not the source's), and sets the HEAD-kept paths in a bounded number of
+    git processes, `with_entries_from`: an `ls-tree` per chunk and one `update-index -z
+    --index-info` on stdin; those paths go in `ForkLink::not_compared`, which `fork_changes`
+    leaves out of both sides' diffs and the Changes tab counts), `diff` (diff bases, numstat, line classification,
     truncation, the hunk line map, a selection's comment span and a comment's anchor in a
     later diff: exact, moved once, or gone, never a guess; `card_files`/`card_comment_span`, a
     file-change card's diff of several files cut by its headers, one file a comment, and an
@@ -158,8 +175,16 @@ Architectural mandates, standards, and workflows for this codebase.
     one has lost its lines; `repo_path` names a card's file from the thread's repository or
     folder), `restore` (undo: pin, restore, contained deletion, check),
     `worktree` (worktree locations, branch checks, create and clean-only
-    remove; `head_branch`, a folder's branch or why there is none, for a saved prompt's
-    `{branch}`), `commit` (the diff panel's commit of the ticked paths: its context, arguments and
+    remove, and `removal_blocker`, why a worktree's removal is not offered: not registered on its
+    branch, not clean, or git cannot say; `head_branch`, a folder's branch or why there is none,
+    for a saved prompt's `{branch}`; a fork's own worktree: `plan_fork`, read-only, the first free
+    `fork/<slug>-<n>`, its folder and the source's HEAD commit and branch, and `add_fork`, which
+    refuses a source that moved to another commit or branch since, plans the name again once if
+    it was taken, takes the fork's baseline, puts the branch at the source's HEAD commit with
+    `add` and lays the baseline in with `lay_in_fork_worktree`, so the fork starts with the
+    source's uncommitted work, uncommitted, and never a secret-looking file; `remove` refuses
+    uncommitted and untracked files but deletes ignored ones, so every caller runs
+    `removal_blocker` in the same step), `commit` (the diff panel's commit of the ticked paths: its context, arguments and
     run), `merge` (a worktree branch merged back into its base: the read-only `preflight`, the
     one `commands` list the preview shows and the merge runs, and the abort-only `merge`), `github` (a branch's pull-request state, the compare URL, the unforced push; it also gives
     a thread's subtitle its branch, shown only for a repository on GitHub),
@@ -258,7 +283,16 @@ Architectural mandates, standards, and workflows for this codebase.
     fork point in one read, `Store::fork_pairings` names only threads that exist and are not
     hidden, and `Store::compare_columns` folds each side as a hand-off reads it (no reasoning,
     notices or inherited context) after its point, all in one read; `Store::fork_columns` reads
-    those columns and each side's baseline together; each a read through `store_job`.
+    those columns, each side's baseline and which one was kept together; each a read through
+    `store_job`. `Store::keep_fork` (Keep This One, a write through the writer) archives the other
+    thread, never deleting it, records the choice in the pair's links and, unless the kept
+    thread's live session writes it right after, appends its notice (scrubbed like any event) in
+    one transaction that checks everything again, answering `KeepOutcome::Refused` (nothing
+    written) for no pair, a thread archived already, a settled pair or a link holding another
+    pair; it returns the archived thread's worktree and who else works in it.
+    `Store::worktree_occupant` is that question: any thread but one, archived ones and delegated
+    workers' hidden ones included, its folder at or below the path, links resolved.
+    `Store::undo_keep_fork` brings it back and clears the record.
   - The app (`src/`): `config.rs` (persisted settings + migration, re-exporting
     `SessionFormat`; per-agent defaults live on the profiles), `theme.rs`
     (colour schemes, infallible `RGBA::new`), `utils.rs` (detection and
@@ -305,13 +339,35 @@ Architectural mandates, standards, and workflows for this codebase.
     a spinner until its first read, a generation so only the newest read draws, Refresh, replies
     as guarded markdown; its Changes tab, shown once a caller begins a read of it, has a
     generation of its own and draws each side's diff with the diff panel's read-only file list,
-    `diff_panel::read_only_files`; it knows nothing of forks), `window/imp/fork_compare.rs`
+    `diff_panel::read_only_files`; a footer under the columns shows each one's `KeepState`, its
+    Keep This One calling the caller back with the column, `connect_keep`; it knows nothing of
+    forks), `window/imp/fork_compare.rs`
     (Compare with Fork…, `/compare` and the fork toast's Compare: the pairings and the picker,
     then each column read through `store_job` and each side's changes since its baseline through
     `off_main`; two sides in one folder are one diff under a note saying their changes cannot be
     told apart; and the fork's baseline: taken by Fork thread off the main thread, unless
     checkpoints are off, right after the fork point is read, its ref kept once the fork is
-    stored and dropped when the fork is deleted), `window/diff_panel.rs` (the
+    stored and dropped when the fork is deleted, through its main checkout when it was a fork in
+    its own worktree (`stored_baseline`: the worktree may be gone by then); Fork in Isolated
+    Worktree… and `/fork worktree`,
+    which plan the worktree off the main thread, ask, then fork into it as a worktree thread,
+    taking the snapshot whatever the checkpoint setting, while plain `/fork` forks in place as
+    before, a failure after the worktree is made naming the worktree and branch left behind
+    (`NewThread::left_behind`, a `LeftBehind` guard: said with every failure shown and logged
+    by any path that drops it before the thread opens); and Keep This One: both buttons disabled
+    at the click (a `Reread` guard reads the window again on every path, a declined stop question
+    included), the
+    click, a confirmation over the compare window, Cancel the default, `Store::keep_fork` (a
+    refusal said and the pair read again), the other thread's page closed only once that has
+    landed, Undo (`KeepDone`), and the clean-only removal of the archived thread's worktree,
+    offered only when no other thread and no open tab is in it and `removal_blocker` finds
+    nothing, else a toast saying why, taken back by Undo whether shown or not; its Remove
+    (`remove_kept_worktree`) checks, in one `store_job`, the open tabs' folders resolved
+    (`worktree::any_inside`), that the thread is still archived, `worktree_occupant`,
+    `removal_blocker` and only then `remove`; the page Keep closes (`close_row_for_keep`) makes
+    no offer of its own, and the generic Remove of a closed worktree tab checks the tabs,
+    `worktree_occupant` and `removal_blocker` the same way; it never merges),
+    `window/diff_panel.rs` (the
     diff panel's widgets, its file tick boxes, "Commit…", "Open a PR" and "Merge into …" bars;
     it pops out into
     its own window, keeping its
@@ -450,7 +506,16 @@ Architectural mandates, standards, and workflows for this codebase.
   whose names look like secrets are never captured. A fork's baseline is such a snapshot,
   recorded as `refs/agent-terminal/fork/<thread>` (empty old value), spared by checkpoint
   pruning and deleted with its fork; `git::fork::tests` prove it leaves the user's state alone
-  and skips secret-looking files.
+  and skips secret-looking files. A fork in its own worktree starts its new branch at the
+  source's HEAD commit, never at that snapshot commit, and gets the snapshot only as uncommitted
+  changes in the new worktree (`worktree::add_fork`, `git::lay_in_fork_worktree`): nothing the
+  app authored lands on a branch that Open a PR or Merge into could publish.
+  `worktree::tests::fork_worktree_*` prove it carries the uncommitted work, never a
+  secret-looking (tracked or not), assume-unchanged, skip-worktree or ignored file, and leaves the
+  user's index, HEAD and stash alone, and
+  `store::compare::tests::keep_archives_the_other_and_never_removes_a_dirty_worktree` that Keep
+  This One archives, never deletes, is checked again in its transaction, and never has a dirty
+  worktree removed.
 - **Hand-off briefs are the terminal's, not the CLI's**: a CLI out of quota
   cannot summarize itself, so briefs are built from disk. Every brief goes
   through `agent_core::redact::redact` and is written `0600` in a `0700` directory outside

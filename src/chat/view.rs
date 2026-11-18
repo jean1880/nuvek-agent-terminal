@@ -88,6 +88,8 @@ pub enum ViewAction {
     Handoff { target: Option<Driver> },
     /// `/fork`.
     Fork,
+    /// `/fork worktree`: a fork in a new worktree of its own (asked first).
+    ForkInWorktree,
     /// `/compare`: this thread beside a fork of it (or its source).
     CompareForks,
     /// `/rewind`.
@@ -1792,7 +1794,22 @@ impl Inner {
                 let target = typeahead::parse_driver(args);
                 self.emit(ViewAction::Handoff { target });
             }
-            BuiltinAction::Fork => self.emit(ViewAction::Fork),
+            BuiltinAction::Fork => match agent_core::commands::fork_place(args) {
+                Some(agent_core::commands::ForkPlace::Here) => self.emit(ViewAction::Fork),
+                Some(agent_core::commands::ForkPlace::Worktree) => {
+                    self.emit(ViewAction::ForkInWorktree)
+                }
+                None => {
+                    let changes = self.model.borrow_mut().push_notice(
+                        format!(
+                            "Unknown option “{args}”. Use /fork, or /fork worktree for a fork in \
+                             an isolated worktree of its own."
+                        ),
+                        Tone::Warning,
+                    );
+                    self.handle(changes);
+                }
+            },
             BuiltinAction::CompareForks => self.emit(ViewAction::CompareForks),
             BuiltinAction::Rewind => self.emit(ViewAction::Rewind),
             BuiltinAction::NewThread => self.emit(ViewAction::NewThread),
@@ -6951,7 +6968,18 @@ pub(crate) mod tests {
                     BuiltinAction::Fork,
                     "{driver:?} {typed}"
                 );
+                assert_eq!(
+                    agent_core::commands::fork_place(&line.args),
+                    Some(agent_core::commands::ForkPlace::Here),
+                    "no option: a fork in place, as always"
+                );
             }
+            let line = typeahead::parse_command_line("/fork worktree", &caps).expect("a built-in");
+            assert_eq!(line.builtin.action, BuiltinAction::Fork);
+            assert_eq!(
+                agent_core::commands::fork_place(&line.args),
+                Some(agent_core::commands::ForkPlace::Worktree)
+            );
         }
     }
 

@@ -9,11 +9,21 @@ use serde_json::json;
 /// missing one fails, never skips.
 fn runner() -> PathBuf {
     let exe = std::env::current_exe().expect("test binary");
-    let target = exe
+    // Cargo <= 1.98 puts test binaries under `<profile>/deps/`; newer toolchains under
+    // `<profile>/build/<pkg>/<hash>/deps/`. Either way, the compiled app binary sits in an
+    // ancestor directory inside the target dir (`<profile>/agent-terminal`).
+    let default = exe
         .parent()
         .and_then(std::path::Path::parent)
-        .expect("target directory");
-    let runner = target.join("agent-terminal");
+        .expect("target directory")
+        .join("agent-terminal");
+    let runner = exe
+        .ancestors()
+        .skip(2)
+        .take(5)
+        .map(|dir| dir.join("agent-terminal"))
+        .find(|p| p.is_file())
+        .unwrap_or(default);
     assert!(
         runner.is_file(),
         "the app binary is not built: {} (make test builds it)",

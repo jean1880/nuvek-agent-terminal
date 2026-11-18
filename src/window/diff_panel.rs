@@ -132,6 +132,135 @@ fn file_view(text: &str, colours: &DiffColours) -> gtk4::TextView {
     view
 }
 
+/// Each listed file's diff text, by `diff.stats` index, with why it shows none when it has none
+/// (`too_large` when the whole diff was too large to fetch). Chunk `i` is `stats[i]`'s: git
+/// writes `--numstat` and the patch in the same order. A diff cut short has fewer chunks than
+/// files; a too-large one has none.
+fn file_texts(diff: &TabDiff, too_large: &'static str) -> Vec<(String, Option<&'static str>)> {
+    let chunks: Vec<&str> = if diff.too_large {
+        Vec::new()
+    } else {
+        crate::diff::split_by_file(&diff.text)
+    };
+    let cut_short = !diff.too_large && diff.omitted_lines > 0;
+    (0..diff.stats.len())
+        .map(|i| {
+            let text = chunks.get(i).copied().unwrap_or_default().to_owned();
+            let why_hidden = if diff.too_large {
+                Some(too_large)
+            } else if text.is_empty() && cut_short {
+                Some("Not shown: the diff was cut short before this file.")
+            } else if text.is_empty() {
+                Some("No text diff for this file.")
+            } else {
+                None
+            };
+            (text, why_hidden)
+        })
+        .collect()
+}
+
+/// The heading over a folder's files; `first` has no space above it.
+fn folder_header(folder: &str, first: bool) -> gtk4::Label {
+    let heading = if folder.is_empty() {
+        "Repository root".to_owned()
+    } else {
+        format!("{folder}/")
+    };
+    gtk4::Label::builder()
+        .label(heading)
+        .xalign(0.0)
+        .ellipsize(gtk4::pango::EllipsizeMode::Start)
+        .tooltip_text(folder)
+        .margin_top(if first { 0 } else { 8 })
+        .css_classes(["heading", "dim-label"])
+        .build()
+}
+
+/// What is said under the file list of a diff not shown whole.
+fn diff_note(diff: &TabDiff) -> Option<String> {
+    if diff.too_large {
+        let (_, added, deleted) = crate::diff::totals(&diff.stats);
+        Some(format!(
+            "This diff is too large to show ({} changed lines). The file list above is complete.",
+            added + deleted
+        ))
+    } else if diff.omitted_lines > 0 {
+        Some(format!(
+            "… diff truncated: {} more lines not shown",
+            diff.omitted_lines
+        ))
+    } else {
+        None
+    }
+}
+
+/// A read-only list of `diff`'s files, laid out as the panel lays them out (a heading per
+/// folder, a collapsed row per file, its diff built when first expanded), with nothing to act
+/// on: no tick boxes, tools, editor or comments. For a diff shown outside a thread's panel (the
+/// compare window).
+pub(crate) fn read_only_files(diff: &TabDiff, colours: &DiffColours) -> gtk4::Box {
+    apply_view_colours(colours);
+    let list = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(2)
+        .css_classes(["diff-files"])
+        .build();
+    let texts = file_texts(diff, "Not shown: the diff is too large.");
+    let mut first = true;
+    for (folder, files) in crate::diff::group_by_folder(&diff.stats) {
+        list.append(&folder_header(&folder, first));
+        first = false;
+        for index in files {
+            let stat = &diff.stats[index];
+            let (text, why_hidden) = texts[index].clone();
+            let label = gtk4::Label::builder()
+                .label(crate::diff::file_label(stat))
+                .xalign(0.0)
+                .hexpand(true)
+                .ellipsize(gtk4::pango::EllipsizeMode::Middle)
+                .tooltip_text(stat.path.as_str())
+                .build();
+            let expander = gtk4::Expander::builder()
+                .label_widget(&label)
+                .margin_start(8)
+                .build();
+            expander.add_css_class("diff-file");
+            let colours = colours.clone();
+            expander.connect_expanded_notify(move |expander| {
+                if !expander.is_expanded() || expander.child().is_some() {
+                    return;
+                }
+                let child: gtk4::Widget = match why_hidden {
+                    Some(why) => gtk4::Label::builder()
+                        .label(why)
+                        .xalign(0.0)
+                        .wrap(true)
+                        .margin_start(6)
+                        .css_classes(["dim-label"])
+                        .build()
+                        .upcast(),
+                    None => file_view(&text, &colours).upcast(),
+                };
+                expander.set_child(Some(&child));
+            });
+            list.append(&expander);
+        }
+    }
+    if let Some(note) = diff_note(diff) {
+        list.append(
+            &gtk4::Label::builder()
+                .label(note)
+                .xalign(0.0)
+                .wrap(true)
+                .margin_top(6)
+                .css_classes(["dim-label"])
+                .build(),
+        );
+    }
+    list
+}
+
 /// What a Ctrl+click on `row` of a file's diff opens: the file at the row's line in the new
 /// file ([`crate::diff::new_line_at`]: an added or context row is its own line, a removed row or
 /// a hunk header the nearest one). `None` for a row with no line in the new file (the file
@@ -1817,21 +1946,11 @@ impl DiffPanel {
             }
         }
 
-        // Chunk `i` is `stats[i]`'s: git writes `--numstat` and the patch in the same order. A
-        // diff cut short has fewer chunks than files; a too-large one has none.
-        let chunks: Vec<String> = if diff.too_large {
-            Vec::new()
-        } else {
-            crate::diff::split_by_file(&diff.text)
-                .into_iter()
-                .map(str::to_owned)
-                .collect()
-        };
-        let mut by_stat = vec![String::new(); diff.stats.len()];
-        for (slot, chunk) in by_stat.iter_mut().zip(chunks) {
-            *slot = chunk;
-        }
-        let cut_short = !diff.too_large && diff.omitted_lines > 0;
+        let texts = file_texts(
+            diff,
+            "Not shown: the diff is too large. Open it in your diff tool.",
+        );
+        let by_stat: Vec<String> = texts.iter().map(|(text, _)| text.clone()).collect();
         // Before the rows are built: their Comment buttons register with the review.
         self.review.show(
             self.begun_base.get(),
@@ -1845,20 +1964,7 @@ impl DiffPanel {
 
         let mut rows = 0;
         for (folder, files) in crate::diff::group_by_folder(&diff.stats) {
-            let heading = if folder.is_empty() {
-                "Repository root".to_owned()
-            } else {
-                format!("{folder}/")
-            };
-            let header = gtk4::Label::builder()
-                .label(heading)
-                .xalign(0.0)
-                .ellipsize(gtk4::pango::EllipsizeMode::Start)
-                .tooltip_text(folder.as_str())
-                .margin_top(if rows == 0 { 0 } else { 8 })
-                .css_classes(["heading", "dim-label"])
-                .build();
-            self.files.append(&header);
+            self.files.append(&folder_header(&folder, rows == 0));
             for index in files {
                 let stat = &diff.stats[index];
                 if self.commit.uncommitted.get() && committable(stat) {
@@ -1867,16 +1973,7 @@ impl DiffPanel {
                         old_path: stat.old_path.clone(),
                     });
                 }
-                let text = by_stat[index].clone();
-                let why_hidden = if diff.too_large {
-                    Some("Not shown: the diff is too large. Open it in your diff tool.")
-                } else if text.is_empty() && cut_short {
-                    Some("Not shown: the diff was cut short before this file.")
-                } else if text.is_empty() {
-                    Some("No text diff for this file.")
-                } else {
-                    None
-                };
+                let (text, why_hidden) = texts[index].clone();
                 self.files.append(&self.file_row(stat, text, why_hidden));
                 rows += 1;
             }
@@ -1884,20 +1981,7 @@ impl DiffPanel {
         self.file_rows.set(rows);
         *self.chunks.borrow_mut() = by_stat;
 
-        let note = if diff.too_large {
-            let (_, added, deleted) = crate::diff::totals(&diff.stats);
-            Some(format!(
-                "This diff is too large to show ({} changed lines). The file list above is complete.",
-                added + deleted
-            ))
-        } else if cut_short {
-            Some(format!(
-                "… diff truncated: {} more lines not shown",
-                diff.omitted_lines
-            ))
-        } else {
-            None
-        };
+        let note = diff_note(diff);
         self.note.set_visible(note.is_some());
         self.note.set_text(note.as_deref().unwrap_or_default());
         self.stack.set_visible_child_name("diff");

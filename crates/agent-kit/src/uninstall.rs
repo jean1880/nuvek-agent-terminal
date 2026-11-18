@@ -1192,6 +1192,9 @@ mod tests {
         sh(&["commit", "-q", "-m", "one"]);
         let head = sh(&["rev-parse", "HEAD"]);
         sh(&["update-ref", "refs/agent-terminal/1/0001", &head]);
+        // A fork's baseline goes with the checkpoints.
+        let fork = git::fork_ref("0f8fad5b-d9cb-469f-a165-70867728950e").unwrap();
+        sh(&["update-ref", &fork, &head]);
         sh(&["update-ref", "refs/heads/agent-terminal/w_x", &head]);
         let git_dir = repo.join(".git");
         fs::create_dir_all(git_dir.join(APP_DIR)).unwrap();

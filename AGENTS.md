@@ -98,12 +98,20 @@ Architectural mandates, standards, and workflows for this codebase.
     `Entry`s from a `Side`, a thread and the sequence number after which it counts; `table`
     lines them up by turn, a turn being a prompt and what follows it, with an `Earlier` row for
     what came before a column's first prompt; summaries and the text cap) and `fork_compare`
-    (a fork's `ForkLink`, its source's id and last stored seq at the fork, read leniently; and
+    (a fork's `ForkLink`, its source's id and last stored seq at the fork and its baseline's tree
+    and commit ids, read leniently: a link from an earlier build has no baseline, and a baseline
+    that is not two object ids is dropped, never the link; and
     `pairings`: a thread pairs with its source, its forks and its source's other forks, a fork of
-    a fork with its own source only, never a thread that is gone).
+    a fork with its own source only, never a thread that is gone; `Pairing::bases`: a fork and
+    its source share the fork's baseline, two siblings each have their own).
   - `crates/agent-kit` (GTK-free; blocking process and file I/O): `git`
     (git plumbing for turn checkpoints and diffs: shells out, but its parsers
-    and filters are pure), `diff` (diff bases, numstat, line classification,
+    and filters are pure; `diff_trees` is the one tree-to-tree diff, capped, driver-free;
+    `git/fork.rs` is a fork's baseline: `take_fork_baseline` snapshots and commits the source's
+    working tree as a checkpoint does, `keep_fork_baseline` points
+    `refs/agent-terminal/fork/<thread>` at it once the fork is stored, `drop_fork_baseline`
+    deletes it with the fork only while it still points there, and `fork_changes` diffs a fresh
+    snapshot of a side's folder against it; checkpoint pruning never takes a fork ref), `diff` (diff bases, numstat, line classification,
     truncation, the hunk line map, a selection's comment span and a comment's anchor in a
     later diff: exact, moved once, or gone, never a guess), `restore` (undo: pin, restore, contained deletion, check),
     `worktree` (worktree locations, branch checks, create and clean-only
@@ -202,8 +210,8 @@ Architectural mandates, standards, and workflows for this codebase.
     `create_thread_record`), `Store::transcript_at_fork` takes the hand-off's transcript and the
     fork point in one read, `Store::fork_pairings` names only threads that exist and are not
     hidden, and `Store::compare_columns` folds each side as a hand-off reads it (no reasoning,
-    notices or inherited context) after its point, all in one read; each a read through
-    `store_job`.
+    notices or inherited context) after its point, all in one read; `Store::fork_columns` reads
+    those columns and each side's baseline together; each a read through `store_job`.
   - The app (`src/`): `config.rs` (persisted settings + migration, re-exporting
     `SessionFormat`; per-agent defaults live on the profiles), `theme.rs`
     (colour schemes, infallible `RGBA::new`), `utils.rs` (detection and
@@ -239,9 +247,15 @@ Architectural mandates, standards, and workflows for this codebase.
     compare window: an `adw::Window` of its own, never a page or a `TabState`, that only reads;
     it holds itself until closed or destroyed with its parent, so no caller keeps it;
     a spinner until its first read, a generation so only the newest read draws, Refresh, replies
-    as guarded markdown; it knows nothing of forks), `window/imp/fork_compare.rs` (Compare with
-    Fork…, `/compare` and the fork toast's Compare: the pairings and the picker, then each
-    column read through `store_job`), `window/diff_panel.rs` (the
+    as guarded markdown; its Changes tab, shown once a caller begins a read of it, has a
+    generation of its own and draws each side's diff with the diff panel's read-only file list,
+    `diff_panel::read_only_files`; it knows nothing of forks), `window/imp/fork_compare.rs`
+    (Compare with Fork…, `/compare` and the fork toast's Compare: the pairings and the picker,
+    then each column read through `store_job` and each side's changes since its baseline through
+    `off_main`; two sides in one folder are one diff under a note saying their changes cannot be
+    told apart; and the fork's baseline: taken by Fork thread off the main thread, unless
+    checkpoints are off, right after the fork point is read, its ref kept once the fork is
+    stored and dropped when the fork is deleted), `window/diff_panel.rs` (the
     diff panel's widgets, its file tick boxes, "Commit…", "Open a PR" and "Merge into …" bars;
     it pops out into
     its own window, keeping its
@@ -368,7 +382,10 @@ Architectural mandates, standards, and workflows for this codebase.
   runs in its own process group like the commit. It never deletes the branch or the worktree.
   `merge::tests` prove these. Every git call strips inherited
   `GIT_DIR`-style variables and sets `GIT_OPTIONAL_LOCKS=0`. Untracked files
-  whose names look like secrets are never captured.
+  whose names look like secrets are never captured. A fork's baseline is such a snapshot,
+  recorded as `refs/agent-terminal/fork/<thread>` (empty old value), spared by checkpoint
+  pruning and deleted with its fork; `git::fork::tests` prove it leaves the user's state alone
+  and skips secret-looking files.
 - **Hand-off briefs are the terminal's, not the CLI's**: a CLI out of quota
   cannot summarize itself, so briefs are built from disk. Every brief goes
   through `agent_core::redact::redact` and is written `0600` in a `0700` directory outside

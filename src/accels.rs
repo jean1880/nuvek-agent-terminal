@@ -51,9 +51,9 @@ const COMMON: &[Binding] = &[
     ("win.zoom-out", &["<Primary>minus", "<Primary>KP_Subtract"]),
     ("win.zoom-reset", &["<Primary>0", "<Primary>KP_0"]),
     // Region cycling: the sidebar, the transcript, the composer, the drawer and the diff panel,
-    // whichever are shown. Bare F6 and Shift+F6 are matched in the window's bubble phase
-    // (`window/imp/regions.rs`), after the focused widget, so a terminal program keeps them;
-    // these work from a terminal too.
+    // whichever are shown. Bare F6 and Shift+F6 are matched by the window itself
+    // (`window/imp/regions.rs`), which leaves them to a focused terminal, so a terminal program
+    // keeps them; these work from a terminal too.
     ("win.focus-next-region", &["<Primary>F6"]),
     ("win.focus-previous-region", &["<Primary><Shift>F6"]),
     ("win.next-tab", &["<Primary>Tab", "<Primary>Page_Down"]),
@@ -90,6 +90,16 @@ fn all() -> Vec<(String, Vec<String>)> {
         ));
     }
     all
+}
+
+/// The accelerators of `action`, as written in the table.
+#[cfg(test)]
+pub(crate) fn accels_for(action: &str) -> Vec<String> {
+    all()
+        .into_iter()
+        .find(|(a, _)| a == action)
+        .map(|(_, accels)| accels)
+        .unwrap_or_default()
 }
 
 /// Registers every accelerator on the application.
@@ -179,12 +189,12 @@ const HAND_BOUND: &[HandBound] = &[
     ),
     hand(
         "F6",
-        "focused widget let it go (bubble phase)",
+        "focus not in a terminal (window capture phase)",
         "window/imp/regions.rs",
     ),
     hand(
         "<Shift>F6",
-        "focused widget let it go (bubble phase)",
+        "focus not in a terminal (window capture phase)",
         "window/imp/regions.rs",
     ),
     hand("Up", "composer focused", "chat/view/composer.rs"),
@@ -340,11 +350,19 @@ mod tests {
                 );
             }
         }
-        let next = all()
-            .into_iter()
-            .find(|(a, _)| a == "win.focus-next-region")
-            .expect("bound");
-        assert_eq!(normalise(&next.1[0]), "<ctrl>f6");
+        for (action, accel) in [
+            ("win.focus-next-region", "<Primary>F6"),
+            ("win.focus-previous-region", "<Primary><Shift>F6"),
+        ] {
+            assert_eq!(
+                accels_for(action)
+                    .iter()
+                    .map(|a| normalise(a))
+                    .collect::<Vec<_>>(),
+                [normalise(accel)],
+                "{action}"
+            );
+        }
     }
 
     #[test]

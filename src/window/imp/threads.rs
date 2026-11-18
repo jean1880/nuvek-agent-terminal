@@ -13242,6 +13242,22 @@ pub(super) mod tests {
         crate::testutil::settle(&ctx);
         assert!(sidebar.grab_focus() || sidebar.child_focus(gtk4::DirectionType::TabForward));
         assert!(focus().is_some_and(|f| f == sidebar || f.is_ancestor(&sidebar)));
+        // No other region can take the focus: the sidebar stays shown, and keeps it.
+        transcript.set_can_focus(false);
+        field.set_sensitive(false);
+        drawer.set_sensitive(false);
+        assert_eq!(names(), ["sidebar", "transcript", "composer"]);
+        assert_eq!(imp.cycle_region(true), None);
+        assert_eq!(imp.cycle_region(false), None);
+        assert!(
+            split.shows_sidebar(),
+            "the overlay was closed with nothing to go to"
+        );
+        assert!(focus().is_some_and(|f| f == sidebar || f.is_ancestor(&sidebar)));
+        transcript.set_can_focus(true);
+        field.set_sensitive(true);
+        drawer.set_sensitive(true);
+        crate::testutil::settle(&ctx);
         assert_eq!(imp.cycle_region(true), Some("transcript"));
         assert!(!split.shows_sidebar(), "the overlay was closed");
         crate::testutil::settle(&ctx);
@@ -13254,6 +13270,126 @@ pub(super) mod tests {
         imp.closing_started.set(true);
         assert!(imp.focus_regions().is_empty());
         imp.closing_started.set(false);
+        window.destroy();
+        crate::testutil::settle(&ctx);
+    }
+
+    /// A real F6 key press, from the X server through every widget's handling, moves the focus
+    /// between regions from inside the thread's panes (each a `GtkPaned`, which binds F6
+    /// itself), and Shift+F6 back; in a terminal the key is the terminal program's: it reaches
+    /// the terminal, and the focus stays there.
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    #[cfg(feature = "terminal")]
+    fn a_real_f6_press_moves_regions_and_is_left_to_a_terminal() {
+        use crate::testutil::{keysym, pump_until, XKeyboard};
+        use std::{cell::RefCell, rc::Rc};
+        use vte4::prelude::*;
+        crate::testutil::gtk_init().unwrap();
+        crate::testutil::adw_init().unwrap();
+        crate::icons::register();
+        crate::load_css();
+        crate::window::imp::SPAWN_TERMINAL_PAGES.with(|s| s.set(false));
+        let app = crate::window::imp::test_support::test_app("org.test.RealF6", true);
+        CHAT_RESTORED.with(|done| done.set(true));
+        let ctx = glib::MainContext::default();
+        let window = crate::window::imp::test_support::test_window(&app, &ctx);
+        window.set_default_size(1200, 800);
+        window.present();
+        assert!(pump_until(&ctx, 5, || window.is_realized()));
+        let imp = window.imp();
+        assert!(pump_until(&ctx, 20, || !imp.detecting.get()));
+        imp.finish_shell(None);
+        imp.reveal_shell();
+        let dir = tempfile::tempdir().unwrap();
+        let thread = open_quiet_thread(imp, dir.path(), "Real F6");
+        assert!(pump_until(&ctx, 10, || imp
+            .with_chat(&thread, |c| c.view.is_some())
+            .unwrap_or(false)));
+        let view = imp
+            .with_chat(&thread, |c| c.view.clone())
+            .flatten()
+            .unwrap();
+        view.replay(&crate::chat::view::demo::DemoBackend::script_envelopes());
+        imp.split_view
+            .borrow()
+            .as_ref()
+            .expect("the split view")
+            .set_show_sidebar(true);
+        gtk4::gio::prelude::ActionGroupExt::activate_action(&window, "toggle-drawer", None);
+        let names =
+            || -> Vec<&'static str> { imp.focus_regions().iter().map(|r| r.name).collect() };
+        assert!(
+            pump_until(&ctx, 10, || names()
+                == ["sidebar", "transcript", "composer", "terminal"]),
+            "{:?}",
+            names()
+        );
+        let page = imp.page_of_thread(&thread).expect("the thread's page");
+        let terminal = imp
+            .with_page_tab(&page, |t| t.terminal.clone())
+            .expect("the drawer's terminal");
+        let keyboard = match XKeyboard::open(&window) {
+            Ok(keyboard) => keyboard,
+            Err(why) => {
+                eprintln!("SKIPPED: no real key presses on this display: {why}");
+                window.destroy();
+                return;
+            }
+        };
+        let press = |shift: bool, to: &str| {
+            let from = imp.region_of_focus();
+            keyboard.tap(keysym::F6, shift);
+            assert!(
+                pump_until(&ctx, 5, || imp.region_of_focus() == Some(to)),
+                "{} from {from:?} went to {:?}, not {to}",
+                if shift { "Shift+F6" } else { "F6" },
+                imp.region_of_focus()
+            );
+        };
+
+        // From the message box (in the drawer's pane) back to the transcript, and forward again.
+        view.focus_composer();
+        assert!(pump_until(&ctx, 5, || imp.region_of_focus() == Some("composer")));
+        press(true, "transcript");
+        press(false, "composer");
+        press(false, "terminal");
+
+        // In the terminal F6 is its program's: the window lets it through to the terminal.
+        let reached: Rc<RefCell<Vec<bool>>> = Rc::default();
+        let probe = gtk4::EventControllerKey::new();
+        probe.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let seen = reached.clone();
+        probe.connect_key_pressed(move |_, key, _, state| {
+            if let Some(forward) = super::super::regions::region_key(key, state) {
+                seen.borrow_mut().push(forward);
+            }
+            glib::Propagation::Proceed
+        });
+        terminal.add_controller(probe);
+        let committed: Rc<RefCell<String>> = Rc::default();
+        let sent = committed.clone();
+        terminal.connect_commit(move |_, text, _| sent.borrow_mut().push_str(text));
+        keyboard.tap(keysym::F6, false);
+        keyboard.tap(keysym::F6, true);
+        assert!(
+            pump_until(&ctx, 5, || reached.borrow().len() == 2),
+            "the terminal had {:?}",
+            reached.borrow()
+        );
+        assert_eq!(*reached.borrow(), [true, false]);
+        assert!(
+            pump_until(&ctx, 5, || committed.borrow().contains("\u{1b}[17~")),
+            "the terminal sent {:?}",
+            committed.borrow()
+        );
+        assert_eq!(imp.region_of_focus(), Some("terminal"));
+        assert!(gtk4::prelude::GtkWindowExt::focus(&window)
+            .is_some_and(|f| &f == terminal.upcast_ref::<gtk4::Widget>()));
+
+        // The accelerators' action still leaves it.
+        gtk4::gio::prelude::ActionGroupExt::activate_action(&window, "focus-next-region", None);
+        assert_eq!(imp.region_of_focus(), Some("sidebar"));
         window.destroy();
         crate::testutil::settle(&ctx);
     }
@@ -13412,6 +13548,37 @@ pub(super) mod tests {
         assert!(changes.get() <= before + 2, "one update for the burst");
         assert!(!imp.live_region_queued());
         let said = imp.live_region_texts().0;
+
+        // Closing: nothing is queued, and what waited when it began is not said.
+        let waiting = Event::ApprovalRequested {
+            tool: "Bash".into(),
+            title: Some("Run cargo fmt".into()),
+            input: serde_json::Value::Null,
+            reason: None,
+            options: vec![agent_core::event::Decision::Allow],
+            response: agent_core::event::ResponseCapability::Live,
+            remembers: None,
+        };
+        imp.announce_event(&waiting, "Live regions", true, false, true);
+        assert!(imp.live_region_queued());
+        imp.closing_started.set(true);
+        let before = changes.get();
+        imp.announce_event(
+            &Envelope::turn_completed(agent_core::event::TurnState::Failed, None).event,
+            "Closing",
+            false,
+            false,
+            true,
+        );
+        crate::testutil::settle(&ctx);
+        assert!(!imp.live_region_queued());
+        assert_eq!(changes.get(), before);
+        assert_eq!(imp.live_region_texts().0, said);
+        assert_eq!(
+            imp.live_region_texts().1,
+            "Approval needed: Run cargo clippy."
+        );
+        imp.closing_started.set(false);
 
         // Off: nothing is queued, nothing changes.
         imp.config.borrow_mut().announce_events = false;

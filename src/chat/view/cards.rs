@@ -724,8 +724,8 @@ impl MarkdownInner {
 const ROW_LABEL_TITLE: usize = 80;
 
 /// A transcript row's root: a list item of the transcript's list, which a screen reader steps
-/// through item by item.
-fn list_item(orientation: gtk4::Orientation, spacing: i32) -> gtk4::Box {
+/// through item by item. Every row's root is one (`Row::build`), named by [`row_label`].
+pub(super) fn list_item(orientation: gtk4::Orientation, spacing: i32) -> gtk4::Box {
     gtk4::Box::builder()
         .orientation(orientation)
         .spacing(spacing)
@@ -733,11 +733,28 @@ fn list_item(orientation: gtk4::Orientation, spacing: i32) -> gtk4::Box {
         .build()
 }
 
+/// A plan's title: how its steps ended.
+fn plan_title(
+    steps: &[agent_core::event::PlanStep],
+    outcome: Option<agent_core::event::TurnState>,
+) -> &'static str {
+    use agent_core::event::{StepStatus, TurnState};
+    if !steps.is_empty() && steps.iter().all(|s| s.status == StepStatus::Completed) {
+        return "Completed plan";
+    }
+    match outcome {
+        Some(TurnState::Interrupted) => "Plan interrupted",
+        Some(TurnState::Failed) => "Plan failed",
+        Some(TurnState::Completed) => "Plan ended with unfinished steps",
+        None => "Plan",
+    }
+}
+
 /// What a screen reader names a transcript row by: who wrote it, or what it is ("You",
-/// "Claude", "Tool: Run cargo test"). Its words are its children's, read after the name.
-/// `None` for a row that names itself (a plan, by its title; quick replies).
-pub fn row_label(body: &Body) -> Option<String> {
-    Some(match body {
+/// "Claude", "Tool: Run cargo test", a plan by its title). Its words are its children's, read
+/// after the name. Every row has one.
+pub fn row_label(body: &Body) -> String {
+    match body {
         Body::User { queued: true, .. } => "You (queued)".to_owned(),
         Body::User { .. } => "You".to_owned(),
         Body::Assistant { driver, .. } => driver.info().label.to_owned(),
@@ -758,8 +775,9 @@ pub fn row_label(body: &Body) -> Option<String> {
         Body::Approval(_) => "Approval request".to_owned(),
         Body::Question(_) => "Question".to_owned(),
         Body::Form(_) => "Form request".to_owned(),
-        Body::QuickReplies(_) | Body::Plan { .. } => return None,
-    })
+        Body::QuickReplies(_) => "Quick replies".to_owned(),
+        Body::Plan { steps, outcome } => plan_title(steps, *outcome).to_owned(),
+    }
 }
 
 /// Whether a row is still growing (a reply or reasoning streaming in, a tool running): a
@@ -802,6 +820,9 @@ pub enum Row {
     Question(QuestionCardWidget),
     Form(FormCardWidget),
     Plan {
+        /// The list item that holds the expander, which keeps its own role (a button that
+        /// expands).
+        item: gtk4::Box,
         root: gtk4::Expander,
         steps: gtk4::Box,
         updating: Rc<Cell<bool>>,
@@ -902,7 +923,9 @@ impl Row {
                 Self::Static(super::quick_replies::row(&q.options, sink).upcast())
             }
             Body::Plan { .. } => {
+                let holder = list_item(gtk4::Orientation::Vertical, 0);
                 let root = gtk4::Expander::new(None);
+                holder.append(&root);
                 let steps = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
                 steps.set_margin_start(12);
                 steps.set_margin_top(6);
@@ -922,12 +945,18 @@ impl Row {
                     });
                 });
                 Self::Plan {
+                    item: holder,
                     root,
                     steps,
                     updating,
                 }
             }
         };
+        debug_assert_eq!(
+            row.widget().accessible_role(),
+            gtk4::AccessibleRole::ListItem,
+            "a transcript row's root is a list item"
+        );
         row.update(item);
         row
     }
@@ -941,7 +970,7 @@ impl Row {
             Self::Approval(a) => a.root.clone().upcast(),
             Self::Question(q) => q.root.clone().upcast(),
             Self::Form(f) => f.root().clone().upcast(),
-            Self::Plan { root, .. } => root.clone().upcast(),
+            Self::Plan { item, .. } => item.clone().upcast(),
         }
     }
 
@@ -989,9 +1018,7 @@ impl Row {
     pub fn update(&self, item: &Item) {
         // Named for a screen reader by its author or kind, and busy while it grows.
         let widget = self.widget();
-        if let Some(name) = row_label(&item.body) {
-            widget.update_property(&[gtk4::accessible::Property::Label(&name)]);
-        }
+        widget.update_property(&[gtk4::accessible::Property::Label(&row_label(&item.body))]);
         widget.update_state(&[gtk4::accessible::State::Busy(row_busy(&item.body))]);
         match (self, &item.body) {
             (
@@ -1139,22 +1166,12 @@ impl Row {
                     root,
                     steps: list,
                     updating,
+                    ..
                 },
                 Body::Plan { steps, outcome },
             ) => {
-                use agent_core::event::{StepStatus, TurnState};
-                let complete =
-                    !steps.is_empty() && steps.iter().all(|s| s.status == StepStatus::Completed);
-                let title = if complete {
-                    "Completed plan"
-                } else {
-                    match outcome {
-                        Some(TurnState::Interrupted) => "Plan interrupted",
-                        Some(TurnState::Failed) => "Plan failed",
-                        Some(TurnState::Completed) => "Plan ended with unfinished steps",
-                        None => "Plan",
-                    }
-                };
+                use agent_core::event::StepStatus;
+                let title = plan_title(steps, *outcome);
                 root.set_label(Some(title));
                 if root.is_expanded() != item.expanded {
                     updating.set(true);
@@ -1219,7 +1236,7 @@ pub fn switch_text(
 }
 
 fn notice(text: &str, tone: Tone) -> gtk4::Box {
-    let root = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    let root = list_item(gtk4::Orientation::Horizontal, 8);
     root.add_css_class("notice-row");
     if tone == Tone::Warning {
         root.add_css_class("warning");
@@ -1239,7 +1256,7 @@ fn notice(text: &str, tone: Tone) -> gtk4::Box {
 }
 
 fn error_row(message: &str) -> gtk4::Box {
-    let root = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+    let root = list_item(gtk4::Orientation::Horizontal, 10);
     root.add_css_class("error-row");
     let icon = gtk4::Image::from_icon_name("at-dialog-error-symbolic");
     icon.set_valign(gtk4::Align::Start);
@@ -1267,7 +1284,7 @@ fn divider(text: &str, class: &str, driver: Option<Driver>) -> gtk4::Widget {
 
 /// [`divider`] and its words, for a divider whose text can change (a switch named later).
 fn divider_parts(text: &str, class: &str, driver: Option<Driver>) -> (gtk4::Widget, gtk4::Label) {
-    let root = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+    let root = list_item(gtk4::Orientation::Horizontal, 12);
     root.add_css_class("divider");
     root.add_css_class(class);
     if let Some(d) = driver {
@@ -3762,7 +3779,7 @@ pub(crate) mod tests {
             queued: false,
             attachments: Vec::new(),
         };
-        assert_eq!(row_label(&user).as_deref(), Some("You"));
+        assert_eq!(row_label(&user), "You");
         assert!(!row_busy(&user));
         let reply = |streaming| Body::Assistant {
             text: "On it".into(),
@@ -3770,20 +3787,17 @@ pub(crate) mod tests {
             streaming,
             images: Vec::new(),
         };
-        assert_eq!(row_label(&reply(true)).as_deref(), Some("Claude"));
+        assert_eq!(row_label(&reply(true)), "Claude");
         assert!(row_busy(&reply(true)));
         assert!(!row_busy(&reply(false)));
         assert_eq!(
-            row_label(&tool("cargo test", ToolStatus::Running)).as_deref(),
-            Some("Tool: cargo test")
+            row_label(&tool("cargo test", ToolStatus::Running)),
+            "Tool: cargo test"
         );
         assert!(row_busy(&tool("cargo test", ToolStatus::Running)));
         assert!(!row_busy(&tool("cargo test", ToolStatus::Failed)));
-        assert_eq!(
-            row_label(&tool("  ", ToolStatus::Completed)).as_deref(),
-            Some("Tool")
-        );
-        let long = row_label(&tool(&"x".repeat(500), ToolStatus::Completed)).unwrap();
+        assert_eq!(row_label(&tool("  ", ToolStatus::Completed)), "Tool");
+        let long = row_label(&tool(&"x".repeat(500), ToolStatus::Completed));
         assert_eq!(long.chars().count(), "Tool: ".len() + ROW_LABEL_TITLE);
         assert!(long.ends_with('…'), "{long}");
         // A tool's title is the agent's: a secret is masked, and control, bidi and zero-width
@@ -3792,8 +3806,7 @@ pub(crate) mod tests {
         let named = row_label(&tool(
             &format!("curl -H {key}\n\n  --data\u{202e}x\u{200b}y\u{7}z"),
             ToolStatus::Running,
-        ))
-        .unwrap();
+        ));
         assert!(!named.contains(key), "{named}");
         assert!(!named.chars().any(agent_core::text::is_hidden), "{named:?}");
         assert!(named.starts_with("Tool: curl -H "), "{named}");
@@ -3801,17 +3814,33 @@ pub(crate) mod tests {
         assert_eq!(
             row_label(&Body::TurnError {
                 message: "boom".into()
-            })
-            .as_deref(),
-            Some("Error")
+            }),
+            "Error"
+        );
+        // A plan by its title, as its expander shows it.
+        let plan = |status, outcome| Body::Plan {
+            steps: vec![agent_core::event::PlanStep {
+                text: "Build".into(),
+                status,
+            }],
+            outcome,
+        };
+        use agent_core::event::{StepStatus, TurnState};
+        assert_eq!(row_label(&plan(StepStatus::Pending, None)), "Plan");
+        assert_eq!(
+            row_label(&plan(StepStatus::Completed, None)),
+            "Completed plan"
         );
         assert_eq!(
-            row_label(&Body::Plan {
-                steps: Vec::new(),
-                outcome: None
-            }),
-            None,
-            "a plan is named by its title"
+            row_label(&plan(StepStatus::InProgress, Some(TurnState::Failed))),
+            "Plan failed"
+        );
+        assert_eq!(
+            row_label(&Body::QuickReplies(super::super::model::QuickReplies {
+                request: "reply:a1".into(),
+                options: vec!["Yes".into()],
+            })),
+            "Quick replies"
         );
     }
 

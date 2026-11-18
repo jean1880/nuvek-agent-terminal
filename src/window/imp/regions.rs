@@ -4,11 +4,13 @@
 //! open) and the diff panel while docked beside the thread. A region with nothing that can take
 //! focus (an empty transcript) is passed over.
 //!
-//! Bare F6 is not an application accelerator: it is matched in the window's bubble phase
-//! ([`AgentTerminalWindow::install_region_keys`]), after the focused widget had it, so a
-//! terminal program (mc, htop, vim) still gets its F6, and the key goes on unhandled when there
-//! is nowhere to move (one region, a dialog open, the window closing). Ctrl+F6 and
-//! Ctrl+Shift+F6 are the accelerators (`accels.rs`), which work from a terminal too.
+//! Bare F6 is not an application accelerator: it is matched in the window's capture phase
+//! ([`AgentTerminalWindow::install_region_keys`]), before any widget inside has it, since a
+//! `GtkPaned` (a thread's drawer split, the diff panel split) binds F6 itself and would take it
+//! on the way back up. It is left to the focused widget when that is a terminal, so a terminal
+//! program (mc, htop, vim) still gets its F6, and goes on unhandled when there is nowhere to
+//! move (one region, a dialog open, the window closing). Ctrl+F6 and Ctrl+Shift+F6 are the
+//! accelerators (`accels.rs`), which work from a terminal too.
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -176,7 +178,8 @@ impl AgentTerminalWindow {
 
     /// Moves focus to the next region (`forward`) or the previous one; the name of the region
     /// that took it, or `None` when focus could not move. Leaving a sidebar laid over the
-    /// thread (a collapsed split view) hides it, so focus never goes behind it.
+    /// thread (a collapsed split view) hides it once another region has the focus, so focus
+    /// never stays behind it; when none takes it the sidebar stays shown.
     pub(super) fn cycle_region(&self, forward: bool) -> Option<&'static str> {
         // With one region and focus in it, or none, there is nowhere to go.
         let regions = self.focus_regions();
@@ -198,32 +201,52 @@ impl AgentTerminalWindow {
                 continue;
             }
             let region = &regions[i];
-            if region.name != "sidebar" {
-                if let Some(split) = overlaid.as_ref() {
-                    split.set_show_sidebar(false);
-                }
-            }
             if region.focus() {
+                if region.name != "sidebar" {
+                    if let Some(split) = overlaid.as_ref() {
+                        split.set_show_sidebar(false);
+                    }
+                }
                 return Some(region.name);
             }
         }
         None
     }
 
-    /// Bare F6 and Shift+F6, in the window's bubble phase: only once the focused widget (a
-    /// terminal above all) has let the key go, and handled only when focus moved.
+    /// The region that holds the window's focus now.
+    #[cfg(test)]
+    pub(super) fn region_of_focus(&self) -> Option<&'static str> {
+        let focus = gtk4::prelude::GtkWindowExt::focus(&*self.obj())?;
+        self.focus_regions()
+            .iter()
+            .find(|r| r.holds(&focus))
+            .map(|r| r.name)
+    }
+
+    /// Whether the window's focus is in a terminal, whose program owns its F6.
+    fn focus_in_terminal(&self) -> bool {
+        gtk4::prelude::GtkWindowExt::focus(&*self.obj())
+            .is_some_and(|f| f.ancestor(super::Terminal::static_type()).is_some())
+    }
+
+    /// Bare F6 and Shift+F6, in the window's capture phase, ahead of the panes that bind F6
+    /// themselves; left to a focused terminal, and handled only when focus moved.
     pub(super) fn install_region_keys(&self) {
         let keys = gtk4::EventControllerKey::new();
-        keys.set_propagation_phase(gtk4::PropagationPhase::Bubble);
+        keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let weak = self.obj().downgrade();
         keys.connect_key_pressed(move |_, key, _, state| {
             let Some(forward) = region_key(key, state) else {
                 return glib::Propagation::Proceed;
             };
-            match weak.upgrade() {
-                Some(obj) if obj.imp().cycle_region(forward).is_some() => glib::Propagation::Stop,
-                _ => glib::Propagation::Proceed,
+            let Some(obj) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            let imp = obj.imp();
+            if imp.focus_in_terminal() || imp.cycle_region(forward).is_none() {
+                return glib::Propagation::Proceed;
             }
+            glib::Propagation::Stop
         });
         self.obj().add_controller(keys);
     }
@@ -246,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn only_bare_f6_and_shift_f6_cycle_in_the_bubble_phase() {
+    fn only_bare_f6_and_shift_f6_are_region_keys() {
         assert_eq!(region_key(Key::F6, M::empty()), Some(true));
         assert_eq!(region_key(Key::F6, M::SHIFT_MASK), Some(false));
         // Caps Lock or Num Lock held changes nothing.

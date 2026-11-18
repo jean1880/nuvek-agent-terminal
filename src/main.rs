@@ -456,8 +456,16 @@ fn load_css() {
     // The agents' colours (`@brand_claude`…), which no theme changes.
     brand::install();
     let provider = CssProvider::new();
-    provider.load_from_data(&[
-        "
+    provider.load_from_data(&[GLOBAL_CSS, &palette::tag_chip_css()].concat());
+    gtk4::style_context_add_provider_for_display(
+        &gdk::Display::default().expect("Could not connect to a display."),
+        &provider,
+        STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+}
+
+/// The app's global stylesheet, which [`load_css`] loads with the tag chips' colours.
+pub(crate) const GLOBAL_CSS: &str = "
         window {
             background-color: @at_bg;
         }
@@ -507,6 +515,12 @@ fn load_css() {
         }
         button.suggested-action:hover {
             background-color: @at_accent_hover;
+        }
+        /* Filled with the accent, which the focus colour may equal: the ring goes outside it,
+           on the surface around it, where the focus colour reads at 3:1. */
+        button.suggested-action:focus-visible {
+            outline: 2px solid @at_focus;
+            outline-offset: 2px;
         }
         .loading-text {
             font-size: 145%;
@@ -685,17 +699,7 @@ fn load_css() {
         button.closing-quit:hover {
             color: @at_fg;
         }
-        ",
-        &palette::tag_chip_css(),
-    ]
-    .concat()
-    );
-    gtk4::style_context_add_provider_for_display(
-        &gdk::Display::default().expect("Could not connect to a display."),
-        &provider,
-        STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
-}
+        ";
 
 #[cfg(test)]
 mod brand_css_tests {

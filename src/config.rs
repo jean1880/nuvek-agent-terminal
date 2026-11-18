@@ -1701,6 +1701,10 @@ impl TerminalConfig {
             self.profiles = default_profiles();
         }
 
+        // A hand-edited text scale is held to the range the setting offers, as a zoom is: a
+        // scale of 0 would leave no readable text to fix it from.
+        self.font_scale = crate::style::clamp_text_scale(self.font_scale);
+
         // Migrate "Agy" profile name to "Antigravity" if "Antigravity" is not already defined.
         if !self.profiles.iter().any(|p| p.name == "Antigravity") {
             for profile in &mut self.profiles {
@@ -3023,6 +3027,37 @@ mod tests {
         assert_eq!(loaded.font_scale, TerminalConfig::default().font_scale);
         // An older config gets idle suspension at its default, not 0 (never).
         assert_eq!(loaded.idle_suspend_minutes, 15);
+    }
+
+    /// A text scale edited into the file is held to the setting's range, on the first load and
+    /// on a reload alike; 0.5 and 3 themselves are kept.
+    #[test]
+    fn a_hand_edited_text_scale_is_held_to_its_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        for (written, read) in [
+            ("0.5", 0.5),
+            ("3.0", 3.0),
+            ("0", 0.5),
+            ("0.1", 0.5),
+            ("-2", 0.5),
+            ("9", 3.0),
+            ("1e300", 3.0),
+            ("1.3", 1.3),
+        ] {
+            std::fs::write(&path, format!(r#"{{"font_scale":{written}}}"#)).unwrap();
+            assert_eq!(
+                TerminalConfig::load_from(&path).font_scale,
+                read,
+                "{written}"
+            );
+            match TerminalConfig::default().check_disk_at(&path) {
+                DiskChange::Updated(reloaded) => {
+                    assert_eq!(reloaded.font_scale, read, "{written} on reload")
+                }
+                _ => panic!("{written}: the file was not read again"),
+            }
+        }
     }
 
     #[test]

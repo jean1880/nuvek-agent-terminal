@@ -249,8 +249,12 @@ fn join(texts: &[String], more: usize) -> Option<String> {
     }
     let total = texts.len() + more;
     let tail = |left: usize| (left > 0).then(|| format!("And {left} more."));
-    // Room for the count however many are left out.
-    let room = MAX_TEXT - format!(" And {total} more.").chars().count();
+    // Room for the count however many are left out; one alone is never counted.
+    let room = if total > 1 {
+        MAX_TEXT - format!(" And {total} more.").chars().count()
+    } else {
+        MAX_TEXT
+    };
     let mut said: Vec<&str> = Vec::new();
     let mut length = 0;
     for text in texts.iter().take(MAX_SAID) {
@@ -537,6 +541,18 @@ mod tests {
         let huge = coalesce(&[polite("y".repeat(2000))]).0.unwrap();
         assert!(huge.chars().count() <= MAX_TEXT);
         assert!(huge.ends_with('…'));
+        // One alone that fits the ceiling is read whole: no room is kept for a count it
+        // never has.
+        let whole = "z".repeat(MAX_TEXT);
+        assert_eq!(coalesce(&[polite(whole.clone())]).0, Some(whole));
+        let near = "w".repeat(MAX_TEXT - 3);
+        assert_eq!(coalesce(&[polite(near.clone())]).0, Some(near));
+        // Two: the count's room is kept, so the whole stays within the ceiling.
+        let said = coalesce(&[polite("a".repeat(MAX_TEXT)), polite("b".into())])
+            .0
+            .unwrap();
+        assert!(said.chars().count() <= MAX_TEXT, "{}", said.chars().count());
+        assert!(said.ends_with("… And 1 more."), "{said}");
     }
 
     #[test]

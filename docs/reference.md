@@ -767,7 +767,8 @@ stopped yourself says nothing. When a desktop notification already announced the
 thread out of sight asking for approval, or finishing with **Notify When an Agent Finishes**
 on), the window says nothing more, so nothing is read twice. Several things happening at once
 are read as one announcement: at most three of them, then how many more ("And 4 more."). The
-text is short, has secrets masked like everything the app stores, and is never saved.
+text is short, has secrets masked like everything the app stores, and is never saved. A window
+that is closing says nothing more, not even what was waiting to be said.
 
 Turn it off with Settings → General → Notifications → **Announce Events to Screen Readers**
 (`announce_events` in the config file).
@@ -775,17 +776,19 @@ Turn it off with Settings → General → Notifications → **Announce Events to
 **Text size.** Settings → General → Appearance → **Text Scale** (or Ctrl+= and Ctrl+-, and
 Ctrl+0 to reset) sets the size of all the app's text: threads, the thread list, menus,
 Settings and every other dialog, and the terminals. It applies at once, to every window, and
-is kept as `font_scale`. At 2× the window needs to be at least 600 by 400 pixels for every
-control to fit.
+is kept as `font_scale`, from 0.5× to 3×: a value outside that written into the config file
+by hand is read as the nearest end of it. At 2× the window needs to be at least 600 by 400
+pixels for every control to fit.
 
 **Moving around.** F6 moves the keyboard focus to the next part of the window, and Shift+F6
 to the previous one, wrapping round: the thread list, the transcript (its newest message),
 the message box, the terminal drawer while it is open, and the Changes panel while it is
-docked. Tab goes through them in the same order. In a terminal (a terminal page or the
-drawer) F6 belongs to the program running there (mc, htop, vim), so Ctrl+F6 and
-Ctrl+Shift+F6 do the same from anywhere. F6 does nothing while a dialog such as Settings is
-open, and leaving a thread list laid over a narrow window closes it first, so the focus never
-goes behind it. Each is a landmark a screen reader can jump
+docked. Tab goes through them in the same order. F6 works wherever the focus is, a pane
+divider included, except in a terminal (a terminal page or the drawer): there F6 belongs to
+the program running there (mc, htop, vim), so Ctrl+F6 and Ctrl+Shift+F6 do the same from
+anywhere. F6 does nothing while a dialog such as Settings is open, and leaving a thread list
+laid over a narrow window closes it once the focus has moved, so the focus never goes behind
+it (with nowhere else to go, the list stays open). Each is a landmark a screen reader can jump
 to, named "Threads", "Transcript", "Message composer", "Terminal drawer" and "Changes"; the
 sub-agent shelf and the approval bar above the message box are named groups. A request for
 approval that arrives while you type never takes the focus away from the message box: its
@@ -795,7 +798,8 @@ card.
 **The transcript.** A screen reader reads the transcript as a list named "Messages", one
 item per message, step or request, each named for who wrote it or what it is: "You",
 "Claude" (or the agent that replied), "Reasoning", "Tool: cargo test", "Approval request",
-"Question", "Error". A reply still streaming in, or a tool still running, is marked busy until
+"Question", "Form request", "Error", "Notice", "Compaction", "Now Claude" (a switch),
+"Quick replies", and a plan by its title ("Plan", "Completed plan"…). A reply still streaming in, or a tool still running, is marked busy until
 it is done, or until the turn is stopped or fails or the agent exits: a tool cut off that way
 shows as **Interrupted** (a command left running in the background goes on until the agent
 exits).

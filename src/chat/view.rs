@@ -2295,6 +2295,117 @@ pub(crate) mod tests {
         }
     }
 
+    /// Every kind of transcript row, built as the transcript builds it, is a list item named
+    /// by `row_label`: notices, dividers, errors, requests, quick replies and plans as much as
+    /// messages and tools.
+    #[test]
+    #[ignore = "constructs GTK widgets; run on a private display"]
+    fn every_kind_of_transcript_row_is_a_named_list_item() {
+        use agent_core::event::{Decision, PlanStep, StepStatus, TurnState};
+        use model::{Body, Item};
+        let _ctx = native_init();
+        let sink: cards::RowSink = std::rc::Rc::new(|_| {});
+        let bodies = vec![
+            Body::User {
+                text: "Fix it".into(),
+                queued: true,
+                attachments: Vec::new(),
+            },
+            Body::Assistant {
+                text: "On it".into(),
+                driver: Driver::Codex,
+                streaming: false,
+                images: Vec::new(),
+            },
+            Body::new_reasoning(),
+            Body::Tool(model::Tool {
+                kind: agent_core::event::ItemKind::Command,
+                title: "cargo test".into(),
+                input: None,
+                input_text: String::new(),
+                output: String::new(),
+                error: None,
+                status: model::ToolStatus::Completed,
+                reported_model: None,
+                images: Vec::new(),
+            }),
+            Body::Notice {
+                text: "Heads up".into(),
+                tone: model::Tone::Warning,
+            },
+            Body::Compaction {
+                manual: true,
+                before: 90_000,
+                after: Some(12_000),
+            },
+            Body::TurnError {
+                message: "boom".into(),
+            },
+            Body::Switch {
+                driver: Driver::Claude,
+                model: Some("opus".into()),
+                agent_changed: true,
+                returned: false,
+            },
+            Body::Approval(model::Approval {
+                request: "a1".into(),
+                tool: "Bash".into(),
+                title: Some("Run cargo test".into()),
+                input: serde_json::Value::Null,
+                reason: None,
+                options: vec![Decision::Allow, Decision::Deny],
+                state: model::ApprovalState::Pending,
+                remembers: None,
+            }),
+            Body::Question(model::QuestionCard {
+                request: "q1".into(),
+                questions: Vec::new(),
+                state: model::QuestionState::Pending,
+            }),
+            Body::Form(model::FormCard {
+                request: "f1".into(),
+                server: "docs".into(),
+                message: "Sign in".into(),
+                form: agent_core::form::Form::Link {
+                    url: "https://example.com/login".into(),
+                },
+                state: model::FormState::Pending,
+                refused: false,
+            }),
+            Body::QuickReplies(model::QuickReplies {
+                request: "reply:a2".into(),
+                options: vec!["Yes".into(), "No".into()],
+            }),
+            Body::Plan {
+                steps: vec![PlanStep {
+                    text: "Build".into(),
+                    status: StepStatus::InProgress,
+                }],
+                outcome: Some(TurnState::Interrupted),
+            },
+        ];
+        for (n, body) in bodies.into_iter().enumerate() {
+            let item = Item {
+                id: format!("row-{n}"),
+                body,
+                expanded: false,
+                parent: None,
+                children: Vec::new(),
+            };
+            let row = cards::Row::build(&item, &sink);
+            let widget = row.widget();
+            let name = cards::row_label(&item.body);
+            assert!(
+                gtk4::test_accessible_has_role(&widget, gtk4::AccessibleRole::ListItem),
+                "{name}: not a list item"
+            );
+            assert!(
+                crate::testutil::has_accessible_label(&widget, &name),
+                "{n}: not named {name:?}"
+            );
+        }
+    }
+
     /// The transcript is a list a screen reader steps through: each message, step and request
     /// is a list item, named by its author or kind ("You", "Claude", "Tool: …"), and a reply
     /// streaming in or a tool at work is busy until it is done.
@@ -2332,9 +2443,7 @@ pub(crate) mod tests {
         };
         let mut kinds = std::collections::HashSet::new();
         for (id, body) in &rows {
-            let Some(name) = row_label(body) else {
-                continue;
-            };
+            let name = row_label(body);
             let Some(widget) = inner.transcript.with_row(id, cards::Row::widget) else {
                 continue; // not built: outside the window of rows
             };
@@ -2347,16 +2456,11 @@ pub(crate) mod tests {
                 "{name}: not busy={}",
                 row_busy(body)
             );
-            if matches!(
-                body,
-                model::Body::User { .. } | model::Body::Assistant { .. } | model::Body::Tool(_)
-            ) {
-                assert!(
-                    gtk4::test_accessible_has_role(&widget, gtk4::AccessibleRole::ListItem),
-                    "{name}: not a list item"
-                );
-                kinds.insert(name.split(':').next().unwrap_or_default().to_owned());
-            }
+            assert!(
+                gtk4::test_accessible_has_role(&widget, gtk4::AccessibleRole::ListItem),
+                "{name}: not a list item"
+            );
+            kinds.insert(name.split(':').next().unwrap_or_default().to_owned());
         }
         for author in ["You", "Claude", "Tool"] {
             assert!(kinds.contains(author), "no row named {author}: {kinds:?}");
@@ -3051,17 +3155,24 @@ pub(crate) mod tests {
     }
 
     /// A button filled with a colour the focus ring may equal (the accent) draws its ring
-    /// outside itself, on the surface around it, never inset on its own fill.
+    /// outside itself, on the surface around it, never inset on its own fill: in the chat's
+    /// stylesheet and in the global one (main.rs), whose `button.suggested-action` fill reaches
+    /// every dialog, popover and page. A ring covers a fill only when its selector is the
+    /// fill's own or a wider one: one compound selector the fill's last compound includes
+    /// (`button.suggested-action` covers `.chat-view button.suggested-action`, `.send-button`
+    /// covers `button.send-button`; never the reverse).
     #[test]
     fn a_filled_button_rings_outside_its_fill() {
-        // (selectors, body) of every rule, comments dropped.
+        // (selectors, body) of every rule in both stylesheets, comments dropped.
         let mut css = String::new();
-        let mut rest = STYLE;
-        while let Some((before, after)) = rest.split_once("/*") {
-            css.push_str(before);
-            rest = after.split_once("*/").map_or("", |(_, tail)| tail);
+        for sheet in [STYLE, crate::GLOBAL_CSS] {
+            let mut rest = sheet;
+            while let Some((before, after)) = rest.split_once("/*") {
+                css.push_str(before);
+                rest = after.split_once("*/").map_or("", |(_, tail)| tail);
+            }
+            css.push_str(rest);
         }
-        css.push_str(rest);
         let rules: Vec<(String, String)> = css
             .split('}')
             .filter_map(|rule| rule.split_once('{'))
@@ -3076,35 +3187,58 @@ pub(crate) mod tests {
             })
             .flat_map(|(sel, _)| {
                 sel.split(',')
-                    .map(|s| s.trim().to_owned())
+                    .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
                     .collect::<Vec<_>>()
             })
             .filter(|sel| sel.contains("button"))
-            .filter_map(|sel| sel.rsplit('.').next().map(|class| format!(".{class}")))
             .collect();
-        assert!(filled.contains(&".send-button".to_owned()), "{filled:?}");
-        assert!(
-            filled.contains(&".suggested-action".to_owned()),
-            "{filled:?}"
-        );
-        for class in filled {
-            let ring = rules
+        for wanted in ["button.send-button", "button.suggested-action"] {
+            assert!(filled.iter().any(|s| s == wanted), "{wanted}: {filled:?}");
+        }
+        // A compound selector's element name (empty for any) and its classes.
+        fn compound(sel: &str) -> (&str, std::collections::BTreeSet<&str>) {
+            let mut parts = sel.split('.');
+            let element = parts.next().unwrap_or_default();
+            (element, parts.collect())
+        }
+        let covers = |ring: &str, fill: &str| {
+            if ring == fill {
+                return true;
+            }
+            if ring.contains(' ') {
+                return false;
+            }
+            let last = fill.rsplit(' ').next().unwrap_or(fill);
+            let ((ring_element, ring_classes), (fill_element, fill_classes)) =
+                (compound(ring), compound(last));
+            (ring_element.is_empty() || ring_element == fill_element)
+                && ring_classes.is_subset(&fill_classes)
+        };
+        for fill in filled {
+            // Every rule whose ring reaches the fill and places it (the bare `:focus-visible`
+            // that only colours every ring places none).
+            let offsets: Vec<&str> = rules
                 .iter()
-                .find(|(sel, _)| {
-                    sel.split(',')
-                        .any(|s| s.trim().ends_with(&format!("{class}:focus-visible")))
+                .filter(|(sel, _)| {
+                    sel.split(',').any(|s| {
+                        let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+                        s.strip_suffix(":focus-visible")
+                            .is_some_and(|ring| !ring.is_empty() && covers(ring, &fill))
+                    })
                 })
-                .unwrap_or_else(|| panic!("{class}: no focus ring"));
-            let offset = ring
-                .1
-                .split(';')
-                .find_map(|d| d.trim().strip_prefix("outline-offset:"))
-                .map(str::trim)
-                .unwrap_or_else(|| panic!("{class}: no outline-offset"));
-            assert!(
-                !offset.starts_with('-') && offset != "0" && offset != "0px",
-                "{class}: its ring is drawn on its own fill ({offset})"
-            );
+                .filter_map(|(_, body)| {
+                    body.split(';')
+                        .find_map(|d| d.trim().strip_prefix("outline-offset:"))
+                        .map(str::trim)
+                })
+                .collect();
+            assert!(!offsets.is_empty(), "{fill}: no focus ring covers it");
+            for offset in offsets {
+                assert!(
+                    !offset.starts_with('-') && offset != "0" && offset != "0px",
+                    "{fill}: its ring is drawn on its own fill ({offset})"
+                );
+            }
         }
     }
 

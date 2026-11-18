@@ -84,9 +84,10 @@ impl AgentTerminalWindow {
         holder.upcast()
     }
 
-    /// Queues `announcement` for its live region, unless announcements are off.
+    /// Queues `announcement` for its live region, unless announcements are off or the window
+    /// is closing (its threads' last events say nothing).
     pub(super) fn announce(&self, announcement: Announcement) {
-        if !self.config.borrow().announce_events {
+        if !self.config.borrow().announce_events || self.is_closing() {
             return;
         }
         let urgency = announcement.urgency;
@@ -142,8 +143,8 @@ impl AgentTerminalWindow {
         };
         queued.set(false);
         let text = self.live.pending.borrow_mut().take(urgency);
-        // Turned off while they waited: nothing is said.
-        if !self.config.borrow().announce_events {
+        // Turned off, or the window began closing, while they waited: nothing is said.
+        if !self.config.borrow().announce_events || self.is_closing() {
             self.live.pending.borrow_mut().clear();
             return;
         }

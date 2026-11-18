@@ -824,10 +824,9 @@ dialog.chat-panel bottom-sheet > sheet,
     outline-offset: -2px;
 }
 /* Filled with the accent, which the focus colour may equal: the ring goes outside it, on the
-   composer, where the focus colour reads at 3:1. */
-.send-button:focus-visible,
-.chat-view button.suggested-action:focus-visible,
-.chat-panel button.suggested-action:focus-visible {
+   composer, where the focus colour reads at 3:1. Every `button.suggested-action` has its ring
+   in the global stylesheet (main.rs). */
+.send-button:focus-visible {
     outline: 2px solid @at_focus;
     outline-offset: 2px;
 }

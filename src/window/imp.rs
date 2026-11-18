@@ -267,14 +267,14 @@ const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
             </child>
             <child>
               <object class="GtkShortcutsShortcut">
-                <property name="accelerator">F6 &lt;Ctrl&gt;F6</property>
+                <property name="accelerator">F6 &lt;Primary&gt;F6</property>
                 <property name="title">Next Region (Threads, Transcript, Message Box, Drawer, Changes)</property>
                 <property name="subtitle">In a terminal, F6 is the program's: use Ctrl+F6</property>
               </object>
             </child>
             <child>
               <object class="GtkShortcutsShortcut">
-                <property name="accelerator">&lt;Shift&gt;F6 &lt;Ctrl&gt;&lt;Shift&gt;F6</property>
+                <property name="accelerator">&lt;Shift&gt;F6 &lt;Primary&gt;&lt;Shift&gt;F6</property>
                 <property name="title">Previous Region</property>
               </object>
             </child>
@@ -1917,7 +1917,9 @@ impl AgentTerminalWindow {
             (
                 config.theme,
                 config.scrollback_lines,
-                config.font_scale,
+                // Held to the setting's range when read (`TerminalConfig::normalize`); again
+                // here, as every other way in is.
+                crate::style::clamp_text_scale(config.font_scale),
                 config.context_warning,
             )
         };
@@ -2106,7 +2108,7 @@ impl AgentTerminalWindow {
         self.add_win_action("focus-previous-region", |imp| {
             imp.cycle_region(false);
         });
-        // Bare F6 and Shift+F6: after the focused widget, so a terminal program keeps them.
+        // Bare F6 and Shift+F6: ahead of the panes, and left to a terminal's program.
         self.install_region_keys();
         self.add_win_action("search", Self::toggle_search);
         self.add_win_action("close-tab", |imp| {
@@ -8635,6 +8637,26 @@ fn excerpt_toast(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shortcuts window shows the region keys as they are bound: the bare key, then the
+    /// accelerator spelled as the table spells it (`<Primary>`, the Command key on macOS).
+    #[test]
+    fn the_shortcuts_window_lists_the_region_keys_as_bound() {
+        let escape = |a: &str| a.replace('<', "&lt;").replace('>', "&gt;");
+        for (action, bare) in [
+            ("win.focus-next-region", "F6"),
+            ("win.focus-previous-region", "&lt;Shift&gt;F6"),
+        ] {
+            let accels = crate::accels::accels_for(action);
+            assert!(!accels.is_empty(), "{action} is not bound");
+            let shown: Vec<String> = accels.iter().map(|a| escape(a)).collect();
+            let line = format!(
+                "<property name=\"accelerator\">{bare} {}</property>",
+                shown.join(" ")
+            );
+            assert!(SHORTCUTS_XML.contains(&line), "{action}: no {line}");
+        }
+    }
 
     #[test]
     fn send_resolves_by_target_focus_and_selection() {

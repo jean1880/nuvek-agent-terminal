@@ -442,6 +442,28 @@ impl Prompts {
         Some((window, result))
     }
 
+    /// Removes the prompt at `index` when it is still `shown`, leaving `shown` unchanged so
+    /// another click or focus-leave on the dying row before the idle rebuild cannot hit the
+    /// prompt that shifted into `index`.
+    fn remove_at(
+        &self,
+        index: usize,
+        shown: &RefCell<SavedPrompt>,
+    ) -> Option<(Window, SavedPrompt)> {
+        let window = self.window()?;
+        let still_here =
+            window.imp().config.borrow().saved_prompts.get(index) == Some(&*shown.borrow());
+        if !still_here {
+            return None;
+        }
+        let removed = window
+            .imp()
+            .config
+            .borrow_mut()
+            .remove_saved_prompt(index)?;
+        Some((window, removed))
+    }
+
     fn prompt_row(
         self: &Rc<Self>,
         index: usize,
@@ -650,19 +672,17 @@ impl Prompts {
         // Delete: taken out at once, with Undo on the toast that says so.
         let this = Rc::downgrade(self);
         let delete_shown = Rc::clone(shown);
+        let delete_row = row.downgrade();
         delete.connect_clicked(move |_| {
             let Some(this) = this.upgrade() else {
                 return;
             };
-            let Some((window, removed)) = this.edit(index, &delete_shown, |c| {
-                c.remove_saved_prompt(index)
-                    .ok_or_else(|| "That saved prompt is no longer there".to_owned())
-            }) else {
+            let Some((window, removed)) = this.remove_at(index, &delete_shown) else {
                 return;
             };
-            let Ok(removed) = removed else {
-                return;
-            };
+            if let Some(row) = delete_row.upgrade() {
+                row.set_sensitive(false);
+            }
             window.imp().schedule_config_save();
             let name = removed.name.trim().to_owned();
             this.toast(&format!("Deleted /{name}"), Some((index, removed)));
@@ -1110,19 +1130,23 @@ pub(super) mod tests {
         assert_eq!(expanders()[2].title(), "/review2-copy");
         let unnamed = crate::testutil::icon_only_without_label(group.upcast_ref());
         assert!(unnamed.is_empty(), "{unnamed:?}");
-        let delete = buttons()
+        // Clicking Delete twice before the idle rebuild runs removes only that row, not the one
+        // that shifted into its slot.
+        let delete_mid = buttons()
             .into_iter()
             .filter(|b| b.icon_name().as_deref() == Some("at-user-trash-symbolic"))
-            .nth(2)
-            .expect("the copy's Delete");
-        delete.emit_clicked();
+            .nth(1)
+            .expect("the middle Delete");
+        delete_mid.emit_clicked();
+        delete_mid.emit_clicked();
         crate::testutil::settle(&ctx);
         assert_eq!(prompts().len(), 2);
+        assert_eq!(prompts()[1].name, "review2-copy");
         assert_eq!(expanders().len(), 3, "its row is gone");
 
         // A prompt of the deleted one's name is added meanwhile: its Undo is refused, and the
         // new one stays as it is, offered.
-        new_name.set_text("review2-copy");
+        new_name.set_text("review2");
         new_body.buffer().set_text("the new one");
         crate::testutil::settle(&ctx);
         add.emit_clicked();

@@ -204,7 +204,8 @@ pub const SYSTEM_COLOURS: [(&str, &str); 28] = [
     // A control's outline reaches 3:1 on Adwaita's light and dark windows
     // (`a_system_themes_controls_are_seen_on_adwaita`).
     ("at_border_strong", "alpha(@window_fg_color, 0.55)"),
-    ("at_border_hover", "alpha(@accent_color, 0.6)"),
+    // Pointing at a control brightens its outline to the accent, opaque: 3:1 or more there too.
+    ("at_border_hover", "@accent_color"),
     ("at_fg_strong", "@window_fg_color"),
     ("at_fg", "@window_fg_color"),
     // Secondary text stays at 4.5:1 on Adwaita's light window, whose text is itself 80 % opaque
@@ -1300,33 +1301,59 @@ mod tests {
         assert!(main.contains(":focus-visible {\n            outline-color: @at_focus;"));
     }
 
-    /// The system theme's control outline reaches 3:1 on libadwaita's own light and dark
-    /// windows (light text is itself 80 % opaque).
+    /// The system theme's control outline, and the same outline pointed at, reach 3:1 on
+    /// libadwaita's own light and dark windows (light text is itself 80 % opaque; the accent is
+    /// libadwaita's blue).
     #[test]
     fn a_system_themes_controls_are_seen_on_adwaita() {
-        let (_, value) = SYSTEM_COLOURS
-            .iter()
-            .find(|(n, _)| *n == "at_border_strong")
-            .expect("a system colour");
-        let alpha: f64 = value
-            .trim_start_matches("alpha(@window_fg_color, ")
-            .trim_end_matches(')')
-            .parse()
-            .expect("an alpha");
-        for (mode, bg, fg, fg_alpha) in [
+        let value_of = |name: &str| -> &str {
+            SYSTEM_COLOURS
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| *v)
+                .expect("a system colour")
+        };
+        // `@base` or `alpha(@base, a)`: how much of the named colour is drawn.
+        let alpha_of = |value: &str, base: &str| -> f64 {
+            if value == base {
+                return 1.0;
+            }
+            value
+                .strip_prefix(&format!("alpha({base}, "))
+                .and_then(|v| v.strip_suffix(')'))
+                .unwrap_or_else(|| panic!("{value}: not {base} or an alpha of it"))
+                .parse()
+                .expect("an alpha")
+        };
+        let outline = alpha_of(value_of("at_border_strong"), "@window_fg_color");
+        let hover = alpha_of(value_of("at_border_hover"), "@accent_color");
+        for (mode, bg, fg, fg_alpha, accent) in [
             (
                 "light",
                 Rgb::from_hex(0xfafafb),
                 Rgb::from_hex(0x000006),
                 0.8,
+                Rgb::from_hex(0x1c71d8),
             ),
-            ("dark", Rgb::from_hex(0x222226), Rgb::WHITE, 1.0),
+            (
+                "dark",
+                Rgb::from_hex(0x222226),
+                Rgb::WHITE,
+                1.0,
+                Rgb::from_hex(0x78aeed),
+            ),
         ] {
-            let ratio = bg.mix(fg, fg_alpha * alpha).contrast(bg);
+            let ratio = bg.mix(fg, fg_alpha * outline).contrast(bg);
             assert!(
                 ratio >= MIN_NON_TEXT_CONTRAST,
                 "{mode}: at_border_strong at {ratio:.2}:1"
             );
+            let pointed = bg.mix(accent, hover).contrast(bg);
+            assert!(
+                pointed >= MIN_NON_TEXT_CONTRAST,
+                "{mode}: at_border_hover at {pointed:.2}:1"
+            );
+            assert!(pointed >= ratio, "{mode}: pointing at a control dims it");
         }
     }
 

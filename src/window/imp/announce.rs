@@ -3,25 +3,33 @@
 //! GTK 4.10 has no announcement call, so each window holds two off-screen labels whose text
 //! changes are what the screen reader reads: a status (polite) for finished and failed turns and
 //! errors, an alert for approvals, questions and forms. What to say is decided by
-//! [`agent_core::a11y_announce`]; announcements made while one is waiting are joined and shown
-//! once, at idle, on the main loop. Never stored: the text lives in the labels only.
+//! [`agent_core::a11y_announce`]; what waits is bounded there ([`a11y_announce::Pending`]) and
+//! read as at most three items and a count of the rest. Alerts are shown at idle, on the main
+//! loop; polite texts after [`POLITE_DELAY`], so a burst (several threads finishing at once) is
+//! one update. Never stored: the text lives in the labels only.
 
 use std::cell::{Cell, RefCell};
+use std::time::Duration;
 
 use adw::subclass::prelude::*;
-use agent_core::a11y_announce::{self, Announcement};
+use agent_core::a11y_announce::{self, Announcement, Urgency};
 use gtk4::glib;
 use gtk4::prelude::*;
 
 use super::AgentTerminalWindow;
+
+/// How long a polite announcement waits for others to join it.
+const POLITE_DELAY: Duration = Duration::from_millis(200);
 
 /// The two labels, and what waits to be shown in them.
 #[derive(Default)]
 pub(super) struct LiveRegions {
     status: RefCell<Option<gtk4::Label>>,
     alert: RefCell<Option<gtk4::Label>>,
-    pending: RefCell<Vec<Announcement>>,
-    queued: Cell<bool>,
+    pending: RefCell<a11y_announce::Pending>,
+    /// A flush is queued: the polite one on its timer, the alert one at idle.
+    polite_queued: Cell<bool>,
+    alert_queued: Cell<bool>,
 }
 
 /// One live region: drawn nowhere (no opacity, no size worth the name, no pointer), but in the
@@ -46,12 +54,16 @@ fn region(role: gtk4::AccessibleRole, name: &str) -> gtk4::Label {
 
 /// Shows `text` in `label` so its change is seen: the same words again are cleared first, so a
 /// repeat is still announced.
+///
+/// Only the label's text is set. A GtkLabel keeps its accessible name equal to its text, and
+/// that name changing is the one event a screen reader (Orca) reads a status or alert by; setting
+/// the name again as a property besides would be a second route to the same event, which GTK
+/// drops as unchanged at best and a screen reader reads twice at worst.
 fn say(label: &gtk4::Label, text: &str) {
     if label.text() == text {
         label.set_text("");
     }
     label.set_text(text);
-    label.update_property(&[gtk4::accessible::Property::Label(text)]);
 }
 
 impl AgentTerminalWindow {
@@ -72,21 +84,34 @@ impl AgentTerminalWindow {
         holder.upcast()
     }
 
-    /// Queues `announcement` for the live regions, unless announcements are off.
+    /// Queues `announcement` for its live region, unless announcements are off.
     pub(super) fn announce(&self, announcement: Announcement) {
         if !self.config.borrow().announce_events {
             return;
         }
+        let urgency = announcement.urgency;
         self.live.pending.borrow_mut().push(announcement);
-        if self.live.queued.replace(true) {
+        let queued = match urgency {
+            Urgency::Polite => &self.live.polite_queued,
+            Urgency::Assertive => &self.live.alert_queued,
+        };
+        if queued.replace(true) {
             return;
         }
         let weak = self.obj().downgrade();
-        glib::idle_add_local_once(move || {
+        let flush = move || {
             if let Some(obj) = weak.upgrade() {
-                obj.imp().flush_announcements();
+                obj.imp().flush_announcements(urgency);
             }
-        });
+        };
+        match urgency {
+            Urgency::Polite => {
+                glib::timeout_add_local_once(POLITE_DELAY, flush);
+            }
+            Urgency::Assertive => {
+                glib::idle_add_local_once(flush);
+            }
+        }
     }
 
     /// What `event` on `thread` (titled `title`) says, if anything, queued.
@@ -109,18 +134,21 @@ impl AgentTerminalWindow {
         }
     }
 
-    fn flush_announcements(&self) {
-        self.live.queued.set(false);
-        let pending = self.live.pending.take();
+    /// Shows what waits of `urgency` in its region.
+    fn flush_announcements(&self, urgency: Urgency) {
+        let (queued, label) = match urgency {
+            Urgency::Polite => (&self.live.polite_queued, &self.live.status),
+            Urgency::Assertive => (&self.live.alert_queued, &self.live.alert),
+        };
+        queued.set(false);
+        let text = self.live.pending.borrow_mut().take(urgency);
         // Turned off while they waited: nothing is said.
         if !self.config.borrow().announce_events {
+            self.live.pending.borrow_mut().clear();
             return;
         }
-        let (polite, assertive) = a11y_announce::coalesce(&pending);
-        for (label, text) in [(&self.live.status, polite), (&self.live.alert, assertive)] {
-            if let (Some(label), Some(text)) = (label.borrow().as_ref(), text) {
-                say(label, &text);
-            }
+        if let (Some(label), Some(text)) = (label.borrow().as_ref(), text) {
+            say(label, &text);
         }
     }
 
@@ -141,5 +169,11 @@ impl AgentTerminalWindow {
     pub(super) fn live_region_labels(&self) -> (gtk4::Label, gtk4::Label) {
         let get = |l: &RefCell<Option<gtk4::Label>>| l.borrow().clone().expect("a live region");
         (get(&self.live.status), get(&self.live.alert))
+    }
+
+    /// Whether a flush of either region is queued.
+    #[cfg(test)]
+    pub(super) fn live_region_queued(&self) -> bool {
+        self.live.polite_queued.get() || self.live.alert_queued.get()
     }
 }

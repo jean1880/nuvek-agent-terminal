@@ -819,10 +819,17 @@ dialog.chat-panel bottom-sheet > sheet,
 .section-more:focus-visible,
 .jump-button:focus-visible,
 .image-tile:focus-visible,
-.attach-button:focus-visible,
-.send-button:focus-visible {
+.attach-button:focus-visible {
     outline: 2px solid @at_focus;
     outline-offset: -2px;
+}
+/* Filled with the accent, which the focus colour may equal: the ring goes outside it, on the
+   composer, where the focus colour reads at 3:1. */
+.send-button:focus-visible,
+.chat-view button.suggested-action:focus-visible,
+.chat-panel button.suggested-action:focus-visible {
+    outline: 2px solid @at_focus;
+    outline-offset: 2px;
 }
 
 /* ---------------------------------------------------------------- images */

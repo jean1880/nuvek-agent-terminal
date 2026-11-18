@@ -267,13 +267,14 @@ const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
             </child>
             <child>
               <object class="GtkShortcutsShortcut">
-                <property name="accelerator">F6</property>
+                <property name="accelerator">F6 &lt;Ctrl&gt;F6</property>
                 <property name="title">Next Region (Threads, Transcript, Message Box, Drawer, Changes)</property>
+                <property name="subtitle">In a terminal, F6 is the program's: use Ctrl+F6</property>
               </object>
             </child>
             <child>
               <object class="GtkShortcutsShortcut">
-                <property name="accelerator">&lt;Shift&gt;F6</property>
+                <property name="accelerator">&lt;Shift&gt;F6 &lt;Ctrl&gt;&lt;Shift&gt;F6</property>
                 <property name="title">Previous Region</property>
               </object>
             </child>
@@ -2105,6 +2106,8 @@ impl AgentTerminalWindow {
         self.add_win_action("focus-previous-region", |imp| {
             imp.cycle_region(false);
         });
+        // Bare F6 and Shift+F6: after the focused widget, so a terminal program keeps them.
+        self.install_region_keys();
         self.add_win_action("search", Self::toggle_search);
         self.add_win_action("close-tab", |imp| {
             // Through the same door as the sidebar's X, so a running thread asks first.

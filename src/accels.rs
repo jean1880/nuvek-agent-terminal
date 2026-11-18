@@ -50,10 +50,12 @@ const COMMON: &[Binding] = &[
     ),
     ("win.zoom-out", &["<Primary>minus", "<Primary>KP_Subtract"]),
     ("win.zoom-reset", &["<Primary>0", "<Primary>KP_0"]),
-    // Region cycling, as GTK and GNOME apps do it: the sidebar, the transcript, the composer,
-    // the drawer and the diff panel, whichever are shown.
-    ("win.focus-next-region", &["F6"]),
-    ("win.focus-previous-region", &["<Shift>F6"]),
+    // Region cycling: the sidebar, the transcript, the composer, the drawer and the diff panel,
+    // whichever are shown. Bare F6 and Shift+F6 are matched in the window's bubble phase
+    // (`window/imp/regions.rs`), after the focused widget, so a terminal program keeps them;
+    // these work from a terminal too.
+    ("win.focus-next-region", &["<Primary>F6"]),
+    ("win.focus-previous-region", &["<Primary><Shift>F6"]),
     ("win.next-tab", &["<Primary>Tab", "<Primary>Page_Down"]),
     (
         "win.previous-tab",
@@ -174,6 +176,16 @@ const HAND_BOUND: &[HandBound] = &[
         "KP_Delete",
         "sidebar thread row selected",
         "window/imp/thread_menu.rs",
+    ),
+    hand(
+        "F6",
+        "focused widget let it go (bubble phase)",
+        "window/imp/regions.rs",
+    ),
+    hand(
+        "<Shift>F6",
+        "focused widget let it go (bubble phase)",
+        "window/imp/regions.rs",
     ),
     hand("Up", "composer focused", "chat/view/composer.rs"),
     hand("Down", "composer focused", "chat/view/composer.rs"),
@@ -313,6 +325,26 @@ mod tests {
                 h.site
             );
         }
+    }
+
+    /// An application accelerator is caught before the focused widget: a bare F6 bound there
+    /// would never reach a terminal program. Region cycling has Ctrl+F6 instead.
+    #[test]
+    fn bare_f6_is_left_to_the_focused_widget() {
+        for (action, accels) in all() {
+            for accel in accels {
+                let key = normalise(&accel);
+                assert!(
+                    key != "f6" && key != "<shift>f6",
+                    "{action} takes {accel} from terminals"
+                );
+            }
+        }
+        let next = all()
+            .into_iter()
+            .find(|(a, _)| a == "win.focus-next-region")
+            .expect("bound");
+        assert_eq!(normalise(&next.1[0]), "<ctrl>f6");
     }
 
     #[test]

@@ -164,19 +164,114 @@ pub fn announce(event: &Event, cx: &Context<'_>) -> Option<Announcement> {
     }
 }
 
+/// The most announcements one live-region update reads out; the rest are counted ("And 2
+/// more.").
+pub const MAX_SAID: usize = 3;
+/// The most characters one live-region update holds, its count of the rest included.
+pub const MAX_TEXT: usize = 480;
+/// The most distinct announcements of one urgency held while they wait; past it they are only
+/// counted.
+pub const MAX_HELD: usize = 16;
+
 /// Announcements made while one was waiting to be shown, joined: each urgency's texts in
-/// order, a repeat dropped. The polite text first, then the assertive.
+/// order, a repeat dropped, at most [`MAX_SAID`] within [`MAX_TEXT`] characters, the rest
+/// counted. The polite text first, then the assertive.
 pub fn coalesce(pending: &[Announcement]) -> (Option<String>, Option<String>) {
-    let join = |urgency: Urgency| {
-        let mut texts: Vec<&str> = Vec::new();
-        for a in pending.iter().filter(|a| a.urgency == urgency) {
-            if !texts.contains(&a.text.as_str()) {
-                texts.push(&a.text);
-            }
+    let mut held = Pending::default();
+    for a in pending {
+        held.push(a.clone());
+    }
+    (held.take(Urgency::Polite), held.take(Urgency::Assertive))
+}
+
+/// What waits to be shown, bounded: up to [`MAX_HELD`] distinct texts of each urgency, and a
+/// count of those past it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Pending {
+    polite: Held,
+    assertive: Held,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Held {
+    texts: Vec<String>,
+    /// Past [`MAX_HELD`]: said only as a count.
+    more: usize,
+}
+
+impl Pending {
+    fn held(&mut self, urgency: Urgency) -> &mut Held {
+        match urgency {
+            Urgency::Polite => &mut self.polite,
+            Urgency::Assertive => &mut self.assertive,
         }
-        (!texts.is_empty()).then(|| texts.join(" "))
-    };
-    (join(Urgency::Polite), join(Urgency::Assertive))
+    }
+
+    /// Holds `announcement` (a repeat of one held is dropped).
+    pub fn push(&mut self, announcement: Announcement) {
+        let held = self.held(announcement.urgency);
+        if held.texts.contains(&announcement.text) {
+            return;
+        }
+        if held.texts.len() < MAX_HELD {
+            held.texts.push(announcement.text);
+        } else {
+            held.more += 1;
+        }
+    }
+
+    /// Whether anything of `urgency` waits.
+    pub fn has(&self, urgency: Urgency) -> bool {
+        let held = match urgency {
+            Urgency::Polite => &self.polite,
+            Urgency::Assertive => &self.assertive,
+        };
+        !held.texts.is_empty() || held.more > 0
+    }
+
+    /// The text to show for `urgency`, joined and bounded, and nothing of it held any more.
+    pub fn take(&mut self, urgency: Urgency) -> Option<String> {
+        let held = std::mem::take(self.held(urgency));
+        join(&held.texts, held.more)
+    }
+
+    /// Drops everything held.
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// `texts` read one after another: the first [`MAX_SAID`] that fit in [`MAX_TEXT`] characters,
+/// and "And N more." for the rest and `more` besides.
+fn join(texts: &[String], more: usize) -> Option<String> {
+    if texts.is_empty() && more == 0 {
+        return None;
+    }
+    let total = texts.len() + more;
+    let tail = |left: usize| (left > 0).then(|| format!("And {left} more."));
+    // Room for the count however many are left out.
+    let room = MAX_TEXT - format!(" And {total} more.").chars().count();
+    let mut said: Vec<&str> = Vec::new();
+    let mut length = 0;
+    for text in texts.iter().take(MAX_SAID) {
+        let add = text.chars().count() + usize::from(!said.is_empty());
+        if length + add > room && !said.is_empty() {
+            break;
+        }
+        said.push(text);
+        length += add;
+    }
+    let mut out = said.join(" ");
+    if out.chars().count() > room {
+        // One text longer than the room (parts are capped, so only a very long sentence).
+        let cut: String = out.chars().take(room.saturating_sub(1)).collect();
+        out = format!("{}…", cut.trim_end());
+    }
+    match tail(total - said.len()) {
+        Some(tail) if out.is_empty() => Some(tail),
+        Some(tail) => Some(format!("{out} {tail}")),
+        None => Some(out),
+    }
 }
 
 /// `title` in quotation marks, or "A thread" when it has none.
@@ -210,6 +305,13 @@ fn with_detail(head: &str, detail: Option<&str>) -> String {
 /// `text` redacted, without hidden characters, its whitespace collapsed, cut to [`MAX_PART`]
 /// characters (with an ellipsis).
 pub fn part(text: &str) -> String {
+    plain(text, MAX_PART)
+}
+
+/// `text` as one plain line a screen reader may be given: redacted, without control, bidi,
+/// zero-width or other hidden characters, its whitespace collapsed, cut to `max` characters
+/// with an ellipsis. Announcements' parts and transcript rows' names both come from it.
+pub fn plain(text: &str, max: usize) -> String {
     let redacted = crate::redact::redact(text);
     let words: Vec<&str> = redacted
         .split(|c: char| c.is_whitespace() || crate::text::is_hidden(c))
@@ -220,10 +322,10 @@ pub fn part(text: &str) -> String {
         .chars()
         .filter(|c| !crate::text::is_hidden(*c))
         .collect();
-    if plain.chars().count() <= MAX_PART {
+    if plain.chars().count() <= max {
         return plain;
     }
-    let cut: String = plain.chars().take(MAX_PART - 1).collect();
+    let cut: String = plain.chars().take(max.saturating_sub(1)).collect();
     format!("{}…", cut.trim_end())
 }
 
@@ -406,5 +508,68 @@ mod tests {
         assert_eq!(polite.as_deref(), Some("“A” finished. “C” finished."));
         assert_eq!(alert.as_deref(), Some("“B” needs approval."));
         assert_eq!(coalesce(&[]), (None, None));
+    }
+
+    #[test]
+    fn a_burst_reads_three_and_counts_the_rest() {
+        let polite = |text: String| Announcement {
+            text,
+            urgency: Urgency::Polite,
+        };
+        let burst: Vec<Announcement> = (0..10)
+            .map(|i| polite(format!("“Thread {i}” finished.")))
+            .collect();
+        let (said, alert) = coalesce(&burst);
+        assert_eq!(alert, None);
+        assert_eq!(
+            said.as_deref(),
+            Some("“Thread 0” finished. “Thread 1” finished. “Thread 2” finished. And 7 more.")
+        );
+
+        // Long texts: fewer, within the ceiling, the rest counted.
+        let long: Vec<Announcement> = (0..5)
+            .map(|i| polite(format!("{i} {}.", "x".repeat(200))))
+            .collect();
+        let said = coalesce(&long).0.unwrap();
+        assert!(said.chars().count() <= MAX_TEXT, "{}", said.chars().count());
+        assert!(said.ends_with("And 3 more."), "{said}");
+        // One alone longer than the ceiling is cut.
+        let huge = coalesce(&[polite("y".repeat(2000))]).0.unwrap();
+        assert!(huge.chars().count() <= MAX_TEXT);
+        assert!(huge.ends_with('…'));
+    }
+
+    #[test]
+    fn what_waits_is_bounded_and_taken_per_urgency() {
+        let mut held = Pending::default();
+        for i in 0..1000 {
+            held.push(Announcement {
+                text: format!("“T{i}” finished."),
+                urgency: Urgency::Polite,
+            });
+            held.push(Announcement {
+                text: "“A” needs approval.".into(),
+                urgency: Urgency::Assertive,
+            });
+        }
+        assert_eq!(held.polite.texts.len(), MAX_HELD);
+        assert_eq!(held.polite.more, 1000 - MAX_HELD);
+        assert_eq!(held.assertive.texts.len(), 1, "repeats dropped");
+        assert!(held.has(Urgency::Assertive));
+        assert_eq!(
+            held.take(Urgency::Assertive).as_deref(),
+            Some("“A” needs approval.")
+        );
+        assert!(!held.has(Urgency::Assertive));
+        assert!(held.has(Urgency::Polite), "the other urgency still waits");
+        let said = held.take(Urgency::Polite).unwrap();
+        assert!(said.ends_with("And 997 more."), "{said}");
+        assert_eq!(held.take(Urgency::Polite), None);
+        held.push(Announcement {
+            text: "x".into(),
+            urgency: Urgency::Polite,
+        });
+        held.clear();
+        assert_eq!(held, Pending::default());
     }
 }

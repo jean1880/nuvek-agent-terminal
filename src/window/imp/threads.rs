@@ -776,7 +776,7 @@ pub(super) struct ChatTab {
     pub(super) view: Option<ChatView>,
     building: bool,
     /// The drawer: the paned's end child, hidden until toggled.
-    drawer: gtk4::Box,
+    pub(super) drawer: gtk4::Box,
     drawer_paned: gtk4::Paned,
     drawer_started: bool,
     rate_banner: adw::Banner,
@@ -7074,16 +7074,16 @@ impl AgentTerminalWindow {
             page.is_some(),
             true,
         );
-        let Some(page) = page else {
-            return;
-        };
+        // The list and the unread mark follow whether or not a notification goes out.
         if in_view && focused {
             let id = thread.to_owned();
             self.write_store("mark the thread read", move |s| s.mark_read(&id));
         } else {
             self.reload_summaries();
         }
-        self.notify_thread(&page, &turn_notification_id(thread), "Thread finished");
+        if let Some(page) = page {
+            self.notify_thread(&page, &turn_notification_id(thread), "Thread finished");
+        }
         self.refresh_sidebar();
     }
 
@@ -13198,6 +13198,62 @@ pub(super) mod tests {
             order.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
             "Tab order"
         );
+
+        // The drawer's search entry is in the drawer: Shift+F6 from it goes to the message box,
+        // not into the drawer's own terminal.
+        let bar = crate::testutil::descendants(&drawer_box)
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk4::SearchBar>().ok())
+            .expect("the drawer's search bar");
+        bar.set_search_mode(true);
+        let entry = crate::testutil::descendants(bar.upcast_ref())
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk4::SearchEntry>().ok())
+            .expect("its entry");
+        assert!(pump_until(&ctx, 5, || entry.is_mapped()));
+        assert!(entry.grab_focus());
+        assert_eq!(imp.cycle_region(false), Some("composer"));
+        bar.set_search_mode(false);
+
+        // A dialog keeps the focus: F6 has nowhere to go, and the key goes on unhandled.
+        let dialog = adw::AlertDialog::new(Some("Sure?"), None);
+        dialog.add_response("cancel", "Cancel");
+        dialog.present(Some(&window));
+        assert!(pump_until(&ctx, 5, || window.visible_dialog().is_some()));
+        crate::testutil::settle(&ctx);
+        assert!(imp.focus_regions().is_empty());
+        assert_eq!(imp.cycle_region(true), None);
+        assert_eq!(imp.cycle_region(false), None);
+        assert!(
+            focus().is_none_or(
+                |f| f.is_ancestor(&dialog) || &f == dialog.upcast_ref::<gtk4::Widget>()
+            ),
+            "focus left the dialog: {:?}",
+            focus()
+        );
+        dialog.force_close();
+        assert!(pump_until(&ctx, 5, || window.visible_dialog().is_none()));
+
+        // A sidebar laid over the thread (a narrow window): leaving it closes it, so focus is
+        // never behind it; once hidden it is not a region.
+        let split = imp.split_view.borrow().clone().expect("the split view");
+        split.set_collapsed(true);
+        split.set_show_sidebar(true);
+        crate::testutil::settle(&ctx);
+        assert!(sidebar.grab_focus() || sidebar.child_focus(gtk4::DirectionType::TabForward));
+        assert!(focus().is_some_and(|f| f == sidebar || f.is_ancestor(&sidebar)));
+        assert_eq!(imp.cycle_region(true), Some("transcript"));
+        assert!(!split.shows_sidebar(), "the overlay was closed");
+        crate::testutil::settle(&ctx);
+        assert_eq!(names().first(), Some(&"transcript"), "{:?}", names());
+        split.set_collapsed(false);
+        split.set_show_sidebar(true);
+        crate::testutil::settle(&ctx);
+
+        // Closing: nothing to cycle.
+        imp.closing_started.set(true);
+        assert!(imp.focus_regions().is_empty());
+        imp.closing_started.set(false);
         window.destroy();
         crate::testutil::settle(&ctx);
     }
@@ -13264,12 +13320,17 @@ pub(super) mod tests {
             "{said}"
         );
 
+        // The screen reader reads the region's accessible name, which is its text.
+        assert!(crate::testutil::has_accessible_label(
+            status.upcast_ref(),
+            &said
+        ));
+
         // The same words again: cleared first, so the screen reader sees a change.
         let before = changes.get();
         turn(agent_core::event::TurnState::Completed);
-        crate::testutil::settle(&ctx);
         assert!(
-            changes.get() >= before + 2,
+            crate::testutil::pump_until(&ctx, 5, || changes.get() >= before + 2),
             "{} → {}",
             before,
             changes.get()
@@ -13277,23 +13338,20 @@ pub(super) mod tests {
         assert_eq!(imp.live_region_texts().0, said);
 
         // An approval is an alert. Out of sight it is a desktop notification, which says it.
+        let approval = Event::ApprovalRequested {
+            tool: "Bash".into(),
+            title: Some("Run cargo test".into()),
+            input: serde_json::Value::Null,
+            reason: None,
+            options: vec![
+                agent_core::event::Decision::Allow,
+                agent_core::event::Decision::Deny,
+            ],
+            response: agent_core::event::ResponseCapability::Live,
+            remembers: None,
+        };
         let looking = window.is_active() && imp.current_thread().as_deref() == Some(&thread);
-        imp.on_thread_envelope(
-            &thread,
-            Driver::Claude,
-            &Envelope::new(Event::ApprovalRequested {
-                tool: "Bash".into(),
-                title: Some("Run cargo test".into()),
-                input: serde_json::Value::Null,
-                reason: None,
-                options: vec![
-                    agent_core::event::Decision::Allow,
-                    agent_core::event::Decision::Deny,
-                ],
-                response: agent_core::event::ResponseCapability::Live,
-                remembers: None,
-            }),
-        );
+        imp.on_thread_envelope(&thread, Driver::Claude, &Envelope::new(approval));
         crate::testutil::settle(&ctx);
         if looking {
             assert_eq!(
@@ -13303,14 +13361,122 @@ pub(super) mod tests {
         } else {
             assert_eq!(imp.live_region_texts().1, "");
         }
+        // Whatever the display makes of the window's focus, the path a looked-at thread takes
+        // reaches the alert region: shown at idle, ahead of any polite text.
+        let before = imp.live_region_texts().1;
+        let other = Event::ApprovalRequested {
+            tool: "Bash".into(),
+            title: Some("Run cargo clippy".into()),
+            input: serde_json::Value::Null,
+            reason: None,
+            options: vec![agent_core::event::Decision::Allow],
+            response: agent_core::event::ResponseCapability::Live,
+            remembers: None,
+        };
+        imp.announce_event(&other, "Live regions", true, false, true);
+        assert_eq!(imp.live_region_texts().1, before, "not before idle");
+        assert!(
+            crate::testutil::pump_until(&ctx, 5, || imp.live_region_texts().1
+                == "Approval needed: Run cargo clippy."),
+            "{:?}",
+            imp.live_region_texts()
+        );
+        assert!(crate::testutil::has_accessible_label(
+            alert.upcast_ref(),
+            "Approval needed: Run cargo clippy."
+        ));
 
-        // Off: nothing changes.
+        // A burst is one update: three read, the rest counted.
+        for i in 0..10 {
+            imp.announce_event(
+                &Envelope::turn_completed(agent_core::event::TurnState::Completed, None).event,
+                &format!("Thread {i}"),
+                false,
+                false,
+                true,
+            );
+        }
+        let before = changes.get();
+        assert!(
+            crate::testutil::pump_until(&ctx, 5, || imp
+                .live_region_texts()
+                .0
+                .ends_with("And 7 more.")),
+            "{:?}",
+            imp.live_region_texts()
+        );
+        assert_eq!(
+            imp.live_region_texts().0,
+            "“Thread 0” finished. “Thread 1” finished. “Thread 2” finished. And 7 more."
+        );
+        assert!(changes.get() <= before + 2, "one update for the burst");
+        assert!(!imp.live_region_queued());
+        let said = imp.live_region_texts().0;
+
+        // Off: nothing is queued, nothing changes.
         imp.config.borrow_mut().announce_events = false;
         let before = changes.get();
         turn(agent_core::event::TurnState::Failed);
+        assert!(!imp.live_region_queued());
         crate::testutil::settle(&ctx);
         assert_eq!(changes.get(), before);
         assert_eq!(imp.live_region_texts().0, said);
+        window.destroy();
+        crate::testutil::settle(&ctx);
+    }
+
+    /// A turn that ends while background work still runs is finished once that work goes: the
+    /// thread is marked (unread, or read when looked at) and its sidebar row redrawn, with the
+    /// default settings too, where no desktop notification goes out for a finished turn.
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    fn a_held_finish_redraws_the_sidebar_without_a_notification() {
+        use agent_core::event::{BackgroundTask, BackgroundTaskKind, TurnState};
+        crate::testutil::gtk_init().unwrap();
+        crate::testutil::adw_init().unwrap();
+        crate::icons::register();
+        let app = crate::window::imp::test_support::test_app("org.test.HeldFinish", true);
+        CHAT_RESTORED.with(|done| done.set(true));
+        let ctx = glib::MainContext::default();
+        let window = crate::window::imp::test_support::test_window(&app, &ctx);
+        let imp = window.imp();
+        assert!(!imp.config.borrow().notify_on_bell, "the default");
+        let dir = tempfile::tempdir().unwrap();
+        let thread = open_quiet_thread(imp, dir.path(), "Held finish");
+        window.present();
+        crate::testutil::settle(&ctx);
+
+        let send = |event| imp.on_thread_envelope(&thread, Driver::Claude, &Envelope::new(event));
+        let tasks = |n: usize| Event::BackgroundTasks {
+            tasks: (0..n)
+                .map(|i| BackgroundTask {
+                    id: format!("t{i}"),
+                    kind: BackgroundTaskKind::Shell,
+                    description: Some("cargo build".into()),
+                    tool_use_id: None,
+                })
+                .collect(),
+        };
+        send(Event::TurnStarted { model: None });
+        send(tasks(1));
+        imp.on_thread_envelope(
+            &thread,
+            Driver::Claude,
+            &Envelope::turn_completed(TurnState::Completed, None),
+        );
+        assert_eq!(imp.with_chat(&thread, |c| c.finish_held), Some(true));
+        crate::testutil::settle(&ctx);
+        // The work ends: the release is queued for idle. Run it here, so only it is counted.
+        send(tasks(0));
+        let before = SIDEBAR_REFRESHES.load(std::sync::atomic::Ordering::Relaxed);
+        imp.release_held_finish(&thread);
+        let after = SIDEBAR_REFRESHES.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(imp.with_chat(&thread, |c| c.finish_held), Some(false));
+        assert!(
+            after > before,
+            "the sidebar was redrawn: {before} → {after}"
+        );
+        crate::testutil::settle(&ctx);
         window.destroy();
         crate::testutil::settle(&ctx);
     }

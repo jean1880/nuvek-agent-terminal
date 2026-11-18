@@ -1686,6 +1686,72 @@ impl Transcript {
         changed
     }
 
+    /// Whether the tool item `id`, or a sub-agent it runs under, is background work: a call that
+    /// returned while it works on (`run_in_background`, a listed background task) or a worker
+    /// with its own lifecycle. Such work outlives a turn that failed or was stopped.
+    fn in_background(&self, id: &str) -> bool {
+        let mut at = Some(id.to_owned());
+        while let Some(id) = at {
+            let Some(item) = self.items.get(&id) else {
+                return false;
+            };
+            if let Body::Tool(tool) = &item.body {
+                let input: Option<Value> = tool
+                    .input
+                    .clone()
+                    .or_else(|| serde_json::from_str(&tool.input_text).ok());
+                let field = |key: &str| input.as_ref().and_then(|i| i.get(key));
+                if field("run_in_background").and_then(Value::as_bool) == Some(true)
+                    || field("worker_state").is_some()
+                    || self.worker_ids.contains(&id)
+                    || self
+                        .background
+                        .iter()
+                        .any(|task| task.id == id || task.tool_use_id.as_deref() == Some(&id))
+                {
+                    return true;
+                }
+            }
+            at = item.parent.clone();
+        }
+        false
+    }
+
+    /// Ends what a turn that failed or was stopped, or a session that exited, leaves open:
+    /// streaming text stops streaming, and a tool still Running becomes Interrupted (its card's
+    /// spinner stops, as a replayed thread's does in [`Self::settle_stale`]), so no row stays
+    /// busy. With `keep_background`, background work and its steps are left running: they
+    /// outlive the turn. The changed items, in order.
+    fn settle_open(&mut self, keep_background: bool) -> Vec<Change> {
+        let mut ids: Vec<ItemId> = self
+            .items
+            .iter()
+            .filter(|(_, item)| match &item.body {
+                Body::Assistant { streaming, .. } | Body::Reasoning { streaming, .. } => *streaming,
+                Body::Tool(t) => t.status == ToolStatus::Running,
+                _ => false,
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        if keep_background {
+            ids.retain(|id| {
+                !matches!(self.items.get(id).map(|i| &i.body), Some(Body::Tool(_)))
+                    || !self.in_background(id)
+            });
+        }
+        ids.sort();
+        for id in &ids {
+            match self.items.get_mut(id).map(|i| &mut i.body) {
+                Some(Body::Assistant { streaming, .. } | Body::Reasoning { streaming, .. }) => {
+                    *streaming = false;
+                }
+                Some(Body::Tool(t)) => t.status = ToolStatus::Interrupted,
+                _ => {}
+            }
+        }
+        ids.into_iter().map(Change::Updated).collect()
+    }
+
     /// A sub-agent that finished cannot finish its own steps any more: one still Running (its
     /// completion was lost) becomes Interrupted, as [`Self::settle_stale`] settles them, so its
     /// spinner stops. Only its direct tool steps: a nested sub-agent still running keeps its own
@@ -1877,6 +1943,8 @@ impl Transcript {
                     out.push(Change::Workers);
                     out.push(Change::Running);
                 }
+                // Nothing it was writing or running goes on: no row stays busy.
+                out.extend(self.settle_open(false));
                 // A dead session runs nothing in the background either.
                 if self.running || !self.background.is_empty() {
                     self.running = false;
@@ -1942,6 +2010,11 @@ impl Transcript {
                 // turn that completed or failed and still ask, and those requests stay live.
                 if *state == TurnState::Interrupted {
                     out.extend(self.expire_requests().into_iter().map(Change::Updated));
+                }
+                // A turn that failed or was stopped finishes nothing it left open, bar the
+                // background work that outlives it: those rows stop streaming and running.
+                if *state != TurnState::Completed {
+                    out.extend(self.settle_open(true));
                 }
                 match state {
                     TurnState::Completed => {}
@@ -2087,7 +2160,12 @@ impl Transcript {
                     }),
                 };
                 if matches!(kind, ItemKind::AssistantMessage | ItemKind::Reasoning) {
-                    self.open_text = Some(id.clone());
+                    // The text that was open is done: a new block of text began.
+                    if let Some(prev) = self.open_text.replace(id.clone()) {
+                        if prev != id {
+                            out.extend(self.finish_text(&prev));
+                        }
+                    }
                 }
                 out.push(Change::Added(self.insert(id, body, parent.clone())));
             }
@@ -2630,7 +2708,12 @@ impl Transcript {
         };
         let id = env.item.clone().unwrap_or_else(|| self.next_id("text"));
         let id = self.insert(id, body, None);
-        self.open_text = Some(id.clone());
+        // The text that was open is done: a new block of text began.
+        if let Some(prev) = self.open_text.replace(id.clone()) {
+            if prev != id {
+                out.extend(self.finish_text(&prev));
+            }
+        }
         out.push(Change::Added(id.clone()));
         Some(id)
     }
@@ -2808,6 +2891,98 @@ mod tests {
             output: Some(output.to_owned()),
             error: (status == ItemStatus::Failed).then(|| output.to_owned()),
         }
+    }
+
+    /// A stopped or failed turn, or an exited session, leaves no row growing: open text stops
+    /// streaming and running tools become Interrupted, each reported as an update, so its row
+    /// stops being busy. Background work outlives the turn, not the session. A new block of
+    /// text ends the one before it.
+    #[test]
+    fn nothing_stays_open_after_a_stop_a_failure_or_an_exit() {
+        use crate::chat::view::cards::row_busy;
+        let busy = |t: &Transcript, id: &str| row_busy(&t.get(id).expect(id).body);
+        let open = |t: &mut Transcript, n: usize| {
+            t.apply(&ev(Event::TurnStarted { model: None }), Driver::Claude);
+            let reply = format!("reply{n}");
+            t.apply(
+                &Envelope::item_started(&reply, ItemKind::AssistantMessage, "", None, None),
+                Driver::Claude,
+            );
+            t.apply(
+                &Envelope::delta(&reply, StreamKind::Assistant, "so far"),
+                Driver::Claude,
+            );
+            for (id, input) in [
+                (format!("tool{n}"), None),
+                (
+                    format!("bg{n}"),
+                    Some(json!({"command": "sleep 9", "run_in_background": true})),
+                ),
+            ] {
+                t.apply(
+                    &ev(tool_start(ItemKind::Command, "run", input)).item(&id),
+                    Driver::Claude,
+                );
+            }
+            for id in [&reply, &format!("tool{n}"), &format!("bg{n}")] {
+                assert!(busy(t, id), "{id}");
+            }
+        };
+        let mut t = Transcript::new();
+        for (n, state) in [TurnState::Interrupted, TurnState::Failed]
+            .into_iter()
+            .enumerate()
+        {
+            open(&mut t, n);
+            let changes = t.apply(&Envelope::turn_completed(state, None), Driver::Claude);
+            for id in [format!("reply{n}"), format!("tool{n}")] {
+                assert!(!busy(&t, &id), "{id} after {state:?}");
+                assert!(changes.contains(&Change::Updated(id.clone())), "{id}");
+            }
+            assert!(busy(&t, &format!("bg{n}")), "background work goes on");
+        }
+        let Some(Body::Tool(tool)) = t.get("tool0").map(|i| &i.body) else {
+            panic!("no tool");
+        };
+        assert_eq!(tool.status, ToolStatus::Interrupted);
+
+        open(&mut t, 2);
+        let changes = t.apply(
+            &ev(Event::SessionExited {
+                code: None,
+                expected: true,
+            }),
+            Driver::Claude,
+        );
+        for id in ["reply2", "tool2", "bg0", "bg1", "bg2"] {
+            assert!(!busy(&t, id), "{id} after the exit");
+            assert!(changes.contains(&Change::Updated(id.to_owned())), "{id}");
+        }
+
+        // Reasoning, then a reply: the reasoning is done.
+        t.apply(&ev(Event::TurnStarted { model: None }), Driver::Claude);
+        t.apply(
+            &Envelope::item_started("think", ItemKind::Reasoning, "", None, None),
+            Driver::Claude,
+        );
+        assert!(busy(&t, "think"));
+        let changes = t.apply(
+            &Envelope::item_started("say", ItemKind::AssistantMessage, "", None, None),
+            Driver::Claude,
+        );
+        assert!(!busy(&t, "think"));
+        assert!(changes.contains(&Change::Updated("think".to_owned())));
+        assert!(busy(&t, "say"));
+        // Text with no item of its own opens one, ending the open reply.
+        let changes = t.apply(
+            &ev(Event::ContentDelta {
+                stream: StreamKind::Reasoning,
+                text: "more".into(),
+            }),
+            Driver::Claude,
+        );
+        assert!(!busy(&t, "say"));
+        assert!(changes.contains(&Change::Updated("say".to_owned())));
     }
 
     #[test]

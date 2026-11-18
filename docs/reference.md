@@ -766,8 +766,8 @@ A thread you are looking at is not named; another thread is named by its title. 
 stopped yourself says nothing. When a desktop notification already announced the same thing (a
 thread out of sight asking for approval, or finishing with **Notify When an Agent Finishes**
 on), the window says nothing more, so nothing is read twice. Several things happening at once
-are read as one announcement. The text is short, has secrets masked like everything the app
-stores, and is never saved.
+are read as one announcement: at most three of them, then how many more ("And 4 more."). The
+text is short, has secrets masked like everything the app stores, and is never saved.
 
 Turn it off with Settings → General → Notifications → **Announce Events to Screen Readers**
 (`announce_events` in the config file).
@@ -781,7 +781,11 @@ control to fit.
 **Moving around.** F6 moves the keyboard focus to the next part of the window, and Shift+F6
 to the previous one, wrapping round: the thread list, the transcript (its newest message),
 the message box, the terminal drawer while it is open, and the Changes panel while it is
-docked. Tab goes through them in the same order. Each is a landmark a screen reader can jump
+docked. Tab goes through them in the same order. In a terminal (a terminal page or the
+drawer) F6 belongs to the program running there (mc, htop, vim), so Ctrl+F6 and
+Ctrl+Shift+F6 do the same from anywhere. F6 does nothing while a dialog such as Settings is
+open, and leaving a thread list laid over a narrow window closes it first, so the focus never
+goes behind it. Each is a landmark a screen reader can jump
 to, named "Threads", "Transcript", "Message composer", "Terminal drawer" and "Changes"; the
 sub-agent shelf and the approval bar above the message box are named groups. A request for
 approval that arrives while you type never takes the focus away from the message box: its
@@ -792,7 +796,9 @@ card.
 item per message, step or request, each named for who wrote it or what it is: "You",
 "Claude" (or the agent that replied), "Reasoning", "Tool: cargo test", "Approval request",
 "Question", "Error". A reply still streaming in, or a tool still running, is marked busy until
-it is done.
+it is done, or until the turn is stopped or fails or the agent exits: a tool cut off that way
+shows as **Interrupted** (a command left running in the background goes on until the agent
+exits).
 
 ### Sending terminal output to a thread
 

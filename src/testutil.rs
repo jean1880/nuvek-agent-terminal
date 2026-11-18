@@ -424,6 +424,28 @@ pub fn has_accessible_label(widget: &gtk4::Widget, label: &str) -> bool {
     }
 }
 
+/// Whether `widget`'s accessible busy state is `busy`, as GTK's own test check reads it.
+pub fn has_accessible_busy(widget: &gtk4::Widget, busy: bool) -> bool {
+    use gtk4::glib::translate::ToGlibPtr;
+    use gtk4::prelude::*;
+    let accessible = widget.upcast_ref::<gtk4::Accessible>();
+    // SAFETY: `accessible` is a live GtkAccessible for the call, the busy state takes one
+    // gboolean, and a non-NULL result is a newly allocated message we free.
+    unsafe {
+        let message = gtk4::ffi::gtk_test_accessible_check_state(
+            accessible.to_glib_none().0,
+            gtk4::ffi::GTK_ACCESSIBLE_STATE_BUSY,
+            gtk4::glib::ffi::gboolean::from(busy),
+        );
+        if message.is_null() {
+            true
+        } else {
+            gtk4::glib::ffi::g_free(message.cast());
+            false
+        }
+    }
+}
+
 /// The marker `make` sets (`DISPLAY_ENV`) for a run on its private Xvfb display and D-Bus session.
 pub const VIRTUAL_DISPLAY_MARKER: &str = "AGENT_TERMINAL_TEST_DISPLAY";
 

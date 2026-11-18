@@ -2301,7 +2301,7 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "constructs GTK widgets; run on a private display"]
     fn transcript_rows_are_list_items_named_by_their_author() {
-        use agent_core::event::{Envelope, Event, ItemKind, ItemStatus, StreamKind};
+        use agent_core::event::{Envelope, Event, ItemKind, ItemStatus, StreamKind, TurnState};
         use cards::{row_busy, row_label};
         let ctx = native_init();
         let view = ChatView::new(StubBackend::new(Driver::Claude));
@@ -2339,12 +2339,13 @@ pub(crate) mod tests {
                 continue; // not built: outside the window of rows
             };
             assert!(
-                gtk4::test_accessible_has_property(&widget, gtk4::AccessibleProperty::Label),
-                "{name}: no name"
+                crate::testutil::has_accessible_label(&widget, &name),
+                "{id}: not named {name:?}"
             );
             assert!(
-                gtk4::test_accessible_has_state(&widget, gtk4::AccessibleState::Busy),
-                "{name}: no busy state"
+                crate::testutil::has_accessible_busy(&widget, row_busy(body)),
+                "{name}: not busy={}",
+                row_busy(body)
             );
             if matches!(
                 body,
@@ -2361,39 +2362,51 @@ pub(crate) mod tests {
             assert!(kinds.contains(author), "no row named {author}: {kinds:?}");
         }
 
-        // A reply streaming in is busy; done, it is not. A running tool too.
-        view.apply(&Envelope::new(Event::TurnStarted { model: None }));
-        view.apply(&Envelope::item_started(
-            "live-reply",
-            ItemKind::AssistantMessage,
-            "",
-            None,
-            None,
-        ));
-        view.apply(&Envelope::delta(
-            "live-reply",
-            StreamKind::Assistant,
-            "Working on it",
-        ));
-        view.apply(&Envelope::item_started(
-            "live-tool",
-            ItemKind::Command,
-            "cargo test",
-            None,
-            None,
-        ));
-        while ctx.iteration(false) {}
-        let body = |id: &str| inner.model.borrow().get(id).expect(id).body.clone();
-        assert!(row_busy(&body("live-reply")));
-        assert!(row_busy(&body("live-tool")));
-        assert_eq!(
-            row_label(&body("live-tool")).as_deref(),
-            Some("Tool: cargo test")
-        );
-        assert!(inner
-            .transcript
-            .with_row("live-reply", |r| r.widget())
-            .is_some());
+        // What the row's widget says: its name and whether it is busy, as a screen reader
+        // reads them.
+        let says = |id: &str, name: &str, busy: bool| {
+            while ctx.iteration(false) {}
+            let widget = inner
+                .transcript
+                .with_row(id, cards::Row::widget)
+                .unwrap_or_else(|| panic!("{id}: no row"));
+            assert!(
+                crate::testutil::has_accessible_label(&widget, name),
+                "{id}: not named {name:?}"
+            );
+            assert!(
+                crate::testutil::has_accessible_busy(&widget, busy),
+                "{id}: not busy={busy}"
+            );
+        };
+        // A reply streaming in and a running tool, in a turn of their own.
+        let start = |reply: &str, tool: &str, input: Option<serde_json::Value>| {
+            view.apply(&Envelope::new(Event::TurnStarted { model: None }));
+            view.apply(&Envelope::item_started(
+                reply,
+                ItemKind::AssistantMessage,
+                "",
+                None,
+                None,
+            ));
+            view.apply(&Envelope::delta(
+                reply,
+                StreamKind::Assistant,
+                "Working on it",
+            ));
+            view.apply(&Envelope::item_started(
+                tool,
+                ItemKind::Command,
+                "cargo test",
+                input,
+                None,
+            ));
+            says(reply, "Claude", true);
+            says(tool, "Tool: cargo test", true);
+        };
+
+        // Done, neither is busy.
+        start("live-reply", "live-tool", None);
         view.apply(&Envelope::item_completed(
             "live-reply",
             ItemStatus::Completed,
@@ -2406,9 +2419,68 @@ pub(crate) mod tests {
             Some("ok"),
             None,
         ));
-        while ctx.iteration(false) {}
-        assert!(!row_busy(&body("live-reply")));
-        assert!(!row_busy(&body("live-tool")));
+        says("live-reply", "Claude", false);
+        says("live-tool", "Tool: cargo test", false);
+        view.apply(&Envelope::turn_completed(TurnState::Completed, None));
+
+        // Stopped, or failed, with neither finished: both settle, the tool shown interrupted.
+        // A command run in the background outlives a failed turn and stays busy.
+        let tool_status = |id: &str| match &inner.model.borrow().get(id).expect(id).body {
+            model::Body::Tool(t) => t.status,
+            other => panic!("{id}: {other:?}"),
+        };
+        for (n, state) in [TurnState::Interrupted, TurnState::Failed]
+            .into_iter()
+            .enumerate()
+        {
+            let (reply, tool, bg) = (format!("r{n}"), format!("t{n}"), format!("bg{n}"));
+            start(&reply, &tool, None);
+            view.apply(&Envelope::item_started(
+                &bg,
+                ItemKind::Command,
+                "cargo build",
+                Some(serde_json::json!({"command": "cargo build", "run_in_background": true})),
+                None,
+            ));
+            view.apply(&Envelope::turn_completed(state, Some("boom")));
+            says(&reply, "Claude", false);
+            says(&tool, "Tool: cargo test", false);
+            assert_eq!(tool_status(&tool), model::ToolStatus::Interrupted);
+            says(&bg, "Tool: cargo build", true);
+        }
+
+        // The session exits mid-turn: nothing goes on, background work included.
+        start("exit-reply", "exit-tool", None);
+        view.apply(&Envelope::new(Event::SessionExited {
+            code: Some(1),
+            expected: false,
+        }));
+        says("exit-reply", "Claude", false);
+        says("exit-tool", "Tool: cargo test", false);
+        says("bg1", "Tool: cargo build", false);
+
+        // Reasoning is done once the reply after it begins.
+        view.apply(&Envelope::new(Event::TurnStarted { model: None }));
+        view.apply(&Envelope::item_started(
+            "think",
+            ItemKind::Reasoning,
+            "",
+            None,
+            None,
+        ));
+        view.apply(&Envelope::delta("think", StreamKind::Reasoning, "Hmm"));
+        says("think", "Reasoning", true);
+        view.apply(&Envelope::item_started(
+            "answer",
+            ItemKind::AssistantMessage,
+            "",
+            None,
+            None,
+        ));
+        says("think", "Reasoning", false);
+        says("answer", "Claude", true);
+        view.apply(&Envelope::turn_completed(TurnState::Completed, None));
+        says("answer", "Claude", false);
         window.destroy();
     }
 
@@ -2974,6 +3046,64 @@ pub(crate) mod tests {
             assert!(
                 STYLE.contains(&format!("{class}:focus-visible")),
                 "{class} has no :focus-visible rule"
+            );
+        }
+    }
+
+    /// A button filled with a colour the focus ring may equal (the accent) draws its ring
+    /// outside itself, on the surface around it, never inset on its own fill.
+    #[test]
+    fn a_filled_button_rings_outside_its_fill() {
+        // (selectors, body) of every rule, comments dropped.
+        let mut css = String::new();
+        let mut rest = STYLE;
+        while let Some((before, after)) = rest.split_once("/*") {
+            css.push_str(before);
+            rest = after.split_once("*/").map_or("", |(_, tail)| tail);
+        }
+        css.push_str(rest);
+        let rules: Vec<(String, String)> = css
+            .split('}')
+            .filter_map(|rule| rule.split_once('{'))
+            .map(|(sel, body)| (sel.trim().to_owned(), body.to_owned()))
+            .collect();
+        let filled: Vec<String> = rules
+            .iter()
+            .filter(|(sel, body)| {
+                !sel.contains(':')
+                    && (body.contains("background-color: @at_accent;")
+                        || body.contains("background: @at_accent;"))
+            })
+            .flat_map(|(sel, _)| {
+                sel.split(',')
+                    .map(|s| s.trim().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|sel| sel.contains("button"))
+            .filter_map(|sel| sel.rsplit('.').next().map(|class| format!(".{class}")))
+            .collect();
+        assert!(filled.contains(&".send-button".to_owned()), "{filled:?}");
+        assert!(
+            filled.contains(&".suggested-action".to_owned()),
+            "{filled:?}"
+        );
+        for class in filled {
+            let ring = rules
+                .iter()
+                .find(|(sel, _)| {
+                    sel.split(',')
+                        .any(|s| s.trim().ends_with(&format!("{class}:focus-visible")))
+                })
+                .unwrap_or_else(|| panic!("{class}: no focus ring"));
+            let offset = ring
+                .1
+                .split(';')
+                .find_map(|d| d.trim().strip_prefix("outline-offset:"))
+                .map(str::trim)
+                .unwrap_or_else(|| panic!("{class}: no outline-offset"));
+            assert!(
+                !offset.starts_with('-') && offset != "0" && offset != "0px",
+                "{class}: its ring is drawn on its own fill ({offset})"
             );
         }
     }

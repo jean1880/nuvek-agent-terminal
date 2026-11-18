@@ -743,8 +743,8 @@ pub fn row_label(body: &Body) -> Option<String> {
         Body::Assistant { driver, .. } => driver.info().label.to_owned(),
         Body::Reasoning { .. } => "Reasoning".to_owned(),
         Body::Tool(tool) => {
-            let title: String = tool.title.chars().take(ROW_LABEL_TITLE).collect();
-            let title = title.trim();
+            // Agent-supplied: redacted and made one plain line, as announcements are.
+            let title = agent_core::a11y_announce::plain(&tool.title, ROW_LABEL_TITLE);
             if title.is_empty() {
                 "Tool".to_owned()
             } else {
@@ -3785,6 +3785,19 @@ pub(crate) mod tests {
         );
         let long = row_label(&tool(&"x".repeat(500), ToolStatus::Completed)).unwrap();
         assert_eq!(long.chars().count(), "Tool: ".len() + ROW_LABEL_TITLE);
+        assert!(long.ends_with('…'), "{long}");
+        // A tool's title is the agent's: a secret is masked, and control, bidi and zero-width
+        // characters never reach the name, its lines and runs of spaces one space each.
+        let key = "sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnop0123456789";
+        let named = row_label(&tool(
+            &format!("curl -H {key}\n\n  --data\u{202e}x\u{200b}y\u{7}z"),
+            ToolStatus::Running,
+        ))
+        .unwrap();
+        assert!(!named.contains(key), "{named}");
+        assert!(!named.chars().any(agent_core::text::is_hidden), "{named:?}");
+        assert!(named.starts_with("Tool: curl -H "), "{named}");
+        assert!(named.ends_with(" --data x y z"), "{named:?}");
         assert_eq!(
             row_label(&Body::TurnError {
                 message: "boom".into()

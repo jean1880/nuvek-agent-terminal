@@ -10,10 +10,13 @@ Architectural mandates, standards, and workflows for this codebase.
 - **Bundled icons**: All icons are bundled (`assets/icons`, GResource); never rely on the
   system icon theme for a name; the icon test (`tests/icons.rs`) guards it. See the rendering
   note in `THIRD_PARTY.md` before editing an SVG there.
-- **Accessibility**: F6/Shift+F6 (`win.focus-next-region`/`-previous-region`,
-  `window/imp/regions.rs`) cycle the shown regions: sidebar (Navigation "Threads"), transcript
-  (Region), composer (Region), terminal, docked diff panel; a new pane needs a role, a label and
-  an entry there. The text scale (`font_scale`) is the whole app's: one provider,
+- **Accessibility**: F6/Shift+F6 (`window/imp/regions.rs`, matched in the window's bubble
+  phase, never an application accelerator, so a terminal program keeps F6) and Ctrl+F6/
+  Ctrl+Shift+F6 (`win.focus-next-region`/`-previous-region`) cycle the shown regions: sidebar
+  (Navigation "Threads", only while shown), transcript (Region), composer (Region), terminal (a
+  thread's drawer box or a terminal page's terminal and search bar), docked diff panel; none
+  while a dialog is open or the window closes, and leaving an overlaid sidebar hides it. A new
+  pane needs a role, a label and an entry there. The text scale (`font_scale`) is the whole app's: one provider,
   `style::set_text_scale` (`window { font-size: N% }`), so app CSS font sizes are relative, never
   `pt`/`px`. Transcript rows are `ListItem`s named by `cards::row_label` and busy per
   `cards::row_busy`; a new `Body` variant must name itself there.
@@ -115,9 +118,12 @@ Architectural mandates, standards, and workflows for this codebase.
     its source share the fork's baseline, two siblings each have their own) and `a11y_announce`
     (what a screen reader is told of an event, given whether the user was looking and whether a
     desktop notification already said it: an exhaustive match, so a new `Event` variant must
-    decide; each part redacted, cut short, never stored; the window shows it in its off-screen
-    live regions, `window/imp/announce.rs`: one `Status` label, polite, and one `Alert` label for
-    requests, joined and set at idle, only while `announce_events` is on).
+    decide; each part redacted, cut short, never stored, through `plain`, which transcript rows'
+    names use too; what waits is bounded, `Pending`, and read as at most three items and "And N
+    more." within a character ceiling; the window shows it in its off-screen live regions,
+    `window/imp/announce.rs`: one `Status` label, polite, set after a 200 ms pause so a burst is
+    one update, and one `Alert` label for requests, set at idle, each only by its text (the
+    label's own accessible name), only while `announce_events` is on).
   - `crates/agent-kit` (GTK-free; blocking process and file I/O): `git`
     (git plumbing for turn checkpoints and diffs: shells out, but its parsers
     and filters are pure; `diff_trees` is the one tree-to-tree diff, capped, driver-free;

@@ -162,6 +162,9 @@ pub fn drop_fork_baseline(dir: &Path, thread: &str, commit: &str) -> Result<bool
     let Some(refname) = fork_ref(thread) else {
         return Ok(false);
     };
+    if !dir.is_dir() {
+        return Ok(false);
+    }
     let Some(repo) = discover(dir)? else {
         return Ok(false);
     };
@@ -570,5 +573,6 @@ mod tests {
         // The worktree started at HEAD, without the main checkout's uncommitted edit.
         assert_eq!(paths(&side), ["a.txt", "side.txt"]);
         assert!(drop_fork_baseline(dir, "abc-1", &baseline.commit).unwrap());
+        assert!(!drop_fork_baseline(&dir.join("missing"), "abc-1", &baseline.commit).unwrap());
     }
 }

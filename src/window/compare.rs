@@ -70,6 +70,9 @@ pub(crate) struct ChangesColumn {
 pub(crate) struct ChangesContent {
     /// Said above the columns: what the diffs can and cannot tell (one folder shared).
     pub(crate) note: Option<String>,
+    /// True when the sides share one working folder, so overlapping paths are not "changed on
+    /// both sides".
+    pub(crate) shared: bool,
     /// One column per side, or a single one standing for several that are one and the same.
     pub(crate) columns: Vec<ChangesColumn>,
 }
@@ -122,6 +125,16 @@ struct Inner {
 /// its `adw::Window` is destroyed, whoever holds a clone.
 #[derive(Clone)]
 pub(crate) struct CompareWindow(Rc<Inner>);
+
+/// A weak hold on a [`CompareWindow`], for async reads that must not keep a closed window alive.
+#[derive(Clone)]
+pub(crate) struct WeakCompareWindow(std::rc::Weak<Inner>);
+
+impl WeakCompareWindow {
+    pub(crate) fn upgrade(&self) -> Option<CompareWindow> {
+        self.0.upgrade().map(CompareWindow)
+    }
+}
 
 impl CompareWindow {
     /// A window titled `title`, sized from `parent` and closed with it, showing a spinner until
@@ -216,6 +229,11 @@ impl CompareWindow {
         Self(inner)
     }
 
+    /// A weak hold on this window, for async work.
+    pub(crate) fn downgrade(&self) -> WeakCompareWindow {
+        WeakCompareWindow(Rc::downgrade(&self.0))
+    }
+
     /// The window itself.
     pub(crate) fn window(&self) -> &adw::Window {
         &self.0.window
@@ -273,16 +291,11 @@ impl CompareWindow {
     }
 
     /// Draws the Changes tab, unless a newer read of it has started since `generation`.
-    pub(crate) fn show_changes(
-        &self,
-        generation: u64,
-        content: &ChangesContent,
-        colours: &crate::theme::DiffColours,
-    ) {
+    pub(crate) fn show_changes(&self, generation: u64, content: &ChangesContent) {
         if !self.0.changes_generation.is_current(generation) {
             return;
         }
-        replace_shown(&self.0.changes, &changes_page(content, colours));
+        replace_shown(&self.0.changes, &changes_page(content));
     }
 
     /// Says why the Changes tab could not be read, unless a newer read has started.
@@ -322,7 +335,7 @@ fn replace_shown(stack: &gtk4::Stack, page: &gtk4::Widget) {
 
 /// The Changes tab for `content`: its note, the files changed on every side, then a column
 /// per side with its totals and its files.
-fn changes_page(content: &ChangesContent, colours: &crate::theme::DiffColours) -> gtk4::Widget {
+fn changes_page(content: &ChangesContent) -> gtk4::Widget {
     let outer = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .spacing(12)
@@ -335,7 +348,11 @@ fn changes_page(content: &ChangesContent, colours: &crate::theme::DiffColours) -
         let note = label(note, &["compare-changes-note", "warning"]);
         outer.append(&note);
     }
-    let in_all = changed_in_all(&content.columns);
+    let in_all = if content.shared {
+        Vec::new()
+    } else {
+        changed_in_all(&content.columns)
+    };
     if !in_all.is_empty() {
         let both = label(
             &format!("Changed on both sides: {}", in_all.join(", ")),
@@ -374,7 +391,7 @@ fn changes_page(content: &ChangesContent, colours: &crate::theme::DiffColours) -
                     &crate::diff::summary(&diff.stats),
                     &["dim-label", "caption", "compare-changes-summary"],
                 ));
-                col.append(&super::diff_panel::read_only_files(diff, colours));
+                col.append(&super::diff_panel::read_only_files(diff));
             }
         }
         grid.attach(&col, i as i32, 0, 1, 1);
@@ -712,7 +729,6 @@ pub(crate) mod tests {
             !switcher.is_visible(),
             "no Changes tab without changes to read"
         );
-        let colours = crate::theme::Theme::diff_colours(Default::default());
         let stale = window.begin_changes();
         let current = window.begin_changes();
         assert!(switcher.is_visible());
@@ -734,6 +750,7 @@ pub(crate) mod tests {
         };
         let changes = ChangesContent {
             note: Some("One folder.".into()),
+            shared: true,
             columns: vec![
                 ChangesColumn {
                     heading: "A".into(),
@@ -745,12 +762,12 @@ pub(crate) mod tests {
                 },
             ],
         };
-        window.show_changes(stale, &changes, &colours);
+        window.show_changes(stale, &changes);
         assert!(
             crate::testutil::find_first::<gtk4::Expander>(&root).is_none(),
             "a superseded read of the changes draws nothing"
         );
-        window.show_changes(current, &changes, &colours);
+        window.show_changes(current, &changes);
         let texts = crate::testutil::label_texts(&root);
         for expected in [
             "One folder.",
@@ -772,7 +789,11 @@ pub(crate) mod tests {
             "a file's diff is built when first opened"
         );
         expander.set_expanded(true);
-        let view = expander
+        let scroller = expander
+            .child()
+            .and_downcast::<gtk4::ScrolledWindow>()
+            .expect("the file's diff scroller");
+        let view = scroller
             .child()
             .and_downcast::<gtk4::TextView>()
             .expect("the file's diff");
@@ -780,9 +801,53 @@ pub(crate) mod tests {
         let buffer = view.buffer();
         let shown = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
         assert!(shown.contains("+new"), "{shown}");
-        // Both sides changed one path: named once, above the columns.
+        // Live theme switch recolours open read-only diff views.
+        let before_added = buffer
+            .tag_table()
+            .lookup("added")
+            .and_then(|t| t.foreground_rgba());
+        crate::palette::apply(
+            crate::config::ThemeChoice::SolarizedLight,
+            crate::config::ThemePair::default(),
+        );
+        let after_added = buffer
+            .tag_table()
+            .lookup("added")
+            .and_then(|t| t.foreground_rgba());
+        assert_ne!(before_added, after_added);
+        crate::palette::apply(
+            crate::config::ThemeChoice::default(),
+            crate::config::ThemePair::default(),
+        );
+
+        // Two shared-folder columns never say "Changed on both sides".
+        let shared_two = ChangesContent {
+            note: Some("One folder.".into()),
+            shared: true,
+            columns: vec![
+                ChangesColumn {
+                    heading: "A".into(),
+                    state: ChangesState::Ready(changed.clone()),
+                },
+                ChangesColumn {
+                    heading: "B".into(),
+                    state: ChangesState::Ready(changed.clone()),
+                },
+            ],
+        };
+        let g = window.begin_changes();
+        window.show_changes(g, &shared_two);
+        assert!(
+            !crate::testutil::label_texts(&root)
+                .iter()
+                .any(|t| t.starts_with("Changed on both sides:")),
+            "shared folder suppresses 'Changed on both sides'"
+        );
+
+        // Both sides changed one path in separate folders: named once, above the columns.
         let both = ChangesContent {
             note: None,
+            shared: false,
             columns: vec![
                 ChangesColumn {
                     heading: "A".into(),
@@ -796,7 +861,7 @@ pub(crate) mod tests {
         };
         assert_eq!(changed_in_all(&both.columns), ["src/x.rs"]);
         let g = window.begin_changes();
-        window.show_changes(g, &both, &colours);
+        window.show_changes(g, &both);
         assert!(crate::testutil::label_texts(&root)
             .iter()
             .any(|t| t == "Changed on both sides: src/x.rs"));
@@ -807,6 +872,8 @@ pub(crate) mod tests {
             .any(|t| t == "Could Not Read the Changes"));
         let problems = crate::testutil::button_problems(&root, 24);
         assert!(problems.is_empty(), "{problems:#?}");
+        let unnamed = crate::testutil::icon_only_without_label(&root);
+        assert!(unnamed.is_empty(), "{unnamed:#?}");
 
         // Nobody else holds it: Refresh still reaches the caller while the window is open.
         let shown = window.window().clone();

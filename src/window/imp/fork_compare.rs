@@ -134,6 +134,7 @@ fn changes_content(headings: &[String], sides: Vec<ForkChanges>, shared: bool) -
         let first = sides.into_iter().next().map(state);
         return ChangesContent {
             note,
+            shared,
             columns: first
                 .map(|state| ChangesColumn {
                     heading: format!("Shared by “{}” and “{}”", heading(0), heading(1)),
@@ -145,6 +146,7 @@ fn changes_content(headings: &[String], sides: Vec<ForkChanges>, shared: bool) -
     }
     ChangesContent {
         note,
+        shared,
         columns: sides
             .into_iter()
             .enumerate()
@@ -299,11 +301,10 @@ impl AgentTerminalWindow {
     /// window keeps itself alive while it is open, so Refresh works with no one holding it.
     pub(super) fn open_fork_compare(&self, thread: &str, pairing: Pairing) {
         let window = CompareWindow::new(self.obj().upcast_ref(), "Compare Forks");
-        let colours = crate::theme::Theme::diff_colours(self.config.borrow().theme);
         let thread = thread.to_owned();
-        load_fork_compare(&window, thread.clone(), pairing.clone(), colours.clone());
+        load_fork_compare(&window, thread.clone(), pairing.clone());
         window.connect_refresh(move |window| {
-            load_fork_compare(window, thread.clone(), pairing.clone(), colours.clone())
+            load_fork_compare(window, thread.clone(), pairing.clone())
         });
         window.window().present();
     }
@@ -311,17 +312,12 @@ impl AgentTerminalWindow {
 
 /// Reads `thread` and `pairing`'s other thread off the main thread and shows them in `window`:
 /// the transcripts from the store, then each side's file changes from git. Only the newest read
-/// of each draws.
-fn load_fork_compare(
-    window: &CompareWindow,
-    thread: String,
-    pairing: Pairing,
-    colours: crate::theme::DiffColours,
-) {
+/// of each draws; holds `window` weakly across awaits so closing it stops the work.
+fn load_fork_compare(window: &CompareWindow, thread: String, pairing: Pairing) {
     let generation = window.begin();
     let changes = window.begin_changes();
     let relation = pairing.relation;
-    let window = window.clone();
+    let weak = window.downgrade();
     glib::MainContext::default().spawn_local(async move {
         let read = store_job(move |store| {
             store
@@ -329,6 +325,7 @@ fn load_fork_compare(
                 .map_err(|e| e.to_string())
         })
         .await;
+        let Some(window) = weak.upgrade() else { return };
         let ForkColumns { columns, bases } = match read {
             Some(Ok(read)) => read,
             Some(Err(why)) => {
@@ -350,17 +347,17 @@ fn load_fork_compare(
         let content = fork_content(relation, columns);
         let headings: Vec<String> = content.columns.iter().map(|c| c.heading.clone()).collect();
         window.show(generation, &content);
+        drop(window);
         let dirs = [
             dirs.first().cloned().flatten(),
             dirs.get(1).cloned().flatten(),
         ];
         let sides = off_main("the fork comparison", move || Ok(read_changes(dirs, bases))).await;
+        let Some(window) = weak.upgrade() else { return };
         match sides {
-            Ok((sides, shared)) => window.show_changes(
-                changes,
-                &changes_content(&headings, sides, shared),
-                &colours,
-            ),
+            Ok((sides, shared)) => {
+                window.show_changes(changes, &changes_content(&headings, sides, shared))
+            }
             Err(why) => window.show_changes_error(changes, &why),
         }
     });
@@ -473,12 +470,13 @@ pub(super) mod tests {
             "a file is not 'changed on both sides' just because the folder is one"
         );
         // Two siblings forked at different times from one folder: each against its own
-        // baseline, still saying the folder is one.
+        // baseline, still saying the folder is one (`shared: true` suppresses "both sides").
         let content = changes_content(
             &headings,
             vec![ready("/w", "one", &["x.rs"]), ready("/w", "two", &["x.rs"])],
             true,
         );
+        assert!(content.shared);
         assert_eq!(content.note.as_deref(), Some(SHARED_FOLDER));
         assert_eq!(content.columns.len(), 2);
     }

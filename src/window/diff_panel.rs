@@ -46,6 +46,23 @@ thread_local! {
     /// its colours. GTK objects stay on the main thread, hence thread-local.
     static VIEW_CSS: (gtk4::CssProvider, Cell<bool>) =
         (gtk4::CssProvider::new(), Cell::new(false));
+    /// Read-only diff views built outside a panel (the compare window), kept weakly so a
+    /// theme change recolours live ones without capturing a stale `DiffColours` snapshot.
+    static READ_ONLY_VIEWS: RefCell<Vec<glib::WeakRef<gtk4::TextView>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Re-paints live read-only diff views when the palette changes.
+fn recolour_read_only() {
+    let colours = crate::theme::Theme::diff_colours(crate::palette::in_effect());
+    apply_view_colours(&colours);
+    READ_ONLY_VIEWS.with(|all| {
+        let mut all = all.borrow_mut();
+        all.retain(|v| v.upgrade().is_some());
+        for view in all.iter().filter_map(glib::WeakRef::upgrade) {
+            colour_tags(&view, &colours);
+        }
+    });
 }
 
 /// Paints diff views with the terminal's background and text colours, so
@@ -198,9 +215,11 @@ fn diff_note(diff: &TabDiff) -> Option<String> {
 /// A read-only list of `diff`'s files, laid out as the panel lays them out (a heading per
 /// folder, a collapsed row per file, its diff built when first expanded), with nothing to act
 /// on: no tick boxes, tools, editor or comments. For a diff shown outside a thread's panel (the
-/// compare window).
-pub(crate) fn read_only_files(diff: &TabDiff, colours: &DiffColours) -> gtk4::Box {
-    apply_view_colours(colours);
+/// compare window); follows the active palette dynamically.
+pub(crate) fn read_only_files(diff: &TabDiff) -> gtk4::Box {
+    crate::palette::on_change(recolour_read_only);
+    let colours = crate::theme::Theme::diff_colours(crate::palette::in_effect());
+    apply_view_colours(&colours);
     let list = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .spacing(2)
@@ -226,7 +245,6 @@ pub(crate) fn read_only_files(diff: &TabDiff, colours: &DiffColours) -> gtk4::Bo
                 .margin_start(8)
                 .build();
             expander.add_css_class("diff-file");
-            let colours = colours.clone();
             expander.connect_expanded_notify(move |expander| {
                 if !expander.is_expanded() || expander.child().is_some() {
                     return;
@@ -240,7 +258,25 @@ pub(crate) fn read_only_files(diff: &TabDiff, colours: &DiffColours) -> gtk4::Bo
                         .css_classes(["dim-label"])
                         .build()
                         .upcast(),
-                    None => file_view(&text, &colours).upcast(),
+                    None => {
+                        let colours =
+                            crate::theme::Theme::diff_colours(crate::palette::in_effect());
+                        let view = file_view(&text, &colours);
+                        READ_ONLY_VIEWS.with(|all| {
+                            let mut all = all.borrow_mut();
+                            all.push(view.downgrade());
+                            if all.len() >= 64 && all.len().is_power_of_two() {
+                                all.retain(|v| v.upgrade().is_some());
+                            }
+                        });
+                        gtk4::ScrolledWindow::builder()
+                            .hscrollbar_policy(gtk4::PolicyType::Automatic)
+                            .vscrollbar_policy(gtk4::PolicyType::Never)
+                            .propagate_natural_height(true)
+                            .child(&view)
+                            .build()
+                            .upcast()
+                    }
                 };
                 expander.set_child(Some(&child));
             });

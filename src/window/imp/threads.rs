@@ -5232,6 +5232,7 @@ impl AgentTerminalWindow {
             "discard a blank thread",
             // What it was stored with, once deleted; None when the store found something in it.
             move |s| {
+                let baseline = super::fork_compare::stored_baseline(s, &id);
                 let stored = StoredChoices {
                     model: s.thread_summary(&id)?.and_then(|t| t.model),
                     attributes: s.thread_attributes(&id)?,
@@ -5239,11 +5240,14 @@ impl AgentTerminalWindow {
                         s.events(&id, None, REPLAY_LIMIT)?.iter().map(|(_, e)| e),
                     ),
                 };
-                Ok(s.delete_if_blank(&id)?.then_some(stored))
+                Ok(s.delete_if_blank(&id)?.then_some((stored, baseline)))
             },
             move |imp, outcome| {
-                if let Some(Ok(Some(stored))) = outcome {
+                if let Some(Ok(Some((stored, baseline)))) = outcome {
                     info!("Discarded blank thread {thread}");
+                    if let Some((cwd, commit)) = baseline {
+                        super::fork_compare::drop_fork_baseline(cwd, thread, commit);
+                    }
                     imp.offer_undo_discard(spec.with_stored(stored, live));
                 }
             },

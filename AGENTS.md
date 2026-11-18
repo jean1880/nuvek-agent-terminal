@@ -915,24 +915,37 @@ Architectural mandates, standards, and workflows for this codebase.
   the app's minus `clear_env` and every agent-only variable, and no profile, provider, key file,
   approval socket or delegation binding; the adapter gets an empty cwd. Only a POSIX login shell
   (`remote::POSIX_SHELLS`; the probe, the folder check and `ssh_chat_argv` all refuse any other,
-  since `sh_quote`'s quoting holds only there) and a CLI path with no `=` are accepted, and no
+  since `sh_quote`'s quoting holds only there; `$SHELL` is not trusted alone: the probe's first
+  command, parsed by the login shell itself, prints `sh_quote` of a canary holding `'` and `\\`,
+  and `parse_probe` refuses unless it comes back exactly, as fish's does not) and a CLI path
+  with no `=` are accepted, and no
   argument with a control or invisible character (`plain_arg`; a remote-reported session id or
   model holding one is refused at ingestion, and `AgentProcess::spawn` refuses a NUL). Every
   `ssh` to another machine starts in `ssh_env()` (no agent-only variable). Its machine must
-  still be listed before every process (`HostCheck`, `remote::listed`, in `start_process`), and
-  Settings forgets a machine's probe when it is removed or renamed. It is never reopened at
+  still be listed before every process (`HostCheck`, `remote::listed`, in `start_process`), as
+  before every remote terminal page or drawer (`remote_page_argv`: a toast's "Open a Terminal
+  There", Reconnect, Restart), and Settings forgets a machine's probe when it is removed or
+  renamed, and refuses either while a running remote thread, an open drawer or a terminal page
+  is on it, naming them (`remote_machine_in_use`, `in_use_refusal`). It is never reopened at
   launch (left out of the open-thread layout and refused at restore), so its agent starts only
-  when the user creates or opens it, or when a crash restart follows a run the user started
-  (ssh's exit 255 says "Could not reach <alias>" with ssh's redacted reason; a host-key or login
+  when the user creates or opens it, when the user sends a message after a failed start
+  (`retry_remote_with_message`; showing the page never retries), or when a crash restart
+  follows a run the user started (ssh's exit 255 says "Could not reach <alias>" with ssh's
+  redacted reason, both it and whether a terminal would help read only from ssh's own lines,
+  `remote::ssh_own_line`, never the remote CLI's output on the same stderr; a host-key or login
   failure is not retried and the window offers a terminal page there). Dangerous permissive
-  mode is refused (`Inner::set_mode`, the view, and a safe mode forced in `launch_spec`), and so
+  mode is refused (`Inner::set_mode`, the view, and a safe mode forced in `launch_spec`; a
+  `ModeChanged { Bypass }` the remote agent reports is rewritten to the session-safe mode in
+  `Inner::emit`, said once, and the safe mode sent back to the agent), and so
   is a switch to another agent or profile (`Inner::switch` and every window entry,
   `refuse_remote_switch`). It has no checkpoints (`ThreadDiffs` takes no baseline, so no ref is
   made), diff panel, undo, worktree, fork baseline, hand-off brief, `/handoff`, session pickers,
   sub-agents, usage-limit wait or continuation, model-retirement check, vendor probe or sign-in
   banner; a card's diff is the agent's own (`filediff::agent_edit_only`), file links and images
   Codex viewed are never read here, its transcript hands the system only
-  `remote::remote_link_allowed` links, Codex takes no images (`remote::takes_images`, steered
+  `remote::remote_link_allowed` links (and so does every label in no thread's view, the compare
+  window's replies and release notes included, since it cannot tell which machine wrote it),
+  Codex takes no images (`remote::takes_images`, steered
   input too, and before its session starts), and its cards keep Allow once and Deny
   (`remote::approval_options`, no rule offered, recorded or applied, nothing auto-answered in
   any mode; a Codex permission request is Deny only, and an Allow sent for one is answered
@@ -940,7 +953,8 @@ Architectural mandates, standards, and workflows for this codebase.
   local folder: its agent fails to start for want of that folder, unless a folder of that
   relative name exists where it was started (said in `docs/reference.md`).
   The `remote_tests` session tests prove these with a recording fake `ssh` (`set_test_ssh`); an
-  unset one is `false`. **Accepted risks:** a remote agent acts with the remote account's
+  unset one is `false`. They assert on the spawn's own `SpawnSpec` (what is unset, added and
+  where it runs), never on variables the test process happened to inherit. **Accepted risks:** a remote agent acts with the remote account's
   authority, under weaker approval scoping (Allow once is all a card can grant, and Codex's
   Accept edits asks for every edit); Stop is the agent's own interrupt over its input, so a tool
   it started there may keep running, and closing the thread ends only the local `ssh`; the

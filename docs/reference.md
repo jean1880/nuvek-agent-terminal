@@ -869,7 +869,10 @@ with `ssh` (a `Host` from `~/.ssh/config`, a host name or `user@host`) and press
 **Add**. A name that `ssh` could read as an option (one starting with `-`, or a `user@host`
 whose user or host does), one with more than one `@` or an empty user or host, or one that
 holds spaces or shell characters is refused as you type, and nothing is saved. Each machine has
-an optional label, **Check** and **Remove**.
+an optional label, **Check** and **Remove**. A machine cannot be removed or renamed while
+something still connects to it: a thread there whose agent is running, a thread's open drawer,
+or a terminal page there. Settings says which, and changes nothing; stop the thread or close
+the drawer or page, then remove or rename it.
 
 **Check** runs `ssh -T -o BatchMode=yes -o ConnectTimeout=10 … -- <machine> true` in the
 background, with the same forwarding, tunnel and remote-command options as a page and the
@@ -905,7 +908,9 @@ all, names something on the other machine and is refused here), its `machine:fol
 and window title (whatever title the shell there sets), its sidebar group, notifications on
 the bell, and
 **Reconnect** (the right-click menu, or **Restart** once it has exited), which connects again
-to the same machine and folder.
+to the same machine and folder. Every page there, a thread's drawer and a toast's **Open a
+Terminal There** included, connects only while the machine is still listed in Settings;
+otherwise the page says so and nothing starts.
 
 **What does not:** turn checkpoints, the diff panel and undo, hand-offs, session pickers,
 a profile's environment file or model provider, and **New Thread in This Folder** opening a
@@ -923,7 +928,10 @@ BatchMode=yes` and the page's forwarding options, at most 15 seconds each:
 - where the agent is: a login shell there (`$SHELL -l`, never interactive) reports its `PATH`
   and the absolute path of `claude` or `codex` on it. Only a POSIX login shell is accepted
   (`sh`, `bash`, `zsh`, `ksh`, `dash`, `ash`, `mksh`, `yash`): the command line below relies
-  on POSIX quoting, which fish, nu, pwsh, csh and others read differently. An agent not on that
+  on POSIX quoting, which fish, nu, pwsh, csh and others read differently. `$SHELL` is not
+  taken on its word: the login shell itself first prints a quoting test (`printf '%s\n'
+  '…a'\''b c\\d'`), and anything but exactly `a'b c\\d` back (fish prints `c\d`) is refused
+  as not POSIX. An agent not on that
   `PATH`, or whose path holds `=`, is refused too. The answer is kept until Agent Terminal quits,
   per machine and agent; a failure is never kept, and removing or renaming the machine in
   Settings forgets it;
@@ -952,10 +960,16 @@ machine whose key you have not accepted, or that needs a password, fails with th
 (secrets in it masked), is not tried again, and a toast offers **Open a Terminal There**, where
 you answer it; your next message tries again. Any other failure of ssh itself (exit 255) says
 **Could not reach <machine>** with ssh's reason and tries again after 2, 10 and 30 seconds, as
-for any agent that exits with an error.
+for any agent that exits with an error. The reason, and whether a terminal would help, come
+only from the lines ssh itself writes (`ssh: …`, `Host key verification failed.`,
+`user@host: Permission denied (publickey).` and the like), never from what the agent there wrote
+to the same output: an agent printing "Permission denied" is not taken for a refused login.
 
-The agent starts only when you create the thread or open it (showing it again after a failed
-start tries again), never at launch: threads on another machine are left out of the threads
+The agent starts only when you create the thread or open it, never at launch. A thread whose
+agent did not start (the machine out of reach or not listed, the agent not found) says why and
+**Send a message to try again**: showing the thread again does not try again, and your next
+message does, sent once the agent is up (a message with images is not kept: send it again once
+the agent runs). Threads on another machine are left out of the threads
 reopened by Reopen Last Thread, and never continue on their own after a usage limit. Its folder
 is fixed for its life; the sidebar groups it under `machine:/path` with a network-server mark,
 and the window's subtitle and the Spending dialog say the same. Whether the machine is still
@@ -984,10 +998,13 @@ request for extra permissions can only be denied. Codex takes no images there (i
 from a file path, and the image is on this machine): the composer keeps the message and says
 so, mid-turn too. An image Codex viewed there is not shown. A link to a file opens nothing, and
 so does any link but a plain `http(s)://` one with a host and no `user@` (no `mailto:`, no
-hidden characters): the other machine wrote the transcript.
+hidden characters): the other machine wrote the transcript. The same holds for a reply shown in
+the Compare window, and for links in any text outside a thread (the Compare window and release
+notes open only plain web links, never `mailto:`).
 
 **What does not work:** dangerous permissive mode (the picker and `/mode` refuse it and say
-why), checkpoints, the diff panel and its Changes toggle (shown greyed; `Ctrl+Shift+D` says
+why; an agent there that reports entering it on its own, from its own settings there, is kept
+in the thread's safe mode, told to return to it, and the thread says so once), checkpoints, the diff panel and its Changes toggle (shown greyed; `Ctrl+Shift+D` says
 why), undo and `/rewind`, worktrees, hand-off briefs and `/handoff`, switching the thread to
 another agent or profile (refused before anything stops), Continue in (also off the rate-limit
 banner), the model-retirement check, Open folder, Review

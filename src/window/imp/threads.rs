@@ -779,13 +779,14 @@ impl ChatTab {
     }
 
     /// What closing this thread's page would lose: its work ([`Self::busy`]) or its unsent
-    /// draft, which includes messages held for a switch that did not go ahead or still waits
-    /// ([`ChatSession::has_unsent_held`]). `None`: nothing, so no question is asked.
+    /// draft, which includes messages held for a switch ([`ChatSession::has_unsent_held`]) or
+    /// waiting on a remote retry (`pending_prompt`). `None`: nothing, so no question is asked.
     pub(super) fn closing_loses(&self) -> Option<CloseReasons> {
         close_reasons(
             self.busy(),
             unsent_message(
-                self.view.as_ref().is_some_and(ChatView::has_draft),
+                self.view.as_ref().is_some_and(ChatView::has_draft)
+                    || self.pending_prompt.is_some(),
                 self.slot.get().is_some_and(|s| s.has_unsent_held()),
             ),
         )
@@ -1048,6 +1049,72 @@ impl SessionSlot {
             None => self.driver.get(),
         }
     }
+
+    /// A message to a thread on another machine with no session: the user's asking to try its
+    /// start again ([`AgentTerminalWindow::retry_remote_with_message`], deferred until the view's
+    /// handlers return), the message kept to be sent once the agent is up. One with images is
+    /// not kept (the kept message is text), and the thread says so.
+    fn retry_remote(&self, input: &crate::chat::PromptInput) {
+        let Some(thread) = self.thread.clone() else {
+            return;
+        };
+        let view = self.view.borrow().as_ref().and_then(|v| v.upgrade());
+        let say = move |text: String| {
+            if let Some(view) = &view {
+                view.apply(&Envelope::new(Event::Notice { text }));
+            }
+        };
+        let label = self.driver.get().info().label;
+        if !input.images.is_empty() {
+            say(format!(
+                "{label} is not running on the other machine, so the message with images was \
+                 not sent. Send a message without images to start it again."
+            ));
+            return;
+        }
+        let text = input.text.clone();
+        glib::idle_add_local_once(move || {
+            let outcome = thread_owner(&thread)
+                .map(|obj| obj.imp().retry_remote_with_message(&thread, text.clone()));
+            match outcome {
+                Some(RetryRemote::Kept) => say(format!(
+                    "Starting {label} on the other machine; the message is sent once it is up."
+                )),
+                Some(RetryRemote::Ready(session)) => {
+                    deliver_slot_prompt(&thread, &session, &text);
+                }
+                Some(RetryRemote::Refused) | None => say(format!(
+                    "{label} is not running on the other machine, so the message was not sent."
+                )),
+            }
+        });
+    }
+}
+
+/// What [`AgentTerminalWindow::retry_remote_with_message`] did with the message.
+pub(super) enum RetryRemote {
+    /// Kept to be sent once the remote agent is up (and started a retry if none was running).
+    Kept,
+    /// A session started meanwhile and is ready to take the message directly.
+    Ready(Rc<ChatSession>),
+    /// Could not retry (tab closed or not remote).
+    Refused,
+}
+
+/// Sends `text` to `session`, deferring when a delegated worker holds the root turn.
+fn deliver_slot_prompt(thread: &str, session: &ChatSession, text: &str) {
+    let deferred = crate::delegation::supervisor().is_some_and(|supervisor| {
+        matches!(
+            supervisor.before_root_turn(thread),
+            crate::delegation::supervisor::RootTurnGate::Deferred
+        )
+    });
+    let input = crate::chat::PromptInput::text(text);
+    if deferred {
+        session.queue_input(&input);
+    } else {
+        session.send_input(&input);
+    }
 }
 
 impl ChatBackend for SessionSlot {
@@ -1077,6 +1144,11 @@ impl ChatBackend for SessionSlot {
         self.send_input(&crate::chat::PromptInput::text(text));
     }
     fn send_refusal(&self) -> Option<String> {
+        // A thread on another machine with no session (its start failed, or is on its way)
+        // takes a message: it starts the agent there again, and is sent once it is up.
+        if self.remote && self.thread.is_some() {
+            return None;
+        }
         self.get().is_none().then(|| {
             format!(
                 "{} is not running for this thread yet",
@@ -1102,6 +1174,10 @@ impl ChatBackend for SessionSlot {
                 }
             }
             None => {
+                if self.remote {
+                    self.retry_remote(input);
+                    return;
+                }
                 warn!("a prompt arrived before the thread's session started");
                 let view = self.view.borrow().as_ref().and_then(|v| v.upgrade());
                 if let Some(view) = view {
@@ -2247,6 +2323,10 @@ struct RemoteStart {
 /// profile arguments, model or effort, no approval socket, and the app's environment minus
 /// `clear` only. A switch to another agent or profile is refused: the probe found this agent's
 /// CLI, and a profile's environment and model server are this machine's.
+/// How a thread on another machine whose agent did not start is started again: never by showing
+/// it, only by the user's next message.
+const REMOTE_RETRY_HINT: &str = "Send a message to try again.";
+
 fn remote_agent_launch(
     own: Driver,
     asked: Driver,
@@ -2905,9 +2985,14 @@ pub(super) fn profile_launch(
 /// agent session's markers) and any inherited approval socket, which only the app may set.
 pub(super) fn unset_list(patterns: &[String]) -> Vec<String> {
     // `vars_os`, lossy: one non-UTF-8 variable in the user's environment must not panic here.
-    let mut env: Vec<String> = std::env::vars_os()
+    let env: Vec<String> = std::env::vars_os()
         .map(|(k, v)| format!("{}={}", k.to_string_lossy(), v.to_string_lossy()))
         .collect();
+    unset_list_from(env, patterns)
+}
+
+/// [`unset_list`] of the environment `env` (`NAME=value` entries) in place of this process's.
+fn unset_list_from(mut env: Vec<String>, patterns: &[String]) -> Vec<String> {
     let mut names = crate::utils::strip_env(&mut env, patterns);
     for own in [
         agent_core::approval::ENV_SOCKET,
@@ -6196,20 +6281,9 @@ impl AgentTerminalWindow {
             };
             if chat.view.is_some() || chat.building {
                 // A built thread on another machine whose start failed (unreachable, not
-                // listed, no agent there): showing it again is the user's asking to try again.
-                let retry_remote = remote
-                    && chat.view.is_some()
-                    && !chat.building
-                    && !chat.starting
-                    && chat.slot.get().is_none();
-                if retry_remote {
-                    let (page, thread, driver) = (page.clone(), chat.thread.clone(), chat.driver);
-                    glib::idle_add_local_once(glib::clone!(
-                        #[weak(rename_to = obj)]
-                        self.obj(),
-                        move || obj.imp().retry_remote_start(&page, thread, driver)
-                    ));
-                }
+                // listed, no agent there) is not started again by being shown, a page selected
+                // by the app included: only the user's next message tries again
+                // (`Self::retry_remote_with_message`), so no ssh runs unasked.
                 if let Some(view) = &chat.view {
                     let view = view.clone();
                     // A message-search hit being opened goes to its message instead.
@@ -6862,8 +6936,46 @@ impl AgentTerminalWindow {
         }
     }
 
-    /// Starts a built thread on another machine again, the user having shown it after its start
-    /// failed: its provider thread is read again (to resume it), then the remote start runs.
+    /// The user sent `prompt` to a built thread on another machine whose start failed (or has
+    /// not finished): it is kept to be sent once the agent there is up (after any message still
+    /// waiting, in one message), and the start is tried again unless one is already on its way.
+    /// If the session came up before this idle ran, returns [`RetryRemote::Ready`] so the message
+    /// goes straight to it instead of being dropped.
+    pub(super) fn retry_remote_with_message(&self, thread: &str, prompt: String) -> RetryRemote {
+        let Some(page) = self.page_of_thread(thread) else {
+            return RetryRemote::Refused;
+        };
+        if !self.page_is_remote(&page) {
+            return RetryRemote::Refused;
+        }
+        let retry = self.with_page_chat_mut(&page, |chat| {
+            if let Some(session) = chat.slot.get() {
+                return Ok(session);
+            }
+            chat.pending_prompt = Some(match chat.pending_prompt.take() {
+                Some(earlier) => format!("{earlier}\n\n{prompt}"),
+                None => prompt,
+            });
+            Err((
+                !chat.starting && !chat.building && chat.view.is_some(),
+                chat.driver,
+            ))
+        });
+        match retry {
+            Some(Ok(session)) => RetryRemote::Ready(session),
+            Some(Err((start, driver))) => {
+                if start && self.session_start_allowed() {
+                    self.retry_remote_start(&page, thread.to_owned(), driver);
+                }
+                RetryRemote::Kept
+            }
+            None => RetryRemote::Refused,
+        }
+    }
+
+    /// Starts a built thread on another machine again, the user having sent it a message after
+    /// its start failed: its provider thread is read again (to resume it), then the remote start
+    /// runs, which sends the kept message once the agent is up.
     fn retry_remote_start(&self, page: &adw::TabPage, thread: String, driver: Driver) {
         let Some(remote) = self.with_page_tab(page, |t| t.remote.clone()).flatten() else {
             return;
@@ -6895,6 +7007,39 @@ impl AgentTerminalWindow {
         });
     }
 
+    /// What still connects to `alias` in any window, named for the user: a remote thread whose
+    /// agent is running, a remote thread's open terminal drawer, and every terminal page there.
+    /// Settings refuses to remove or rename a machine while this is not empty, so nothing keeps
+    /// running on a machine the list no longer names.
+    pub(super) fn remote_machine_in_use(&self, alias: &str) -> Vec<String> {
+        let uses = RefCell::new(Vec::new());
+        self.for_each_window(|window| uses.borrow_mut().extend(window.remote_uses_here(alias)));
+        uses.into_inner()
+    }
+
+    /// [`Self::remote_machine_in_use`] in this window only.
+    fn remote_uses_here(&self, alias: &str) -> Vec<String> {
+        let mut uses = Vec::new();
+        for tab in self.tabs.borrow().iter() {
+            let Some(remote) = tab.remote.as_ref().filter(|r| r.alias == alias) else {
+                continue;
+            };
+            match &tab.chat {
+                Some(chat) => {
+                    let title = display_title(&chat.title);
+                    if chat.starting || chat.slot.get().is_some_and(|s| s.status().alive) {
+                        uses.push(format!("the thread “{title}”"));
+                    }
+                    if chat.drawer_started {
+                        uses.push(format!("the terminal drawer of “{title}”"));
+                    }
+                }
+                None => uses.push(format!("the terminal page {}", remote.title())),
+            }
+        }
+        uses
+    }
+
     /// Whether `page` is a page on another machine (a remote thread or terminal page).
     pub(super) fn page_is_remote(&self, page: &adw::TabPage) -> bool {
         self.with_page_tab(page, |t| t.remote.is_some())
@@ -6924,8 +7069,10 @@ impl AgentTerminalWindow {
         let folder = match checked {
             Ok(folder) => folder,
             Err(why) => {
-                // Shown, not stored: listing the machine again and reopening the thread starts it.
-                view.apply(&Envelope::new(Event::Error { message: why }));
+                // Shown, not stored: once the machine is listed again, a message starts it.
+                view.apply(&Envelope::new(Event::Error {
+                    message: format!("{}. {REMOTE_RETRY_HINT}", why.trim_end_matches('.')),
+                }));
                 self.refresh_sidebar();
                 return;
             }
@@ -6968,10 +7115,10 @@ impl AgentTerminalWindow {
                 Err(failure) => {
                     info!("A thread on another machine could not start its agent");
                     let message = format!(
-                        "Could not start {} on {}: {}",
+                        "Could not start {} on {}: {}. {REMOTE_RETRY_HINT}",
                         start.driver.info().label,
                         folder.alias(),
-                        failure.reason()
+                        failure.reason().trim_end_matches('.')
                     );
                     view.apply(&Envelope::new(Event::Error { message }));
                     if failure.needs_terminal() {
@@ -9835,13 +9982,88 @@ pub(super) mod tests {
         assert_eq!(launch.program, "claude");
         assert!(launch.extra_args.is_empty());
         assert!(launch.env.env.is_empty(), "no env file");
-        assert!(launch.env.unset.iter().any(|n| n == "CLAUDECODE"));
+        // Whatever this process inherited, the approval socket and every delegation variable
+        // are always removed.
+        for always in [
+            agent_core::approval::ENV_SOCKET,
+            crate::approval_server::ENV_HOOK_BIN,
+        ]
+        .into_iter()
+        .chain(agent_core::delegation::env::STRIP_ON_SPAWN.iter().copied())
+        {
+            assert!(launch.env.unset.iter().any(|n| n == always), "{always}");
+        }
         assert!(launch.server.is_none() && launch.profile.is_none());
         assert!(matches!(launch.approval, Err(None)));
         assert!(remote_agent_launch(Driver::Claude, Driver::Codex, None, &clear).is_err());
         assert!(remote_agent_launch(Driver::Codex, Driver::Codex, Some("server"), &clear).is_err());
         assert!(remote_agent_launch(Driver::Agy, Driver::Agy, None, &clear).is_err());
         assert!(remote_agent_launch(Driver::Local, Driver::Local, None, &clear).is_err());
+    }
+
+    /// A thread on another machine whose start failed is not started again by its page being
+    /// shown (by the user or by the app): only the user's next message starts it again, and that
+    /// message is kept for the start. Its machine is never listed, so no start gets as far as
+    /// `ssh`.
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    fn a_failed_remote_thread_starts_again_only_on_a_message() {
+        use crate::testutil::pump_until;
+        crate::testutil::gtk_init().unwrap();
+        crate::testutil::adw_init().unwrap();
+        crate::icons::register();
+        crate::load_css();
+        let app = crate::window::imp::test_support::test_app("org.test.RemoteRetry", true);
+        CHAT_RESTORED.with(|done| done.set(true));
+        let ctx = glib::MainContext::default();
+        let window = crate::window::imp::test_support::test_window(&app, &ctx);
+        window.present();
+        assert!(pump_until(&ctx, 5, || window.is_realized()));
+        let imp = window.imp();
+        assert!(
+            imp.config.borrow().remote_hosts.is_empty(),
+            "nothing listed"
+        );
+        let store = app_store();
+        let id = store
+            .create_thread("ssh://box/srv/app", Some("there"))
+            .unwrap();
+        let provider = store.add_provider_thread(&id, "claude", "default").unwrap();
+        store.set_active_provider_thread(&id, &provider).unwrap();
+        imp.reload_summaries();
+        let page = imp.open_thread(&id, true).expect("opened");
+        let root = page.child();
+        let refusals = || {
+            crate::testutil::label_texts(&root)
+                .iter()
+                .filter(|t| t.contains("is not listed") && t.contains(REMOTE_RETRY_HINT))
+                .count()
+        };
+        assert!(
+            pump_until(&ctx, 5, || refusals() == 1),
+            "{:#?}",
+            crate::testutil::label_texts(&root)
+        );
+        // Shown again, twice: nothing starts.
+        imp.ensure_built(&page);
+        imp.ensure_built(&page);
+        pump_until(&ctx, 1, || false);
+        assert_eq!(refusals(), 1, "showing it never starts it again");
+        // The user's message does, and is kept for the start.
+        let slot = imp.slot_of(&id).expect("its slot");
+        assert_eq!(slot.send_refusal(), None, "a message is taken");
+        slot.send_prompt("hello there");
+        assert!(pump_until(&ctx, 5, || refusals() == 2));
+        assert!(crate::testutil::label_texts(&root)
+            .iter()
+            .any(|t| t.starts_with("Starting Claude on the other machine")));
+        assert_eq!(
+            imp.with_chat(&id, |c| c.pending_prompt.clone()).flatten(),
+            Some("hello there".to_owned())
+        );
+        assert!(slot.get().is_none());
+        window.destroy();
+        crate::testutil::settle(&ctx);
     }
 
     /// A send lands in the target thread's draft, labelled for its source and redacted, never
@@ -12331,6 +12553,27 @@ pub(super) mod tests {
         assert!(names
             .iter()
             .any(|n| n == crate::approval_server::ENV_HOOK_BIN));
+    }
+
+    /// `clear_env` names what the given environment holds, never what the test process happened
+    /// to inherit: a launching session's marker is removed when present, and nothing absent is.
+    #[test]
+    fn unset_list_from_reads_only_the_environment_it_is_given() {
+        let clear = vec!["CLAUDECODE".to_owned(), "CODEX_*".to_owned()];
+        let names = unset_list_from(
+            vec![
+                "CLAUDECODE=1".to_owned(),
+                "CODEX_THREAD=x".to_owned(),
+                "PATH=/usr/bin".to_owned(),
+            ],
+            &clear,
+        );
+        assert!(names.iter().any(|n| n == "CLAUDECODE"), "{names:?}");
+        assert!(names.iter().any(|n| n == "CODEX_THREAD"), "{names:?}");
+        assert!(!names.iter().any(|n| n == "PATH"));
+        let none = unset_list_from(vec!["PATH=/usr/bin".to_owned()], &clear);
+        assert!(!none.iter().any(|n| n == "CLAUDECODE"), "{none:?}");
+        assert!(none.iter().any(|n| n == agent_core::approval::ENV_SOCKET));
     }
 
     #[test]

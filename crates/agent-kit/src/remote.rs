@@ -85,8 +85,15 @@ impl Ssh {
     }
 }
 
-/// Probes kept per (machine, command).
-static PROBES: Mutex<Option<HashMap<(String, String), RemoteProbe>>> = Mutex::new(None);
+#[derive(Default)]
+struct ProbeCache {
+    entries: HashMap<(String, String), RemoteProbe>,
+    epochs: HashMap<String, u64>,
+}
+
+/// Probes kept per (machine, command), with a per-alias epoch so an in-flight probe cannot write
+/// back after [`forget`].
+static PROBES: Mutex<Option<ProbeCache>> = Mutex::new(None);
 
 /// The kept probe of `cli` on `alias`, if one succeeded in this process.
 pub fn cached_probe(alias: &str, cli: &str) -> Option<RemoteProbe> {
@@ -94,6 +101,7 @@ pub fn cached_probe(alias: &str, cli: &str) -> Option<RemoteProbe> {
         .lock()
         .ok()?
         .as_ref()?
+        .entries
         .get(&(alias.to_owned(), cli.to_owned()))
         .cloned()
 }
@@ -101,25 +109,41 @@ pub fn cached_probe(alias: &str, cli: &str) -> Option<RemoteProbe> {
 /// Forgets every kept probe of `alias` (it was removed or renamed in Settings).
 pub fn forget(alias: &str) {
     if let Ok(mut probes) = PROBES.lock() {
-        if let Some(map) = probes.as_mut() {
-            map.retain(|(host, _), _| host != alias);
-        }
+        let cache = probes.get_or_insert_with(ProbeCache::default);
+        cache.entries.retain(|(host, _), _| host != alias);
+        let epoch = cache.epochs.entry(alias.to_owned()).or_insert(0);
+        *epoch = epoch.wrapping_add(1);
     }
 }
 
-/// Where `cli` is on `alias`: the kept answer, else a probe now (kept when it succeeds).
+/// Where `cli` is on `alias`: the kept answer, else a probe now (kept when it succeeds, unless
+/// [`forget`] ran for `alias` while it was in flight).
 pub fn probe(ssh: &Ssh, alias: &str, cli: &str) -> Result<RemoteProbe, RemoteError> {
-    if let Some(found) = cached_probe(alias, cli) {
-        return Ok(found);
-    }
+    let epoch = {
+        let mut probes = PROBES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cache = probes.get_or_insert_with(ProbeCache::default);
+        if let Some(found) = cache
+            .entries
+            .get(&(alias.to_owned(), cli.to_owned()))
+            .cloned()
+        {
+            return Ok(found);
+        }
+        cache.epochs.get(alias).copied().unwrap_or(0)
+    };
     let command = remote::probe_command(cli).map_err(RemoteError::Refused)?;
     let argv = remote::ssh_batch_argv(alias, command).map_err(RemoteError::Refused)?;
     let stdout = ssh.run(&argv)?;
     let found = remote::parse_probe(cli, &stdout).map_err(RemoteError::Refused)?;
     if let Ok(mut probes) = PROBES.lock() {
-        probes
-            .get_or_insert_with(HashMap::new)
-            .insert((alias.to_owned(), cli.to_owned()), found.clone());
+        let cache = probes.get_or_insert_with(ProbeCache::default);
+        if cache.epochs.get(alias).copied().unwrap_or(0) == epoch {
+            cache
+                .entries
+                .insert((alias.to_owned(), cli.to_owned()), found.clone());
+        }
     }
     Ok(found)
 }
@@ -300,5 +324,54 @@ mod tests {
         assert!(failed.needs_terminal());
         assert_eq!(failed.reason(), "Host key verification failed.");
         assert!(cached_probe("unknown-key-box", "codex").is_none());
+    }
+
+    /// A `probe` in flight when `forget` runs must not write its stale answer back into the
+    /// cache afterwards.
+    #[test]
+    fn an_in_flight_probe_does_not_repopulate_after_forget() {
+        let base = tempfile::tempdir().unwrap();
+        let bin = base.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let cli = bin.join("claude");
+        std::fs::write(&cli, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let started = base.path().join("started");
+        let proceed = base.path().join("proceed");
+        let script = base.path().join("ssh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n: > '{}'\nwhile [ ! -e '{}' ]; do sleep 0.02; done\n\
+                 for last in \"$@\"; do :; done\n\
+                 exec env SHELL=/bin/sh HOME='{}' PATH='{}:/usr/bin:/bin' sh -c \"$last\"\n",
+                started.display(),
+                proceed.display(),
+                base.path().display(),
+                bin.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ssh = Ssh {
+            program: script.to_string_lossy().into_owned(),
+            env: vec!["PATH=/usr/bin:/bin".into()],
+        };
+        let alias = "inflight-forget-box";
+        forget(alias);
+        let handle = std::thread::spawn(move || probe(&ssh, alias, "claude"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !started.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(started.exists(), "probe entered ssh");
+        forget(alias);
+        std::fs::write(&proceed, b"ok").unwrap();
+        let found = handle.join().unwrap().unwrap();
+        assert_eq!(found.cli, cli.to_string_lossy());
+        assert!(
+            cached_probe(alias, "claude").is_none(),
+            "stale probe not cached after forget"
+        );
     }
 }

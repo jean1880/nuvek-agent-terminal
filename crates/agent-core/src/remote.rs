@@ -494,6 +494,13 @@ pub struct RemoteProbe {
 const PROBE_SHELL: &str = "__agent_terminal_shell=";
 const PROBE_PATH: &str = "__agent_terminal_path=";
 const PROBE_CLI: &str = "__agent_terminal_cli=";
+const PROBE_QUOTE: &str = "__agent_terminal_quote=";
+
+/// The quoting canary's value: [`sh_quote`] of it is what the login shell itself parses first in
+/// the probe, so it comes back exactly only from a shell that reads that quoting as POSIX does.
+/// The `'` is closed, escaped and reopened (`'\''`); the `\\` stays two backslashes inside single
+/// quotes, where fish reads it as one (and `\'` as a quote that does not close).
+const QUOTE_CANARY: &str = r"a'b c\\d";
 
 /// The login shells a thread on another machine runs under, by name: POSIX shells only. The
 /// account's login shell parses the thread's command line (`cd -- '…' && exec …`), and the
@@ -510,11 +517,14 @@ pub fn posix_shell(shell: &str) -> bool {
 }
 
 /// The remote command of the probe for `cli` (a bare command name). Read by whatever login
-/// shell the account has, so it is written to parse the same in csh: one line, a single-quoted
-/// `/bin/sh` script with no `'` or `!` in it. The script says the login shell, stops there for
-/// any shell not in [`POSIX_SHELLS`], and otherwise asks a login shell (`-l`, never
-/// interactive, its input empty) for its `PATH` and where `cli` is on it. Markers set the
-/// answers apart from anything a profile prints.
+/// shell the account has, so it is written to parse the same in csh: one line, with no `!` and
+/// no `$` outside single quotes. The login shell itself first prints the quoting canary
+/// ([`QUOTE_CANARY`], quoted with [`sh_quote`] as every value on a thread's command line is), so
+/// the probe learns how the shell that will read those lines quotes, whatever `$SHELL` says. Then
+/// a single-quoted `/bin/sh` script with no `'` in it says the login shell, stops there for any
+/// shell not in [`POSIX_SHELLS`], and otherwise asks a login shell (`-l`, never interactive, its
+/// input empty) for its `PATH` and where `cli` is on it. Markers set the answers apart from
+/// anything a profile prints.
 pub fn probe_command(cli: &str) -> Result<String, String> {
     if cli.is_empty()
         || !cli
@@ -525,18 +535,21 @@ pub fn probe_command(cli: &str) -> Result<String, String> {
         return Err(format!("“{cli}” is not a command name"));
     }
     Ok(format!(
-        "exec /bin/sh -c 'printf \"{PROBE_SHELL}%s\\n\" \"$SHELL\"; case \"${{SHELL##*/}}\" in \
+        "printf '%s\\n' {canary}; \
+         exec /bin/sh -c 'printf \"{PROBE_SHELL}%s\\n\" \"$SHELL\"; case \"${{SHELL##*/}}\" in \
          {shells}) ;; *) exit 0;; esac; exec \"$SHELL\" -lc \"printf \\\"{PROBE_PATH}%s\\\\n\\\" \
          \\\"\\$PATH\\\"; printf \\\"{PROBE_CLI}%s\\\\n\\\" \\\"\\$(command -v {cli})\\\"\" \
          </dev/null'",
+        canary = sh_quote(&format!("{PROBE_QUOTE}{QUOTE_CANARY}")),
         shells = POSIX_SHELLS.join("|")
     ))
 }
 
 /// What the probe printed, as a [`RemoteProbe`], or why the agent cannot run there: a login
-/// shell not in [`POSIX_SHELLS`] (the thread's command line is POSIX), no `PATH`, or `cli` not
-/// found on it (or not a plain absolute path). What the other machine printed is redacted before
-/// it is quoted.
+/// shell not in [`POSIX_SHELLS`] (the thread's command line is POSIX), a quoting canary that did
+/// not come back exactly (the shell parsing the command line does not quote as POSIX does,
+/// whatever `$SHELL` names), no `PATH`, or `cli` not found on it (or not a plain absolute path).
+/// What the other machine printed is redacted before it is quoted.
 pub fn parse_probe(cli: &str, stdout: &str) -> Result<RemoteProbe, String> {
     let field = |marker: &str| {
         stdout
@@ -558,6 +571,13 @@ pub fn parse_probe(cli: &str, stdout: &str) -> Result<RemoteProbe, String> {
         return Err(format!(
             "The login shell there is “{name}”; a thread on another machine needs a POSIX \
              login shell ({})",
+            POSIX_SHELLS.join(", ")
+        ));
+    }
+    if field(PROBE_QUOTE).as_deref() != Some(QUOTE_CANARY) {
+        return Err(format!(
+            "The shell that reads commands there does not quote as a POSIX shell does; a thread \
+             on another machine needs a POSIX login shell ({})",
             POSIX_SHELLS.join(", ")
         ));
     }
@@ -680,18 +700,37 @@ pub struct BatchFailure {
 
 /// A batch `ssh`'s failure: the redacted, bounded reason [`check_outcome`] gives, and whether
 /// ssh stopped at something only a person can answer.
+///
+/// The standard error of a batch `ssh` also carries what the command there wrote (the agent CLI,
+/// the remote shell), which can say anything, "Permission denied" included. So for ssh's own
+/// failure (exit 255) both the reason and whether a terminal would help are read only from the
+/// lines ssh itself writes ([`ssh_own_line`]); for any other exit, the command there failed and
+/// no terminal is offered.
 pub fn batch_failure(code: Option<i32>, stderr: &str) -> BatchFailure {
     // Called for a failure: a zero exit with nothing to show still reads as one.
     let code = if code == Some(0) { Some(1) } else { code };
-    let reason = match check_outcome(code, stderr) {
+    if !ssh_failed(code) {
+        let reason = match check_outcome(code, stderr) {
+            RemoteCheck::Unreachable(why) => why,
+            _ => "ssh failed".to_owned(),
+        };
+        return BatchFailure {
+            reason,
+            needs_terminal: false,
+        };
+    }
+    let own: Vec<&str> = stderr.lines().filter(|l| ssh_own_line(l)).collect();
+    let own = own.join("\n");
+    let reason = match check_outcome(code, &own) {
         RemoteCheck::Unreachable(why) => why,
         _ => "ssh failed".to_owned(),
     };
-    let lower = stderr.to_ascii_lowercase();
+    let lower = own.to_ascii_lowercase();
     let needs_terminal = [
         "host key verification failed",
         "remote host identification has changed",
-        "permission denied",
+        " host key is known for ",
+        ": permission denied (",
         "no more authentication methods",
         "passphrase",
         "keyboard-interactive",
@@ -702,6 +741,72 @@ pub fn batch_failure(code: Option<i32>, stderr: &str) -> BatchFailure {
         reason,
         needs_terminal,
     }
+}
+
+/// The starts of the lines OpenSSH writes itself when it fails (lower case), beside those it
+/// prefixes with `ssh:`.
+const SSH_LINE_STARTS: &[&str] = &[
+    "host key verification failed",
+    "@@@@@@@@",
+    "@    warning: remote host identification has changed",
+    "it is also possible that a host key has just been changed",
+    "received disconnect from ",
+    "disconnected from ",
+    "connection closed by ",
+    "connection reset by ",
+    "connection timed out during banner exchange",
+    "kex_exchange_identification:",
+    "ssh_exchange_identification:",
+    "banner exchange:",
+    "unable to negotiate with ",
+    "too many authentication failures",
+    "no more authentication methods",
+    "load key ",
+    "bad owner or permissions on ",
+];
+
+/// Whether a line of a batch `ssh`'s standard error is ssh's own (`ssh: …`, or one of the
+/// messages OpenSSH writes unprefixed: [`SSH_LINE_STARTS`], `<user>@<host>: Permission denied
+/// (…)`, `No <type> host key is known for …`, a configuration file's error), never the command's
+/// there.
+pub fn ssh_own_line(line: &str) -> bool {
+    let line = line.trim();
+    let lower = line.to_ascii_lowercase();
+    if lower.starts_with("ssh: ") || SSH_LINE_STARTS.iter().any(|s| lower.starts_with(s)) {
+        return true;
+    }
+    if lower.starts_with("no ") && lower.contains(" host key is known for ") {
+        return true;
+    }
+    // `<user>@<host>: Permission denied (publickey,password).`: the destination is one word with
+    // an `@`, and the parentheses hold only authentication method names (not, say, a program's
+    // `Permission denied (os error 13)`).
+    if let Some((who, rest)) = line.split_once(": ") {
+        let one_word = !who.is_empty() && !who.contains(char::is_whitespace);
+        let methods = rest
+            .strip_prefix("Permission denied (")
+            .and_then(|r| r.strip_suffix(")."));
+        if one_word
+            && who.contains('@')
+            && methods.is_some_and(|m| {
+                !m.is_empty()
+                    && m.chars()
+                        .all(|c| c.is_ascii_lowercase() || matches!(c, ',' | '-' | '@' | '.'))
+            })
+        {
+            return true;
+        }
+        // `/home/me/.ssh/config: line 3: Bad configuration option: x`, and its `terminating`.
+        if one_word
+            && (who.starts_with('/') || who.starts_with('~'))
+            && rest
+                .to_ascii_lowercase()
+                .contains("bad configuration option")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// What a thread on another machine has of each part of a local thread. The one list docs,
@@ -1291,7 +1396,10 @@ mod tests {
     #[test]
     fn only_a_posix_login_shell_is_accepted() {
         let reply = |shell: &str| {
-            format!("{PROBE_SHELL}{shell}\n{PROBE_PATH}/usr/bin\n{PROBE_CLI}/usr/bin/claude\n")
+            format!(
+                "{}{PROBE_SHELL}{shell}\n{PROBE_PATH}/usr/bin\n{PROBE_CLI}/usr/bin/claude\n",
+                canary_line()
+            )
         };
         for ok in [
             "/bin/sh",
@@ -1360,9 +1468,13 @@ mod tests {
             ..probe()
         };
         assert!(ssh_chat_argv(&folder, &assigned, &[]).is_err());
-        let reply =
-            format!("{PROBE_SHELL}/bin/bash\n{PROBE_PATH}/usr/bin\n{PROBE_CLI}/x=y/codex\n");
-        assert!(parse_probe("codex", &reply).is_err());
+        let reply = format!(
+            "{}{PROBE_SHELL}/bin/bash\n{PROBE_PATH}/usr/bin\n{PROBE_CLI}/x=y/codex\n",
+            canary_line()
+        );
+        assert!(parse_probe("codex", &reply)
+            .unwrap_err()
+            .contains("not a program file"));
         for bad in [
             "sess\0ion",
             "model\nname",
@@ -1451,9 +1563,19 @@ mod tests {
         }
         let command = probe_command("claude").unwrap();
         assert!(!command.contains('!'));
-        // Inside its outer single quotes there is no other single quote (csh reads it too).
+        // The login shell first prints the canary as `sh_quote` quotes it; then the script, inside
+        // whose outer single quotes there is no other single quote (csh reads it too).
+        let canary = format!(
+            "printf '%s\\n' {}; ",
+            sh_quote(&format!("{PROBE_QUOTE}{QUOTE_CANARY}"))
+        );
+        assert_eq!(
+            canary,
+            r"printf '%s\n' '__agent_terminal_quote=a'\''b c\\d'; "
+        );
         let inner = command
-            .strip_prefix("exec /bin/sh -c '")
+            .strip_prefix(canary.as_str())
+            .and_then(|r| r.strip_prefix("exec /bin/sh -c '"))
             .and_then(|r| r.strip_suffix('\''))
             .unwrap();
         assert!(!inner.contains('\''));
@@ -1489,20 +1611,69 @@ mod tests {
             assert!(found.path.starts_with(&bin.display().to_string()));
             std::fs::remove_dir_all(&base).unwrap();
         }
+        let quote = canary_line();
         let ok = format!(
-            "motd\n{PROBE_SHELL}/usr/bin/zsh\n{PROBE_PATH}/usr/bin\n{PROBE_CLI}/usr/bin/codex\n"
+            "motd\n{quote}{PROBE_SHELL}/usr/bin/zsh\n{PROBE_PATH}/usr/bin\n{PROBE_CLI}/usr/bin/codex\n"
         );
         assert_eq!(parse_probe("codex", &ok).unwrap().cli, "/usr/bin/codex");
-        let csh = format!("{PROBE_SHELL}/bin/tcsh\n");
+        let csh = format!("{quote}{PROBE_SHELL}/bin/tcsh\n");
         assert!(parse_probe("codex", &csh).unwrap_err().contains("tcsh"));
-        let missing = format!("{PROBE_SHELL}/bin/bash\n{PROBE_PATH}/usr/bin\n{PROBE_CLI}\n");
+        let missing = format!("{quote}{PROBE_SHELL}/bin/bash\n{PROBE_PATH}/usr/bin\n{PROBE_CLI}\n");
         assert!(parse_probe("codex", &missing)
             .unwrap_err()
             .contains("not found"));
-        let alias =
-            format!("{PROBE_SHELL}/bin/bash\n{PROBE_PATH}/usr/bin\n{PROBE_CLI}alias codex=x\n");
+        let alias = format!(
+            "{quote}{PROBE_SHELL}/bin/bash\n{PROBE_PATH}/usr/bin\n{PROBE_CLI}alias codex=x\n"
+        );
         assert!(parse_probe("codex", &alias).is_err());
         assert!(parse_probe("codex", "").is_err());
+    }
+
+    /// What a POSIX login shell prints for the probe's quoting canary.
+    fn canary_line() -> String {
+        format!("{PROBE_QUOTE}{QUOTE_CANARY}\n")
+    }
+
+    /// `$SHELL` is only what the account says: the canary is what the shell that parses the
+    /// command line printed. fish reads `\\` inside single quotes as one backslash (and would
+    /// read `\'` as a quote that does not close), so its transcript is refused even under a
+    /// `$SHELL` naming bash; so is a transcript with no canary, or a changed one.
+    #[test]
+    fn the_probe_refuses_a_shell_that_does_not_quote_as_posix_does() {
+        let rest =
+            format!("{PROBE_SHELL}/bin/bash\n{PROBE_PATH}/usr/bin\n{PROBE_CLI}/usr/bin/claude\n");
+        assert!(parse_probe("claude", &format!("{}{rest}", canary_line())).is_ok());
+        let fish = format!("{PROBE_QUOTE}a'b c\\d\n{rest}");
+        let why = parse_probe("claude", &fish).unwrap_err();
+        assert!(why.contains("does not quote as a POSIX shell"), "{why}");
+        for other in [
+            String::new(),
+            format!("{PROBE_QUOTE}\n"),
+            format!("{PROBE_QUOTE}a'\\''b c\\\\d\n"),
+            format!("{PROBE_QUOTE}ab c\\\\d\n"),
+            format!("{PROBE_QUOTE}{QUOTE_CANARY} \n"),
+        ] {
+            assert!(
+                parse_probe("claude", &format!("{other}{rest}")).is_err(),
+                "{other:?}"
+            );
+        }
+        // A real POSIX shell parsing the probe's first command prints the canary exactly.
+        if std::process::Command::new("sh")
+            .arg("-c")
+            .arg("true")
+            .status()
+            .is_ok()
+        {
+            let command = probe_command("claude").unwrap();
+            let first = command.split_once("; exec ").unwrap().0;
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(first)
+                .output()
+                .unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout), canary_line());
+        }
     }
 
     #[test]
@@ -1532,6 +1703,55 @@ mod tests {
         assert!(ssh_failed(Some(255)));
         assert!(!ssh_failed(Some(1)));
         assert_eq!(unreachable_notice("box"), "Could not reach box.");
+    }
+
+    /// What the agent CLI or the shell there wrote to the same standard error never decides why
+    /// ssh failed, nor whether a terminal would help: only ssh's own lines do.
+    #[test]
+    fn a_batch_failure_reads_only_the_lines_ssh_writes_itself() {
+        // The remote CLI saying "Permission denied" and a fake key prompt, then exiting 255.
+        let cli = "Error: /srv/app/.env: Permission denied (os error 13)\n\
+                   claude: Permission denied\n\
+                   Enter passphrase for key: host key verification failed\n";
+        let failure = batch_failure(Some(255), cli);
+        assert!(!failure.needs_terminal, "{failure:?}");
+        assert_eq!(failure.reason, "ssh exited with status 255");
+        // The same text from a command that failed otherwise offers no terminal either.
+        assert!(!batch_failure(Some(1), cli).needs_terminal);
+        // ssh's own line after the CLI's: it alone is the reason, and it is answered there.
+        let mixed =
+            format!("{cli}me@box: Permission denied (publickey,password).\nlast cli line\n");
+        let failure = batch_failure(Some(255), &mixed);
+        assert!(failure.needs_terminal);
+        assert_eq!(
+            failure.reason,
+            "me@box: Permission denied (publickey,password)."
+        );
+        let dns = batch_failure(
+            Some(255),
+            "codex: retrying\nssh: Could not resolve hostname box: Name or service not known\n",
+        );
+        assert!(!dns.needs_terminal);
+        assert!(dns.reason.starts_with("ssh: Could not resolve"), "{dns:?}");
+        for own in [
+            "ssh: connect to host box port 22: Connection refused",
+            "Host key verification failed.",
+            "No ED25519 host key is known for box and you have requested strict checking.",
+            "Connection closed by 192.0.2.7 port 22",
+            "kex_exchange_identification: read: Connection reset by peer",
+            "/home/me/.ssh/config: line 3: Bad configuration option: frob",
+        ] {
+            assert!(ssh_own_line(own), "{own}");
+        }
+        for theirs in [
+            "Permission denied",
+            "Error: Permission denied (os error 13)",
+            "claude: Permission denied (publickey).",
+            "the host key verification failed for npm",
+            "",
+        ] {
+            assert!(!ssh_own_line(theirs), "{theirs}");
+        }
     }
 
     /// `Subsystem::ALL` is hand-maintained: `next` has no wildcard, so a new part does not

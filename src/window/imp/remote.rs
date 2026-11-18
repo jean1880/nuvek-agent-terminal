@@ -249,6 +249,15 @@ impl Machines {
                     }
                     let text = alias_entry.text().to_string();
                     let old = alias_current.borrow().clone();
+                    // A rename while something runs there would leave it connected to a
+                    // machine the list no longer names: refused, naming what runs.
+                    if text.trim() != old {
+                        let uses = imp.remote_machine_in_use(&old);
+                        if let Some(why) = in_use_refusal("rename", &old, &uses) {
+                            mark_entry(&alias_entry, &alias_row, Some(&why), ALIAS_HELP);
+                            return;
+                        }
+                    }
                     let result = imp.config.borrow_mut().set_remote_alias(index, &text);
                     match result {
                         Ok(false) => {}
@@ -343,6 +352,7 @@ impl Machines {
 
         let this = Rc::downgrade(self);
         let remove_here = Rc::clone(&still_here);
+        let remove_current = Rc::clone(&current);
         remove.connect_clicked(move |_| {
             let Some(this) = this.upgrade() else {
                 return;
@@ -352,6 +362,12 @@ impl Machines {
             };
             let imp = window.imp();
             if !remove_here(imp) {
+                return;
+            }
+            let alias = remove_current.borrow().clone();
+            let uses = imp.remote_machine_in_use(&alias);
+            if let Some(why) = in_use_refusal("remove", &alias, &uses) {
+                super::present_message(&window, "Cannot Remove the Machine", &why);
                 return;
             }
             let removed = {
@@ -413,6 +429,22 @@ impl Machines {
             this.checks.borrow_mut().insert(alias, result);
         });
     }
+}
+
+/// Why Settings refuses to `action` ("remove" or "rename") the machine `alias` while `uses`
+/// (what still connects there, [`AgentTerminalWindow::remote_machine_in_use`]) is not empty;
+/// `None` when nothing does.
+fn in_use_refusal(action: &str, alias: &str, uses: &[String]) -> Option<String> {
+    let (last, rest) = uses.split_last()?;
+    let named = if rest.is_empty() {
+        last.clone()
+    } else {
+        format!("{} and {last}", rest.join(", "))
+    };
+    Some(format!(
+        "{alias} cannot be {action}d while {named} still connects there. Stop the thread, close \
+         the drawer or page, then {action} it."
+    ))
 }
 
 /// Whether a thread in `folder` may run `driver`: Claude or Codex, on a machine still listed in
@@ -885,6 +917,59 @@ pub(super) mod tests {
             "a refused rename keeps the saved name"
         );
         assert!(alias.has_css_class("error"));
+
+        // A terminal page there (started with no ssh): the machine is neither renamed nor
+        // removed while it is open, and the refusal names it.
+        let trash = || {
+            crate::testutil::descendants(group.upcast_ref())
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk4::Button>().ok())
+                .find(|b| b.icon_name().as_deref() == Some("at-user-trash-symbolic"))
+                .expect("a remove button")
+        };
+        crate::window::imp::SPAWN_TERMINAL_PAGES.with(|s| s.set(false));
+        imp.add_remote_terminal_tab(RemoteTab {
+            alias: "box".into(),
+            dir: "~/src".into(),
+        });
+        crate::testutil::settle(&ctx);
+        let page = imp
+            .tabs
+            .borrow()
+            .iter()
+            .find(|t| t.remote.is_some() && t.chat.is_none())
+            .map(|t| t.page.clone())
+            .expect("the remote page");
+        let uses = imp.remote_machine_in_use("box");
+        assert_eq!(uses.len(), 1, "{uses:?}");
+        assert!(uses[0].starts_with("the terminal page box:"), "{uses:?}");
+        assert!(imp.remote_machine_in_use("other").is_empty());
+        commit(&alias, "box3");
+        assert_eq!(
+            hosts()[0].alias,
+            "box",
+            "no rename while a page is open there"
+        );
+        assert!(alias.has_css_class("error"));
+        trash().emit_clicked();
+        crate::testutil::settle(&ctx);
+        assert_eq!(hosts().len(), 1, "no removal while a page is open there");
+        let refusal = window.visible_dialog().expect("the refusal is said");
+        assert!(
+            crate::testutil::label_texts(refusal.upcast_ref::<gtk4::Widget>())
+                .iter()
+                .any(|t| t.contains("the terminal page box:"))
+        );
+        refusal.force_close();
+        imp.tab_view
+            .borrow()
+            .as_ref()
+            .expect("the tab view")
+            .close_page(&page);
+        crate::testutil::settle(&ctx);
+        crate::window::imp::SPAWN_TERMINAL_PAGES.with(|s| s.set(true));
+        assert!(imp.remote_machine_in_use("box").is_empty());
+
         commit(&alias, "box2");
         assert_eq!(hosts()[0].alias, "box2");
         assert!(!alias.has_css_class("error"));
@@ -906,5 +991,32 @@ pub(super) mod tests {
         assert_eq!(entries().len(), 1, "only the add row is left");
 
         imp.config.borrow_mut().remote_hosts = before;
+    }
+
+    #[test]
+    fn a_refusal_names_everything_still_connected() {
+        assert_eq!(in_use_refusal("remove", "box", &[]), None);
+        let one = in_use_refusal("rename", "box", &["the thread “A”".to_owned()]).unwrap();
+        assert!(
+            one.starts_with("box cannot be renamed while the thread “A” still"),
+            "{one}"
+        );
+        let three = in_use_refusal(
+            "remove",
+            "box",
+            &[
+                "the thread “A”".to_owned(),
+                "the terminal drawer of “A”".to_owned(),
+                "the terminal page box:~".to_owned(),
+            ],
+        )
+        .unwrap();
+        assert!(
+            three.contains(
+                "removed while the thread “A”, the terminal drawer of “A” and the terminal page \
+                 box:~ still"
+            ),
+            "{three}"
+        );
     }
 }

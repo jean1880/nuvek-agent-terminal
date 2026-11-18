@@ -1299,6 +1299,19 @@ fn reveal_on_first_output(terminal: &Terminal, stack: &Stack) {
     reveal_handler.replace(Some(handler_id));
 }
 
+/// The `ssh -t` argv of a terminal page or drawer on another machine
+/// ([`agent_core::remote::ssh_tty_argv`]), or why it cannot start: its machine must still be
+/// listed in Settings ([`agent_core::remote::listed`], read at every start), so a page opened
+/// from a toast, Reconnect, Restart or a thread's drawer never reaches a machine the user
+/// removed.
+fn remote_page_argv(
+    hosts: &[agent_core::remote::RemoteHost],
+    remote: &RemoteTab,
+) -> Result<Vec<String>, String> {
+    agent_core::remote::listed(hosts, &remote.alias)?;
+    agent_core::remote::ssh_tty_argv(&remote.alias, &remote.dir, &[])
+}
+
 /// A terminal tab whose model provider refused it: nothing is spawned, and the tab (kept, with
 /// the reason written into it) and a dialog say why.
 fn refuse_terminal(
@@ -4960,7 +4973,8 @@ impl AgentTerminalWindow {
         work_dir: &str,
     ) {
         let obj = self.obj();
-        let mut argv = match agent_core::remote::ssh_tty_argv(&remote.alias, &remote.dir, &[]) {
+        let argv = remote_page_argv(&self.config.borrow().remote_hosts, remote);
+        let mut argv = match argv {
             Ok(argv) => argv,
             Err(why) => {
                 refuse_terminal(&obj, stack, terminal, &format!("Cannot connect: {why}"));
@@ -9228,6 +9242,25 @@ mod tests {
             ssh_env_from(env),
             ["PATH=/usr/bin".to_owned(), "HOME=/home/me".to_owned()]
         );
+    }
+
+    /// A terminal page or drawer on another machine (a toast's "Open a Terminal There", Reconnect,
+    /// Restart, a thread's drawer) builds its `ssh` only for a machine still listed in Settings:
+    /// one removed since is refused with the reason, before any process.
+    #[test]
+    fn a_remote_page_reaches_only_a_listed_machine() {
+        let page = RemoteTab {
+            alias: "box".into(),
+            dir: "~/src".into(),
+        };
+        let listed = vec![agent_core::remote::RemoteHost::new("box", "").expect("a host")];
+        let argv = remote_page_argv(&listed, &page).expect("listed");
+        assert!(argv.iter().any(|a| a == "box"), "{argv:?}");
+        let other = vec![agent_core::remote::RemoteHost::new("other", "").expect("a host")];
+        for hosts in [Vec::new(), other] {
+            let why = remote_page_argv(&hosts, &page).unwrap_err();
+            assert!(why.contains("not listed"), "{why}");
+        }
     }
 
     #[test]

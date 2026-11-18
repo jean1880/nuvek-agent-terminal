@@ -145,6 +145,18 @@ fn a_remote_agent_runs_through_batch_ssh_with_nothing_of_this_machine() {
         for name in agent_core::delegation::env::STRIP_ON_SPAWN {
             assert!(!env.contains(&format!("export {name}=")), "{name}");
         }
+        // What the spawn is told, whatever this test process inherited (the checks of ssh's
+        // environment above prove nothing for a variable that was never set here).
+        let spec = session.inner.launch_spec();
+        assert!(spec.env.is_empty(), "no variable is added: {:?}", spec.env);
+        assert!(spec.cwd.is_none(), "no local folder");
+        for name in ["HOME", agent_core::approval::ENV_SOCKET]
+            .into_iter()
+            .chain([crate::approval_server::ENV_HOOK_BIN])
+            .chain(agent_core::delegation::env::STRIP_ON_SPAWN)
+        {
+            assert!(spec.unset.iter().any(|u| u == name), "{name} is removed");
+        }
         // The adapter was given no local folder (Codex would send it as a path there).
         assert_eq!(session.inner.open.borrow().cwd, "");
     });
@@ -249,6 +261,13 @@ fn a_remote_card_offers_allow_once_and_deny_and_no_rule_answers_it() {
                 "{tool}"
             );
             assert!(!auto, "{tool}: nothing answers a remote card but the user");
+            // Not even with the session's state somehow in dangerous permissive mode.
+            let before = session.inner.state.borrow().mode;
+            session.inner.state.borrow_mut().mode = Mode::Bypass;
+            let (shown, auto) = session.inner.gate_approval(card(tool, every.clone()));
+            session.inner.state.borrow_mut().mode = before;
+            assert!(!auto, "{tool}: Bypass answers no remote card");
+            assert_eq!(options_of(&shown), [Decision::Allow, Decision::Deny]);
             assert!(
                 matches!(
                     &shown.event,
@@ -277,14 +296,127 @@ fn a_remote_card_offers_allow_once_and_deny_and_no_rule_answers_it() {
     });
 }
 
-/// Dangerous permissive mode is refused on another machine, by the session itself and so for
-/// every caller: the mode never changes, nothing restarts into it, and no process there is ever
-/// started with Claude's bypass or Codex's never-ask policy.
+/// [`fake_ssh`] that stays up, reading its standard input until the session closes it, as a live
+/// agent there would: shell builtins only.
+fn live_fake_ssh(dir: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join("ssh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho run >> '{d}/runs'\nwhile read -r line; do :; done\n",
+            d = dir.display()
+        ),
+    )
+    .expect("the fake ssh");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    script
+}
+
+fn is_set_mode_bypass(command: &Command) -> bool {
+    matches!(command, Command::SetMode { mode: Mode::Bypass })
+}
+
+/// Dangerous permissive mode is refused on another machine for a live agent there, by the
+/// session itself and so for every caller: the mode never changes, nothing is ever told to enter
+/// it and nothing restarts into it. An agent that reports it on its own is kept in the safe mode,
+/// told so, and the thread says it once; no card is auto-answered meanwhile.
 #[test]
-fn dangerous_permissive_mode_is_refused_for_a_remote_thread() {
+fn dangerous_permissive_mode_is_refused_for_a_live_remote_agent() {
     in_loop(|ctx| {
         let tmp = tempfile::tempdir().expect("tmp");
-        set_test_ssh(&fake_ssh(tmp.path(), 0).to_string_lossy());
+        set_test_ssh(&live_fake_ssh(tmp.path()).to_string_lossy());
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let log: Log = Rc::default();
+        let (session, seen) = remote_session(
+            FakeAdapter::boxed(Driver::Claude, &log),
+            &store,
+            LaunchEnv::default(),
+            "claude",
+        );
+        assert!(pump_until(ctx, 10, || runs(tmp.path()) >= 1), "ssh is up");
+        pump_until(ctx, 1, || false);
+        assert_eq!(exited_count(&seen), 0, "the agent there is live");
+        assert!(session.inner.proc.borrow().is_some());
+        let safe = session.status().mode;
+        assert_ne!(safe, Mode::Bypass);
+
+        log.borrow_mut().clear();
+        ChatBackend::set_mode(&*session, Mode::Bypass);
+        pump_until(ctx, 1, || false);
+        assert!(has(&seen, |e| matches!(
+            e,
+            Event::Notice { text } if text == REMOTE_NO_BYPASS
+        )));
+        assert_eq!(session.status().mode, safe);
+        assert_ne!(session.wanted_mode(), Mode::Bypass);
+        assert!(
+            !log.borrow().iter().any(is_set_mode_bypass),
+            "the agent is never told to enter it: {:?}",
+            log.borrow()
+        );
+        assert_eq!(runs(tmp.path()), 1, "nothing restarted into it");
+
+        // The agent there reports dangerous permissive mode on its own, twice.
+        for _ in 0..2 {
+            session
+                .inner
+                .emit(Envelope::new(Event::ModeChanged { mode: Mode::Bypass }));
+        }
+        assert_eq!(session.inner.state.borrow().mode, safe);
+        assert_eq!(session.inner.open.borrow().mode, safe);
+        assert_ne!(session.wanted_mode(), Mode::Bypass);
+        assert!(!has(&seen, |e| matches!(
+            e,
+            Event::ModeChanged { mode: Mode::Bypass }
+        )));
+        let told = seen
+            .borrow()
+            .iter()
+            .filter(
+                |e| matches!(&e.event, Event::Notice { text } if text == REMOTE_BYPASS_REPORTED),
+            )
+            .count();
+        assert_eq!(told, 1, "said once");
+        pump_until(ctx, 1, || false);
+        assert!(
+            log.borrow()
+                .iter()
+                .any(|c| matches!(c, Command::SetMode { mode } if *mode == safe)),
+            "the agent is told the safe mode: {:?}",
+            log.borrow()
+        );
+        assert!(!log.borrow().iter().any(is_set_mode_bypass));
+        let (_, auto) = session
+            .inner
+            .gate_approval(card("Bash", vec![Decision::Allow]));
+        assert!(!auto, "no card is auto-answered");
+        assert_eq!(runs(tmp.path()), 1);
+        session.shutdown(false);
+    });
+}
+
+/// Real [`ClaudeAdapter`] in a remote session whose initial `system/init` frame reports
+/// `bypassPermissions`: it is refused on arrival, the session keeps its safe mode, tells the
+/// user once, and sends `set_permission_mode` back over ssh.
+#[test]
+fn real_claude_adapter_refuses_bypass_on_initial_remote_init() {
+    use std::os::unix::fs::PermissionsExt;
+    in_loop(|ctx| {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let script = tmp.path().join("ssh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho run >> '{d}/runs'\n\
+                 printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"model\":\"claude-sonnet\",\"session_id\":\"s1\",\"permissionMode\":\"bypassPermissions\"}}'\n\
+                 while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{d}/stdin'; done\n",
+                d = tmp.path().display()
+            ),
+        )
+        .expect("the fake ssh");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        set_test_ssh(&script.to_string_lossy());
         let store = Rc::new(Store::open_in_memory().expect("store"));
         let (session, seen) = remote_session(
             Box::new(ClaudeAdapter::new()),
@@ -292,39 +424,53 @@ fn dangerous_permissive_mode_is_refused_for_a_remote_thread() {
             LaunchEnv::default(),
             "claude",
         );
-        assert!(pump_until(ctx, 10, || exited_count(&seen) >= 1));
-        let before = runs(tmp.path());
-        ChatBackend::set_mode(&*session, Mode::Bypass);
-        pump_until(ctx, 1, || false);
-        assert!(has(&seen, |e| matches!(
+        let safe = session.status().mode;
+        assert_ne!(safe, Mode::Bypass);
+        assert!(
+            pump_until(ctx, 10, || has(&seen, |e| matches!(
+                e,
+                Event::Notice { text } if text == REMOTE_BYPASS_REPORTED
+            ))),
+            "initial bypass init is caught and reported: {:?}",
+            seen.borrow()
+        );
+        assert_eq!(session.status().mode, safe);
+        assert_eq!(session.inner.open.borrow().mode, safe);
+        assert!(!has(&seen, |e| matches!(
             e,
-            Event::Notice { text } if text == REMOTE_NO_BYPASS
+            Event::ModeChanged { mode: Mode::Bypass }
         )));
-        assert_ne!(session.status().mode, Mode::Bypass);
-        assert_ne!(session.wanted_mode(), Mode::Bypass);
-        assert_eq!(runs(tmp.path()), before, "nothing restarted into it");
-        // Even a start that somehow had it in hand goes in a safe mode.
+        assert!(
+            pump_until(ctx, 10, || {
+                std::fs::read_to_string(tmp.path().join("stdin"))
+                    .is_ok_and(|s| s.contains("\"set_permission_mode\""))
+            }),
+            "set_permission_mode sent back over ssh"
+        );
+        let stdin = std::fs::read_to_string(tmp.path().join("stdin")).unwrap_or_default();
+        assert!(!stdin.contains("bypassPermissions"), "{stdin}");
+        session.shutdown(false);
+    });
+}
+
+/// Even a start that somehow had dangerous permissive mode in hand goes in a safe mode: Claude
+/// there is never started with its bypass.
+#[test]
+fn a_remote_start_never_carries_dangerous_permissive_mode() {
+    in_loop(|_| {
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let (session, _) = remote_session(
+            Box::new(ClaudeAdapter::new()),
+            &store,
+            LaunchEnv::default(),
+            "claude",
+        );
         session.inner.open.borrow_mut().mode = Mode::Bypass;
         let spec = session.inner.launch_spec();
         let line = spec.argv.last().expect("the remote command line");
+        assert!(line.contains("'--permission-mode'"), "{line}");
         assert!(!line.contains("bypassPermissions"), "{line}");
         assert_ne!(session.inner.open.borrow().mode, Mode::Bypass);
-
-        // Codex there: its turn never asks for the never-ask policy or full access.
-        let (codex, _) = remote_session(
-            Box::new(agent_core::codex::CodexAdapter::new()),
-            &store,
-            LaunchEnv::default(),
-            "codex",
-        );
-        ChatBackend::set_mode(&*codex, Mode::Bypass);
-        assert_ne!(codex.status().mode, Mode::Bypass);
-        let spec = codex.inner.launch_spec();
-        let line = spec.argv.last().expect("the remote command line");
-        assert!(
-            !line.contains("dangerFullAccess") && !line.contains("never"),
-            "{line}"
-        );
     });
 }
 
@@ -549,6 +695,49 @@ fn a_host_key_failure_is_not_retried_and_offers_a_terminal() {
         )));
         pump_until(ctx, 3, || false);
         assert_eq!(runs(tmp.path()), 1);
+    });
+}
+
+/// The agent there writing "Permission denied" or a host-key line to the same standard error
+/// before an exit 255 is not ssh stopping at a login: the thread is retried as usual, its reason
+/// is ssh's own word (none here), and no terminal page is offered.
+#[test]
+fn what_the_agent_there_writes_never_reads_as_ssh_stopping_at_a_login() {
+    in_loop(|ctx| {
+        let tmp = tempfile::tempdir().expect("tmp");
+        set_test_ssh(
+            &fake_ssh_saying(
+                tmp.path(),
+                255,
+                "Error: /srv/app/.env: Permission denied (os error 13)\n\
+                 claude: host key verification failed for the registry\n",
+            )
+            .to_string_lossy(),
+        );
+        let store = Rc::new(Store::open_in_memory().expect("store"));
+        let (session, seen) = remote_session(
+            Box::new(ClaudeAdapter::new()),
+            &store,
+            LaunchEnv::default(),
+            "claude",
+        );
+        assert!(pump_until(ctx, 10, || has(&seen, |e| matches!(
+            e,
+            Event::Notice { text } if text.contains("Trying again")
+        ))));
+        assert!(has(&seen, |e| matches!(
+            e,
+            Event::Notice { text }
+                if text.starts_with("Could not reach box. ssh exited with status 255.")
+        )));
+        assert!(!has(&seen, |e| matches!(
+            e,
+            Event::Notice { text } | Event::Error { message: text }
+                if text.starts_with("Could not reach")
+                    && (text.contains("Permission denied") || text.contains("registry"))
+        )));
+        assert_eq!(session.take_remote_needs_terminal(), None);
+        session.shutdown(false);
     });
 }
 

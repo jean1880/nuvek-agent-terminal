@@ -623,6 +623,9 @@ struct Inner {
     /// Codex permission requests of a remote session, which can only be denied: an Allow sent
     /// for one is answered Deny.
     remote_deny_only: RefCell<HashSet<String>>,
+    /// The thread has said that its remote agent reported dangerous permissive mode and was put
+    /// back in a safe one ([`REMOTE_BYPASS_REPORTED`]): said once a session.
+    remote_bypass_told: Cell<bool>,
 }
 
 /// What a thread on another machine starts its agent with: the folder there and what the probe
@@ -736,6 +739,12 @@ pub(crate) const REMOTE_SWITCH_REFUSED: &str = "A thread on another machine keep
 /// Why a thread on another machine refuses dangerous permissive mode.
 pub(crate) const REMOTE_NO_BYPASS: &str = "Dangerous permissive mode is not available for a \
     thread on another machine: its approval cards are the only check on what it does there.";
+
+/// Said once when an agent on another machine reports it entered dangerous permissive mode on its
+/// own (its own settings there, say): the thread keeps a safe mode and tells the agent so.
+pub(crate) const REMOTE_BYPASS_REPORTED: &str = "The agent on the other machine reported \
+    dangerous permissive mode; this thread keeps a safe mode there and asked the agent to return \
+    to it.";
 
 /// The warning on a Codex permission card from another machine.
 const REMOTE_PERMISSIONS: &str = "Codex asks for these permissions on another machine, where \
@@ -1352,6 +1361,7 @@ impl ChatSession {
             remote_stderr: RefCell::default(),
             remote_needs_terminal: Cell::new(false),
             remote_deny_only: RefCell::default(),
+            remote_bypass_told: Cell::new(false),
         });
         *inner.weak_self.borrow_mut() = Some(Rc::downgrade(&inner));
         if remote_refused.is_some() {
@@ -1771,7 +1781,27 @@ impl Inner {
     }
 
     /// Persists (under the current provider thread), updates the status, then delivers.
-    fn emit(&self, env: Envelope) {
+    fn emit(&self, mut env: Envelope) {
+        // An agent on another machine never runs in dangerous permissive mode here, whatever it
+        // reports: the session keeps its safe mode (so no card is ever auto-answered and no
+        // respawn carries it), says so once, and tells the agent that mode once its handlers
+        // have returned.
+        if self.remote.is_some() && matches!(env.event, Event::ModeChanged { mode: Mode::Bypass }) {
+            let safe = self.safe_mode.get().session_safe();
+            warn!("the remote agent reported dangerous permissive mode; kept in a safe mode");
+            env.event = Event::ModeChanged { mode: safe };
+            if !self.remote_bypass_told.replace(true) {
+                self.notice(REMOTE_BYPASS_REPORTED);
+            }
+            let weak = self.weak_self.borrow().clone();
+            glib::spawn_future_local(async move {
+                if let Some(inner) = weak.and_then(|w| w.upgrade()) {
+                    if inner.proc.borrow().is_some() {
+                        inner.command(Command::SetMode { mode: safe });
+                    }
+                }
+            });
+        }
         if let Event::ToolImage { image } = env.event {
             // A path from an agent on another machine names a file there: never read here (it
             // would read whatever this machine has at that path).

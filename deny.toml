@@ -12,7 +12,8 @@ all-features = true
 unmaintained = "all"
 yanked = "deny"
 ignore = [
-    # Transitive via rmcp -> schemars; no replacement release exists yet.
+    # RUSTSEC-2026-0543 ("chrono is unmaintained"): chrono 0.4.45 is pulled in directly by
+    # rmcp and by schemars; drop once rmcp (and its schemars dependency) no longer needs chrono.
     "RUSTSEC-2026-0543",
 ]
 

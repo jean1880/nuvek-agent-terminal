@@ -1181,7 +1181,7 @@ impl ChatSession {
     }
 
     #[cfg(test)]
-    pub fn launched_free(&self) -> bool {
+    pub(crate) fn launched_free(&self) -> bool {
         self.inner.launched_free.get()
     }
 

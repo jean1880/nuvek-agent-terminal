@@ -268,6 +268,7 @@ impl AgentTerminalWindow {
             let Some(summary) = imp.summary_of(&thread) else {
                 return; // deleted meanwhile
             };
+            let remote = agent_core::remote::is_remote_cwd(&summary.cwd);
             let input = ThreadMenuInput {
                 thread,
                 archived: summary.archived,
@@ -276,10 +277,16 @@ impl AgentTerminalWindow {
                 has_messages,
                 forks,
                 agents: imp.menu_agents(),
+                remote,
             };
             let menu = to_gio_menu(&thread_menu(&input));
             let popover = gtk4::PopoverMenu::from_model(Some(&menu));
-            popover.set_tooltip_text(Some("Switch changes the agent in this thread and stops its current turn. Continue, Fork and Compact create a new thread with a handoff."));
+            popover.set_tooltip_text(Some(if remote {
+                crate::window::sidebar_model::REMOTE_MENU_NOTE
+            } else {
+                "Switch changes the agent in this thread and stops its current turn. Continue, \
+                 Fork and Compact create a new thread with a handoff."
+            }));
             popover.set_has_arrow(false);
             popover.set_halign(gtk4::Align::Start);
             popover.set_parent(&list);
@@ -295,6 +302,19 @@ impl AgentTerminalWindow {
 
     /// Carries out a menu choice.
     pub(super) fn run_thread_action(&self, action: ThreadAction) {
+        // A thread on another machine keeps its agent and has no folder here: what its menu
+        // greys out is refused with the reason whatever asked for it.
+        let local_only = match &action {
+            ThreadAction::ContinueIn { thread, .. }
+            | ThreadAction::SwitchTo { thread, .. }
+            | ThreadAction::OpenFolder(thread)
+            | ThreadAction::ReviewEnvironment(thread) => Some(thread.clone()),
+            _ => None,
+        };
+        if local_only.is_some_and(|thread| self.thread_is_remote(&thread)) {
+            self.show_toast(crate::window::sidebar_model::REMOTE_MENU_NOTE);
+            return;
+        }
         match action {
             ThreadAction::ContinueIn {
                 thread,
@@ -1363,6 +1383,7 @@ pub(super) mod tests {
             tagged: false,
             has_messages: false,
             forks: false,
+            remote: false,
             agents: vec![MenuAgent {
                 driver: Driver::Claude,
                 models: Vec::new(),

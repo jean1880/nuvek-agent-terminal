@@ -259,13 +259,18 @@ pub(super) type LinkSink = Rc<RefCell<Option<Rc<dyn Fn(agent_kit::editor::Locati
 
 /// Routes `label`'s links by `agent_kit::editor::link_action`: one that names a file on this
 /// machine (a path, a `path:line`, a local `file:` URL) goes to `links`, to be opened in the
-/// editor (with nowhere to go it opens nothing); a web or mail link is left to GTK; anything else
-/// opens nothing. So no local path ever reaches the system's handler for URIs.
+/// editor (with nowhere to go it opens nothing); a web or mail link is left to GTK when
+/// [`system_link_allowed`] says so; anything else opens nothing. So no local path ever reaches
+/// the system's handler for URIs.
 pub(super) fn route_file_links(label: &gtk4::Label, links: &LinkSink) {
     let links = Rc::clone(links);
-    label.connect_activate_link(move |_, uri| {
+    label.connect_activate_link(move |label, uri| {
         use agent_kit::editor::LinkAction;
         match agent_kit::editor::link_action(uri) {
+            // In a thread on another machine, a link the other machine wrote reaches this one's
+            // handler only when it is a plain web link (no `mailto:`, no `user@` authority, no
+            // hidden characters).
+            LinkAction::System if !system_link_allowed(label, uri) => glib::Propagation::Stop,
             LinkAction::System => glib::Propagation::Proceed,
             LinkAction::Refuse => glib::Propagation::Stop,
             LinkAction::Open(location) => {
@@ -279,8 +284,28 @@ pub(super) fn route_file_links(label: &gtk4::Label, links: &LinkSink) {
     });
 }
 
-/// Guards a label whose markup came from [`super::markdown`] outside any thread (no file to
-/// open): its file links, and every link but a web or mail one, open nothing.
+/// Whether `uri`, a link [`agent_kit::editor::link_action`] would hand the system, may go there
+/// from `label`: always in a local thread's view; in a thread on another machine
+/// ([`super::ChatView::web_links_only`]) and in any label outside a thread's view (the compare
+/// window, whose columns may be remote threads, and every other [`guard_links`] label), only
+/// [`agent_core::remote::remote_link_allowed`] links do.
+fn system_link_allowed(label: &gtk4::Label, uri: &str) -> bool {
+    let remote = label
+        .ancestor(super::ChatView::static_type())
+        .and_downcast::<super::ChatView>()
+        .map(|view| view.web_links_only());
+    system_link_allowed_for(remote, uri)
+}
+
+/// [`system_link_allowed`] once it is known whether the label's thread is remote: `None` for a
+/// label in no thread's view, which cannot tell and so is held to the remote rule.
+fn system_link_allowed_for(remote: Option<bool>, uri: &str) -> bool {
+    remote == Some(false) || agent_core::remote::remote_link_allowed(uri)
+}
+
+/// Guards a label whose markup came from [`super::markdown`] outside any thread's view (no file
+/// to open, and no telling which machine wrote it): its file links, and every link but a plain
+/// web one ([`agent_core::remote::remote_link_allowed`]), open nothing.
 pub fn guard_links(label: &gtk4::Label) {
     route_file_links(label, &Rc::default());
 }
@@ -3762,6 +3787,40 @@ pub(super) fn pattern_error(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A link the system would open: any in a local thread, only a plain web link in a thread on
+    /// another machine, whose transcript the other machine wrote.
+    #[test]
+    fn a_remote_threads_transcript_hands_the_system_only_plain_web_links() {
+        for refused in [
+            "mailto:me@example.com",
+            "https://good.example@evil.example/",
+            "https:///etc/passwd",
+            "https://exa\u{202e}mple.com",
+            "https://user:pass@example.com/",
+        ] {
+            assert!(
+                matches!(
+                    agent_kit::editor::link_action(refused),
+                    agent_kit::editor::LinkAction::System | agent_kit::editor::LinkAction::Refuse
+                ),
+                "{refused}"
+            );
+            assert!(!system_link_allowed_for(Some(true), refused), "{refused}");
+            // A label in no thread's view (the compare window, whose column may be a thread on
+            // another machine) is held to the same rule.
+            assert!(!system_link_allowed_for(None, refused), "{refused}");
+        }
+        assert!(system_link_allowed_for(
+            Some(true),
+            "https://example.com/docs"
+        ));
+        assert!(system_link_allowed_for(None, "https://example.com/docs"));
+        assert!(system_link_allowed_for(
+            Some(false),
+            "mailto:me@example.com"
+        ));
+    }
 
     fn tool(title: &str, status: super::super::model::ToolStatus) -> Body {
         Body::Tool(super::super::model::Tool {

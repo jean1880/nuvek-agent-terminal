@@ -42,6 +42,10 @@ pub(super) const SHARED_FOLDER: &str = "Both threads work in the same folder, so
 /// is not in a repository, git is busy or the snapshot fails (said in the log), and the fork
 /// then compares by transcript only.
 pub(super) async fn fork_baseline(dir: String) -> Option<ForkBaseline> {
+    // A folder on another machine has no working tree here: no baseline, never a local git.
+    if agent_core::remote::is_remote_cwd(&dir) {
+        return None;
+    }
     let taken = off_main("the fork baseline", move || {
         crate::git::take_fork_baseline(Path::new(&dir))
     })
@@ -99,6 +103,10 @@ pub(super) fn stored_baseline(store: &Store, thread: &str) -> Option<(String, St
 /// Deletes deleted fork `thread`'s baseline ref in the repository of `dir`, off the main
 /// thread, while it still points at `commit`.
 pub(super) fn drop_fork_baseline(dir: String, thread: String, commit: String) {
+    // A fork on another machine took no baseline here: no local git is run for its folder.
+    if agent_core::remote::is_remote_cwd(&dir) {
+        return;
+    }
     glib::MainContext::default().spawn_local(async move {
         let dropped = off_main("the fork baseline", move || {
             crate::git::drop_fork_baseline(Path::new(&dir), &thread, &commit)
@@ -120,6 +128,10 @@ fn read_changes(
 ) -> (Vec<ForkChanges>, bool) {
     let side = |dir: Option<&str>, base: Option<&str>, skip: &[String]| match dir {
         None => ForkChanges::Unavailable("This thread no longer exists".to_owned()),
+        // Its working tree is on another machine: never read here.
+        Some(dir) if agent_core::remote::is_remote_cwd(dir) => {
+            ForkChanges::Unavailable(agent_core::remote::NOT_ON_REMOTE.to_owned())
+        }
         Some(dir) => crate::git::fork_changes(Path::new(dir), base, skip)
             .unwrap_or_else(|e| ForkChanges::Unavailable(agent_core::redact::redact(&e))),
     };

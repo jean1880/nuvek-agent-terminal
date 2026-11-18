@@ -20,7 +20,8 @@
 //! does is the caller's. The window itself still changes nothing.
 //!
 //! What it shows is already scrubbed (the store scrubs every event and title); replies are
-//! markdown whose links open nothing but a web or mail address ([`crate::chat::view::guard_links`]).
+//! markdown whose links open nothing but a plain web address, a column on another machine
+//! included ([`crate::chat::view::guard_links`]).
 
 use std::cell::RefCell;
 use std::rc::Rc;

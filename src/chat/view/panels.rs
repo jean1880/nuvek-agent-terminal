@@ -1575,6 +1575,8 @@ pub(crate) mod tests {
             alive: true,
             capabilities: agent_core::caps::Capabilities::claude(),
             commands: Vec::new(),
+            images_refused: None,
+            remote: false,
         }
     }
 

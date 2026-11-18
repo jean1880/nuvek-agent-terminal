@@ -654,9 +654,12 @@ impl ClaudeAdapter {
 
         // Claude reports its permission mode in every `init`; a change it made itself (leaving
         // plan mode once a plan is accepted) shows here. The first one is what it was started
-        // with, which the host already knows.
+        // with, which the host already knows — unless it starts in `Bypass` on its own (such as
+        // a remote setting or wrapper forcing dangerous permissive mode), which must be reported
+        // so the host can refuse it.
         if let Some(mode) = str_of(v, "permissionMode").and_then(mode_from_name) {
-            if self.mode.is_some_and(|m| m != mode) {
+            if self.mode.is_some_and(|m| m != mode) || (self.mode.is_none() && mode == Mode::Bypass)
+            {
                 out.push(Envelope::new(Event::ModeChanged { mode }));
             }
             self.mode = Some(mode);
@@ -2212,8 +2215,14 @@ mod tests {
         assert_eq!(changed(&a.feed(&init("default"))), [Mode::Ask]);
         // A mode the picker has no entry for is not forced onto it.
         assert!(changed(&a.feed(&init("dontAsk"))).is_empty());
-        // Bypass (the dangerous permissive entry) is reported as itself.
+        // Bypass (the dangerous permissive entry) is reported as itself, including on the first
+        // init when Claude starts in it on its own.
         assert_eq!(changed(&a.feed(&init("bypassPermissions"))), [Mode::Bypass]);
+        let mut fresh = ClaudeAdapter::new();
+        assert_eq!(
+            changed(&fresh.feed(&init("bypassPermissions"))),
+            [Mode::Bypass]
+        );
         // Claude entering plan or accept-edits on its own is reported as exactly that.
         assert_eq!(changed(&a.feed(&init("plan"))), [Mode::Plan]);
         assert_eq!(changed(&a.feed(&init("acceptEdits"))), [Mode::AcceptEdits]);

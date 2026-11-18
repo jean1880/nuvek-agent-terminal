@@ -1194,7 +1194,15 @@ pub struct ThreadMenuInput {
     pub forks: bool,
     /// Only enabled (and installed) agents appear.
     pub agents: Vec<MenuAgent>,
+    /// The thread's folder is on another machine: it keeps its agent (no switch or continuing in
+    /// another), and has no local folder to open or review. Fork and Compact keep the folder.
+    pub remote: bool,
 }
+
+/// The popover tooltip of a remote thread's menu: why its greyed entries are greyed.
+pub const REMOTE_MENU_NOTE: &str = "This thread is on another machine: it keeps its agent, and \
+     has no folder here to open or review. Fork and Compact make a new thread in the same folder \
+     there.";
 
 /// The agents a menu offers: every driver `usable` accepts (see `availability`), in registry
 /// order, each with the catalogue models listed for it. A cached model list of an agent that is
@@ -1299,9 +1307,10 @@ pub fn thread_menu(input: &ThreadMenuInput) -> Vec<MenuEntry> {
         };
     let thread = input.thread.clone();
     let t = thread.clone();
+    let local = !input.remote;
     let continue_in = by_agent(
         "Continue in a new thread with…",
-        input.has_messages,
+        input.has_messages && local,
         &move |driver, model, effort| ThreadAction::ContinueIn {
             thread: t.clone(),
             driver,
@@ -1312,7 +1321,7 @@ pub fn thread_menu(input: &ThreadMenuInput) -> Vec<MenuEntry> {
     let t = thread.clone();
     let switch_to = by_agent(
         "Switch agent (stops the current turn)",
-        true,
+        local,
         &move |driver, model, effort| ThreadAction::SwitchTo {
             thread: t.clone(),
             driver,
@@ -1381,7 +1390,11 @@ pub fn thread_menu(input: &ThreadMenuInput) -> Vec<MenuEntry> {
             entries
         }),
         MenuEntry::Section(vec![
-            item("Open folder", ThreadAction::OpenFolder(thread.clone())),
+            MenuEntry::Item {
+                label: "Open folder".to_owned(),
+                action: ThreadAction::OpenFolder(thread.clone()),
+                enabled: local,
+            },
             MenuEntry::Item {
                 label: "Export…".to_owned(),
                 action: ThreadAction::Export(thread.clone()),
@@ -1390,7 +1403,7 @@ pub fn thread_menu(input: &ThreadMenuInput) -> Vec<MenuEntry> {
             MenuEntry::Item {
                 label: "Review Multi-Agent Environment…".to_owned(),
                 action: ThreadAction::ReviewEnvironment(thread.clone()),
-                enabled: !input.agents.is_empty(),
+                enabled: !input.agents.is_empty() && local,
             },
             item("Copy thread id", ThreadAction::CopyId(thread)),
         ]),
@@ -1945,7 +1958,52 @@ mod tests {
                     models: vec![model(Driver::Codex, "gpt", &[])],
                 },
             ],
+            remote: false,
         }
+    }
+
+    /// A thread on another machine greys out what needs a local folder or another agent, and
+    /// keeps Fork, Compact, Export and the rest.
+    #[test]
+    fn a_remote_threads_menu_greys_out_switching_and_its_local_folder() {
+        let remote = ThreadMenuInput {
+            remote: true,
+            ..input(true, false)
+        };
+        let menu = thread_menu(&remote);
+        for label in [
+            "Continue in a new thread with…",
+            "Switch agent (stops the current turn)",
+        ] {
+            assert!(
+                matches!(
+                    submenu(&menu, label),
+                    MenuEntry::Submenu { enabled: false, .. }
+                ),
+                "{label}"
+            );
+        }
+        let enabled = |label: &str| {
+            items(&menu)
+                .into_iter()
+                .find(|(l, _, _)| l == label)
+                .map(|(_, _, on)| on)
+                .unwrap_or_else(|| panic!("no {label}"))
+        };
+        assert!(!enabled("Open folder"));
+        assert!(!enabled("Review Multi-Agent Environment…"));
+        for kept in [
+            "Fork thread",
+            "Compact into a new thread",
+            "Export…",
+            "Rename…",
+        ] {
+            assert!(enabled(kept), "{kept}");
+        }
+        let local = thread_menu(&input(true, false));
+        assert!(items(&local)
+            .iter()
+            .any(|(l, _, on)| l == "Open folder" && *on));
     }
 
     /// Every item reachable in a submenu, depth first, as (label, action).

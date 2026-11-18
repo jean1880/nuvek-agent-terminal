@@ -609,6 +609,155 @@ struct Inner {
     continue_armed: Cell<u64>,
     /// Bumped whenever the agent works again on its own ([`ChatSession::work_epoch`]).
     work_epoch: Cell<u64>,
+    /// The folder on another machine this thread's agent runs in, through `ssh`: fixed for the
+    /// session's life. `None`: a local thread.
+    remote: Option<RemoteLaunch>,
+    /// Asked before every remote process: is its machine still listed.
+    host_check: Option<HostCheck>,
+    /// The last lines the current remote `ssh` wrote to standard error (bounded, raw; redacted
+    /// when read), for why it failed.
+    remote_stderr: RefCell<std::collections::VecDeque<String>>,
+    /// The last remote `ssh` stopped at something only a person can answer (a host key, a
+    /// password): taken once by the window, which offers a terminal page there.
+    remote_needs_terminal: Cell<bool>,
+    /// Codex permission requests of a remote session, which can only be denied: an Allow sent
+    /// for one is answered Deny.
+    remote_deny_only: RefCell<HashSet<String>>,
+    /// The thread has said that its remote agent reported dangerous permissive mode and was put
+    /// back in a safe one ([`REMOTE_BYPASS_REPORTED`]): said once a session.
+    remote_bypass_told: Cell<bool>,
+}
+
+/// What a thread on another machine starts its agent with: the folder there and what the probe
+/// found (the CLI's absolute path and a login shell's `PATH`). Every process of the session is
+/// [`agent_core::remote::ssh_chat_argv`] of these, with nothing of this machine's environment,
+/// profile or delegation binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteLaunch {
+    pub folder: agent_core::remote::RemoteFolder,
+    pub probe: agent_core::remote::RemoteProbe,
+}
+
+/// Whether a machine may be reached now: `Ok` while it is listed in Settings
+/// ([`agent_core::remote::listed`]), else why not. Asked before every process of a remote
+/// session (its first, a crash restart, an idle resume, a mode or model respawn), so removing a
+/// machine stops every later connection to it.
+pub type HostCheck = Rc<dyn Fn(&str) -> Result<(), String>>;
+
+/// The most of a remote session's `ssh` standard error kept, in lines and bytes a line: what
+/// says why ssh failed (a host key, a refused login), read once it exits.
+const REMOTE_STDERR_LINES: usize = 20;
+const REMOTE_STDERR_LINE_BYTES: usize = 512;
+
+#[cfg(test)]
+thread_local! {
+    /// The `ssh` a test's remote session runs in place of the real one (a recording fake), so
+    /// no test ever connects anywhere. Each test runs on its own thread.
+    static TEST_SSH: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// The program a remote session's `ssh` runs: `ssh` on `PATH`, or a test's fake. A test that
+/// set none gets `false`, which exits at once: no test can reach a real `ssh` by mistake.
+fn ssh_program() -> String {
+    #[cfg(test)]
+    {
+        TEST_SSH
+            .with(|ssh| ssh.borrow().clone())
+            .unwrap_or_else(|| "false".to_owned())
+    }
+    #[cfg(not(test))]
+    {
+        "ssh".to_owned()
+    }
+}
+
+/// A remote session's process: the local `ssh` running the adapter's `argv` there
+/// ([`agent_core::remote::ssh_chat_argv`], the probed CLI in place of the program), in the app's
+/// own environment minus `unset` (the configured `clear_env`) and every variable the app keeps
+/// from agents, plus nothing: no profile env file, no model provider, no key file, no approval
+/// socket, no delegation binding. No local working directory: the folder is the remote `cd`. An
+/// argv that cannot be built is empty, which refuses the spawn.
+fn remote_spec(remote: &RemoteLaunch, argv: &[String], unset: &[String]) -> SpawnSpec {
+    let args = argv.get(1..).unwrap_or_default();
+    let argv = match agent_core::remote::ssh_chat_argv(&remote.folder, &remote.probe, args) {
+        Ok(mut argv) => {
+            argv[0] = ssh_program();
+            argv
+        }
+        Err(why) => {
+            warn!(%why, "a remote agent's command line could not be built");
+            Vec::new()
+        }
+    };
+    let mut unset = unset.to_vec();
+    for name in agent_core::delegation::env::STRIP_ON_SPAWN
+        .iter()
+        .copied()
+        .chain([
+            agent_core::approval::ENV_SOCKET,
+            crate::approval_server::ENV_HOOK_BIN,
+        ])
+    {
+        if !unset.iter().any(|u| u == name) {
+            unset.push(name.to_owned());
+        }
+    }
+    SpawnSpec {
+        argv,
+        cwd: None,
+        env: Vec::new(),
+        unset,
+        key_file: Default::default(),
+    }
+}
+
+/// Which value of `event` a remote agent reported that could not go on its command line again
+/// ([`agent_core::remote::plain_arg`]): a session id or a model.
+fn remote_unplain_field(event: &Event) -> Option<&'static str> {
+    let plain = agent_core::remote::plain_arg;
+    match event {
+        Event::SessionStarted {
+            native_id, model, ..
+        } => {
+            if !plain(native_id) {
+                Some("session id")
+            } else if model.as_deref().is_some_and(|m| !plain(m)) {
+                Some("model")
+            } else {
+                None
+            }
+        }
+        Event::ModelChanged { model } if !plain(model) => Some("model"),
+        _ => None,
+    }
+}
+
+/// Why a thread on another machine refuses a switch to another agent or profile.
+pub(crate) const REMOTE_SWITCH_REFUSED: &str = "A thread on another machine keeps its agent: \
+    start a new thread there for another agent.";
+
+/// Why a thread on another machine refuses dangerous permissive mode.
+pub(crate) const REMOTE_NO_BYPASS: &str = "Dangerous permissive mode is not available for a \
+    thread on another machine: its approval cards are the only check on what it does there.";
+
+/// Said once when an agent on another machine reports it entered dangerous permissive mode on its
+/// own (its own settings there, say): the thread keeps a safe mode and tells the agent so.
+pub(crate) const REMOTE_BYPASS_REPORTED: &str = "The agent on the other machine reported \
+    dangerous permissive mode; this thread keeps a safe mode there and asked the agent to return \
+    to it.";
+
+/// The warning on a Codex permission card from another machine.
+const REMOTE_PERMISSIONS: &str = "Codex asks for these permissions on another machine, where \
+    this app cannot check what they reach, so they can only be denied.";
+
+/// Said, not stored, in place of an image an agent on another machine viewed from a file.
+const REMOTE_TOOL_IMAGE: &str = "The agent viewed an image file on the other machine; it is not \
+    shown here, since the file is there.";
+
+/// Installs the fake `ssh` every remote session this test thread starts from now on runs.
+#[cfg(test)]
+pub(crate) fn set_test_ssh(program: &str) {
+    TEST_SSH.with(|ssh| *ssh.borrow_mut() = Some(program.to_owned()));
 }
 
 /// The one continuation a busy switch sends its new process, once two things are true, in
@@ -927,11 +1076,57 @@ impl ChatSession {
         )
     }
 
+    /// A thread on another machine: its agent runs there through `ssh`
+    /// ([`RemoteLaunch`]). No approval socket, no delegation hooks, no environment of this
+    /// machine's but `env.unset` (what the local `ssh` must not inherit). Claude and Codex only:
+    /// any other agent is refused with its reason, and nothing starts. `listed` is asked before
+    /// every process: a machine no longer listed is refused, never connected to.
+    #[allow(clippy::too_many_arguments)] // the session's parts, plus where and whether to go
+    pub fn remote(
+        adapter: Box<dyn Adapter>,
+        open: OpenSession,
+        store: impl Into<SessionStore>,
+        thread: ThreadId,
+        sink: EnvelopeSink,
+        env: LaunchEnv,
+        remote: RemoteLaunch,
+        listed: HostCheck,
+    ) -> Rc<Self> {
+        Self::build_with(
+            adapter,
+            open,
+            store.into(),
+            thread,
+            sink,
+            Err(None),
+            env,
+            SessionOptions::default(),
+            Some((remote, listed)),
+        )
+    }
+
+    /// Takes whether the last remote `ssh` stopped at a host key or a login only a terminal page
+    /// there can answer, with the machine and folder to open one on.
+    pub fn take_remote_needs_terminal(&self) -> Option<(String, String)> {
+        let remote = self.inner.remote.as_ref()?;
+        self.inner.remote_needs_terminal.replace(false).then(|| {
+            (
+                remote.folder.alias().to_owned(),
+                remote.folder.dir().to_owned(),
+            )
+        })
+    }
+
+    /// Whether this session's agent runs on another machine.
+    pub fn is_remote(&self) -> bool {
+        self.inner.remote.is_some()
+    }
+
     /// [`Self::with_env`] with delegation options installed before the first process starts.
     #[allow(clippy::too_many_arguments)] // `with_env`'s seven, plus the options
     fn build(
-        mut adapter: Box<dyn Adapter>,
-        mut open: OpenSession,
+        adapter: Box<dyn Adapter>,
+        open: OpenSession,
         store: SessionStore,
         thread: ThreadId,
         sink: EnvelopeSink,
@@ -939,11 +1134,49 @@ impl ChatSession {
         env: LaunchEnv,
         opts: SessionOptions,
     ) -> Rc<Self> {
+        Self::build_with(
+            adapter, open, store, thread, sink, approval, env, opts, None,
+        )
+    }
+
+    /// [`Self::build`], on another machine when `remote` is given.
+    #[allow(clippy::too_many_arguments)] // `build`'s eight, plus the remote folder
+    fn build_with(
+        mut adapter: Box<dyn Adapter>,
+        mut open: OpenSession,
+        store: SessionStore,
+        thread: ThreadId,
+        sink: EnvelopeSink,
+        approval: Approval,
+        env: LaunchEnv,
+        mut opts: SessionOptions,
+        remote: Option<(RemoteLaunch, HostCheck)>,
+    ) -> Rc<Self> {
+        let (remote, host_check) = match remote {
+            Some((remote, check)) => (Some(remote), Some(check)),
+            None => (None, None),
+        };
         let SessionStore {
             handle: store,
             provider: known_provider,
         } = store;
         let driver = adapter.driver();
+        // A remote agent's refusal (agy, the Local agent) stops it here, before any process.
+        let remote_refused = remote
+            .as_ref()
+            .and_then(|_| agent_core::remote::chat_cli(driver).err());
+        let approval = if remote.is_some() {
+            // Sub-agents run on this machine and an approval socket is this machine's: a remote
+            // thread is never a delegation root and never has a socket.
+            opts.hooks = None;
+            opts.child = None;
+            // The adapter's cwd would reach Codex's requests as a path there: the process
+            // starts in the folder instead (`cd --` in its command line).
+            open.cwd = String::new();
+            Err(None)
+        } else {
+            approval
+        };
         let (approval, unbound) = match approval {
             Ok(handle) => (Some(handle), None),
             Err(reason) => (None, reason),
@@ -1123,8 +1356,18 @@ impl ChatSession {
             continue_on_switch_to: Cell::new(None),
             continue_armed: Cell::new(0),
             work_epoch: Cell::new(0),
+            remote,
+            host_check,
+            remote_stderr: RefCell::default(),
+            remote_needs_terminal: Cell::new(false),
+            remote_deny_only: RefCell::default(),
+            remote_bypass_told: Cell::new(false),
         });
         *inner.weak_self.borrow_mut() = Some(Rc::downgrade(&inner));
+        if remote_refused.is_some() {
+            // Said by `start_process`, which refuses it at every start.
+            warn!("a thread on another machine refused its agent");
+        }
         inner.attach_approval();
         // Hookless agy runs forced into dangerous permissive mode: said every time the thread
         // opens on it, whatever its mode, since nothing asks before it acts.
@@ -1339,6 +1582,8 @@ impl ChatSession {
     /// thread to the replacement first, through the ordinary same-agent switch, and says so. A
     /// switch the user makes meanwhile replaces the whole question.
     pub fn set_retired(&self, retired: Option<RetiredModel>) {
+        // Judged by this machine's model list: never applied to an agent on another machine.
+        let retired = retired.filter(|_| self.inner.remote.is_none());
         *self.inner.retired.borrow_mut() = retired;
     }
 
@@ -1536,10 +1781,58 @@ impl Inner {
     }
 
     /// Persists (under the current provider thread), updates the status, then delivers.
-    fn emit(&self, env: Envelope) {
+    fn emit(&self, mut env: Envelope) {
+        // An agent on another machine never runs in dangerous permissive mode here, whatever it
+        // reports: the session keeps its safe mode (so no card is ever auto-answered and no
+        // respawn carries it), says so once, and tells the agent that mode once its handlers
+        // have returned.
+        if self.remote.is_some() && matches!(env.event, Event::ModeChanged { mode: Mode::Bypass }) {
+            let safe = self.safe_mode.get().session_safe();
+            warn!("the remote agent reported dangerous permissive mode; kept in a safe mode");
+            env.event = Event::ModeChanged { mode: safe };
+            if !self.remote_bypass_told.replace(true) {
+                self.notice(REMOTE_BYPASS_REPORTED);
+            }
+            let weak = self.weak_self.borrow().clone();
+            glib::spawn_future_local(async move {
+                if let Some(inner) = weak.and_then(|w| w.upgrade()) {
+                    if inner.proc.borrow().is_some() {
+                        inner.command(Command::SetMode { mode: safe });
+                    }
+                }
+            });
+        }
         if let Event::ToolImage { image } = env.event {
+            // A path from an agent on another machine names a file there: never read here (it
+            // would read whatever this machine has at that path).
+            if self.remote.is_some()
+                && matches!(image, agent_core::attachment::ToolImageSource::File { .. })
+            {
+                self.deliver(&Envelope::new(Event::Notice {
+                    text: REMOTE_TOOL_IMAGE.to_owned(),
+                }));
+                return;
+            }
             self.store_tool_image(env.item, image);
             return;
+        }
+        // A session id or model the other machine reported goes back on its command line at the
+        // next start: one with a control, bidi or invisible character (a NUL above all) is
+        // refused here, never stored, so no later start can carry it.
+        if self.remote.is_some() {
+            if let Some(field) = remote_unplain_field(&env.event) {
+                warn!(
+                    field,
+                    "the remote agent reported a value that cannot be kept"
+                );
+                self.deliver(&Envelope::new(Event::Error {
+                    message: format!(
+                        "The agent on the other machine reported a {field} holding a control or \
+                         invisible character; it was not kept."
+                    ),
+                }));
+                return;
+            }
         }
         let env = self.stamp_turn(env);
         if matches!(env.event, Event::TurnStarted { .. }) {
@@ -2165,6 +2458,14 @@ impl Inner {
     // ---- process ----
 
     fn launch_spec(&self) -> SpawnSpec {
+        // An agent on another machine starts in a safe mode, whatever led here (`set_mode`
+        // refuses Bypass; this is the floor for every respawn).
+        if self.remote.is_some() && self.open.borrow().mode == Mode::Bypass {
+            let safe = self.safe_mode.get().session_safe();
+            self.open.borrow_mut().mode = safe;
+            self.state.borrow_mut().mode = safe;
+            self.wanted_mode.set(safe);
+        }
         // One source for the hook flag and the socket env var: both come from `approval`.
         let approval = self.approval();
         self.open.borrow_mut().approval_hook = approval.is_some();
@@ -2202,7 +2503,9 @@ impl Inner {
         agent_core::provider::bind_thread_model_args(&mut argv, open.model.as_deref());
         // Claude shares its thinking only with this hidden flag, so it goes only to a
         // version known to take it (`claude_probe`), and never after the one retry without it.
+        // (Never to a remote one: the version probed is this machine's.)
         let thinking = self.adapter.borrow().driver() == Driver::Claude
+            && self.remote.is_none()
             && !self.thinking.retried.get()
             && crate::claude_probe::thinking_display_allowed(&open.program);
         if thinking {
@@ -2218,6 +2521,9 @@ impl Inner {
             argv.extend(binding.argv_tail.iter().cloned());
         }
         let launch = self.launch_env.borrow();
+        if let Some(remote) = &self.remote {
+            return remote_spec(remote, &argv, &launch.unset);
+        }
         // The profile's environment first, so it can never override the approval socket or the
         // delegation binding.
         let mut env = launch.env.clone();
@@ -2263,6 +2569,16 @@ impl Inner {
     /// since. Meanwhile the session is starting (alive, no process) and writes to it are held.
     /// A failed proof starts it hookless instead.
     fn start_process(self: &Rc<Self>) {
+        // An agent that cannot run on another machine (agy, the Local agent) never starts there.
+        // Nor on a machine no longer listed in Settings: asked at every start (the first, a
+        // crash restart, an idle resume, a mode or model respawn, a reload).
+        if let Err(why) = self.remote_start_allowed() {
+            self.error(why);
+            return;
+        }
+        // A new `ssh`: only what it writes says why it fails.
+        self.remote_stderr.borrow_mut().clear();
+        self.remote_needs_terminal.set(false);
         self.end_pending_switch();
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
@@ -2846,6 +3162,17 @@ impl Inner {
         if generation != self.generation.get() {
             return;
         }
+        // A remote session's ssh writes why it failed to stderr: its last lines are kept,
+        // bounded, for its exit.
+        if stderr && self.remote.is_some() {
+            let mut tail = self.remote_stderr.borrow_mut();
+            if tail.len() == REMOTE_STDERR_LINES {
+                tail.pop_front();
+            }
+            tail.push_back(
+                agent_core::text::truncate_bytes(line, REMOTE_STDERR_LINE_BYTES).to_owned(),
+            );
+        }
         // Every raw line, in arrival order, before agy's hold (read-back; memory only).
         if let Some(hooks) = &self.hooks {
             hooks.line(
@@ -3014,7 +3341,11 @@ impl Inner {
                     self.thinking.init_seen.set(true);
                     self.pre_init_prompts.borrow_mut().clear();
                 }
-                if let Some(version) = agent_core::claude::session_version(&frame) {
+                // A remote Claude's version is the other machine's: never recorded against a
+                // program name this machine's probe keys on.
+                if let Some(version) =
+                    agent_core::claude::session_version(&frame).filter(|_| self.remote.is_none())
+                {
                     crate::claude_probe::note_version(&self.open.borrow().program, version);
                 }
             }
@@ -3270,6 +3601,19 @@ impl Inner {
     fn gate_approval(&self, mut env: Envelope) -> (Envelope, bool) {
         let driver = self.adapter.borrow().driver();
         if driver == Driver::Agy {
+            return (env, false);
+        }
+        // A call on another machine: rules are judged against this machine's files, so none is
+        // offered, recorded or applied, and nothing answers the card but the user (Allow once or
+        // Deny), whatever the mode. A Codex permission request included.
+        if self.remote.is_some() {
+            if let Event::ApprovalRequested {
+                options, remembers, ..
+            } = &mut env.event
+            {
+                agent_core::remote::approval_options(options);
+                *remembers = None;
+            }
             return (env, false);
         }
         // A Codex permission request is never matched, answered or remembered by a rule.
@@ -3683,11 +4027,44 @@ impl Inner {
             return;
         }
         let attempt = self.crash_restarts.get();
+        // ssh's own failure (255) on a remote thread is the machine out of reach, not the agent:
+        // said with ssh's reason (redacted, bounded). One only a person can answer (a host key,
+        // a password) is never tried again unasked: the window offers a terminal page there.
+        let unreachable = match self
+            .remote
+            .as_ref()
+            .filter(|_| agent_core::remote::ssh_failed(code))
+        {
+            Some(remote) => {
+                let stderr: Vec<String> = self.remote_stderr.borrow().iter().cloned().collect();
+                let failure = agent_core::remote::batch_failure(code, &stderr.join("\n"));
+                let why = format!(
+                    "{} {}.",
+                    agent_core::remote::unreachable_notice(remote.folder.alias()),
+                    failure.reason.trim_end_matches('.')
+                );
+                if failure.needs_terminal {
+                    self.remote_needs_terminal.set(true);
+                    self.error(format!(
+                        "{why} Accept its key or sign in in a terminal page there, then send a \
+                         message to try again."
+                    ));
+                    return;
+                }
+                Some(why)
+            }
+            None => None,
+        };
         let Some(&delay) = DELAYS.get(attempt as usize) else {
-            self.error(
-                "The agent keeps exiting with an error, so it was not started again. Send a \
-                 message to start it.",
-            );
+            match &unreachable {
+                Some(why) => self.error(format!(
+                    "{why} It was not tried again; send a message to try again."
+                )),
+                None => self.error(
+                    "The agent keeps exiting with an error, so it was not started again. Send \
+                     a message to start it.",
+                ),
+            }
             return;
         };
         self.crash_restarts.set(attempt + 1);
@@ -3699,10 +4076,13 @@ impl Inner {
         );
         // Read before anything is said: a sink may start or stop something meanwhile.
         let generation = self.generation.get();
-        self.notice(format!(
-            "The agent exited unexpectedly (code {}); starting it again in {delay} s.",
-            code.unwrap_or_default()
-        ));
+        self.notice(match unreachable {
+            Some(why) => format!("{why} Trying again in {delay} s."),
+            None => format!(
+                "The agent exited unexpectedly (code {}); starting it again in {delay} s.",
+                code.unwrap_or_default()
+            ),
+        });
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             glib::timeout_future(Duration::from_secs(delay)).await;
@@ -4408,6 +4788,15 @@ impl Inner {
 
     fn steer_input(self: &Rc<Self>, input: &PromptInput) {
         let text = input.text.as_str();
+        // Images an agent on another machine would read from this machine's paths: refused
+        // mid-turn as at a turn's start, never steered in.
+        if !input.images.is_empty() {
+            let driver = self.adapter.borrow().driver();
+            if let Some(why) = self.remote_images_refused(driver) {
+                self.error(why);
+                return;
+            }
+        }
         self.continue_on_switch_to.set(None);
         // A switch waiting to read the thread: the message is for its new agent, never a live
         // write into the outgoing one. It queues (and is held if the switch does not happen).
@@ -4680,6 +5069,15 @@ impl Inner {
         handoff: Option<Handoff>,
         images: &[PromptImage],
     ) -> bool {
+        // Images to an agent that would read them from a path on another machine: refused, never
+        // sent as this machine's paths (the composer keeps them back already; this is the floor).
+        if !images.is_empty() {
+            let driver = self.adapter.borrow().driver();
+            if let Some(why) = self.remote_images_refused(driver) {
+                self.error(why);
+                return false;
+            }
+        }
         // A new prompt: an earlier interrupt no longer explains an exit.
         self.interrupted.set(false);
         // New Local settings first: their restart is a planned rotation for a delegation root,
@@ -4874,7 +5272,7 @@ impl Inner {
     /// every message behind it. The user is told once; Up takes it back, and a switch to an
     /// agent that takes images sends it.
     fn next_sendable_queued(&self) -> Option<QueuedPrompt> {
-        let takes_images = self.adapter.borrow().capabilities().image_input;
+        let takes_images = self.takes_images();
         let at = {
             let queue = self.queued_prompts.borrow();
             let at = queue
@@ -4891,7 +5289,11 @@ impl Inner {
                 .filter(|id| self.image_waits_told.borrow_mut().insert(id.clone()))
                 .collect();
             if !fresh.is_empty() {
-                let agent = self.adapter.borrow().driver().info().label;
+                let driver = self.adapter.borrow().driver();
+                let agent = match self.remote_images_refused(driver) {
+                    Some(_) => format!("{} on another machine", driver.info().label),
+                    None => driver.info().label.to_owned(),
+                };
                 self.emit(Envelope::new(Event::Notice {
                     text: format!(
                         "{agent} can't take images, so {} waiting with images {} not sent. \
@@ -4987,6 +5389,22 @@ impl Inner {
     ) {
         // Recheck inherited authority before every provider-specific answer path.
         let decision = self.child_answer(request, decision);
+        // A Codex permission request from another machine can only be denied (or its turn
+        // stopped), whatever answer came.
+        let decision =
+            if self.remote_deny_only.borrow_mut().remove(request) && decision != Decision::Cancel {
+                Decision::Deny
+            } else {
+                decision
+            };
+        // On another machine an answer keeps no rule, whatever asked for one: it is allowed once.
+        let (decision, custom_rule) = match decision {
+            Decision::AllowForSession | Decision::AllowAlways if self.remote.is_some() => {
+                (Decision::Allow, None)
+            }
+            _ if self.remote.is_some() => (decision, None),
+            _ => (decision, custom_rule),
+        };
         if self.adapter.borrow().driver() == Driver::Local
             && self
                 .approval_inputs
@@ -5178,6 +5596,12 @@ impl Inner {
     }
 
     fn set_mode(self: &Rc<Self>, mode: Mode) {
+        // An agent on another machine never runs in dangerous permissive mode: nothing on this
+        // machine could see or bound what it does there, and its cards are the only gate.
+        if self.remote.is_some() && mode == Mode::Bypass {
+            self.refuse_mode(REMOTE_NO_BYPASS, true);
+            return;
+        }
         // A supervised child runs within its fixed task mode, and never in dangerous permissive
         // mode, whoever asks.
         if let Some(child) = &self.child {
@@ -5376,6 +5800,14 @@ impl Inner {
     fn switch(self: &Rc<Self>, driver: Driver, model: Option<String>, effort: Option<String>) {
         // Another profile (`switch_to`): a new process there, whatever the agent.
         let target = self.switch_target.borrow_mut().take();
+        // An agent on another machine is never switched to another agent or profile: the probe
+        // found its own CLI there, and a profile's environment and model server are this
+        // machine's. Refused before anything stops; a model on its own agent goes on below.
+        if self.remote.is_some() && (target.is_some() || driver != self.adapter.borrow().driver()) {
+            self.continue_on_switch_to.set(None);
+            self.notice(REMOTE_SWITCH_REFUSED);
+            return;
+        }
         // The latest choice wins over a switch still reading the thread, and over the
         // continuation an earlier switch still owes.
         self.end_pending_switch();
@@ -6141,6 +6573,34 @@ impl Inner {
         self.announce_failed_switch();
     }
 
+    /// Whether a process may start now for a remote session (always for a local one): its agent
+    /// is Claude or Codex and its machine is still listed.
+    fn remote_start_allowed(&self) -> Result<(), String> {
+        let Some(remote) = &self.remote else {
+            return Ok(());
+        };
+        let driver = self.adapter.borrow().driver();
+        agent_core::remote::chat_cli(driver)?;
+        match &self.host_check {
+            Some(listed) => listed(remote.folder.alias()),
+            None => Err("This thread's machine could not be checked against Settings.".to_owned()),
+        }
+    }
+
+    /// Why `driver` here takes no images although it can: Codex on another machine.
+    fn remote_images_refused(&self, driver: Driver) -> Option<&'static str> {
+        self.remote
+            .as_ref()
+            .and_then(|_| agent_core::remote::takes_images(driver).err())
+    }
+
+    /// Whether a prompt with images may go to the running agent.
+    fn takes_images(&self) -> bool {
+        let driver = self.adapter.borrow().driver();
+        self.adapter.borrow().capabilities().image_input
+            && self.remote_images_refused(driver).is_none()
+    }
+
     fn status(&self) -> SessionStatus {
         let hookless = self.ask_unavailable();
         let adapter = self.adapter.borrow();
@@ -6149,7 +6609,13 @@ impl Inner {
         if hookless {
             capabilities.live_approvals = false;
         }
+        let images_refused = self.remote_images_refused(adapter.driver());
+        if images_refused.is_some() {
+            capabilities.image_input = false;
+        }
         SessionStatus {
+            images_refused,
+            remote: self.remote.is_some(),
             driver: adapter.driver(),
             model: state.model.clone(),
             pending_model: self
@@ -6275,6 +6741,16 @@ impl Inner {
         };
         if tool != agent_core::codex::PERMISSIONS_TOOL {
             return Some(env);
+        }
+        // Its targets are paths on another machine, which this one cannot check: it can only
+        // be denied (the remote gate then keeps Deny alone).
+        if self.remote.is_some() {
+            // Recorded, so an answer other than Deny or Stop (sent by anything but the card) is
+            // still answered Deny.
+            if let Some(request) = &env.request {
+                self.remote_deny_only.borrow_mut().insert(request.clone());
+            }
+            return Some(Self::deny_only(env, Some(REMOTE_PERMISSIONS.to_owned())));
         }
         let Some(request) = env.request.clone() else {
             return Some(Self::deny_only(env, None));
@@ -7556,6 +8032,7 @@ mod tests {
     mod continuation_tests;
     mod delegated_tests;
     mod handoff_tests;
+    mod remote_tests;
     mod switch_tests;
     mod teardown_tests;
 

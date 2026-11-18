@@ -37,11 +37,34 @@ pub fn run_command_in_group(
     run(cmd, name, timeout_secs, true, None)
 }
 
+/// [`run_command_in_group`] keeping at most `cap` bytes of each of stdout and stderr: what comes
+/// after is read and dropped, so a command that prints without end costs its timeout, never
+/// memory. For output another machine controls.
+pub fn run_command_in_group_capped(
+    cmd: std::process::Command,
+    name: &str,
+    timeout_secs: u64,
+    cap: usize,
+) -> Result<std::process::Output, String> {
+    run_capped(cmd, name, timeout_secs, true, cap, None)
+}
+
 fn run(
+    cmd: std::process::Command,
+    name: &str,
+    timeout_secs: u64,
+    group: bool,
+    input: Option<Vec<u8>>,
+) -> Result<std::process::Output, String> {
+    run_capped(cmd, name, timeout_secs, group, usize::MAX, input)
+}
+
+fn run_capped(
     mut cmd: std::process::Command,
     name: &str,
     timeout_secs: u64,
     group: bool,
+    cap: usize,
     input: Option<Vec<u8>>,
 ) -> Result<std::process::Output, String> {
     use std::io::{Read, Write};
@@ -134,7 +157,8 @@ fn run(
                         Ok(_) if stop.load(Ordering::Relaxed) => break,
                         Ok(n) => {
                             if let Ok(mut bytes) = sink.lock() {
-                                bytes.extend_from_slice(&chunk[..n]);
+                                let room = cap.saturating_sub(bytes.len()).min(n);
+                                bytes.extend_from_slice(&chunk[..room]);
                             }
                         }
                     }
@@ -227,6 +251,21 @@ mod tests {
                 LIVE_DRAINS.fetch_sub(1, Ordering::SeqCst);
             }
         }
+    }
+
+    /// Output past the cap is read and dropped: the command is not blocked, and the bytes kept
+    /// are the first ones.
+    #[test]
+    fn a_capped_run_keeps_only_the_first_bytes() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(
+            "i=0; while [ $i -lt 2000 ]; do printf 'abcdefghij'; i=$((i+1)); done; echo done >&2",
+        );
+        let out = run_command_in_group_capped(cmd, "capped", 10, 1000).unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout.len(), 1000);
+        assert!(out.stdout.starts_with(b"abcdefghij"));
+        assert_eq!(out.stderr, b"done\n");
     }
 
     /// Kills the holder when the test ends, however it ends.

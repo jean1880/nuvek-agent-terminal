@@ -492,11 +492,29 @@ pub(crate) const GLOBAL_CSS: &str = "
             padding: 10px;
         }
         /* Font sizes are relative (to 11pt text: 24pt is 218%), so the app's text scale, set
-           on every window (`style::set_text_scale`), reaches them. */
+           on every window (`style::set_text_scale`), reaches them. Libadwaita 1.5 (Ubuntu 24.04)
+           also sets its typography classes in pt, which would block the window's percentage scale;
+           relative sizes here let the scale reach every label on 1.5 too. */
         .title-1 {
             font-size: 218%;
             font-weight: bold;
             color: @at_accent;
+        }
+        .title-2, .title-3 {
+            font-size: 136%;
+        }
+        .title-4 {
+            font-size: 118%;
+        }
+        .caption, .caption-heading {
+            font-size: 82%;
+        }
+        statuspage > scrolledwindow > viewport > box > clamp > box > .title {
+            font-size: 181%;
+        }
+        statuspage.compact > scrolledwindow > viewport > box > clamp > box > .title,
+        statuspage.spinner > scrolledwindow > viewport > box > clamp > box > .title {
+            font-size: 136%;
         }
         .command-text {
             font-family: monospace;

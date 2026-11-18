@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 mod fork;
 pub use fork::{
     drop_fork_baseline, fork_changes, fork_ref, is_fork_ref, keep_fork_baseline,
-    lay_in_fork_worktree, take_fork_baseline, BaselineOutcome, ForkBaseline, ForkChanges,
+    lay_in_fork_worktree, take_fork_baseline, BaselineOutcome, ForkBaseline, ForkChanges, LaidIn,
     FORK_REF_ROOT,
 };
 

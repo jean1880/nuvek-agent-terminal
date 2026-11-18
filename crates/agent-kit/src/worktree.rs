@@ -358,6 +358,15 @@ pub fn removal_blocker(info: &WorktreeInfo) -> Option<String> {
     }
 }
 
+/// Whether any of `dirs` (the open tabs' folders, say) is `root` or inside it, every link
+/// resolved on both sides (a folder that cannot be resolved is compared as it is). Blocking: it
+/// asks the filesystem; run it off the main thread, in the same step as what it guards.
+pub fn any_inside(dirs: &[PathBuf], root: &Path) -> bool {
+    let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let root = canonical(root);
+    dirs.iter().any(|dir| canonical(dir).starts_with(&root))
+}
+
 /// Where a fork in its own worktree goes ([`plan_fork`]), shown before it is made
 /// ([`add_fork`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -442,12 +451,12 @@ pub struct ForkWorktree {
 /// Makes the worktree `plan` names for a fork of the thread in `source`. The source must still be
 /// at the HEAD commit and branch planned (else refused, nothing made); a branch name taken since
 /// is planned again once (the next free name). Then a snapshot of the source's working tree is
-/// taken as the fork's baseline ([`crate::git::take_fork_baseline`]: tracked changes and untracked
-/// files, less secret-looking, oversized and nested ones; the user's index, HEAD, working tree and
-/// stash untouched), [`add`] puts the new branch at the source's HEAD commit in a new worktree,
-/// and the snapshot is laid in as uncommitted changes only
-/// ([`crate::git::lay_in_fork_worktree`]), so the fork starts with the source's uncommitted work
-/// and nothing the app made lands on the branch. Blocking.
+/// taken ([`crate::git::take_fork_baseline`]: tracked changes and untracked files, less
+/// secret-looking, oversized and nested ones; the user's index, HEAD, working tree and stash
+/// untouched), [`add`] puts the new branch at the source's HEAD commit in a new worktree, and the
+/// snapshot is laid in as uncommitted changes only ([`crate::git::lay_in_fork_worktree`]), so the
+/// fork starts with the source's uncommitted work and nothing the app made lands on the branch.
+/// The returned baseline is the tree laid in and its commit, never the raw snapshot. Blocking.
 pub fn add_fork(source: &Path, plan: &ForkPlan) -> Result<ForkWorktree, String> {
     let repo = crate::git::discover(source)?
         .ok_or("The thread's folder is no longer in a git repository")?;
@@ -479,15 +488,19 @@ pub fn add_fork(source: &Path, plan: &ForkPlan) -> Result<ForkWorktree, String> 
         }
     };
     add(&plan.main_toplevel, &branch, &path, &plan.head)?;
-    let from_head =
-        crate::git::lay_in_fork_worktree(source, &path, &baseline.tree).map_err(|e| {
-            format!(
-                "The worktree {} was made on branch {branch}, but the thread's uncommitted work \
-                 could not be copied into it: {e}. It holds the branch's commit only; remove it \
-                 with `git worktree remove` if you do not want it.",
-                path.display()
-            )
-        })?;
+    let laid = crate::git::lay_in_fork_worktree(source, &path, &baseline.tree).map_err(|e| {
+        format!(
+            "The worktree {} was made on branch {branch}, but {e}. Look at it with `git status` \
+             there before you use it or remove it.",
+            path.display()
+        )
+    })?;
+    // The baseline is what was laid in, not the raw snapshot: the fork's changes are compared
+    // against what it started with, and its ref keeps no file that was not copied.
+    let mut baseline = baseline;
+    baseline.tree = laid.tree;
+    baseline.commit = laid.commit;
+    let from_head = laid.from_head;
     // The fork works where the source did: the same folder inside the new worktree, when the
     // snapshot has it.
     let inner = source
@@ -731,6 +744,34 @@ mod tests {
             .filter(|r| !r.starts_with("refs/heads/") && *r != "refs/stash")
             .collect();
         assert_eq!(ours, [format!("refs/agent-terminal/fork/{thread}")]);
+        // The baseline is what was laid in: a fresh fork shows no change against it, and what
+        // its ref keeps holds HEAD's content where the fork took it, never the source's secret.
+        match crate::git::fork_changes(wt, Some(&fork.baseline.tree)).unwrap() {
+            crate::git::ForkChanges::Ready { diff, .. } => assert!(
+                diff.stats.is_empty(),
+                "a fresh fork changed nothing: {:?}",
+                diff.stats
+            ),
+            other => panic!("expected changes, got {other:?}"),
+        }
+        let pinned = format!("refs/agent-terminal/fork/{thread}");
+        assert_eq!(
+            sh(&main, &["show", &format!("{pinned}:.env")]),
+            "TOKEN=committed"
+        );
+        assert_eq!(
+            sh(&main, &["show", &format!("{pinned}:cert.pem")]),
+            "committed cert"
+        );
+        let pinned_files = sh(&main, &["ls-tree", "-r", "--name-only", &pinned]);
+        assert!(
+            !pinned_files.lines().any(|f| f == "deploy.key"),
+            "{pinned_files}"
+        );
+        assert!(
+            pinned_files.lines().any(|f| f == "new.txt"),
+            "the work it did copy is there: {pinned_files}"
+        );
         // The next plan for the same title takes the next number.
         let next = plan_fork(&main, "Try the --other way", None).unwrap();
         assert_eq!(next.branch, "fork/try-the-other-way-2");
@@ -748,6 +789,80 @@ mod tests {
         assert!(err.contains("moved"), "{err}");
         assert!(!stale.path.exists());
         assert!(check_new_branch(&main, &stale.branch).is_ok());
+    }
+
+    /// A submodule (a gitlink) the source hides from git keeps HEAD's entry in the fork, never
+    /// dropped: the fork shows no change to it.
+    #[test]
+    fn fork_worktree_keeps_a_hidden_submodule_as_head_has_it() {
+        use crate::test_support::{git as sh, git_or_skip, init_repo_at};
+        if !git_or_skip() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("work/main");
+        std::fs::create_dir_all(&main).unwrap();
+        init_repo_at(&main, &[("a.txt", b"a\n")]);
+        let main = main.canonicalize().unwrap();
+        let pinned = sh(&main, &["rev-parse", "HEAD"]);
+        for (module, flag) in [
+            ("mod-sparse", "--skip-worktree"),
+            ("mod-assumed", "--assume-unchanged"),
+        ] {
+            sh(
+                &main,
+                &[
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("160000,{pinned},{module}"),
+                ],
+            );
+            std::fs::create_dir_all(main.join(module)).unwrap();
+            sh(&main, &["commit", "-q", "-m", module]);
+            sh(&main, &["update-index", flag, module]);
+        }
+        std::fs::write(main.join("a.txt"), "work\n").unwrap();
+        let plan = plan_fork(&main, "modules", None).unwrap();
+        let fork = add_fork(&main, &plan).unwrap();
+        let wt = &fork.info.path;
+        for module in ["mod-sparse", "mod-assumed"] {
+            assert!(
+                fork.from_head.iter().any(|p| p == module),
+                "{:?}",
+                fork.from_head
+            );
+            assert_eq!(
+                sh(wt, &["ls-tree", &fork.baseline.tree, module]),
+                format!("160000 commit {pinned}\t{module}"),
+                "HEAD's gitlink, kept"
+            );
+        }
+        let status = sh(wt, &["status", "--porcelain"]);
+        assert!(
+            !status.contains("mod-"),
+            "no change to a submodule: {status}"
+        );
+        assert!(status.contains("a.txt"), "{status}");
+    }
+
+    #[test]
+    fn a_folder_is_inside_a_worktree_through_a_link_and_beside_it_is_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("wt");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        let beside = tmp.path().join("wt-beside");
+        std::fs::create_dir_all(&beside).unwrap();
+        assert!(any_inside(&[root.join("sub")], &root));
+        assert!(any_inside(&[link.join("sub")], &root), "through a link");
+        assert!(
+            any_inside(std::slice::from_ref(&root), &link),
+            "the root through a link"
+        );
+        assert!(!any_inside(&[beside], &root));
+        assert!(!any_inside(&[], &root));
     }
 
     #[test]

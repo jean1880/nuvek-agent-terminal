@@ -123,8 +123,10 @@ Architectural mandates, standards, and workflows for this codebase.
     `lay_in_fork_worktree` lays a baseline's tree into a fresh fork worktree as uncommitted
     changes only, `read-tree -u --reset` then `reset -q` there, the paths whose names look like
     secrets and those the source's index marks assume-unchanged or skip-worktree taking HEAD's
-    content through a private index, so nothing of the app's lands on a branch and no such file
-    is copied), `diff` (diff bases, numstat, line classification,
+    content (a submodule's gitlink too) through a private index with the snapshot's config
+    overrides, so nothing of the app's lands on a branch and no such file is copied; what it
+    laid in, recorded as a commit (`LaidIn`), is the fork's baseline and what its ref keeps,
+    never the raw snapshot), `diff` (diff bases, numstat, line classification,
     truncation, the hunk line map, a selection's comment span and a comment's anchor in a
     later diff: exact, moved once, or gone, never a guess; `card_files`/`card_comment_span`, a
     file-change card's diff of several files cut by its headers, one file a comment, and an
@@ -306,14 +308,20 @@ Architectural mandates, standards, and workflows for this codebase.
     which plan the worktree off the main thread, ask, then fork into it as a worktree thread,
     taking the snapshot whatever the checkpoint setting, while plain `/fork` forks in place as
     before, a failure after the worktree is made naming the worktree and branch left behind
-    (`NewThread::left_behind`, logged too); and Keep This One: both buttons disabled at the
+    (`NewThread::left_behind`, a `LeftBehind` guard: said with every failure shown and logged
+    by any path that drops it before the thread opens); and Keep This One: both buttons disabled
+    at the click (a `Reread` guard reads the window again on every path, a declined stop question
+    included), the
     click, a confirmation over the compare window, Cancel the default, `Store::keep_fork` (a
     refusal said and the pair read again), the other thread's page closed only once that has
     landed, Undo (`KeepDone`), and the clean-only removal of the archived thread's worktree,
     offered only when no other thread and no open tab is in it and `removal_blocker` finds
     nothing, else a toast saying why, taken back by Undo whether shown or not; its Remove
-    (`remove_kept_worktree`) checks the tabs, then in one `store_job` that the thread is still
-    archived, `worktree_occupant`, `removal_blocker` and only then `remove`; it never merges),
+    (`remove_kept_worktree`) checks, in one `store_job`, the open tabs' folders resolved
+    (`worktree::any_inside`), that the thread is still archived, `worktree_occupant`,
+    `removal_blocker` and only then `remove`; the page Keep closes (`close_row_for_keep`) makes
+    no offer of its own, and the generic Remove of a closed worktree tab checks the tabs,
+    `worktree_occupant` and `removal_blocker` the same way; it never merges),
     `window/diff_panel.rs` (the
     diff panel's widgets, its file tick boxes, "Commit…", "Open a PR" and "Merge into …" bars;
     it pops out into

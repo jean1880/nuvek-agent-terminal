@@ -221,8 +221,8 @@ impl SettleRefused {
             }
             Self::Settled => "One of these two threads was kept over the other already",
             Self::LinkHoldsAnotherPair => {
-                "This fork was already kept over, or kept over, another thread; its record is \
-                 not replaced"
+                "One of these forks already records a choice made with another thread, and that \
+                 record is not replaced"
             }
         }
     }

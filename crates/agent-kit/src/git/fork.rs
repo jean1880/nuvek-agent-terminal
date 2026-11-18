@@ -224,8 +224,25 @@ fn head_only_paths(source: &Path, worktree: &Path, tree: &str) -> Result<Vec<OsS
         .collect())
 }
 
-/// HEAD's entry for `path` in the repository of `dir`: its mode and object id, when HEAD has it
-/// as a file or a link.
+/// One entry of `ls-tree -z` (`<mode> <type> <oid>\t<path>`) as the mode and object id of a file,
+/// a link or a submodule (gitlink) at exactly `path`, its bytes compared whole; `None` for
+/// anything else.
+fn tree_entry(entry: &[u8], path: &[u8]) -> Option<(String, String)> {
+    let tab = entry.iter().position(|b| *b == b'\t')?;
+    let (meta, name) = (&entry[..tab], &entry[tab + 1..]);
+    if name != path {
+        return None;
+    }
+    let meta = std::str::from_utf8(meta).ok()?;
+    match meta.split(' ').collect::<Vec<_>>().as_slice() {
+        [mode, "blob", oid] | [mode @ "160000", "commit", oid] if is_object_id(oid) => {
+            Some(((*mode).to_owned(), (*oid).to_owned()))
+        }
+        _ => None,
+    }
+}
+
+/// HEAD's entry for `path` in the repository of `dir` ([`tree_entry`]).
 fn head_entry(dir: &Path, path: &OsStr) -> Result<Option<(String, String)>, String> {
     let args: [&OsStr; 6] = [
         OsStr::new("--literal-pathspecs"),
@@ -236,21 +253,21 @@ fn head_entry(dir: &Path, path: &OsStr) -> Result<Option<(String, String)>, Stri
         path,
     ];
     let out = git_raw(dir, args, &[], SNAPSHOT_TIMEOUT_SECS)?;
-    // `<mode> <type> <oid>\t<path>`
-    let Some(entry) = out.split(|b| *b == 0).next().filter(|e| !e.is_empty()) else {
-        return Ok(None);
-    };
-    let entry = String::from_utf8_lossy(entry);
-    let Some((meta, name)) = entry.split_once('\t') else {
-        return Ok(None);
-    };
-    let fields: Vec<&str> = meta.split(' ').collect();
-    Ok(match fields.as_slice() {
-        [mode, "blob", oid] if name.as_bytes() == path.as_bytes() && is_object_id(oid) => {
-            Some(((*mode).to_owned(), (*oid).to_owned()))
-        }
-        _ => None,
-    })
+    Ok(out
+        .split(|b| *b == 0)
+        .find_map(|entry| tree_entry(entry, path.as_bytes())))
+}
+
+/// What [`lay_in_fork_worktree`] laid in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaidIn {
+    /// The tree laid in: the snapshot, with HEAD's content at the paths that take it.
+    pub tree: String,
+    /// That tree recorded as a commit on top of HEAD (the checkpoint identity, on no branch):
+    /// the fork's baseline, which its ref keeps and its changes are compared against.
+    pub commit: String,
+    /// The paths that took HEAD's content (or were left out where HEAD has none).
+    pub from_head: Vec<String>,
 }
 
 /// Lays snapshot `tree` (a fork's baseline of `source`) into `worktree`, a fresh worktree whose
@@ -258,59 +275,104 @@ fn head_entry(dir: &Path, path: &OsStr) -> Result<Option<(String, String)>, Stri
 /// snapshot (modified, deleted and new files), while its index and branch stay at HEAD, so
 /// nothing the app made ever lands on a branch. The paths [`head_only_paths`] names keep HEAD's
 /// content (or are left out when HEAD has none), so a secret-looking or hidden-from-git file is
-/// never copied. Touches only the new worktree; returns the paths taken from HEAD. Blocking.
-pub fn lay_in_fork_worktree(
-    source: &Path,
-    worktree: &Path,
-    tree: &str,
-) -> Result<Vec<String>, String> {
+/// never copied. The tree laid in is recorded as the fork's baseline ([`LaidIn::commit`]), so
+/// the fork's changes are compared against exactly what it started with and the baseline ref
+/// keeps no such file either. Touches only the new worktree. Its error says how far it got.
+/// Blocking.
+pub fn lay_in_fork_worktree(source: &Path, worktree: &Path, tree: &str) -> Result<LaidIn, String> {
+    let not_copied = |e: String| format!("the thread's uncommitted work could not be copied: {e}");
     if !is_object_id(tree) {
-        return Err("The fork's starting point is not a git object id".to_owned());
+        return Err(not_copied(
+            "the fork's starting point is not a git object id".to_owned(),
+        ));
     }
-    let source = discover(source)?.ok_or("The source's folder is no longer in a git repository")?;
-    let fork = discover(worktree)?.ok_or("The fork's worktree is not a git working tree")?;
-    let head_only = head_only_paths(&source.toplevel, &fork.toplevel, tree)?;
+    let source = discover(source)
+        .map_err(not_copied)?
+        .ok_or_else(|| not_copied("the folder is no longer in a git repository".to_owned()))?;
+    let fork = discover(worktree)
+        .map_err(not_copied)?
+        .ok_or_else(|| not_copied("the new worktree is not a git working tree".to_owned()))?;
+    let head_only = head_only_paths(&source.toplevel, &fork.toplevel, tree).map_err(not_copied)?;
     let dir = fork.toplevel.as_path();
+    // The tree to lay in, made in a private index of the fork's own git directory.
     let laid = if head_only.is_empty() {
         tree.to_owned()
     } else {
-        // The tree to lay in, made in a private index of the fork's own git directory.
         let work = fork.git_dir.join("agent-terminal");
         std::fs::create_dir_all(&work)
-            .map_err(|err| format!("Could not create {}: {err}", work.display()))?;
+            .map_err(|err| not_copied(format!("could not create {}: {err}", work.display())))?;
         let scratch = ScratchIndex(work.join(format!("index-{}", snapshot_tag("forkwt"))));
         let env = [("GIT_INDEX_FILE", scratch.0.as_os_str())];
-        git_raw(dir, ["read-tree", tree], &env, LAY_IN_TIMEOUT_SECS)?;
+        let private = |args: &[&OsStr], timeout: u64| {
+            git_raw(
+                dir,
+                SNAPSHOT_CONFIG
+                    .iter()
+                    .map(OsStr::new)
+                    .chain(args.iter().copied()),
+                &env,
+                timeout,
+            )
+        };
+        private(
+            &[OsStr::new("read-tree"), OsStr::new(tree)],
+            LAY_IN_TIMEOUT_SECS,
+        )
+        .map_err(not_copied)?;
         for path in &head_only {
-            let args: Vec<OsString> = match head_entry(dir, path)? {
-                Some((mode, oid)) => ["update-index", "--add", "--cacheinfo", &mode, &oid]
-                    .iter()
-                    .map(OsString::from)
-                    .chain([path.clone()])
-                    .collect(),
-                None => ["update-index", "--force-remove", "--"]
-                    .iter()
-                    .map(OsString::from)
-                    .chain([path.clone()])
-                    .collect(),
-            };
-            git_raw(dir, args, &env, SNAPSHOT_TIMEOUT_SECS)?;
+            match head_entry(dir, path).map_err(not_copied)? {
+                Some((mode, oid)) => private(
+                    &[
+                        OsStr::new("update-index"),
+                        OsStr::new("--add"),
+                        OsStr::new("--replace"),
+                        OsStr::new("--cacheinfo"),
+                        OsStr::new(&mode),
+                        OsStr::new(&oid),
+                        path,
+                    ],
+                    SNAPSHOT_TIMEOUT_SECS,
+                ),
+                None => private(
+                    &[
+                        OsStr::new("update-index"),
+                        OsStr::new("--force-remove"),
+                        OsStr::new("--"),
+                        path,
+                    ],
+                    SNAPSHOT_TIMEOUT_SECS,
+                ),
+            }
+            .map_err(not_copied)?;
         }
-        let written = git_raw(dir, ["write-tree"], &env, LAY_IN_TIMEOUT_SECS)?;
+        let written =
+            private(&[OsStr::new("write-tree")], LAY_IN_TIMEOUT_SECS).map_err(not_copied)?;
         String::from_utf8_lossy(&written).trim().to_owned()
     };
+    let commit = commit_tree(&fork, &laid, fork.head.as_deref(), &baseline_message(&[]))
+        .map_err(not_copied)?;
     // The working tree to the snapshot, then the index back to HEAD: the work is uncommitted.
     git_raw(
         dir,
         ["read-tree", "-u", "--reset", &laid],
         &[],
         LAY_IN_TIMEOUT_SECS,
-    )?;
-    git_raw(dir, ["reset", "-q"], &[], LAY_IN_TIMEOUT_SECS)?;
-    Ok(head_only
-        .iter()
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect())
+    )
+    .map_err(|e| format!("copying the thread's uncommitted work stopped part-way: {e}"))?;
+    git_raw(dir, ["reset", "-q"], &[], LAY_IN_TIMEOUT_SECS).map_err(|e| {
+        format!(
+            "the thread's uncommitted work was copied, but the new worktree's index could not \
+             be set back to its branch's commit, so the work may show as staged: {e}"
+        )
+    })?;
+    Ok(LaidIn {
+        tree: laid,
+        commit,
+        from_head: head_only
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+    })
 }
 
 /// One side of a fork comparison ([`fork_changes`]).

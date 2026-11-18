@@ -359,20 +359,17 @@ impl AgentTerminalWindow {
             else {
                 return;
             };
-            // Once kept, the window reads the pair again and shows what was decided.
+            // Whatever comes of it (kept, refused, cancelled, a question declined or never
+            // asked), the window reads the pair again, which also gives its buttons back.
             let weak = window.downgrade();
             let (t, p) = (thread.clone(), pairing.clone());
-            let reread = move || {
+            let reread = Reread::new(move || {
                 if let Some(window) = weak.upgrade() {
                     load_fork_compare(&window, t, p);
                 }
-            };
-            obj.imp().confirm_keep(
-                window,
-                kept.thread.clone(),
-                other.thread.clone(),
-                std::boxed::Box::new(reread),
-            );
+            });
+            obj.imp()
+                .confirm_keep(window, kept.thread.clone(), other.thread.clone(), reread);
         });
         window.window().present();
     }
@@ -437,14 +434,9 @@ impl AgentTerminalWindow {
 
     /// Keep This One in `over` (a compare window): asks first, over that window, naming what
     /// changes (Cancel is the default), then keeps `kept` over `other`. `reread` reads the pair
-    /// into the window again, whatever the answer (its buttons were disabled at the click).
-    fn confirm_keep(
-        &self,
-        over: &CompareWindow,
-        kept: String,
-        other: String,
-        reread: std::boxed::Box<dyn FnOnce()>,
-    ) {
+    /// into the window again, whatever the answer (its buttons were disabled at the click): it
+    /// runs when dropped, so no path that ends the Keep early can leave them disabled.
+    fn confirm_keep(&self, over: &CompareWindow, kept: String, other: String, reread: Reread) {
         let kept_title = self.thread_title_of(&kept);
         let other_title = self.thread_title_of(&other);
         let dialog = confirm_dialog(
@@ -466,19 +458,21 @@ impl AgentTerminalWindow {
         let parent = over.window().clone();
         glib::MainContext::default().spawn_local(async move {
             if !crate::dialogs::confirmed(&dialog, &parent, "keep").await {
-                reread();
+                reread.now();
                 return;
             }
             match obj.upgrade() {
                 Some(obj) => obj.imp().keep_fork(kept, other, reread),
-                None => reread(),
+                None => reread.now(),
             }
         });
     }
 
     /// Keeps `kept` over `other`, in the window that has `other` open: archiving it ends a
-    /// running turn and drops an unsent message as closing does, so that is asked first.
-    fn keep_fork(&self, kept: String, other: String, reread: std::boxed::Box<dyn FnOnce()>) {
+    /// running turn and drops an unsent message as closing does, so that is asked first. A
+    /// question declined (or never shown, one already being open) drops `reread`, which reads
+    /// the window again.
+    pub(super) fn keep_fork(&self, kept: String, other: String, reread: Reread) {
         if let Some(owner) = super::threads::thread_owner(&other).filter(|w| w != &*self.obj()) {
             owner.imp().keep_fork(kept, other, reread);
             return;
@@ -496,7 +490,7 @@ impl AgentTerminalWindow {
     /// and may refuse), and only once that has landed closes `other`'s page, says so with Undo,
     /// and offers to remove its worktree. A kept thread with a live session writes the notice
     /// itself, right after the transaction (so its open view shows it), not inside it.
-    fn keep_now(&self, kept: String, other: String, reread: std::boxed::Box<dyn FnOnce()>) {
+    fn keep_now(&self, kept: String, other: String, reread: Reread) {
         let owner = super::threads::thread_owner(&kept);
         let session = owner
             .as_ref()
@@ -513,7 +507,9 @@ impl AgentTerminalWindow {
             move |s| s.keep_fork(&k, &o, write_notice),
             move |imp, outcome| match outcome {
                 Some(Ok(agent_kit::store::KeepOutcome::Kept(done))) => {
-                    imp.close_row_without_discard(&other);
+                    // Its page's detach makes no worktree offer of its own: the one below,
+                    // which Undo takes back, is the only one.
+                    imp.close_row_for_keep(&other);
                     match (&session, &view) {
                         (Some(session), _) => session.note(done.notice.clone()),
                         // Stored already: an open view with no session shows it too.
@@ -527,7 +523,7 @@ impl AgentTerminalWindow {
                         (None, None) => {}
                     }
                     imp.reload_summaries();
-                    reread();
+                    reread.now();
                     let keep = std::rc::Rc::new(KeepDone {
                         kept,
                         other,
@@ -549,11 +545,11 @@ impl AgentTerminalWindow {
                     imp.offer_kept_worktree_removal(&keep, done.worktree, done.worktree_used_by);
                 }
                 Some(Ok(agent_kit::store::KeepOutcome::Refused(why))) => {
-                    reread();
+                    reread.now();
                     imp.show_toast(&format!("Nothing was kept: {why}"));
                 }
                 failed => {
-                    reread();
+                    reread.now();
                     let error = failed.and_then(Result::err).map_or_else(
                         || "the thread store did not answer in time".to_owned(),
                         |e| e.to_string(),
@@ -609,15 +605,15 @@ impl AgentTerminalWindow {
             self.show_toast(&kept(&format!("{who} works in it")));
             return;
         }
-        if self.worktree_in_use(&info.path) {
-            self.show_toast(&kept("a tab is open in it"));
-            return;
-        }
+        let dirs = self.open_tab_dirs();
         let obj = self.obj().downgrade();
         let keep = std::rc::Rc::downgrade(keep);
         glib::MainContext::default().spawn_local(async move {
             let checked = info.clone();
             let blocker = off_main("the status check", move || {
+                if crate::worktree::any_inside(&dirs, &checked.path) {
+                    return Ok(Some("a tab is open in it".to_owned()));
+                }
                 Ok(crate::worktree::removal_blocker(&checked))
             })
             .await;
@@ -646,22 +642,22 @@ impl AgentTerminalWindow {
         });
     }
 
-    /// The Remove of [`Self::offer_kept_worktree_removal`], at the click: refused while a tab is
-    /// in the worktree, then in one step off the main thread, so nothing can change between the
-    /// checks and the removal: `other` must still be archived, no other thread (archived ones
-    /// and delegated sub-agents included) may work in it, git must find it registered and
-    /// clean, and only then is it removed, never forced, its branch kept.
+    /// The Remove of [`Self::offer_kept_worktree_removal`], at the click, all in one step off the
+    /// main thread, so nothing can change between the checks and the removal: no open tab may be
+    /// in the worktree (folders resolved), `other` must still be archived, no other thread
+    /// (archived ones and delegated sub-agents included) may work in it, git must find it
+    /// registered and clean, and only then is it removed, never forced, its branch kept.
     pub(super) fn remove_kept_worktree(&self, info: crate::worktree::WorktreeInfo, other: String) {
         let branch = info.branch.clone();
         let kept = move |why: &str| format!("Its worktree ⎇ {branch} is kept: {why}");
-        if self.worktree_in_use(&info.path) {
-            self.show_toast(&kept("a tab is open in it"));
-            return;
-        }
+        let dirs = self.open_tab_dirs();
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
             let checked = info.clone();
             let removed = store_job(move |store| -> Result<(), String> {
+                if crate::worktree::any_inside(&dirs, &checked.path) {
+                    return Err("a tab is open in it".to_owned());
+                }
                 match store.thread_summary(&other) {
                     Ok(Some(thread)) if thread.archived => {}
                     Ok(_) => return Err("its thread is back in the list".to_owned()),
@@ -698,6 +694,31 @@ impl AgentTerminalWindow {
     }
 }
 
+/// What reads a compare window again after a Keep This One, whatever comes of it: run by
+/// [`Reread::now`], or when dropped (a stop question declined, one already open, the window
+/// gone), so the window never keeps its Keep buttons disabled.
+pub(super) struct Reread(Option<std::boxed::Box<dyn FnOnce()>>);
+
+impl Reread {
+    pub(super) fn new(reread: impl FnOnce() + 'static) -> Self {
+        Self(Some(std::boxed::Box::new(reread)))
+    }
+
+    pub(super) fn now(mut self) {
+        if let Some(reread) = self.0.take() {
+            reread();
+        }
+    }
+}
+
+impl Drop for Reread {
+    fn drop(&mut self) {
+        if let Some(reread) = self.0.take() {
+            reread();
+        }
+    }
+}
+
 /// A Keep This One that landed, for its Undo and the offer to remove the archived thread's
 /// worktree: Undo takes the offer back, and none is shown once it is undone.
 pub(super) struct KeepDone {
@@ -715,6 +736,9 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     /// What the last Remove of a kept-over thread's worktree came to.
     static LAST_REMOVAL: std::cell::RefCell<Option<Option<Result<(), String>>>> =
+        const { std::cell::RefCell::new(None) };
+    /// What the last generic Remove (a worktree tab closed) came to.
+    static LAST_GENERIC_REMOVAL: std::cell::RefCell<Option<Result<(), String>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -781,6 +805,21 @@ pub(super) mod tests {
     use agent_kit::store::ThreadSummary;
 
     use super::*;
+
+    thread_local! {
+        /// How many times a closed worktree tab offered its worktree's removal.
+        static GENERIC_OFFERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A worktree tab's close offered to remove its worktree (the generic offer).
+    pub(in crate::window) fn note_generic_offer() {
+        GENERIC_OFFERS.with(|n| n.set(n.get() + 1));
+    }
+
+    /// What the generic Remove came to.
+    pub(in crate::window) fn note_removal(removed: &Result<(), String>) {
+        LAST_GENERIC_REMOVAL.with(|last| *last.borrow_mut() = Some(removed.clone()));
+    }
 
     fn summary(title: &str, driver: Option<&str>, model: Option<&str>) -> ThreadSummary {
         ThreadSummary {
@@ -1590,10 +1629,56 @@ pub(super) mod tests {
             .flatten()
             .is_some_and(|s| !s.archived)));
 
-        // Committed in the fork, the worktree is clean: Keep again offers its removal, and
-        // Undo takes the offer back. A Remove from before the Undo then removes nothing.
+        // A Keep whose stop question is never asked (one is open already) or is declined still
+        // reads the window again, so its buttons come back.
+        assert!(
+            imp.open_thread(&fork, true).is_some(),
+            "the fork's tab, open again"
+        );
+        let reasons = || super::super::threads::CloseReasons {
+            busy: false,
+            draft: true,
+        };
+        let reread = std::rc::Rc::new(std::cell::Cell::new(0));
+        let keep_after = |reread: &std::rc::Rc<std::cell::Cell<usize>>| {
+            let counted = reread.clone();
+            let guard = Reread::new(move || counted.set(counted.get() + 1));
+            let (k, o) = (source.clone(), fork.clone());
+            move |imp: &AgentTerminalWindow| imp.keep_now(k, o, guard)
+        };
+        imp.with_chat_mut(&fork, |c| c.confirming_close = true);
+        imp.confirm_stop_then(&fork, reasons(), keep_after(&reread));
+        assert_eq!(
+            reread.get(),
+            1,
+            "a question already open: read again at once"
+        );
+        imp.with_chat_mut(&fork, |c| c.confirming_close = false);
+        imp.confirm_stop_then(&fork, reasons(), keep_after(&reread));
+        let question = || {
+            window
+                .property::<Option<adw::Dialog>>("visible-dialog")
+                .and_then(|d| d.downcast::<adw::AlertDialog>().ok())
+        };
+        assert!(crate::testutil::pump_until(&ctx, 10, || question().is_some()));
+        question().expect("the stop question").close();
+        assert!(
+            crate::testutil::pump_until(&ctx, 10, || reread.get() == 2),
+            "declined: read again"
+        );
+        assert!(!store
+            .thread_summary(&fork)
+            .ok()
+            .flatten()
+            .is_some_and(|s| s.archived));
+
+        // Committed in the fork, with its tab open, the worktree is clean: Keep closes the tab
+        // and offers its removal once, its own offer, which Undo takes back; the tab's close
+        // offers nothing of its own. A Remove from before the Undo then removes nothing.
         git(&info.path, &["add", "-A"]).expect("add");
         git(&info.path, &["commit", "-qm", "the fork's work"]).expect("commit");
+        assert!(imp.page_of_thread(&fork).is_some(), "its tab is open");
+        let generic_before = GENERIC_OFFERS.with(std::cell::Cell::get);
         let removal = |other: &str| {
             LAST_REMOVAL.with(|last| last.borrow_mut().take());
             imp.remove_kept_worktree(info.clone(), other.to_owned());
@@ -1604,7 +1689,11 @@ pub(super) mod tests {
                 .flatten()
                 .expect("the store answered")
         };
-        imp.keep_now(source.clone(), fork.clone(), std::boxed::Box::new(|| {}));
+        imp.keep_now(source.clone(), fork.clone(), Reread::new(|| {}));
+        assert!(
+            crate::testutil::pump_until(&ctx, 20, || imp.page_of_thread(&fork).is_none()),
+            "Keep closed its tab once kept"
+        );
         let (keep, undo) = {
             let mut got = None;
             assert!(crate::testutil::pump_until(&ctx, 20, || {
@@ -1629,9 +1718,19 @@ pub(super) mod tests {
             .is_some_and(|s| !s.archived)));
         let why = removal(&fork).expect_err("restored: kept");
         assert!(why.contains("back in the list"), "{why}");
-        assert!(info.path.exists());
+        crate::testutil::pump_until(&ctx, 2, || false);
+        assert_eq!(
+            GENERIC_OFFERS.with(std::cell::Cell::get),
+            generic_before,
+            "the tab Keep closed offered no removal of its own"
+        );
+        assert!(
+            info.path.exists(),
+            "the restored thread's worktree survives"
+        );
 
-        // Archived again: a third thread working in the worktree keeps it, archived or not.
+        // Archived again: a third thread working in the worktree keeps it, archived or not,
+        // whichever Remove is clicked (the Keep's, or a closed tab's).
         store.set_archived(&fork, true).expect("archive");
         let inside = info.path.join("sub");
         std::fs::create_dir_all(&inside).expect("dir");
@@ -1641,7 +1740,36 @@ pub(super) mod tests {
         store.set_archived(&third, true).expect("archive");
         let why = removal(&fork).expect_err("in use: kept");
         assert!(why.contains("Third"), "{why}");
+        LAST_GENERIC_REMOVAL.with(|last| last.borrow_mut().take());
+        imp.remove_worktree(info.clone(), Some(fork.clone()));
+        assert!(crate::testutil::pump_until(&ctx, 20, || {
+            LAST_GENERIC_REMOVAL.with(|last| last.borrow().is_some())
+        }));
+        let why = LAST_GENERIC_REMOVAL
+            .with(|last| last.borrow_mut().take())
+            .and_then(Result::err)
+            .expect("the generic Remove kept it");
+        assert!(why.contains("Third"), "{why}");
+        if let Some(dialog) = window.property::<Option<adw::Dialog>>("visible-dialog") {
+            dialog.force_close();
+        }
         assert!(info.path.exists());
+        // A tab open in it through a link keeps it too.
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&info.path, &alias).expect("link");
+        store.delete_thread(&third).expect("delete");
+        let linked = store
+            .create_thread(&alias.join("sub").to_string_lossy(), Some("Linked"))
+            .expect("linked");
+        assert!(imp.open_thread(&linked, true).is_some());
+        let why = removal(&fork).expect_err("a tab in it: kept");
+        assert!(why.contains("tab"), "{why}");
+        assert!(info.path.exists());
+        imp.close_row_without_discard(&linked);
+        store.delete_thread(&linked).expect("delete");
+        let third = store
+            .create_thread(&inside.to_string_lossy(), Some("Third"))
+            .expect("third");
         // One in a folder beside it is no one in it: the worktree goes, its branch stays.
         store.delete_thread(&third).expect("delete");
         std::fs::remove_dir(&inside).expect("rmdir");
@@ -1669,5 +1797,43 @@ pub(super) mod tests {
         store.delete_thread(&fork).expect("delete");
         store.delete_thread(&source).expect("delete");
         imp.reload_summaries();
+    }
+
+    /// A fork's worktree made for a thread that never opens is named in the failure shown, on
+    /// the paths that end before the store is written too (here: its folder refused). Run from
+    /// the window test.
+    pub(in crate::window) fn a_worktree_left_behind_is_named_when_no_thread_opens(
+        window: &crate::window::AgentTerminalWindow,
+    ) {
+        let imp = window.imp();
+        let ctx = glib::MainContext::default();
+        let gone = tempfile::tempdir().expect("dir");
+        let missing = gone.path().join("not-there");
+        let info = crate::worktree::WorktreeInfo {
+            path: gone.path().join("wt"),
+            branch: "fork/left-1".into(),
+            main_toplevel: gone.path().to_path_buf(),
+            base: None,
+        };
+        let opened = imp.create_chat_thread(super::super::threads::NewThread {
+            dir: Some(missing.to_string_lossy().into_owned()),
+            left_behind: super::super::threads::LeftBehind::fork_worktree(&info),
+            ..super::super::threads::NewThread::new(Driver::Claude)
+        });
+        assert!(opened.is_none(), "a folder that is gone opens nothing");
+        let shown = || {
+            window
+                .property::<Option<adw::Dialog>>("visible-dialog")
+                .and_then(|d| d.downcast::<adw::AlertDialog>().ok())
+        };
+        assert!(crate::testutil::pump_until(&ctx, 10, || shown().is_some()));
+        let dialog = shown().expect("the refusal");
+        let body = dialog.body();
+        assert!(body.contains("no longer exists"), "{body}");
+        assert!(
+            body.contains("fork/left-1") && body.contains(&info.path.display().to_string()),
+            "the worktree and branch left behind are named: {body}"
+        );
+        dialog.force_close();
     }
 }

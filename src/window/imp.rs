@@ -2973,8 +2973,13 @@ impl AgentTerminalWindow {
                         imp.discard_if_blank(tab);
                     }
                     imp.withdraw_quota_notification(tab.key);
-                    if let Some(worktree) = &tab.worktree {
-                        imp.offer_worktree_removal(worktree.clone());
+                    // A page Keep This One closes gets the Keep's own offer, never this one.
+                    let thread = tab.chat.as_ref().map(|c| c.thread.clone());
+                    let kept_over = thread
+                        .as_deref()
+                        .is_some_and(AgentTerminalWindow::worktree_offer_suppressed);
+                    if let (Some(worktree), false) = (&tab.worktree, kept_over) {
+                        imp.offer_worktree_removal(worktree.clone(), thread);
                     }
                 }
                 imp.withdraw_bell_if_answered();
@@ -7603,12 +7608,12 @@ impl AgentTerminalWindow {
     }
 
     /// When a worktree tab closes and leaves its worktree clean, offers to
-    /// remove it. Never offered for a worktree another open tab is still in,
-    /// or one with anything uncommitted — that is simply kept.
-    fn offer_worktree_removal(&self, info: crate::worktree::WorktreeInfo) {
-        if self.worktree_in_use(&info.path) {
-            return;
-        }
+    /// remove it. Never offered for a worktree another open tab is still in
+    /// (folders compared with links resolved), or one with anything
+    /// uncommitted — that is simply kept. `thread` is the closing page's
+    /// thread, which its Remove does not count as working there.
+    fn offer_worktree_removal(&self, info: crate::worktree::WorktreeInfo, thread: Option<String>) {
+        let dirs = self.open_tab_dirs();
         let obj = self.obj();
         glib::MainContext::default().spawn_local(glib::clone!(
             #[weak]
@@ -7618,6 +7623,9 @@ impl AgentTerminalWindow {
                 // offered only while git still has it, at that path and on that branch.
                 let checked = info.clone();
                 let clean = off_main("the status check", move || {
+                    if crate::worktree::any_inside(&dirs, &checked.path) {
+                        return Err("a tab is open in it".into());
+                    }
                     if !crate::worktree::is_registered(&checked)? {
                         return Err("it is no longer a registered worktree on its branch".into());
                     }
@@ -7638,57 +7646,71 @@ impl AgentTerminalWindow {
                         return;
                     }
                 }
+                #[cfg(test)]
+                fork_compare::tests::note_generic_offer();
                 obj.imp().action_toast(
                     &format!("Worktree ⎇ {} is clean", info.branch),
                     "Remove",
                     10,
                     adw::ToastPriority::Normal,
-                    move |imp| imp.remove_worktree(info.clone()),
+                    move |imp| imp.remove_worktree(info.clone(), thread.clone()),
                 );
             }
         ));
     }
 
-    /// Whether any open tab, in any window, is in the worktree at `path`.
-    fn worktree_in_use(&self, path: &std::path::Path) -> bool {
-        let in_use = std::cell::Cell::new(false);
+    /// The folders of every open tab, in every window: what a removal checks, off the main
+    /// thread and with links resolved ([`crate::worktree::any_inside`]), in the same step as it
+    /// removes.
+    fn open_tab_dirs(&self) -> Vec<std::path::PathBuf> {
+        let dirs = std::cell::RefCell::new(Vec::new());
         self.for_each_window(|window| {
-            if window
-                .tabs
-                .borrow()
-                .iter()
-                .any(|t| std::path::Path::new(&t.dir).starts_with(path))
-            {
-                in_use.set(true);
-            }
+            dirs.borrow_mut().extend(
+                window
+                    .tabs
+                    .borrow()
+                    .iter()
+                    .map(|t| std::path::PathBuf::from(&t.dir)),
+            );
         });
-        in_use.get()
+        dirs.into_inner()
     }
 
-    /// Removes a worktree the user asked to, keeping its branch.
-    fn remove_worktree(&self, info: crate::worktree::WorktreeInfo) {
-        // Asked again at the click: a tab may have opened there while the
-        // offer was up, and git does not check who is inside a worktree.
-        // Whether it is still clean is asked again too, in the same step as the
-        // removal: `worktree remove` refuses uncommitted and untracked files
-        // but deletes ignored ones without asking.
-        if self.worktree_in_use(&info.path) {
-            self.show_toast("A tab is open in that worktree now; it was kept");
-            return;
-        }
+    /// Removes a worktree the user asked to, keeping its branch. `thread` is the thread whose
+    /// page closed in it, not counted as working there.
+    fn remove_worktree(&self, info: crate::worktree::WorktreeInfo, thread: Option<String>) {
+        // Asked again at the click, all in one step off the main thread with the removal: a tab
+        // may have opened there while the offer was up (folders compared with links resolved),
+        // another thread may work there (git does not check who is inside a worktree), and it
+        // must still be clean: `worktree remove` refuses uncommitted and untracked files but
+        // deletes ignored ones without asking.
+        let dirs = self.open_tab_dirs();
         let obj = self.obj();
         glib::MainContext::default().spawn_local(glib::clone!(
             #[weak]
             obj,
             async move {
                 let checked = info.clone();
-                let removed = off_main("removing the worktree", move || {
+                let removed = threads::store_job(move |store| -> Result<(), String> {
+                    if crate::worktree::any_inside(&dirs, &checked.path) {
+                        return Err("The worktree was kept: a tab is open in it.".to_owned());
+                    }
+                    let except = thread.as_deref().unwrap_or("");
+                    if let Some(who) = store
+                        .worktree_occupant(&checked.path, except)
+                        .map_err(|e| format!("The thread store could not say who is in it: {e}"))?
+                    {
+                        return Err(format!("The worktree was kept: {who} works in it."));
+                    }
                     if let Some(why) = crate::worktree::removal_blocker(&checked) {
                         return Err(format!("The worktree was kept: {why}."));
                     }
                     crate::worktree::remove(&checked.main_toplevel, &checked.path)
                 })
-                .await;
+                .await
+                .unwrap_or_else(|| Err("The thread store could not be read.".to_owned()));
+                #[cfg(test)]
+                fork_compare::tests::note_removal(&removed);
                 match removed {
                     Ok(()) => {
                         info!("Removed worktree {}", info.path.display());
@@ -10265,6 +10287,7 @@ mod tests {
         fork_compare::tests::a_fork_is_linked_and_compared_side_by_side(window);
         fork_compare::tests::a_forks_files_are_compared_against_its_baseline(window);
         fork_compare::tests::a_fork_in_a_worktree_is_kept_and_its_pair_archived(window);
+        fork_compare::tests::a_worktree_left_behind_is_named_when_no_thread_opens(window);
     }
 
     /// A folder outside any repository has nothing to diff: no Changes toggle, no shortcut.

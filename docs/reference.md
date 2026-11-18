@@ -189,7 +189,9 @@ folder had them, nothing staged, nothing committed, so the fork starts with the 
 progress and you commit it, in the fork, when you choose. Untracked files whose names look like
 secrets (`.env`, keys), files over 5 MiB, nested repositories and ignored files are not copied;
 tracked files whose names look like secrets, and files your index marks assume-unchanged or
-skip-worktree, keep the commit's version (or are left out when the commit has none). Your own
+skip-worktree (submodules included), keep the commit's version (or are left out when the commit
+has none). The fork's baseline is what was laid in, so a fresh fork's **Changes** show nothing and
+its ref keeps none of the files that were not copied. Your own
 index, HEAD, branch, working tree and stash are left exactly as they were. The snapshot is taken
 whether or not **Checkpoint Each Turn** is on, since it is what carries the work across. The fork
 opens in the same folder inside the worktree as the source was in, as a worktree thread (its
@@ -217,10 +219,12 @@ When the archived thread was opened in a worktree, its removal is offered (a toa
 links resolved), no open tab is in it, and git says it is still that branch's worktree with
 nothing uncommitted, untracked or ignored in it; otherwise the toast says why it is kept. A fork
 in its own worktree starts with uncommitted work, so its removal is offered only once that is
-committed. **Undo** takes the offer back, shown or not. **Remove** checks everything again at the
-click, in one step with the removal: the thread must still be archived, no other thread in it,
-no tab in it, and git must still find it clean. Removal is `git worktree remove` without
-`--force`, and the branch is never deleted.
+committed. It is the only offer: closing the thread's page for the Keep makes none of its own.
+**Undo** takes the offer back, shown or not. **Remove** checks everything again at the click, in
+one step with the removal: the thread must still be archived, no other thread in it, no tab in it
+(folders compared with links resolved), and git must still find it clean. The **Remove** offered
+when any worktree tab closes checks the same, except the archiving. Removal is `git worktree
+remove` without `--force`, and the branch is never deleted.
 
 ### Pinning threads
 

@@ -871,6 +871,18 @@ pub(super) mod tests {
         LAST_GENERIC_REMOVAL.with(|last| *last.borrow_mut() = Some(removed.clone()));
     }
 
+    /// Presents `host` if needed, waits until `dialog`'s sheet has opened on libadwaita 1.5,
+    /// closes it, and waits until it leaves `visible-dialog` so later tests never see it.
+    fn dismiss_dialog(ctx: &glib::MainContext, host: &gtk4::Window, dialog: &adw::Dialog) {
+        host.present();
+        assert!(crate::testutil::pump_until(ctx, 5, || host.is_mapped()));
+        assert!(crate::testutil::pump_until_dialog_open(ctx, dialog, 10));
+        dialog.force_close();
+        assert!(crate::testutil::pump_until(ctx, 10, || host
+            .property::<Option<adw::Dialog>>("visible-dialog")
+            .is_none()));
+    }
+
     fn summary(title: &str, driver: Option<&str>, model: Option<&str>) -> ThreadSummary {
         ThreadSummary {
             id: "t".into(),
@@ -1655,7 +1667,7 @@ pub(super) mod tests {
                 .is_some_and(|s| s.archived)),
             "the fork is archived"
         );
-        alert.force_close();
+        dismiss_dialog(&ctx, compare.upcast_ref(), alert.upcast_ref());
         assert!(
             imp.page_of_thread(&fork).is_none(),
             "its page closed once kept"
@@ -1761,6 +1773,7 @@ pub(super) mod tests {
             10
         ));
         stop.close();
+        assert!(crate::testutil::pump_until(&ctx, 10, || question().is_none()));
         assert!(
             crate::testutil::pump_until(&ctx, 10, || reread.get() == 2),
             "declined: read again"
@@ -1850,7 +1863,7 @@ pub(super) mod tests {
             .expect("the generic Remove kept it");
         assert!(why.contains("Third"), "{why}");
         if let Some(dialog) = window.property::<Option<adw::Dialog>>("visible-dialog") {
-            dialog.force_close();
+            dismiss_dialog(&ctx, window.upcast_ref(), &dialog);
         }
         assert!(info.path.exists());
         // A tab open in it through a link keeps it too.
@@ -1945,6 +1958,6 @@ pub(super) mod tests {
             body.contains("fork/left-1") && body.contains(&info.path.display().to_string()),
             "the worktree and branch left behind are named: {body}"
         );
-        dialog.force_close();
+        dismiss_dialog(&ctx, window.upcast_ref(), dialog.upcast_ref());
     }
 }

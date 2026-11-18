@@ -12,8 +12,12 @@
 //! ([`ForkLink::base_tree`]: a snapshot of the source's working tree taken when the fork was
 //! made; [`Pairing::bases`]), so each side's changes since the fork are told from what was
 //! there before it.
+//!
+//! Keep This One settles a pair: [`settle`] names the links that record which thread was kept
+//! over which ([`Kept`]), and [`Pairing::kept`] reads it back, so a settled pair is shown as
+//! such and not offered again.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::compare::Side;
 
@@ -31,6 +35,41 @@ pub struct ForkLink {
     /// The commit recording [`Self::base_tree`], which the baseline ref points at.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_commit: Option<String>,
+    /// Which thread was kept over which, when the pair was settled with Keep This One. Read
+    /// leniently: anything but two distinct thread ids reads as none, never losing the link.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_kept"
+    )]
+    pub kept: Option<Kept>,
+}
+
+/// A settled pair: `thread` was kept and `over` archived (Keep This One).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Kept {
+    pub thread: String,
+    pub over: String,
+}
+
+/// Most characters of a thread id a [`Kept`] reads (a thread id is a UUID).
+const MAX_KEPT_ID: usize = 128;
+
+/// A stored [`ForkLink::kept`]: `None` for anything that is not two distinct, non-empty ids.
+fn lenient_kept<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Kept>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    let id = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && s.len() <= MAX_KEPT_ID)
+            .map(str::to_owned)
+    };
+    Ok(match (id("thread"), id("over")) {
+        (Some(thread), Some(over)) if thread != over => Some(Kept { thread, over }),
+        _ => None,
+    })
 }
 
 /// Whether `id` reads as a git object id: 40 (SHA-1) or 64 (SHA-256) lowercase hex digits.
@@ -67,7 +106,7 @@ impl ForkLink {
 
     /// The link as stored.
     pub fn to_json(&self) -> String {
-        // Two plain fields: serialising cannot fail.
+        // Plain strings and a number: serialising cannot fail.
         serde_json::to_string(self).unwrap_or_default()
     }
 }
@@ -137,6 +176,120 @@ impl Pairing {
             Relation::Fork => [base(other), base(other)],
             Relation::Sibling => [base(own), base(other)],
         }
+    }
+
+    /// Which of `this` and [`Self::other`] was kept over the other, when the pair was settled
+    /// ([`settle`]): read from the link of the pair's fork (both, for two siblings), and only when
+    /// it names exactly these two threads.
+    pub fn kept(
+        &self,
+        this: &str,
+        own: Option<&ForkLink>,
+        other: Option<&ForkLink>,
+    ) -> Option<String> {
+        let links: &[Option<&ForkLink>] = match self.relation {
+            Relation::Source => &[own],
+            Relation::Fork => &[other],
+            Relation::Sibling => &[own, other],
+        };
+        links.iter().flatten().find_map(|link| {
+            let kept = link.kept.as_ref()?;
+            let pair = (kept.thread.as_str(), kept.over.as_str());
+            (pair == (this, self.other.as_str()) || pair == (self.other.as_str(), this))
+                .then(|| kept.thread.clone())
+        })
+    }
+}
+
+/// The links to write when `kept` is kept over `other` (Keep This One), each with its fork's id
+/// and [`ForkLink::kept`] set: the fork's own link when one was forked from the other, both links
+/// when they are two forks of one source. Empty when the two are no pair, or are one thread.
+pub fn settle(
+    kept: &str,
+    kept_link: Option<&ForkLink>,
+    other: &str,
+    other_link: Option<&ForkLink>,
+) -> Vec<(String, ForkLink)> {
+    if kept == other {
+        return Vec::new();
+    }
+    let record = Kept {
+        thread: kept.to_owned(),
+        over: other.to_owned(),
+    };
+    let settled = |fork: &str, link: &ForkLink| {
+        (
+            fork.to_owned(),
+            ForkLink {
+                kept: Some(record.clone()),
+                ..link.clone()
+            },
+        )
+    };
+    match (kept_link, other_link) {
+        (_, Some(o)) if o.source_thread == kept => vec![settled(other, o)],
+        (Some(k), _) if k.source_thread == other => vec![settled(kept, k)],
+        (Some(k), Some(o)) if k.source_thread == o.source_thread => {
+            vec![settled(kept, k), settled(other, o)]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The links to write when a [`settle`] of `kept` over `other` is undone: those of the two that
+/// still record exactly that, with [`ForkLink::kept`] cleared.
+pub fn unsettle(
+    kept: &str,
+    kept_link: Option<&ForkLink>,
+    other: &str,
+    other_link: Option<&ForkLink>,
+) -> Vec<(String, ForkLink)> {
+    let record = Kept {
+        thread: kept.to_owned(),
+        over: other.to_owned(),
+    };
+    [(kept, kept_link), (other, other_link)]
+        .into_iter()
+        .filter_map(|(fork, link)| {
+            let link = link?;
+            (link.kept.as_ref() == Some(&record)).then(|| {
+                (
+                    fork.to_owned(),
+                    ForkLink {
+                        kept: None,
+                        ..link.clone()
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
+/// The words of a fork's branch name, from its source's title: lowercase ASCII letters and
+/// digits joined by `-`, at most 32 characters, never starting or ending with `-`; `thread` when
+/// nothing is left. A fork in its own worktree is on `fork/<slug>-<n>`.
+pub fn branch_slug(title: &str) -> String {
+    let mut slug = String::new();
+    for word in title
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+    {
+        let sep = usize::from(!slug.is_empty());
+        let room = 32usize.saturating_sub(slug.len() + sep);
+        if room == 0 {
+            break;
+        }
+        if sep == 1 {
+            slug.push('-');
+        }
+        let word = word.to_ascii_lowercase();
+        slug.push_str(&word[..word.len().min(room)]);
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "thread".to_owned()
+    } else {
+        slug.to_owned()
     }
 }
 
@@ -259,6 +412,123 @@ mod tests {
         }
         assert!(is_object_id(TREE));
         assert!(!is_object_id(""));
+    }
+
+    #[test]
+    fn a_kept_record_round_trips_and_a_malformed_one_is_dropped_not_the_link() {
+        let kept = ForkLink {
+            kept: Some(Kept {
+                thread: "src".into(),
+                over: "fork".into(),
+            }),
+            ..link("src", 3)
+        };
+        assert_eq!(ForkLink::parse(&kept.to_json()), Some(kept.clone()));
+        assert!(
+            !link("src", 3).to_json().contains("kept"),
+            "an unsettled link is written as before"
+        );
+        for bad in [
+            serde_json::json!("src"),
+            serde_json::json!(5),
+            serde_json::json!(null),
+            serde_json::json!({"thread": "a"}),
+            serde_json::json!({"thread": "a", "over": "a"}),
+            serde_json::json!({"thread": "", "over": "b"}),
+            serde_json::json!({"thread": "a", "over": 1}),
+            serde_json::json!({"thread": "a", "over": "x".repeat(200)}),
+        ] {
+            let json = serde_json::json!({
+                "source_thread": "src",
+                "fork_seq": 3,
+                "kept": bad,
+            })
+            .to_string();
+            assert_eq!(ForkLink::parse(&json), Some(link("src", 3)), "{json}");
+        }
+    }
+
+    #[test]
+    fn settling_records_the_pair_on_the_forks_link_and_reads_back_only_for_that_pair() {
+        let fork = link("a", 10);
+        let sibling = link("a", 20);
+        // A source kept over its fork, and a fork kept over its source: the fork's link.
+        let s = settle("a", None, "b", Some(&fork));
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].0, "b");
+        assert_eq!(
+            s[0].1.kept,
+            Some(Kept {
+                thread: "a".into(),
+                over: "b".into()
+            })
+        );
+        assert_eq!(s[0].1.fork_seq, 10, "the rest of the link is kept");
+        let s = settle("b", Some(&fork), "a", None);
+        assert_eq!(s.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(), ["b"]);
+        // Two siblings: both links.
+        let s = settle("b", Some(&fork), "c", Some(&sibling));
+        assert_eq!(
+            s.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+            ["b", "c"]
+        );
+        // No pair, or one thread: nothing.
+        assert!(settle("a", None, "x", None).is_empty());
+        assert!(settle("b", Some(&fork), "y", Some(&link("x", 1))).is_empty());
+        assert!(settle("b", Some(&fork), "b", Some(&fork)).is_empty());
+
+        // Read back from either side, for this pair only.
+        let settled = settle("b", Some(&fork), "a", None).remove(0).1;
+        let from_fork = Pairing {
+            other: "a".into(),
+            relation: Relation::Source,
+            fork_seq: 10,
+        };
+        assert_eq!(
+            from_fork.kept("b", Some(&settled), None).as_deref(),
+            Some("b")
+        );
+        let from_source = Pairing {
+            other: "b".into(),
+            relation: Relation::Fork,
+            fork_seq: 10,
+        };
+        assert_eq!(
+            from_source.kept("a", None, Some(&settled)).as_deref(),
+            Some("b")
+        );
+        // The same link settled against a sibling says nothing of the source.
+        let over_sibling = settle("b", Some(&fork), "c", Some(&sibling)).remove(0).1;
+        assert_eq!(from_fork.kept("b", Some(&over_sibling), None), None);
+        let siblings = Pairing {
+            other: "c".into(),
+            relation: Relation::Sibling,
+            fork_seq: 0,
+        };
+        assert_eq!(
+            siblings
+                .kept("b", Some(&over_sibling), Some(&sibling))
+                .as_deref(),
+            Some("b")
+        );
+
+        // Undone: only links that still record exactly that are cleared.
+        let undone = unsettle("b", Some(&over_sibling), "c", Some(&sibling));
+        assert_eq!(undone.len(), 1);
+        assert_eq!(undone[0], ("b".to_owned(), fork.clone()));
+        assert!(unsettle("c", Some(&sibling), "b", Some(&over_sibling)).is_empty());
+    }
+
+    #[test]
+    fn a_branch_slug_is_safe_for_git_and_never_empty() {
+        assert_eq!(branch_slug("Fix the login bug"), "fix-the-login-bug");
+        assert_eq!(branch_slug("  --Déjà vu: v2!  "), "d-j-vu-v2");
+        assert_eq!(branch_slug(""), "thread");
+        assert_eq!(branch_slug("✨"), "thread");
+        let long = branch_slug(&"word ".repeat(40));
+        assert!(long.len() <= 32, "{long}");
+        assert!(!long.starts_with('-') && !long.ends_with('-'), "{long}");
+        assert!(branch_slug("-rf /").starts_with("rf"));
     }
 
     #[test]

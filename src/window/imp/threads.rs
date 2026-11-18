@@ -7633,6 +7633,10 @@ impl AgentTerminalWindow {
                 self.when_not_busy(thread, move |imp| imp.continue_rate_limited(&id));
             }
             ViewAction::Fork => self.fork_thread(thread, slot.driver(), dir, false),
+            ViewAction::ForkInWorktree => match dir {
+                Some(dir) => self.fork_in_worktree(thread, slot.driver(), dir),
+                None => self.show_toast("This thread has no folder to fork from"),
+            },
             ViewAction::CompareForks => self.compare_with_fork(thread),
             ViewAction::CompactByHandoff => self.fork_thread(thread, slot.driver(), dir, true),
             ViewAction::Rewind => {
@@ -7717,9 +7721,33 @@ impl AgentTerminalWindow {
             settings.model,
             settings.effort,
             compact,
+            None,
         );
     }
 
+    /// Fork in Isolated Worktree, once confirmed: as [`Self::fork_thread`], but the fork opens in
+    /// the new worktree `plan` names, made from a snapshot of the source's folder taken right
+    /// after the fork point is read (that snapshot is the fork's baseline too).
+    pub(super) fn fork_thread_into(
+        &self,
+        thread: &str,
+        driver: Driver,
+        dir: String,
+        plan: crate::worktree::ForkPlan,
+    ) {
+        let settings = self.thread_carry_settings(thread);
+        self.fork_thread_with(
+            thread,
+            driver,
+            Some(dir),
+            settings.model,
+            settings.effort,
+            false,
+            Some(plan),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn fork_thread_with(
         &self,
         thread: &str,
@@ -7728,6 +7756,7 @@ impl AgentTerminalWindow {
         model: Option<String>,
         effort: Option<String>,
         compact: bool,
+        worktree: Option<crate::worktree::ForkPlan>,
     ) {
         let (title, source_driver, source_profile) = self
             .with_chat(thread, |c| {
@@ -7762,9 +7791,37 @@ impl AgentTerminalWindow {
             })
             .await;
             // A fork's baseline: the source's folder as it is now, right after the fork point
-            // was read (no window is held meanwhile).
-            let baseline = match (&dir, &loaded) {
-                (Some(dir), Some(Ok(_))) if takes_baseline => {
+            // was read (no window is held meanwhile). In a worktree of its own, that snapshot is
+            // what the worktree's branch starts at, taken whether or not checkpoints are on: it
+            // is what carries the source's uncommitted work across.
+            let mut made = None;
+            let baseline = match (&dir, &loaded, worktree) {
+                (Some(dir), Some(Ok(_)), Some(plan)) => {
+                    let source = dir.clone();
+                    let created = off_main("creating the fork's worktree", move || {
+                        crate::worktree::add_fork(std::path::Path::new(&source), &plan)
+                    })
+                    .await;
+                    match created {
+                        Ok(fork) => {
+                            info!(
+                                "Created worktree {} on {} for a fork",
+                                fork.info.path.display(),
+                                fork.info.branch
+                            );
+                            let baseline = fork.baseline.clone();
+                            made = Some(fork);
+                            Some(baseline)
+                        }
+                        Err(e) => {
+                            if let Some(obj) = obj.upgrade() {
+                                present_message(&obj, "Could Not Fork into a Worktree", &e);
+                            }
+                            return;
+                        }
+                    }
+                }
+                (Some(dir), Some(Ok(_)), None) if takes_baseline => {
                     super::fork_compare::fork_baseline(dir.clone()).await
                 }
                 _ => None,
@@ -7790,8 +7847,24 @@ impl AgentTerminalWindow {
                 base_commit: baseline.as_ref().map(|b| b.commit.clone()),
                 ..agent_core::fork_compare::ForkLink::new(&thread, fork_seq)
             });
+            if let Some(made) = &made {
+                if !made.baseline.skipped.is_empty() {
+                    info!(
+                        "The fork's worktree left out {} untracked path(s)",
+                        made.baseline.skipped.len()
+                    );
+                }
+            }
+            let (dir, worktree) = match made {
+                Some(made) => (
+                    Some(made.dir.to_string_lossy().into_owned()),
+                    Some(made.info),
+                ),
+                None => (dir, None),
+            };
             imp.create_chat_thread(NewThread {
                 dir,
+                worktree,
                 model: settings.model,
                 effort: settings.effort,
                 mode: settings.mode,

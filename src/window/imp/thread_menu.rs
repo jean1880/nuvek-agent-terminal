@@ -316,6 +316,13 @@ impl AgentTerminalWindow {
                     }
                 }
             }
+            ThreadAction::ForkInWorktree(thread) => {
+                if let Some(summary) = self.summary_of(&thread) {
+                    if let Some(driver) = self.thread_driver(&thread, &summary) {
+                        self.fork_in_worktree(&thread, driver, summary.cwd);
+                    }
+                }
+            }
             ThreadAction::CompareForks(thread) => self.compare_with_fork(&thread),
             ThreadAction::Rename(thread) => self.prompt_rename(&thread),
             ThreadAction::Pin(thread) => self.change_pin(&thread, PinChange::Pin { at: None }),
@@ -1374,6 +1381,7 @@ pub(super) mod tests {
                 "Continue in a new thread with…",
                 "Switch agent (stops the current turn)",
                 "Fork thread",
+                "Fork in Isolated Worktree…",
                 "Compact into a new thread"
             ]
         );
@@ -1446,6 +1454,7 @@ pub(super) mod tests {
                 "Continue in a new thread with…",
                 "Switch agent (stops the current turn)",
                 "Fork thread",
+                "Fork in Isolated Worktree…",
                 "Compact into a new thread"
             ]
         );
@@ -1454,7 +1463,9 @@ pub(super) mod tests {
             assert_eq!(action_of(&section, index).as_deref(), Some(ACTION_OFF));
         }
 
-        // A fork (or a thread that was forked) offers Compare with Fork… beside Fork thread.
+        // Fork in Isolated Worktree… follows Fork thread, enabled once there is a message.
+        assert_eq!(action_of(&section, 3).as_deref(), Some(ACTION));
+        // A fork (or a thread that was forked) offers Compare with Fork… beside the fork entries.
         let forked = ThreadMenuInput {
             forks: true,
             ..none
@@ -1462,8 +1473,8 @@ pub(super) mod tests {
         let menu = to_gio_menu(&thread_menu(&forked));
         let model: &gio::MenuModel = menu.upcast_ref();
         let section = model.item_link(0, "section").expect("first section");
-        assert_eq!(gio_menu_labels_of(&section)[3], "Compare with Fork…");
-        assert_eq!(action_of(&section, 3).as_deref(), Some(ACTION));
+        assert_eq!(gio_menu_labels_of(&section)[4], "Compare with Fork…");
+        assert_eq!(action_of(&section, 4).as_deref(), Some(ACTION));
     }
 
     /// Each menu choice, carried out on a real window and store, does what its label says and

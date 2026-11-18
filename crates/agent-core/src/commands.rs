@@ -180,7 +180,7 @@ static BUILTINS: [Builtin; 13] = [
     Builtin {
         name: "fork",
         aliases: &[],
-        description: "Branch the thread from this turn",
+        description: "Branch the thread from this turn (/fork worktree: in its own worktree)",
         hint: None,
         action: BuiltinAction::Fork,
     },
@@ -238,6 +238,25 @@ static BUILTINS: [Builtin; 13] = [
 /// The built-in command registry.
 pub fn builtins() -> &'static [Builtin] {
     &BUILTINS
+}
+
+/// Where `/fork` puts the fork, from what follows the command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkPlace {
+    /// No option: in the source's folder, as `/fork` always has.
+    Here,
+    /// `/fork worktree`: in a new worktree of its own, from a snapshot of the source's folder.
+    Worktree,
+}
+
+/// `/fork`'s option: nothing for [`ForkPlace::Here`], `worktree` (any case) for
+/// [`ForkPlace::Worktree`]; `None` for anything else, which the caller says it does not know.
+pub fn fork_place(args: &str) -> Option<ForkPlace> {
+    match args.trim().to_lowercase().as_str() {
+        "" => Some(ForkPlace::Here),
+        "worktree" => Some(ForkPlace::Worktree),
+        _ => None,
+    }
 }
 
 /// Normalizes a typed command name: no leading slashes, lowercase.
@@ -803,6 +822,24 @@ mod tests {
         no_context.context_usage = false;
         let items = completion_items(builtins(), &[], &no_context, &slash(""));
         assert!(!names(&items).contains(&"context"));
+    }
+
+    /// `/fork` alone forks in place, as it always has (it still runs at once from the
+    /// typeahead: no hint); `worktree` is its one option, and anything else is refused.
+    #[test]
+    fn fork_takes_worktree_as_its_one_option() {
+        assert_eq!(fork_place(""), Some(ForkPlace::Here));
+        assert_eq!(fork_place("   "), Some(ForkPlace::Here));
+        assert_eq!(fork_place("worktree"), Some(ForkPlace::Worktree));
+        assert_eq!(fork_place(" WorkTree "), Some(ForkPlace::Worktree));
+        for other in ["wt", "here", "worktree now", "-b x"] {
+            assert_eq!(fork_place(other), None, "{other:?}");
+        }
+        let fork = builtins()
+            .iter()
+            .find(|b| b.action == BuiltinAction::Fork)
+            .expect("fork");
+        assert_eq!(fork.hint, None, "picking /fork still forks at once");
     }
 
     #[test]

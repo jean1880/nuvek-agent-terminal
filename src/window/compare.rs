@@ -15,6 +15,10 @@
 //! ([`super::diff_panel::read_only_files`]). The diffs are read off the main thread by the
 //! caller.
 //!
+//! Under the columns, a footer offers Keep This One on each column the caller marks
+//! ([`KeepState`]) and calls it back with the column ([`CompareWindow::connect_keep`]); what Keep
+//! does is the caller's. The window itself still changes nothing.
+//!
 //! What it shows is already scrubbed (the store scrubs every event and title); replies are
 //! markdown whose links open nothing but a web or mail address ([`crate::chat::view::guard_links`]).
 
@@ -35,6 +39,22 @@ pub(crate) struct ColumnView {
     /// The agent and model, or why there is nothing (the thread is gone).
     pub(crate) detail: String,
     pub(crate) entries: Vec<Entry>,
+    /// What the column's footer says or offers.
+    pub(crate) keep: KeepState,
+}
+
+/// A column's footer: Keep This One, or what was decided.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum KeepState {
+    /// Nothing to offer or say.
+    #[default]
+    None,
+    /// Keep This One, which calls the caller back ([`CompareWindow::connect_keep`]).
+    Offered,
+    /// This one was kept.
+    Kept,
+    /// This one is archived.
+    Archived,
 }
 
 /// What [`CompareWindow::show`] draws.
@@ -105,6 +125,9 @@ pub(crate) fn changed_in_all(columns: &[ChangesColumn]) -> Vec<String> {
 /// What Refresh calls ([`CompareWindow::connect_refresh`]).
 type Refresh = Rc<dyn Fn(&CompareWindow)>;
 
+/// What Keep This One calls, with its column ([`CompareWindow::connect_keep`]).
+type Keep = Rc<dyn Fn(&CompareWindow, usize)>;
+
 struct Inner {
     window: adw::Window,
     title: adw::WindowTitle,
@@ -116,6 +139,7 @@ struct Inner {
     refresh: gtk4::Button,
     generation: Generation,
     on_refresh: RefCell<Option<Refresh>>,
+    on_keep: RefCell<Option<Keep>>,
     /// The window's own hold on itself, so it lives (and Refresh works) with no caller keeping
     /// it: let go once its `adw::Window` is destroyed (closed, or its parent gone).
     kept: RefCell<Option<CompareWindow>>,
@@ -197,6 +221,7 @@ impl CompareWindow {
             refresh,
             generation: Generation::new(),
             on_refresh: RefCell::new(None),
+            on_keep: RefCell::new(None),
             kept: RefCell::new(None),
         });
         *inner.kept.borrow_mut() = Some(Self(inner.clone()));
@@ -246,6 +271,12 @@ impl CompareWindow {
         *self.0.on_refresh.borrow_mut() = Some(Rc::new(refresh));
     }
 
+    /// Calls `keep` with this window and the column whose Keep This One was clicked (a column
+    /// shown as [`KeepState::Offered`]). Handed the window, as Refresh is.
+    pub(crate) fn connect_keep(&self, keep: impl Fn(&CompareWindow, usize) + 'static) {
+        *self.0.on_keep.borrow_mut() = Some(Rc::new(keep));
+    }
+
     /// Starts a read: its generation, which only [`Self::show`] or [`Self::show_error`] of the
     /// newest read draws. What is shown stays until then; Refresh waits for the answer.
     pub(crate) fn begin(&self) -> u64 {
@@ -260,7 +291,15 @@ impl CompareWindow {
         }
         self.0.refresh.set_sensitive(true);
         self.0.title.set_subtitle(&content.subtitle);
-        let page = content_page(content);
+        let weak = Rc::downgrade(&self.0);
+        let keep = move |column: usize| {
+            let Some(inner) = weak.upgrade() else { return };
+            let callback = inner.on_keep.borrow().clone();
+            if let Some(callback) = callback {
+                callback(&CompareWindow(inner), column);
+            }
+        };
+        let page = content_page(content, &keep);
         self.replace_page(&page);
     }
 
@@ -415,8 +454,53 @@ fn label(text: &str, classes: &[&str]) -> gtk4::Label {
         .build()
 }
 
-/// The page for `content`: a heading per column, then the rows lined up by turn.
-fn content_page(content: &CompareContent) -> gtk4::Widget {
+/// The footer under the columns: Keep This One for each column that offers it (calling `keep`
+/// with the column), or what was decided. `None` when no column has anything to show.
+fn keep_footer(
+    content: &CompareContent,
+    keep: &(impl Fn(usize) + Clone + 'static),
+) -> Option<gtk4::Widget> {
+    if content.columns.iter().all(|c| c.keep == KeepState::None) {
+        return None;
+    }
+    let grid = gtk4::Grid::builder()
+        .column_homogeneous(true)
+        .column_spacing(18)
+        .margin_top(6)
+        .margin_bottom(12)
+        .margin_start(18)
+        .margin_end(18)
+        .css_classes(["compare-keep-footer"])
+        .build();
+    for (i, column) in content.columns.iter().enumerate() {
+        let cell: gtk4::Widget = match column.keep {
+            KeepState::None => gtk4::Box::new(gtk4::Orientation::Horizontal, 0).upcast(),
+            KeepState::Offered => {
+                let button = gtk4::Button::builder()
+                    .label("Keep This One")
+                    .halign(gtk4::Align::Start)
+                    .tooltip_text("Keep this thread and archive the other; nothing is deleted")
+                    .css_classes(["compare-keep"])
+                    .build();
+                let keep = keep.clone();
+                button.connect_clicked(move |_| keep(i));
+                button.upcast()
+            }
+            KeepState::Kept => label("Kept", &["success", "compare-keep-state"]).upcast(),
+            KeepState::Archived => label("Archived", &["dim-label", "compare-keep-state"]).upcast(),
+        };
+        grid.attach(&cell, i as i32, 0, 1, 1);
+    }
+    Some(grid.upcast())
+}
+
+/// The page for `content`: a heading per column, then the rows lined up by turn, then the
+/// columns' footer ([`keep_footer`]).
+fn content_page(
+    content: &CompareContent,
+    keep: &(impl Fn(usize) + Clone + 'static),
+) -> gtk4::Widget {
+    let footer = keep_footer(content, keep);
     let columns: Vec<Vec<Entry>> = content.columns.iter().map(|c| c.entries.clone()).collect();
     let table = compare::table(&columns);
     let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -452,6 +536,10 @@ fn content_page(content: &CompareContent) -> gtk4::Widget {
             .vexpand(true)
             .build();
         outer.append(&empty);
+        if let Some(footer) = &footer {
+            outer.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+            outer.append(footer);
+        }
         return outer.upcast();
     }
     let grid = gtk4::Grid::builder()
@@ -498,6 +586,10 @@ fn content_page(content: &CompareContent) -> gtk4::Widget {
         .child(&grid)
         .build();
     outer.append(&scroll);
+    if let Some(footer) = &footer {
+        outer.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+        outer.append(footer);
+    }
     outer.upcast()
 }
 
@@ -638,6 +730,7 @@ pub(crate) mod tests {
                         e(Role::Reply, "**left** reply", "completed"),
                         e(Role::Prompt, "left two", "completed"),
                     ],
+                    keep: KeepState::Offered,
                 },
                 ColumnView {
                     heading: "B".into(),
@@ -646,6 +739,7 @@ pub(crate) mod tests {
                         e(Role::Prompt, "right one", "completed"),
                         e(Role::Tool, "Run cargo test", "failed"),
                     ],
+                    keep: KeepState::Archived,
                 },
             ],
             empty: "Nothing yet.".into(),
@@ -685,6 +779,21 @@ pub(crate) mod tests {
         assert!(problems.is_empty(), "{problems:#?}");
         let unlabelled = crate::testutil::icon_only_without_label(&root);
         assert!(unlabelled.is_empty(), "{unlabelled:#?}");
+        // The footer: Keep This One where offered, calling back with its column; what was
+        // decided elsewhere.
+        assert!(crate::testutil::label_texts(&root)
+            .iter()
+            .any(|t| t == "Archived"));
+        let kept_column = Rc::new(std::cell::Cell::new(None));
+        let k = kept_column.clone();
+        window.connect_keep(move |_, column| k.set(Some(column)));
+        let keeps: Vec<gtk4::Button> = crate::testutil::find_all::<gtk4::Button>(&root)
+            .into_iter()
+            .filter(|b| b.label().as_deref() == Some("Keep This One"))
+            .collect();
+        assert_eq!(keeps.len(), 1, "offered on the first column only");
+        keeps[0].emit_clicked();
+        assert_eq!(kept_column.get(), Some(0));
         // Refresh asks the caller to read again, and waits for that read.
         let refresh = crate::testutil::find_all::<gtk4::Button>(&root)
             .into_iter()

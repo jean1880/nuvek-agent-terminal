@@ -8,6 +8,15 @@
 //! A fork's baseline is taken here too ([`fork_baseline`], when Fork thread runs), its ref kept
 //! once the fork is stored ([`keep_fork_baseline`]) and dropped with the fork
 //! ([`drop_fork_baseline`]).
+//!
+//! Fork in Isolated Worktree (the thread menu, `/fork worktree`) plans the fork's worktree off
+//! the main thread, asks, then forks into it ([`AgentTerminalWindow::fork_in_worktree`]).
+//!
+//! Keep This One (each column's footer) settles a pair: after a confirmation it archives the
+//! other thread (never deleting it), records the choice in the pair's fork links and says so in
+//! the kept thread ([`Store::keep_fork`]); Undo reverses the first two. When the archived thread
+//! has a worktree that is clean and that no tab or listed thread is in, it offers the clean-only
+//! removal, which keeps the branch; otherwise it says why not. It merges nothing.
 
 use std::path::{Path, PathBuf};
 
@@ -20,8 +29,9 @@ use super::*;
 use crate::git::{BaselineOutcome, ForkBaseline, ForkChanges};
 use crate::window::compare::{
     ChangesColumn, ChangesContent, ChangesState, ColumnView, CompareContent, CompareWindow,
+    KeepState,
 };
-use crate::window::sidebar_model::display_title;
+use crate::window::sidebar_model::{display_title, RowKey};
 
 /// Said above the file changes of two threads in one folder: what they can and cannot show.
 pub(super) const SHARED_FOLDER: &str = "Both threads work in the same folder, so their file \
@@ -165,6 +175,7 @@ fn column_view(column: CompareColumn) -> ColumnView {
             heading: "Deleted thread".to_owned(),
             detail: "This thread no longer exists".to_owned(),
             entries: Vec::new(),
+            keep: KeepState::None,
         };
     };
     let agent = summary
@@ -183,13 +194,48 @@ fn column_view(column: CompareColumn) -> ColumnView {
         heading: display_title(&summary.title).to_owned(),
         detail,
         entries: column.entries,
+        keep: KeepState::None,
     }
 }
 
+/// Each column's footer: what was kept and archived once the pair is settled (`kept`); Keep This
+/// One on both while both threads are there and in the list; else only which is archived.
+fn keep_states(columns: &[CompareColumn], kept: Option<&str>) -> Vec<KeepState> {
+    let archived = |c: &CompareColumn| c.summary.as_ref().is_some_and(|s| s.archived);
+    let offered = columns.len() == 2
+        && columns
+            .iter()
+            .all(|c| c.summary.as_ref().is_some_and(|s| !s.archived));
+    columns
+        .iter()
+        .map(|c| {
+            let id = c.summary.as_ref().map(|s| s.id.as_str());
+            match kept {
+                Some(kept) if id == Some(kept) => KeepState::Kept,
+                None if offered => KeepState::Offered,
+                _ if archived(c) => KeepState::Archived,
+                _ => KeepState::None,
+            }
+        })
+        .collect()
+}
+
 /// The window's content for a fork pair read as `columns` (source first, then the fork; or two
-/// siblings), compared as `relation` says.
-fn fork_content(relation: Relation, columns: Vec<CompareColumn>) -> CompareContent {
-    let columns: Vec<ColumnView> = columns.into_iter().map(column_view).collect();
+/// siblings), compared as `relation` says, `kept` naming the thread kept if the pair is settled.
+fn fork_content(
+    relation: Relation,
+    columns: Vec<CompareColumn>,
+    kept: Option<&str>,
+) -> CompareContent {
+    let states = keep_states(&columns, kept);
+    let columns: Vec<ColumnView> = columns
+        .into_iter()
+        .zip(states)
+        .map(|(column, keep)| ColumnView {
+            keep,
+            ..column_view(column)
+        })
+        .collect();
     let name = |i: usize| {
         columns
             .get(i)
@@ -303,10 +349,265 @@ impl AgentTerminalWindow {
         let window = CompareWindow::new(self.obj().upcast_ref(), "Compare Forks");
         let thread = thread.to_owned();
         load_fork_compare(&window, thread.clone(), pairing.clone());
-        window.connect_refresh(move |window| {
-            load_fork_compare(window, thread.clone(), pairing.clone())
+        let (t, p) = (thread.clone(), pairing.clone());
+        window.connect_refresh(move |window| load_fork_compare(window, t.clone(), p.clone()));
+        let obj = self.obj().downgrade();
+        window.connect_keep(move |window, column| {
+            let Some(obj) = obj.upgrade() else { return };
+            let sides = pairing.sides(&thread);
+            let (Some(kept), Some(other)) = (sides.get(column), sides.get(1 - column.min(1)))
+            else {
+                return;
+            };
+            // Once kept, the window reads the pair again and shows what was decided.
+            let weak = window.downgrade();
+            let (t, p) = (thread.clone(), pairing.clone());
+            let reread = move || {
+                if let Some(window) = weak.upgrade() {
+                    load_fork_compare(&window, t, p);
+                }
+            };
+            obj.imp().confirm_keep(
+                window,
+                kept.thread.clone(),
+                other.thread.clone(),
+                std::boxed::Box::new(reread),
+            );
         });
         window.window().present();
+    }
+
+    /// Fork in Isolated Worktree and `/fork worktree` on `thread` (on `driver`, in `dir`): plans
+    /// the fork's worktree off the main thread (which says why there can be none: no git, no
+    /// repository, no free branch name), asks, then forks into it.
+    pub(super) fn fork_in_worktree(&self, thread: &str, driver: Driver, dir: String) {
+        if !agent_kit::git::git_installed() {
+            self.show_toast("Git is not installed on this system");
+            return;
+        }
+        let title = self.thread_title_of(thread);
+        let root = {
+            let root = self.config.borrow().worktree_root.trim().to_string();
+            (!root.is_empty()).then(|| PathBuf::from(crate::utils::expand_tilde(&root)))
+        };
+        let obj = self.obj().downgrade();
+        let thread = thread.to_owned();
+        glib::MainContext::default().spawn_local(async move {
+            let (source, slug) = (dir.clone(), title.clone());
+            let planned = off_main("planning the fork's worktree", move || {
+                let source = Path::new(&source);
+                crate::worktree::plan_fork(source, &slug, root.as_deref())
+                    .map_err(|e| worktree_repo_problem(source, &e))
+            })
+            .await;
+            let Some(obj) = obj.upgrade() else { return };
+            let plan = match planned {
+                Ok(plan) => plan,
+                Err(e) => {
+                    present_message(&obj, "Cannot Fork in a Worktree", &e);
+                    return;
+                }
+            };
+            let dialog = confirm_dialog(
+                "Fork in an Isolated Worktree?",
+                &format!(
+                    "Creates branch {} in a new worktree at {}, from a snapshot of “{title}”'s \
+                     folder, and opens the fork there.\n\nThe folder's uncommitted changes and \
+                     untracked files are copied, as one commit at the start of the branch, \
+                     except files whose names look like secrets (such as .env or a key), \
+                     ignored files and very large ones. Your own branch, index, working tree \
+                     and stash are left as they are.",
+                    plan.branch,
+                    plan.path.display()
+                ),
+                ("cancel", "Cancel"),
+                ("fork", "Fork in Worktree"),
+                adw::ResponseAppearance::Suggested,
+                true,
+            );
+            obj.imp().ask(dialog, "fork", move |imp, go| {
+                if go {
+                    imp.fork_thread_into(&thread, driver, dir, plan);
+                }
+            });
+        });
+    }
+
+    /// Keep This One in `over` (a compare window): asks first, over that window, naming what
+    /// changes (Cancel is the default), then keeps `kept` over `other` and calls `kept_then`.
+    fn confirm_keep(
+        &self,
+        over: &CompareWindow,
+        kept: String,
+        other: String,
+        kept_then: std::boxed::Box<dyn FnOnce()>,
+    ) {
+        let kept_title = self.thread_title_of(&kept);
+        let other_title = self.thread_title_of(&other);
+        let dialog = confirm_dialog(
+            &format!("Keep “{kept_title}”?"),
+            &format!(
+                "“{other_title}” is archived: it stays in the list behind Show Archived, and \
+                 nothing is deleted. A notice in “{kept_title}” records the choice. If \
+                 “{other_title}” has a worktree that is clean and open in no tab, you are \
+                 offered its removal; its branch is always kept.\n\nNothing is merged: to bring \
+                 a worktree's work into its base branch, use Merge into … in that thread's diff \
+                 panel first."
+            ),
+            ("cancel", "Cancel"),
+            ("keep", "Keep This One"),
+            adw::ResponseAppearance::Suggested,
+            false,
+        );
+        let obj = self.obj().downgrade();
+        let parent = over.window().clone();
+        glib::MainContext::default().spawn_local(async move {
+            if !crate::dialogs::confirmed(&dialog, &parent, "keep").await {
+                return;
+            }
+            if let Some(obj) = obj.upgrade() {
+                obj.imp().keep_fork(kept, other, kept_then);
+            }
+        });
+    }
+
+    /// Keeps `kept` over `other`, in the window that has `other` open: archiving it ends a
+    /// running turn and drops an unsent message as closing does, so that is asked first.
+    fn keep_fork(&self, kept: String, other: String, kept_then: std::boxed::Box<dyn FnOnce()>) {
+        if let Some(owner) = super::threads::thread_owner(&other).filter(|w| w != &*self.obj()) {
+            owner.imp().keep_fork(kept, other, kept_then);
+            return;
+        }
+        if let Some(reasons) = self.row_close_reasons(&RowKey::Thread(other.clone())) {
+            let id = other.clone();
+            self.confirm_stop_then(&id, reasons, move |imp| {
+                imp.keep_now(kept, other, kept_then)
+            });
+            return;
+        }
+        self.keep_now(kept, other, kept_then);
+    }
+
+    /// [`Self::keep_fork`] once nothing more is asked: closes `other`'s page, then archives it,
+    /// records the choice and posts the notice in one store write ([`Store::keep_fork`]). A
+    /// kept thread with a live session posts the notice itself, so its open view shows it.
+    fn keep_now(&self, kept: String, other: String, kept_then: std::boxed::Box<dyn FnOnce()>) {
+        self.close_row_without_discard(&other);
+        let owner = super::threads::thread_owner(&kept);
+        let session = owner
+            .as_ref()
+            .and_then(|w| w.imp().slot_of(&kept))
+            .and_then(|slot| slot.get());
+        let view = owner
+            .as_ref()
+            .and_then(|w| w.imp().with_chat(&kept, |c| c.view.clone()))
+            .flatten();
+        let write_notice = session.is_none();
+        let (k, o) = (kept.clone(), other.clone());
+        self.write_store_then(
+            "keep the thread",
+            move |s| s.keep_fork(&k, &o, write_notice),
+            move |imp, outcome| match outcome {
+                Some(Ok(done)) => {
+                    match (&session, &view) {
+                        (Some(session), _) => session.note(done.notice.clone()),
+                        // Stored already: an open view with no session shows it too.
+                        (None, Some(view)) => {
+                            view.sink()(&agent_core::event::Envelope::new(
+                                agent_core::event::Event::Notice {
+                                    text: done.notice.clone(),
+                                },
+                            ));
+                        }
+                        (None, None) => {}
+                    }
+                    imp.reload_summaries();
+                    kept_then();
+                    let (k, o) = (kept.clone(), other.clone());
+                    imp.action_toast(
+                        &done.notice,
+                        "Undo",
+                        10,
+                        adw::ToastPriority::Normal,
+                        move |imp| imp.undo_keep(&k, &o),
+                    );
+                    imp.offer_kept_worktree_removal(done.worktree, done.worktree_used_by);
+                }
+                failed => {
+                    let error = failed.and_then(Result::err).map_or_else(
+                        || "the thread store did not answer in time".to_owned(),
+                        |e| e.to_string(),
+                    );
+                    present_message(&imp.obj(), "Could Not Keep the Thread", &error);
+                }
+            },
+        );
+    }
+
+    /// Keep's Undo: brings `other` back and clears the record ([`Store::undo_keep_fork`]).
+    fn undo_keep(&self, kept: &str, other: &str) {
+        let (k, o) = (kept.to_owned(), other.to_owned());
+        self.write_store_then(
+            "restore the thread",
+            move |s| s.undo_keep_fork(&k, &o),
+            |imp, outcome| match outcome {
+                Some(Ok(())) => {
+                    imp.reload_summaries();
+                    imp.show_toast("Thread restored");
+                }
+                failed => {
+                    let error = failed.and_then(Result::err).map_or_else(
+                        || "the thread store did not answer in time".to_owned(),
+                        |e| e.to_string(),
+                    );
+                    present_message(&imp.obj(), "Could Not Restore the Thread", &error);
+                }
+            },
+        );
+    }
+
+    /// After a Keep: offers to remove the archived thread's worktree `info` only when no listed
+    /// thread works in it (`used_by` names one that does), no open tab is in it, and git says it
+    /// is registered and clean ([`crate::worktree::removal_blocker`], off the main thread);
+    /// otherwise says why it is kept. The removal itself is the clean-only one, which checks the
+    /// tabs again at the click and keeps the branch.
+    fn offer_kept_worktree_removal(
+        &self,
+        info: Option<crate::worktree::WorktreeInfo>,
+        used_by: Option<String>,
+    ) {
+        let Some(info) = info else { return };
+        let kept = |why: &str| format!("Its worktree ⎇ {} is kept: {why}", info.branch);
+        if let Some(title) = used_by {
+            self.show_toast(&kept(&format!("“{}” works in it", display_title(&title))));
+            return;
+        }
+        if self.worktree_in_use(&info.path) {
+            self.show_toast(&kept("a tab is open in it"));
+            return;
+        }
+        let obj = self.obj().downgrade();
+        glib::MainContext::default().spawn_local(async move {
+            let checked = info.clone();
+            let blocker = off_main("the status check", move || {
+                Ok(crate::worktree::removal_blocker(&checked))
+            })
+            .await;
+            let Some(obj) = obj.upgrade() else { return };
+            let imp = obj.imp();
+            match blocker {
+                Ok(None) => imp.action_toast(
+                    &format!("Worktree ⎇ {} is clean", info.branch),
+                    "Remove",
+                    10,
+                    adw::ToastPriority::Normal,
+                    move |imp| imp.remove_worktree(info.clone()),
+                ),
+                Ok(Some(why)) | Err(why) => {
+                    imp.show_toast(&format!("Its worktree ⎇ {} is kept: {why}", info.branch))
+                }
+            }
+        });
     }
 }
 
@@ -326,7 +627,11 @@ fn load_fork_compare(window: &CompareWindow, thread: String, pairing: Pairing) {
         })
         .await;
         let Some(window) = weak.upgrade() else { return };
-        let ForkColumns { columns, bases } = match read {
+        let ForkColumns {
+            columns,
+            bases,
+            kept,
+        } = match read {
             Some(Ok(read)) => read,
             Some(Err(why)) => {
                 window.show_error(generation, &why);
@@ -344,7 +649,7 @@ fn load_fork_compare(window: &CompareWindow, thread: String, pairing: Pairing) {
             .iter()
             .map(|c| c.summary.as_ref().map(|s| s.cwd.clone()))
             .collect();
-        let content = fork_content(relation, columns);
+        let content = fork_content(relation, columns, kept.as_deref());
         let headings: Vec<String> = content.columns.iter().map(|c| c.heading.clone()).collect();
         window.show(generation, &content);
         drop(window);
@@ -540,15 +845,62 @@ pub(super) mod tests {
                 },
             ]
         };
-        let fork = fork_content(Relation::Source, columns());
+        let fork = fork_content(Relation::Source, columns(), None);
         assert_eq!(fork.subtitle, "“A” and its fork “B”, since the fork");
         assert_eq!(fork.columns[0].entries.len(), 1);
         assert_eq!(
-            fork_content(Relation::Fork, columns()).subtitle,
+            fork_content(Relation::Fork, columns(), None).subtitle,
             fork.subtitle
         );
-        let siblings = fork_content(Relation::Sibling, columns());
+        let siblings = fork_content(Relation::Sibling, columns(), None);
         assert_eq!(siblings.subtitle, "“A” and “B”, two forks of one thread");
+    }
+
+    /// Keep This One is offered on both columns while both threads are there and in the list;
+    /// a settled pair says which was kept instead, and is not offered again.
+    #[test]
+    fn keep_is_offered_until_the_pair_is_settled() {
+        let column = |id: &str, archived: bool| CompareColumn {
+            summary: Some(ThreadSummary {
+                id: id.into(),
+                archived,
+                ..summary(id, Some("claude"), None)
+            }),
+            entries: Vec::new(),
+        };
+        let states = |columns: Vec<CompareColumn>, kept: Option<&str>| -> Vec<KeepState> {
+            fork_content(Relation::Source, columns, kept)
+                .columns
+                .iter()
+                .map(|c| c.keep)
+                .collect()
+        };
+        assert_eq!(
+            states(vec![column("a", false), column("b", false)], None),
+            [KeepState::Offered, KeepState::Offered]
+        );
+        assert_eq!(
+            states(vec![column("a", false), column("b", true)], Some("a")),
+            [KeepState::Kept, KeepState::Archived]
+        );
+        // Undone and brought back by hand since: nothing left to settle is shown as offered.
+        assert_eq!(
+            states(vec![column("a", false), column("b", false)], Some("b")),
+            [KeepState::None, KeepState::Kept]
+        );
+        // One archived by hand, or gone: nothing to keep it over.
+        assert_eq!(
+            states(vec![column("a", false), column("b", true)], None),
+            [KeepState::None, KeepState::Archived]
+        );
+        let gone = CompareColumn {
+            summary: None,
+            entries: Vec::new(),
+        };
+        assert_eq!(
+            states(vec![column("a", false), gone], None),
+            [KeepState::None, KeepState::None]
+        );
     }
 
     /// Fork thread records the link through the real fork path, and Compare opens a window on
@@ -908,6 +1260,150 @@ pub(super) mod tests {
         );
         assert_eq!(git(dir, &["rev-parse", "HEAD"]), before_fork.1);
         assert_eq!(git(dir, &["stash", "list"]), before_fork.2);
+        store.delete_thread(&source).expect("delete");
+        imp.reload_summaries();
+    }
+
+    /// Fork in Isolated Worktree, once confirmed, forks through the real path into a new
+    /// worktree made from a snapshot of the source's folder (its uncommitted work there, the
+    /// user's index and HEAD untouched), stored as a worktree thread with a baseline; then Keep
+    /// This One on the source archives the fork, never deleting it or its worktree, records the
+    /// choice and posts the notice in the source. Run from the window test (no store writer).
+    pub(in crate::window) fn a_fork_in_a_worktree_is_kept_and_its_pair_archived(
+        window: &crate::window::AgentTerminalWindow,
+    ) {
+        let imp = window.imp();
+        let ctx = glib::MainContext::default();
+        let store = super::super::threads::app_store();
+        let tmp = tempfile::tempdir().expect("dir");
+        let main = tmp.path().join("work/main");
+        std::fs::create_dir_all(&main).expect("dir");
+        if git(&main, &["init", "-q"]).is_none() {
+            eprintln!("git is not available; skipping");
+            return;
+        }
+        let main = main.canonicalize().expect("canonical");
+        std::fs::write(main.join("a.txt"), "one\n").expect("write");
+        git(&main, &["add", "."]).expect("add");
+        git(&main, &["commit", "-qm", "first"]).expect("commit");
+        std::fs::write(main.join("a.txt"), "uncommitted\n").expect("write");
+        let index = std::fs::read(main.join(".git/index")).expect("index");
+        let head = git(&main, &["rev-parse", "HEAD"]);
+
+        let main_s = main.to_string_lossy().into_owned();
+        let source = store
+            .create_thread(&main_s, Some("Worktree source"))
+            .expect("source");
+        store
+            .append_user_message(&source, None, "try something")
+            .expect("prompt");
+        imp.reload_summaries();
+        let known: std::collections::HashSet<String> = store
+            .list_threads(true)
+            .expect("list")
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        let plan = crate::worktree::plan_fork(&main, "Worktree source", None).expect("a plan");
+        assert_eq!(plan.branch, "fork/worktree-source-1");
+        imp.fork_thread_into(&source, Driver::Claude, main_s.clone(), plan.clone());
+        let mut fork = None;
+        assert!(
+            crate::testutil::pump_until(&ctx, 30, || {
+                fork = store
+                    .list_threads(true)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .map(|t| t.id)
+                    .find(|id| !known.contains(id));
+                fork.is_some()
+            }),
+            "the fork is stored"
+        );
+        let fork = fork.unwrap_or_default();
+        let attributes = store.thread_attributes(&fork).expect("attributes");
+        let info = attributes.worktree.clone().expect("a worktree thread");
+        assert_eq!((&info.path, &info.branch), (&plan.path, &plan.branch));
+        let cwd = store
+            .thread_summary(&fork)
+            .expect("read")
+            .expect("fork")
+            .cwd;
+        assert_eq!(
+            Path::new(&cwd).canonicalize().ok(),
+            plan.path.canonicalize().ok(),
+            "the fork works in its worktree"
+        );
+        let link = attributes.fork.expect("a fork link");
+        assert_eq!(link.source_thread, source);
+        let commit = link.base_commit.clone().expect("a baseline");
+        assert_eq!(
+            git(&info.path, &["rev-parse", "HEAD"]),
+            Some(commit.clone())
+        );
+        assert_eq!(
+            std::fs::read_to_string(info.path.join("a.txt"))
+                .ok()
+                .as_deref(),
+            Some("uncommitted\n"),
+            "the source's uncommitted work"
+        );
+        assert_eq!(std::fs::read(main.join(".git/index")).ok(), Some(index));
+        assert_eq!(git(&main, &["rev-parse", "HEAD"]), head);
+        let refname = crate::git::fork_ref(&fork).expect("a ref name");
+        assert!(crate::testutil::pump_until(&ctx, 20, || {
+            git(&main, &["rev-parse", "-q", "--verify", &refname]).as_deref()
+                == Some(commit.as_str())
+        }));
+
+        // Keep the source: the fork is archived (its page closed), never deleted.
+        imp.keep_now(source.clone(), fork.clone(), std::boxed::Box::new(|| {}));
+        assert!(
+            crate::testutil::pump_until(&ctx, 20, || store
+                .thread_summary(&fork)
+                .ok()
+                .flatten()
+                .is_some_and(|s| s.archived)),
+            "the fork is archived"
+        );
+        assert!(imp.page_of_thread(&fork).is_none(), "its page closed");
+        let notices: Vec<String> = store
+            .events(&source, None, 1000)
+            .expect("events")
+            .into_iter()
+            .filter_map(|(_, env)| match env.event {
+                agent_core::event::Event::Notice { text } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notices.iter().any(|n| n.starts_with("Kept over")),
+            "{notices:#?}"
+        );
+        let settled = store.fork_link(&fork).expect("read").expect("link");
+        assert_eq!(
+            settled.kept.map(|k| (k.thread, k.over)),
+            Some((source.clone(), fork.clone()))
+        );
+        assert!(
+            info.path.join("a.txt").exists(),
+            "its worktree is left alone"
+        );
+        assert!(
+            git(
+                &main,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "-q",
+                    &format!("refs/heads/{}", info.branch)
+                ]
+            )
+            .is_some(),
+            "its branch too"
+        );
+        store.delete_thread(&fork).expect("delete");
         store.delete_thread(&source).expect("delete");
         imp.reload_summaries();
     }

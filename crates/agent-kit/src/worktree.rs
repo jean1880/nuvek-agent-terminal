@@ -338,6 +338,130 @@ fn listed_worktree(porcelain: &str, path: &Path, branch: &str) -> bool {
     })
 }
 
+/// Why removing the worktree `info` would not be offered, or `None` when it may be: it must still
+/// be registered on its branch ([`is_registered`]) and hold nothing that removing it would lose
+/// ([`is_clean`]). A question git cannot answer is a reason too, never taken as clean. Whether a
+/// tab or another thread is in it is the caller's to ask.
+pub fn removal_blocker(info: &WorktreeInfo) -> Option<String> {
+    match is_registered(info) {
+        Ok(true) => {}
+        Ok(false) => return Some("it is no longer a worktree on its branch".to_owned()),
+        Err(e) => return Some(format!("git could not say whether it is a worktree: {e}")),
+    }
+    match is_clean(&info.path) {
+        Ok(true) => None,
+        Ok(false) => Some(
+            "it holds uncommitted, untracked or ignored files, which removing it would lose"
+                .to_owned(),
+        ),
+        Err(e) => Some(format!("git could not say whether it is clean: {e}")),
+    }
+}
+
+/// Where a fork in its own worktree goes ([`plan_fork`]), shown before it is made
+/// ([`add_fork`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkPlan {
+    /// The main working tree of the source's repository.
+    pub main_toplevel: PathBuf,
+    /// `fork/<slug>-<n>`, a branch that does not exist yet.
+    pub branch: String,
+    /// Where the worktree goes ([`default_path`]), not there yet.
+    pub path: PathBuf,
+    /// The branch the source has checked out, which "Merge into …" merges back into.
+    pub base: Option<String>,
+}
+
+/// Most numbered names [`plan_fork`] tries before giving up.
+const MAX_FORK_NAMES: u32 = 99;
+
+/// Where a fork of the thread in `source` would go in a worktree of its own: the first
+/// `fork/<slug>-<n>` (`slug` from [`agent_core::fork_compare::branch_slug`]) that names no branch
+/// and whose folder (under `root`, else beside the repository) does not exist. Read-only.
+pub fn plan_fork(source: &Path, slug: &str, root: Option<&Path>) -> Result<ForkPlan, String> {
+    let main = main_toplevel(source)?;
+    let slug = agent_core::fork_compare::branch_slug(slug);
+    for n in 1..=MAX_FORK_NAMES {
+        let branch = format!("fork/{slug}-{n}");
+        let path = default_path(&main, &branch, root);
+        if path.exists() || check_new_branch(&main, &branch).is_err() {
+            continue;
+        }
+        return Ok(ForkPlan {
+            base: current_branch(source),
+            main_toplevel: main,
+            branch,
+            path,
+        });
+    }
+    Err(format!(
+        "Every branch name from fork/{slug}-1 to fork/{slug}-{MAX_FORK_NAMES} is taken"
+    ))
+}
+
+/// A fork's worktree, made by [`add_fork`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkWorktree {
+    pub info: WorktreeInfo,
+    /// The snapshot of the source's folder the worktree's branch starts at: the fork's baseline.
+    pub baseline: crate::git::ForkBaseline,
+    /// The fork's folder: the worktree, or the same folder inside it the source was in.
+    pub dir: PathBuf,
+}
+
+/// Makes the worktree `plan` names for a fork of the thread in `source`: a snapshot of the
+/// source's working tree as a fork's baseline is taken ([`crate::git::take_fork_baseline`]:
+/// tracked changes and untracked files, less secret-looking, oversized and nested ones; the
+/// user's index, HEAD, working tree and stash untouched), then [`add`] puts `plan.branch` at that
+/// commit in a new worktree, so the fork starts with the source's uncommitted work. The branch
+/// is checked again first. Blocking.
+pub fn add_fork(source: &Path, plan: &ForkPlan) -> Result<ForkWorktree, String> {
+    check_new_branch(&plan.main_toplevel, &plan.branch)?;
+    let baseline = match crate::git::take_fork_baseline(source)? {
+        crate::git::BaselineOutcome::Taken(baseline) => baseline,
+        crate::git::BaselineOutcome::Busy => {
+            return Err(
+                "Git is busy in this repository (its index is locked); try again in a \
+                        moment"
+                    .to_owned(),
+            )
+        }
+        crate::git::BaselineOutcome::NotRepo => {
+            return Err("The thread's folder is not in a git repository".to_owned())
+        }
+    };
+    add(
+        &plan.main_toplevel,
+        &plan.branch,
+        &plan.path,
+        &baseline.commit,
+    )?;
+    // The fork works where the source did: the same folder inside the new worktree, when the
+    // snapshot has it.
+    let inner = source
+        .canonicalize()
+        .ok()
+        .and_then(|s| {
+            let top = baseline.toplevel.canonicalize().ok()?;
+            s.strip_prefix(top).ok().map(Path::to_path_buf)
+        })
+        .filter(|rel| !rel.as_os_str().is_empty());
+    let dir = match inner.map(|rel| plan.path.join(rel)) {
+        Some(dir) if dir.is_dir() => dir,
+        _ => plan.path.clone(),
+    };
+    Ok(ForkWorktree {
+        info: WorktreeInfo {
+            path: plan.path.clone(),
+            branch: plan.branch.clone(),
+            main_toplevel: plan.main_toplevel.clone(),
+            base: plan.base.clone(),
+        },
+        baseline,
+        dir,
+    })
+}
+
 /// Removes the worktree at `path`. Never forced: git refuses a dirty one.
 /// The branch is kept.
 pub fn remove(main_toplevel: &Path, path: &Path) -> Result<(), String> {
@@ -423,6 +547,145 @@ mod tests {
             json,
             "no base, no key"
         );
+    }
+
+    /// `<tmp>/work/main` with a commit and work in progress of every kind: a staged edit edited
+    /// again, an unstaged edit, a deleted tracked file, an untracked file, an untracked secret, a
+    /// subfolder, and a stash entry of the user's.
+    fn repo_with_work() -> Option<(tempfile::TempDir, PathBuf)> {
+        use crate::test_support::{git as sh, git_or_skip, init_repo_at};
+        use std::fs;
+        if !git_or_skip() {
+            return None;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("work/main");
+        fs::create_dir_all(&main).unwrap();
+        init_repo_at(
+            &main,
+            &[
+                ("a.txt", b"a\n"),
+                ("b.txt", b"b\n"),
+                ("gone.txt", b"gone\n"),
+                ("sub/c.txt", b"c\n"),
+                (".gitignore", b"build/\n"),
+            ],
+        );
+        let main = main.canonicalize().unwrap();
+        fs::write(main.join("b.txt"), "stashed\n").unwrap();
+        sh(&main, &["stash", "push", "-q", "-m", "mine"]);
+        fs::write(main.join("a.txt"), "staged\n").unwrap();
+        sh(&main, &["add", "a.txt"]);
+        fs::write(main.join("a.txt"), "staged then edited\n").unwrap();
+        fs::write(main.join("sub/c.txt"), "unstaged\n").unwrap();
+        fs::remove_file(main.join("gone.txt")).unwrap();
+        fs::write(main.join("new.txt"), "untracked\n").unwrap();
+        fs::write(main.join(".env"), "TOKEN=x\n").unwrap();
+        fs::create_dir_all(main.join("build")).unwrap();
+        fs::write(main.join("build/out.bin"), "ignored\n").unwrap();
+        Some((tmp, main))
+    }
+
+    #[test]
+    fn fork_worktree_starts_with_uncommitted_work() {
+        use crate::test_support::git as sh;
+        use std::fs;
+        let Some((_tmp, main)) = repo_with_work() else {
+            return;
+        };
+        let head = sh(&main, &["rev-parse", "HEAD"]);
+        let source = main.join("sub");
+        let plan = plan_fork(&source, "Try the --other way", None).unwrap();
+        assert_eq!(plan.branch, "fork/try-the-other-way-1");
+        assert_eq!(plan.path, default_path(&main, &plan.branch, None));
+        assert_eq!(plan.base.as_deref(), Some("main"));
+        assert!(!plan.path.exists(), "planning makes nothing");
+        let fork = add_fork(&source, &plan).unwrap();
+        let wt = &fork.info.path;
+        assert_eq!(current_branch(wt).as_deref(), Some(plan.branch.as_str()));
+        assert_eq!(fork.dir, wt.join("sub"), "the folder the source was in");
+        assert_eq!(fork.info.base.as_deref(), Some("main"));
+        assert_eq!(is_registered(&fork.info), Ok(true));
+        // The source's uncommitted work, as its working tree had it.
+        let read = |p: &str| fs::read_to_string(wt.join(p)).ok();
+        assert_eq!(read("a.txt").as_deref(), Some("staged then edited\n"));
+        assert_eq!(read("sub/c.txt").as_deref(), Some("unstaged\n"));
+        assert_eq!(read("new.txt").as_deref(), Some("untracked\n"));
+        assert_eq!(read("b.txt").as_deref(), Some("b\n"), "never the stash");
+        assert_eq!(read("gone.txt"), None, "a deletion is carried too");
+        // Never a secret-looking file, nor an ignored one.
+        assert_eq!(read(".env"), None);
+        assert!(fork.baseline.skipped.iter().any(|s| s.path == ".env"));
+        assert!(!wt.join("build").exists());
+        // The branch starts at the baseline, recorded on top of the source's HEAD.
+        assert_eq!(sh(wt, &["rev-parse", "HEAD"]), fork.baseline.commit);
+        assert_eq!(
+            sh(wt, &["rev-parse", &format!("{}^", fork.baseline.commit)]),
+            head
+        );
+        // The fork's baseline ref goes under the app's namespace only.
+        let thread = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        crate::git::keep_fork_baseline(&fork.dir, thread, &fork.baseline.commit).unwrap();
+        let refs = sh(&main, &["for-each-ref", "--format=%(refname)"]);
+        let ours: Vec<&str> = refs
+            .lines()
+            .filter(|r| !r.starts_with("refs/heads/") && *r != "refs/stash")
+            .collect();
+        assert_eq!(ours, [format!("refs/agent-terminal/fork/{thread}")]);
+        // The next plan for the same title takes the next number.
+        let next = plan_fork(&main, "Try the --other way", None).unwrap();
+        assert_eq!(next.branch, "fork/try-the-other-way-2");
+        // A fresh fork's worktree is clean (its work is the branch's first commit), so removal
+        // could be offered; once it is worked in, never.
+        assert_eq!(removal_blocker(&fork.info), None);
+        fs::write(wt.join("later.txt"), "fork's own\n").unwrap();
+        assert!(removal_blocker(&fork.info).is_some_and(|why| why.contains("uncommitted")));
+        // A plan made stale by a branch of that name since is refused before anything is made.
+        sh(&main, &["branch", &next.branch]);
+        assert!(add_fork(&main, &next).is_err());
+        assert!(!next.path.exists());
+    }
+
+    #[test]
+    fn fork_worktree_leaves_the_users_index_head_and_stash_alone() {
+        use crate::test_support::git as sh;
+        use std::fs;
+        let Some((_tmp, main)) = repo_with_work() else {
+            return;
+        };
+        let state = || {
+            (
+                fs::read(main.join(".git/index")).unwrap(),
+                sh(&main, &["rev-parse", "HEAD"]),
+                sh(&main, &["symbolic-ref", "HEAD"]),
+                sh(&main, &["stash", "list"]),
+                // (Not `git status`, which may refresh the index itself.)
+                fs::read_to_string(main.join("a.txt")).unwrap(),
+                fs::read_to_string(main.join("sub/c.txt")).unwrap(),
+                main.join("gone.txt").exists(),
+                main.join(".env").exists(),
+            )
+        };
+        let before = state();
+        let plan = plan_fork(&main, "fork", None).unwrap();
+        let fork = add_fork(&main, &plan).unwrap();
+        assert_eq!(
+            state(),
+            before,
+            "forking into a worktree touched the user's state"
+        );
+        assert_eq!(sh(&main, &["stash", "list"]).lines().count(), 1);
+        // Removing it, clean, keeps the branch and still leaves the user's state alone.
+        assert_eq!(removal_blocker(&fork.info), None);
+        remove(&main, &fork.info.path).unwrap();
+        assert!(
+            check_new_branch(&main, &plan.branch).is_err(),
+            "the branch is kept"
+        );
+        assert_eq!(state(), before);
+        // A source not in a repository has no plan.
+        let plain = tempfile::tempdir().unwrap();
+        assert!(plan_fork(plain.path(), "x", None).is_err());
     }
 
     mod repo {

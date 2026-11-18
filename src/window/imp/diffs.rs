@@ -90,9 +90,14 @@ pub(super) struct ThreadDiffs {
     toast: Toast,
     /// Itself, so the async halves of the [`DiffSource`] methods can keep it alive.
     me: std::rc::Weak<ThreadDiffs>,
+    /// The thread's folder is on another machine: no baseline is ever taken (so no checkpoint
+    /// ref is made), a card shows only the agent's own edit, and nothing opens a local file.
+    remote: bool,
 }
 
 impl ThreadDiffs {
+    /// The diffs of a thread whose stored folder is `dir`: one on another machine
+    /// (`ssh://…`) touches nothing of this machine's ([`Self::remote`]).
     pub(super) fn new(dir: &str, key: u64, label: &str, toast: Toast) -> Rc<Self> {
         Rc::new_cyclic(|me| Self {
             me: me.clone(),
@@ -103,13 +108,29 @@ impl ThreadDiffs {
             current: RefCell::default(),
             in_turn: Cell::new(false),
             toast,
+            remote: agent_core::remote::is_remote_cwd(dir),
         })
+    }
+
+    /// Whether this thread's folder is on another machine.
+    #[cfg(test)]
+    pub(super) fn is_remote(&self) -> bool {
+        self.remote
+    }
+
+    /// Baselines taken so far (each one a checkpoint ref when kept).
+    #[cfg(test)]
+    pub(super) fn baselines_started(&self) -> bool {
+        self.current.borrow().is_some()
     }
 
     /// A turn started: records the baseline. A second start event inside the same turn (an agent
     /// that re-announces itself) must not replace it with a state that already has the turn's
-    /// edits in it.
+    /// edits in it. On another machine nothing is recorded: the working tree is not here.
     pub(super) fn turn_started(&self, keep_ref: bool) {
+        if self.remote {
+            return;
+        }
         if self.in_turn.replace(true) {
             return;
         }
@@ -172,6 +193,10 @@ impl ThreadDiffs {
 
 impl DiffSource for ThreadDiffs {
     fn load(&self, ask: DiffAsk, done: Box<dyn FnOnce(DiffReply)>) {
+        if self.remote {
+            done(filediff::agent_edit_only(&ask.input));
+            return;
+        }
         let Some(me) = self.me.upgrade() else { return };
         let dir = self.dir.clone();
         glib::MainContext::default().spawn_local(async move {
@@ -185,10 +210,19 @@ impl DiffSource for ThreadDiffs {
     }
 
     fn open_in_editor(&self, ask: DiffAsk, parent: gtk4::Widget) {
+        if self.remote {
+            (self.toast)(agent_core::remote::NOT_ON_REMOTE);
+            return;
+        }
         self.open_first_file_in_editor(ask, parent);
     }
 
     fn open_location(&self, location: agent_kit::editor::Location, parent: gtk4::Widget) {
+        // A path from an agent on another machine names a file there, never this machine's.
+        if self.remote {
+            (self.toast)(agent_core::remote::NOT_ON_REMOTE);
+            return;
+        }
         let toast = Rc::clone(&self.toast);
         crate::editor_tool::open_with_toast(
             crate::editor_tool::OpenRequest::at(PathBuf::from(&self.dir), location),
@@ -198,6 +232,10 @@ impl DiffSource for ThreadDiffs {
     }
 
     fn open_external(&self, ask: DiffAsk) {
+        if self.remote {
+            (self.toast)(agent_core::remote::NOT_ON_REMOTE);
+            return;
+        }
         let Some(me) = self.me.upgrade() else { return };
         let dir = self.dir.clone();
         let Some(tool) = DiffTools::shared().get() else {
@@ -310,6 +348,68 @@ mod tests {
 
     fn diffs() -> Rc<ThreadDiffs> {
         ThreadDiffs::new("/nonexistent", 1, "test", Rc::new(|_| {}))
+    }
+
+    /// A thread on another machine reaches no checkpoint or diff path: a turn takes no baseline
+    /// (so no `refs/agent-terminal/` ref is ever made, even when this machine has a repository
+    /// at the same path), a card shows the agent's own edit without reading the local file, and
+    /// opening a file or the diff tool is refused with the reason.
+    #[test]
+    fn a_remote_thread_takes_no_baseline_and_reads_no_local_file() {
+        let repo = tempfile::tempdir().unwrap();
+        let local = repo.path().join("app.rs");
+        std::fs::write(&local, "LOCAL\n").unwrap();
+        let cwd = format!("ssh://box{}", repo.path().display());
+        let toasts = Rc::new(RefCell::new(Vec::<String>::new()));
+        let seen = Rc::clone(&toasts);
+        let d = ThreadDiffs::new(
+            &cwd,
+            1,
+            "test",
+            Rc::new(move |t: &str| seen.borrow_mut().push(t.to_owned())),
+        );
+        assert!(d.is_remote());
+        assert!(!diffs().is_remote());
+        d.turn_started(true);
+        assert!(!d.baselines_started(), "a remote turn takes no baseline");
+        assert!(!d.in_turn.get());
+        d.item_started("edit");
+        assert_eq!(d.bound_items(), 0);
+        assert!(
+            !repo.path().join(".git").exists(),
+            "nothing ran git in the folder"
+        );
+
+        let input = serde_json::json!({
+            "file_path": local.to_string_lossy(),
+            "old_string": "a\n",
+            "new_string": "b\n",
+        });
+        let reply = Rc::new(RefCell::new(None));
+        let got = Rc::clone(&reply);
+        d.load(
+            DiffAsk {
+                item: "edit".into(),
+                input: input.clone(),
+            },
+            Box::new(move |r| *got.borrow_mut() = Some(r)),
+        );
+        let shown = reply
+            .borrow_mut()
+            .take()
+            .expect("answered at once")
+            .unwrap();
+        assert_eq!(shown.origin, filediff::Origin::AgentEdit);
+        assert!(!shown.text.contains("LOCAL"));
+
+        d.open_external(DiffAsk {
+            item: "edit".into(),
+            input,
+        });
+        assert_eq!(
+            toasts.borrow().as_slice(),
+            [agent_core::remote::NOT_ON_REMOTE]
+        );
     }
 
     #[test]

@@ -1,10 +1,11 @@
 //! Machines reached with the user's own `ssh`: Settings → General → Remote Machines (the list,
-//! each machine's Check and Remove) and New Terminal Thread on Another Machine… (the dialog that
-//! opens a terminal page there).
+//! each machine's Check and Remove), New Terminal Thread on Another Machine… (the dialog that
+//! opens a terminal page there) and New Thread on Another Machine… (Claude or Codex there).
 //!
 //! Nothing here connects on its own. A check runs only when its button is pressed, a page
-//! connects only when the user opens it (or presses Reconnect on it), and remote pages are never
-//! saved for Reopen Terminal Tabs, so no `ssh` starts at launch.
+//! connects only when the user opens it (or presses Reconnect on it), a thread there is checked
+//! only when the user presses Create and its agent starts only when the user opens it, and
+//! neither remote pages nor remote threads are reopened at launch, so no `ssh` starts then.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -95,6 +96,24 @@ pub(super) fn entry_row(
         .build();
     row.add_suffix(&entry);
     (row, entry)
+}
+
+/// Marks a folder row invalid (with `problem`) or valid, for the eye and a screen reader.
+fn mark_folder(row: &adw::EntryRow, problem: Option<&str>) {
+    match problem {
+        Some(problem) => {
+            row.add_css_class("error");
+            row.set_tooltip_text(Some(problem));
+            row.upcast_ref::<gtk4::Widget>()
+                .update_property(&[gtk4::accessible::Property::Description(problem)]);
+        }
+        None => {
+            row.remove_css_class("error");
+            row.set_tooltip_text(None);
+            row.upcast_ref::<gtk4::Widget>()
+                .update_property(&[gtk4::accessible::Property::Description("")]);
+        }
+    }
 }
 
 const ALIAS_HELP: &str = "A Host from your ssh configuration, a host name, or user@host";
@@ -230,12 +249,23 @@ impl Machines {
                     }
                     let text = alias_entry.text().to_string();
                     let old = alias_current.borrow().clone();
+                    // A rename while something runs there would leave it connected to a
+                    // machine the list no longer names: refused, naming what runs.
+                    if text.trim() != old {
+                        let uses = imp.remote_machine_in_use(&old);
+                        if let Some(why) = in_use_refusal("rename", &old, &uses) {
+                            mark_entry(&alias_entry, &alias_row, Some(&why), ALIAS_HELP);
+                            return;
+                        }
+                    }
                     let result = imp.config.borrow_mut().set_remote_alias(index, &text);
                     match result {
                         Ok(false) => {}
                         Ok(true) => {
-                            // A new name is a new machine as far as the check knows.
+                            // A new name is a new machine as far as the check knows, and the
+                            // agents found under the old name are found again under the new.
                             this.checks.borrow_mut().remove(&old);
+                            agent_kit::remote::forget(&old);
                             imp.schedule_config_save();
                             let host = imp.config.borrow().remote_hosts.get(index).cloned();
                             if let Some(host) = host {
@@ -322,6 +352,7 @@ impl Machines {
 
         let this = Rc::downgrade(self);
         let remove_here = Rc::clone(&still_here);
+        let remove_current = Rc::clone(&current);
         remove.connect_clicked(move |_| {
             let Some(this) = this.upgrade() else {
                 return;
@@ -333,12 +364,19 @@ impl Machines {
             if !remove_here(imp) {
                 return;
             }
+            let alias = remove_current.borrow().clone();
+            let uses = imp.remote_machine_in_use(&alias);
+            if let Some(why) = in_use_refusal("remove", &alias, &uses) {
+                super::present_message(&window, "Cannot Remove the Machine", &why);
+                return;
+            }
             let removed = {
                 let mut config = imp.config.borrow_mut();
                 (index < config.remote_hosts.len()).then(|| config.remote_hosts.remove(index))
             };
             if let Some(host) = removed {
                 this.checks.borrow_mut().remove(&host.alias);
+                agent_kit::remote::forget(&host.alias);
                 imp.schedule_config_save();
                 // Rebuilt after this handler returns, since it removes this very button's row.
                 let this = Rc::clone(&this);
@@ -356,10 +394,7 @@ impl Machines {
             .insert(alias.clone(), RemoteCheck::Checking);
         row.set_subtitle(&glib::markup_escape_text(&RemoteCheck::Checking.describe()));
         // The same environment a page on that machine gets.
-        let env = self
-            .window()
-            .map(|w| w.imp().terminal_env())
-            .unwrap_or_default();
+        let env = self.window().map(|w| w.imp().ssh_env()).unwrap_or_default();
         let this = Rc::downgrade(self);
         let row = row.downgrade();
         let button = button.downgrade();
@@ -396,7 +431,268 @@ impl Machines {
     }
 }
 
+/// Why Settings refuses to `action` ("remove" or "rename") the machine `alias` while `uses`
+/// (what still connects there, [`AgentTerminalWindow::remote_machine_in_use`]) is not empty;
+/// `None` when nothing does.
+fn in_use_refusal(action: &str, alias: &str, uses: &[String]) -> Option<String> {
+    let (last, rest) = uses.split_last()?;
+    let named = if rest.is_empty() {
+        last.clone()
+    } else {
+        format!("{} and {last}", rest.join(", "))
+    };
+    Some(format!(
+        "{alias} cannot be {action}d while {named} still connects there. Stop the thread, close \
+         the drawer or page, then {action} it."
+    ))
+}
+
+/// Whether a thread in `folder` may run `driver`: Claude or Codex, on a machine still listed in
+/// Settings ([`remote::listed`]). Checked when the thread is made and again at every start.
+pub(super) fn remote_thread_allowed(
+    config: &crate::config::TerminalConfig,
+    folder: &remote::RemoteFolder,
+    driver: agent_core::adapter::Driver,
+) -> Result<(), String> {
+    remote::chat_cli(driver)?;
+    remote::listed(&config.remote_hosts, folder.alias())
+}
+
+/// The agents a thread on another machine can run, in the dialog's order.
+const REMOTE_AGENTS: [agent_core::adapter::Driver; 2] = [
+    agent_core::adapter::Driver::Claude,
+    agent_core::adapter::Driver::Codex,
+];
+
+/// Asks `alias` where `driver`'s CLI is and what `dir` is there, with the user's `ssh` in batch
+/// mode (`env`: the environment a remote page gets). Blocking: call it off the main thread.
+fn check_remote_thread(
+    alias: &str,
+    dir: &str,
+    driver: agent_core::adapter::Driver,
+    env: Vec<String>,
+) -> Result<remote::RemoteFolder, agent_kit::remote::RemoteError> {
+    use agent_kit::remote::RemoteError;
+    let cli = remote::chat_cli(driver).map_err(RemoteError::Refused)?;
+    let Some(program) = glib::find_program_in_path("ssh") else {
+        return Err(RemoteError::Refused(
+            "ssh was not found. Install the OpenSSH client.".to_owned(),
+        ));
+    };
+    let ssh = agent_kit::remote::Ssh {
+        program: program.to_string_lossy().into_owned(),
+        env,
+    };
+    let probe = agent_kit::remote::probe(&ssh, alias, cli)?;
+    let canonical = agent_kit::remote::check_folder(&ssh, alias, dir, &probe)?;
+    remote::RemoteFolder::new(alias, &canonical).map_err(RemoteError::Refused)
+}
+
 impl AgentTerminalWindow {
+    /// Creates a thread on another machine in `folder` (already checked there) on `driver`
+    /// (else the default agent, when Claude or Codex, else Claude), opened once stored.
+    pub(super) fn new_remote_chat_thread(
+        &self,
+        driver: Option<agent_core::adapter::Driver>,
+        folder: remote::RemoteFolder,
+    ) {
+        let driver = driver
+            .or_else(|| self.default_agent())
+            .filter(|d| remote::chat_cli(*d).is_ok())
+            .unwrap_or(agent_core::adapter::Driver::Claude);
+        if let Err(why) = remote_thread_allowed(&self.config.borrow(), &folder, driver) {
+            super::present_message(&self.obj(), "Cannot Create a Thread", &why);
+            return;
+        }
+        tracing::info!("New thread on another machine");
+        self.store_new_thread(super::threads::NewThread::new(driver), folder.cwd());
+    }
+
+    /// Offers, in a toast, a terminal page on `alias` in `dir`: where the user answers what a
+    /// batch `ssh` cannot (a host key to accept, a password).
+    pub(super) fn offer_remote_terminal(&self, alias: &str, dir: &str) {
+        let remote = RemoteTab {
+            alias: alias.to_owned(),
+            dir: dir.to_owned(),
+        };
+        self.action_toast(
+            &format!("{alias} needs you to accept its key or sign in"),
+            "Open a Terminal There",
+            15,
+            adw::ToastPriority::High,
+            move |imp| imp.add_remote_terminal_tab(remote.clone()),
+        );
+    }
+
+    /// The dialog said when no machine is listed: where to add one.
+    fn no_remote_machines(&self) {
+        let obj = self.obj();
+        let dialog = crate::dialogs::confirm_dialog(
+            "No Remote Machines",
+            "Add a machine in Settings → General → Remote Machines, by the name you reach it \
+             with ssh. Then open a thread on it from here.",
+            ("close", "Close"),
+            ("settings", "Open Settings"),
+            adw::ResponseAppearance::Suggested,
+            true,
+        );
+        dialog.connect_response(
+            Some("settings"),
+            glib::clone!(
+                #[weak]
+                obj,
+                move |_, _| obj.imp().show_preferences()
+            ),
+        );
+        dialog.present(Some(&*obj));
+    }
+
+    /// New Thread on Another Machine…: a listed machine, a folder there and Claude or Codex.
+    /// Create asks the machine (off the main thread, `ssh` in batch mode) where the agent is
+    /// and what the folder is canonically, then makes the thread; nothing connects before.
+    pub(super) fn show_remote_thread_dialog(&self) {
+        let obj = self.obj();
+        let hosts = self.config.borrow().remote_hosts.clone();
+        if hosts.is_empty() {
+            self.no_remote_machines();
+            return;
+        }
+        let dialog = crate::dialogs::confirm_dialog(
+            "New Thread on Another Machine",
+            "Runs the agent there with your own ssh, never asking for anything: accept a new \
+             machine's key or a password in a terminal page there first. Approvals offer Allow \
+             once and Deny only; checkpoints, changes, undo and hand-off briefs are not \
+             available on another machine.",
+            ("cancel", "Cancel"),
+            ("create", "Create"),
+            adw::ResponseAppearance::Suggested,
+            true,
+        );
+        let names: Vec<String> = hosts
+            .iter()
+            .map(|h| {
+                if h.display_name() == h.alias {
+                    h.alias.clone()
+                } else {
+                    format!("{} ({})", h.display_name(), h.alias)
+                }
+            })
+            .collect();
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let machine = adw::ComboRow::builder()
+            .title("Machine")
+            .model(&gtk4::StringList::new(&name_refs))
+            .build();
+        let agent_names: Vec<&str> = REMOTE_AGENTS.iter().map(|d| d.info().label).collect();
+        let agent = adw::ComboRow::builder()
+            .title("Agent")
+            .model(&gtk4::StringList::new(&agent_names))
+            .build();
+        if let Some(at) = self
+            .default_agent()
+            .and_then(|d| REMOTE_AGENTS.iter().position(|r| *r == d))
+        {
+            agent.set_selected(at as u32);
+        }
+        let folder = adw::EntryRow::builder()
+            .title("Folder There (~ is your home there)")
+            .text("~")
+            .activates_default(true)
+            .build();
+        let rows = gtk4::ListBox::builder()
+            .selection_mode(gtk4::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+        rows.append(&machine);
+        rows.append(&agent);
+        rows.append(&folder);
+        dialog.set_extra_child(Some(&rows));
+        folder.connect_changed(glib::clone!(
+            #[weak]
+            dialog,
+            move |row| {
+                let problem = remote::parse_remote_dir(&row.text()).err();
+                mark_folder(row, problem.as_deref());
+                dialog.set_response_enabled("create", problem.is_none());
+            }
+        ));
+        dialog.connect_response(
+            Some("create"),
+            glib::clone!(
+                #[weak]
+                obj,
+                #[weak]
+                machine,
+                #[weak]
+                agent,
+                #[weak]
+                folder,
+                move |_, _| {
+                    let Some(host) = hosts.get(machine.selected() as usize) else {
+                        return;
+                    };
+                    let Some(&driver) = REMOTE_AGENTS.get(agent.selected() as usize) else {
+                        return;
+                    };
+                    let Ok(dir) = remote::parse_remote_dir(&folder.text()) else {
+                        return;
+                    };
+                    obj.imp()
+                        .create_remote_thread(host.alias.clone(), dir, driver);
+                }
+            ),
+        );
+        dialog.present(Some(&*obj));
+    }
+
+    /// Checks `dir` and the agent on `alias` off the main thread, then makes the thread, or says
+    /// why not (offering a terminal page there when one would get past it).
+    fn create_remote_thread(
+        &self,
+        alias: String,
+        dir: String,
+        driver: agent_core::adapter::Driver,
+    ) {
+        if let Err(why) = remote::listed(&self.config.borrow().remote_hosts, &alias) {
+            super::present_message(&self.obj(), "Cannot Create a Thread", &why);
+            return;
+        }
+        self.show_toast(&format!("Checking {alias}…"));
+        let env = self.ssh_env();
+        let obj = self.obj().downgrade();
+        glib::MainContext::default().spawn_local(async move {
+            let (asked_alias, asked_dir) = (alias.clone(), dir.clone());
+            let checked = gtk4::gio::spawn_blocking(move || {
+                check_remote_thread(&asked_alias, &asked_dir, driver, env)
+            })
+            .await
+            .unwrap_or_else(|_| {
+                Err(agent_kit::remote::RemoteError::Refused(
+                    "the check of the other machine failed".to_owned(),
+                ))
+            });
+            let Some(obj) = obj.upgrade() else { return };
+            let imp = obj.imp();
+            if imp.is_closing() {
+                return;
+            }
+            match checked {
+                Ok(folder) => imp.new_remote_chat_thread(Some(driver), folder),
+                Err(failure) => {
+                    tracing::info!("A thread on another machine could not be made");
+                    if failure.needs_terminal() {
+                        imp.offer_remote_terminal(&alias, &dir);
+                    }
+                    super::present_message(
+                        &obj,
+                        "Cannot Create a Thread",
+                        &format!("{alias}: {}", failure.reason()),
+                    );
+                }
+            }
+        });
+    }
+
     /// Settings → General → Remote Machines.
     pub(super) fn remote_machines_group(&self) -> adw::PreferencesGroup {
         let group = adw::PreferencesGroup::builder()
@@ -479,24 +775,7 @@ impl AgentTerminalWindow {
         let obj = self.obj();
         let hosts = self.config.borrow().remote_hosts.clone();
         if hosts.is_empty() {
-            let dialog = crate::dialogs::confirm_dialog(
-                "No Remote Machines",
-                "Add a machine in Settings → General → Remote Machines, by the name you reach it \
-                 with ssh. Then open a terminal on it from here.",
-                ("close", "Close"),
-                ("settings", "Open Settings"),
-                adw::ResponseAppearance::Suggested,
-                true,
-            );
-            dialog.connect_response(
-                Some("settings"),
-                glib::clone!(
-                    #[weak]
-                    obj,
-                    move |_, _| obj.imp().show_preferences()
-                ),
-            );
-            dialog.present(Some(&*obj));
+            self.no_remote_machines();
             return;
         }
 
@@ -543,20 +822,7 @@ impl AgentTerminalWindow {
             dialog,
             move |row| {
                 let problem = remote::parse_remote_dir(&row.text()).err();
-                match &problem {
-                    Some(problem) => {
-                        row.add_css_class("error");
-                        row.set_tooltip_text(Some(problem));
-                        row.upcast_ref::<gtk4::Widget>()
-                            .update_property(&[gtk4::accessible::Property::Description(problem)]);
-                    }
-                    None => {
-                        row.remove_css_class("error");
-                        row.set_tooltip_text(None);
-                        row.upcast_ref::<gtk4::Widget>()
-                            .update_property(&[gtk4::accessible::Property::Description("")]);
-                    }
-                }
+                mark_folder(row, problem.as_deref());
                 dialog.set_response_enabled("open", problem.is_none());
             }
         ));
@@ -651,6 +917,59 @@ pub(super) mod tests {
             "a refused rename keeps the saved name"
         );
         assert!(alias.has_css_class("error"));
+
+        // A terminal page there (started with no ssh): the machine is neither renamed nor
+        // removed while it is open, and the refusal names it.
+        let trash = || {
+            crate::testutil::descendants(group.upcast_ref())
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk4::Button>().ok())
+                .find(|b| b.icon_name().as_deref() == Some("at-user-trash-symbolic"))
+                .expect("a remove button")
+        };
+        crate::window::imp::SPAWN_TERMINAL_PAGES.with(|s| s.set(false));
+        imp.add_remote_terminal_tab(RemoteTab {
+            alias: "box".into(),
+            dir: "~/src".into(),
+        });
+        crate::testutil::settle(&ctx);
+        let page = imp
+            .tabs
+            .borrow()
+            .iter()
+            .find(|t| t.remote.is_some() && t.chat.is_none())
+            .map(|t| t.page.clone())
+            .expect("the remote page");
+        let uses = imp.remote_machine_in_use("box");
+        assert_eq!(uses.len(), 1, "{uses:?}");
+        assert!(uses[0].starts_with("the terminal page box:"), "{uses:?}");
+        assert!(imp.remote_machine_in_use("other").is_empty());
+        commit(&alias, "box3");
+        assert_eq!(
+            hosts()[0].alias,
+            "box",
+            "no rename while a page is open there"
+        );
+        assert!(alias.has_css_class("error"));
+        trash().emit_clicked();
+        crate::testutil::settle(&ctx);
+        assert_eq!(hosts().len(), 1, "no removal while a page is open there");
+        let refusal = window.visible_dialog().expect("the refusal is said");
+        assert!(
+            crate::testutil::label_texts(refusal.upcast_ref::<gtk4::Widget>())
+                .iter()
+                .any(|t| t.contains("the terminal page box:"))
+        );
+        refusal.force_close();
+        imp.tab_view
+            .borrow()
+            .as_ref()
+            .expect("the tab view")
+            .close_page(&page);
+        crate::testutil::settle(&ctx);
+        crate::window::imp::SPAWN_TERMINAL_PAGES.with(|s| s.set(true));
+        assert!(imp.remote_machine_in_use("box").is_empty());
+
         commit(&alias, "box2");
         assert_eq!(hosts()[0].alias, "box2");
         assert!(!alias.has_css_class("error"));
@@ -672,5 +991,32 @@ pub(super) mod tests {
         assert_eq!(entries().len(), 1, "only the add row is left");
 
         imp.config.borrow_mut().remote_hosts = before;
+    }
+
+    #[test]
+    fn a_refusal_names_everything_still_connected() {
+        assert_eq!(in_use_refusal("remove", "box", &[]), None);
+        let one = in_use_refusal("rename", "box", &["the thread “A”".to_owned()]).unwrap();
+        assert!(
+            one.starts_with("box cannot be renamed while the thread “A” still"),
+            "{one}"
+        );
+        let three = in_use_refusal(
+            "remove",
+            "box",
+            &[
+                "the thread “A”".to_owned(),
+                "the terminal drawer of “A”".to_owned(),
+                "the terminal page box:~".to_owned(),
+            ],
+        )
+        .unwrap();
+        assert!(
+            three.contains(
+                "removed while the thread “A”, the terminal drawer of “A” and the terminal page \
+                 box:~ still"
+            ),
+            "{three}"
+        );
     }
 }

@@ -197,6 +197,17 @@ fn die_with_app(parent: libc::pid_t) {
     let _ = parent;
 }
 
+/// Whether anything [`AgentProcess::spawn`] hands gio holds a NUL.
+fn nul_in_spec(spec: &SpawnSpec) -> bool {
+    spec.argv.iter().any(|a| a.contains('\0'))
+        || spec.cwd.as_deref().is_some_and(|c| c.contains('\0'))
+        || spec
+            .env
+            .iter()
+            .any(|(k, v)| k.contains('\0') || v.contains('\0'))
+        || spec.unset.iter().any(|k| k.contains('\0'))
+}
+
 /// A running agent. Dropping it terminates the process (SIGTERM, then SIGKILL after a grace).
 pub struct AgentProcess {
     shared: Rc<Shared>,
@@ -215,6 +226,11 @@ impl AgentProcess {
         let Some(program) = spec.argv.first() else {
             return Err("empty command line".to_owned());
         };
+        // No argv, environment or folder can hold a NUL: gio would panic making a C string of
+        // it. Refused here, so a value an agent reported can never take the app down.
+        if nul_in_spec(spec) {
+            return Err("the command line holds a NUL character".to_owned());
+        }
         // A model server's key helper that was never bound to its key file: refused, never run.
         if agent_core::provider::needs_key_file(&spec.argv) {
             return Err("the model server's key was not prepared for this start".to_owned());
@@ -1179,6 +1195,38 @@ mod tests {
             };
             assert!(AgentProcess::spawn(&spec, |_| {}, |_| {}, |_| {}).is_err());
             assert!(AgentProcess::spawn(&SpawnSpec::default(), |_| {}, |_| {}, |_| {}).is_err());
+        });
+    }
+
+    /// A NUL anywhere gio would make a C string of (a session id an agent reported, say) is an
+    /// error, never a panic.
+    #[test]
+    fn a_nul_in_the_command_line_is_an_error_not_a_panic() {
+        in_loop(|_| {
+            let specs = [
+                SpawnSpec {
+                    argv: vec!["true".into(), "--resume=se\0ssion".into()],
+                    ..SpawnSpec::default()
+                },
+                SpawnSpec {
+                    argv: vec!["true".into()],
+                    env: vec![("X".into(), "a\0b".into())],
+                    ..SpawnSpec::default()
+                },
+                SpawnSpec {
+                    argv: vec!["true".into()],
+                    cwd: Some("/tmp\0x".into()),
+                    ..SpawnSpec::default()
+                },
+            ];
+            for spec in &specs {
+                let refused = AgentProcess::spawn(spec, |_| {}, |_| {}, |_| {});
+                assert!(
+                    refused.as_ref().is_err_and(|why| why.contains("NUL")),
+                    "{:?}",
+                    spec.argv
+                );
+            }
         });
     }
 

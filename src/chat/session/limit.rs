@@ -49,7 +49,9 @@ impl ChatSession {
 
 impl Inner {
     fn continue_after_limit(self: &Rc<Self>) -> ContinueOutcome {
-        if self.child.is_some() || self.wakes_held.get() {
+        // A thread on another machine never continues on its own: that would start its agent
+        // there with nobody asking. The user's next message does.
+        if self.child.is_some() || self.wakes_held.get() || self.remote.is_some() {
             return ContinueOutcome::Refused;
         }
         // A delegation root may need a rebind first: the hook starts it and says no.

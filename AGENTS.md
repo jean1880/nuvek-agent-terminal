@@ -93,8 +93,13 @@ Architectural mandates, standards, and workflows for this codebase.
     the Local agent's gate) and `export` (a thread as Markdown or JSON: agent labels and
     dividers, capped fenced tool output, a final redaction pass; `agent-kit`'s `export` reads,
     renders and writes it `0600` and atomically) and `remote` (machines reached with the user's
-    `ssh`: host validation, the remote folder, POSIX quoting and the exact `ssh` argv of a
-    terminal page and of the reachability check) and `search_query` (the sidebar search's one
+    `ssh`: host validation and `listed`, the remote folder, POSIX quoting and the exact `ssh`
+    argv of a terminal page, of the reachability check and of a remote thread's agent
+    (`ssh_chat_argv`), the probe and folder-check command lines and their parsers,
+    `ThreadFolder`, which reads a stored `cwd` as `Local` or `Remote` (`ssh://<alias><abs path>`,
+    an unreadable `ssh://` value an error, never a local path), `chat_cli` (Claude and Codex
+    only), `approval_options` (Allow once and Deny) and `Subsystem::ALL`/`support`, what a remote
+    thread has of each part) and `search_query` (the sidebar search's one
     grammar, `SearchQuery`: plain words, and `#tag` words that filter by tag, ANDed; `compile`
     makes only the plain words an FTS5 query: quoted phrases, the last a prefix, never a syntax
     error) and `thread_tag` (a thread's tags: one lowercased word of at most 32 characters, at
@@ -170,7 +175,10 @@ Architectural mandates, standards, and workflows for this codebase.
     process group), `attachments` (image normalising under decode limits, metadata dropped by
     encoding again, and the content-addressed `0600` blob store under
     `$XDG_DATA_HOME/agent-terminal/attachments`, read back only when its hash matches, swept of
-    blobs no event refers to) and `exec` (child processes with a timeout).
+    blobs no event refers to), `remote` (a remote thread's probe of its agent and folder check, each
+    one batch `ssh` through `exec::run_command`, 15 s; a probe that succeeded kept in memory per
+    machine and command until quit, a failure never kept) and `exec` (child processes with a
+    timeout).
   - `agent-kit`'s `store` is the SQLite thread store (threads, provider
     threads, scrubbed events, app meta such as the open-thread list).
     `store_writer` is the one thread that writes it: the app's main thread
@@ -269,7 +277,9 @@ Architectural mandates, standards, and workflows for this codebase.
     only draws; Settings → General → Spending, whose amounts are refused inline unless
     `spend::parse_budget` accepts them; and the budget check, started by a metered turn or a
     new extra-usage reading, run once at a time, its toasts what the writer recorded as due), `window/imp/remote.rs` (Settings →
-    General → Remote Machines and the New Terminal Thread on Another Machine dialog),
+    General → Remote Machines, the New Terminal Thread on Another Machine dialog and New Thread
+    on Another Machine, which probes the agent and checks the folder off the main thread on
+    Create),
     `window/imp/prompts_prefs.rs` (Settings → General → Saved Prompts: each field saved when
     committed and only when `saved_prompts::name_problem`/`validate_body`/`folder_problem` accept
     it, through `TerminalConfig::set_saved_prompt_*`; Add takes a whole valid prompt
@@ -923,7 +933,63 @@ Architectural mandates, standards, and workflows for this codebase.
   <command>`, every user value single-quoted, writing nothing before `exec`. Nothing is ever
   installed or written on the other machine, and nothing local but the config, so uninstall is
   unchanged. A remote page has no checkpoints, diff panel, hand-off, session pickers, profile
-  env file or provider: they read or start things on this machine. The user's ssh
+  env file or provider: they read or start things on this machine. A remote chat thread (Claude
+  or Codex only; agy and the Local agent are refused by `remote::chat_cli` before any process)
+  keeps `ssh://<alias><abs path>` as its `cwd` for life (no schema change; every boundary that
+  takes a thread's folder reads it with `ThreadFolder`, and `is_remote_cwd` never lets one reach
+  local git, files or folder resolution; a remote page's `TabState::dir` is that `ssh://` value,
+  and `$HOME` is only the drawer's local `ssh` working folder). Its agent is
+  `ChatSession::remote`: `remote_spec` wraps every process as `ssh_chat_argv` (`cd -- '<dir>' &&
+  exec env PATH='<probed>' '<cli>' …`, `BatchMode=yes`) with no local cwd, no environment but
+  the app's minus `clear_env` and every agent-only variable, and no profile, provider, key file,
+  approval socket or delegation binding; the adapter gets an empty cwd. Only a POSIX login shell
+  (`remote::POSIX_SHELLS`; the probe, the folder check and `ssh_chat_argv` all refuse any other,
+  since `sh_quote`'s quoting holds only there; `$SHELL` is not trusted alone: the probe's first
+  command, parsed by the login shell itself, prints `sh_quote` of a canary holding `'` and `\\`,
+  and `parse_probe` refuses unless it comes back exactly, as fish's does not) and a CLI path
+  with no `=` are accepted, and no
+  argument with a control or invisible character (`plain_arg`; a remote-reported session id or
+  model holding one is refused at ingestion, and `AgentProcess::spawn` refuses a NUL). Every
+  `ssh` to another machine starts in `ssh_env()` (no agent-only variable). Its machine must
+  still be listed before every process (`HostCheck`, `remote::listed`, in `start_process`), as
+  before every remote terminal page or drawer (`remote_page_argv`: a toast's "Open a Terminal
+  There", Reconnect, Restart), and Settings forgets a machine's probe when it is removed or
+  renamed, and refuses either while a running remote thread, an open drawer or a terminal page
+  is on it, naming them (`remote_machine_in_use`, `in_use_refusal`). It is never reopened at
+  launch (left out of the open-thread layout and refused at restore), so its agent starts only
+  when the user creates or opens it, when the user sends a message after a failed start
+  (`retry_remote_with_message`; showing the page never retries), or when a crash restart
+  follows a run the user started (ssh's exit 255 says "Could not reach <alias>" with ssh's
+  redacted reason, both it and whether a terminal would help read only from ssh's own lines,
+  `remote::ssh_own_line`, never the remote CLI's output on the same stderr; a host-key or login
+  failure is not retried and the window offers a terminal page there). Dangerous permissive
+  mode is refused (`Inner::set_mode`, the view, and a safe mode forced in `launch_spec`; a
+  `ModeChanged { Bypass }` the remote agent reports is rewritten to the session-safe mode in
+  `Inner::emit`, said once, and the safe mode sent back to the agent), and so
+  is a switch to another agent or profile (`Inner::switch` and every window entry,
+  `refuse_remote_switch`). It has no checkpoints (`ThreadDiffs` takes no baseline, so no ref is
+  made), diff panel, undo, worktree, fork baseline, hand-off brief, `/handoff`, session pickers,
+  sub-agents, usage-limit wait or continuation, model-retirement check, vendor probe or sign-in
+  banner; a card's diff is the agent's own (`filediff::agent_edit_only`), file links and images
+  Codex viewed are never read here, its transcript hands the system only
+  `remote::remote_link_allowed` links (and so does every label in no thread's view, the compare
+  window's replies and release notes included, since it cannot tell which machine wrote it),
+  Codex takes no images (`remote::takes_images`, steered
+  input too, and before its session starts), and its cards keep Allow once and Deny
+  (`remote::approval_options`, no rule offered, recorded or applied, nothing auto-answered in
+  any mode; a Codex permission request is Deny only, and an Allow sent for one is answered
+  Deny). Its drawer is `ssh -t` to the folder. An older build reads such a `cwd` as a relative
+  local folder: its agent fails to start for want of that folder, unless a folder of that
+  relative name exists where it was started (said in `docs/reference.md`).
+  The `remote_tests` session tests prove these with a recording fake `ssh` (`set_test_ssh`); an
+  unset one is `false`. They assert on the spawn's own `SpawnSpec` (what is unset, added and
+  where it runs), never on variables the test process happened to inherit. **Accepted risks:** a remote agent acts with the remote account's
+  authority, under weaker approval scoping (Allow once is all a card can grant, and Codex's
+  Accept edits asks for every edit); Stop is the agent's own interrupt over its input, so a tool
+  it started there may keep running, and closing the thread ends only the local `ssh`; the
+  user's ssh configuration runs as configured; and a compromised remote machine can feed the
+  app arbitrary agent events, which the existing bounds, redaction and the store's scrubbing
+  still apply to. The user's ssh
   configuration (ProxyCommand, ControlMaster) runs as the user set it. The update check (`agent_kit::update`): a single HTTPS GET of the
   repository's latest GitHub release, off the main thread, with a timeout. It runs once per
   process a few seconds after startup unless Settings → "Check for Updates at Startup" is off

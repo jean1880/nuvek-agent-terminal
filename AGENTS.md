@@ -10,6 +10,13 @@ Architectural mandates, standards, and workflows for this codebase.
 - **Bundled icons**: All icons are bundled (`assets/icons`, GResource); never rely on the
   system icon theme for a name; the icon test (`tests/icons.rs`) guards it. See the rendering
   note in `THIRD_PARTY.md` before editing an SVG there.
+- **Accessibility**: F6/Shift+F6 (`win.focus-next-region`/`-previous-region`,
+  `window/imp/regions.rs`) cycle the shown regions: sidebar (Navigation "Threads"), transcript
+  (Region), composer (Region), terminal, docked diff panel; a new pane needs a role, a label and
+  an entry there. The text scale (`font_scale`) is the whole app's: one provider,
+  `style::set_text_scale` (`window { font-size: N% }`), so app CSS font sizes are relative, never
+  `pt`/`px`. Transcript rows are `ListItem`s named by `cards::row_label` and busy per
+  `cards::row_busy`; a new `Body` variant must name itself there.
 - **Native GTK4/Libadwaita**: a native Rust binary. Minimum system libraries are
   set by the Cargo version features, currently GTK 4.10 (`v4_10`, for
   `FileDialog`), libadwaita 1.5 (`v1_5`, for `AlertDialog`/`PreferencesDialog`)

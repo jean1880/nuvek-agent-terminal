@@ -714,6 +714,58 @@ impl MarkdownInner {
 // Rows
 // ---------------------------------------------------------------------------------------------
 
+/// The most characters of a tool's title a row's accessible name keeps.
+const ROW_LABEL_TITLE: usize = 80;
+
+/// A transcript row's root: a list item of the transcript's list, which a screen reader steps
+/// through item by item.
+fn list_item(orientation: gtk4::Orientation, spacing: i32) -> gtk4::Box {
+    gtk4::Box::builder()
+        .orientation(orientation)
+        .spacing(spacing)
+        .accessible_role(gtk4::AccessibleRole::ListItem)
+        .build()
+}
+
+/// What a screen reader names a transcript row by: who wrote it, or what it is ("You",
+/// "Claude", "Tool: Run cargo test"). Its words are its children's, read after the name.
+/// `None` for a row that names itself (a plan, by its title; quick replies).
+pub fn row_label(body: &Body) -> Option<String> {
+    Some(match body {
+        Body::User { queued: true, .. } => "You (queued)".to_owned(),
+        Body::User { .. } => "You".to_owned(),
+        Body::Assistant { driver, .. } => driver.info().label.to_owned(),
+        Body::Reasoning { .. } => "Reasoning".to_owned(),
+        Body::Tool(tool) => {
+            let title: String = tool.title.chars().take(ROW_LABEL_TITLE).collect();
+            let title = title.trim();
+            if title.is_empty() {
+                "Tool".to_owned()
+            } else {
+                format!("Tool: {title}")
+            }
+        }
+        Body::Notice { .. } => "Notice".to_owned(),
+        Body::Compaction { .. } => "Compaction".to_owned(),
+        Body::TurnError { .. } => "Error".to_owned(),
+        Body::Switch { driver, .. } => format!("Now {}", driver.info().label),
+        Body::Approval(_) => "Approval request".to_owned(),
+        Body::Question(_) => "Question".to_owned(),
+        Body::Form(_) => "Form request".to_owned(),
+        Body::QuickReplies(_) | Body::Plan { .. } => return None,
+    })
+}
+
+/// Whether a row is still growing (a reply or reasoning streaming in, a tool running): a
+/// screen reader hears it as busy until it is done.
+pub fn row_busy(body: &Body) -> bool {
+    match body {
+        Body::Assistant { streaming, .. } | Body::Reasoning { streaming, .. } => *streaming,
+        Body::Tool(tool) => tool.status == super::model::ToolStatus::Running,
+        _ => false,
+    }
+}
+
 pub enum Row {
     User {
         root: gtk4::Box,
@@ -754,7 +806,7 @@ impl Row {
     pub fn build(item: &Item, sink: &RowSink) -> Self {
         let row = match &item.body {
             Body::User { queued, .. } => {
-                let root = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+                let root = list_item(gtk4::Orientation::Horizontal, 0);
                 root.add_css_class("user-row");
                 root.set_halign(gtk4::Align::End);
                 if *queued {
@@ -781,7 +833,7 @@ impl Row {
                 }
             }
             Body::Assistant { driver, .. } => {
-                let root = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+                let root = list_item(gtk4::Orientation::Vertical, 6);
                 root.add_css_class("assistant-row");
                 root.add_css_class(accent_class(*driver));
                 let head = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
@@ -921,6 +973,12 @@ impl Row {
     }
 
     pub fn update(&self, item: &Item) {
+        // Named for a screen reader by its author or kind, and busy while it grows.
+        let widget = self.widget();
+        if let Some(name) = row_label(&item.body) {
+            widget.update_property(&[gtk4::accessible::Property::Label(&name)]);
+        }
+        widget.update_state(&[gtk4::accessible::State::Busy(row_busy(&item.body))]);
         match (self, &item.body) {
             (
                 Self::User {
@@ -1245,7 +1303,7 @@ pub struct ReasoningRow {
 
 impl ReasoningRow {
     fn new(id: &str, sink: &RowSink) -> Self {
-        let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let root = list_item(gtk4::Orientation::Vertical, 0);
         root.add_css_class("reasoning-row");
         let toggle = gtk4::Button::new();
         toggle.add_css_class("flat");
@@ -1827,7 +1885,7 @@ impl ToolCard {
                 }));
             }
         ));
-        let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+        let outer = list_item(gtk4::Orientation::Vertical, 6);
         outer.append(&root);
         let shown = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         shown.add_css_class("shown-images");
@@ -2569,7 +2627,7 @@ fn head_lines_in(text: &str, max: usize, width: usize, rest_in: &str) -> (String
 
 impl ApprovalCard {
     fn new(sink: &RowSink) -> Self {
-        let root = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
+        let root = list_item(gtk4::Orientation::Vertical, 10);
         root.add_css_class("approval-card");
         root.add_css_class("card");
         let head = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
@@ -3078,7 +3136,7 @@ pub struct QuestionCardWidget {
 
 impl QuestionCardWidget {
     fn new(card: &super::model::QuestionCard, sink: &RowSink) -> Self {
-        let root = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+        let root = list_item(gtk4::Orientation::Vertical, 12);
         root.add_css_class("question-card");
         root.add_css_class("card");
         let (head, _) = card_head("at-dialog-question-symbolic", "The agent has a question");
@@ -3628,6 +3686,68 @@ pub(super) fn pattern_error(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    fn tool(title: &str, status: super::super::model::ToolStatus) -> Body {
+        Body::Tool(super::super::model::Tool {
+            kind: agent_core::event::ItemKind::Command,
+            title: title.into(),
+            input: None,
+            input_text: String::new(),
+            output: String::new(),
+            error: None,
+            status,
+            reported_model: None,
+            images: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn a_row_is_named_by_its_author_and_busy_while_it_grows() {
+        use super::super::model::ToolStatus;
+        let user = Body::User {
+            text: "Fix it".into(),
+            queued: false,
+            attachments: Vec::new(),
+        };
+        assert_eq!(row_label(&user).as_deref(), Some("You"));
+        assert!(!row_busy(&user));
+        let reply = |streaming| Body::Assistant {
+            text: "On it".into(),
+            driver: Driver::Claude,
+            streaming,
+            images: Vec::new(),
+        };
+        assert_eq!(row_label(&reply(true)).as_deref(), Some("Claude"));
+        assert!(row_busy(&reply(true)));
+        assert!(!row_busy(&reply(false)));
+        assert_eq!(
+            row_label(&tool("cargo test", ToolStatus::Running)).as_deref(),
+            Some("Tool: cargo test")
+        );
+        assert!(row_busy(&tool("cargo test", ToolStatus::Running)));
+        assert!(!row_busy(&tool("cargo test", ToolStatus::Failed)));
+        assert_eq!(
+            row_label(&tool("  ", ToolStatus::Completed)).as_deref(),
+            Some("Tool")
+        );
+        let long = row_label(&tool(&"x".repeat(500), ToolStatus::Completed)).unwrap();
+        assert_eq!(long.chars().count(), "Tool: ".len() + ROW_LABEL_TITLE);
+        assert_eq!(
+            row_label(&Body::TurnError {
+                message: "boom".into()
+            })
+            .as_deref(),
+            Some("Error")
+        );
+        assert_eq!(
+            row_label(&Body::Plan {
+                steps: Vec::new(),
+                outcome: None
+            }),
+            None,
+            "a plan is named by its title"
+        );
+    }
 
     #[test]
     fn only_a_visible_stale_view_is_parsed_again_at_once() {

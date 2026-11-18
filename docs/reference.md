@@ -772,6 +772,12 @@ approval that arrives while you type never takes the focus away from the message
 alert is read, and the approval bar's **Jump to card in transcript** button takes you to its
 card.
 
+**The transcript.** A screen reader reads the transcript as a list named "Messages", one
+item per message, step or request, each named for who wrote it or what it is: "You",
+"Claude" (or the agent that replied), "Reasoning", "Tool: cargo test", "Approval request",
+"Question", "Error". A reply still streaming in, or a tool still running, is marked busy until
+it is done.
+
 ### Sending terminal output to a thread
 
 Right-click a terminal (or press the Menu key or Shift+F10 in it) for two items:

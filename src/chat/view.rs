@@ -2280,6 +2280,123 @@ pub(crate) mod tests {
         }
     }
 
+    /// The transcript is a list a screen reader steps through: each message, step and request
+    /// is a list item, named by its author or kind ("You", "Claude", "Tool: …"), and a reply
+    /// streaming in or a tool at work is busy until it is done.
+    #[test]
+    #[ignore = "constructs GTK widgets; run on a private display"]
+    fn transcript_rows_are_list_items_named_by_their_author() {
+        use agent_core::event::{Envelope, Event, ItemKind, ItemStatus, StreamKind};
+        use cards::{row_busy, row_label};
+        let ctx = native_init();
+        let view = ChatView::new(StubBackend::new(Driver::Claude));
+        let window = gtk4::Window::new();
+        window.set_default_size(900, 700);
+        window.set_child(Some(&view));
+        window.present();
+        view.replay(&demo::DemoBackend::script_envelopes());
+        while ctx.iteration(false) {}
+        let inner = view.inner().expect("inner");
+        let (transcript, _, _) = view.region_widgets().expect("regions");
+        let list = crate::testutil::descendants(&transcript)
+            .into_iter()
+            .find(|w| w.has_css_class("transcript"))
+            .expect("the message list");
+        assert!(gtk4::test_accessible_has_role(
+            &list,
+            gtk4::AccessibleRole::List
+        ));
+
+        let rows: Vec<(String, model::Body)> = {
+            let model = inner.model.borrow();
+            model
+                .order()
+                .iter()
+                .filter_map(|id| model.get(id).map(|i| (id.clone(), i.body.clone())))
+                .collect()
+        };
+        let mut kinds = std::collections::HashSet::new();
+        for (id, body) in &rows {
+            let Some(name) = row_label(body) else {
+                continue;
+            };
+            let Some(widget) = inner.transcript.with_row(id, cards::Row::widget) else {
+                continue; // not built: outside the window of rows
+            };
+            assert!(
+                gtk4::test_accessible_has_property(&widget, gtk4::AccessibleProperty::Label),
+                "{name}: no name"
+            );
+            assert!(
+                gtk4::test_accessible_has_state(&widget, gtk4::AccessibleState::Busy),
+                "{name}: no busy state"
+            );
+            if matches!(
+                body,
+                model::Body::User { .. } | model::Body::Assistant { .. } | model::Body::Tool(_)
+            ) {
+                assert!(
+                    gtk4::test_accessible_has_role(&widget, gtk4::AccessibleRole::ListItem),
+                    "{name}: not a list item"
+                );
+                kinds.insert(name.split(':').next().unwrap_or_default().to_owned());
+            }
+        }
+        for author in ["You", "Claude", "Tool"] {
+            assert!(kinds.contains(author), "no row named {author}: {kinds:?}");
+        }
+
+        // A reply streaming in is busy; done, it is not. A running tool too.
+        view.apply(&Envelope::new(Event::TurnStarted { model: None }));
+        view.apply(&Envelope::item_started(
+            "live-reply",
+            ItemKind::AssistantMessage,
+            "",
+            None,
+            None,
+        ));
+        view.apply(&Envelope::delta(
+            "live-reply",
+            StreamKind::Assistant,
+            "Working on it",
+        ));
+        view.apply(&Envelope::item_started(
+            "live-tool",
+            ItemKind::Command,
+            "cargo test",
+            None,
+            None,
+        ));
+        while ctx.iteration(false) {}
+        let body = |id: &str| inner.model.borrow().get(id).expect(id).body.clone();
+        assert!(row_busy(&body("live-reply")));
+        assert!(row_busy(&body("live-tool")));
+        assert_eq!(
+            row_label(&body("live-tool")).as_deref(),
+            Some("Tool: cargo test")
+        );
+        assert!(inner
+            .transcript
+            .with_row("live-reply", |r| r.widget())
+            .is_some());
+        view.apply(&Envelope::item_completed(
+            "live-reply",
+            ItemStatus::Completed,
+            None,
+            None,
+        ));
+        view.apply(&Envelope::item_completed(
+            "live-tool",
+            ItemStatus::Completed,
+            Some("ok"),
+            None,
+        ));
+        while ctx.iteration(false) {}
+        assert!(!row_busy(&body("live-reply")));
+        assert!(!row_busy(&body("live-tool")));
+        window.destroy();
+    }
+
     #[test]
     #[ignore = "constructs GTK widgets; run on a private display"]
     fn a_saved_prompt_fills_its_placeholders_from_the_thread() {

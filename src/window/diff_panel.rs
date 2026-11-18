@@ -3189,7 +3189,7 @@ pub(crate) mod tests {
         );
         done(vec![Checked::Moved { start: 2, end: 3 }]);
         assert_eq!(rig.sent.borrow().len(), 2);
-        let second = &rig.sent.borrow()[1];
+        let second = rig.sent.borrow()[1].clone();
         assert!(second.contains("sub/b.rs"), "{second}");
         assert!(!second.contains("WhileChecking"), "{second}");
         let kept = rig.panel.review.drafts();
@@ -3198,7 +3198,7 @@ pub(crate) mod tests {
         assert_eq!(kept[0].note, "WhileChecking");
         assert_eq!(
             rig.panel.review.bar_view().map(|v| v.0),
-            Some("1 comment · Checked against the files: 1 moved".into())
+            Some("1 comment · 1 not in this diff · Checked against the files: 1 moved".into())
         );
 
         // A panel refresh landing while files are checked cannot shift the lines that were asked
@@ -3206,6 +3206,9 @@ pub(crate) mod tests {
         rig.panel.review.clear();
         let generation = rig.panel.begin();
         rig.panel.show(generation, one_file("a.rs", 10, "new one"));
+        rig.panel.file_expanders()[0].set_expanded(true);
+        let view = rig.panel.review.view_of("a.rs").expect("view");
+        assert!(crate::testutil::pump_until(&ctx, 5, || view.is_mapped()));
         rig.comment(5, 5, "BeforeRefresh");
         send.emit_clicked();
         let (asks, done) = pending.borrow_mut().take().expect("asked");

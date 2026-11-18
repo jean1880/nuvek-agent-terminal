@@ -259,6 +259,476 @@ pub fn remote_link_allowed(uri: &str) -> bool {
     !authority.is_empty() && !authority.starts_with(':') && !authority.contains('@')
 }
 
+/// Options of every `ssh` that has no terminal: a chat thread's agent, the probe of the agent
+/// there and the folder check. `-T` asks for no terminal; `BatchMode=yes` makes ssh fail rather
+/// than wait on a host-key question or a password nobody can see (the user answers those in a
+/// terminal page instead); the forwarding options are [`TTY_OPTIONS`]'s, for the same reasons.
+pub const BATCH_OPTIONS: &[&str] = &[
+    "-T",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=15",
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ClearAllForwardings=yes",
+    "-o",
+    "ForwardAgent=no",
+    "-o",
+    "ForwardX11=no",
+    "-o",
+    "PermitLocalCommand=no",
+    "-o",
+    "Tunnel=no",
+    "-o",
+    "RemoteCommand=none",
+];
+
+/// What starts a thread's folder in the store when it is on another machine.
+pub const THREAD_SCHEME: &str = "ssh://";
+
+/// The longest `PATH` a probe may report.
+pub const MAX_PATH_LEN: usize = 8192;
+
+/// A folder on another machine as a thread keeps it: the listed alias and the folder's
+/// canonical absolute path there (what `pwd -P` said when the thread was made).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RemoteFolder {
+    alias: String,
+    dir: String,
+}
+
+impl RemoteFolder {
+    /// A folder whose alias is valid and whose path is absolute, free of control and invisible
+    /// characters and at most [`MAX_DIR_LEN`] long.
+    pub fn new(alias: &str, dir: &str) -> Result<Self, String> {
+        validate_alias(alias)?;
+        validate_absolute(dir)?;
+        Ok(Self {
+            alias: alias.to_owned(),
+            dir: dir.to_owned(),
+        })
+    }
+
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    pub fn dir(&self) -> &str {
+        &self.dir
+    }
+
+    /// What the store's `cwd` column holds: `ssh://<alias><dir>` (the path starts with `/`).
+    pub fn cwd(&self) -> String {
+        format!("{THREAD_SCHEME}{}{}", self.alias, self.dir)
+    }
+
+    /// The name shown for it, in the sidebar and the thread's subtitle: `alias:/path`.
+    pub fn title(&self) -> String {
+        page_title(&self.alias, &self.dir)
+    }
+}
+
+/// Whether `dir` is a usable absolute folder on another machine.
+fn validate_absolute(dir: &str) -> Result<(), String> {
+    if !dir.starts_with('/') {
+        return Err("The folder there must be an absolute path".into());
+    }
+    if dir.len() > MAX_DIR_LEN {
+        return Err(format!("At most {MAX_DIR_LEN} characters"));
+    }
+    if crate::text::has_control_or_bidi(dir, &[]) || crate::text::has_hidden(dir) {
+        return Err("A folder cannot hold control or invisible characters".into());
+    }
+    Ok(())
+}
+
+/// A thread's folder, read from its stored `cwd` at every boundary that receives a path: a
+/// folder on this machine, or one on another machine reached with `ssh`. Code that takes a
+/// thread's folder must match both, so nothing local is ever done with a remote path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ThreadFolder {
+    Local(String),
+    Remote(RemoteFolder),
+}
+
+impl ThreadFolder {
+    /// Reads a stored `cwd`. Anything not starting with [`THREAD_SCHEME`] is a local folder
+    /// (as every thread stored before remote threads was); an `ssh://` value that does not hold
+    /// a valid alias and absolute path is an error, never taken for a local path.
+    pub fn parse(cwd: &str) -> Result<Self, String> {
+        let Some(rest) = cwd.strip_prefix(THREAD_SCHEME) else {
+            return Ok(Self::Local(cwd.to_owned()));
+        };
+        let Some(slash) = rest.find('/') else {
+            return Err("A folder on another machine names no path".into());
+        };
+        let (alias, dir) = rest.split_at(slash);
+        RemoteFolder::new(alias, dir).map(Self::Remote)
+    }
+
+    /// The folder on another machine, if it is one.
+    pub fn remote(&self) -> Option<&RemoteFolder> {
+        match self {
+            Self::Remote(folder) => Some(folder),
+            Self::Local(_) => None,
+        }
+    }
+
+    /// What the store keeps for it.
+    pub fn cwd(&self) -> String {
+        match self {
+            Self::Local(dir) => dir.clone(),
+            Self::Remote(folder) => folder.cwd(),
+        }
+    }
+}
+
+/// Whether a stored `cwd` names a folder on another machine (valid or not): such a value is
+/// never a local path, whatever else is wrong with it.
+pub fn is_remote_cwd(cwd: &str) -> bool {
+    cwd.starts_with(THREAD_SCHEME)
+}
+
+/// The agent CLI a thread on another machine runs for `driver`, or why it cannot run there:
+/// Claude and Codex only. agy reads its transcript and media from this machine's disk, and the
+/// Local agent is this app's own runner, which is not on the other machine.
+pub fn chat_cli(driver: crate::adapter::Driver) -> Result<&'static str, String> {
+    use crate::adapter::Driver;
+    match driver {
+        Driver::Claude | Driver::Codex => Ok(driver.info().default_command),
+        Driver::Agy => Err(
+            "Antigravity cannot run a thread on another machine: the app reads its transcript \
+             and images from this machine's disk."
+                .into(),
+        ),
+        Driver::Local => Err(
+            "The Local agent cannot run a thread on another machine: it is this app's own \
+             runner, which is not installed there."
+                .into(),
+        ),
+    }
+}
+
+/// The buttons a remote approval card keeps: Allow once and Deny. Session and always rules
+/// are judged against this machine's files and folders, so none is offered, kept or applied for
+/// a call on another machine.
+pub fn approval_options(options: &mut Vec<crate::event::Decision>) {
+    use crate::event::Decision;
+    options.retain(|d| matches!(d, Decision::Allow | Decision::Deny));
+    if !options.contains(&Decision::Deny) {
+        options.push(Decision::Deny);
+    }
+}
+
+/// Why Codex on another machine takes no images: it is given an image as a file path, read
+/// there, and the image is a file on this machine.
+pub const CODEX_IMAGES_REFUSED: &str =
+    "Codex on another machine can't take images: it reads an image from a file path, and the \
+     image is on this machine.";
+
+/// Whether an agent on another machine takes images with a prompt: Claude does (they go as
+/// base64 on its input), Codex does not ([`CODEX_IMAGES_REFUSED`]).
+pub fn takes_images(driver: crate::adapter::Driver) -> Result<(), &'static str> {
+    match driver {
+        crate::adapter::Driver::Codex => Err(CODEX_IMAGES_REFUSED),
+        _ => Ok(()),
+    }
+}
+
+/// What a remote thread says when its `ssh` exits 255 (ssh's own failure: no connection, an
+/// unknown host key, a refused login), rather than the agent's.
+pub fn unreachable_notice(alias: &str) -> String {
+    format!("Could not reach {alias}.")
+}
+
+/// `ssh` exits with 255 when it fails itself, never for the remote command.
+pub fn ssh_failed(code: Option<i32>) -> bool {
+    code == Some(255)
+}
+
+/// What the probe of an agent on another machine found: the login shell there, the `PATH` a
+/// login shell has, and the agent CLI's absolute path on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteProbe {
+    pub shell: String,
+    pub path: String,
+    pub cli: String,
+}
+
+const PROBE_SHELL: &str = "__agent_terminal_shell=";
+const PROBE_PATH: &str = "__agent_terminal_path=";
+const PROBE_CLI: &str = "__agent_terminal_cli=";
+
+/// The remote command of the probe for `cli` (a bare command name). Read by whatever login
+/// shell the account has, so it is written to parse the same in csh: one line, a single-quoted
+/// `/bin/sh` script with no `'` or `!` in it. The script says the login shell, stops there for
+/// csh and tcsh, and otherwise asks a login shell (`-l`, never interactive, its input empty) for
+/// its `PATH` and where `cli` is on it. Markers set the answers apart from anything a profile
+/// prints.
+pub fn probe_command(cli: &str) -> Result<String, String> {
+    if cli.is_empty()
+        || !cli
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        || cli.starts_with('-')
+    {
+        return Err(format!("“{cli}” is not a command name"));
+    }
+    Ok(format!(
+        "exec /bin/sh -c 'printf \"{PROBE_SHELL}%s\\n\" \"$SHELL\"; case \"${{SHELL##*/}}\" in \
+         csh|tcsh) exit 0;; esac; exec \"$SHELL\" -lc \"printf \\\"{PROBE_PATH}%s\\\\n\\\" \
+         \\\"\\$PATH\\\"; printf \\\"{PROBE_CLI}%s\\\\n\\\" \\\"\\$(command -v {cli})\\\"\" \
+         </dev/null'"
+    ))
+}
+
+/// What the probe printed, as a [`RemoteProbe`], or why the agent cannot run there: a csh or
+/// tcsh login shell (the thread's command line is POSIX), no `PATH`, or `cli` not found on it.
+/// What the other machine printed is redacted before it is quoted.
+pub fn parse_probe(cli: &str, stdout: &str) -> Result<RemoteProbe, String> {
+    let field = |marker: &str| {
+        stdout
+            .lines()
+            .rev()
+            .find_map(|l| l.strip_prefix(marker))
+            .map(str::to_owned)
+    };
+    let shell = field(PROBE_SHELL)
+        .ok_or_else(|| "The other machine did not say what its login shell is".to_owned())?;
+    let name = shell.rsplit('/').next().unwrap_or_default();
+    if matches!(name, "csh" | "tcsh") {
+        return Err(format!(
+            "The login shell there is {name}; a thread on another machine needs a POSIX shell \
+             (sh, bash, zsh, ksh, dash)"
+        ));
+    }
+    let path = field(PROBE_PATH).unwrap_or_default();
+    if path.is_empty() || path.len() > MAX_PATH_LEN || crate::text::has_control_or_bidi(&path, &[])
+    {
+        return Err("The login shell there reported no usable PATH".into());
+    }
+    let found = field(PROBE_CLI).unwrap_or_default();
+    if found.is_empty() {
+        return Err(format!(
+            "{cli} was not found on the login shell's PATH there; install it, or put it on \
+             the PATH a login shell gets"
+        ));
+    }
+    if !found.starts_with('/')
+        || found.len() > MAX_DIR_LEN
+        || crate::text::has_control_or_bidi(&found, &[])
+        || crate::text::has_hidden(&found)
+    {
+        let shown = crate::text::truncate_bytes(
+            &crate::text::without_hidden(&crate::redact::redact(&found)),
+            120,
+        )
+        .to_owned();
+        return Err(format!("{cli} there is not a program file ({shown})"));
+    }
+    Ok(RemoteProbe {
+        shell: crate::text::without_hidden(&shell),
+        path,
+        cli: found,
+    })
+}
+
+/// The remote command of the folder check: `cd -- '<dir>' && pwd -P` (the folder as typed,
+/// `~` allowed), which prints the canonical absolute path a thread then keeps.
+pub fn folder_command(dir: &str) -> Result<String, String> {
+    let dir = parse_remote_dir(dir)?;
+    Ok(format!("cd -- {} && pwd -P", cd_operand(&dir)))
+}
+
+/// The folder the check printed: its last line, which must be an absolute path.
+pub fn parse_folder(stdout: &str) -> Result<String, String> {
+    let line = stdout.lines().rev().find(|l| !l.is_empty()).unwrap_or("");
+    validate_absolute(line).map_err(|_| "The folder there could not be read".to_owned())?;
+    Ok(line.to_owned())
+}
+
+/// The argv of an `ssh` with no terminal ([`BATCH_OPTIONS`]) running `remote` (one POSIX line)
+/// on `alias`.
+pub fn ssh_batch_argv(alias: &str, remote: String) -> Result<Vec<String>, String> {
+    validate_alias(alias)?;
+    let mut argv = vec!["ssh".to_owned()];
+    argv.extend(BATCH_OPTIONS.iter().map(|s| (*s).to_owned()));
+    argv.push("--".to_owned());
+    argv.push(alias.to_owned());
+    argv.push(remote);
+    Ok(argv)
+}
+
+/// The argv of a chat thread's agent on another machine: `ssh` + [`BATCH_OPTIONS`] + `--` + the
+/// alias + `cd -- '<dir>' && exec env PATH='<probed>' '<cli>' '<arg>'…`, every value quoted.
+/// `args` are the adapter's arguments after its program, which the probed CLI replaces.
+pub fn ssh_chat_argv(
+    folder: &RemoteFolder,
+    probe: &RemoteProbe,
+    args: &[String],
+) -> Result<Vec<String>, String> {
+    validate_absolute(&probe.cli)?;
+    if probe.path.is_empty() || crate::text::has_control_or_bidi(&probe.path, &[]) {
+        return Err("The PATH there is not usable".into());
+    }
+    let mut line = format!(
+        "cd -- {} && exec env {} {}",
+        sh_quote(&folder.dir),
+        sh_quote(&format!("PATH={}", probe.path)),
+        sh_quote(&probe.cli)
+    );
+    for arg in args {
+        line.push(' ');
+        line.push_str(&sh_quote(arg));
+    }
+    ssh_batch_argv(&folder.alias, line)
+}
+
+/// Why a batch `ssh` failed, read from its exit and standard error, and whether a terminal
+/// page there would get past it (the user answering a host-key question or a password, which a
+/// batch `ssh` refuses to ask).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchFailure {
+    pub reason: String,
+    pub needs_terminal: bool,
+}
+
+/// A batch `ssh`'s failure: the redacted, bounded reason [`check_outcome`] gives, and whether
+/// ssh stopped at something only a person can answer.
+pub fn batch_failure(code: Option<i32>, stderr: &str) -> BatchFailure {
+    // Called for a failure: a zero exit with nothing to show still reads as one.
+    let code = if code == Some(0) { Some(1) } else { code };
+    let reason = match check_outcome(code, stderr) {
+        RemoteCheck::Unreachable(why) => why,
+        _ => "ssh failed".to_owned(),
+    };
+    let lower = stderr.to_ascii_lowercase();
+    let needs_terminal = [
+        "host key verification failed",
+        "remote host identification has changed",
+        "permission denied",
+        "no more authentication methods",
+        "passphrase",
+        "keyboard-interactive",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    BatchFailure {
+        reason,
+        needs_terminal,
+    }
+}
+
+/// What a thread on another machine has of each part of a local thread. The one list docs,
+/// controls and tests read; [`support`] has no wildcard, so a new part does not compile until it
+/// says what a remote thread does with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Subsystem {
+    Agent,
+    Stop,
+    Approvals,
+    SessionRules,
+    AlwaysRules,
+    Checkpoints,
+    DiffPanel,
+    Undo,
+    Worktree,
+    Fork,
+    HandoffBrief,
+    SessionPickers,
+    ProfileEnvFile,
+    ModelProvider,
+    Delegation,
+    Images,
+    FileLinks,
+    WorkspaceFiles,
+    VendorProbe,
+    Drawer,
+    IdleSuspend,
+}
+
+impl Subsystem {
+    pub const ALL: [Subsystem; 21] = [
+        Subsystem::Agent,
+        Subsystem::Stop,
+        Subsystem::Approvals,
+        Subsystem::SessionRules,
+        Subsystem::AlwaysRules,
+        Subsystem::Checkpoints,
+        Subsystem::DiffPanel,
+        Subsystem::Undo,
+        Subsystem::Worktree,
+        Subsystem::Fork,
+        Subsystem::HandoffBrief,
+        Subsystem::SessionPickers,
+        Subsystem::ProfileEnvFile,
+        Subsystem::ModelProvider,
+        Subsystem::Delegation,
+        Subsystem::Images,
+        Subsystem::FileLinks,
+        Subsystem::WorkspaceFiles,
+        Subsystem::VendorProbe,
+        Subsystem::Drawer,
+        Subsystem::IdleSuspend,
+    ];
+}
+
+/// How a thread on another machine has a [`Subsystem`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Support {
+    /// As a local thread has it.
+    Full,
+    /// Has it, differently: what differs.
+    Degraded(&'static str),
+    /// Does not have it: why, as its control's tooltip says.
+    Unavailable(&'static str),
+}
+
+/// What a control on a remote thread says when it is insensitive.
+pub const NOT_ON_REMOTE: &str = "Not available for a folder on another machine";
+
+/// How a thread on another machine has `part`.
+pub fn support(part: Subsystem) -> Support {
+    match part {
+        Subsystem::Agent => Support::Degraded(
+            "Claude and Codex only, run with ssh in batch mode by their absolute path and the \
+             PATH a login shell has there",
+        ),
+        Subsystem::Stop => Support::Degraded(
+            "the agent's own interrupt over its input; a tool it started there may keep running",
+        ),
+        Subsystem::Approvals => Support::Degraded("Allow once and Deny only"),
+        Subsystem::SessionRules | Subsystem::AlwaysRules => Support::Unavailable(
+            "rules are judged against this machine's files, so none is offered or applied",
+        ),
+        Subsystem::Checkpoints
+        | Subsystem::DiffPanel
+        | Subsystem::Undo
+        | Subsystem::Worktree
+        | Subsystem::HandoffBrief
+        | Subsystem::SessionPickers
+        | Subsystem::WorkspaceFiles => Support::Unavailable(NOT_ON_REMOTE),
+        Subsystem::Fork => {
+            Support::Degraded("a fork keeps the folder there and takes no baseline to compare")
+        }
+        Subsystem::ProfileEnvFile | Subsystem::ModelProvider => {
+            Support::Unavailable("a profile's environment file and model server are this machine's")
+        }
+        Subsystem::Delegation => {
+            Support::Unavailable("sub-agents run on this machine, not beside the remote agent")
+        }
+        Subsystem::Images => Support::Degraded(CODEX_IMAGES_REFUSED),
+        Subsystem::FileLinks => Support::Degraded("only web links open; a path names a file there"),
+        Subsystem::VendorProbe => Support::Unavailable(
+            "this machine's account and usage say nothing of the account there",
+        ),
+        Subsystem::Drawer => Support::Degraded("an ssh terminal in the same folder there"),
+        Subsystem::IdleSuspend => Support::Full,
+    }
+}
+
 /// The longest link a remote page opens.
 pub const MAX_LINK_LEN: usize = 4096;
 
@@ -576,6 +1046,334 @@ mod tests {
             "https://exa\u{202e}mple.com",
         ] {
             assert!(!remote_link_allowed(refused), "{refused:?}");
+        }
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    fn probe() -> RemoteProbe {
+        RemoteProbe {
+            shell: "/bin/bash".into(),
+            path: "/home/me/.local/bin:/usr/bin".into(),
+            cli: "/home/me/.local/bin/claude".into(),
+        }
+    }
+
+    #[test]
+    fn a_chat_process_runs_batch_ssh_with_no_forwarding_and_dashdash_before_the_host() {
+        let folder = RemoteFolder::new("box", "/srv/app").unwrap();
+        let argv = ssh_chat_argv(&folder, &probe(), &strings(&["--verbose"])).unwrap();
+        let mut expected = strings(&[
+            "ssh",
+            "-T",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=15",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ClearAllForwardings=yes",
+            "-o",
+            "ForwardAgent=no",
+            "-o",
+            "ForwardX11=no",
+            "-o",
+            "PermitLocalCommand=no",
+            "-o",
+            "Tunnel=no",
+            "-o",
+            "RemoteCommand=none",
+            "--",
+            "box",
+        ]);
+        expected.push(
+            "cd -- '/srv/app' && exec env 'PATH=/home/me/.local/bin:/usr/bin' \
+             '/home/me/.local/bin/claude' '--verbose'"
+                .to_owned(),
+        );
+        assert_eq!(argv, expected);
+        // Never a terminal, never a prompt, never a forwarding flag.
+        for flag in [
+            "-t", "-tt", "-L", "-R", "-D", "-A", "-X", "-Y", "-W", "-M", "-f", "-N", "-w",
+        ] {
+            assert!(!argv.iter().any(|a| a == flag), "{flag}");
+        }
+        assert!(!argv.iter().any(|a| a == "BatchMode=no"));
+        // The probe and the folder check take the same options.
+        let check = ssh_batch_argv("box", folder_command("~").unwrap()).unwrap();
+        assert_eq!(check[..check.len() - 1], expected[..expected.len() - 1]);
+        // An alias ssh would read as an option is refused before any argv exists.
+        assert!(RemoteFolder::new("-oProxyCommand=x", "/srv").is_err());
+        assert!(ssh_batch_argv("-v", "true".into()).is_err());
+    }
+
+    #[test]
+    fn a_chat_command_quotes_hostile_folders_paths_and_arguments() {
+        if std::process::Command::new("sh")
+            .arg("-c")
+            .arg("true")
+            .status()
+            .is_err()
+        {
+            eprintln!("no sh; skipping");
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("agent-core-chat-{}", std::process::id()));
+        let tricky = "a b 'c' $x \"d\" `e` ;f && $(id) |g";
+        let dir = base.join(tricky);
+        std::fs::create_dir_all(&dir).unwrap();
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        // A fake "cli" that prints where it runs, its PATH and its arguments.
+        let cli = base.join("it's a cli");
+        std::fs::write(
+            &cli,
+            "#!/bin/sh\npwd -P\nprintf '%s\\n' \"$PATH\"\nfor a in \"$@\"; do printf '[%s]' \"$a\"; done\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let folder = RemoteFolder::new("box", canonical.to_str().unwrap()).unwrap();
+        let probe = RemoteProbe {
+            shell: "/bin/sh".into(),
+            path: "/usr/bin:/bin:/odd 'dir' $x".into(),
+            cli: cli.to_str().unwrap().into(),
+        };
+        let args = strings(&["one two", "$x", "it's", "\"q\"", "`id`", "$(id)", "a;b"]);
+        let argv = ssh_chat_argv(&folder, &probe, &args).unwrap();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(argv.last().unwrap())
+            .env("x", "EXPANDED")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!(
+                "{}\n/usr/bin:/bin:/odd 'dir' $x\n[one two][$x][it's][\"q\"][`id`][$(id)][a;b]",
+                canonical.display()
+            )
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+
+        // A probe that reported something unusable never makes a command line.
+        let mut bad = probe.clone();
+        bad.cli = "claude".into();
+        assert!(ssh_chat_argv(&folder, &bad, &[]).is_err());
+        let mut bad = probe;
+        bad.path = "/usr/bin\n:/x".into();
+        assert!(ssh_chat_argv(&folder, &bad, &[]).is_err());
+    }
+
+    #[test]
+    fn a_thread_folder_round_trips_and_a_bad_remote_one_is_never_local() {
+        let folder = ThreadFolder::parse("ssh://box/srv/my app").unwrap();
+        let remote = folder.remote().unwrap();
+        assert_eq!((remote.alias(), remote.dir()), ("box", "/srv/my app"));
+        assert_eq!(folder.cwd(), "ssh://box/srv/my app");
+        assert_eq!(remote.title(), "box:/srv/my app");
+        assert_eq!(
+            ThreadFolder::parse("ssh://me@fe80::1/").unwrap().cwd(),
+            "ssh://me@fe80::1/"
+        );
+        assert_eq!(
+            ThreadFolder::parse("/home/me/src").unwrap(),
+            ThreadFolder::Local("/home/me/src".into())
+        );
+        for bad in [
+            "ssh://",
+            "ssh://box",
+            "ssh:///srv",
+            "ssh://-oProxyCommand=x/srv",
+            "ssh://box;id/srv",
+            "ssh://box/srv\nx",
+            "ssh://box/a\u{202e}b",
+        ] {
+            assert!(ThreadFolder::parse(bad).is_err(), "{bad:?}");
+            assert!(is_remote_cwd(bad), "{bad:?}");
+        }
+        assert!(!is_remote_cwd("/srv"));
+        assert!(RemoteFolder::new("box", "~/src").is_err(), "only absolute");
+    }
+
+    #[test]
+    fn only_claude_and_codex_run_on_another_machine() {
+        use crate::adapter::Driver;
+        assert_eq!(chat_cli(Driver::Claude), Ok("claude"));
+        assert_eq!(chat_cli(Driver::Codex), Ok("codex"));
+        assert!(chat_cli(Driver::Agy).unwrap_err().contains("Antigravity"));
+        assert!(chat_cli(Driver::Local).unwrap_err().contains("Local agent"));
+        assert!(takes_images(Driver::Claude).is_ok());
+        assert_eq!(takes_images(Driver::Codex), Err(CODEX_IMAGES_REFUSED));
+    }
+
+    #[test]
+    fn a_remote_card_offers_allow_once_and_deny_only() {
+        use crate::event::Decision;
+        let mut options = vec![
+            Decision::Allow,
+            Decision::AllowForSession,
+            Decision::AllowAlways,
+            Decision::Deny,
+            Decision::Cancel,
+        ];
+        approval_options(&mut options);
+        assert_eq!(options, vec![Decision::Allow, Decision::Deny]);
+        let mut options = vec![Decision::Allow, Decision::Cancel];
+        approval_options(&mut options);
+        assert_eq!(options, vec![Decision::Allow, Decision::Deny]);
+    }
+
+    #[test]
+    fn the_probe_parses_in_sh_and_refuses_csh_a_missing_cli_and_junk() {
+        assert!(probe_command("claude").is_ok());
+        for bad in ["", "-x", "a b", "a;b", "$(id)", "a'b"] {
+            assert!(probe_command(bad).is_err(), "{bad:?}");
+        }
+        let command = probe_command("claude").unwrap();
+        assert!(!command.contains('!'));
+        // Inside its outer single quotes there is no other single quote (csh reads it too).
+        let inner = command
+            .strip_prefix("exec /bin/sh -c '")
+            .and_then(|r| r.strip_suffix('\''))
+            .unwrap();
+        assert!(!inner.contains('\''));
+        // Run as a POSIX login shell would, with a fake `claude` on the login PATH.
+        if std::process::Command::new("sh")
+            .arg("-c")
+            .arg("true")
+            .status()
+            .is_ok()
+        {
+            let base =
+                std::env::temp_dir().join(format!("agent-core-probe-{}", std::process::id()));
+            let bin = base.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let fake = bin.join("claude");
+            std::fs::write(&fake, "#!/bin/sh\n").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let path = format!("{}:/usr/bin:/bin", bin.display());
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .env("SHELL", "/bin/sh")
+                .env("PATH", &path)
+                .env("HOME", &base)
+                .env_remove("ENV")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let found = parse_probe("claude", &stdout).unwrap();
+            assert_eq!(found.cli, fake.to_str().unwrap());
+            assert_eq!(found.shell, "/bin/sh");
+            assert!(found.path.starts_with(&bin.display().to_string()));
+            std::fs::remove_dir_all(&base).unwrap();
+        }
+        let ok = format!(
+            "motd\n{PROBE_SHELL}/usr/bin/zsh\n{PROBE_PATH}/usr/bin\n{PROBE_CLI}/usr/bin/codex\n"
+        );
+        assert_eq!(parse_probe("codex", &ok).unwrap().cli, "/usr/bin/codex");
+        let csh = format!("{PROBE_SHELL}/bin/tcsh\n");
+        assert!(parse_probe("codex", &csh).unwrap_err().contains("tcsh"));
+        let missing = format!("{PROBE_SHELL}/bin/bash\n{PROBE_PATH}/usr/bin\n{PROBE_CLI}\n");
+        assert!(parse_probe("codex", &missing)
+            .unwrap_err()
+            .contains("not found"));
+        let alias =
+            format!("{PROBE_SHELL}/bin/bash\n{PROBE_PATH}/usr/bin\n{PROBE_CLI}alias codex=x\n");
+        assert!(parse_probe("codex", &alias).is_err());
+        assert!(parse_probe("codex", "").is_err());
+    }
+
+    #[test]
+    fn the_folder_check_prints_the_canonical_path() {
+        assert_eq!(
+            folder_command("~/src").unwrap(),
+            r#"cd -- "$HOME"/'src' && pwd -P"#
+        );
+        assert!(folder_command("~root").is_err());
+        assert_eq!(parse_folder("motd\n/srv/app\n").unwrap(), "/srv/app");
+        assert!(parse_folder("relative\n").is_err());
+        assert!(parse_folder("").is_err());
+    }
+
+    #[test]
+    fn a_batch_failure_says_when_a_terminal_would_get_past_it() {
+        let key = batch_failure(Some(255), "Host key verification failed.\n");
+        assert!(key.needs_terminal);
+        assert_eq!(key.reason, "Host key verification failed.");
+        assert!(batch_failure(Some(255), "me@box: Permission denied (publickey).").needs_terminal);
+        let dns = batch_failure(Some(255), "ssh: Could not resolve hostname box");
+        assert!(!dns.needs_terminal);
+        let token = "ghp_abcdefghijklmnopqrstuvwxyz0123";
+        assert!(!batch_failure(Some(1), &format!("proxy {token}"))
+            .reason
+            .contains(token));
+        assert!(ssh_failed(Some(255)));
+        assert!(!ssh_failed(Some(1)));
+        assert_eq!(unreachable_notice("box"), "Could not reach box.");
+    }
+
+    /// `Subsystem::ALL` is hand-maintained: `next` has no wildcard, so a new part does not
+    /// compile until it is chained in here, and walking the chain must give exactly `ALL`.
+    #[test]
+    fn every_subsystem_says_what_a_remote_thread_has() {
+        use Subsystem::*;
+        fn next(s: Subsystem) -> Option<Subsystem> {
+            match s {
+                Agent => Some(Stop),
+                Stop => Some(Approvals),
+                Approvals => Some(SessionRules),
+                SessionRules => Some(AlwaysRules),
+                AlwaysRules => Some(Checkpoints),
+                Checkpoints => Some(DiffPanel),
+                DiffPanel => Some(Undo),
+                Undo => Some(Worktree),
+                Worktree => Some(Fork),
+                Fork => Some(HandoffBrief),
+                HandoffBrief => Some(SessionPickers),
+                SessionPickers => Some(ProfileEnvFile),
+                ProfileEnvFile => Some(ModelProvider),
+                ModelProvider => Some(Delegation),
+                Delegation => Some(Images),
+                Images => Some(FileLinks),
+                FileLinks => Some(WorkspaceFiles),
+                WorkspaceFiles => Some(VendorProbe),
+                VendorProbe => Some(Drawer),
+                Drawer => Some(IdleSuspend),
+                IdleSuspend => None,
+            }
+        }
+        let mut walked = vec![Agent];
+        while let Some(n) = next(*walked.last().unwrap()) {
+            walked.push(n);
+        }
+        assert_eq!(walked, Subsystem::ALL);
+        for part in Subsystem::ALL {
+            match support(part) {
+                Support::Full => {}
+                Support::Degraded(why) | Support::Unavailable(why) => {
+                    assert!(!why.is_empty(), "{part:?}")
+                }
+            }
+        }
+        for local_only in [
+            Checkpoints,
+            DiffPanel,
+            Undo,
+            Worktree,
+            HandoffBrief,
+            SessionPickers,
+        ] {
+            assert_eq!(support(local_only), Support::Unavailable(NOT_ON_REMOTE));
         }
     }
 

@@ -11,7 +11,11 @@ all-features = true
 # crates we depend on directly or transitively.
 unmaintained = "all"
 yanked = "deny"
-ignore = []
+ignore = [
+    # RUSTSEC-2026-0543 ("chrono is unmaintained"): chrono 0.4.45 is pulled in directly by
+    # rmcp and by schemars; drop once rmcp (and its schemars dependency) no longer needs chrono.
+    "RUSTSEC-2026-0543",
+]
 
 [licenses]
 # Permissive licences compatible with shipping an MIT binary. A new licence in the tree fails the

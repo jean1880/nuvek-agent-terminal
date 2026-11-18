@@ -399,6 +399,66 @@ pub(super) fn budget_text(amount: Option<f64>) -> String {
 thread_local! {
     /// A budget check is running; a second one asked for meanwhile runs once it ends.
     static BUDGET_CHECK: Cell<(bool, bool)> = const { Cell::new((false, false)) };
+    /// Warnings raised while no window was open, held until a window can toast them.
+    static PENDING_WARNINGS: std::cell::RefCell<Vec<spend::BudgetWarning>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn warning_notification_id(warning: &spend::BudgetWarning) -> String {
+    let period = match warning.period {
+        spend::BudgetPeriod::Day => "day",
+        spend::BudgetPeriod::Month => "month",
+    };
+    let level = match warning.level {
+        spend::BudgetLevel::Near => "near",
+        spend::BudgetLevel::Over => "over",
+    };
+    format!("spending-warning-{period}-{level}")
+}
+
+fn send_spending_notification(warning: &spend::BudgetWarning) {
+    let Some(app) = gtk4::gio::Application::default() else {
+        tracing::debug!("no application to send a spending notification; warning queued");
+        return;
+    };
+    let notification = gtk4::gio::Notification::new("Spending warning");
+    notification.set_body(Some(&warning.text()));
+    notification.set_priority(gtk4::gio::NotificationPriority::High);
+    notification.set_default_action("app.new-window");
+    app.send_notification(Some(&warning_notification_id(warning)), &notification);
+}
+
+/// Shows `warnings` as toasts on `shown`, or queues them (one per `(period, level)`) and notifies
+/// the desktop when no window is open so a recorded warning is never dropped silently.
+fn deliver_spending_warnings(
+    shown: Option<&crate::window::AgentTerminalWindow>,
+    warnings: Vec<spend::BudgetWarning>,
+) {
+    if warnings.is_empty() {
+        return;
+    }
+    if let Some(window) = shown {
+        for warning in warnings {
+            window.imp().show_toast(&warning.text());
+        }
+        return;
+    }
+    for warning in &warnings {
+        send_spending_notification(warning);
+    }
+    PENDING_WARNINGS.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        for warning in warnings {
+            if let Some(existing) = pending
+                .iter_mut()
+                .find(|w| w.period == warning.period && w.level == warning.level)
+            {
+                *existing = warning;
+            } else {
+                pending.push(warning);
+            }
+        }
+    });
 }
 
 const BUDGET_HELP_DAILY: &str =
@@ -572,17 +632,7 @@ impl AgentTerminalWindow {
                 other => another_window(other.as_ref()).or(other),
             };
             match result {
-                Some(Ok(warnings)) => match &shown {
-                    Some(window) => {
-                        for warning in warnings {
-                            window.imp().show_toast(&warning.text());
-                        }
-                    }
-                    None if !warnings.is_empty() => {
-                        tracing::warn!("no window is open to show a spending warning");
-                    }
-                    None => {}
-                },
+                Some(Ok(warnings)) => deliver_spending_warnings(shown.as_ref(), warnings),
                 Some(Err(e)) => tracing::warn!(error = %e, "could not check the spending warnings"),
                 None => tracing::warn!("the spending warnings were not checked"),
             }
@@ -592,6 +642,19 @@ impl AgentTerminalWindow {
                 check_spending_budget_on(shown);
             }
         });
+    }
+
+    /// Shows any spending warnings that arrived while no window was open, withdrawing their
+    /// desktop notifications so the user does not see the same warning twice.
+    pub(super) fn flush_pending_spending_warnings(&self) {
+        let pending = PENDING_WARNINGS.with(|p| std::mem::take(&mut *p.borrow_mut()));
+        let app = gtk4::gio::Application::default();
+        for warning in pending {
+            if let Some(app) = &app {
+                app.withdraw_notification(&warning_notification_id(&warning));
+            }
+            self.show_toast(&warning.text());
+        }
     }
 }
 
@@ -1089,6 +1152,46 @@ pub(super) mod tests {
         crate::testutil::pump_until(&ctx, 2, || BUDGET_CHECK.with(Cell::get) == (false, false));
         crate::testutil::settle(&ctx);
         assert_eq!(warned(), shown + 1, "a level is warned of once a period");
+
+        // A warning raised while no window is open is kept (deduplicated per period and level) and
+        // toasted once when a window opens.
+        let older = spend::BudgetWarning {
+            period: spend::BudgetPeriod::Day,
+            level: spend::BudgetLevel::Over,
+            spent: spend::to_micros(10.0),
+            limit: spend::to_micros(10.0),
+        };
+        let newer = spend::BudgetWarning {
+            period: spend::BudgetPeriod::Day,
+            level: spend::BudgetLevel::Over,
+            spent: spend::to_micros(12.0),
+            limit: spend::to_micros(10.0),
+        };
+        let older_text = older.text();
+        let newer_text = newer.text();
+        deliver_spending_warnings(None, vec![older, newer]);
+        imp.flush_pending_spending_warnings();
+        assert_eq!(
+            imp.test_toasts
+                .borrow()
+                .iter()
+                .filter(|t| {
+                    matches!(
+                        t.title().as_deref(),
+                        Some(s) if s == older_text || s == newer_text
+                    )
+                })
+                .count(),
+            1,
+            "duplicate (period, level) warnings while no window is open collapse to one toast"
+        );
+        assert!(
+            imp.test_toasts
+                .borrow()
+                .iter()
+                .any(|t| t.title().as_deref() == Some(newer_text.as_str())),
+            "the latest warning raised with no window open is shown when a window opens"
+        );
 
         store.delete_thread(&thread).expect("delete");
         let mut c = imp.config.borrow_mut();

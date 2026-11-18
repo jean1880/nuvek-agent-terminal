@@ -205,6 +205,15 @@ pub fn is_valid_profile_id(id: &str) -> bool {
 /// with the clock, the process id and a counter, so two ids made in one nanosecond still
 /// differ. The app has no RNG dependency and this adds none.
 pub fn new_profile_id() -> String {
+    format!("p-{}", fresh_hex())
+}
+
+/// A fresh saved prompt id: `s-` and 16 lowercase hex characters, made as [`new_profile_id`].
+pub fn new_saved_prompt_id() -> String {
+    format!("s-{}", fresh_hex())
+}
+
+fn fresh_hex() -> String {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -217,7 +226,7 @@ pub fn new_profile_id() -> String {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos()),
     );
-    format!("p-{:016x}", hasher.finish())
+    format!("{:016x}", hasher.finish())
 }
 
 /// The chat driver a profile's command runs, judged by the command's file
@@ -1835,6 +1844,164 @@ impl TerminalConfig {
         Ok(true)
     }
 
+    /// Adds a saved prompt at the end of [`Self::saved_prompts`], refusing one that is not valid
+    /// whole (name, text, folder) or whose name and folder another prompt has. The name and
+    /// folder are trimmed (a blank folder is every folder), the text kept exactly, and the
+    /// prompt given an id. Nothing changes on a refusal.
+    pub fn add_saved_prompt(
+        &mut self,
+        mut prompt: agent_core::saved_prompts::SavedPrompt,
+    ) -> Result<(), String> {
+        prompt.name = prompt.name.trim().to_owned();
+        prompt.folder = prompt
+            .folder
+            .map(|f| f.trim().to_owned())
+            .filter(|f| !f.is_empty());
+        if let Some(why) = agent_core::saved_prompts::candidate_problem(
+            &self.saved_prompts,
+            None,
+            &prompt,
+            agent_core::commands::builtins(),
+            crate::utils::expand_tilde,
+        ) {
+            return Err(why);
+        }
+        if prompt.id.is_empty() {
+            prompt.id = new_saved_prompt_id();
+        }
+        self.saved_prompts.push(prompt);
+        Ok(())
+    }
+
+    /// Renames the saved prompt at `index`; `Ok(false)` when it already had that name. Refuses
+    /// an invalid name, a built-in's, or one another prompt has for the same folder, leaving
+    /// the prompt as it was. Only the name is checked: a prompt that was already not valid
+    /// for another reason stays so, and stays in the file.
+    pub fn set_saved_prompt_name(&mut self, index: usize, name: &str) -> Result<bool, String> {
+        let name = name.trim();
+        let prompt = self
+            .saved_prompts
+            .get(index)
+            .ok_or_else(|| "That saved prompt is no longer there".to_owned())?;
+        if let Some(why) = agent_core::saved_prompts::name_problem(
+            &self.saved_prompts,
+            Some(index),
+            name,
+            prompt.folder.as_deref(),
+            agent_core::commands::builtins(),
+            crate::utils::expand_tilde,
+        ) {
+            return Err(why);
+        }
+        let prompt = &mut self.saved_prompts[index];
+        if prompt.name == name {
+            return Ok(false);
+        }
+        prompt.name = name.to_owned();
+        Ok(true)
+    }
+
+    /// Replaces the text of the saved prompt at `index`, kept exactly; `Ok(false)` when it is
+    /// unchanged. Refuses blank text or text over the size cap.
+    pub fn set_saved_prompt_body(&mut self, index: usize, body: &str) -> Result<bool, String> {
+        agent_core::saved_prompts::validate_body(body)?;
+        let prompt = self
+            .saved_prompts
+            .get_mut(index)
+            .ok_or_else(|| "That saved prompt is no longer there".to_owned())?;
+        if prompt.body == body {
+            return Ok(false);
+        }
+        prompt.body = body.to_owned();
+        Ok(true)
+    }
+
+    /// Limits the saved prompt at `index` to `folder` (blank: every folder); `Ok(false)` when
+    /// that is already its scope. Refuses a folder that is not absolute once `~/` is expanded,
+    /// and a scope where another prompt already has its name.
+    pub fn set_saved_prompt_folder(&mut self, index: usize, folder: &str) -> Result<bool, String> {
+        let folder = Some(folder.trim()).filter(|f| !f.is_empty());
+        let prompt = self
+            .saved_prompts
+            .get(index)
+            .ok_or_else(|| "That saved prompt is no longer there".to_owned())?;
+        if let Some(why) = agent_core::saved_prompts::folder_problem(
+            &self.saved_prompts,
+            Some(index),
+            &prompt.name,
+            folder,
+            crate::utils::expand_tilde,
+        ) {
+            return Err(why);
+        }
+        let prompt = &mut self.saved_prompts[index];
+        if prompt.folder.as_deref() == folder {
+            return Ok(false);
+        }
+        prompt.folder = folder.map(str::to_owned);
+        Ok(true)
+    }
+
+    /// Copies the saved prompt at `index` just after it, under a name no prompt has, with a new
+    /// id. Returns the copy's index. Refused past the prompt count cap.
+    pub fn duplicate_saved_prompt(&mut self, index: usize) -> Result<usize, String> {
+        let prompt = self
+            .saved_prompts
+            .get(index)
+            .ok_or_else(|| "That saved prompt is no longer there".to_owned())?;
+        if self.saved_prompts.len() >= agent_core::saved_prompts::MAX_PROMPTS {
+            return Err(format!(
+                "There can be at most {} saved prompts",
+                agent_core::saved_prompts::MAX_PROMPTS
+            ));
+        }
+        let copy = agent_core::saved_prompts::SavedPrompt {
+            id: new_saved_prompt_id(),
+            name: agent_core::saved_prompts::copy_name(&self.saved_prompts, &prompt.name),
+            ..prompt.clone()
+        };
+        self.saved_prompts.insert(index + 1, copy);
+        Ok(index + 1)
+    }
+
+    /// Takes the saved prompt at `index` out of the list, valid or not, and returns it (so it
+    /// can be put back with [`Self::restore_saved_prompt`]).
+    pub fn remove_saved_prompt(
+        &mut self,
+        index: usize,
+    ) -> Option<agent_core::saved_prompts::SavedPrompt> {
+        (index < self.saved_prompts.len()).then(|| self.saved_prompts.remove(index))
+    }
+
+    /// Puts a removed saved prompt back at `index` (or the end), exactly as it was: an undo
+    /// never changes what it restores, and one that was not valid (a hand edit) may come back
+    /// as it was. Refused, leaving the list as it is, when another prompt now has its name for
+    /// the same folder (the one added meanwhile would stop being offered) or the list is full.
+    pub fn restore_saved_prompt(
+        &mut self,
+        index: usize,
+        prompt: agent_core::saved_prompts::SavedPrompt,
+    ) -> Result<(), String> {
+        if self.saved_prompts.len() >= agent_core::saved_prompts::MAX_PROMPTS {
+            return Err(format!(
+                "there can be at most {} saved prompts",
+                agent_core::saved_prompts::MAX_PROMPTS
+            ));
+        }
+        if let Some(why) = agent_core::saved_prompts::clash(
+            &self.saved_prompts,
+            None,
+            &prompt.name,
+            prompt.folder.as_deref(),
+            crate::utils::expand_tilde,
+        ) {
+            return Err(why);
+        }
+        let index = index.min(self.saved_prompts.len());
+        self.saved_prompts.insert(index, prompt);
+        Ok(())
+    }
+
     /// Gives every profile a valid, unique id. A missing (or malformed) id is assigned once; of
     /// several profiles sharing an id the first keeps it and later ones get fresh ids. Never
     /// fails the load. Marks `ids_assigned` when anything changed, so the loader saves it.
@@ -2258,6 +2425,114 @@ mod tests {
         assert_eq!(loaded.saved_prompts, cfg.saved_prompts);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"saved_prompts\""), "{text}");
+    }
+
+    #[test]
+    fn saved_prompt_edits_save_only_what_is_valid_and_keep_invalid_entries() {
+        use agent_core::saved_prompts::SavedPrompt;
+        let prompt = |name: &str, body: &str, folder: Option<&str>| SavedPrompt {
+            id: String::new(),
+            name: name.into(),
+            body: body.into(),
+            folder: folder.map(str::to_owned),
+        };
+        let mut cfg = TerminalConfig::default();
+        // An entry that is not valid, already in the file: kept through every edit.
+        cfg.saved_prompts
+            .push(prompt("model", "a built-in's name", None));
+
+        // Add: refused unless valid whole, trimmed, and given an id.
+        assert!(cfg.add_saved_prompt(prompt("help", "x", None)).is_err());
+        assert!(cfg
+            .add_saved_prompt(prompt("review", " \n ", None))
+            .is_err());
+        assert!(cfg
+            .add_saved_prompt(prompt("review", "x", Some("relative")))
+            .is_err());
+        assert_eq!(cfg.saved_prompts.len(), 1, "a refusal adds nothing");
+        cfg.add_saved_prompt(prompt(" review ", "Review {file}\n", Some("  ")))
+            .unwrap();
+        let added = &cfg.saved_prompts[1];
+        assert_eq!(added.name, "review");
+        assert_eq!(added.body, "Review {file}\n", "the text is kept exactly");
+        assert_eq!(added.folder, None, "a blank folder is every folder");
+        assert!(added.id.starts_with("s-"));
+        assert!(cfg.add_saved_prompt(prompt("REVIEW", "y", None)).is_err());
+        cfg.add_saved_prompt(prompt("review", "here", Some("/w/app")))
+            .unwrap();
+
+        cfg.add_saved_prompt(prompt("tidy", "t", None)).unwrap();
+
+        // Rename: a duplicate for the same folder, or a built-in, is refused.
+        assert!(cfg.set_saved_prompt_name(1, "TIDY").is_err());
+        assert_eq!(cfg.saved_prompts[1].name, "review");
+        assert!(cfg.set_saved_prompt_name(1, "new").is_err());
+        assert_eq!(cfg.set_saved_prompt_name(1, "review"), Ok(false));
+        assert_eq!(cfg.set_saved_prompt_name(2, "local"), Ok(true));
+        assert_eq!(cfg.saved_prompts[2].name, "local");
+        // The text: blank refused, anything else kept exactly.
+        assert!(cfg.set_saved_prompt_body(1, "   ").is_err());
+        assert_eq!(cfg.set_saved_prompt_body(1, "  two\nlines "), Ok(true));
+        assert_eq!(cfg.saved_prompts[1].body, "  two\nlines ");
+        // The folder: absolute, or `~/`, or blank; never where its name is taken.
+        assert!(cfg.set_saved_prompt_folder(1, "rel/dir").is_err());
+        assert_eq!(cfg.set_saved_prompt_folder(1, "~/work"), Ok(true));
+        assert_eq!(cfg.saved_prompts[1].folder.as_deref(), Some("~/work"));
+        assert_eq!(cfg.set_saved_prompt_folder(1, " "), Ok(true));
+        assert_eq!(cfg.saved_prompts[1].folder, None);
+        cfg.add_saved_prompt(prompt("local", "global one", None))
+            .unwrap();
+        assert!(cfg.set_saved_prompt_folder(2, "").is_err(), "taken there");
+        // An index that went away.
+        assert!(cfg.set_saved_prompt_name(99, "x").is_err());
+
+        // Duplicate: just after, a free name, a new id.
+        let at = cfg.duplicate_saved_prompt(1).unwrap();
+        assert_eq!(at, 2);
+        assert_eq!(cfg.saved_prompts[2].name, "review-copy");
+        assert_eq!(cfg.saved_prompts[2].body, cfg.saved_prompts[1].body);
+        assert_ne!(cfg.saved_prompts[2].id, cfg.saved_prompts[1].id);
+
+        // Remove and undo: back exactly where and as it was, invalid or not.
+        let removed = cfg.remove_saved_prompt(0).unwrap();
+        assert_eq!(removed.name, "model");
+        cfg.restore_saved_prompt(0, removed.clone()).unwrap();
+        assert_eq!(cfg.saved_prompts[0], removed);
+        assert!(cfg.remove_saved_prompt(99).is_none());
+
+        // An undo into a slot now taken: refused, and the prompt added meanwhile stays first.
+        let at = cfg
+            .saved_prompts
+            .iter()
+            .position(|p| p.name == "tidy")
+            .unwrap();
+        let tidy = cfg.remove_saved_prompt(at).unwrap();
+        cfg.add_saved_prompt(prompt("Tidy", "the new one", None))
+            .unwrap();
+        let before = cfg.saved_prompts.clone();
+        let refused = cfg.restore_saved_prompt(0, tidy.clone());
+        assert!(refused.is_err_and(|why| why.contains("already")));
+        assert_eq!(cfg.saved_prompts, before, "a refused undo changes nothing");
+        // Nor past the cap.
+        let mut full = TerminalConfig {
+            saved_prompts: (0..agent_core::saved_prompts::MAX_PROMPTS)
+                .map(|i| prompt(&format!("p{i}"), "x", None))
+                .collect(),
+            ..TerminalConfig::default()
+        };
+        assert!(full.restore_saved_prompt(0, tidy).is_err());
+        assert_eq!(
+            full.saved_prompts.len(),
+            agent_core::saved_prompts::MAX_PROMPTS
+        );
+
+        // The invalid entry survives a save and a load untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        assert!(cfg.save_to(&path));
+        let loaded = TerminalConfig::load_from(&path);
+        assert_eq!(loaded.saved_prompts, cfg.saved_prompts);
+        assert_eq!(loaded.saved_prompts[0].name, "model");
     }
 
     #[test]

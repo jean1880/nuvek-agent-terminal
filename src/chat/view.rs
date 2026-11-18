@@ -2028,6 +2028,7 @@ impl ComposerHost for Inner {
         name: &str,
         draft: &str,
         selection: Option<&str>,
+        branch: Option<&agent_kit::worktree::HeadBranch>,
     ) -> Option<saved_prompts::Resolved> {
         let prompt = self
             .saved_prompts()
@@ -2036,6 +2037,16 @@ impl ComposerHost for Inner {
         let mut values = saved_prompts::Values::default();
         if let Some(dir) = self.workspace.borrow().as_deref() {
             values = values.with_folder(&dir.to_string_lossy());
+        }
+        // Redacted by `with_branch`, like every value. With none, `{branch}` stays to fill.
+        match branch {
+            Some(agent_kit::worktree::HeadBranch::Branch(b)) => values = values.with_branch(b),
+            Some(other) => {
+                if let Some(note) = branch_note(other) {
+                    self.notify(note);
+                }
+            }
+            None => {}
         }
         let file = saved_prompts::first_file_mention(draft).or_else(|| {
             self.prompts
@@ -2067,6 +2078,21 @@ impl ComposerHost for Inner {
             );
         }
         Some(resolved)
+    }
+
+    fn saved_branch_reader(&self, name: &str) -> Option<composer::BranchReader> {
+        let prompt = self
+            .saved_prompts()
+            .into_iter()
+            .find(|p| p.name.trim().eq_ignore_ascii_case(name))?;
+        if !saved_prompts::uses(&prompt.body, saved_prompts::Placeholder::Branch) {
+            return None;
+        }
+        let dir = self.workspace.borrow().clone();
+        Some(Box::new(move || match dir {
+            Some(dir) => agent_kit::worktree::head_branch(&dir),
+            None => agent_kit::worktree::HeadBranch::NotRepository,
+        }))
     }
 
     fn request_files(&self, query: &str) -> Option<String> {
@@ -2231,6 +2257,19 @@ impl PlanPanel {
     }
 }
 
+/// Why a saved prompt's `{branch}` was left to fill, as a toast; `None` when it was filled.
+fn branch_note(head: &agent_kit::worktree::HeadBranch) -> Option<&'static str> {
+    use agent_kit::worktree::HeadBranch;
+    match head {
+        HeadBranch::Branch(_) => None,
+        HeadBranch::Detached => Some("{branch} is left to fill: HEAD is detached, on no branch"),
+        HeadBranch::NotRepository => {
+            Some("{branch} is left to fill: the thread's folder is not in a git repository")
+        }
+        HeadBranch::Unknown => Some("{branch} is left to fill: git could not say which branch"),
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2305,6 +2344,7 @@ pub(crate) mod tests {
             "REVIEW",
             " and more",
             Some(&format!("the token {secret}")),
+            None,
         )
         .expect("expanded");
         assert_eq!(
@@ -2314,7 +2354,7 @@ pub(crate) mod tests {
         assert_eq!(&r.text[r.unresolved[0].range.clone()], "{branch}");
 
         // An `@path` already in the draft wins over the panel's file.
-        let r = ComposerHost::expand_saved(&*inner, "review", " see @src/main.rs", None)
+        let r = ComposerHost::expand_saved(&*inner, "review", " see @src/main.rs", None, None)
             .expect("expanded");
         assert!(r
             .text
@@ -2322,19 +2362,89 @@ pub(crate) mod tests {
 
         // A selection over the cap is cut and said to be.
         let big = "line of text\n".repeat(2_000);
-        let r = ComposerHost::expand_saved(&*inner, "review", "", Some(&big)).expect("expanded");
+        let r =
+            ComposerHost::expand_saved(&*inner, "review", "", Some(&big), None).expect("expanded");
         assert!(r.selection_cut);
         assert!(r.text.len() < agent_core::saved_prompts::SELECTION_MAX_BYTES + 100);
 
         // One unbroken run too long to keep: left to fill, and said to be.
         let run = "x".repeat(agent_core::saved_prompts::SELECTION_MAX_BYTES * 4 + 1);
-        let r = ComposerHost::expand_saved(&*inner, "review", "", Some(&run)).expect("expanded");
+        let r =
+            ComposerHost::expand_saved(&*inner, "review", "", Some(&run), None).expect("expanded");
         assert!(r.selection_dropped && !r.selection_cut);
         assert!(r.text.contains("{selection}"));
 
         // A name no prompt has any more.
-        assert!(ComposerHost::expand_saved(&*inner, "gone", "", None).is_none());
-        assert!(ComposerHost::expand_saved(&*inner, "model", "", None).is_none());
+        assert!(ComposerHost::expand_saved(&*inner, "gone", "", None, None).is_none());
+        assert!(ComposerHost::expand_saved(&*inner, "model", "", None, None).is_none());
+
+        // `{branch}`: asked for only by a prompt that uses it, read in the thread's folder (a
+        // folder outside any repository says so), and redacted like every value.
+        assert!(ComposerHost::saved_branch_reader(&*inner, "here").is_none());
+        let read = ComposerHost::saved_branch_reader(&*inner, "review").expect("a reader");
+        assert_eq!(
+            read(),
+            agent_kit::worktree::HeadBranch::Unknown,
+            "/w/app is not there"
+        );
+        let named = agent_kit::worktree::HeadBranch::Branch(format!("feat/{secret}"));
+        let r = ComposerHost::expand_saved(&*inner, "review", "", None, Some(&named))
+            .expect("expanded");
+        assert!(r.text.ends_with("(feat/****6789)"), "the branch is masked");
+        for left in [
+            agent_kit::worktree::HeadBranch::Detached,
+            agent_kit::worktree::HeadBranch::NotRepository,
+            agent_kit::worktree::HeadBranch::Unknown,
+        ] {
+            let r = ComposerHost::expand_saved(&*inner, "review", "", None, Some(&left))
+                .expect("expanded");
+            assert!(r.text.ends_with("({branch})"));
+            assert!(r
+                .unresolved
+                .iter()
+                .any(|u| u.placeholder == agent_core::saved_prompts::Placeholder::Branch));
+            assert!(branch_note(&left).is_some_and(|n| n.contains("left to fill")));
+        }
+        assert!(branch_note(&named).is_none());
+    }
+
+    #[test]
+    #[ignore = "constructs GTK widgets; run on a private display"]
+    fn a_branch_left_to_fill_says_why_in_a_toast() {
+        crate::testutil::gtk_init().expect("GTK init");
+        crate::testutil::adw_init().expect("adw init");
+        let ctx = glib::MainContext::default();
+        for (head, says) in [
+            (
+                agent_kit::worktree::HeadBranch::Detached,
+                "HEAD is detached",
+            ),
+            (
+                agent_kit::worktree::HeadBranch::NotRepository,
+                "not in a git repository",
+            ),
+        ] {
+            let view = ChatView::new(StubBackend::new(Driver::Claude));
+            let inner = view.inner().expect("inner");
+            view.set_prompt_source(Rc::new(StubPrompts {
+                prompts: vec![agent_core::saved_prompts::SavedPrompt {
+                    name: "rel".into(),
+                    body: "Notes for {branch}".into(),
+                    ..Default::default()
+                }],
+                focused: None,
+            }));
+            let r = ComposerHost::expand_saved(&*inner, "rel", "", None, Some(&head))
+                .expect("expanded");
+            assert_eq!(r.text, "Notes for {branch}");
+            let overlay = view.toast_overlay().expect("the toast overlay");
+            let shown = crate::testutil::pump_until(&ctx, 5, || {
+                crate::testutil::label_texts(overlay.upcast_ref())
+                    .iter()
+                    .any(|t| t.contains("{branch} is left to fill") && t.contains(says))
+            });
+            assert!(shown, "a toast says why: {says}");
+        }
     }
 
     #[test]

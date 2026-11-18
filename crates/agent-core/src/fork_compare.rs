@@ -8,25 +8,61 @@
 //!
 //! What a pairing compares ([`Pairing::sides`]): a fork's whole transcript (the context it
 //! inherited is not its own work, and is left out by the caller), and its source's transcript
-//! after the fork point.
+//! after the fork point. Files are compared against the fork's baseline
+//! ([`ForkLink::base_tree`]: a snapshot of the source's working tree taken when the fork was
+//! made; [`Pairing::bases`]), so each side's changes since the fork are told from what was
+//! there before it.
 
 use serde::{Deserialize, Serialize};
 
 use crate::compare::Side;
 
-/// Where a fork came from: its source thread and the source's last stored event at the fork.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Where a fork came from: its source thread and the source's last stored event at the fork,
+/// and the snapshot of the source's working tree taken then, when there was one.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ForkLink {
     pub source_thread: String,
     pub fork_seq: i64,
+    /// The git tree of the source's working tree at the fork (tracked changes and untracked
+    /// files, less what checkpoints skip), kept alive by the fork's baseline ref. `None`: not a
+    /// repository, git was busy, or a link made before baselines were taken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_tree: Option<String>,
+    /// The commit recording [`Self::base_tree`], which the baseline ref points at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
+}
+
+/// Whether `id` reads as a git object id: 40 (SHA-1) or 64 (SHA-256) lowercase hex digits.
+pub fn is_object_id(id: &str) -> bool {
+    matches!(id.len(), 40 | 64) && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 impl ForkLink {
+    /// A link with no baseline.
+    pub fn new(source_thread: &str, fork_seq: i64) -> Self {
+        Self {
+            source_thread: source_thread.to_owned(),
+            fork_seq,
+            ..Self::default()
+        }
+    }
+
     /// A link read back from storage: `None` for anything malformed (not JSON of this shape, no
-    /// source, a negative sequence). Unknown fields are ignored, so a later build's link reads.
+    /// source, a negative sequence). Unknown fields are ignored, so a later build's link reads,
+    /// and one from an earlier build has no baseline. A baseline that is not a pair of object
+    /// ids is dropped and the link kept: the fork still compares by transcript.
     pub fn parse(json: &str) -> Option<Self> {
-        let link: Self = serde_json::from_str(json).ok()?;
-        (!link.source_thread.trim().is_empty() && link.fork_seq >= 0).then_some(link)
+        let mut link: Self = serde_json::from_str(json).ok()?;
+        if link.source_thread.trim().is_empty() || link.fork_seq < 0 {
+            return None;
+        }
+        let valid = |id: &Option<String>| id.as_deref().is_some_and(is_object_id);
+        if !(valid(&link.base_tree) && valid(&link.base_commit)) {
+            link.base_tree = None;
+            link.base_commit = None;
+        }
+        Some(link)
     }
 
     /// The link as stored.
@@ -87,6 +123,21 @@ impl Pairing {
             Relation::Sibling => [whole(this), whole(&self.other)],
         }
     }
+
+    /// The baseline tree each of [`Self::sides`] is compared against, in the same order, from
+    /// the link of the thread the pairing was found for (`own`) and the other's (`other`). A
+    /// fork and its source share the fork's baseline; two siblings each have their own (they
+    /// may have been forked at different times).
+    pub fn bases(&self, own: Option<&ForkLink>, other: Option<&ForkLink>) -> [Option<String>; 2] {
+        let base = |link: Option<&ForkLink>| link.and_then(|l| l.base_tree.clone());
+        match self.relation {
+            // This thread is the fork.
+            Relation::Source => [base(own), base(own)],
+            // The other one is.
+            Relation::Fork => [base(other), base(other)],
+            Relation::Sibling => [base(own), base(other)],
+        }
+    }
 }
 
 /// Every thread `thread` can be compared with: its source (while `exists` says it does), then
@@ -132,9 +183,17 @@ mod tests {
     use super::*;
 
     fn link(source: &str, seq: i64) -> ForkLink {
+        ForkLink::new(source, seq)
+    }
+
+    const TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn based(source: &str, seq: i64, tree: &str) -> ForkLink {
         ForkLink {
-            source_thread: source.to_owned(),
-            fork_seq: seq,
+            base_tree: Some(tree.to_owned()),
+            base_commit: Some(COMMIT.to_owned()),
+            ..link(source, seq)
         }
     }
 
@@ -143,7 +202,12 @@ mod tests {
         let l = link("src", 42);
         assert_eq!(ForkLink::parse(&l.to_json()), Some(l.clone()));
         assert_eq!(
-            ForkLink::parse(r#"{"source_thread":"src","fork_seq":42,"base_tree":"abc"}"#),
+            l.to_json(),
+            r#"{"source_thread":"src","fork_seq":42}"#,
+            "a link with no baseline is written as earlier builds wrote one"
+        );
+        assert_eq!(
+            ForkLink::parse(r#"{"source_thread":"src","fork_seq":42,"later":"abc"}"#),
             Some(l),
             "a later build's extra fields are ignored"
         );
@@ -159,6 +223,67 @@ mod tests {
         ] {
             assert_eq!(ForkLink::parse(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_baseline_round_trips_and_a_malformed_one_is_dropped_not_the_link() {
+        let l = based("src", 3, TREE);
+        assert_eq!(ForkLink::parse(&l.to_json()), Some(l.clone()));
+        let sha256 = "a".repeat(64);
+        assert_eq!(
+            ForkLink::parse(&based("src", 3, &sha256).to_json())
+                .and_then(|l| l.base_tree)
+                .as_deref(),
+            Some(sha256.as_str()),
+            "a SHA-256 repository's ids read"
+        );
+        let upper = TREE.to_uppercase();
+        for (tree, commit) in [
+            (Some("abc"), Some(COMMIT)),
+            (Some(TREE), None),
+            (None, Some(COMMIT)),
+            (
+                Some("-delete-me-0123456789abcdef0123456789abc"),
+                Some(COMMIT),
+            ),
+            (Some(upper.as_str()), Some(COMMIT)),
+        ] {
+            let json = serde_json::json!({
+                "source_thread": "src",
+                "fork_seq": 3,
+                "base_tree": tree,
+                "base_commit": commit,
+            })
+            .to_string();
+            assert_eq!(ForkLink::parse(&json), Some(link("src", 3)), "{json}");
+        }
+        assert!(is_object_id(TREE));
+        assert!(!is_object_id(""));
+    }
+
+    #[test]
+    fn a_fork_and_its_source_share_the_forks_baseline_and_siblings_keep_their_own() {
+        let fork = based("a", 10, TREE);
+        let other_tree = "b".repeat(40);
+        let sibling = based("a", 20, &other_tree);
+        let p = |relation, other: &str| Pairing {
+            other: other.to_owned(),
+            relation,
+            fork_seq: 10,
+        };
+        let shared = [Some(TREE.to_owned()), Some(TREE.to_owned())];
+        // Seen from the fork, then from its source.
+        assert_eq!(p(Relation::Source, "a").bases(Some(&fork), None), shared);
+        assert_eq!(p(Relation::Fork, "b").bases(None, Some(&fork)), shared);
+        assert_eq!(
+            p(Relation::Sibling, "c").bases(Some(&fork), Some(&sibling)),
+            [Some(TREE.to_owned()), Some(other_tree)]
+        );
+        // A link with no baseline (an earlier build's, or no repository) gives none.
+        assert_eq!(
+            p(Relation::Source, "a").bases(Some(&link("a", 10)), None),
+            [None, None]
+        );
     }
 
     #[test]

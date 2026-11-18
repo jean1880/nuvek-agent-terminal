@@ -39,7 +39,12 @@ fn check_reachable(alias: &str, env: &[String]) -> RemoteCheck {
 
 /// Shows `problem` (or, with none, `help`) under `row` and marks `entry` invalid or valid, for
 /// the eye and for a screen reader.
-fn mark_entry(entry: &gtk4::Entry, row: &adw::ActionRow, problem: Option<&str>, help: &str) {
+pub(super) fn mark_entry(
+    entry: &gtk4::Entry,
+    row: &adw::ActionRow,
+    problem: Option<&str>,
+    help: &str,
+) {
     match problem {
         Some(problem) => {
             entry.add_css_class("error");
@@ -61,7 +66,7 @@ fn mark_entry(entry: &gtk4::Entry, row: &adw::ActionRow, problem: Option<&str>, 
 }
 
 /// Runs `commit` when `entry` is committed: Enter, or focus leaving it.
-fn on_commit(entry: &gtk4::Entry, commit: impl Fn() + 'static) {
+pub(super) fn on_commit(entry: &gtk4::Entry, commit: impl Fn() + 'static) {
     let commit = Rc::new(commit);
     let on_enter = Rc::clone(&commit);
     entry.connect_activate(move |_| on_enter());
@@ -71,7 +76,7 @@ fn on_commit(entry: &gtk4::Entry, commit: impl Fn() + 'static) {
 }
 
 /// A row titled `title` holding one entry.
-fn entry_row(
+pub(super) fn entry_row(
     title: &str,
     help: &str,
     text: &str,

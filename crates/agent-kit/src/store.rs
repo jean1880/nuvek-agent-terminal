@@ -38,7 +38,7 @@ mod schema_v8;
 mod search;
 mod spend;
 
-pub use compare::CompareColumn;
+pub use compare::{CompareColumn, ForkColumns};
 pub use preflight::{BACKUP_DIR, PRE_V4_BACKUP_KEY};
 pub use review::ReviewDraft;
 pub use search::{
@@ -4924,10 +4924,7 @@ mod tests {
             attributes: ThreadAttributes {
                 profile_id: Some("p".into()),
                 worktree: Some(worktree()),
-                fork: Some(agent_core::fork_compare::ForkLink {
-                    source_thread: "src".into(),
-                    fork_seq: 1,
-                }),
+                fork: Some(agent_core::fork_compare::ForkLink::new("src", 1)),
             },
             ..ThreadRecord::new(&t, "/w")
         })

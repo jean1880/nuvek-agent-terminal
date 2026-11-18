@@ -2002,13 +2002,7 @@ mod tests {
             root_thread,
             child_thread,
         } = tree();
-        let link = |source: &str| {
-            ForkLink {
-                source_thread: source.to_owned(),
-                fork_seq: 0,
-            }
-            .to_json()
-        };
+        let link = |source: &str| ForkLink::new(source, 0).to_json();
         // The hidden thread as a fork of the root, beside a visible fork of the root.
         s.set_meta(
             &super::super::thread_fork_key(&child_thread),

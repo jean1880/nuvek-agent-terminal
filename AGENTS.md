@@ -100,12 +100,20 @@ Architectural mandates, standards, and workflows for this codebase.
     `Entry`s from a `Side`, a thread and the sequence number after which it counts; `table`
     lines them up by turn, a turn being a prompt and what follows it, with an `Earlier` row for
     what came before a column's first prompt; summaries and the text cap) and `fork_compare`
-    (a fork's `ForkLink`, its source's id and last stored seq at the fork, read leniently; and
+    (a fork's `ForkLink`, its source's id and last stored seq at the fork and its baseline's tree
+    and commit ids, read leniently: a link from an earlier build has no baseline, and a baseline
+    that is not two object ids is dropped, never the link; and
     `pairings`: a thread pairs with its source, its forks and its source's other forks, a fork of
-    a fork with its own source only, never a thread that is gone).
+    a fork with its own source only, never a thread that is gone; `Pairing::bases`: a fork and
+    its source share the fork's baseline, two siblings each have their own).
   - `crates/agent-kit` (GTK-free; blocking process and file I/O): `git`
     (git plumbing for turn checkpoints and diffs: shells out, but its parsers
-    and filters are pure), `diff` (diff bases, numstat, line classification,
+    and filters are pure; `diff_trees` is the one tree-to-tree diff, capped, driver-free;
+    `git/fork.rs` is a fork's baseline: `take_fork_baseline` snapshots and commits the source's
+    working tree as a checkpoint does, `keep_fork_baseline` points
+    `refs/agent-terminal/fork/<thread>` at it once the fork is stored, `drop_fork_baseline`
+    deletes it with the fork only while it still points there, and `fork_changes` diffs a fresh
+    snapshot of a side's folder against it; checkpoint pruning never takes a fork ref), `diff` (diff bases, numstat, line classification,
     truncation, the hunk line map, a selection's comment span and a comment's anchor in a
     later diff: exact, moved once, or gone, never a guess; `card_files`/`card_comment_span`, a
     file-change card's diff of several files cut by its headers, one file a comment, and an
@@ -116,7 +124,8 @@ Architectural mandates, standards, and workflows for this codebase.
     one has lost its lines; `repo_path` names a card's file from the thread's repository or
     folder), `restore` (undo: pin, restore, contained deletion, check),
     `worktree` (worktree locations, branch checks, create and clean-only
-    remove), `commit` (the diff panel's commit of the ticked paths: its context, arguments and
+    remove; `head_branch`, a folder's branch or why there is none, for a saved prompt's
+    `{branch}`), `commit` (the diff panel's commit of the ticked paths: its context, arguments and
     run), `merge` (a worktree branch merged back into its base: the read-only `preflight`, the
     one `commands` list the preview shows and the merge runs, and the abort-only `merge`), `github` (a branch's pull-request state, the compare URL, the unforced push; it also gives
     a thread's subtitle its branch, shown only for a repository on GitHub),
@@ -211,8 +220,8 @@ Architectural mandates, standards, and workflows for this codebase.
     `create_thread_record`), `Store::transcript_at_fork` takes the hand-off's transcript and the
     fork point in one read, `Store::fork_pairings` names only threads that exist and are not
     hidden, and `Store::compare_columns` folds each side as a hand-off reads it (no reasoning,
-    notices or inherited context) after its point, all in one read; each a read through
-    `store_job`.
+    notices or inherited context) after its point, all in one read; `Store::fork_columns` reads
+    those columns and each side's baseline together; each a read through `store_job`.
   - The app (`src/`): `config.rs` (persisted settings + migration, re-exporting
     `SessionFormat`; per-agent defaults live on the profiles), `theme.rs`
     (colour schemes, infallible `RGBA::new`), `utils.rs` (detection and
@@ -232,6 +241,13 @@ Architectural mandates, standards, and workflows for this codebase.
     `spend::parse_budget` accepts them; and the budget check, started by a metered turn or a
     new extra-usage reading, run once at a time, its toasts what the writer recorded as due), `window/imp/remote.rs` (Settings →
     General → Remote Machines and the New Terminal Thread on Another Machine dialog),
+    `window/imp/prompts_prefs.rs` (Settings → General → Saved Prompts: each field saved when
+    committed and only when `saved_prompts::name_problem`/`validate_body`/`folder_problem` accept
+    it, through `TerminalConfig::set_saved_prompt_*`; Add takes a whole valid prompt
+    (`candidate_problem`); an invalid entry already in the file is listed with its problem and
+    kept, never dropped; Delete offers Undo, which puts it back exactly, or is refused when the
+    name now clashes or the list is full; a reload of the file that changes the prompts redraws
+    an open group, after pending in-app saves are written),
     `window/imp/threads/message_search.rs` (the sidebar's "In Messages" section, behind the
     toggle beside its search entry: `Store::search` through `store_job` after typing pauses, a
     generation counter so only the newest search draws, "Search is unavailable" never shown as
@@ -248,9 +264,15 @@ Architectural mandates, standards, and workflows for this codebase.
     compare window: an `adw::Window` of its own, never a page or a `TabState`, that only reads;
     it holds itself until closed or destroyed with its parent, so no caller keeps it;
     a spinner until its first read, a generation so only the newest read draws, Refresh, replies
-    as guarded markdown; it knows nothing of forks), `window/imp/fork_compare.rs` (Compare with
-    Fork…, `/compare` and the fork toast's Compare: the pairings and the picker, then each
-    column read through `store_job`), `window/diff_panel.rs` (the
+    as guarded markdown; its Changes tab, shown once a caller begins a read of it, has a
+    generation of its own and draws each side's diff with the diff panel's read-only file list,
+    `diff_panel::read_only_files`; it knows nothing of forks), `window/imp/fork_compare.rs`
+    (Compare with Fork…, `/compare` and the fork toast's Compare: the pairings and the picker,
+    then each column read through `store_job` and each side's changes since its baseline through
+    `off_main`; two sides in one folder are one diff under a note saying their changes cannot be
+    told apart; and the fork's baseline: taken by Fork thread off the main thread, unless
+    checkpoints are off, right after the fork point is read, its ref kept once the fork is
+    stored and dropped when the fork is deleted), `window/diff_panel.rs` (the
     diff panel's widgets, its file tick boxes, "Commit…", "Open a PR" and "Merge into …" bars;
     it pops out into
     its own window, keeping its
@@ -386,7 +408,10 @@ Architectural mandates, standards, and workflows for this codebase.
   runs in its own process group like the commit. It never deletes the branch or the worktree.
   `merge::tests` prove these. Every git call strips inherited
   `GIT_DIR`-style variables and sets `GIT_OPTIONAL_LOCKS=0`. Untracked files
-  whose names look like secrets are never captured.
+  whose names look like secrets are never captured. A fork's baseline is such a snapshot,
+  recorded as `refs/agent-terminal/fork/<thread>` (empty old value), spared by checkpoint
+  pruning and deleted with its fork; `git::fork::tests` prove it leaves the user's state alone
+  and skips secret-looking files.
 - **Hand-off briefs are the terminal's, not the CLI's**: a CLI out of quota
   cannot summarize itself, so briefs are built from disk. Every brief goes
   through `agent_core::redact::redact` and is written `0600` in a `0700` directory outside
@@ -431,7 +456,8 @@ Architectural mandates, standards, and workflows for this codebase.
   fork, compact-by-handoff, brief) goes through `agent_core::redact` and the
   handoff budget. A new store write or injected prompt must take the same path. A saved
   prompt's placeholder values (`{file}`, `{selection}`, `{folder}`, `{branch}`) are redacted
-  when they are given to `saved_prompts::Values` (a selection before it is cut to 8 KB);
+  when they are given to `saved_prompts::Values` (a selection before it is cut to 8 KB),
+  after their control, bidi and zero-width characters are taken out;
   the expanded text only fills the draft, never sends, and is then the user's own prompt.
   Terminal text sent to a thread ("Send Selection" or "Send Last Output", from a drawer or a
   terminal page, a remote one included) goes through `terminal_excerpt::format_excerpt`: only
@@ -440,6 +466,11 @@ Architectural mandates, standards, and workflows for this codebase.
   instructions" label. It only fills a draft, never sends, and a terminal page's target is the
   thread last shown in its window (`last_chat_key`), never one opened for it; with none the
   actions are disabled.
+  `{branch}` is read off the main thread (`ComposerHost::saved_branch_reader`, run by
+  `gio::spawn_blocking`); the composer keeps the typed `/name` until it answers and uses the
+  answer only if the draft is unchanged and no other prompt was chosen meanwhile
+  (`saved_seq`). No repository, a detached HEAD or a failed read leaves `{branch}` to fill,
+  with a toast saying why.
   A thread's tag is shown on every row, so one that redaction would change is refused (by the
   Tags dialog and again by `Store::set_tags`), never stored masked; tags are never injected
   into a prompt or a hand-off.

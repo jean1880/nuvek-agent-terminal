@@ -7,6 +7,14 @@
 //! store off the main thread and hands the result to [`CompareWindow::show`]; only the newest
 //! read draws. Refresh (the header's button) calls the caller back to read again.
 //!
+//! A caller with file changes to show starts a read of the Changes tab too
+//! ([`CompareWindow::begin_changes`], which shows the tab switcher) and hands each side's diff to
+//! [`CompareWindow::show_changes`]: a column per side (or one, standing for sides that share a
+//! folder, with a note saying what that means), the paths changed on every side, and each
+//! side's files laid out as the diff panel lays them out, read-only
+//! ([`super::diff_panel::read_only_files`]). The diffs are read off the main thread by the
+//! caller.
+//!
 //! What it shows is already scrubbed (the store scrubs every event and title); replies are
 //! markdown whose links open nothing but a web or mail address ([`crate::chat::view::guard_links`]).
 
@@ -39,6 +47,61 @@ pub(crate) struct CompareContent {
     pub(crate) empty: String,
 }
 
+/// One column of the Changes tab: what changed in a thread's folder since its starting point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ChangesState {
+    /// The folder is not in a git repository.
+    NotRepo,
+    /// Why there is nothing to show (no starting point, git busy, the folder gone).
+    Unavailable(String),
+    /// The diff from the starting point to the folder as it is now.
+    Ready(crate::git::TabDiff),
+}
+
+/// A column of the Changes tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChangesColumn {
+    pub(crate) heading: String,
+    pub(crate) state: ChangesState,
+}
+
+/// What [`CompareWindow::show_changes`] draws.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChangesContent {
+    /// Said above the columns: what the diffs can and cannot tell (one folder shared).
+    pub(crate) note: Option<String>,
+    /// True when the sides share one working folder, so overlapping paths are not "changed on
+    /// both sides".
+    pub(crate) shared: bool,
+    /// One column per side, or a single one standing for several that are one and the same.
+    pub(crate) columns: Vec<ChangesColumn>,
+}
+
+/// The paths changed in every one of `columns` (each ready, at least two), in the first one's
+/// order: where the sides' work overlaps.
+pub(crate) fn changed_in_all(columns: &[ChangesColumn]) -> Vec<String> {
+    let diffs: Vec<&crate::git::TabDiff> = columns
+        .iter()
+        .filter_map(|c| match &c.state {
+            ChangesState::Ready(diff) => Some(diff),
+            _ => None,
+        })
+        .collect();
+    if diffs.len() < 2 || diffs.len() != columns.len() {
+        return Vec::new();
+    }
+    diffs[0]
+        .stats
+        .iter()
+        .map(|s| s.path.clone())
+        .filter(|path| {
+            diffs[1..]
+                .iter()
+                .all(|d| d.stats.iter().any(|s| &s.path == path))
+        })
+        .collect()
+}
+
 /// What Refresh calls ([`CompareWindow::connect_refresh`]).
 type Refresh = Rc<dyn Fn(&CompareWindow)>;
 
@@ -46,6 +109,10 @@ struct Inner {
     window: adw::Window,
     title: adw::WindowTitle,
     stack: gtk4::Stack,
+    /// Switches between the Transcripts and Changes tabs; shown once a Changes read has begun.
+    switcher: adw::ViewSwitcher,
+    changes: gtk4::Stack,
+    changes_generation: Generation,
     refresh: gtk4::Button,
     generation: Generation,
     on_refresh: RefCell<Option<Refresh>>,
@@ -58,6 +125,16 @@ struct Inner {
 /// its `adw::Window` is destroyed, whoever holds a clone.
 #[derive(Clone)]
 pub(crate) struct CompareWindow(Rc<Inner>);
+
+/// A weak hold on a [`CompareWindow`], for async reads that must not keep a closed window alive.
+#[derive(Clone)]
+pub(crate) struct WeakCompareWindow(std::rc::Weak<Inner>);
+
+impl WeakCompareWindow {
+    pub(crate) fn upgrade(&self) -> Option<CompareWindow> {
+        self.0.upgrade().map(CompareWindow)
+    }
+}
 
 impl CompareWindow {
     /// A window titled `title`, sized from `parent` and closed with it, showing a spinner until
@@ -73,18 +150,22 @@ impl CompareWindow {
         header.set_title_widget(Some(&heading));
         header.pack_start(&refresh);
         let stack = gtk4::Stack::new();
-        let spinner = gtk4::Spinner::builder()
-            .spinning(true)
-            .width_request(32)
-            .height_request(32)
-            .halign(gtk4::Align::Center)
-            .valign(gtk4::Align::Center)
+        stack.add_named(&spinner("Reading the threads"), Some("loading"));
+        let changes = gtk4::Stack::new();
+        changes.add_named(&spinner("Reading the file changes"), Some("loading"));
+        let tabs = adw::ViewStack::new();
+        tabs.add_titled(&stack, Some("transcripts"), "Transcripts");
+        tabs.add_titled(&changes, Some("changes"), "Changes");
+        let switcher = adw::ViewSwitcher::builder()
+            .stack(&tabs)
+            .policy(adw::ViewSwitcherPolicy::Wide)
+            .visible(false)
+            .tooltip_text("Show the transcripts or the file changes")
             .build();
-        spinner.update_property(&[gtk4::accessible::Property::Label("Reading the threads")]);
-        stack.add_named(&spinner, Some("loading"));
+        header.pack_end(&switcher);
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&header);
-        toolbar.set_content(Some(&stack));
+        toolbar.set_content(Some(&tabs));
         let window = adw::Window::builder()
             .title(title)
             .default_width(parent.width().clamp(720, 1280))
@@ -110,6 +191,9 @@ impl CompareWindow {
             window,
             title: heading,
             stack,
+            switcher,
+            changes,
+            changes_generation: Generation::new(),
             refresh,
             generation: Generation::new(),
             on_refresh: RefCell::new(None),
@@ -143,6 +227,11 @@ impl CompareWindow {
             }
         });
         Self(inner)
+    }
+
+    /// A weak hold on this window, for async work.
+    pub(crate) fn downgrade(&self) -> WeakCompareWindow {
+        WeakCompareWindow(Rc::downgrade(&self.0))
     }
 
     /// The window itself.
@@ -190,13 +279,130 @@ impl CompareWindow {
     }
 
     fn replace_page(&self, page: &gtk4::Widget) {
-        let stack = &self.0.stack;
-        if let Some(old) = stack.child_by_name("shown") {
-            stack.remove(&old);
-        }
-        stack.add_named(page, Some("shown"));
-        stack.set_visible_child_name("shown");
+        replace_shown(&self.0.stack, page);
     }
+
+    /// Starts a read of the Changes tab (showing the tab's switcher from then on): its
+    /// generation, which only the newest [`Self::show_changes`] or
+    /// [`Self::show_changes_error`] draws.
+    pub(crate) fn begin_changes(&self) -> u64 {
+        self.0.switcher.set_visible(true);
+        self.0.changes_generation.next()
+    }
+
+    /// Draws the Changes tab, unless a newer read of it has started since `generation`.
+    pub(crate) fn show_changes(&self, generation: u64, content: &ChangesContent) {
+        if !self.0.changes_generation.is_current(generation) {
+            return;
+        }
+        replace_shown(&self.0.changes, &changes_page(content));
+    }
+
+    /// Says why the Changes tab could not be read, unless a newer read has started.
+    pub(crate) fn show_changes_error(&self, generation: u64, why: &str) {
+        if !self.0.changes_generation.is_current(generation) {
+            return;
+        }
+        let page = adw::StatusPage::builder()
+            .title("Could Not Read the Changes")
+            .description(glib::markup_escape_text(why).as_str())
+            .build();
+        crate::icons::set_status_icon(&page, "at-dialog-error-symbolic");
+        replace_shown(&self.0.changes, page.upcast_ref());
+    }
+}
+
+fn spinner(name: &str) -> gtk4::Spinner {
+    let spinner = gtk4::Spinner::builder()
+        .spinning(true)
+        .width_request(32)
+        .height_request(32)
+        .halign(gtk4::Align::Center)
+        .valign(gtk4::Align::Center)
+        .build();
+    spinner.update_property(&[gtk4::accessible::Property::Label(name)]);
+    spinner
+}
+
+/// Puts `page` in `stack` as its shown page, in place of the one before.
+fn replace_shown(stack: &gtk4::Stack, page: &gtk4::Widget) {
+    if let Some(old) = stack.child_by_name("shown") {
+        stack.remove(&old);
+    }
+    stack.add_named(page, Some("shown"));
+    stack.set_visible_child_name("shown");
+}
+
+/// The Changes tab for `content`: its note, the files changed on every side, then a column
+/// per side with its totals and its files.
+fn changes_page(content: &ChangesContent) -> gtk4::Widget {
+    let outer = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(12)
+        .margin_top(12)
+        .margin_bottom(18)
+        .margin_start(18)
+        .margin_end(18)
+        .build();
+    if let Some(note) = &content.note {
+        let note = label(note, &["compare-changes-note", "warning"]);
+        outer.append(&note);
+    }
+    let in_all = if content.shared {
+        Vec::new()
+    } else {
+        changed_in_all(&content.columns)
+    };
+    if !in_all.is_empty() {
+        let both = label(
+            &format!("Changed on both sides: {}", in_all.join(", ")),
+            &["compare-changed-in-all"],
+        );
+        both.set_selectable(true);
+        outer.append(&both);
+    }
+    let grid = gtk4::Grid::builder()
+        .column_homogeneous(true)
+        .column_spacing(18)
+        .build();
+    for (i, column) in content.columns.iter().enumerate() {
+        let col = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .spacing(6)
+            .valign(gtk4::Align::Start)
+            .css_classes(["compare-changes-column"])
+            .build();
+        let title = label(&column.heading, &["title-4"]);
+        title.set_wrap(false);
+        title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        title.set_tooltip_text(Some(&column.heading));
+        col.append(&title);
+        match &column.state {
+            ChangesState::NotRepo => col.append(&label(
+                "This folder is not in a git repository, so there are no file changes to show.",
+                &["dim-label"],
+            )),
+            ChangesState::Unavailable(why) => col.append(&label(why, &["dim-label"])),
+            ChangesState::Ready(diff) if diff.stats.is_empty() => {
+                col.append(&label("No files changed.", &["dim-label"]))
+            }
+            ChangesState::Ready(diff) => {
+                col.append(&label(
+                    &crate::diff::summary(&diff.stats),
+                    &["dim-label", "caption", "compare-changes-summary"],
+                ));
+                col.append(&super::diff_panel::read_only_files(diff));
+            }
+        }
+        grid.attach(&col, i as i32, 0, 1, 1);
+    }
+    outer.append(&grid);
+    gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vexpand(true)
+        .child(&outer)
+        .build()
+        .upcast()
 }
 
 fn label(text: &str, classes: &[&str]) -> gtk4::Label {
@@ -516,6 +722,159 @@ pub(crate) mod tests {
             texts.iter().any(|t| t == "Nothing yet"),
             "each column's summary"
         );
+        // The Changes tab: hidden until a read of it begins, then only its newest read draws.
+        let switcher =
+            crate::testutil::find_first::<adw::ViewSwitcher>(&root).expect("the tab switcher");
+        assert!(
+            !switcher.is_visible(),
+            "no Changes tab without changes to read"
+        );
+        let stale = window.begin_changes();
+        let current = window.begin_changes();
+        assert!(switcher.is_visible());
+        let text = "diff --git a/src/x.rs b/src/x.rs\n--- a/src/x.rs\n+++ b/src/x.rs\n\
+                    @@ -1 +1 @@\n-old\n+new\n";
+        let changed = crate::git::TabDiff {
+            stats: vec![crate::diff::FileStat {
+                path: "src/x.rs".into(),
+                old_path: None,
+                added: Some(1),
+                deleted: Some(1),
+            }],
+            text: text.into(),
+            omitted_lines: 3,
+            too_large: false,
+            undo_to: None,
+            from: "base".into(),
+            to_checkpoint: None,
+        };
+        let changes = ChangesContent {
+            note: Some("One folder.".into()),
+            shared: true,
+            columns: vec![
+                ChangesColumn {
+                    heading: "A".into(),
+                    state: ChangesState::Ready(changed.clone()),
+                },
+                ChangesColumn {
+                    heading: "B".into(),
+                    state: ChangesState::Unavailable("Git is busy".into()),
+                },
+            ],
+        };
+        window.show_changes(stale, &changes);
+        assert!(
+            crate::testutil::find_first::<gtk4::Expander>(&root).is_none(),
+            "a superseded read of the changes draws nothing"
+        );
+        window.show_changes(current, &changes);
+        let texts = crate::testutil::label_texts(&root);
+        for expected in [
+            "One folder.",
+            "1 file, +1 −1",
+            "src/",
+            "x.rs  +1 −1",
+            "Git is busy",
+            "… diff truncated: 3 more lines not shown",
+        ] {
+            assert!(
+                texts.iter().any(|t| t == expected),
+                "{expected:?} in {texts:#?}"
+            );
+        }
+        let expander =
+            crate::testutil::find_first::<gtk4::Expander>(&root).expect("the file's row");
+        assert!(
+            expander.child().is_none(),
+            "a file's diff is built when first opened"
+        );
+        expander.set_expanded(true);
+        let scroller = expander
+            .child()
+            .and_downcast::<gtk4::ScrolledWindow>()
+            .expect("the file's diff scroller");
+        let view = scroller
+            .child()
+            .and_downcast::<gtk4::TextView>()
+            .expect("the file's diff");
+        assert!(!view.is_editable());
+        let buffer = view.buffer();
+        let shown = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
+        assert!(shown.contains("+new"), "{shown}");
+        // Live theme switch recolours open read-only diff views.
+        let before_added = buffer
+            .tag_table()
+            .lookup("added")
+            .and_then(|t| t.foreground_rgba());
+        crate::palette::apply(
+            crate::config::ThemeChoice::SolarizedLight,
+            crate::config::ThemePair::default(),
+        );
+        let after_added = buffer
+            .tag_table()
+            .lookup("added")
+            .and_then(|t| t.foreground_rgba());
+        assert_ne!(before_added, after_added);
+        crate::palette::apply(
+            crate::config::ThemeChoice::default(),
+            crate::config::ThemePair::default(),
+        );
+
+        // Two shared-folder columns never say "Changed on both sides".
+        let shared_two = ChangesContent {
+            note: Some("One folder.".into()),
+            shared: true,
+            columns: vec![
+                ChangesColumn {
+                    heading: "A".into(),
+                    state: ChangesState::Ready(changed.clone()),
+                },
+                ChangesColumn {
+                    heading: "B".into(),
+                    state: ChangesState::Ready(changed.clone()),
+                },
+            ],
+        };
+        let g = window.begin_changes();
+        window.show_changes(g, &shared_two);
+        assert!(
+            !crate::testutil::label_texts(&root)
+                .iter()
+                .any(|t| t.starts_with("Changed on both sides:")),
+            "shared folder suppresses 'Changed on both sides'"
+        );
+
+        // Both sides changed one path in separate folders: named once, above the columns.
+        let both = ChangesContent {
+            note: None,
+            shared: false,
+            columns: vec![
+                ChangesColumn {
+                    heading: "A".into(),
+                    state: ChangesState::Ready(changed.clone()),
+                },
+                ChangesColumn {
+                    heading: "B".into(),
+                    state: ChangesState::Ready(changed),
+                },
+            ],
+        };
+        assert_eq!(changed_in_all(&both.columns), ["src/x.rs"]);
+        let g = window.begin_changes();
+        window.show_changes(g, &both);
+        assert!(crate::testutil::label_texts(&root)
+            .iter()
+            .any(|t| t == "Changed on both sides: src/x.rs"));
+        let g = window.begin_changes();
+        window.show_changes_error(g, "the store is busy");
+        assert!(crate::testutil::label_texts(&root)
+            .iter()
+            .any(|t| t == "Could Not Read the Changes"));
+        let problems = crate::testutil::button_problems(&root, 24);
+        assert!(problems.is_empty(), "{problems:#?}");
+        let unnamed = crate::testutil::icon_only_without_label(&root);
+        assert!(unnamed.is_empty(), "{unnamed:#?}");
+
         // Nobody else holds it: Refresh still reaches the caller while the window is open.
         let shown = window.window().clone();
         drop(window);

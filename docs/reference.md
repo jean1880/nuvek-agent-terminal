@@ -845,8 +845,8 @@ the place of a prompt of the same name without one; the deepest folder wins.
 
 ### Remote machines
 
-A terminal page can run on another machine through your own `ssh`. Agent Terminal installs
-nothing there and writes nothing there.
+A terminal page, or a Claude or Codex chat thread, can run on another machine through your
+own `ssh`. Agent Terminal installs nothing there and writes nothing there.
 
 **Listing a machine.** In Settings → General → Remote Machines, type the name you reach it by
 with `ssh` (a `Host` from `~/.ssh/config`, a host name or `user@host`) and press Enter or
@@ -894,3 +894,63 @@ to the same machine and folder.
 a profile's environment file or model provider, and **New Thread in This Folder** opening a
 local thread. All of these read or start things on this machine. Remote pages are not
 reopened at launch by Reopen Terminal Tabs, so no `ssh` starts unless you open one.
+
+#### Threads on another machine
+
+**+** → New Thread on Another Machine… asks for a listed machine, the agent (**Claude** or
+**Codex**; Antigravity and the Local agent cannot run there, since the app reads Antigravity's
+transcript and images from this machine's disk and the Local agent is the app's own runner)
+and a folder there. **Create** asks the machine two things, each with `ssh -T -o
+BatchMode=yes` and the page's forwarding options, at most 15 seconds each:
+
+- where the agent is: a login shell there (`$SHELL -l`, never interactive) reports its `PATH`
+  and the absolute path of `claude` or `codex` on it. A csh or tcsh login shell is refused (the
+  command line below is POSIX), and so is an agent not on that `PATH`. The answer is kept until
+  Agent Terminal quits, per machine and agent; a failure is never kept;
+- what the folder is: `cd -- '<folder>' && pwd -P`, so the thread keeps its canonical
+  absolute path.
+
+The thread's agent then runs as
+
+```
+ssh -T -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 \
+    -o ClearAllForwardings=yes -o ForwardAgent=no -o ForwardX11=no \
+    -o PermitLocalCommand=no -o Tunnel=no -o RemoteCommand=none \
+    -- <machine> "cd -- '<folder>' && exec env 'PATH=<probed>' '<agent>' '<argument>' …"
+```
+
+every value quoted, in Agent Terminal's own environment minus `clear_env`: no profile
+arguments, environment file, model provider, key file, approval socket or delegation binding.
+`BatchMode=yes` means ssh never waits on a question nobody can see: a machine whose key you have
+not accepted, or that needs a password, fails with the reason ssh gave (secrets in it masked),
+and a toast offers **Open a Terminal There**, where you answer it. When ssh itself fails (exit
+255), the thread says **Could not reach <machine>** and tries again after 2, 10 and 30 seconds,
+as for any agent that exits with an error.
+
+The agent starts only when you create the thread or open it, never at launch: threads on
+another machine are left out of the threads reopened by Reopen Last Thread. Its folder is fixed
+for its life; the sidebar groups it under `machine:/path` with a network-server mark, and the
+window's subtitle says the same. If the machine is removed from Settings, the thread refuses to
+start until it is listed again. An older Agent Terminal that opens such a thread cannot start
+it: it takes the stored `ssh://machine/path` folder for a local folder, which does not exist, so
+the start fails.
+
+**What works:** the conversation itself, the model picker, modes, **Stop** (the agent's own
+interrupt, sent over its input: a command the agent started there may keep running), idle
+suspension and resume, Fork and Compact (the new thread stays in the same folder there, with no
+baseline to compare changes against), Export, tags and search. File-change cards show the
+agent's own diff. Images go to Claude as they do locally.
+
+**What is reduced:** approval cards offer **Allow once** and **Deny** only. Session and saved
+rules are judged against this machine's files, so none is offered, kept or applied, and the app
+answers no card itself, whatever the mode (Codex's Accept edits asks before each edit). A Codex
+request for extra permissions can only be denied. Codex takes no images there (it reads an image
+from a file path, and the image is on this machine): the composer keeps the message and says
+so. An image Codex viewed there is not shown. A link to a file opens nothing; web links do.
+
+**What does not work:** checkpoints, the diff panel and its Changes toggle (shown greyed;
+`Ctrl+Shift+D` says why), undo and `/rewind`, worktrees, hand-off briefs and `/handoff`,
+switching the thread to another agent or profile, Continue in, Open folder, Review
+Multi-Agent Environment, session pickers, sub-agents, the usage-limit wait (send a message to
+continue) and the sign-in and agent-missing banners, which describe this machine's agent. The
+drawer (`` Ctrl+` ``) opens `ssh -t` to the same folder there, as a remote page does.

@@ -31,6 +31,7 @@ pub mod native;
 pub mod paths;
 pub mod provider_key;
 pub mod provider_models;
+pub mod remote;
 pub mod restore;
 pub mod search_backfill;
 pub mod sessions;

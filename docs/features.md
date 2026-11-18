@@ -269,7 +269,10 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   Machines, then **+** → New Terminal Thread on Another Machine… opens a terminal page in a
   folder there (`~` works), titled `machine:folder`. It is your own `ssh`, with your own
   configuration and keys, never with port, agent or X11 forwarding, and nothing connects until
-  you ask. See [Remote machines](reference.md#remote-machines).
+  you ask. **+** → New Thread on Another Machine… runs Claude or Codex there as a chat thread,
+  in a reduced form: approvals offer Allow once and Deny only, and checkpoints, the diff
+  panel, undo, worktrees, hand-off briefs and session pickers are not available. See
+  [Remote machines](reference.md#remote-machines).
 
 ### Appearance and behaviour
 

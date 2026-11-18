@@ -1827,8 +1827,12 @@ fn image_drop_target(composer: &Rc<Composer>) -> gtk4::DropTarget {
 }
 
 /// Why the thread's agent cannot take images, in its own words ("Antigravity can't take images
-/// (its input is text only)."), or `None` when it can.
+/// (its input is text only)."), or `None` when it can. A session that refuses them although its
+/// agent takes them (Codex on another machine) says its own reason.
 fn image_refusal(status: &SessionStatus) -> Option<String> {
+    if let Some(why) = status.images_refused {
+        return Some(why.to_owned());
+    }
     status.capabilities.unsupported_note(
         agent_core::caps::Feature::ImageInput,
         status.driver.info().label,
@@ -2500,6 +2504,7 @@ pub(crate) mod tests {
             alive: true,
             capabilities: agent_core::caps::Capabilities::of(driver),
             commands: Vec::new(),
+            images_refused: None,
         }
     }
 
@@ -6293,6 +6298,7 @@ pub(crate) mod tests {
                 alive: true,
                 capabilities: caps.clone(),
                 commands: Vec::new(),
+                images_refused: None,
             };
             for feature in agent_core::caps::Feature::ALL {
                 if let Some(note) = caps.unsupported_note(feature, name) {
@@ -6364,6 +6370,7 @@ pub(crate) mod tests {
             alive: true,
             capabilities: agent_core::caps::Capabilities::codex(),
             commands: Vec::new(),
+            images_refused: None,
         };
         let note = unavailable_builtin_note("/mcp", &status).expect("a note");
         assert!(note.ends_with("has no MCP panel."), "{note}");

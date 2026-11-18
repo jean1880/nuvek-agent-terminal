@@ -355,6 +355,10 @@ pub struct SessionStatus {
     pub alive: bool,
     pub capabilities: agent_core::caps::Capabilities,
     pub commands: Vec<agent_core::event::AgentCommand>,
+    /// Why this session takes no images although its agent can, when it cannot: Codex on
+    /// another machine, which reads an image from a path ([`agent_core::remote::takes_images`]).
+    /// `capabilities.image_input` is then false too.
+    pub images_refused: Option<&'static str>,
 }
 
 /// Where a backend delivers envelopes (the view's `apply`). Called on the main thread.

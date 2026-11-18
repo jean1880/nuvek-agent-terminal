@@ -73,6 +73,7 @@ pub fn demo_backend() -> Rc<DemoBackend> {
             alive: true,
             capabilities: Capabilities::claude(),
             commands: demo_commands(),
+            images_refused: None,
         }),
         queue: RefCell::new(VecDeque::new()),
         pumping: Cell::new(false),

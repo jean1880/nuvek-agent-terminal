@@ -476,7 +476,7 @@ impl RemoteTab {
 pub(super) const REMOTE_ICON: &str = "at-network-server-symbolic";
 
 /// What a remote page refuses, said once for every local-only control.
-const NOT_ON_REMOTE: &str = "Not available for a folder on another machine";
+const NOT_ON_REMOTE: &str = agent_core::remote::NOT_ON_REMOTE;
 
 /// Whether a terminal page takes checkpoints when its turn ends: checkpoints are on, and its
 /// folder is on this machine. A remote page's working tree is out of reach of the local git.
@@ -2269,6 +2269,12 @@ impl AgentTerminalWindow {
             debug!("Action: New Terminal Thread on Another Machine");
             imp.show_remote_terminal_dialog();
         });
+        // New Thread on Another Machine…: Claude or Codex there, through the same ssh. The
+        // machine is asked only once the user presses Create.
+        self.add_win_action("new-remote-thread", |imp| {
+            debug!("Action: New Thread on Another Machine");
+            imp.show_remote_thread_dialog();
+        });
 
         // New Tab in Folder Action (opens a folder picker)
         self.add_win_action("new-tab-folder", |imp| {
@@ -3220,6 +3226,10 @@ impl AgentTerminalWindow {
         threads.append(
             Some("New Thread in Isolated Git Worktree…"),
             Some("win.new-tab-worktree"),
+        );
+        threads.append(
+            Some("New Thread on Another Machine…"),
+            Some("win.new-remote-thread"),
         );
         threads.append(
             Some("New Terminal Thread on Another Machine…"),
@@ -4291,6 +4301,10 @@ impl AgentTerminalWindow {
     fn remote_terminal_menu(&self) -> gtk4::gio::Menu {
         let menu = gtk4::gio::Menu::new();
         menu.append(Some("New Thread"), Some("win.new-tab"));
+        menu.append(
+            Some("New Thread on Another Machine…"),
+            Some("win.new-remote-thread"),
+        );
         menu.append(
             Some("New Terminal Thread on Another Machine…"),
             Some("win.new-remote-terminal"),
@@ -6938,13 +6952,21 @@ impl AgentTerminalWindow {
     /// not known to be outside a repository.
     pub(super) fn sync_diff_toggle(&self) {
         let selected = self.selected_page();
-        let usable = selected.is_some_and(|page| {
-            self.with_page_tab(&page, |t| t.in_repo != Some(false))
+        let usable = selected.as_ref().is_some_and(|page| {
+            self.with_page_tab(page, |t| t.in_repo != Some(false))
+                .unwrap_or(false)
+        });
+        // A page on another machine shows the toggle insensitive, saying why; its shortcut stays
+        // live and answers with the same reason (`toggle_diff_panel`).
+        let remote = selected.is_some_and(|page| {
+            self.with_page_tab(&page, |t| t.remote.is_some())
                 .unwrap_or(false)
         });
         if let Some(toggle) = self.diff_toggle.borrow().as_ref() {
             let fits = toggle.first_child().is_some_and(|b| b.is_visible());
             toggle.set_visible(usable && fits);
+            toggle.set_sensitive(!remote);
+            toggle.set_tooltip_text(remote.then_some(NOT_ON_REMOTE));
         }
         if let Some(action) = self
             .obj()
@@ -6958,8 +6980,11 @@ impl AgentTerminalWindow {
     /// Reads `page`'s branch off the main thread and shows it in the subtitle, if `page` is a
     /// thread still on show ([`thread_subtitle`]).
     pub(super) fn refresh_branch(&self, page: &adw::TabPage) {
+        // A thread on another machine has no branch here: its subtitle stays `alias:/path`.
         let Some(dir) = self
-            .with_page_tab(page, |t| t.chat.is_some().then(|| t.repo_dir()))
+            .with_page_tab(page, |t| {
+                (t.chat.is_some() && t.remote.is_none()).then(|| t.repo_dir())
+            })
             .flatten()
         else {
             return;

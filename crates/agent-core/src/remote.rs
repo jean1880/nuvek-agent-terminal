@@ -231,6 +231,21 @@ pub fn ssh_check_argv(alias: &str) -> Result<Vec<String>, String> {
     Ok(argv)
 }
 
+/// Whether `alias` may be reached: it is valid and listed in Settings → General → Remote
+/// Machines (`hosts`) as stored now. A thread keeps its alias for life, so one made on a machine
+/// since removed (or renamed) from the list is refused, never connected to.
+pub fn listed(hosts: &[RemoteHost], alias: &str) -> Result<(), String> {
+    validate_alias(alias)?;
+    if hosts.iter().any(|h| h.alias == alias && h.is_valid()) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{alias} is not listed in Settings → General → Remote Machines; add it there to \
+             connect"
+        ))
+    }
+}
+
 /// Whether a link shown on a remote page may be opened on this machine: only `http://` and
 /// `https://` with a host. Anything else (`file://`, `ssh:`, a custom handler's scheme) names
 /// something on the other machine, or asks this one to run a handler the other machine chose.
@@ -1201,6 +1216,24 @@ mod tests {
         }
         assert!(!is_remote_cwd("/srv"));
         assert!(RemoteFolder::new("box", "~/src").is_err(), "only absolute");
+    }
+
+    #[test]
+    fn only_a_listed_machine_is_reached() {
+        let hosts = vec![
+            RemoteHost::new("box", "").unwrap(),
+            RemoteHost {
+                alias: "-oProxyCommand=x".into(),
+                label: String::new(),
+            },
+        ];
+        assert!(listed(&hosts, "box").is_ok());
+        assert!(listed(&hosts, "other").unwrap_err().contains("not listed"));
+        assert!(
+            listed(&hosts, "-oProxyCommand=x").is_err(),
+            "invalid even if stored"
+        );
+        assert!(listed(&[], "box").is_err());
     }
 
     #[test]

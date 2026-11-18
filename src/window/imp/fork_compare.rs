@@ -32,6 +32,10 @@ pub(super) const SHARED_FOLDER: &str = "Both threads work in the same folder, so
 /// is not in a repository, git is busy or the snapshot fails (said in the log), and the fork
 /// then compares by transcript only.
 pub(super) async fn fork_baseline(dir: String) -> Option<ForkBaseline> {
+    // A folder on another machine has no working tree here: no baseline, never a local git.
+    if agent_core::remote::is_remote_cwd(&dir) {
+        return None;
+    }
     let taken = off_main("the fork baseline", move || {
         crate::git::take_fork_baseline(Path::new(&dir))
     })
@@ -98,6 +102,10 @@ pub(super) fn drop_fork_baseline(dir: String, thread: String, commit: String) {
 fn read_changes(dirs: [Option<String>; 2], bases: [Option<String>; 2]) -> (Vec<ForkChanges>, bool) {
     let side = |dir: Option<&str>, base: Option<&str>| match dir {
         None => ForkChanges::Unavailable("This thread no longer exists".to_owned()),
+        // Its working tree is on another machine: never read here.
+        Some(dir) if agent_core::remote::is_remote_cwd(dir) => {
+            ForkChanges::Unavailable(agent_core::remote::NOT_ON_REMOTE.to_owned())
+        }
         Some(dir) => crate::git::fork_changes(Path::new(dir), base)
             .unwrap_or_else(|e| ForkChanges::Unavailable(agent_core::redact::redact(&e))),
     };

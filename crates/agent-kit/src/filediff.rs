@@ -471,6 +471,38 @@ pub fn shown_for_item_in(
     })
 }
 
+/// The diff of a file-change item on another machine: the agent's own edit only. Pure: it never
+/// looks at this machine's disk or git, since every path in it names a file there.
+pub fn agent_edit_only(input: &serde_json::Value) -> Result<Shown, String> {
+    let mut files = editdiff::paths_from_input(input);
+    let preview = editdiff::preview_from_input(input);
+    for p in preview.iter().map(|e| e.path.clone()) {
+        if !files.contains(&p) {
+            files.push(p);
+        }
+    }
+    let text = preview.iter().map(|e| e.diff.as_str()).collect::<String>();
+    if text.is_empty() {
+        return Err(if files.is_empty() {
+            "This edit carries no file diff to show.".to_owned()
+        } else {
+            "The agent sent no diff for this edit, and its file is on another machine.".to_owned()
+        });
+    }
+    let (kept, omitted_lines) = crate::diff::truncate(
+        &text,
+        crate::diff::MAX_DIFF_BYTES,
+        crate::diff::MAX_DIFF_LINES,
+    );
+    Ok(Shown {
+        text: kept.to_owned(),
+        origin: Origin::AgentEdit,
+        omitted_lines,
+        clipped: preview.iter().any(|edit| edit.clipped),
+        files,
+    })
+}
+
 // ---------------------------------------------------------------------------------------------
 // Temp files for an external tool
 // ---------------------------------------------------------------------------------------------
@@ -1042,5 +1074,34 @@ mod tests {
         assert_eq!(remove_own_temp(&root), 1);
         assert!(!second.exists() && foreign.exists());
         assert_eq!(sweep_temp(&root, Duration::ZERO), 1);
+    }
+}
+
+#[cfg(test)]
+mod remote_tests {
+    use super::*;
+
+    /// A remote edit shows the agent's own diff, and never this machine's file at that path: one
+    /// that exists here, in a repository, is not read.
+    #[test]
+    fn a_remote_edit_shows_only_the_agents_own_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("same-name.txt");
+        std::fs::write(&local, "LOCAL CONTENT\n").unwrap();
+        let path = local.to_string_lossy().into_owned();
+        let edit = serde_json::json!({
+            "file_path": path,
+            "old_string": "a\n",
+            "new_string": "b\n",
+        });
+        let shown = agent_edit_only(&edit).unwrap();
+        assert_eq!(shown.origin, Origin::AgentEdit);
+        assert!(!shown.text.contains("LOCAL CONTENT"), "{}", shown.text);
+        assert!(shown.text.contains("+b"), "{}", shown.text);
+        // No diff of its own: refused, the local file still unread.
+        let bare = serde_json::json!({ "file_path": path });
+        let refused = agent_edit_only(&bare).unwrap_err();
+        assert!(refused.contains("another machine"), "{refused}");
+        assert!(agent_edit_only(&serde_json::json!({})).is_err());
     }
 }

@@ -1180,6 +1180,11 @@ impl ChatSession {
         self.inner.launched_free.set(free);
     }
 
+    #[cfg(test)]
+    pub fn launched_free(&self) -> bool {
+        self.inner.launched_free.get()
+    }
+
     pub fn stage_local_context(
         &self,
         context: Result<agent_core::local_context::LocalLaunchContext, String>,

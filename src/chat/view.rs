@@ -148,7 +148,6 @@ mod imp {
     pub struct ChatView {
         pub(super) inner: RefCell<Option<Rc<Inner>>>,
         pub(super) toasts: RefCell<Option<adw::ToastOverlay>>,
-        pub(super) text_style: RefCell<Option<(gdk::Display, gtk4::CssProvider, String)>>,
     }
 
     #[glib::object_subclass]
@@ -160,9 +159,6 @@ mod imp {
 
     impl ObjectImpl for ChatView {
         fn dispose(&self) {
-            if let Some((display, provider, _)) = self.text_style.borrow_mut().take() {
-                gtk4::style_context_remove_provider_for_display(&display, &provider);
-            }
             if let Some(inner) = self.inner.borrow_mut().take() {
                 inner.composer.dispose();
                 inner.disconnect_models();
@@ -856,29 +852,12 @@ impl ChatView {
         }
     }
 
-    /// Scale chat content and controls without changing the desktop theme or other windows.
+    /// Scales the app's text (the one app-wide scale, [`crate::style::set_text_scale`]: this
+    /// view, the sidebar, Settings and every dialog alike), and moves this view's header
+    /// breakpoints with it.
     pub fn set_text_scale(&self, scale: f64) {
-        let scale = if scale.is_finite() {
-            scale.clamp(0.5, 3.0)
-        } else {
-            1.0
-        };
-        let display = self.display();
-        let mut style = self.imp().text_style.borrow_mut();
-        let (_, provider, class) = style.get_or_insert_with(|| {
-            static NEXT_SCALE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-            let id = NEXT_SCALE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let class = format!("chat-scale-{id}");
-            self.add_css_class(&class);
-            let provider = gtk4::CssProvider::new();
-            gtk4::style_context_add_provider_for_display(
-                &display,
-                &provider,
-                gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 2,
-            );
-            (display, provider, class)
-        });
-        provider.load_from_data(&format!(".{class} {{ font-size: {scale}em; }}"));
+        let scale = crate::style::clamp_text_scale(scale);
+        crate::style::set_text_scale(scale);
         if let Some(inner) = self.inner() {
             inner.header.set_text_scale(scale);
         }

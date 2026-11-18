@@ -139,7 +139,7 @@ until it is fixed.
 | `spend_warn_enabled` | `false` | Warn when real money spent nears or passes the amounts below. See [Spending warning](reference.md#spending-warning) |
 | `spend_warn_daily` | none | Today's warning amount in US dollars (a positive number; anything else warns of nothing) |
 | `spend_warn_monthly` | none | This month's warning amount in US dollars (metered turns only; Claude's extra usage is never counted) |
-| `font`, `font_scale` | JetBrains Mono 11, `1.0` | Terminal font and zoom |
+| `font`, `font_scale` | JetBrains Mono 11, `1.0` | Terminal font; the text scale of the whole app (threads, sidebar, Settings, dialogs and terminals), from `0.5` to `3.0` |
 | `cursor_shape`, `cursor_blink` | `block`, `true` | Terminal cursor |
 | `scrollback_lines` | `10000` | Terminal scrollback |
 | `indicators` | `[]` | Header status lights. See [Status indicators](reference.md#status-indicators) |

@@ -477,8 +477,10 @@ fn load_css() {
         .terminal-container {
             padding: 10px;
         }
+        /* Font sizes are relative (to 11pt text: 24pt is 218%), so the app's text scale, set
+           on every window (`style::set_text_scale`), reaches them. */
         .title-1 {
-            font-size: 24pt;
+            font-size: 218%;
             font-weight: bold;
             color: @at_accent;
         }
@@ -501,12 +503,12 @@ fn load_css() {
             background-color: @at_accent_hover;
         }
         .loading-text {
-            font-size: 16pt;
+            font-size: 145%;
             font-weight: bold;
             color: @at_fg;
         }
         .loading-subtext {
-            font-size: 11pt;
+            font-size: 100%;
             color: @at_fg_soft;
         }
         .exit-bar {
@@ -563,7 +565,7 @@ fn load_css() {
         }
         .update-dot {
             color: @at_warning;
-            font-size: 9px;
+            font-size: 61%;
             margin: 3px 3px 0 0;
         }
         .thread-list row.active-divider {
@@ -657,7 +659,7 @@ fn load_css() {
             color: @at_fg;
         }
         headerbar .subtitle {
-            font-size: 9pt;
+            font-size: 82%;
             color: @at_fg_soft;
         }
         /* The closing screen: the animation and one calm line below it. */
@@ -666,10 +668,10 @@ fn load_css() {
         }
         .closing-step {
             color: @at_fg_soft;
-            font-size: 11pt;
+            font-size: 100%;
         }
         button.closing-quit {
-            font-size: 9.5pt;
+            font-size: 86%;
             color: @at_fg_dim;
             padding: 2px 10px;
             min-height: 0;

@@ -103,7 +103,12 @@ Architectural mandates, standards, and workflows for this codebase.
     that is not two object ids is dropped, never the link; and
     `pairings`: a thread pairs with its source, its forks and its source's other forks, a fork of
     a fork with its own source only, never a thread that is gone; `Pairing::bases`: a fork and
-    its source share the fork's baseline, two siblings each have their own).
+    its source share the fork's baseline, two siblings each have their own) and `a11y_announce`
+    (what a screen reader is told of an event, given whether the user was looking and whether a
+    desktop notification already said it: an exhaustive match, so a new `Event` variant must
+    decide; each part redacted, cut short, never stored; the window shows it in its off-screen
+    live regions, `window/imp/announce.rs`: one `Status` label, polite, and one `Alert` label for
+    requests, joined and set at idle, only while `announce_events` is on).
   - `crates/agent-kit` (GTK-free; blocking process and file I/O): `git`
     (git plumbing for turn checkpoints and diffs: shells out, but its parsers
     and filters are pure; `diff_trees` is the one tree-to-tree diff, capped, driver-free;

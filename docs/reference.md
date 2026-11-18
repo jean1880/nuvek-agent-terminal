@@ -747,6 +747,12 @@ stores, and is never saved.
 Turn it off with Settings → General → Notifications → **Announce Events to Screen Readers**
 (`announce_events` in the config file).
 
+**Text size.** Settings → General → Appearance → **Text Scale** (or Ctrl+= and Ctrl+-, and
+Ctrl+0 to reset) sets the size of all the app's text: threads, the thread list, menus,
+Settings and every other dialog, and the terminals. It applies at once, to every window, and
+is kept as `font_scale`. At 2× the window needs to be at least 600 by 400 pixels for every
+control to fit.
+
 **Moving around.** F6 moves the keyboard focus to the next part of the window, and Shift+F6
 to the previous one, wrapping round: the thread list, the transcript (its newest message),
 the message box, the terminal drawer while it is open, and the Changes panel while it is

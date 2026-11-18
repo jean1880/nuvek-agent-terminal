@@ -447,10 +447,13 @@ mod tests {
         let baseline = taken(take_fork_baseline(dir).unwrap());
         let files = sh(dir, &["ls-tree", "-r", "--name-only", &baseline.tree]);
         assert!(files.lines().any(|f| f == "notes.txt"), "{files}");
-        for secret in [".env", "tls.key"] {
-            assert!(is_secret_path(Path::new(secret)));
-            assert!(!files.lines().any(|f| f == secret), "{secret} in {files}");
-            assert!(baseline.skipped.iter().any(|s| s.path == secret));
+        for skipped_name in [".env", "tls.key"] {
+            assert!(is_secret_path(Path::new(skipped_name)));
+            assert!(
+                !files.lines().any(|f| f == skipped_name),
+                "{skipped_name} in {files}"
+            );
+            assert!(baseline.skipped.iter().any(|s| s.path == skipped_name));
         }
         // And the diff since the fork never brings it in either.
         fs::write(dir.join("later.pem"), "pem\n").unwrap();

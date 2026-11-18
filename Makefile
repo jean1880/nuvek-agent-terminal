@@ -14,7 +14,9 @@ LOCAL_ICON = $(LOCAL_ICON_DIR)/$(APP_ID).svg
 	test check coverage hooks lint test-display test-one test-stress test-qa test-deps bench test-gdb
 
 # ---- Tests -----------------------------------------------------------------------------------
-# Tools: cargo-nextest and cargo-llvm-cov (`make test-deps`), plus xvfb-run and dbus-run-session.
+# Tools: cargo-nextest and cargo-llvm-cov (`make test-deps`), plus xvfb-run and dbus-run-session,
+# and optionally libXtst (libxtst6), through which a display test presses real keys
+# (`testutil::XKeyboard`; without it that test says so and skips).
 # GTK tests need a display: every run gets a private Xvfb and D-Bus session, and private XDG
 # directories, so no test reads or writes the real settings, thread store or keyring.
 # Line coverage as llvm-cov counts it (86.5% on 2026-10-13). Raise it as coverage rises.

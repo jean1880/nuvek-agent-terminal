@@ -50,6 +50,12 @@ const COMMON: &[Binding] = &[
     ),
     ("win.zoom-out", &["<Primary>minus", "<Primary>KP_Subtract"]),
     ("win.zoom-reset", &["<Primary>0", "<Primary>KP_0"]),
+    // Region cycling: the sidebar, the transcript, the composer, the drawer and the diff panel,
+    // whichever are shown. Bare F6 and Shift+F6 are matched by the window itself
+    // (`window/imp/regions.rs`), which leaves them to a focused terminal, so a terminal program
+    // keeps them; these work from a terminal too.
+    ("win.focus-next-region", &["<Primary>F6"]),
+    ("win.focus-previous-region", &["<Primary><Shift>F6"]),
     ("win.next-tab", &["<Primary>Tab", "<Primary>Page_Down"]),
     (
         "win.previous-tab",
@@ -84,6 +90,16 @@ fn all() -> Vec<(String, Vec<String>)> {
         ));
     }
     all
+}
+
+/// The accelerators of `action`, as written in the table.
+#[cfg(test)]
+pub(crate) fn accels_for(action: &str) -> Vec<String> {
+    all()
+        .into_iter()
+        .find(|(a, _)| a == action)
+        .map(|(_, accels)| accels)
+        .unwrap_or_default()
 }
 
 /// Registers every accelerator on the application.
@@ -170,6 +186,16 @@ const HAND_BOUND: &[HandBound] = &[
         "KP_Delete",
         "sidebar thread row selected",
         "window/imp/thread_menu.rs",
+    ),
+    hand(
+        "F6",
+        "focus not in a terminal (window capture phase)",
+        "window/imp/regions.rs",
+    ),
+    hand(
+        "<Shift>F6",
+        "focus not in a terminal (window capture phase)",
+        "window/imp/regions.rs",
     ),
     hand("Up", "composer focused", "chat/view/composer.rs"),
     hand("Down", "composer focused", "chat/view/composer.rs"),
@@ -307,6 +333,34 @@ mod tests {
                 h.accel,
                 h.context,
                 h.site
+            );
+        }
+    }
+
+    /// An application accelerator is caught before the focused widget: a bare F6 bound there
+    /// would never reach a terminal program. Region cycling has Ctrl+F6 instead.
+    #[test]
+    fn bare_f6_is_left_to_the_focused_widget() {
+        for (action, accels) in all() {
+            for accel in accels {
+                let key = normalise(&accel);
+                assert!(
+                    key != "f6" && key != "<shift>f6",
+                    "{action} takes {accel} from terminals"
+                );
+            }
+        }
+        for (action, accel) in [
+            ("win.focus-next-region", "<Primary>F6"),
+            ("win.focus-previous-region", "<Primary><Shift>F6"),
+        ] {
+            assert_eq!(
+                accels_for(action)
+                    .iter()
+                    .map(|a| normalise(a))
+                    .collect::<Vec<_>>(),
+                [normalise(accel)],
+                "{action}"
             );
         }
     }

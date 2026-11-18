@@ -6,6 +6,7 @@
 //! Several modules port logic from T3 Code (MIT, Copyright (c) 2026 T3 Tools Inc.); see
 //! THIRD_PARTY.md at the repository root.
 
+pub mod a11y_announce;
 pub mod adapter;
 pub mod agent_command;
 pub mod agy;

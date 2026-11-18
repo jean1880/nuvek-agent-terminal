@@ -10,6 +10,25 @@ Architectural mandates, standards, and workflows for this codebase.
 - **Bundled icons**: All icons are bundled (`assets/icons`, GResource); never rely on the
   system icon theme for a name; the icon test (`tests/icons.rs`) guards it. See the rendering
   note in `THIRD_PARTY.md` before editing an SVG there.
+- **Accessibility**: F6/Shift+F6 (`window/imp/regions.rs`, matched in the window's capture
+  phase, since a `GtkPaned` binds F6 and would take it in the bubble phase; never an
+  application accelerator; left to the focused widget when that is in a terminal, so a
+  terminal program keeps F6) and Ctrl+F6/Ctrl+Shift+F6 (`win.focus-next-region`/
+  `-previous-region`) cycle the shown regions: sidebar (Navigation "Threads", only while
+  shown), transcript (Region), composer (Region), terminal (a thread's drawer box or a terminal
+  page's terminal and search bar), docked diff panel; none while a dialog is open or the window
+  closes, and leaving an overlaid sidebar hides it once another region has the focus (never
+  when none took it). A new pane needs a role, a label and an entry there. Display tests press
+  real keys through `testutil::XKeyboard` (XTest, libXtst loaded with `dlopen`; a test without
+  it says so and skips on a developer machine, and fails on CI, where `libxtst6` is installed). The text scale (`font_scale`) is the whole app's: one provider,
+  `style::set_text_scale` (`window { font-size: N% }`), so app CSS font sizes are relative, never
+  `pt`/`px`; it is held to `style::TEXT_SCALE_RANGE` wherever it comes in (the setting, a zoom,
+  `TerminalConfig::normalize` on every load and reload). Every transcript row's root is a
+  `ListItem` (`cards::list_item`; a plan's expander sits inside one) named by `cards::row_label`
+  (every `Body` variant has a name) and busy per `cards::row_busy`; a new `Body` variant must
+  name itself there. A filled `button.suggested-action` rings outside its fill
+  (`outline-offset: 2px`), in the global stylesheet (`main.rs`'s `GLOBAL_CSS`), so every dialog
+  and page has it.
 - **Native GTK4/Libadwaita**: a native Rust binary. Minimum system libraries are
   set by the Cargo version features, currently GTK 4.10 (`v4_10`, for
   `FileDialog`), libadwaita 1.5 (`v1_5`, for `AlertDialog`/`PreferencesDialog`)
@@ -110,7 +129,17 @@ Architectural mandates, standards, and workflows for this codebase.
     that is not two object ids is dropped, never the link; and
     `pairings`: a thread pairs with its source, its forks and its source's other forks, a fork of
     a fork with its own source only, never a thread that is gone; `Pairing::bases`: a fork and
-    its source share the fork's baseline, two siblings each have their own).
+    its source share the fork's baseline, two siblings each have their own) and `a11y_announce`
+    (what a screen reader is told of an event, given whether the user was looking and whether a
+    desktop notification already said it: an exhaustive match, so a new `Event` variant must
+    decide; each part redacted, cut short, never stored, through `plain`, which transcript rows'
+    names use too; what waits is bounded, `Pending`, and read as at most three items and "And N
+    more." within a character ceiling (room for the count kept only when there is more than
+    one); the window shows it in its off-screen live regions,
+    `window/imp/announce.rs`: one `Status` label, polite, set after a 200 ms pause so a burst is
+    one update, and one `Alert` label for requests, set at idle, each only by its text (the
+    label's own accessible name), only while `announce_events` is on and never once the window
+    is closing, what waits then included).
   - `crates/agent-kit` (GTK-free; blocking process and file I/O): `git`
     (git plumbing for turn checkpoints and diffs: shells out, but its parsers
     and filters are pure; `diff_trees` is the one tree-to-tree diff, capped, driver-free;
@@ -1130,7 +1159,10 @@ epoch field) in `make package` and `packaging/build-deb.sh`; the rpm has `epoch 
   `theme_light`/`theme_dark` (`ThemePair`, each slot only its polarity, a wrong one loading as
   the slot's default) matching `StyleManager::is_dark`, never forces the colour scheme, and
   swaps members through the same watch as System (`palette::desktop_changed`); every lookup by
-  choice resolves it first (`palette::concrete`, `palette::in_effect`).
+  choice resolves it first (`palette::concrete`, `palette::in_effect`). Every bundled scheme's
+  outlines, accent, state colours and focus ring are lifted to 3:1 on every surface
+  (`Chrome::with_visible_controls`, `every_palettes_controls_are_seen`); `@at_focus` is the one
+  focus-ring colour, libadwaita's ring included.
 - If you modify startup/detection logic, update and run the tests in `utils.rs`.
 - Deployment-specific behaviour belongs in config, not in the binary. Anything
   that reads a path or runs a command particular to one machine should be an

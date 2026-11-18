@@ -134,7 +134,8 @@ impl FormCardWidget {
 
 impl Inner {
     fn build(card: &FormCard, sink: &RowSink, weak: &Weak<Inner>) -> Self {
-        let root = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+        // A transcript row, so a list item of the transcript's list.
+        let root = super::cards::list_item(gtk4::Orientation::Vertical, 12);
         root.add_css_class("form-card");
         root.add_css_class("question-card");
         root.add_css_class("card");

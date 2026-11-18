@@ -36,7 +36,13 @@ pub struct InterruptionShelf {
 
 impl InterruptionShelf {
     pub fn new(sink: RowSink, jump: impl Fn(String) + 'static) -> Self {
-        let card = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+        // A group a screen reader names: the request waiting for an answer.
+        let card = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(12)
+            .accessible_role(gtk4::AccessibleRole::Group)
+            .build();
+        card.update_property(&[gtk4::accessible::Property::Label("Waiting for your answer")]);
         card.add_css_class("interruption-shelf");
 
         let icon = gtk4::Image::from_icon_name("at-security-medium-symbolic");

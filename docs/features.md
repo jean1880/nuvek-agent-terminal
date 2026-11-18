@@ -295,6 +295,14 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
 - **Notifications** when a thread you aren't looking at finishes, needs your approval,
   or runs out of quota. For a terminal thread, the quota notification has a **Continue in…**
   button; a chat thread offers it in the thread itself.
+- **Screen reader announcements**: a finished or failed turn, an approval or question waiting
+  and errors are read out by Orca or another screen reader, without repeating a desktop
+  notification. See [Accessibility](reference.md#accessibility).
+- **Text Scale** sizes all the app's text, threads, sidebar, Settings, dialogs and terminals
+  alike, live (Ctrl+= and Ctrl+-).
+- **F6 and Shift+F6** move between the thread list, the transcript, the message box, the
+  terminal drawer and the Changes panel (Ctrl+F6 and Ctrl+Shift+F6 from a terminal, whose
+  program keeps F6); each is a named landmark for screen readers.
 - **Settings apply as you change them**, to every window, and are saved to
   `~/.config/agent-terminal/config.json`. Hand edits to that file are picked up while
   the app runs.

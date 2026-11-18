@@ -725,6 +725,28 @@ on a light background are darkened until they do: the accent and status colours 
 window and the added, removed and hunk lines of a diff are never paler than a 4.5:1
 contrast, and Solarized Light's text is `#586e75`.
 
+### Accessibility
+
+**Announcements.** With a screen reader such as Orca running, the window tells it when something
+happens in a thread that you would otherwise have to look for:
+
+| What happened | Said | How |
+|---|---|---|
+| A turn finished (sub-agents and background commands done too) | "Reply finished." or "“Title” finished." | politely, after what it is reading |
+| A turn failed, or an error arrived | "Turn failed: …" or "Error: …", the first line of the error | politely |
+| The agent hit its usage limit, or stopped unexpectedly | a short sentence naming the thread | politely |
+| An approval, a question or a tool's form is waiting | "Approval needed: …", "The agent has a question." | at once, as an alert |
+
+A thread you are looking at is not named; another thread is named by its title. A turn you
+stopped yourself says nothing. When a desktop notification already announced the same thing (a
+thread out of sight asking for approval, or finishing with **Notify When an Agent Finishes**
+on), the window says nothing more, so nothing is read twice. Several things happening at once
+are read as one announcement. The text is short, has secrets masked like everything the app
+stores, and is never saved.
+
+Turn it off with Settings → General → Notifications → **Announce Events to Screen Readers**
+(`announce_events` in the config file).
+
 ### Sending terminal output to a thread
 
 Right-click a terminal (or press the Menu key or Shift+F10 in it) for two items:

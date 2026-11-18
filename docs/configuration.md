@@ -126,6 +126,7 @@ until it is fixed.
 | `diffs_expanded` | `false` | Open a file-change card's diff as soon as the edit lands |
 | `notify_on_bell` | `false` | Notify when a background thread finishes |
 | `notify_on_quota` | `true` | Notify, with a hand-off button, when an agent runs out of quota |
+| `announce_events` | `true` | Tell a screen reader when a turn finishes or fails, a thread asks for approval or a question, or an error arrives. See [Accessibility](reference.md#accessibility) |
 | `reopen_last_thread` | `false` | Start with the threads open at the last close |
 | `restore_session` | `false` | Reopen the last terminal threads, as fresh sessions |
 | `skip_load_animation` | `false` | Show the window as soon as it is ready |

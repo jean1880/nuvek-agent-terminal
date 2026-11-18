@@ -932,6 +932,10 @@ pub struct TerminalConfig {
     /// runs out of quota. On by default, unlike the bell: it is rare, and it
     /// means work has stopped.
     pub notify_on_quota: bool,
+    /// Tell a screen reader, through the window's live regions, when a turn finishes or fails,
+    /// a thread asks for approval, or an error arrives (`agent_core::a11y_announce`). On by
+    /// default (an older config opts in): with no screen reader running nothing is heard.
+    pub announce_events: bool,
     /// Ask GitHub, in the background a few seconds after startup, whether a newer release is
     /// out; one found marks the window menu. On by default (an older config opts in); off, the
     /// app connects to nothing unless "Check for Updates…" is picked.
@@ -1420,6 +1424,7 @@ impl Default for TerminalConfig {
             cursor_blink: true,
             notify_on_bell: false,
             notify_on_quota: true,
+            announce_events: true,
             check_updates_on_startup: true,
             idle_suspend_minutes: 15,
             continue_after_limit: true,
@@ -3297,6 +3302,22 @@ mod tests {
         let loaded = TerminalConfig::load_from(&path);
         assert!(loaded.notify_on_quota);
         assert!(!loaded.notify_on_bell);
+    }
+
+    #[test]
+    fn screen_reader_announcements_are_on_for_an_older_config_and_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"notify_on_bell":false}"#).unwrap();
+        assert!(TerminalConfig::load_from(&path).announce_events);
+        let cfg = TerminalConfig {
+            announce_events: false,
+            ..Default::default()
+        };
+        cfg.save_to(&path);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""announce_events": false"#), "{text}");
+        assert!(!TerminalConfig::load_from(&path).announce_events);
     }
 
     #[test]

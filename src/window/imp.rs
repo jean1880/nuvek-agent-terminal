@@ -2,6 +2,7 @@
 
 mod agents_prefs;
 mod animated_menu;
+mod announce;
 mod closing;
 mod commit;
 mod diff_prefs;
@@ -1478,6 +1479,8 @@ pub struct AgentTerminalWindow {
     transcript_paths: RefCell<std::collections::HashMap<(String, String), std::path::PathBuf>>,
     /// Wraps the tab view, for short confirmations that need no dialog.
     toast_overlay: RefCell<Option<adw::ToastOverlay>>,
+    /// The screen reader's live regions (`announce.rs`).
+    live: announce::LiveRegions,
     /// The header's "New Thread With" submenu, refilled when agent detection finishes.
     new_with_menu: RefCell<Option<gtk4::gio::Menu>>,
     /// The header's "New Thread in Existing Folder With" submenu, refilled when agent detection finishes.
@@ -2601,7 +2604,10 @@ impl AgentTerminalWindow {
             .build();
         let (page, name) = self.loading_page();
         boot.add_named(&page, Some(name));
-        content.append(&boot);
+        // The screen reader's live regions ride over everything, drawn nowhere.
+        let stage = gtk4::Overlay::builder().child(&boot).vexpand(true).build();
+        stage.add_overlay(&self.build_live_regions());
+        content.append(&stage);
         obj.set_content(Some(&content));
 
         // The chat shell is built now, behind the splash, not once detection is done: the thread
@@ -5329,6 +5335,16 @@ impl AgentTerminalWindow {
             },
         );
 
+        let announce_row = self.config_switch(
+            "Announce Events to Screen Readers",
+            "Tell a screen reader when a turn finishes or fails, a thread asks for approval or \
+             a question, or an error arrives. Nothing is said twice: what a desktop \
+             notification already said is left to it",
+            |c| c.announce_events,
+            SaveWhen::Debounced(|c, on| c.announce_events = on),
+            |_, _| {},
+        );
+
         let update_check_row = self.update_check_row();
 
         let restore_row = self.config_switch(
@@ -5440,6 +5456,7 @@ impl AgentTerminalWindow {
             .build();
         notifications.add(&notify_row);
         notifications.add(&notify_quota_row);
+        notifications.add(&announce_row);
         general.add(&notifications);
         let replies = adw::PreferencesGroup::builder().title("Replies").build();
         replies.add(&quick_replies_row);

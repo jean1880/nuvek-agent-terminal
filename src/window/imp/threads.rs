@@ -6641,6 +6641,11 @@ impl AgentTerminalWindow {
         // Set by the arms below, acted on after the tab borrow is released.
         let mut ask: Option<(adw::TabPage, bool)> = None; // (page, is a question)
         let mut withdraw_ask = false;
+        // For the screen reader: a desktop notification already said it, and a finished turn
+        // finishes the thread. The thread's title, as its page shows it.
+        let mut notified = false;
+        let mut finished_thread = true;
+        let title_now: String;
         // Switched in place to another agent, and that agent has started: the profile the thread
         // was opened with is no longer its agent's, so it follows the new agent's default (stored,
         // for a reopen). Not before: a switch whose agent never starts rolls back, and the old
@@ -6666,6 +6671,7 @@ impl AgentTerminalWindow {
                 return;
             };
             let page = tab.page.clone();
+            title_now = display_title(&page.title()).to_owned();
             let last_output = tab.last_output.clone();
             let Some(chat) = tab.chat.as_mut() else {
                 return;
@@ -6754,6 +6760,8 @@ impl AgentTerminalWindow {
                         chat.rate_limited = true;
                     }
                     if chat.rate_limited {
+                        // The limit was the news, not a finished reply.
+                        finished_thread = false;
                         After::RateLimited(chat.rate_banner.clone(), driver)
                     } else {
                         // With sub-agents or background commands still going the thread is not
@@ -6776,10 +6784,10 @@ impl AgentTerminalWindow {
                         chat.finish_held = !finished && !stopped;
                         // The turn's end is "output went quiet" for the checkpoint bookkeeping.
                         last_output.set(std::time::Instant::now());
-                        After::TurnDone {
-                            page,
-                            notify: finished && r.notify && !stopped,
-                        }
+                        let notify = finished && r.notify && !stopped;
+                        notified = notify;
+                        finished_thread = finished;
+                        After::TurnDone { page, notify }
                     }
                 }
                 Event::BackgroundTasks { tasks } => {
@@ -6820,6 +6828,7 @@ impl AgentTerminalWindow {
                     chat.approval = true;
                     let r = react(Attention::Asked, in_view, focused, false);
                     chat.unread |= r.unread;
+                    notified = r.notify;
                     if r.notify {
                         // A tool server's form is a question for the user, not an approval.
                         let question = matches!(
@@ -6908,6 +6917,13 @@ impl AgentTerminalWindow {
                 other => other,
             }
         };
+        self.announce_event(
+            &env.event,
+            &title_now,
+            in_view && focused,
+            notified,
+            finished_thread,
+        );
         if withdraw_ask {
             if let Some(app) = self.obj().application() {
                 app.withdraw_notification(&approval_notification_id(thread));
@@ -7033,9 +7049,26 @@ impl AgentTerminalWindow {
                 self.config.borrow().notify_on_bell,
             );
             chat.unread |= r.unread;
-            Some(r.notify.then_some(page))
+            Some((
+                display_title(&page.title()).to_owned(),
+                r.notify.then_some(page),
+            ))
         });
-        let Some(page) = due.flatten() else {
+        let Some((title, page)) = due.flatten() else {
+            return;
+        };
+        self.announce_event(
+            &agent_core::event::Envelope::turn_completed(
+                agent_core::event::TurnState::Completed,
+                None,
+            )
+            .event,
+            &title,
+            in_view && focused,
+            page.is_some(),
+            true,
+        );
+        let Some(page) = page else {
             return;
         };
         if in_view && focused {
@@ -7044,9 +7077,7 @@ impl AgentTerminalWindow {
         } else {
             self.reload_summaries();
         }
-        if let Some(page) = page {
-            self.notify_thread(&page, &turn_notification_id(thread), "Thread finished");
-        }
+        self.notify_thread(&page, &turn_notification_id(thread), "Thread finished");
         self.refresh_sidebar();
     }
 
@@ -12848,6 +12879,156 @@ pub(super) mod tests {
             None,
             "cleared in the store too"
         );
+        window.destroy();
+        crate::testutil::settle(&ctx);
+    }
+
+    /// A thread's turn end reaches the window's polite live region, an approval its alert
+    /// region, both once the main loop is idle. The same words again are still a change a
+    /// screen reader sees, and with announcements off nothing changes.
+    #[test]
+    #[ignore = "needs a display; run alone in an isolated display"]
+    fn live_region_updates_on_turn_end() {
+        crate::testutil::gtk_init().unwrap();
+        crate::testutil::adw_init().unwrap();
+        crate::icons::register();
+        let app = crate::window::imp::test_support::test_app("org.test.LiveRegion", true);
+        CHAT_RESTORED.with(|done| done.set(true));
+        let ctx = glib::MainContext::default();
+        let window = crate::window::imp::test_support::test_window(&app, &ctx);
+        let imp = window.imp();
+        // An agent that starts and stays silent, so only the events below reach the regions.
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("quiet-agent");
+        std::fs::write(&agent, "#!/bin/sh\nexec sleep 600\n").unwrap();
+        std::fs::set_permissions(&agent, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let profile = Profile {
+            id: "claude-live".into(),
+            name: "Claude".into(),
+            command: agent.to_string_lossy().into_owned(),
+            ..crate::config::new_agent_profile(Driver::Claude)
+        };
+        {
+            let mut config = imp.config.borrow_mut();
+            config
+                .profiles
+                .retain(|p| profile_driver(p) != Some(Driver::Claude));
+            config.profiles.insert(0, profile.clone());
+        }
+        RESOLVED.with(|r| {
+            r.borrow_mut().insert(
+                (profile.command.clone(), profile.env_file.clone()),
+                ResolvedAgent {
+                    program: Some(profile.command.clone()),
+                    env: Vec::new(),
+                    env_failed: false,
+                },
+            )
+        });
+        AgentAvailability::shared()
+            .set(Driver::Claude, Availability::Ready(profile.command.clone()));
+        imp.create_chat_thread(NewThread {
+            dir: Some(dir.path().to_string_lossy().into_owned()),
+            title: Some("Live regions".into()),
+            profile_id: Some("claude-live".into()),
+            ..NewThread::new(Driver::Claude)
+        })
+        .expect("opened in place");
+        let thread = imp.current_thread().expect("its page");
+        window.present();
+        crate::testutil::settle(&ctx);
+
+        let (status, alert) = imp.live_region_labels();
+        assert!(gtk4::test_accessible_has_role(
+            &status,
+            gtk4::AccessibleRole::Status
+        ));
+        assert!(gtk4::test_accessible_has_role(
+            &alert,
+            gtk4::AccessibleRole::Alert
+        ));
+        assert_eq!(imp.live_region_texts(), (String::new(), String::new()));
+        let changes = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = changes.clone();
+        status.connect_label_notify(move |_| seen.set(seen.get() + 1));
+
+        let turn = |state| {
+            imp.on_thread_envelope(
+                &thread,
+                Driver::Claude,
+                &Envelope::new(Event::TurnStarted { model: None }),
+            );
+            imp.on_thread_envelope(
+                &thread,
+                Driver::Claude,
+                &Envelope::turn_completed(state, None),
+            );
+        };
+        turn(agent_core::event::TurnState::Completed);
+        // Not before the main loop is idle: announcements are joined and shown there.
+        assert_eq!(imp.live_region_texts().0, "");
+        assert!(
+            crate::testutil::pump_until(&ctx, 5, || imp
+                .live_region_texts()
+                .0
+                .ends_with("finished.")),
+            "{:?}",
+            imp.live_region_texts()
+        );
+        let said = imp.live_region_texts().0;
+        assert!(
+            said == "Reply finished." || said == "“Live regions” finished.",
+            "{said}"
+        );
+
+        // The same words again: cleared first, so the screen reader sees a change.
+        let before = changes.get();
+        turn(agent_core::event::TurnState::Completed);
+        crate::testutil::settle(&ctx);
+        assert!(
+            changes.get() >= before + 2,
+            "{} → {}",
+            before,
+            changes.get()
+        );
+        assert_eq!(imp.live_region_texts().0, said);
+
+        // An approval is an alert. Out of sight it is a desktop notification, which says it.
+        let looking = window.is_active() && imp.current_thread().as_deref() == Some(&thread);
+        imp.on_thread_envelope(
+            &thread,
+            Driver::Claude,
+            &Envelope::new(Event::ApprovalRequested {
+                tool: "Bash".into(),
+                title: Some("Run cargo test".into()),
+                input: serde_json::Value::Null,
+                reason: None,
+                options: vec![
+                    agent_core::event::Decision::Allow,
+                    agent_core::event::Decision::Deny,
+                ],
+                response: agent_core::event::ResponseCapability::Live,
+                remembers: None,
+            }),
+        );
+        crate::testutil::settle(&ctx);
+        if looking {
+            assert_eq!(
+                imp.live_region_texts().1,
+                "Approval needed: Run cargo test."
+            );
+        } else {
+            assert_eq!(imp.live_region_texts().1, "");
+        }
+
+        // Off: nothing changes.
+        imp.config.borrow_mut().announce_events = false;
+        let before = changes.get();
+        turn(agent_core::event::TurnState::Failed);
+        crate::testutil::settle(&ctx);
+        assert_eq!(changes.get(), before);
+        assert_eq!(imp.live_region_texts().0, said);
         window.destroy();
         crate::testutil::settle(&ctx);
     }

@@ -1870,11 +1870,15 @@ pub(super) mod tests {
             })
             .expect("create schedule");
 
-        imp.open_schedules_for_thread(&thread);
         let ctx = glib::MainContext::default();
+        window.present();
+        assert!(pump_until(&ctx, 5, || window.is_mapped()));
+        imp.open_schedules_for_thread(&thread);
         assert!(pump_until(&ctx, 5, || window.visible_dialog().is_some()));
         if let Some(dlg) = window.visible_dialog() {
+            assert!(crate::testutil::pump_until_dialog_open(&ctx, &dlg, 10));
             dlg.force_close();
+            assert!(pump_until(&ctx, 10, || window.visible_dialog().is_none()));
         }
         crate::testutil::settle(&ctx);
 

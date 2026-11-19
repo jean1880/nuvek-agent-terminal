@@ -682,7 +682,7 @@ pub(super) fn dispatch_on_session(
             }
             glib::MainContext::default().spawn_local(async move {
                 let id_copy = sched_id.clone();
-                let _ = write_job("record scheduled run", move |store: &Store| {
+                let res = write_job("record scheduled run", move |store: &Store| {
                     store.record_schedule_run(&ScheduleRunUpdate {
                         id: id_copy,
                         next_due: pending.next_due,
@@ -694,7 +694,14 @@ pub(super) fn dispatch_on_session(
                     })
                 })
                 .await;
-                clear_in_flight(&sched_id);
+                if matches!(res, Some(Ok(()))) {
+                    clear_in_flight(&sched_id);
+                } else {
+                    tracing::warn!(
+                        schedule = %sched_id,
+                        "failed to record scheduled run; keeping in-flight guard to prevent duplicate firing"
+                    );
+                }
             });
         }
         ScheduledOutcome::Busy(why) => {
@@ -813,9 +820,15 @@ impl super::AgentTerminalWindow {
                 self.show_toast("Threads on another machine cannot run scheduled prompts");
                 return;
             }
-            self.open_schedule_dialog_for(Some(&thread), draft.as_deref(), has_images);
+            let clear_composer = draft.is_some() || has_images;
+            self.open_schedule_dialog_for(
+                Some(&thread),
+                draft.as_deref(),
+                has_images,
+                clear_composer,
+            );
         } else {
-            self.open_schedule_dialog_for(None, None, false);
+            self.open_schedule_dialog_for(None, None, false, false);
         }
     }
 
@@ -881,26 +894,34 @@ impl super::AgentTerminalWindow {
         toolbar.set_content(Some(&body));
         dialog.set_child(Some(&toolbar));
 
+        type RefreshSlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
         let filter = Rc::new(RefCell::new(filter_thread.clone()));
-        let refresh: Rc<dyn Fn()> = Rc::new({
+        let refresh: RefreshSlot = Rc::new(RefCell::new(None));
+        let refresh_fn: Rc<dyn Fn()> = Rc::new({
             let obj = self.obj().downgrade();
             let dialog_w = dialog.downgrade();
-            let list = list.clone();
-            let stack = stack.clone();
+            let list_w = list.downgrade();
+            let stack_w = stack.downgrade();
             let filter = filter.clone();
+            let self_refresh_w = Rc::downgrade(&refresh);
             move || {
                 let Some(obj) = obj.upgrade() else {
                     return;
                 };
                 let filter_id = filter.borrow().clone();
-                let list_c = list.clone();
-                let stack_c = stack.clone();
+                let list_w = list_w.clone();
+                let stack_w = stack_w.clone();
                 let obj_c = obj.clone();
                 let dialog_c = dialog_w.clone();
+                let refresh_w = self_refresh_w.clone();
                 glib::MainContext::default().spawn_local(async move {
                     let schedules = store_job(|store| store.list_schedules().unwrap_or_default())
                         .await
                         .unwrap_or_default();
+                    let (Some(list_c), Some(stack_c)) = (list_w.upgrade(), stack_w.upgrade())
+                    else {
+                        return;
+                    };
                     let filtered: Vec<ScheduleRecord> = schedules
                         .into_iter()
                         .filter(|s| match (&filter_id, &s.target) {
@@ -955,19 +976,27 @@ impl super::AgentTerminalWindow {
                             .label("Run Now")
                             .css_classes(["flat"])
                             .build();
-                        let rec_run = record.clone();
+                        let id_run = record.id.clone();
                         let obj_r = obj_c.downgrade();
                         run_btn.connect_clicked(move |_| {
                             let Some(w) = obj_r.upgrade() else {
                                 return;
                             };
-                            if !mark_in_flight(&rec_run.id) {
+                            if !mark_in_flight(&id_run) {
                                 w.imp().show_toast("Already running this schedule");
                                 return;
                             }
-                            let rec = rec_run.clone();
+                            let id_fetch = id_run.clone();
                             let w_c = w.clone();
                             glib::MainContext::default().spawn_local(async move {
+                                let id_q = id_fetch.clone();
+                                let fresh =
+                                    store_job(move |s| s.get_schedule(&id_q).ok().flatten()).await;
+                                let Some(rec) = fresh.flatten() else {
+                                    clear_in_flight(&id_fetch);
+                                    w_c.imp().show_toast("This schedule no longer exists");
+                                    return;
+                                };
                                 let now = now_unix();
                                 let ok =
                                     dispatch_checked_due(&w_c, rec.clone(), now, now, false, true)
@@ -988,6 +1017,7 @@ impl super::AgentTerminalWindow {
                         let rule_p = record.rule.clone();
                         let obj_p = obj_c.downgrade();
                         let dlg_p = dialog_c.clone();
+                        let refresh_p = refresh_w.clone();
                         pause_btn.connect_clicked(move |_| {
                             let Some(w) = obj_p.upgrade() else {
                                 return;
@@ -995,6 +1025,7 @@ impl super::AgentTerminalWindow {
                             let id = id_p.clone();
                             let rule = rule_p.clone();
                             let dlg = dlg_p.clone();
+                            let refresh_p = refresh_p.clone();
                             glib::MainContext::default().spawn_local(async move {
                                 let now = now_unix();
                                 let (paused, next_due_val) = if is_paused {
@@ -1012,6 +1043,11 @@ impl super::AgentTerminalWindow {
                                     } else {
                                         "Schedule resumed"
                                     });
+                                    if let Some(cb) =
+                                        refresh_p.upgrade().and_then(|cell| cell.borrow().clone())
+                                    {
+                                        cb();
+                                    }
                                 }
                             });
                         });
@@ -1026,9 +1062,12 @@ impl super::AgentTerminalWindow {
                             .update_property(&[gtk4::accessible::Property::Label("Edit schedule")]);
                         let rec_e = record.clone();
                         let obj_e = obj_c.downgrade();
+                        let refresh_e = refresh_w.clone();
                         edit_btn.connect_clicked(move |_| {
                             if let Some(w) = obj_e.upgrade() {
-                                w.imp().open_edit_schedule_dialog(rec_e.clone());
+                                let on_saved =
+                                    refresh_e.upgrade().and_then(|cell| cell.borrow().clone());
+                                w.imp().open_edit_schedule_dialog(rec_e.clone(), on_saved);
                             }
                         });
                         controls.append(&edit_btn);
@@ -1075,14 +1114,25 @@ impl super::AgentTerminalWindow {
             }
         });
 
+        *refresh.borrow_mut() = Some(refresh_fn.clone());
+
         let open_new = {
             let obj = self.obj().downgrade();
             let filter = filter.clone();
+            let refresh_w = Rc::downgrade(&refresh);
             move || {
                 if let Some(w) = obj.upgrade() {
                     let tid = filter.borrow().clone();
-                    w.imp()
-                        .open_schedule_dialog_for(tid.as_deref(), None, false);
+                    let on_saved = refresh_w.upgrade().and_then(|c| c.borrow().clone());
+                    w.imp().open_schedule_editor(ScheduleEditorSeed {
+                        editing_id: None,
+                        thread_id: tid,
+                        initial_prompt: String::new(),
+                        has_images: false,
+                        clear_composer: false,
+                        on_saved,
+                        existing: None,
+                    });
                 }
             }
         };
@@ -1090,7 +1140,12 @@ impl super::AgentTerminalWindow {
         new_btn.connect_clicked(move |_| on_new_1());
         create_first.connect_clicked(move |_| open_new());
 
-        refresh();
+        let refresh_drop = refresh.clone();
+        dialog.connect_closed(move |_| {
+            *refresh_drop.borrow_mut() = None;
+        });
+
+        refresh_fn();
         dialog.present(Some(&*self.obj()));
     }
 
@@ -1099,17 +1154,20 @@ impl super::AgentTerminalWindow {
         thread_id: Option<&str>,
         initial_prompt: Option<&str>,
         has_images: bool,
+        clear_composer: bool,
     ) {
         self.open_schedule_editor(ScheduleEditorSeed {
             editing_id: None,
             thread_id: thread_id.map(str::to_owned),
             initial_prompt: initial_prompt.unwrap_or_default().to_owned(),
             has_images,
+            clear_composer,
+            on_saved: None,
             existing: None,
         });
     }
 
-    fn open_edit_schedule_dialog(&self, record: ScheduleRecord) {
+    fn open_edit_schedule_dialog(&self, record: ScheduleRecord, on_saved: Option<Rc<dyn Fn()>>) {
         let tid = match &record.target {
             Target::ExistingThread { thread_id } => Some(thread_id.clone()),
             Target::NewThread { .. } => None,
@@ -1119,6 +1177,8 @@ impl super::AgentTerminalWindow {
             thread_id: tid,
             initial_prompt: record.prompt.clone(),
             has_images: false,
+            clear_composer: false,
+            on_saved,
             existing: Some(record),
         });
     }
@@ -1291,12 +1351,28 @@ impl super::AgentTerminalWindow {
         page.add(&target_group);
 
         let sync_target_fields = {
-            let folder_entry = folder_entry.clone();
-            let driver_row = driver_row.clone();
-            let mode_row = mode_row.clone();
-            let worktree_row = worktree_row.clone();
-            let target_row = target_row.clone();
+            let folder_w = folder_entry.downgrade();
+            let driver_w = driver_row.downgrade();
+            let mode_w = mode_row.downgrade();
+            let worktree_w = worktree_row.downgrade();
+            let target_w = target_row.downgrade();
             move || {
+                let (
+                    Some(folder_entry),
+                    Some(driver_row),
+                    Some(mode_row),
+                    Some(worktree_row),
+                    Some(target_row),
+                ) = (
+                    folder_w.upgrade(),
+                    driver_w.upgrade(),
+                    mode_w.upgrade(),
+                    worktree_w.upgrade(),
+                    target_w.upgrade(),
+                )
+                else {
+                    return;
+                };
                 let is_new = !has_existing_thread || target_row.selected() == 1;
                 folder_entry.set_visible(is_new);
                 driver_row.set_visible(is_new);
@@ -1450,15 +1526,37 @@ impl super::AgentTerminalWindow {
         page.add(&when_group);
 
         let sync_when_fields = {
-            let kind_row = kind_row.clone();
-            let date_row = date_row.clone();
-            let time_row = time_row.clone();
-            let days_action_row = days_action_row.clone();
-            let hours_row = hours_row.clone();
-            let missed_row = missed_row.clone();
-            let ends_row = ends_row.clone();
-            let max_runs_row = max_runs_row.clone();
+            let kind_w = kind_row.downgrade();
+            let date_w = date_row.downgrade();
+            let time_w = time_row.downgrade();
+            let days_w = days_action_row.downgrade();
+            let hours_w = hours_row.downgrade();
+            let missed_w = missed_row.downgrade();
+            let ends_w = ends_row.downgrade();
+            let max_runs_w = max_runs_row.downgrade();
             move || {
+                let (
+                    Some(kind_row),
+                    Some(date_row),
+                    Some(time_row),
+                    Some(days_action_row),
+                    Some(hours_row),
+                    Some(missed_row),
+                    Some(ends_row),
+                    Some(max_runs_row),
+                ) = (
+                    kind_w.upgrade(),
+                    date_w.upgrade(),
+                    time_w.upgrade(),
+                    days_w.upgrade(),
+                    hours_w.upgrade(),
+                    missed_w.upgrade(),
+                    ends_w.upgrade(),
+                    max_runs_w.upgrade(),
+                )
+                else {
+                    return;
+                };
                 let k = kind_row.selected();
                 date_row.set_visible(k == 0);
                 time_row.set_visible(k == 0 || k == 1);
@@ -1495,7 +1593,13 @@ impl super::AgentTerminalWindow {
 
         let obj_w = self.obj().downgrade();
         let dlg_w = dialog.downgrade();
-        save_btn.connect_clicked(move |_| {
+        let save_w = save_btn.downgrade();
+        let clear_composer = seed.clear_composer;
+        let on_saved = seed.on_saved.clone();
+        save_btn.connect_clicked(move |btn| {
+            if !btn.is_sensitive() {
+                return;
+            }
             let Some(window) = obj_w.upgrade() else {
                 return;
             };
@@ -1599,9 +1703,12 @@ impl super::AgentTerminalWindow {
             };
 
             let err_lbl = error_label.clone();
-            let clear_tid = seed.thread_id.clone();
+            let clear_tid = clear_composer.then(|| seed.thread_id.clone()).flatten();
             let edit_id = seed.editing_id.clone();
             let had_images = seed.has_images;
+            let on_saved = on_saved.clone();
+            let save_w = save_w.clone();
+            btn.set_sensitive(false);
             let folder_check = is_new_thread.then_some(folder);
             glib::MainContext::default().spawn_local(async move {
                 let in_git_repo = match folder_check {
@@ -1632,6 +1739,9 @@ impl super::AgentTerminalWindow {
                     Err(msg) => {
                         err_lbl.set_text(msg);
                         err_lbl.set_visible(true);
+                        if let Some(b) = save_w.upgrade() {
+                            b.set_sensitive(true);
+                        }
                         return;
                     }
                 };
@@ -1675,6 +1785,9 @@ impl super::AgentTerminalWindow {
                                 }
                             });
                         }
+                        if let Some(cb) = on_saved {
+                            cb();
+                        }
                         let due_str = target_due
                             .map(|d| format_due(d, now, &GlibLocalClock))
                             .unwrap_or_else(|| "soon".to_owned());
@@ -1682,13 +1795,18 @@ impl super::AgentTerminalWindow {
                         dlg.close();
                     }
                     Some(Err(e)) => {
+                        if let Some(b) = save_w.upgrade() {
+                            b.set_sensitive(true);
+                        }
                         present_message_over(&dlg, "Could Not Save Schedule", &e.to_string());
                     }
                     None => {
+                        // Keep Save disabled: `write_job` may still be queued and commit later,
+                        // so allowing an immediate retry could insert a duplicate schedule.
                         present_message_over(
                             &dlg,
-                            "Store Unavailable",
-                            "Could not reach the thread store.",
+                            "Store Timed Out",
+                            "The thread store did not reply in time. Close this dialog and check the Scheduled Prompts list before trying again.",
                         );
                     }
                 }
@@ -1705,6 +1823,8 @@ struct ScheduleEditorSeed {
     thread_id: Option<String>,
     initial_prompt: String,
     has_images: bool,
+    clear_composer: bool,
+    on_saved: Option<Rc<dyn Fn()>>,
     existing: Option<ScheduleRecord>,
 }
 

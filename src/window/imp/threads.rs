@@ -867,8 +867,8 @@ pub(super) struct ChatTab {
     /// Sent once the session exists (Continue In from a terminal page); also saved as redacted
     /// unsent metadata so closing during a build does not lose it.
     pending_prompt: Option<String>,
-    /// Queued scheduled prompt waiting for this page's session to start.
-    pub(super) pending_scheduled: Option<super::schedules::PendingScheduled>,
+    /// Queued scheduled prompts waiting for this page's session to start.
+    pub(super) pending_scheduled: Vec<super::schedules::PendingScheduled>,
     /// A message-search hit opened before the thread was built: the item its build brings into
     /// view once the history is replayed.
     pending_jump: Option<String>,
@@ -6314,7 +6314,7 @@ impl AgentTerminalWindow {
                 title_item: None,
                 title_provisional: false,
                 pending_prompt: None,
-                pending_scheduled: None,
+                pending_scheduled: Vec::new(),
                 pending_jump: None,
                 pending_handoff: false,
                 profile_id: None,
@@ -6499,15 +6499,24 @@ impl AgentTerminalWindow {
                 if let Some(skeleton) = chat.holder.first_child() {
                     loading::settle(&skeleton);
                 }
-                chat.pending_scheduled.take()
+                std::mem::take(&mut chat.pending_scheduled)
             })
-            .flatten();
-        if let Some(sched) = sched {
+            .unwrap_or_default();
+        for sched in sched {
             super::schedules::mark_dispatch_failed(&self.obj(), sched);
         }
         // Not starting any more: the row stops spinning.
         self.refresh_sidebar();
         self.show_toast("Could not read this thread from the store. Select it again to retry.");
+    }
+
+    fn fail_pending_scheduled(&self, page: &adw::TabPage) {
+        let failed = self
+            .with_page_chat_mut(page, |chat| std::mem::take(&mut chat.pending_scheduled))
+            .unwrap_or_default();
+        for sched in failed {
+            super::schedules::mark_dispatch_failed(&self.obj(), sched);
+        }
     }
 
     fn build_thread(&self, page: &adw::TabPage, job: BuildJob) {
@@ -6705,10 +6714,10 @@ impl AgentTerminalWindow {
                 "Thread {thread} opened without a session: {} is not ready",
                 driver.info().label
             );
-            if let Some(sched) = self
-                .with_page_chat_mut(page, |chat| chat.pending_scheduled.take())
-                .flatten()
-            {
+            let failed_scheds = self
+                .with_page_chat_mut(page, |chat| std::mem::take(&mut chat.pending_scheduled))
+                .unwrap_or_default();
+            for sched in failed_scheds {
                 super::schedules::mark_dispatch_failed(&self.obj(), sched);
             }
             // A switch parked while the thread was being built: its own agent will not start
@@ -6846,6 +6855,18 @@ impl AgentTerminalWindow {
             return; // closed while resolving
         };
         if slot.get().is_some() {
+            if let Some(session) = slot.get() {
+                let queued = self
+                    .with_page_chat_mut(page, |chat| std::mem::take(&mut chat.pending_scheduled))
+                    .unwrap_or_default();
+                for sched in queued {
+                    if self.session_start_allowed() {
+                        super::schedules::dispatch_on_session(&self.obj(), &session, sched);
+                    } else {
+                        super::schedules::mark_dispatch_failed(&self.obj(), sched);
+                    }
+                }
+            }
             return; // already running
         }
         let clear = self.config.borrow().clear_env.clone();
@@ -6856,6 +6877,7 @@ impl AgentTerminalWindow {
                     // Shown, not stored: fixing the profile and reopening the thread starts it.
                     warn!(thread, "a thread's model provider refused its start");
                     view.apply(&Envelope::new(Event::Error { message: why }));
+                    self.fail_pending_scheduled(page);
                     return;
                 }
             };
@@ -6907,6 +6929,7 @@ impl AgentTerminalWindow {
             view.apply(&Envelope::new(Event::Error {
                 message: no_model_reason(source),
             }));
+            self.fail_pending_scheduled(page);
             return;
         }
         // The mode the user chose in this thread first (the session then runs what this agent
@@ -6939,6 +6962,7 @@ impl AgentTerminalWindow {
             Ok(adapter) => adapter,
             Err(why) => {
                 view.apply(&Envelope::new(Event::Error { message: why }));
+                self.fail_pending_scheduled(page);
                 return;
             }
         };
@@ -7006,12 +7030,12 @@ impl AgentTerminalWindow {
                 chat.pending_handoff = false;
                 (
                     chat.pending_prompt.take(),
-                    chat.pending_scheduled.take(),
+                    std::mem::take(&mut chat.pending_scheduled),
                     chat.pending_switch.take(),
                     chat.stored_handoff.take(),
                 )
             })
-            .unwrap_or((None, None, None, None));
+            .unwrap_or((None, Vec::new(), None, None));
         if let Some(stored) = stored {
             session.restore_handoff(stored);
         }
@@ -7021,8 +7045,14 @@ impl AgentTerminalWindow {
         if let Some(prompt) = prompt.filter(|_| self.session_start_allowed()) {
             session.send_prompt(&prompt);
         }
-        if let Some(sched) = scheduled.filter(|_| self.session_start_allowed()) {
-            super::schedules::dispatch_on_session(&self.obj(), &session, sched);
+        if self.session_start_allowed() {
+            for sched in scheduled {
+                super::schedules::dispatch_on_session(&self.obj(), &session, sched);
+            }
+        } else {
+            for sched in scheduled {
+                super::schedules::mark_dispatch_failed(&self.obj(), sched);
+            }
         }
         // The thread is built: judge its model against the current catalogue too.
         self.evaluate_models();
@@ -8525,8 +8555,14 @@ impl AgentTerminalWindow {
             ViewAction::Schedule {
                 initial,
                 has_images,
+                clear_composer,
             } => {
-                self.open_schedule_dialog_for(Some(thread), initial.as_deref(), *has_images);
+                self.open_schedule_dialog_for(
+                    Some(thread),
+                    initial.as_deref(),
+                    *has_images,
+                    *clear_composer,
+                );
             }
         }
     }
@@ -9384,7 +9420,7 @@ impl AgentTerminalWindow {
             } else if chat.view.is_some() && !chat.building && !chat.starting {
                 Ready::Failed
             } else {
-                chat.pending_scheduled = Some(pending.clone());
+                chat.pending_scheduled.push(pending.clone());
                 Ready::Build
             }
         });
@@ -9426,7 +9462,7 @@ impl AgentTerminalWindow {
                 chat.driver = driver;
                 chat.profile_id = profile_id;
                 chat.chosen_mode = Some(Mode::session_safe(mode));
-                chat.pending_scheduled = Some(pending);
+                chat.pending_scheduled.push(pending);
             }
         }
         if let Some(branch) = branch {

@@ -112,6 +112,7 @@ pub enum ViewAction {
     Schedule {
         initial: Option<String>,
         has_images: bool,
+        clear_composer: bool,
     },
 }
 
@@ -1846,6 +1847,7 @@ impl Inner {
                 self.emit(ViewAction::Schedule {
                     initial,
                     has_images: false,
+                    clear_composer: false,
                 });
             }
             BuiltinAction::Help => {
@@ -2104,6 +2106,7 @@ impl ComposerHost for Inner {
         self.emit(ViewAction::Schedule {
             initial,
             has_images,
+            clear_composer: true,
         });
     }
 

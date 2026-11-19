@@ -108,6 +108,12 @@ pub enum ViewAction {
     /// A comment written on one of this thread's file-change cards: the window adds it to the
     /// thread's review, the one its diff panel's "Send Review" sends.
     ReviewComment(CardComment),
+    /// Opens the schedule dialog seeded with an optional draft/command argument.
+    Schedule {
+        initial: Option<String>,
+        has_images: bool,
+        clear_composer: bool,
+    },
 }
 
 /// A comment written on a file-change card.
@@ -761,6 +767,22 @@ impl ChatView {
     pub fn has_draft(&self) -> bool {
         self.inner()
             .is_some_and(|inner| !inner.composer.text().trim().is_empty())
+    }
+
+    pub(crate) fn composer_schedule_draft(&self) -> (Option<String>, bool) {
+        self.inner()
+            .map(|inner| {
+                let text = inner.composer.text();
+                let draft = (!text.trim().is_empty()).then(|| text.to_string());
+                (draft, inner.composer.has_images())
+            })
+            .unwrap_or((None, false))
+    }
+
+    pub(crate) fn clear_composer_draft(&self) {
+        if let Some(inner) = self.inner() {
+            inner.composer.clear();
+        }
     }
 
     /// The composer's text (tests).
@@ -1820,6 +1842,14 @@ impl Inner {
             }
             BuiltinAction::Rewind => self.emit(ViewAction::Rewind),
             BuiltinAction::NewThread => self.emit(ViewAction::NewThread),
+            BuiltinAction::Schedule => {
+                let initial = (!args.trim().is_empty()).then(|| args.trim().to_owned());
+                self.emit(ViewAction::Schedule {
+                    initial,
+                    has_images: false,
+                    clear_composer: false,
+                });
+            }
             BuiltinAction::Help => {
                 let changes = self.model.borrow_mut().push_notice(
                     help_text(&status.capabilities, status.driver.info().label),
@@ -2069,6 +2099,15 @@ impl ComposerHost for Inner {
         if let Some(overlay) = self.view().and_then(|v| v.toast_overlay()) {
             overlay.add_toast(adw::Toast::new(text));
         }
+    }
+
+    fn schedule(&self, draft: &str, has_images: bool) {
+        let initial = (!draft.trim().is_empty()).then(|| draft.to_owned());
+        self.emit(ViewAction::Schedule {
+            initial,
+            has_images,
+            clear_composer: true,
+        });
     }
 
     fn command_items(&self, trigger: &Trigger) -> Vec<agent_core::commands::CompletionItem> {
@@ -2373,6 +2412,7 @@ pub(crate) mod tests {
             Body::User {
                 text: "Fix it".into(),
                 queued: true,
+                scheduled: false,
                 attachments: Vec::new(),
             },
             Body::Assistant {

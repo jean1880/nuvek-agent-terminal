@@ -44,10 +44,6 @@ mod scheduled;
 
 pub(crate) use delegated::{HeldNews, TakenNews, WakeOutcome};
 pub(crate) use limit::ContinueOutcome;
-#[cfg_attr(
-    not(test),
-    expect(unused_imports, reason = "wired by F6 scheduler slice")
-)]
 pub(crate) use scheduled::ScheduledOutcome;
 
 use super::{ChatBackend, EnvelopeSink, PromptImage, PromptInput, SessionStatus};

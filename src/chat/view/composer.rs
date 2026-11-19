@@ -214,6 +214,8 @@ pub trait ComposerHost {
     }
     /// Launches Ask Several Agents pre-filled with the current draft text.
     fn ask_several(&self, _draft: &str) {}
+    /// Opens the schedule creation dialog seeded with the composer's current draft.
+    fn schedule(&self, _draft: &str, _has_images: bool) {}
 }
 
 pub struct Composer {
@@ -225,6 +227,7 @@ pub struct Composer {
     buffer: sourceview5::Buffer,
     send: gtk4::Button,
     ask_several_btn: gtk4::Button,
+    schedule_btn: gtk4::Button,
     send_popover: gtk4::Popover,
     placeholder: gtk4::Label,
     popover: gtk4::Popover,
@@ -327,8 +330,13 @@ impl Composer {
             .label("Ask Several Agents…")
             .css_classes(["flat"])
             .build();
+        let schedule_btn = gtk4::Button::builder()
+            .label("Schedule…")
+            .css_classes(["flat"])
+            .build();
         let menu_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
         menu_box.append(&ask_several_btn);
+        menu_box.append(&schedule_btn);
         let send_popover = gtk4::Popover::builder()
             .child(&menu_box)
             .position(gtk4::PositionType::Top)
@@ -377,6 +385,7 @@ impl Composer {
             buffer,
             send,
             ask_several_btn,
+            schedule_btn,
             send_popover,
             placeholder,
             popover,
@@ -488,6 +497,10 @@ impl Composer {
     pub fn clear(&self) {
         self.set_text("");
         self.close_popup();
+    }
+
+    pub fn has_images(&self) -> bool {
+        !self.tray.images().is_empty()
     }
 
     /// Seeds recall from a thread reopened from its persisted transcript.
@@ -661,6 +674,19 @@ impl Composer {
             let draft = c.text();
             if let Some(host) = c.host() {
                 host.ask_several(&draft);
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.schedule_btn.connect_clicked(move |_| {
+            let Some(c) = weak.upgrade() else {
+                return;
+            };
+            c.send_popover.popdown();
+            if let Some(host) = c.host() {
+                let text = c.text();
+                let has_images = !c.tray.images().is_empty();
+                host.schedule(&text, has_images);
             }
         });
 

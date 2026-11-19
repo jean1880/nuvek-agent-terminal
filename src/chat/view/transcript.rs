@@ -2153,6 +2153,7 @@ mod tests {
         let user = Body::User {
             text: "hi".into(),
             queued: false,
+            scheduled: false,
             attachments: Vec::new(),
         };
         let reply = Body::Assistant {
@@ -2182,6 +2183,7 @@ mod tests {
         let queued = Body::User {
             text: "next".into(),
             queued: true,
+            scheduled: false,
             attachments: Vec::new(),
         };
         assert_eq!(entrance(&queued, Some(&reply)), Some("row-enter"));

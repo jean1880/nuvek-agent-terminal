@@ -11,6 +11,7 @@ pub mod adapter;
 pub mod agent_command;
 pub mod agy;
 pub mod approval;
+pub mod ask_several;
 pub mod attachment;
 pub mod caps;
 pub mod catalog;

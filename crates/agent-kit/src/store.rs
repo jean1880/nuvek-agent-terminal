@@ -38,7 +38,9 @@ mod schema_v8;
 mod search;
 mod spend;
 
-pub use compare::{kept_notice, CompareColumn, ForkColumns, KeepOutcome, KeptFork};
+pub use compare::{
+    kept_notice, CompareColumn, ForkColumns, KeepGroupOutcome, KeepOutcome, KeptFork, KeptGroup,
+};
 pub use preflight::{BACKUP_DIR, PRE_V4_BACKUP_KEY};
 pub use review::ReviewDraft;
 pub use search::{
@@ -100,12 +102,13 @@ pub fn thread_fork_key(thread: &str) -> String {
 const THREAD_FORK_PREFIX: &str = "thread_fork:";
 
 /// Every per-thread [`Store::meta`] key: what deleting a thread removes with it.
-fn thread_meta_keys(thread: &str) -> [String; 4] {
+fn thread_meta_keys(thread: &str) -> [String; 5] {
     [
         pending_prompt_key(thread),
         thread_profile_key(thread),
         thread_worktree_key(thread),
         thread_fork_key(thread),
+        agent_core::ask_several::participant_meta_key(thread),
     ]
 }
 const MAX_DISMISSED_NATIVES: usize = 500;

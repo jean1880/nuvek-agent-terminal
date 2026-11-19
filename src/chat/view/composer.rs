@@ -212,6 +212,8 @@ pub trait ComposerHost {
     fn saved_branch_reader(&self, _name: &str) -> Option<BranchReader> {
         None
     }
+    /// Launches Ask Several Agents pre-filled with the current draft text.
+    fn ask_several(&self, _draft: &str) {}
 }
 
 pub struct Composer {
@@ -222,6 +224,8 @@ pub struct Composer {
     view: sourceview5::View,
     buffer: sourceview5::Buffer,
     send: gtk4::Button,
+    ask_several_btn: gtk4::Button,
+    send_popover: gtk4::Popover,
     placeholder: gtk4::Label,
     popover: gtk4::Popover,
     pop_scroller: gtk4::ScrolledWindow,
@@ -319,6 +323,26 @@ impl Composer {
         send.update_property(&[gtk4::accessible::Property::Label("Send message")]);
         row.append(&send);
 
+        let ask_several_btn = gtk4::Button::builder()
+            .label("Ask Several Agents…")
+            .css_classes(["flat"])
+            .build();
+        let menu_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+        menu_box.append(&ask_several_btn);
+        let send_popover = gtk4::Popover::builder()
+            .child(&menu_box)
+            .position(gtk4::PositionType::Top)
+            .build();
+        let send_menu = gtk4::MenuButton::builder()
+            .icon_name("at-pan-down-symbolic")
+            .popover(&send_popover)
+            .tooltip_text("More send options")
+            .valign(gtk4::Align::End)
+            .css_classes(["flat", "circular"])
+            .build();
+        send_menu.update_property(&[gtk4::accessible::Property::Label("More send options")]);
+        row.append(&send_menu);
+
         let list = gtk4::ListBox::new();
         list.set_selection_mode(gtk4::SelectionMode::Single);
         list.add_css_class("typeahead-list");
@@ -352,6 +376,8 @@ impl Composer {
             view,
             buffer,
             send,
+            ask_several_btn,
+            send_popover,
             placeholder,
             popover,
             pop_scroller,
@@ -623,6 +649,19 @@ impl Composer {
                 c.submit();
             }
             c.view.grab_focus();
+        });
+
+        let weak = Rc::downgrade(self);
+        let popover = self.send_popover.clone();
+        self.ask_several_btn.connect_clicked(move |_| {
+            popover.popdown();
+            let Some(c) = weak.upgrade() else {
+                return;
+            };
+            let draft = c.text();
+            if let Some(host) = c.host() {
+                host.ask_several(&draft);
+            }
         });
 
         let weak = Rc::downgrade(self);

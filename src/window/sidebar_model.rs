@@ -1025,6 +1025,8 @@ pub enum ThreadAction {
     ForkInWorktree(String),
     /// Opens a window reading the thread beside a fork of it, its source or a sibling fork.
     CompareForks(String),
+    /// Opens a window comparing a multi-agent Ask Several group for this thread.
+    CompareGroup(String),
     Compact(String),
     Rename(String),
     Archive(String),
@@ -1081,6 +1083,7 @@ impl ThreadAction {
             Self::Fork(t) => simple("fork", t),
             Self::ForkInWorktree(t) => simple("fork-worktree", t),
             Self::CompareForks(t) => simple("compare-forks", t),
+            Self::CompareGroup(t) => simple("compare-group", t),
             Self::Compact(t) => simple("compact", t),
             Self::Rename(t) => simple("rename", t),
             Self::Archive(t) => simple("archive", t),
@@ -1132,6 +1135,7 @@ impl ThreadAction {
             "fork" => simple(Self::Fork(thread)),
             "fork-worktree" => simple(Self::ForkInWorktree(thread)),
             "compare-forks" => simple(Self::CompareForks(thread)),
+            "compare-group" => simple(Self::CompareGroup(thread)),
             "compact" => simple(Self::Compact(thread)),
             "rename" => simple(Self::Rename(thread)),
             "archive" => simple(Self::Archive(thread)),
@@ -1192,6 +1196,8 @@ pub struct ThreadMenuInput {
     /// The thread is a fork, or was forked, and the other thread still exists: it offers
     /// Compare with Fork….
     pub forks: bool,
+    /// The thread belongs to (or launched) an Ask Several comparison group: it offers Compare Group….
+    pub compare_group: bool,
     /// Only enabled (and installed) agents appear.
     pub agents: Vec<MenuAgent>,
     /// The thread's folder is on another machine: it keeps its agent (no switch or continuing in
@@ -1357,6 +1363,11 @@ pub fn thread_menu(input: &ThreadMenuInput) -> Vec<MenuEntry> {
                     ThreadAction::CompareForks(thread.clone()),
                 )
             }))
+            .chain(
+                input
+                    .compare_group
+                    .then(|| item("Compare Group…", ThreadAction::CompareGroup(thread.clone()))),
+            )
             .chain([MenuEntry::Item {
                 label: "Compact into a new thread".to_owned(),
                 action: ThreadAction::Compact(thread.clone()),
@@ -1944,6 +1955,7 @@ mod tests {
             tagged: false,
             has_messages,
             forks: false,
+            compare_group: false,
             agents: vec![
                 MenuAgent {
                     driver: Driver::Claude,

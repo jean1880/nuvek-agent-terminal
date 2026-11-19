@@ -222,7 +222,7 @@ fn changes_content(
 }
 
 /// What a column is called: the thread's title, or that it is gone.
-fn column_view(column: CompareColumn) -> ColumnView {
+pub(super) fn column_view(column: CompareColumn) -> ColumnView {
     let Some(summary) = column.summary else {
         return ColumnView {
             heading: "Deleted thread".to_owned(),

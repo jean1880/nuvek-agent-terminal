@@ -61,6 +61,7 @@ and [`.env.example`](../.env.example).
 | `Ctrl+Shift+O` | New thread in a chosen folder |
 | `Ctrl+Shift+E` | Resume an existing session |
 | `Ctrl+Shift+S` | Take a checkpoint now |
+| `Ctrl+Shift+L` | Schedule a prompt |
 | `F9`, `Ctrl+Shift+B` | Show or hide the sidebar |
 | `` Ctrl+` ``, `Ctrl+J` | Show or hide the terminal drawer |
 | `Ctrl+Shift+D` | Show or hide the diff panel |
@@ -121,6 +122,9 @@ until it is fixed.
 | `default_profile` | none | The profile terminal threads run (none: the first one installed) |
 | `checkpoints` | `true` | Snapshot each turn in a git repository |
 | `worktree_root` | `""` | Where worktrees go (blank: a hidden folder beside the repository) |
+| `default_merge_method` | `"merge"` | Starting method in the merge dialog: `merge`, `squash` or `rebase` |
+| `schedules_enabled` | `true` | Run due scheduled and repeating prompts automatically |
+| `notify_scheduled` | `true` | Show a notification when a scheduled prompt runs |
 | `diff_tool` | none | The external diff tool for **Open in…** |
 | `editor` | none | The editor for **Open in ‹editor›**: a name and an argv with `{file}` (required), `{line}`, `{column}` and `{dir}` (none: the system's default app) |
 | `diffs_expanded` | `false` | Open a file-change card's diff as soon as the edit lands |

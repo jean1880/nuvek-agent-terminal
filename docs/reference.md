@@ -569,10 +569,11 @@ git --literal-pathspecs add -A -- <files>
 git --literal-pathspecs commit -m '<message>' -- <files>
 ```
 
-- **Only the ticked files are committed.** Anything else you had staged yourself stays
-  staged and is not part of the commit; the dialog says how many such files there are.
-  Pathspecs are literal, so a file named `*` names only itself. A rename commits both its
-  old and its new path.
+- **Only the ticked files and hunks are committed.** Expanding a file's diff on **Uncommitted**
+  adds a tick box beside each diff hunk; unticking some commits only the selected hunks through
+  a temporary git index, leaving unstaged changes and anything else you had staged yourself
+  untouched. The dialog says how many separately staged files exist. Pathspecs are literal, so
+  a file named `*` names only itself. A rename commits both its old and its new path.
 - **Your hooks and signing run, and nothing is skipped or amended.** The app never passes
   `--no-verify`, `--amend`, `--allow-empty`, `-a` or `--no-gpg-sign`. Your own `user.name`
   and `user.email` are used; when one is missing git's message is shown and nothing is
@@ -719,9 +720,12 @@ git branch -d <branch>          # refuses if it is unmerged
 
 #### Merging back
 
-A worktree thread's Changes panel has a **Merge into <base>…** bar, where `<base>` is the branch
-the worktree was started from (a worktree started from a commit or a tag, or made by an older
-version, merges into whatever branch the main checkout has checked out). Pressing it reads,
+A worktree thread's Changes panel—and a worktree thread's sidebar context menu—offers **Merge
+into <base>…** (or **Merge Back…**), where `<base>` is the branch the worktree was started
+from (a worktree started from a commit or a tag, or made by an older version, merges into
+whatever branch the main checkout has checked out; if `<base>` is checked out in another
+linked worktree, the merge runs there instead). Delegated sub-agents running in an isolated
+worktree also offer **Merge Branch…** in their inspector once closed. Pressing it reads,
 without changing anything:
 
 - how many commits each side has that the other does not;
@@ -730,15 +734,17 @@ without changing anything:
 - which of your merge hooks will run;
 - every open tab, and every delegated sub-agent, working in the main checkout or this worktree.
 
-The dialog then shows the exact command, the settings it runs with and the folder it runs in. It
-merges the very commit it read, by its id, and turns off for this one command the settings that
-would make it something else (`branch.<base>.mergeOptions`, `merge.ff`, `merge.log`,
-`merge.autoStash`), passed through git's configuration environment so any branch name works:
-
-```bash
-# in the main checkout, with those four settings
-git merge --no-ff --no-edit -m "Merge branch '<branch>'" -- <commit>
-```
+The dialog lets you pick **Merge commit** (`git merge --no-ff`), **Squash and commit** (with
+an editable pre-filled message), or **Rebase and merge** (when the branch still has an active
+worktree; branch-only worker merges whose clean worktree was already removed offer Merge
+commit and Squash and commit only). Set the starting choice in Settings → Git (**Default Merge
+Method**). When conflicts are predicted on a clean registered worktree with no other tab
+blockers, **Ask Agent to Bring in <base>** rechecks the checkout and tips and asks the thread's
+agent to merge `refs/heads/<base>`; when the worktree has uncommitted changes, **Commit First…**
+opens the thread's Changes panel on Uncommitted. The dialog always shows the exact commands,
+settings (`branch.<base>.mergeOptions`, `merge.ff`, `merge.log`, `merge.autoStash` via git's
+configuration environment) and folder they run in, and merges the exact tip commit read in the
+preview.
 
 **Merge** runs it off the main thread. It is refused, with the reason, when:
 

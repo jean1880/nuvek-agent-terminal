@@ -412,6 +412,96 @@ pub fn first_hunk_line(diff: &str) -> Option<u32> {
     new_line_at(diff, row)
 }
 
+/// One unified-diff hunk extracted from a file chunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffHunk {
+    pub index: usize,
+    /// The `@@ -a,b +c,d @@ ...` header line (without trailing newline).
+    pub header: String,
+    /// Raw hunk lines after the header (including trailing newlines if present).
+    pub body: String,
+    pub new_start: u32,
+    pub new_count: u32,
+}
+
+/// Splits a single file's unified diff `chunk` into its file header block and individual hunks.
+///
+/// Returns `None` if `chunk` has no `--- `/`+++ ` headers or no valid `@@` hunks (for example,
+/// binary files or mode-only changes).
+pub fn split_hunks(chunk: &str) -> Option<(String, Vec<DiffHunk>)> {
+    let kinds = classify(chunk);
+    let mut header_block = String::new();
+    let mut hunks: Vec<DiffHunk> = Vec::new();
+    let mut in_hunk = false;
+    let mut has_old = false;
+    let mut has_new = false;
+
+    for (raw_line, kind) in chunk.split_inclusive('\n').zip(kinds) {
+        let trimmed = raw_line.trim_end_matches(&['\r', '\n'][..]);
+        match kind {
+            LineKind::Hunk => {
+                let (_, (new_start, new_count)) = parse_hunk_header(trimmed)?;
+                in_hunk = true;
+                let idx = hunks.len();
+                hunks.push(DiffHunk {
+                    index: idx,
+                    header: trimmed.to_owned(),
+                    body: String::new(),
+                    new_start,
+                    new_count,
+                });
+            }
+            _ if !in_hunk => {
+                if trimmed.starts_with("--- ") {
+                    has_old = true;
+                } else if trimmed.starts_with("+++ ") {
+                    has_new = true;
+                }
+                header_block.push_str(raw_line);
+                if !raw_line.ends_with('\n') {
+                    header_block.push('\n');
+                }
+            }
+            _ => {
+                if let Some(current) = hunks.last_mut() {
+                    current.body.push_str(raw_line);
+                    if !raw_line.ends_with('\n') {
+                        current.body.push('\n');
+                    }
+                }
+            }
+        }
+    }
+
+    if hunks.is_empty() || !has_old || !has_new {
+        return None;
+    }
+    Some((header_block, hunks))
+}
+
+/// Builds a valid unified-diff patch containing only the hunks at `selected` indices of `chunk`.
+pub fn build_hunk_patch(chunk: &str, selected: &[usize]) -> Option<String> {
+    if selected.is_empty() {
+        return None;
+    }
+    let (file_header, hunks) = split_hunks(chunk)?;
+    let mut wanted = std::collections::BTreeSet::new();
+    for &idx in selected {
+        if idx >= hunks.len() {
+            return None;
+        }
+        wanted.insert(idx);
+    }
+    let mut patch = file_header;
+    for idx in wanted {
+        let hunk = &hunks[idx];
+        patch.push_str(&hunk.header);
+        patch.push('\n');
+        patch.push_str(&hunk.body);
+    }
+    Some(patch)
+}
+
 /// The lines of a file's diff a review comment is on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommentSpan {
@@ -1541,5 +1631,40 @@ mod tests {
             anchor(panel, s.side, s.start, s.end, &s.quoted).located,
             Located::Exact
         );
+    }
+
+    #[test]
+    fn split_hunks_and_build_hunk_patch_select_requested_hunks() {
+        let chunk = "\
+diff --git a/src/lib.rs b/src/lib.rs
+index 1111111..2222222 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,4 @@ fn first()
+ a
++b
+ c
+ d
+@@ -20,3 +21,2 @@ fn second()
+ x
+-y
+ z
+";
+        let (header, hunks) = split_hunks(chunk).expect("two hunks");
+        assert!(header.contains("--- a/src/lib.rs"));
+        assert!(header.contains("+++ b/src/lib.rs"));
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].new_start, 1);
+        assert_eq!(hunks[1].new_start, 21);
+
+        let only_second = build_hunk_patch(chunk, &[1]).expect("patch");
+        assert!(only_second.contains("--- a/src/lib.rs"));
+        assert!(!only_second.contains("fn first()"));
+        assert!(only_second.contains("@@ -20,3 +21,2 @@ fn second()"));
+        assert!(only_second.contains("-y"));
+
+        assert_eq!(build_hunk_patch(chunk, &[]), None);
+        assert_eq!(build_hunk_patch(chunk, &[2]), None);
+        assert_eq!(split_hunks("Binary files a/x and b/x differ\n"), None);
     }
 }

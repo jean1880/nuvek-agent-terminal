@@ -21,7 +21,8 @@
 //! Blocking: run everything here off the main thread.
 
 use crate::git::{
-    failure_message, git_output, git_output_in_group, git_raw, RepoInfo, QUERY_TIMEOUT_SECS,
+    failure_message, git_output, git_output_in_group, git_raw, git_raw_with_input, RepoInfo,
+    QUERY_TIMEOUT_SECS,
 };
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -259,6 +260,24 @@ pub struct CommitRequest {
     pub expected: Expected,
 }
 
+/// Selected hunks of a modified file to stage with `git apply --cached`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HunkPatch {
+    pub path: String,
+    pub patch: String,
+    pub chosen: usize,
+    pub total: usize,
+}
+
+/// A commit mixing whole-file paths and partial-hunk patches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialCommitRequest {
+    pub message: String,
+    pub paths: Vec<String>,
+    pub patches: Vec<HunkPatch>,
+    pub expected: Expected,
+}
+
 /// A commit that was made.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Committed {
@@ -381,6 +400,308 @@ pub fn commit_args(request: &CommitRequest) -> Vec<String> {
 /// staged). Git's message on failure, with anything secret-shaped in it masked.
 pub fn commit_paths(dir: &Path, request: &CommitRequest) -> Result<Committed, String> {
     commit_with(dir, request, &[], COMMIT_TIMEOUT_SECS)
+}
+
+/// Arguments passed to `git apply --cached` for each partial-hunk patch.
+pub fn apply_cached_args() -> Vec<String> {
+    ["--literal-pathspecs", "apply", "--cached", "-"]
+        .map(str::to_owned)
+        .to_vec()
+}
+
+/// Arguments passed to `git commit` when committing a temporary index built from whole paths and
+/// partial patches (`--only <paths>` cannot be used because it ignores `--cached` hunks).
+pub fn index_commit_args(message: &str) -> Vec<String> {
+    [
+        "--literal-pathspecs".to_owned(),
+        "commit".to_owned(),
+        "-m".to_owned(),
+        message.to_owned(),
+    ]
+    .to_vec()
+}
+
+/// Commits a mix of whole-file `paths` and partial-hunk `patches`. When `patches` is empty, runs
+/// [`commit_paths`]; otherwise stages into a private temporary index (`GIT_INDEX_FILE`), commits
+/// with user hooks and signing, and refreshes only the committed paths in the real index.
+pub fn commit_partial(dir: &Path, request: &PartialCommitRequest) -> Result<Committed, String> {
+    commit_partial_with(dir, request, &[], COMMIT_TIMEOUT_SECS)
+}
+
+fn commit_partial_with(
+    dir: &Path,
+    request: &PartialCommitRequest,
+    env: &[(&str, &OsStr)],
+    timeout_secs: u64,
+) -> Result<Committed, String> {
+    if request.patches.is_empty() {
+        return commit_with(
+            dir,
+            &CommitRequest {
+                message: request.message.clone(),
+                paths: request.paths.clone(),
+                expected: request.expected.clone(),
+            },
+            env,
+            timeout_secs,
+        );
+    }
+    if request.message.trim().is_empty() {
+        return Err("Write a commit message first".into());
+    }
+    let mut all_paths: Vec<String> =
+        Vec::with_capacity(request.paths.len() + request.patches.len());
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for p in &request.paths {
+        if seen.insert(p.as_str()) {
+            all_paths.push(p.clone());
+        }
+    }
+    for patch in &request.patches {
+        if patch.patch.trim().is_empty() {
+            return Err(format!(
+                "Selected hunks for {} produced an empty patch",
+                patch.path
+            ));
+        }
+        if !seen.insert(patch.path.as_str()) {
+            return Err(format!(
+                "{} cannot be staged both whole and by hunk",
+                patch.path
+            ));
+        }
+        all_paths.push(patch.path.clone());
+    }
+    validate_paths(&all_paths)?;
+
+    let repo = repository(dir)?;
+    if repo.head.is_none() {
+        return Err("Commit the initial file whole before staging individual hunks".into());
+    }
+    if let Some(op) = in_progress_op(&repo.git_dir) {
+        return Err(op.reason().to_owned());
+    }
+    check_expected(&repo, &request.expected)?;
+    let top = repo.toplevel.as_path();
+    refuse_folders(top, &all_paths, env)?;
+
+    let patch_paths: Vec<String> = request.patches.iter().map(|p| p.path.clone()).collect();
+    let mut cached_args = vec![
+        "--literal-pathspecs".to_owned(),
+        "diff".to_owned(),
+        "--cached".to_owned(),
+        "--name-only".to_owned(),
+        "-z".to_owned(),
+        "--".to_owned(),
+    ];
+    cached_args.extend(patch_paths);
+    let already_staged = git_raw(top, &cached_args, env, QUERY_TIMEOUT_SECS)?;
+    if let Some(first_staged) = already_staged
+        .split(|b| *b == 0)
+        .find(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+    {
+        return Err(format!(
+            "{first_staged} already has staged changes in your index. Commit it whole or unstage \
+             those changes before staging individual hunks."
+        ));
+    }
+
+    let scratch_dir = repo.git_dir.join("agent-terminal");
+    std::fs::create_dir_all(&scratch_dir)
+        .map_err(|e| format!("Could not create temp index folder: {e}"))?;
+    static NEXT_INDEX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = NEXT_INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_index = scratch_dir.join(format!("partial-commit.{}.{seq}.idx", std::process::id()));
+    struct ScratchGuard(PathBuf);
+    impl Drop for ScratchGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            let mut lock = self.0.as_os_str().to_os_string();
+            lock.push(".lock");
+            let _ = std::fs::remove_file(PathBuf::from(lock));
+        }
+    }
+    let _guard = ScratchGuard(tmp_index.clone());
+    let mut index_env: Vec<(&str, &OsStr)> = env.to_vec();
+    index_env.push(("GIT_INDEX_FILE", tmp_index.as_os_str()));
+
+    let resolved_patches: Vec<(&HunkPatch, Vec<u8>)> = request
+        .patches
+        .iter()
+        .map(|patch| raw_patch_bytes(top, patch, env).map(|bytes| (patch, bytes)))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    git_raw(top, ["read-tree", "HEAD"], &index_env, QUERY_TIMEOUT_SECS)?;
+    if !request.paths.is_empty() {
+        let out = git_output_in_group(top, add_args(&request.paths), &index_env, timeout_secs)
+            .map_err(|why| failure(&why, timeout_secs))?;
+        if !out.status.success() {
+            return Err(failure(&failure_message(&out.stderr), timeout_secs));
+        }
+    }
+    for (patch, bytes) in resolved_patches {
+        let mut check_args = apply_cached_args();
+        check_args.insert(3, "--check".to_owned());
+        git_raw_with_input(
+            top,
+            &check_args,
+            &index_env,
+            timeout_secs,
+            bytes.clone(),
+        )
+        .map_err(|why| {
+            format!(
+                "Could not stage selected hunks of {} (the file may have changed since the diff): {}",
+                patch.path,
+                failure(&why, timeout_secs)
+            )
+        })?;
+        git_raw_with_input(top, apply_cached_args(), &index_env, timeout_secs, bytes)
+            .map_err(|why| failure(&why, timeout_secs))?;
+    }
+
+    let commit_out = git_output_in_group(
+        top,
+        index_commit_args(&request.message),
+        &index_env,
+        timeout_secs,
+    )
+    .map_err(|why| failure(&why, timeout_secs))?;
+    if !commit_out.status.success() {
+        return Err(failure(&failure_message(&commit_out.stderr), timeout_secs));
+    }
+
+    let short = git_raw(
+        top,
+        ["rev-parse", "--short", "HEAD"],
+        env,
+        QUERY_TIMEOUT_SECS,
+    )
+    .map(|out| String::from_utf8_lossy(&out).trim().to_owned())
+    .unwrap_or_default();
+
+    // Refresh only the committed paths in the user's real index to match the new HEAD, leaving
+    // uncommitted hunks in the working tree and leaving anything else staged untouched.
+    let mut reset_args = vec![
+        "--literal-pathspecs".to_owned(),
+        "reset".to_owned(),
+        "-q".to_owned(),
+        "HEAD".to_owned(),
+        "--".to_owned(),
+    ];
+    reset_args.extend(all_paths);
+    let reset_out = git_output(top, &reset_args, env, QUERY_TIMEOUT_SECS);
+    let committed_name = if short.is_empty() {
+        "HEAD".to_owned()
+    } else {
+        short.clone()
+    };
+    match reset_out {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            let msg = failure(&failure_message(&out.stderr), QUERY_TIMEOUT_SECS);
+            return Err(format!(
+                "Committed {committed_name}, but could not refresh the git index (your staged \
+                 view may still reflect the prior commit until you run `git reset -q HEAD -- \
+                 ...`): {msg}"
+            ));
+        }
+        Err(why) => {
+            let msg = failure(&why, QUERY_TIMEOUT_SECS);
+            return Err(format!(
+                "Committed {committed_name}, but could not refresh the git index: {msg}"
+            ));
+        }
+    }
+
+    Ok(Committed { short })
+}
+
+/// Splits raw `git diff` bytes for one file into its header block and per-hunk byte slices.
+fn split_raw_diff_hunks(raw: &[u8]) -> Option<(Vec<u8>, Vec<&[u8]>)> {
+    let mut header = Vec::new();
+    let mut starts: Vec<usize> = Vec::new();
+    let mut offset = 0usize;
+    for line in raw.split_inclusive(|&b| b == b'\n') {
+        if line.starts_with(b"@@ ") {
+            starts.push(offset);
+        } else if starts.is_empty() {
+            header.extend_from_slice(line);
+        }
+        offset += line.len();
+    }
+    if starts.is_empty() {
+        return None;
+    }
+    let mut hunks = Vec::with_capacity(starts.len());
+    for i in 0..starts.len() {
+        let start = starts[i];
+        let end = starts.get(i + 1).copied().unwrap_or(raw.len());
+        hunks.push(&raw[start..end]);
+    }
+    Some((header, hunks))
+}
+
+/// Resolves exact patch bytes for `git apply --cached`. When the UI-derived `patch.patch` contains
+/// UTF-8 replacement characters (`'\u{FFFD}'`) from lossy diff decoding, re-reads raw diff bytes
+/// from `HEAD` and selects the matching hunks verbatim so non-UTF-8 bytes are preserved untouched.
+fn raw_patch_bytes(
+    top: &Path,
+    patch: &HunkPatch,
+    env: &[(&str, &OsStr)],
+) -> Result<Vec<u8>, String> {
+    if !patch.patch.contains('\u{FFFD}') {
+        return Ok(patch.patch.as_bytes().to_vec());
+    }
+    let (_, selected_hunks) = crate::diff::split_hunks(&patch.patch)
+        .ok_or_else(|| format!("Selected hunks for {} could not be parsed", patch.path))?;
+    let raw = git_raw(
+        top,
+        [
+            "--literal-pathspecs",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--no-renames",
+            "-U3",
+            "HEAD",
+            "--",
+            patch.path.as_str(),
+        ],
+        env,
+        QUERY_TIMEOUT_SECS,
+    )?;
+    let (mut out, raw_hunks) = split_raw_diff_hunks(&raw).ok_or_else(|| {
+        format!(
+            "Could not read raw diff hunks for {} (the file may have changed)",
+            patch.path
+        )
+    })?;
+    let mut cursor = 0usize;
+    for sel in &selected_hunks {
+        let wanted = format!("{}\n{}", sel.header, sel.body);
+        let wanted_trimmed = wanted.trim_end_matches('\n');
+        let matched = raw_hunks[cursor..].iter().position(|raw_hunk| {
+            let lossy = String::from_utf8_lossy(raw_hunk);
+            lossy.trim_end_matches('\n') == wanted_trimmed
+        });
+        let Some(rel) = matched else {
+            return Err(format!(
+                "Could not match selected hunks of {} against the working tree (it may have \
+                 changed since the diff was loaded)",
+                patch.path
+            ));
+        };
+        let abs = cursor + rel;
+        out.extend_from_slice(raw_hunks[abs]);
+        if !raw_hunks[abs].ends_with(b"\n") {
+            out.push(b'\n');
+        }
+        cursor = abs + 1;
+    }
+    Ok(out)
 }
 
 fn commit_with(
@@ -1049,6 +1370,170 @@ mod tests {
             commit(dir, "First", &["first.txt"]).unwrap();
             assert_eq!(committed_files(dir), vec!["first.txt"]);
             assert_eq!(staged(dir), "mine.txt");
+        }
+
+        #[test]
+        fn partial_commit_commits_selected_hunk_leaves_other_hunk_and_staged_elsewhere() {
+            if !git_or_skip() {
+                return;
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
+            sh(dir, &["init", "-q"]);
+            identity(dir);
+            let mut lines: Vec<String> = (1..=30).map(|i| format!("line {i}")).collect();
+            fs::write(dir.join("a.txt"), format!("{}\n", lines.join("\n"))).unwrap();
+            fs::write(dir.join("whole.txt"), "before\n").unwrap();
+            sh(dir, &["add", "a.txt", "whole.txt"]);
+            sh(dir, &["commit", "-q", "-m", "init"]);
+
+            // Stage an unrelated file by hand.
+            fs::write(dir.join("mine.txt"), "staged by hand\n").unwrap();
+            sh(dir, &["add", "mine.txt"]);
+
+            // Edit two separated hunks in a.txt and one whole file.
+            lines[1] = "hunk one change".into();
+            lines[27] = "hunk two change".into();
+            fs::write(dir.join("a.txt"), format!("{}\n", lines.join("\n"))).unwrap();
+            fs::write(dir.join("whole.txt"), "after\n").unwrap();
+
+            let raw_diff = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(["diff", "--", "a.txt"])
+                .output()
+                .unwrap();
+            let chunk = String::from_utf8(raw_diff.stdout).unwrap();
+            let patch = crate::diff::build_hunk_patch(&chunk, &[0]).expect("first hunk patch");
+
+            let r = repository(dir).unwrap();
+            let req = PartialCommitRequest {
+                message: "First hunk + whole file".into(),
+                paths: vec!["whole.txt".into()],
+                patches: vec![HunkPatch {
+                    path: "a.txt".into(),
+                    patch,
+                    chosen: 1,
+                    total: 2,
+                }],
+                expected: Expected {
+                    branch: r.branch,
+                    head: r.head,
+                },
+            };
+            commit_partial_with(dir, &req, &env(), COMMIT_TIMEOUT_SECS).unwrap();
+
+            assert_eq!(committed_files(dir), vec!["a.txt", "whole.txt"]);
+            assert_eq!(staged(dir), "mine.txt");
+            let committed_a = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(["show", "HEAD:a.txt"])
+                .output()
+                .unwrap();
+            let committed_text = String::from_utf8(committed_a.stdout).unwrap();
+            assert!(committed_text.contains("hunk one change"));
+            assert!(!committed_text.contains("hunk two change"));
+            let work_text = fs::read_to_string(dir.join("a.txt")).unwrap();
+            assert!(work_text.contains("hunk two change"));
+        }
+
+        #[test]
+        fn partial_commit_preserves_non_utf8_bytes_and_reports_reset_lock_failure() {
+            if !git_or_skip() {
+                return;
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
+            sh(dir, &["init", "-q"]);
+            identity(dir);
+            let mut lines: Vec<Vec<u8>> =
+                (1..=30).map(|i| format!("line {i}").into_bytes()).collect();
+            let mut init_bytes = lines.join(&b'\n');
+            init_bytes.push(b'\n');
+            fs::write(dir.join("bin.txt"), &init_bytes).unwrap();
+            sh(dir, &["add", "bin.txt"]);
+            sh(dir, &["commit", "-q", "-m", "init"]);
+
+            lines[1] = b"bad-\xff-byte".to_vec();
+            lines[27] = b"second-hunk".to_vec();
+            let mut dirty_bytes = lines.join(&b'\n');
+            dirty_bytes.push(b'\n');
+            fs::write(dir.join("bin.txt"), &dirty_bytes).unwrap();
+
+            let raw_diff = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(["diff", "--", "bin.txt"])
+                .output()
+                .unwrap();
+            let lossy_chunk = String::from_utf8_lossy(&raw_diff.stdout);
+            assert!(lossy_chunk.contains('\u{FFFD}'));
+            let patch =
+                crate::diff::build_hunk_patch(&lossy_chunk, &[0]).expect("first hunk patch");
+
+            let r = repository(dir).unwrap();
+            let req = PartialCommitRequest {
+                message: "Non-UTF-8 hunk".into(),
+                paths: Vec::new(),
+                patches: vec![HunkPatch {
+                    path: "bin.txt".into(),
+                    patch: patch.clone(),
+                    chosen: 1,
+                    total: 2,
+                }],
+                expected: Expected {
+                    branch: r.branch.clone(),
+                    head: r.head.clone(),
+                },
+            };
+            commit_partial_with(dir, &req, &env(), COMMIT_TIMEOUT_SECS).unwrap();
+
+            let committed_bin = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(["show", "HEAD:bin.txt"])
+                .output()
+                .unwrap();
+            assert!(
+                committed_bin
+                    .stdout
+                    .windows(b"bad-\xff-byte".len())
+                    .any(|w| w == b"bad-\xff-byte"),
+                "exact raw byte 0xff must survive partial commit"
+            );
+            assert!(
+                !committed_bin
+                    .stdout
+                    .windows(3)
+                    .any(|w| w == "\u{FFFD}".as_bytes()),
+                "must not commit lossy UTF-8 replacement chars"
+            );
+
+            // Hold .git/index.lock during reset: partial commit still commits on temporary index
+            // and surfaces the real-index reset failure explicitly.
+            let raw_diff2 = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(["diff", "--", "bin.txt"])
+                .output()
+                .unwrap();
+            let lossy2 = String::from_utf8_lossy(&raw_diff2.stdout);
+            let patch2 = crate::diff::build_hunk_patch(&lossy2, &[0]).expect("remaining hunk");
+            let r2 = repository(dir).unwrap();
+            fs::write(dir.join(".git/index.lock"), b"").unwrap();
+            let req2 = PartialCommitRequest {
+                message: "With index locked".into(),
+                paths: Vec::new(),
+                patches: vec![HunkPatch {
+                    path: "bin.txt".into(),
+                    patch: patch2,
+                    chosen: 1,
+                    total: 1,
+                }],
+                expected: Expected {
+                    branch: r2.branch,
+                    head: r2.head,
+                },
+            };
+            let err = commit_partial_with(dir, &req2, &env(), COMMIT_TIMEOUT_SECS).unwrap_err();
+            let _ = fs::remove_file(dir.join(".git/index.lock"));
+            assert!(err.contains("could not refresh the git index"), "{err}");
         }
     }
 }

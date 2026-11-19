@@ -51,6 +51,18 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   (nothing is deleted, and Undo brings it back), notes the choice in the one you kept, and
   offers to remove the other's worktree when it has nothing uncommitted and no one else works in
   it; its branch is always kept.
+- **Ask several agents at once**: **Ask Several Agents…** in the composer menu, or `/ask`, sends
+  the same prompt to 2–4 agents, models or profiles in parallel and opens **Compare Group…** to
+  read their replies and diffs side by side. Choosing **Keep This One** archives the rest,
+  records the outcome in a redacted brief on the source thread, offers **Undo**, and offers to
+  clean up finished participant worktrees.
+- **Scheduled and repeating prompts**: **Schedule…** in the composer send menu, `/schedule`,
+  or `Ctrl+Shift+L` schedules a prompt once, daily, weekly or at an interval, targeting the
+  current thread or a new thread/worktree. **Scheduled Prompts…** in the window menu (and
+  thread context menu) lists upcoming runs and lets you pause, resume, edit, run now or delete.
+  Repeating schedules pause automatically after 10 unattended runs until you reply, or when a
+  spending warning fires; disable all scheduled runs in Settings → General → Threads
+  (**Run Scheduled Prompts**).
 
 ### Multi-agent environment review
 
@@ -246,8 +258,8 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   first changed line or, with Ctrl+click, at any line of its diff. A read's card and the file
   links in a reply (`src/a.rs:12`) open in the editor too; a file outside the thread's folder
   is asked about first, every time.
-  Tick the files you want and **Commit…** them through your own git, hooks and signing
-  included, after seeing the exact commands. Select lines and **Comment** on them
+  Tick the files or individual diff hunks you want and **Commit…** them through your own git,
+  hooks and signing included, after seeing the exact commands. Select lines and **Comment** on them
   (`Ctrl+Alt+M`), in the panel or on a file change in the thread, keep collecting notes while
   you read, then **Send Review** to the thread's agent as one message with exact paths, lines
   and quoted code, each comment's lines checked against the file first, so lines that moved
@@ -258,9 +270,13 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   See [Undoing a turn](reference.md#undoing-a-turn).
 - **Worktrees** (`Ctrl+Shift+G`): a new branch in its own checkout, so an agent can
   work without touching yours. See [Worktree threads](reference.md#worktree-threads).
-  When the work is done, **Merge into <base>…** in its Changes panel merges the branch back
-  after showing the exact command, refusing anything half-done, and undoes a merge that stops
-  part-way. The branch is always kept. See [Merging back](reference.md#merging-back).
+  When the work is done, **Merge into <base>…** in its Changes panel (or in a worktree
+  thread's context menu) merges, squashes or rebases the branch back after showing the exact
+  commands, refusing anything half-done, offering **Ask Agent to Bring in <base>** or
+  **Commit First…** when conflicts or uncommitted worktree changes block it, and undoing a
+  merge that stops part-way. Delegated workers running in isolated worktrees also offer **Merge
+  Branch…** from their inspector. The branch is always kept. See
+  [Merging back](reference.md#merging-back).
 
 ### Terminals
 

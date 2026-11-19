@@ -135,7 +135,10 @@ Architectural mandates, standards, and workflows for this codebase.
     the fork's link, both for two siblings (`SettleRefused` for no pair, a pair settled already,
     or a link holding another pair's record, which is never overwritten), cleared by `unsettle`,
     and read by `Pairing::kept` only when it names exactly that pair; `branch_slug`, a fork
-    worktree's branch words) and `a11y_announce`
+    worktree's branch words), `ask_several` (parallel multi-agent group validation,
+    compare-group metadata, target resolution and kept-answer handoff brief), `schedule`
+    (one-shot and repeating schedule state machine, rule evaluation, missed-run policies,
+    unattended/budget auto-pause rules and local-clock formatting) and `a11y_announce`
     (what a screen reader is told of an event, given whether the user was looking and whether a
     desktop notification already said it: an exhaustive match, so a new `Event` variant must
     decide; each part redacted, cut short, never stored, through `plain`, which transcript rows'
@@ -184,9 +187,12 @@ Architectural mandates, standards, and workflows for this codebase.
     `add` and lays the baseline in with `lay_in_fork_worktree`, so the fork starts with the
     source's uncommitted work, uncommitted, and never a secret-looking file; `remove` refuses
     uncommitted and untracked files but deletes ignored ones, so every caller runs
-    `removal_blocker` in the same step), `commit` (the diff panel's commit of the ticked paths: its context, arguments and
-    run), `merge` (a worktree branch merged back into its base: the read-only `preflight`, the
-    one `commands` list the preview shows and the merge runs, and the abort-only `merge`), `github` (a branch's pull-request state, the compare URL, the unforced push; it also gives
+    `removal_blocker` in the same step), `commit` (the diff panel's commit of the ticked paths
+    or selected diff hunks via a temporary git index: its context, arguments and run), `merge`
+    (a worktree branch—or closed worker branch—merged back into its base via Merge commit,
+    Squash and commit or Rebase and merge: the read-only `preflight`/`preflight_branch`, the one
+    `commands_for` list the preview shows and the merge runs, and the abort-only
+    `merge_with_method`), `github` (a branch's pull-request state, the compare URL, the unforced push; it also gives
     a thread's subtitle its branch, shown only for a repository on GitHub),
     `handoff` (hand-off briefs, session readers, quota detection),
     `sessions` (`SessionFormat`, session IDs, transcript lookup and listing),
@@ -331,9 +337,14 @@ Architectural mandates, standards, and workflows for this codebase.
     `sidebar_model::snippet_markup`, which escapes every character and makes only the match
     markers bold), `window/sidebar_model.rs` (pure sidebar logic: sections, the `SearchQuery`
     filter on titles, folders and tags, tag chips and the Tags dialog's choices),
-    `window/imp/commit.rs` (the diff panel's commit dialog and flow), `window/imp/merge.rs` (a
-    worktree tab's merge preview, the base checkout's open tabs it refuses or warns about, the
-    merge and its result), `window/compare.rs` (the
+    `window/imp/commit.rs` (the diff panel's commit dialog and partial/whole staging flow),
+    `window/imp/merge.rs` (worktree-tab, thread-menu and delegated worker-branch merge previews,
+    base-checkout and worktree blockers, Ask Agent / Commit First follow-ups, method choice and
+    result dialogs), `window/imp/ask_several.rs` (Ask Several parallel group creation,
+    Compare Group view, Keep This One with Undo and redacted hand-off brief),
+    `window/schedule_model.rs` / `window/imp/schedules.rs` (Scheduled Prompts editor, manager
+    dialog and 60-second background tick scheduler with safe-mode gating and unattended/budget
+    pauses), `window/compare.rs` (the
     compare window: an `adw::Window` of its own, never a page or a `TabState`, that only reads;
     it holds itself until closed or destroyed with its parent, so no caller keeps it;
     a spinner until its first read, a generation so only the newest read draws, Refresh, replies

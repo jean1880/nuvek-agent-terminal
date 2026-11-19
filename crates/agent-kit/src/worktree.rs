@@ -338,7 +338,7 @@ fn listed_worktree(porcelain: &str, path: &Path, branch: &str) -> bool {
     })
 }
 
-fn worktree_for_branch(porcelain: &str, branch: &str) -> Option<PathBuf> {
+pub(crate) fn worktree_for_branch(porcelain: &str, branch: &str) -> Option<PathBuf> {
     let wanted_ref = format!("refs/heads/{}", branch.trim());
     porcelain.split("\n\n").find_map(|record| {
         let mut path = None;

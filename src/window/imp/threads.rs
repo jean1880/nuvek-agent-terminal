@@ -8552,6 +8552,9 @@ impl AgentTerminalWindow {
                 );
             }
             ViewAction::ReviewComment(comment) => self.add_card_comment(thread, comment.clone()),
+            ViewAction::MergeWorker(worker) => {
+                self.merge_worker_branch(thread.to_owned(), worker.clone())
+            }
             ViewAction::Schedule {
                 initial,
                 has_images,

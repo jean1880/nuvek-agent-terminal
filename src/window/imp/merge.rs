@@ -20,8 +20,9 @@ use gtk4::glib;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-use super::threads::off_main;
+use super::threads::{off_main, store_job};
 use super::{present_message_over, AgentTerminalWindow, CHECKPOINT_QUIET};
+use crate::chat::ChatBackend;
 
 /// An open tab, or a live delegated sub-agent, as read on the main thread: where it works and
 /// whether it is working. Placed against the plan's folders off the main thread ([`blockers`]).
@@ -262,11 +263,49 @@ struct MergeChoice {
     squash_message: Option<String>,
 }
 
+/// Options configuring extra follow-up actions in the merge preview dialog.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct MergeDialogOptions {
+    pub initial: agent_kit::merge::MergeMethod,
+    pub can_ask_agent: bool,
+    pub can_commit_first: bool,
+}
+
+/// Builds the conflict-resolution prompt sent to the worktree thread's agent.
+pub(super) fn conflict_handoff_prompt(plan: &MergePlan) -> String {
+    let files: Vec<String> = plan
+        .refusals
+        .iter()
+        .find_map(|r| match r {
+            agent_kit::merge::Refusal::Conflicts(files) => Some(files.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let list = if files.is_empty() {
+        "the conflicting files".to_owned()
+    } else {
+        files
+            .iter()
+            .take(12)
+            .map(|f| redact(f))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let merge_cmd = shown_command(&["merge".to_owned(), format!("refs/heads/{}", plan.base)]);
+    redact(&format!(
+        "Merging `{}` into `{}` would conflict in: {list}.\n\n\
+         Please run `{merge_cmd}` in this worktree, resolve any conflicts, and commit so `{}` \
+         can merge cleanly into `{}`.",
+        plan.branch, plan.base, plan.branch, plan.base
+    ))
+}
+
 /// The merge dialog's parts the flow and its test read back.
 pub(super) struct MergeDialog {
     pub dialog: adw::AlertDialog,
     pub method_row: adw::ComboRow,
     pub squash_buffer: gtk4::TextBuffer,
+    pub methods: Vec<agent_kit::merge::MergeMethod>,
     #[cfg_attr(not(test), expect(dead_code, reason = "read by the dialog test"))]
     pub commands: gtk4::Label,
     #[cfg_attr(not(test), expect(dead_code, reason = "read by the dialog test"))]
@@ -302,12 +341,35 @@ pub(super) fn merge_dialog(plan: &MergePlan, tabs: &TabLines) -> MergeDialog {
 }
 
 /// [`merge_dialog`] starting on `initial`.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "test helper wrapping merge_dialog_full")
+)]
 pub(super) fn merge_dialog_with(
     plan: &MergePlan,
     tabs: &TabLines,
     initial: agent_kit::merge::MergeMethod,
 ) -> MergeDialog {
-    use agent_kit::merge::MergeMethod;
+    merge_dialog_full(
+        plan,
+        tabs,
+        MergeDialogOptions {
+            initial,
+            can_ask_agent: false,
+            can_commit_first: false,
+        },
+    )
+}
+
+/// [`merge_dialog`] with full follow-up action support (`Ask Agent` on predicted conflicts,
+/// `Commit First…` on dirty worktree, and branch-only method filtering when `has_worktree` is false).
+pub(super) fn merge_dialog_full(
+    plan: &MergePlan,
+    tabs: &TabLines,
+    options: MergeDialogOptions,
+) -> MergeDialog {
+    use agent_kit::merge::{MergeMethod, Refusal};
+    let initial = options.initial;
     let dialog = adw::AlertDialog::new(
         Some(&format!("Merge {} into {}?", plan.branch, plan.base)),
         None,
@@ -335,16 +397,19 @@ pub(super) fn merge_dialog_with(
         column.append(&label);
     }
 
-    let labels: Vec<&str> = MergeMethod::ALL.iter().map(|m| m.label()).collect();
+    let methods: Vec<MergeMethod> = if plan.has_worktree {
+        MergeMethod::ALL.to_vec()
+    } else {
+        vec![MergeMethod::Merge, MergeMethod::Squash]
+    };
+    let labels: Vec<&str> = methods.iter().map(|m| m.label()).collect();
     let model = gtk4::StringList::new(&labels);
-    let initial_idx = MergeMethod::ALL
-        .iter()
-        .position(|m| *m == initial)
-        .unwrap_or(0) as u32;
+    let initial_idx = methods.iter().position(|m| *m == initial).unwrap_or(0);
+    let active_initial = methods[initial_idx];
     let method_row = adw::ComboRow::builder()
         .title("Method")
         .model(&model)
-        .selected(initial_idx)
+        .selected(initial_idx as u32)
         .build();
     let method_list = gtk4::ListBox::builder()
         .selection_mode(gtk4::SelectionMode::None)
@@ -379,9 +444,9 @@ pub(super) fn merge_dialog_with(
     let secret_warning = wrapped("Commit message looks like it contains a secret or token.");
     secret_warning.add_css_class("error");
     let initial_check = agent_core::commit_message::check(&plan.squash_message);
-    secret_warning.set_visible(initial == MergeMethod::Squash && initial_check.looks_secret);
+    secret_warning.set_visible(active_initial == MergeMethod::Squash && initial_check.looks_secret);
     squash_box.append(&secret_warning);
-    squash_box.set_visible(initial == MergeMethod::Squash);
+    squash_box.set_visible(active_initial == MergeMethod::Squash);
     column.append(&squash_box);
 
     let method_hooks_label = wrapped("");
@@ -403,7 +468,7 @@ pub(super) fn merge_dialog_with(
             many => format!("Your {} hooks also run.", many.join(", ")),
         }
     };
-    let initial_hooks = method_hooks_text(initial);
+    let initial_hooks = method_hooks_text(active_initial);
     method_hooks_label.set_text(&initial_hooks);
     method_hooks_label.set_visible(!initial_hooks.is_empty());
     column.append(&method_hooks_label);
@@ -411,27 +476,53 @@ pub(super) fn merge_dialog_with(
     let heading = wrapped("Runs, in this order:");
     heading.add_css_class("heading");
     column.append(&heading);
-    let initial_msg = (initial == MergeMethod::Squash).then_some(plan.squash_message.as_str());
-    let commands = wrapped(&shown_steps_for(plan, initial, initial_msg));
+    let initial_msg =
+        (active_initial == MergeMethod::Squash).then_some(plan.squash_message.as_str());
+    let commands = wrapped(&shown_steps_for(plan, active_initial, initial_msg));
     commands.add_css_class("monospace");
     commands.set_selectable(true);
     column.append(&commands);
-    let note = wrapped(&method_note(initial, &plan.branch));
+    let note = wrapped(&method_note(active_initial, &plan.branch));
     note.add_css_class("dim-label");
     column.append(&note);
     dialog.set_extra_child(Some(&column));
 
     dialog.add_response("cancel", "Cancel");
+    let has_conflicts = plan
+        .refusals
+        .iter()
+        .any(|r| matches!(r, Refusal::Conflicts(_)));
+    let has_dirty_worktree = plan
+        .refusals
+        .iter()
+        .any(|r| matches!(r, Refusal::WorktreeChanges));
+    let has_other_plan_refusal = plan
+        .refusals
+        .iter()
+        .any(|r| !matches!(r, Refusal::Conflicts(_)));
+    if options.can_commit_first && plan.has_worktree && has_dirty_worktree {
+        dialog.add_response("commit-first", "Commit First…");
+    }
+    if options.can_ask_agent
+        && plan.has_worktree
+        && has_conflicts
+        && !has_dirty_worktree
+        && !has_other_plan_refusal
+        && tabs.refusals.is_empty()
+    {
+        dialog.add_response("ask-agent", &format!("Ask Agent to Bring in {}", plan.base));
+    }
     dialog.add_response("merge", "Merge");
     dialog.set_response_appearance("merge", adw::ResponseAppearance::Suggested);
     let can_merge = refusals.is_empty()
-        && (initial != MergeMethod::Squash
+        && (active_initial != MergeMethod::Squash
             || (!initial_check.empty && !initial_check.looks_secret));
     dialog.set_response_enabled("merge", can_merge);
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
 
     let has_refusals = !refusals.is_empty();
+    let sync_methods = methods.clone();
     let sync = {
         let plan = plan.clone();
         let dialog = dialog.downgrade();
@@ -465,7 +556,7 @@ pub(super) fn merge_dialog_with(
             else {
                 return;
             };
-            let method = MergeMethod::ALL
+            let method = sync_methods
                 .get(method_row.selected() as usize)
                 .copied()
                 .unwrap_or_default();
@@ -510,8 +601,8 @@ pub(super) fn merge_dialog_with(
     let sync_method = sync.clone();
     method_row.connect_selected_notify(move |_| sync_method());
     squash_buffer.connect_changed(move |_| sync());
-    if initial != MergeMethod::Merge {
-        let label = match initial {
+    if active_initial != MergeMethod::Merge {
+        let label = match active_initial {
             MergeMethod::Merge => "Merge",
             MergeMethod::Squash => "Squash and Commit",
             MergeMethod::Rebase => "Rebase and Merge",
@@ -523,6 +614,7 @@ pub(super) fn merge_dialog_with(
         dialog,
         method_row,
         squash_buffer,
+        methods,
         commands,
         refusals,
     }
@@ -563,14 +655,80 @@ pub(super) fn foreground_job(fd: &impl std::os::fd::AsRawFd) -> bool {
     group > 0 && session > 0 && group != session
 }
 
+/// Target whose branch is being merged into its base checkout.
+enum MergeTarget {
+    WorktreeTab {
+        panel_root: gtk4::Box,
+        page: adw::TabPage,
+        panel: Box<crate::window::diff_panel::DiffPanel>,
+        info: agent_kit::worktree::WorktreeInfo,
+    },
+    ThreadMenu {
+        thread: String,
+        info: agent_kit::worktree::WorktreeInfo,
+    },
+    WorkerBranch {
+        parent_thread: String,
+        lease: crate::delegation::WorktreeLease,
+    },
+}
+
+#[derive(Clone)]
+enum PreflightSpec {
+    Worktree(agent_kit::worktree::WorktreeInfo),
+    Branch(agent_kit::worktree::WorktreeInfo),
+    Lease(crate::delegation::WorktreeLease),
+}
+
+impl MergeTarget {
+    fn worktree_info(&self) -> Option<&agent_kit::worktree::WorktreeInfo> {
+        match self {
+            Self::WorktreeTab { info, .. } | Self::ThreadMenu { info, .. } => Some(info),
+            Self::WorkerBranch { .. } => None,
+        }
+    }
+
+    fn spec(&self) -> PreflightSpec {
+        match self {
+            Self::WorktreeTab { info, .. } => PreflightSpec::Worktree(info.clone()),
+            Self::ThreadMenu { info, .. } => PreflightSpec::Branch(info.clone()),
+            Self::WorkerBranch { lease, .. } => PreflightSpec::Lease(lease.clone()),
+        }
+    }
+}
+
+impl PreflightSpec {
+    fn preflight(&self) -> Result<MergePlan, String> {
+        match self {
+            Self::Worktree(info) => agent_kit::merge::preflight(info),
+            Self::Branch(info) => agent_kit::merge::preflight_branch(
+                &info.main_toplevel,
+                &info.branch,
+                info.base.as_deref(),
+                Some(&info.path),
+            ),
+            Self::Lease(lease) => agent_kit::merge::preflight_branch(
+                &lease.source_repo,
+                &lease.branch,
+                None,
+                Some(&lease.worktree),
+            ),
+        }
+    }
+}
+
 impl AgentTerminalWindow {
     /// Every open tab other than the one whose panel is `own` (in every window) and every live
     /// delegated sub-agent, with where it works and whether it is working; and whether the
     /// tab whose panel is `own` is working itself. Read on the main thread, placed off it.
-    fn seen_for_merge(&self, own: &gtk4::Box) -> (Vec<Seen>, bool) {
+    fn seen_for_merge(
+        &self,
+        own: Option<&gtk4::Box>,
+        own_thread_arg: Option<&str>,
+    ) -> (Vec<Seen>, bool) {
         let found = std::cell::RefCell::new(Vec::new());
         let own_busy = std::cell::Cell::new(false);
-        let own_thread = std::cell::RefCell::new(None::<String>);
+        let own_thread = std::cell::RefCell::new(own_thread_arg.map(str::to_owned));
         self.for_each_window(|window| {
             for tab in window.tabs.borrow().iter() {
                 if tab.remote.is_some() {
@@ -579,9 +737,14 @@ impl AgentTerminalWindow {
                 // A thread is busy while it holds its work; a terminal (a page, or a thread's
                 // drawer) while it has just shown output or runs a job of its own.
                 let busy = terminal_busy(tab) || tab.chat.as_ref().is_some_and(|c| c.holds_merge());
-                if tab.diff_panel.root == *own {
+                let is_own_panel = own.is_some_and(|p| tab.diff_panel.root == *p);
+                let is_own_thread = own_thread_arg
+                    .is_some_and(|tid| tab.chat.as_ref().is_some_and(|c| c.thread == tid));
+                if is_own_panel || is_own_thread {
                     own_busy.set(busy);
-                    *own_thread.borrow_mut() = tab.chat.as_ref().map(|c| c.thread.clone());
+                    if own_thread.borrow().is_none() {
+                        *own_thread.borrow_mut() = tab.chat.as_ref().map(|c| c.thread.clone());
+                    }
                     continue;
                 }
                 found.borrow_mut().push(Seen {
@@ -640,100 +803,395 @@ impl AgentTerminalWindow {
             panel.set_merge_preparing(false);
             return;
         };
+        self.present_merge_flow(MergeTarget::WorktreeTab {
+            panel_root: panel_root.clone(),
+            page,
+            panel: Box::new(panel),
+            info,
+        });
+    }
+
+    /// "Merge into <base>…" from a sidebar thread row's context menu.
+    pub(super) fn merge_worktree_thread(&self, thread: &str) {
         let obj = self.obj().downgrade();
-        let root = panel_root.clone();
+        let thread = thread.to_owned();
         glib::MainContext::default().spawn_local(async move {
-            // The button stays off until the preview is up, or the reason it is not has been
-            // said: one press, one dialog.
-            let done =
-                |panel: &crate::window::diff_panel::DiffPanel| panel.set_merge_preparing(false);
-            let read = {
-                let info = info.clone();
-                off_main("reading the merge", move || {
-                    agent_kit::merge::preflight(&info)
-                })
-                .await
-            };
-            let Some(obj) = obj.upgrade() else {
-                done(&panel);
+            let info = store_job({
+                let thread = thread.clone();
+                move |store| {
+                    store
+                        .thread_attributes(&thread)
+                        .ok()
+                        .and_then(|a| a.worktree)
+                }
+            })
+            .await
+            .unwrap_or(None);
+            let Some(obj) = obj.upgrade() else { return };
+            let imp = obj.imp();
+            let Some(info) = info else {
+                let parent: gtk4::Widget = obj.clone().upcast();
+                present_message_over(
+                    &parent,
+                    "Can't Merge Worktree",
+                    "This thread is not attached to a worktree.",
+                );
                 return;
             };
-            // The tab closed while the plan was read: there is nothing to ask about.
-            if obj.imp().tab_by_panel(&root, |_| ()).is_none() {
-                done(&panel);
+            imp.present_merge_flow(MergeTarget::ThreadMenu { thread, info });
+        });
+    }
+
+    /// "Merge Branch…" from a delegated worker inspector card (`isolated_worktree`).
+    pub(super) fn merge_worker_branch(&self, parent_thread: String, worker_id: String) {
+        let parent_widget: gtk4::Widget = self.obj().clone().upcast();
+        let wid = match agent_core::delegation::WorkerId::parse(&worker_id) {
+            Ok(id) => id,
+            Err(why) => {
+                present_message_over(
+                    &parent_widget,
+                    "Can't Merge Worker Branch",
+                    &redact(&why.to_string()),
+                );
                 return;
             }
+        };
+        let Some(lease) = crate::delegation::supervisor().and_then(|s| s.child_lease(&wid)) else {
+            present_message_over(
+                &parent_widget,
+                "Can't Merge Worker Branch",
+                "This sub-agent does not have an isolated worktree branch.",
+            );
+            return;
+        };
+        self.present_merge_flow(MergeTarget::WorkerBranch {
+            parent_thread,
+            lease,
+        });
+    }
+
+    fn present_merge_flow(&self, target: MergeTarget) {
+        let obj = self.obj().downgrade();
+        glib::MainContext::default().spawn_local(async move {
+            let done_preparing = |target: &MergeTarget| {
+                if let MergeTarget::WorktreeTab { panel, .. } = target {
+                    panel.set_merge_preparing(false);
+                }
+            };
+            let read = {
+                let spec = target.spec();
+                off_main("reading the merge", move || spec.preflight()).await
+            };
+            let Some(obj) = obj.upgrade() else {
+                done_preparing(&target);
+                return;
+            };
+            let imp = obj.imp();
+            let still_open = match &target {
+                MergeTarget::WorktreeTab { panel_root, .. } => {
+                    imp.tab_by_panel(panel_root, |_| ()).is_some()
+                }
+                MergeTarget::ThreadMenu { thread, .. } => imp.summary_of(thread).is_some(),
+                MergeTarget::WorkerBranch { .. } => true,
+            };
+            if !still_open {
+                done_preparing(&target);
+                return;
+            }
+            let parent_widget = |target: &MergeTarget| -> gtk4::Widget {
+                match target {
+                    MergeTarget::WorktreeTab {
+                        panel_root, panel, ..
+                    } => imp.merge_result_parent(panel_root, &panel.dialog_parent()),
+                    MergeTarget::ThreadMenu { .. } | MergeTarget::WorkerBranch { .. } => {
+                        obj.clone().upcast()
+                    }
+                }
+            };
+            let err_title = match &target {
+                MergeTarget::WorkerBranch { .. } => "Can't Merge Worker Branch",
+                MergeTarget::WorktreeTab { .. } | MergeTarget::ThreadMenu { .. } => {
+                    "Can't Merge This Worktree"
+                }
+            };
             let plan = match read {
                 Ok(plan) => plan,
                 Err(why) => {
-                    done(&panel);
-                    // Resolved again: the panel may have popped out or docked meanwhile.
-                    let parent = obj.imp().merge_result_parent(&root, &panel.dialog_parent());
-                    present_message_over(&parent, "Can't Merge This Worktree", &redact(&why));
+                    done_preparing(&target);
+                    present_message_over(&parent_widget(&target), err_title, &redact(&why));
                     return;
                 }
             };
-            let (seen, own_busy) = obj.imp().seen_for_merge(&root);
-            let lines = {
+            let (seen, own_busy) = match &target {
+                MergeTarget::WorktreeTab { panel_root, .. } => {
+                    imp.seen_for_merge(Some(panel_root), None)
+                }
+                MergeTarget::ThreadMenu { thread, .. } => imp.seen_for_merge(None, Some(thread)),
+                MergeTarget::WorkerBranch { .. } => imp.seen_for_merge(None, None),
+            };
+            let expected_info = target.worktree_info().cloned();
+            let check = {
                 let plan = plan.clone();
                 off_main("reading what is open", move || {
-                    Ok::<_, String>(blockers(&plan, &seen, own_busy))
+                    let lines = blockers(&plan, &seen, own_busy);
+                    let matches_thread_wt = plan.has_worktree
+                        && expected_info.as_ref().is_some_and(|i| {
+                            i.branch == plan.branch
+                                && agent_kit::worktree::is_registered(i).unwrap_or(false)
+                        });
+                    Ok::<_, String>((lines, matches_thread_wt))
                 })
                 .await
             };
-            let Ok(lines) = lines else {
-                done(&panel);
+            let Ok((lines, matches_thread_wt)) = check else {
+                done_preparing(&target);
                 return;
             };
-            if obj.imp().tab_by_panel(&root, |_| ()).is_none() {
-                done(&panel);
+            let still_open = match &target {
+                MergeTarget::WorktreeTab { panel_root, .. } => {
+                    imp.tab_by_panel(panel_root, |_| ()).is_some()
+                }
+                MergeTarget::ThreadMenu { thread, .. } => imp.summary_of(thread).is_some(),
+                MergeTarget::WorkerBranch { .. } => true,
+            };
+            if !still_open {
+                done_preparing(&target);
                 return;
             }
-            let parent = obj.imp().merge_result_parent(&root, &panel.dialog_parent());
-            let initial = obj.imp().config.borrow().default_merge_method;
-            let parts = merge_dialog_with(&plan, &lines, initial);
+            let parent = parent_widget(&target);
+            let initial = imp.config.borrow().default_merge_method;
+            let thread_for_actions = match &target {
+                MergeTarget::WorktreeTab { panel_root, .. } => imp
+                    .tab_by_panel(panel_root, |t| t.chat.as_ref().map(|c| c.thread.clone()))
+                    .flatten(),
+                MergeTarget::ThreadMenu { thread, .. } => Some(thread.clone()),
+                MergeTarget::WorkerBranch { .. } => None,
+            };
+            let options = MergeDialogOptions {
+                initial,
+                can_ask_agent: thread_for_actions.is_some() && matches_thread_wt,
+                can_commit_first: matches_thread_wt,
+            };
+            let parts = merge_dialog_full(&plan, &lines, options);
             parts.dialog.present(Some(&parent));
-            done(&panel);
+            done_preparing(&target);
+
             let obj = obj.downgrade();
             let method_row = parts.method_row;
             let squash_buffer = parts.squash_buffer;
+            let methods = parts.methods;
+            let target_ref = std::rc::Rc::new(target);
             parts.dialog.connect_response(None, move |_, response| {
-                if response != "merge" {
-                    return;
-                }
                 let Some(obj) = obj.upgrade() else { return };
-                let method = agent_kit::merge::MergeMethod::ALL
-                    .get(method_row.selected() as usize)
-                    .copied()
-                    .unwrap_or_default();
-                let msg = if method == agent_kit::merge::MergeMethod::Squash {
-                    let (start, end) = squash_buffer.bounds();
-                    Some(squash_buffer.text(&start, &end, false).to_string())
-                } else {
-                    None
-                };
-                obj.imp().run_merge(
-                    &root,
-                    &page,
-                    &panel,
-                    &parent,
-                    plan.clone(),
-                    MergeChoice {
-                        method,
-                        squash_message: msg,
-                    },
-                );
+                match response {
+                    "merge" => {
+                        let method = methods
+                            .get(method_row.selected() as usize)
+                            .copied()
+                            .unwrap_or_default();
+                        let msg = if method == agent_kit::merge::MergeMethod::Squash {
+                            let (start, end) = squash_buffer.bounds();
+                            Some(squash_buffer.text(&start, &end, false).to_string())
+                        } else {
+                            None
+                        };
+                        obj.imp().run_merge(
+                            &target_ref,
+                            &parent,
+                            plan.clone(),
+                            MergeChoice {
+                                method,
+                                squash_message: msg,
+                            },
+                        );
+                    }
+                    "ask-agent" => {
+                        if let Some(ref thread_id) = thread_for_actions {
+                            obj.imp().ask_agent_to_resolve_conflict(
+                                &target_ref,
+                                thread_id,
+                                plan.clone(),
+                                &parent,
+                            );
+                        }
+                    }
+                    "commit-first" => {
+                        obj.imp()
+                            .open_worktree_for_commit(&target_ref, thread_for_actions.as_deref());
+                    }
+                    _ => {}
+                }
             });
         });
+    }
+
+    fn ask_agent_to_resolve_conflict(
+        &self,
+        target: &MergeTarget,
+        thread_id: &str,
+        plan: MergePlan,
+        parent: &gtk4::Widget,
+    ) {
+        let (seen, own_busy) = match target {
+            MergeTarget::WorktreeTab { panel_root, .. } => {
+                self.seen_for_merge(Some(panel_root), None)
+            }
+            MergeTarget::ThreadMenu { thread, .. } => self.seen_for_merge(None, Some(thread)),
+            MergeTarget::WorkerBranch { .. } => return,
+        };
+        let Some(expected_info) = target.worktree_info().cloned() else {
+            return;
+        };
+        let spec = PreflightSpec::Worktree(expected_info);
+        let panel_root = match target {
+            MergeTarget::WorktreeTab { panel_root, .. } => Some(panel_root.clone()),
+            _ => None,
+        };
+        let obj = self.obj().downgrade();
+        let thread_id = thread_id.to_owned();
+        let parent = parent.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let recheck = {
+                let plan = plan.clone();
+                off_main("rechecking worktree before asking agent", move || {
+                    let now = spec.preflight()?;
+                    let lines = blockers(&now, &seen, own_busy);
+                    if now.info.path != plan.info.path
+                        || now.has_worktree != plan.has_worktree
+                        || now.branch != plan.branch
+                        || now.base != plan.base
+                        || now.branch_tip != plan.branch_tip
+                        || now.base_tip != plan.base_tip
+                    {
+                        return Err(redact(&format!(
+                            "{} or {} changed since the preview. Open the merge dialog again \
+                             before asking the agent.",
+                            plan.branch, plan.base
+                        )));
+                    }
+                    if let Some(why) = lines.refusals.first() {
+                        return Err(why.clone());
+                    }
+                    if let Some(other) = now
+                        .refusals
+                        .iter()
+                        .find(|r| !matches!(r, agent_kit::merge::Refusal::Conflicts(_)))
+                    {
+                        return Err(redact(&other.reason(&now)));
+                    }
+                    if !now
+                        .refusals
+                        .iter()
+                        .any(|r| matches!(r, agent_kit::merge::Refusal::Conflicts(_)))
+                    {
+                        return Err(
+                            "No conflicts remain to resolve. Open the merge dialog again."
+                                .to_owned(),
+                        );
+                    }
+                    Ok(conflict_handoff_prompt(&now))
+                })
+                .await
+            };
+            let Some(obj) = obj.upgrade() else { return };
+            let imp = obj.imp();
+            let shown_over = match panel_root.as_ref() {
+                Some(root) => imp.merge_result_parent(root, &parent),
+                None => parent.clone(),
+            };
+            let prompt = match recheck {
+                Ok(p) => p,
+                Err(why) => {
+                    present_message_over(&shown_over, "Can't Ask Agent Right Now", &why);
+                    return;
+                }
+            };
+            let Some(page) = imp.open_thread(&thread_id, true) else {
+                return;
+            };
+            let owner = super::threads::thread_owner(&thread_id).unwrap_or_else(|| obj.clone());
+            if let Some(view) = owner
+                .imp()
+                .with_page_tab(&page, |t| t.chat.as_ref().and_then(|c| c.view.clone()))
+                .flatten()
+            {
+                if let Err(why) = view.submit_review(&prompt) {
+                    present_message_over(&shown_over, "Could Not Ask Agent", &why);
+                }
+                return;
+            }
+            // Opening a previously closed thread builds its view and session asynchronously.
+            let owner_w = owner.downgrade();
+            for _ in 0..80 {
+                glib::timeout_future(std::time::Duration::from_millis(25)).await;
+                let Some(owner) = owner_w.upgrade() else {
+                    return;
+                };
+                let ready = owner
+                    .imp()
+                    .with_page_tab(&page, |t| {
+                        t.chat.as_ref().and_then(|c| {
+                            let view = c.view.clone()?;
+                            let ready = c.slot.get().is_some_and(|s| s.send_refusal().is_none());
+                            Some((view, ready))
+                        })
+                    })
+                    .flatten();
+                if let Some((view, true)) = ready {
+                    if let Err(why) = view.submit_review(&prompt) {
+                        present_message_over(&shown_over, "Could Not Ask Agent", &why);
+                    }
+                    return;
+                }
+            }
+            if let Some(owner) = owner_w.upgrade() {
+                if let Some(view) = owner
+                    .imp()
+                    .with_page_tab(&page, |t| t.chat.as_ref().and_then(|c| c.view.clone()))
+                    .flatten()
+                {
+                    if let Err(why) = view.submit_review(&prompt) {
+                        present_message_over(&shown_over, "Could Not Ask Agent", &why);
+                    }
+                }
+            }
+        });
+    }
+
+    fn open_worktree_for_commit(&self, target: &MergeTarget, thread_id: Option<&str>) {
+        let (owner, page, panel) = match target {
+            MergeTarget::WorktreeTab { page, panel, .. } => {
+                (self.obj().clone(), page.clone(), (**panel).clone())
+            }
+            MergeTarget::ThreadMenu { .. } => {
+                let Some(tid) = thread_id else { return };
+                let Some(page) = self.open_thread(tid, true) else {
+                    return;
+                };
+                let owner = super::threads::thread_owner(tid).unwrap_or_else(|| self.obj().clone());
+                let Some(panel) = owner.imp().with_page_tab(&page, |t| t.diff_panel.clone()) else {
+                    return;
+                };
+                (owner, page, panel)
+            }
+            MergeTarget::WorkerBranch { .. } => return,
+        };
+        panel.select_uncommitted();
+        if panel.is_detached() {
+            panel.present();
+        } else if !panel.root.is_visible() {
+            panel.set_shown(true);
+            owner.imp().config.borrow_mut().diff_panel_visible = true;
+            owner.imp().schedule_config_save();
+        }
+        owner.imp().refresh_diff(&page);
     }
 
     /// Runs `choice` on `plan` once what is open is checked again: a turn may have
     /// started, or a tab opened, while the dialog was up.
     fn run_merge(
         &self,
-        panel_root: &gtk4::Box,
-        page: &adw::TabPage,
-        panel: &crate::window::diff_panel::DiffPanel,
+        target: &MergeTarget,
         parent: &gtk4::Widget,
         plan: MergePlan,
         choice: MergeChoice,
@@ -742,16 +1200,50 @@ impl AgentTerminalWindow {
             method,
             squash_message,
         } = choice;
-        let (seen, own_busy) = self.seen_for_merge(panel_root);
-        let (page, panel, parent, root) = (
-            page.clone(),
-            panel.clone(),
-            parent.clone(),
-            panel_root.clone(),
-        );
+        let (seen, own_busy) = match target {
+            MergeTarget::WorktreeTab { panel_root, .. } => {
+                self.seen_for_merge(Some(panel_root), None)
+            }
+            MergeTarget::ThreadMenu { thread, .. } => self.seen_for_merge(None, Some(thread)),
+            MergeTarget::WorkerBranch { .. } => self.seen_for_merge(None, None),
+        };
+        enum After {
+            WorktreeTab {
+                panel_root: gtk4::Box,
+                page: adw::TabPage,
+                panel: Box<crate::window::diff_panel::DiffPanel>,
+            },
+            Thread {
+                thread: String,
+                offer_close: bool,
+            },
+        }
+        let after = match target {
+            MergeTarget::WorktreeTab {
+                panel_root,
+                page,
+                panel,
+                ..
+            } => After::WorktreeTab {
+                panel_root: panel_root.clone(),
+                page: page.clone(),
+                panel: panel.clone(),
+            },
+            MergeTarget::ThreadMenu { thread, .. } => After::Thread {
+                thread: thread.clone(),
+                offer_close: true,
+            },
+            MergeTarget::WorkerBranch { parent_thread, .. } => After::Thread {
+                thread: parent_thread.clone(),
+                offer_close: false,
+            },
+        };
+        let parent = parent.clone();
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
-            panel.set_merging(true);
+            if let After::WorktreeTab { panel, .. } = &after {
+                panel.set_merging(true);
+            }
             let done = {
                 let plan = plan.clone();
                 off_main("the merge", move || {
@@ -769,17 +1261,35 @@ impl AgentTerminalWindow {
                 })
                 .await
             };
-            panel.set_merging(false);
+            if let After::WorktreeTab { panel, .. } = &after {
+                panel.set_merging(false);
+            }
             let Some(obj) = obj.upgrade() else { return };
             let imp = obj.imp();
-            let shown_over = imp.merge_result_parent(&root, &parent);
+            let shown_over = match &after {
+                After::WorktreeTab { panel_root, .. } => {
+                    imp.merge_result_parent(panel_root, &parent)
+                }
+                After::Thread { .. } => parent.clone(),
+            };
             // `Err(Err(_))`: refused at the click; `Err(Ok(_))`: git's failure.
             let done: Result<Merged, Result<String, String>> =
                 done.unwrap_or_else(|why| Err(Ok(why)));
             match done {
                 Ok(done) => {
                     info!("merged a worktree's branch into its base");
-                    imp.merged(&page, &shown_over, &plan, &done);
+                    match &after {
+                        After::WorktreeTab { page, .. } => {
+                            imp.merged(Some(page), &shown_over, &plan, &done);
+                        }
+                        After::Thread {
+                            thread,
+                            offer_close,
+                        } => {
+                            let page = offer_close.then(|| imp.page_of_thread(thread)).flatten();
+                            imp.merged(page.as_ref(), &shown_over, &plan, &done);
+                        }
+                    }
                 }
                 Err(Err(why)) => {
                     present_message_over(&shown_over, "Can't Merge Right Now", &why);
@@ -789,15 +1299,28 @@ impl AgentTerminalWindow {
                     present_message_over(&shown_over, "Could Not Merge", &why);
                 }
             }
-            imp.refresh_diff(&page);
+            match &after {
+                After::WorktreeTab { page, .. } => imp.refresh_diff(page),
+                After::Thread { thread, .. } => {
+                    if let Some(page) = imp.page_of_thread(thread) {
+                        imp.refresh_diff(&page);
+                    }
+                }
+            }
         });
     }
 
-    /// Says the merge is made, how to delete the branch, and offers to close the thread (which
-    /// offers the worktree's removal as any worktree tab's close does).
-    fn merged(&self, page: &adw::TabPage, parent: &gtk4::Widget, plan: &MergePlan, done: &Merged) {
-        let dialog = merged_dialog(plan, done);
+    /// Says the merge is made, how to delete the branch, and optionally offers to close `page`.
+    fn merged(
+        &self,
+        page: Option<&adw::TabPage>,
+        parent: &gtk4::Widget,
+        plan: &MergePlan,
+        done: &Merged,
+    ) {
+        let dialog = merged_dialog_with(plan, done, page.is_some());
         dialog.present(Some(parent));
+        let Some(page) = page else { return };
         let obj = self.obj().downgrade();
         let page = page.clone();
         dialog.connect_response(None, move |_, response| {
@@ -820,7 +1343,16 @@ impl AgentTerminalWindow {
 
 /// The success dialog: what moved, and the command that deletes the kept branch in a label that
 /// can be selected and copied. Done is the default and what a close answers.
+#[cfg(test)]
 pub(super) fn merged_dialog(plan: &MergePlan, done: &Merged) -> adw::AlertDialog {
+    merged_dialog_with(plan, done, true)
+}
+
+pub(super) fn merged_dialog_with(
+    plan: &MergePlan,
+    done: &Merged,
+    offer_close: bool,
+) -> adw::AlertDialog {
     let (before, after) = merged_words(plan, done);
     let dialog = adw::AlertDialog::new(
         Some(&format!("Merged {} into {}", plan.branch, plan.base)),
@@ -833,12 +1365,16 @@ pub(super) fn merged_dialog(plan: &MergePlan, done: &Merged) -> adw::AlertDialog
     command.add_css_class("merge-delete-command");
     command.set_selectable(true);
     column.append(&command);
-    let note = wrapped(&after);
-    note.add_css_class("dim-label");
-    column.append(&note);
+    if offer_close {
+        let note = wrapped(&after);
+        note.add_css_class("dim-label");
+        column.append(&note);
+    }
     dialog.set_extra_child(Some(&column));
     dialog.add_response("done", "Done");
-    dialog.add_response("close", "Close Thread");
+    if offer_close {
+        dialog.add_response("close", "Close Thread");
+    }
     dialog.set_default_response(Some("done"));
     dialog.set_close_response("done");
     dialog
@@ -875,6 +1411,7 @@ pub(super) mod tests {
             rebase_worktree_hooks_dir: None,
             rebase_base_hooks: Vec::new(),
             worktrees: vec![PathBuf::from("/r/.main.worktrees/feat-x")],
+            has_worktree: true,
             refusals: Vec::new(),
         }
     }
@@ -1231,5 +1768,102 @@ pub(super) mod tests {
         );
         assert!(parts.commands.text().as_str().contains("git rebase"));
         assert!(parts.dialog.is_response_enabled("merge"));
+
+        // Follow-up options: Ask Agent on predicted conflicts (clean worktree), Commit First on
+        // dirty worktree, and branch-only filtering hides Rebase.
+        let mut conflicted = plan();
+        conflicted.refusals = vec![Refusal::Conflicts(vec!["src/main.rs".into()])];
+        let parts = merge_dialog_full(
+            &conflicted,
+            &TabLines::default(),
+            MergeDialogOptions {
+                initial: agent_kit::merge::MergeMethod::Merge,
+                can_ask_agent: true,
+                can_commit_first: true,
+            },
+        );
+        assert!(!parts.dialog.is_response_enabled("merge"));
+        assert!(parts.dialog.has_response("ask-agent"));
+        assert!(!parts.dialog.has_response("commit-first"));
+        let prompt = conflict_handoff_prompt(&conflicted);
+        assert!(prompt.contains("src/main.rs"));
+        assert!(prompt.contains("git merge refs/heads/main"), "{prompt}");
+
+        // Tab blockers or other plan refusals suppress Ask Agent.
+        let blocked_parts = merge_dialog_full(
+            &conflicted,
+            &busy,
+            MergeDialogOptions {
+                initial: agent_kit::merge::MergeMethod::Merge,
+                can_ask_agent: true,
+                can_commit_first: true,
+            },
+        );
+        assert!(!blocked_parts.dialog.has_response("ask-agent"));
+        let mut detached_wt = conflicted.clone();
+        detached_wt.has_worktree = false;
+        let detached_parts = merge_dialog_full(
+            &detached_wt,
+            &TabLines::default(),
+            MergeDialogOptions {
+                initial: agent_kit::merge::MergeMethod::Merge,
+                can_ask_agent: true,
+                can_commit_first: true,
+            },
+        );
+        assert!(!detached_parts.dialog.has_response("ask-agent"));
+        assert!(!detached_parts.dialog.has_response("commit-first"));
+        let mut odd_base = conflicted.clone();
+        odd_base.base = "release candidate".into();
+        assert!(
+            conflict_handoff_prompt(&odd_base).contains("git merge 'refs/heads/release candidate'")
+        );
+
+        let mut dirty_wt = plan();
+        dirty_wt.refusals = vec![
+            Refusal::WorktreeChanges,
+            Refusal::Conflicts(vec!["a.rs".into()]),
+        ];
+        let parts = merge_dialog_full(
+            &dirty_wt,
+            &TabLines::default(),
+            MergeDialogOptions {
+                initial: agent_kit::merge::MergeMethod::Merge,
+                can_ask_agent: true,
+                can_commit_first: true,
+            },
+        );
+        assert!(parts.dialog.has_response("commit-first"));
+        assert!(!parts.dialog.has_response("ask-agent"));
+
+        let mut branch_only = plan();
+        branch_only.has_worktree = false;
+        let parts = merge_dialog_full(
+            &branch_only,
+            &TabLines::default(),
+            MergeDialogOptions {
+                initial: agent_kit::merge::MergeMethod::Rebase,
+                can_ask_agent: false,
+                can_commit_first: false,
+            },
+        );
+        assert_eq!(
+            parts.methods,
+            vec![
+                agent_kit::merge::MergeMethod::Merge,
+                agent_kit::merge::MergeMethod::Squash
+            ]
+        );
+        assert!(!parts.dialog.has_response("ask-agent"));
+        assert!(!parts.dialog.has_response("commit-first"));
+        assert!(!merged_dialog_with(
+            &branch_only,
+            &Merged {
+                before: "0123456789ab".into(),
+                after: "fedcba987654".into(),
+            },
+            false,
+        )
+        .has_response("close"));
     }
 }

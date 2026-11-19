@@ -291,11 +291,12 @@ pub(super) fn conflict_handoff_prompt(plan: &MergePlan) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     };
+    let merge_cmd = shown_command(&["merge".to_owned(), format!("refs/heads/{}", plan.base)]);
     redact(&format!(
         "Merging `{}` into `{}` would conflict in: {list}.\n\n\
-         Please run `git merge {}` in this worktree, resolve any conflicts, and commit so `{}` \
+         Please run `{merge_cmd}` in this worktree, resolve any conflicts, and commit so `{}` \
          can merge cleanly into `{}`.",
-        plan.branch, plan.base, plan.base, plan.branch, plan.base
+        plan.branch, plan.base, plan.branch, plan.base
     ))
 }
 
@@ -495,10 +496,19 @@ pub(super) fn merge_dialog_full(
         .refusals
         .iter()
         .any(|r| matches!(r, Refusal::WorktreeChanges));
+    let has_other_plan_refusal = plan
+        .refusals
+        .iter()
+        .any(|r| !matches!(r, Refusal::Conflicts(_)));
     if options.can_commit_first && has_dirty_worktree {
         dialog.add_response("commit-first", "Commit First…");
     }
-    if options.can_ask_agent && has_conflicts && !has_dirty_worktree {
+    if options.can_ask_agent
+        && has_conflicts
+        && !has_dirty_worktree
+        && !has_other_plan_refusal
+        && tabs.refusals.is_empty()
+    {
         dialog.add_response("ask-agent", &format!("Ask Agent to Bring in {}", plan.base));
     }
     dialog.add_response("merge", "Merge");
@@ -662,6 +672,43 @@ enum MergeTarget {
     },
 }
 
+#[derive(Clone)]
+enum PreflightSpec {
+    Worktree(agent_kit::worktree::WorktreeInfo),
+    Branch(agent_kit::worktree::WorktreeInfo),
+    Lease(crate::delegation::WorktreeLease),
+}
+
+impl MergeTarget {
+    fn spec(&self) -> PreflightSpec {
+        match self {
+            Self::WorktreeTab { info, .. } => PreflightSpec::Worktree(info.clone()),
+            Self::ThreadMenu { info, .. } => PreflightSpec::Branch(info.clone()),
+            Self::WorkerBranch { lease, .. } => PreflightSpec::Lease(lease.clone()),
+        }
+    }
+}
+
+impl PreflightSpec {
+    fn preflight(&self) -> Result<MergePlan, String> {
+        match self {
+            Self::Worktree(info) => agent_kit::merge::preflight(info),
+            Self::Branch(info) => agent_kit::merge::preflight_branch(
+                &info.main_toplevel,
+                &info.branch,
+                info.base.as_deref(),
+                Some(&info.path),
+            ),
+            Self::Lease(lease) => agent_kit::merge::preflight_branch(
+                &lease.source_repo,
+                &lease.branch,
+                None,
+                Some(&lease.worktree),
+            ),
+        }
+    }
+}
+
 impl AgentTerminalWindow {
     /// Every open tab other than the one whose panel is `own` (in every window) and every live
     /// delegated sub-agent, with where it works and whether it is working; and whether the
@@ -823,38 +870,9 @@ impl AgentTerminalWindow {
                     panel.set_merge_preparing(false);
                 }
             };
-            let read = match &target {
-                MergeTarget::WorktreeTab { info, .. } => {
-                    let info = info.clone();
-                    off_main("reading the merge", move || {
-                        agent_kit::merge::preflight(&info)
-                    })
-                    .await
-                }
-                MergeTarget::ThreadMenu { info, .. } => {
-                    let info = info.clone();
-                    off_main("reading the merge", move || {
-                        agent_kit::merge::preflight_branch(
-                            &info.main_toplevel,
-                            &info.branch,
-                            info.base.as_deref(),
-                            Some(&info.path),
-                        )
-                    })
-                    .await
-                }
-                MergeTarget::WorkerBranch { lease, .. } => {
-                    let lease = lease.clone();
-                    off_main("reading the merge", move || {
-                        agent_kit::merge::preflight_branch(
-                            &lease.source_repo,
-                            &lease.branch,
-                            None,
-                            Some(&lease.worktree),
-                        )
-                    })
-                    .await
-                }
+            let read = {
+                let spec = target.spec();
+                off_main("reading the merge", move || spec.preflight()).await
             };
             let Some(obj) = obj.upgrade() else {
                 done_preparing(&target);
@@ -974,8 +992,12 @@ impl AgentTerminalWindow {
                     }
                     "ask-agent" => {
                         if let Some(ref thread_id) = thread_for_actions {
-                            obj.imp()
-                                .ask_agent_to_resolve_conflict(thread_id, &plan, &parent);
+                            obj.imp().ask_agent_to_resolve_conflict(
+                                &target_ref,
+                                thread_id,
+                                plan.clone(),
+                                &parent,
+                            );
                         }
                     }
                     "commit-first" => {
@@ -990,32 +1012,105 @@ impl AgentTerminalWindow {
 
     fn ask_agent_to_resolve_conflict(
         &self,
+        target: &MergeTarget,
         thread_id: &str,
-        plan: &MergePlan,
+        plan: MergePlan,
         parent: &gtk4::Widget,
     ) {
-        let prompt = conflict_handoff_prompt(plan);
-        let Some(page) = self.open_thread(thread_id, true) else {
-            return;
-        };
-        if let Some(view) = self
-            .with_page_tab(&page, |t| t.chat.as_ref().and_then(|c| c.view.clone()))
-            .flatten()
-        {
-            if let Err(why) = view.submit_review(&prompt) {
-                present_message_over(parent, "Could Not Ask Agent", &why);
+        let (seen, own_busy) = match target {
+            MergeTarget::WorktreeTab { panel_root, .. } => {
+                self.seen_for_merge(Some(panel_root), None)
             }
-            return;
-        }
-        // Opening a previously closed thread builds its view and session asynchronously.
+            MergeTarget::ThreadMenu { thread, .. } => self.seen_for_merge(None, Some(thread)),
+            MergeTarget::WorkerBranch { .. } => return,
+        };
+        let spec = target.spec();
+        let panel_root = match target {
+            MergeTarget::WorktreeTab { panel_root, .. } => Some(panel_root.clone()),
+            _ => None,
+        };
         let obj = self.obj().downgrade();
+        let thread_id = thread_id.to_owned();
         let parent = parent.clone();
         glib::MainContext::default().spawn_local(async move {
+            let recheck = {
+                let plan = plan.clone();
+                off_main("rechecking worktree before asking agent", move || {
+                    let now = spec.preflight()?;
+                    let lines = blockers(&now, &seen, own_busy);
+                    if now.info.path != plan.info.path
+                        || now.has_worktree != plan.has_worktree
+                        || now.branch != plan.branch
+                        || now.base != plan.base
+                        || now.branch_tip != plan.branch_tip
+                        || now.base_tip != plan.base_tip
+                    {
+                        return Err(redact(&format!(
+                            "{} or {} changed since the preview. Open the merge dialog again \
+                             before asking the agent.",
+                            plan.branch, plan.base
+                        )));
+                    }
+                    if let Some(why) = lines.refusals.first() {
+                        return Err(why.clone());
+                    }
+                    if let Some(other) = now
+                        .refusals
+                        .iter()
+                        .find(|r| !matches!(r, agent_kit::merge::Refusal::Conflicts(_)))
+                    {
+                        return Err(redact(&other.reason(&now)));
+                    }
+                    if !now
+                        .refusals
+                        .iter()
+                        .any(|r| matches!(r, agent_kit::merge::Refusal::Conflicts(_)))
+                    {
+                        return Err(
+                            "No conflicts remain to resolve. Open the merge dialog again."
+                                .to_owned(),
+                        );
+                    }
+                    Ok(conflict_handoff_prompt(&now))
+                })
+                .await
+            };
+            let Some(obj) = obj.upgrade() else { return };
+            let imp = obj.imp();
+            let shown_over = match panel_root.as_ref() {
+                Some(root) => imp.merge_result_parent(root, &parent),
+                None => parent.clone(),
+            };
+            let prompt = match recheck {
+                Ok(p) => p,
+                Err(why) => {
+                    present_message_over(&shown_over, "Can't Ask Agent Right Now", &why);
+                    return;
+                }
+            };
+            let Some(page) = imp.open_thread(&thread_id, true) else {
+                return;
+            };
+            let owner = super::threads::thread_owner(&thread_id).unwrap_or_else(|| obj.clone());
+            if let Some(view) = owner
+                .imp()
+                .with_page_tab(&page, |t| t.chat.as_ref().and_then(|c| c.view.clone()))
+                .flatten()
+            {
+                if let Err(why) = view.submit_review(&prompt) {
+                    present_message_over(&shown_over, "Could Not Ask Agent", &why);
+                }
+                return;
+            }
+            // Opening a previously closed thread builds its view and session asynchronously.
+            let owner_w = owner.downgrade();
             for _ in 0..80 {
                 glib::timeout_future(std::time::Duration::from_millis(25)).await;
-                let Some(obj) = obj.upgrade() else { return };
-                let imp = obj.imp();
-                let ready = imp
+                let Some(owner) = owner_w.upgrade() else {
+                    return;
+                };
+                let ready = owner
+                    .imp()
                     .with_page_tab(&page, |t| {
                         t.chat.as_ref().and_then(|c| {
                             let view = c.view.clone()?;
@@ -1026,19 +1121,19 @@ impl AgentTerminalWindow {
                     .flatten();
                 if let Some((view, true)) = ready {
                     if let Err(why) = view.submit_review(&prompt) {
-                        present_message_over(&parent, "Could Not Ask Agent", &why);
+                        present_message_over(&shown_over, "Could Not Ask Agent", &why);
                     }
                     return;
                 }
             }
-            if let Some(obj) = obj.upgrade() {
-                if let Some(view) = obj
+            if let Some(owner) = owner_w.upgrade() {
+                if let Some(view) = owner
                     .imp()
                     .with_page_tab(&page, |t| t.chat.as_ref().and_then(|c| c.view.clone()))
                     .flatten()
                 {
                     if let Err(why) = view.submit_review(&prompt) {
-                        present_message_over(&parent, "Could Not Ask Agent", &why);
+                        present_message_over(&shown_over, "Could Not Ask Agent", &why);
                     }
                 }
             }
@@ -1046,17 +1141,20 @@ impl AgentTerminalWindow {
     }
 
     fn open_worktree_for_commit(&self, target: &MergeTarget, thread_id: Option<&str>) {
-        let (page, panel) = match target {
-            MergeTarget::WorktreeTab { page, panel, .. } => (page.clone(), (**panel).clone()),
+        let (owner, page, panel) = match target {
+            MergeTarget::WorktreeTab { page, panel, .. } => {
+                (self.obj().clone(), page.clone(), (**panel).clone())
+            }
             MergeTarget::ThreadMenu { .. } => {
                 let Some(tid) = thread_id else { return };
                 let Some(page) = self.open_thread(tid, true) else {
                     return;
                 };
-                let Some(panel) = self.with_page_tab(&page, |t| t.diff_panel.clone()) else {
+                let owner = super::threads::thread_owner(tid).unwrap_or_else(|| self.obj().clone());
+                let Some(panel) = owner.imp().with_page_tab(&page, |t| t.diff_panel.clone()) else {
                     return;
                 };
-                (page, panel)
+                (owner, page, panel)
             }
             MergeTarget::WorkerBranch { .. } => return,
         };
@@ -1065,10 +1163,10 @@ impl AgentTerminalWindow {
             panel.present();
         } else if !panel.root.is_visible() {
             panel.set_shown(true);
-            self.config.borrow_mut().diff_panel_visible = true;
-            self.schedule_config_save();
+            owner.imp().config.borrow_mut().diff_panel_visible = true;
+            owner.imp().schedule_config_save();
         }
-        self.refresh_diff(&page);
+        owner.imp().refresh_diff(&page);
     }
 
     /// Runs `choice` on `plan` once what is open is checked again: a turn may have
@@ -1671,7 +1769,24 @@ pub(super) mod tests {
         assert!(!parts.dialog.has_response("commit-first"));
         let prompt = conflict_handoff_prompt(&conflicted);
         assert!(prompt.contains("src/main.rs"));
-        assert!(prompt.contains("git merge main"));
+        assert!(prompt.contains("git merge refs/heads/main"), "{prompt}");
+
+        // Tab blockers or other plan refusals suppress Ask Agent.
+        let blocked_parts = merge_dialog_full(
+            &conflicted,
+            &busy,
+            MergeDialogOptions {
+                initial: agent_kit::merge::MergeMethod::Merge,
+                can_ask_agent: true,
+                can_commit_first: true,
+            },
+        );
+        assert!(!blocked_parts.dialog.has_response("ask-agent"));
+        let mut odd_base = conflicted.clone();
+        odd_base.base = "release candidate".into();
+        assert!(
+            conflict_handoff_prompt(&odd_base).contains("git merge 'refs/heads/release candidate'")
+        );
 
         let mut dirty_wt = plan();
         dirty_wt.refusals = vec![

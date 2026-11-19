@@ -469,7 +469,7 @@ pub fn preflight_branch(
         main_toplevel: main_toplevel.to_path_buf(),
         base: base.map(str::to_owned),
     };
-    if worktree.is_some() && is_registered(&info).unwrap_or(false) {
+    if worktree.is_some() && is_registered(&info)? {
         preflight_with(&info, &[])
     } else {
         preflight_branch_with(&info, &[])
@@ -506,16 +506,27 @@ fn preflight_core(
     if base == branch {
         return Err(format!("{branch} is the base branch itself"));
     }
-    let has_worktree = if require_worktree {
+    let porcelain = git_raw(
+        main,
+        ["worktree", "list", "--porcelain"],
+        env,
+        QUERY_TIMEOUT_SECS,
+    )?;
+    let porcelain_text = String::from_utf8_lossy(&porcelain);
+    let (info, has_worktree) = if require_worktree {
         if !is_registered(info)? {
             return Err(format!(
                 "{} is no longer a worktree on {branch}",
                 info.path.display()
             ));
         }
-        true
+        (info.clone(), true)
+    } else if let Some(wt_dir) = crate::worktree::worktree_for_branch(&porcelain_text, &branch) {
+        let mut updated = info.clone();
+        updated.path = wt_dir;
+        (updated, true)
     } else {
-        false
+        (info.clone(), false)
     };
     let branch_tip = tip(main, &branch, env)?;
     let base_tip = tip(main, &base, env)?;
@@ -589,15 +600,9 @@ fn preflight_core(
         (None, Vec::new())
     };
     let (_, rebase_base_hooks) = hooks_for_dir(&base_dir, &REBASE_BASE_HOOKS, env);
-    let worktrees = git_raw(
-        main,
-        ["worktree", "list", "--porcelain"],
-        env,
-        QUERY_TIMEOUT_SECS,
-    )
-    .map(|out| linked_worktrees(&String::from_utf8_lossy(&out)))?;
+    let worktrees = linked_worktrees(&porcelain_text);
     Ok(MergePlan {
-        info: info.clone(),
+        info,
         branch,
         base,
         base_dir,
@@ -851,7 +856,9 @@ fn merge_method_with(
             agent_core::redact::redact(&why)
         )
     })?;
-    if now.base != plan.base
+    if now.has_worktree != plan.has_worktree
+        || (now.has_worktree && now.info.path != plan.info.path)
+        || now.base != plan.base
         || now.base_dir != plan.base_dir
         || now.base_tip != plan.base_tip
         || now.branch_tip != plan.branch_tip
@@ -2584,6 +2591,42 @@ mod tests {
                 .unwrap();
             assert!(!done.after.is_empty());
             assert!(branch_exists(&f.main, &f.info.branch));
+        }
+
+        #[test]
+        fn branch_only_preview_refuses_if_branch_later_checked_out_in_dirty_worktree() {
+            let Some(f) = fixture() else { return };
+            crate::worktree::remove(&f.main, &f.wt).unwrap();
+            let preview = preflight_branch_with(&f.info, &env()).unwrap();
+            assert!(!preview.has_worktree);
+
+            // Re-check out the branch in a worktree with uncommitted changes after preview.
+            let new_wt = f.wt.parent().unwrap().join("rechecked-wt");
+            sh(
+                &f.main,
+                &[
+                    "worktree",
+                    "add",
+                    "--",
+                    &new_wt.to_string_lossy(),
+                    &f.info.branch,
+                ],
+            );
+            fs::write(new_wt.join("dirty.txt"), "uncommitted").unwrap();
+
+            let err = merge_method_with(
+                &preview,
+                MergeMethod::Merge,
+                None,
+                &env(),
+                MERGE_TIMEOUT_SECS,
+            )
+            .unwrap_err();
+            assert!(err.contains("changed since the preview"), "{err}");
+            // And a fresh branch preflight now sees that worktree and refuses WorktreeChanges.
+            let fresh = preflight_branch_with(&f.info, &env()).unwrap();
+            assert!(fresh.has_worktree);
+            assert!(fresh.refusals.contains(&Refusal::WorktreeChanges));
         }
     }
 }

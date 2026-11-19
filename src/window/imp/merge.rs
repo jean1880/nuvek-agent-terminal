@@ -203,8 +203,18 @@ pub(super) fn plan_lines(plan: &MergePlan) -> Vec<String> {
 
 /// The commands the merge runs, each with the directory it runs in: built from the very list
 /// the merge runs.
+#[cfg(test)]
 pub(super) fn shown_steps(plan: &MergePlan) -> String {
-    agent_kit::merge::commands(plan)
+    shown_steps_for(plan, agent_kit::merge::MergeMethod::Merge, None)
+}
+
+/// The exact command lines shown in the preview for `method`.
+pub(super) fn shown_steps_for(
+    plan: &MergePlan,
+    method: agent_kit::merge::MergeMethod,
+    squash_message: Option<&str>,
+) -> String {
+    agent_kit::merge::commands_for(plan, method, squash_message)
         .iter()
         .map(agent_kit::merge::GitStep::shown)
         .collect::<Vec<_>>()
@@ -246,18 +256,58 @@ pub(super) fn merged_words(plan: &MergePlan, done: &Merged) -> (String, String) 
     )
 }
 
+/// The method and optional commit message chosen in [`merge_dialog_with`].
+struct MergeChoice {
+    method: agent_kit::merge::MergeMethod,
+    squash_message: Option<String>,
+}
+
 /// The merge dialog's parts the flow and its test read back.
 pub(super) struct MergeDialog {
     pub dialog: adw::AlertDialog,
+    pub method_row: adw::ComboRow,
+    pub squash_buffer: gtk4::TextBuffer,
     #[cfg_attr(not(test), expect(dead_code, reason = "read by the dialog test"))]
     pub commands: gtk4::Label,
     #[cfg_attr(not(test), expect(dead_code, reason = "read by the dialog test"))]
     pub refusals: Vec<String>,
 }
 
+fn method_note(method: agent_kit::merge::MergeMethod, branch: &str) -> String {
+    match method {
+        agent_kit::merge::MergeMethod::Merge => format!(
+            "The merge is never forced and skips no hook, and it takes exactly the commit shown. If \
+             it stops part-way with a merge in progress (a conflict, say) it is undone with git \
+             merge --abort; anything else git leaves is left as it is and said, never undone for \
+             you. The branch {branch} and its worktree are kept."
+        ),
+        agent_kit::merge::MergeMethod::Squash => format!(
+            "The squash commits the combined diff onto the base branch with no second parent and \
+             skips no hook. If it stops part-way it is undone with git reset --merge. The branch \
+             {branch} and its worktree are kept."
+        ),
+        agent_kit::merge::MergeMethod::Rebase => format!(
+            "First rebases {branch} onto the base commit in this worktree (git rebase --abort \
+             undoes a conflict), then fast-forwards the base checkout. The branch {branch} and its \
+             worktree are kept."
+        ),
+    }
+}
+
 /// Builds the dialog for `plan`, with what the tabs in the base checkout add. Merge is offered
 /// only when nothing refuses it; Cancel is the default and what a press outside answers.
+#[cfg(test)]
 pub(super) fn merge_dialog(plan: &MergePlan, tabs: &TabLines) -> MergeDialog {
+    merge_dialog_with(plan, tabs, agent_kit::merge::MergeMethod::Merge)
+}
+
+/// [`merge_dialog`] starting on `initial`.
+pub(super) fn merge_dialog_with(
+    plan: &MergePlan,
+    tabs: &TabLines,
+    initial: agent_kit::merge::MergeMethod,
+) -> MergeDialog {
+    use agent_kit::merge::MergeMethod;
     let dialog = adw::AlertDialog::new(
         Some(&format!("Merge {} into {}?", plan.branch, plan.base)),
         None,
@@ -284,20 +334,89 @@ pub(super) fn merge_dialog(plan: &MergePlan, tabs: &TabLines) -> MergeDialog {
         label.add_css_class("dim-label");
         column.append(&label);
     }
+
+    let labels: Vec<&str> = MergeMethod::ALL.iter().map(|m| m.label()).collect();
+    let model = gtk4::StringList::new(&labels);
+    let initial_idx = MergeMethod::ALL
+        .iter()
+        .position(|m| *m == initial)
+        .unwrap_or(0) as u32;
+    let method_row = adw::ComboRow::builder()
+        .title("Method")
+        .model(&model)
+        .selected(initial_idx)
+        .build();
+    let method_list = gtk4::ListBox::builder()
+        .selection_mode(gtk4::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+    method_list.append(&method_row);
+    column.append(&method_list);
+
+    let squash_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+    let squash_label = wrapped("Commit message");
+    squash_label.add_css_class("heading");
+    squash_box.append(&squash_label);
+    let squash_buffer = gtk4::TextBuffer::new(None);
+    squash_buffer.set_text(&plan.squash_message);
+    let squash_view = gtk4::TextView::builder()
+        .buffer(&squash_buffer)
+        .wrap_mode(gtk4::WrapMode::WordChar)
+        .accepts_tab(false)
+        .top_margin(6)
+        .bottom_margin(6)
+        .left_margin(8)
+        .right_margin(8)
+        .build();
+    squash_view.update_property(&[gtk4::accessible::Property::Label("Squash commit message")]);
+    let squash_scroll = gtk4::ScrolledWindow::builder()
+        .child(&squash_view)
+        .min_content_height(72)
+        .max_content_height(140)
+        .has_frame(true)
+        .build();
+    squash_box.append(&squash_scroll);
+    let secret_warning = wrapped("Commit message looks like it contains a secret or token.");
+    secret_warning.add_css_class("error");
+    let initial_check = agent_core::commit_message::check(&plan.squash_message);
+    secret_warning.set_visible(initial == MergeMethod::Squash && initial_check.looks_secret);
+    squash_box.append(&secret_warning);
+    squash_box.set_visible(initial == MergeMethod::Squash);
+    column.append(&squash_box);
+
+    let method_hooks_label = wrapped("");
+    method_hooks_label.add_css_class("dim-label");
+    let method_hooks_text = |method: MergeMethod| -> String {
+        let hooks: Vec<&str> = match method {
+            MergeMethod::Merge => Vec::new(),
+            MergeMethod::Squash => plan.squash_hooks.iter().map(String::as_str).collect(),
+            MergeMethod::Rebase => plan
+                .rebase_worktree_hooks
+                .iter()
+                .chain(plan.rebase_base_hooks.iter())
+                .map(String::as_str)
+                .collect(),
+        };
+        match hooks.as_slice() {
+            [] => String::new(),
+            [one] => format!("Your {one} hook also runs."),
+            many => format!("Your {} hooks also run.", many.join(", ")),
+        }
+    };
+    let initial_hooks = method_hooks_text(initial);
+    method_hooks_label.set_text(&initial_hooks);
+    method_hooks_label.set_visible(!initial_hooks.is_empty());
+    column.append(&method_hooks_label);
+
     let heading = wrapped("Runs, in this order:");
     heading.add_css_class("heading");
     column.append(&heading);
-    let commands = wrapped(&shown_steps(plan));
+    let initial_msg = (initial == MergeMethod::Squash).then_some(plan.squash_message.as_str());
+    let commands = wrapped(&shown_steps_for(plan, initial, initial_msg));
     commands.add_css_class("monospace");
     commands.set_selectable(true);
     column.append(&commands);
-    let note = wrapped(&format!(
-        "The merge is never forced and skips no hook, and it takes exactly the commit shown. If \
-         it stops part-way with a merge in progress (a conflict, say) it is undone with git \
-         merge --abort; anything else git leaves is left as it is and said, never undone for \
-         you. The branch {} and its worktree are kept.",
-        plan.branch
-    ));
+    let note = wrapped(&method_note(initial, &plan.branch));
     note.add_css_class("dim-label");
     column.append(&note);
     dialog.set_extra_child(Some(&column));
@@ -305,11 +424,105 @@ pub(super) fn merge_dialog(plan: &MergePlan, tabs: &TabLines) -> MergeDialog {
     dialog.add_response("cancel", "Cancel");
     dialog.add_response("merge", "Merge");
     dialog.set_response_appearance("merge", adw::ResponseAppearance::Suggested);
-    dialog.set_response_enabled("merge", refusals.is_empty());
+    let can_merge = refusals.is_empty()
+        && (initial != MergeMethod::Squash
+            || (!initial_check.empty && !initial_check.looks_secret));
+    dialog.set_response_enabled("merge", can_merge);
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
+
+    let has_refusals = !refusals.is_empty();
+    let sync = {
+        let plan = plan.clone();
+        let dialog = dialog.downgrade();
+        let method_row = method_row.downgrade();
+        let squash_box = squash_box.downgrade();
+        let squash_buffer = squash_buffer.downgrade();
+        let secret_warning = secret_warning.downgrade();
+        let method_hooks_label = method_hooks_label.downgrade();
+        let commands = commands.downgrade();
+        let note = note.downgrade();
+        std::rc::Rc::new(move || {
+            let (
+                Some(dialog),
+                Some(method_row),
+                Some(squash_box),
+                Some(squash_buffer),
+                Some(secret_warning),
+                Some(method_hooks_label),
+                Some(commands),
+                Some(note),
+            ) = (
+                dialog.upgrade(),
+                method_row.upgrade(),
+                squash_box.upgrade(),
+                squash_buffer.upgrade(),
+                secret_warning.upgrade(),
+                method_hooks_label.upgrade(),
+                commands.upgrade(),
+                note.upgrade(),
+            )
+            else {
+                return;
+            };
+            let method = MergeMethod::ALL
+                .get(method_row.selected() as usize)
+                .copied()
+                .unwrap_or_default();
+            squash_box.set_visible(method == MergeMethod::Squash);
+            let (start, end) = squash_buffer.bounds();
+            let msg = squash_buffer.text(&start, &end, false).to_string();
+            let check = agent_core::commit_message::check(&msg);
+            secret_warning.set_visible(method == MergeMethod::Squash && check.looks_secret);
+            let hook_list: Vec<&str> = match method {
+                MergeMethod::Merge => Vec::new(),
+                MergeMethod::Squash => plan.squash_hooks.iter().map(String::as_str).collect(),
+                MergeMethod::Rebase => plan
+                    .rebase_worktree_hooks
+                    .iter()
+                    .chain(plan.rebase_base_hooks.iter())
+                    .map(String::as_str)
+                    .collect(),
+            };
+            let hook_text = match hook_list.as_slice() {
+                [] => String::new(),
+                [one] => format!("Your {one} hook also runs."),
+                many => format!("Your {} hooks also run.", many.join(", ")),
+            };
+            method_hooks_label.set_text(&hook_text);
+            method_hooks_label.set_visible(!hook_text.is_empty());
+            commands.set_text(&shown_steps_for(
+                &plan,
+                method,
+                (method == MergeMethod::Squash).then_some(msg.as_str()),
+            ));
+            note.set_text(&method_note(method, &plan.branch));
+            let label = match method {
+                MergeMethod::Merge => "Merge",
+                MergeMethod::Squash => "Squash and Commit",
+                MergeMethod::Rebase => "Rebase and Merge",
+            };
+            dialog.set_response_label("merge", label);
+            let message_ok = method != MergeMethod::Squash || (!check.empty && !check.looks_secret);
+            dialog.set_response_enabled("merge", !has_refusals && message_ok);
+        })
+    };
+    let sync_method = sync.clone();
+    method_row.connect_selected_notify(move |_| sync_method());
+    squash_buffer.connect_changed(move |_| sync());
+    if initial != MergeMethod::Merge {
+        let label = match initial {
+            MergeMethod::Merge => "Merge",
+            MergeMethod::Squash => "Squash and Commit",
+            MergeMethod::Rebase => "Rebase and Merge",
+        };
+        dialog.set_response_label("merge", label);
+    }
+
     MergeDialog {
         dialog,
+        method_row,
+        squash_buffer,
         commands,
         refusals,
     }
@@ -477,22 +690,44 @@ impl AgentTerminalWindow {
                 return;
             }
             let parent = obj.imp().merge_result_parent(&root, &panel.dialog_parent());
-            let parts = merge_dialog(&plan, &lines);
+            let initial = obj.imp().config.borrow().default_merge_method;
+            let parts = merge_dialog_with(&plan, &lines, initial);
             parts.dialog.present(Some(&parent));
             done(&panel);
             let obj = obj.downgrade();
+            let method_row = parts.method_row;
+            let squash_buffer = parts.squash_buffer;
             parts.dialog.connect_response(None, move |_, response| {
                 if response != "merge" {
                     return;
                 }
                 let Some(obj) = obj.upgrade() else { return };
-                obj.imp()
-                    .run_merge(&root, &page, &panel, &parent, plan.clone());
+                let method = agent_kit::merge::MergeMethod::ALL
+                    .get(method_row.selected() as usize)
+                    .copied()
+                    .unwrap_or_default();
+                let msg = if method == agent_kit::merge::MergeMethod::Squash {
+                    let (start, end) = squash_buffer.bounds();
+                    Some(squash_buffer.text(&start, &end, false).to_string())
+                } else {
+                    None
+                };
+                obj.imp().run_merge(
+                    &root,
+                    &page,
+                    &panel,
+                    &parent,
+                    plan.clone(),
+                    MergeChoice {
+                        method,
+                        squash_message: msg,
+                    },
+                );
             });
         });
     }
 
-    /// Runs the merge `plan` previewed, once what is open is checked again: a turn may have
+    /// Runs `choice` on `plan` once what is open is checked again: a turn may have
     /// started, or a tab opened, while the dialog was up.
     fn run_merge(
         &self,
@@ -501,7 +736,12 @@ impl AgentTerminalWindow {
         panel: &crate::window::diff_panel::DiffPanel,
         parent: &gtk4::Widget,
         plan: MergePlan,
+        choice: MergeChoice,
     ) {
+        let MergeChoice {
+            method,
+            squash_message,
+        } = choice;
         let (seen, own_busy) = self.seen_for_merge(panel_root);
         let (page, panel, parent, root) = (
             page.clone(),
@@ -519,7 +759,12 @@ impl AgentTerminalWindow {
                     let refused = click_refusal(&blockers(&plan, &seen, own_busy));
                     Ok(match refused {
                         Some(why) => Err(Err(why)),
-                        None => agent_kit::merge::merge(&plan).map_err(Ok),
+                        None => agent_kit::merge::merge_with_method(
+                            &plan,
+                            method,
+                            squash_message.as_deref(),
+                        )
+                        .map_err(Ok),
                     })
                 })
                 .await
@@ -619,11 +864,16 @@ pub(super) mod tests {
             base_dir: PathBuf::from("/r/main"),
             base_tip: "0123456789abcdef0123456789abcdef01234567".into(),
             branch_tip: "f".repeat(40),
+            squash_message: "feat/x summary".into(),
             ahead: 3,
             behind: 1,
             prediction: Prediction::Clean,
             hooks: Vec::new(),
             hooks_dir: None,
+            squash_hooks: Vec::new(),
+            rebase_worktree_hooks: Vec::new(),
+            rebase_worktree_hooks_dir: None,
+            rebase_base_hooks: Vec::new(),
             worktrees: vec![PathBuf::from("/r/.main.worktrees/feat-x")],
             refusals: Vec::new(),
         }
@@ -959,5 +1209,27 @@ pub(super) mod tests {
         assert!(command.is_selectable());
         assert!(command.has_css_class("monospace"));
         assert_eq!(command.text().as_str(), delete_branch_command(&p));
+
+        // Switching methods updates preview steps, button label, and blank-squash guard.
+        let parts = merge_dialog_with(
+            &p,
+            &TabLines::default(),
+            agent_kit::merge::MergeMethod::Squash,
+        );
+        assert_eq!(
+            parts.dialog.response_label("merge").as_str(),
+            "Squash and Commit"
+        );
+        assert!(parts.commands.text().as_str().contains("--squash"));
+        assert!(parts.dialog.is_response_enabled("merge"));
+        parts.squash_buffer.set_text("   ");
+        assert!(!parts.dialog.is_response_enabled("merge"));
+        parts.method_row.set_selected(2);
+        assert_eq!(
+            parts.dialog.response_label("merge").as_str(),
+            "Rebase and Merge"
+        );
+        assert!(parts.commands.text().as_str().contains("git rebase"));
+        assert!(parts.dialog.is_response_enabled("merge"));
     }
 }

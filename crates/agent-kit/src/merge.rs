@@ -41,6 +41,29 @@ pub const MERGE_HOOKS: [&str; 4] = [
     "post-merge",
 ];
 
+/// Hooks that run during a squash merge and commit in the base checkout.
+pub const SQUASH_HOOKS: [&str; 5] = [
+    "pre-commit",
+    "prepare-commit-msg",
+    "commit-msg",
+    "post-commit",
+    "post-merge",
+];
+
+/// Hooks that run in the worktree during `git rebase`.
+pub const REBASE_WORKTREE_HOOKS: [&str; 7] = [
+    "pre-rebase",
+    "post-checkout",
+    "pre-commit",
+    "prepare-commit-msg",
+    "commit-msg",
+    "post-commit",
+    "post-rewrite",
+];
+
+/// Hooks that run in the base checkout during `git merge --ff-only`.
+pub const REBASE_BASE_HOOKS: [&str; 1] = ["post-merge"];
+
 /// What `git merge-tree --write-tree` says merging would do. Three states, never two: a
 /// prediction git could not make is never "no conflicts".
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +147,33 @@ fn file_list(files: &[String]) -> String {
     }
 }
 
+/// How a worktree's branch is brought back into its base checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeMethod {
+    /// Merge commit preserving branch history (`git merge --no-ff`).
+    #[default]
+    Merge,
+    /// Squash branch commits into a single commit on base (`git merge --squash` + `git commit`).
+    Squash,
+    /// Rebase branch commits onto base tip in the worktree, then fast-forward base (`git merge --ff-only`).
+    Rebase,
+}
+
+impl MergeMethod {
+    /// Every supported method in display order.
+    pub const ALL: [MergeMethod; 3] =
+        [MergeMethod::Merge, MergeMethod::Squash, MergeMethod::Rebase];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MergeMethod::Merge => "Merge commit",
+            MergeMethod::Squash => "Squash and commit",
+            MergeMethod::Rebase => "Rebase and fast-forward",
+        }
+    }
+}
+
 /// What merging a worktree's branch back would do, read before anything runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergePlan {
@@ -139,6 +189,8 @@ pub struct MergePlan {
     pub base_tip: String,
     /// The branch's commit when the plan was read.
     pub branch_tip: String,
+    /// Default commit message offered when squashing commits.
+    pub squash_message: String,
     /// Commits on the branch that the base does not have.
     pub ahead: u32,
     /// Commits on the base that the branch does not have.
@@ -149,6 +201,14 @@ pub struct MergePlan {
     /// The folder they run from: a merge that finds another (`core.hooksPath` changed) does
     /// nothing.
     pub hooks_dir: Option<PathBuf>,
+    /// Commit hooks in the base checkout that will run for a squash commit.
+    pub squash_hooks: Vec<String>,
+    /// Hooks in the worktree (`info.path`) that will run during `git rebase`.
+    pub rebase_worktree_hooks: Vec<String>,
+    /// The worktree's own hooks folder when rebasing.
+    pub rebase_worktree_hooks_dir: Option<PathBuf>,
+    /// Hooks in the base checkout that will run during `git merge --ff-only`.
+    pub rebase_base_hooks: Vec<String>,
     /// Every linked worktree of the repository (this one included), as git lists them: a folder
     /// inside one of them is not in the base checkout even when it is inside its folder.
     pub worktrees: Vec<PathBuf>,
@@ -273,6 +333,117 @@ pub fn commands(plan: &MergePlan) -> Vec<GitStep> {
     }]
 }
 
+/// Config overrides for `git merge --squash`: ignores branch merge options, forces `merge.ff=true`
+/// so a user's `merge.ff=false` or `merge.ff=only` never breaks `--squash`, and disables log/stash.
+pub fn squash_config(base: &str) -> Vec<(String, String)> {
+    [
+        (format!("branch.{base}.mergeOptions"), ""),
+        ("merge.ff".to_owned(), "true"),
+        ("merge.log".to_owned(), "false"),
+        ("merge.autoStash".to_owned(), "false"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k, v.to_owned()))
+    .collect()
+}
+
+/// Config overrides for `git merge --ff-only`: ignores branch merge options and disables auto-stash,
+/// while requiring fast-forward instead of `--no-ff`.
+pub fn ff_only_config(base: &str) -> Vec<(String, String)> {
+    [
+        (format!("branch.{base}.mergeOptions"), ""),
+        ("merge.ff".to_owned(), "only"),
+        ("merge.autoStash".to_owned(), "false"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k, v.to_owned()))
+    .collect()
+}
+
+/// Config overrides for `git rebase` inside the worktree.
+pub fn rebase_config() -> Vec<(String, String)> {
+    [
+        ("rebase.autoStash", "false"),
+        ("rebase.updateRefs", "false"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect()
+}
+
+/// Arguments for `git merge --squash`.
+pub fn squash_args(tip: &str) -> Vec<String> {
+    vec![
+        "merge".to_owned(),
+        "--squash".to_owned(),
+        "--".to_owned(),
+        tip.to_owned(),
+    ]
+}
+
+/// Arguments for committing a staged squash.
+pub fn squash_commit_args(message: &str) -> Vec<String> {
+    vec!["commit".to_owned(), "-m".to_owned(), message.to_owned()]
+}
+
+/// Arguments for rebasing the worktree branch onto `base_tip`.
+pub fn rebase_args(base_tip: &str) -> Vec<String> {
+    vec!["rebase".to_owned(), "--".to_owned(), base_tip.to_owned()]
+}
+
+/// Arguments for fast-forwarding `base` to `tip`.
+pub fn ff_only_args(tip: &str) -> Vec<String> {
+    vec![
+        "merge".to_owned(),
+        "--ff-only".to_owned(),
+        "--".to_owned(),
+        tip.to_owned(),
+    ]
+}
+
+/// The commands [`merge_with_method`] runs for `method`. For `Rebase`, the second step takes the
+/// commit SHA produced by step 1, shown here as `<resulting rebased commit>`.
+pub fn commands_for(
+    plan: &MergePlan,
+    method: MergeMethod,
+    squash_message: Option<&str>,
+) -> Vec<GitStep> {
+    match method {
+        MergeMethod::Merge => commands(plan),
+        MergeMethod::Squash => {
+            let msg = squash_message
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(plan.squash_message.as_str());
+            let redacted = agent_core::redact::redact(msg);
+            vec![
+                GitStep {
+                    dir: plan.base_dir.clone(),
+                    args: squash_args(&plan.branch_tip),
+                    config: squash_config(&plan.base),
+                },
+                GitStep {
+                    dir: plan.base_dir.clone(),
+                    args: squash_commit_args(&redacted),
+                    config: Vec::new(),
+                },
+            ]
+        }
+        MergeMethod::Rebase => vec![
+            GitStep {
+                dir: plan.info.path.clone(),
+                args: rebase_args(&plan.base_tip),
+                config: rebase_config(),
+            },
+            GitStep {
+                dir: plan.base_dir.clone(),
+                args: ff_only_args("<resulting rebased commit>"),
+                config: ff_only_config(&plan.base),
+            },
+        ],
+    }
+}
+
 /// Reads what merging `info`'s branch into its base would do. Reads only. `Err` when there is
 /// nothing to plan against: the names cannot be passed to git, the worktree is no longer on
 /// its branch, or a branch is gone.
@@ -318,7 +489,10 @@ fn preflight_with(info: &WorktreeInfo, env: &[(&str, &OsStr)]) -> Result<MergePl
         refusals.push(Refusal::WorktreeChanges);
     }
 
-    let base_dir = main.to_path_buf();
+    let base_dir = match crate::worktree::checkout_of(main, &base)? {
+        Some(dir) => dir,
+        None => main.to_path_buf(),
+    };
     let repo = discover(&base_dir)?
         .ok_or_else(|| format!("{} is not a git repository", base_dir.display()))?;
     match repo.branch.as_deref() {
@@ -362,7 +536,12 @@ fn preflight_with(info: &WorktreeInfo, env: &[(&str, &OsStr)]) -> Result<MergePl
         }
         prediction
     };
-    let (hooks_dir, hooks) = hooks(&base_dir, env);
+    let squash_message = default_squash_message(main, &base_tip, &branch_tip, &branch, env);
+    let (hooks_dir, hooks) = hooks_for_dir(&base_dir, &MERGE_HOOKS, env);
+    let (_, squash_hooks) = hooks_for_dir(&base_dir, &SQUASH_HOOKS, env);
+    let (rebase_worktree_hooks_dir, rebase_worktree_hooks) =
+        hooks_for_dir(&info.path, &REBASE_WORKTREE_HOOKS, env);
+    let (_, rebase_base_hooks) = hooks_for_dir(&base_dir, &REBASE_BASE_HOOKS, env);
     let worktrees = git_raw(
         main,
         ["worktree", "list", "--porcelain"],
@@ -377,14 +556,59 @@ fn preflight_with(info: &WorktreeInfo, env: &[(&str, &OsStr)]) -> Result<MergePl
         base_dir,
         base_tip,
         branch_tip,
+        squash_message,
         ahead,
         behind,
         prediction,
         hooks_dir,
         hooks,
+        squash_hooks,
+        rebase_worktree_hooks,
+        rebase_worktree_hooks_dir,
+        rebase_base_hooks,
         worktrees,
         refusals,
     })
+}
+
+fn default_squash_message(
+    repo: &Path,
+    base_tip: &str,
+    branch_tip: &str,
+    branch: &str,
+    env: &[(&str, &OsStr)],
+) -> String {
+    let fallback = format!("Squash merge branch '{branch}'");
+    let Ok(out) = git_output(
+        repo,
+        [
+            "log",
+            "--format=%s",
+            "--no-merges",
+            "--max-count=20",
+            &format!("{base_tip}..{branch_tip}"),
+        ],
+        env,
+        QUERY_TIMEOUT_SECS,
+    ) else {
+        return fallback;
+    };
+    if !out.status.success() {
+        return fallback;
+    }
+    let subjects: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| format!("- {}", agent_core::redact::redact(l)))
+        .collect();
+    if subjects.is_empty() {
+        fallback
+    } else if subjects.len() == 1 {
+        subjects[0].trim_start_matches("- ").to_owned()
+    } else {
+        format!("{fallback}\n\n{}", subjects.join("\n"))
+    }
 }
 
 /// The commit local branch `name` points at.
@@ -464,9 +688,13 @@ pub fn read_prediction(code: Option<i32>, stdout: &[u8]) -> Prediction {
     }
 }
 
-/// The folder `dir`'s repository runs hooks from (`core.hooksPath` honoured), and the merge
-/// hooks installed there.
-fn hooks(dir: &Path, env: &[(&str, &OsStr)]) -> (Option<PathBuf>, Vec<String>) {
+/// The folder `dir`'s repository runs hooks from (`core.hooksPath` honoured), and the executable
+/// hooks among `names` installed there.
+fn hooks_for_dir(
+    dir: &Path,
+    names: &[&str],
+    env: &[(&str, &OsStr)],
+) -> (Option<PathBuf>, Vec<String>) {
     use std::os::unix::fs::PermissionsExt;
     let Ok(out) = git_raw(
         dir,
@@ -482,7 +710,7 @@ fn hooks(dir: &Path, env: &[(&str, &OsStr)]) -> (Option<PathBuf>, Vec<String>) {
     } else {
         dir.join(path)
     };
-    let found = MERGE_HOOKS
+    let found = names
         .iter()
         .filter(|name| {
             std::fs::metadata(hooks.join(name))
@@ -509,13 +737,53 @@ pub fn merge(plan: &MergePlan) -> Result<Merged, String> {
     merge_with(plan, &[], MERGE_TIMEOUT_SECS)
 }
 
+/// Executes `method` (`Merge`, `Squash`, or `Rebase`) on `plan` after re-validating every tip,
+/// branch, checkout and hook against when the preview was read.
+pub fn merge_with_method(
+    plan: &MergePlan,
+    method: MergeMethod,
+    squash_message: Option<&str>,
+) -> Result<Merged, String> {
+    merge_method_with(plan, method, squash_message, &[], MERGE_TIMEOUT_SECS)
+}
+
 fn merge_with(
     plan: &MergePlan,
     env: &[(&str, &OsStr)],
     timeout_secs: u64,
 ) -> Result<Merged, String> {
+    merge_method_with(plan, MergeMethod::Merge, None, env, timeout_secs)
+}
+
+fn merge_method_with(
+    plan: &MergePlan,
+    method: MergeMethod,
+    squash_message: Option<&str>,
+    env: &[(&str, &OsStr)],
+    timeout_secs: u64,
+) -> Result<Merged, String> {
     if let Some(refusal) = plan.refusals.first() {
         return Err(refusal.reason(plan));
+    }
+    let trimmed_squash = squash_message.map(str::trim).unwrap_or("");
+    if method == MergeMethod::Squash {
+        if trimmed_squash.is_empty() {
+            return Err(
+                "Write a commit message for the squash commit first.\n\nNothing was merged."
+                    .to_owned(),
+            );
+        }
+        if trimmed_squash.contains('\0') {
+            return Err(
+                "The commit message cannot contain NUL bytes.\n\nNothing was merged.".to_owned(),
+            );
+        }
+        if agent_core::redact::redact(trimmed_squash) != trimmed_squash {
+            return Err(
+                "The squash commit message looks like it contains a secret or token.\n\nNothing was merged."
+                    .to_owned(),
+            );
+        }
     }
     let now = preflight_with(&plan.info, env).map_err(|why| {
         format!(
@@ -534,7 +802,19 @@ fn merge_with(
             plan.base, plan.branch
         )));
     }
-    if now.hooks != plan.hooks || now.hooks_dir != plan.hooks_dir {
+    let hooks_changed = match method {
+        MergeMethod::Merge => now.hooks != plan.hooks || now.hooks_dir != plan.hooks_dir,
+        MergeMethod::Squash => {
+            now.squash_hooks != plan.squash_hooks || now.hooks_dir != plan.hooks_dir
+        }
+        MergeMethod::Rebase => {
+            now.rebase_worktree_hooks != plan.rebase_worktree_hooks
+                || now.rebase_worktree_hooks_dir != plan.rebase_worktree_hooks_dir
+                || now.rebase_base_hooks != plan.rebase_base_hooks
+                || now.hooks_dir != plan.hooks_dir
+        }
+    };
+    if hooks_changed {
         return Err(
             "The merge hooks that would run changed since the preview (one added or removed, \
              or core.hooksPath changed). Nothing was merged: open the merge again to see which \
@@ -548,7 +828,423 @@ fn merge_with(
             agent_core::redact::redact(&refusal.reason(&now))
         ));
     }
-    execute(plan, env, timeout_secs)
+    match method {
+        MergeMethod::Merge => execute(plan, env, timeout_secs),
+        MergeMethod::Squash => execute_squash(plan, trimmed_squash, env, timeout_secs),
+        MergeMethod::Rebase => execute_rebase(plan, env, timeout_secs),
+    }
+}
+
+fn run_step(step: &GitStep, env: &[(&str, &OsStr)], timeout_secs: u64) -> Result<(), String> {
+    let settings = step.env();
+    let mut step_env: Vec<(&str, &OsStr)> = env.to_vec();
+    step_env.extend(
+        settings
+            .iter()
+            .map(|(k, v)| (k.as_str(), OsStr::new(v.as_str()))),
+    );
+    let ran = git_output_in_group(&step.dir, &step.args, &step_env, timeout_secs);
+    let why = match ran {
+        Ok(out) if out.status.success() => return Ok(()),
+        Ok(out) => said(&out),
+        Err(why) => why,
+    };
+    let why = agent_core::redact::redact(&why);
+    let mut message = why;
+    if message.contains(&format!("did not finish within {timeout_secs}s")) {
+        message.push_str(
+            "\n\nIt was stopped, with the hooks and helpers it started. Hooks and signing \
+             that ask for input (a passphrase prompt, for one) cannot be answered from here: \
+             merge in a terminal instead.",
+        );
+    }
+    Err(message)
+}
+
+fn execute_squash(
+    plan: &MergePlan,
+    message: &str,
+    env: &[(&str, &OsStr)],
+    timeout_secs: u64,
+) -> Result<Merged, String> {
+    if discover(&plan.base_dir)
+        .ok()
+        .flatten()
+        .is_some_and(|r| r.git_dir.join("SQUASH_MSG").exists())
+    {
+        return Err(
+            "A squash commit message (.git/SQUASH_MSG) is already present in the base checkout. \
+             Nothing was merged."
+                .to_owned(),
+        );
+    }
+    let steps = commands_for(plan, MergeMethod::Squash, Some(message));
+    if let Err(err) = run_step(&steps[0], env, timeout_secs) {
+        return Err(format!(
+            "{err}\n\n{}",
+            recover_squash(plan, None, env, timeout_secs)
+        ));
+    }
+    let expected_tree = git_raw(&plan.base_dir, ["write-tree"], env, QUERY_TIMEOUT_SECS)
+        .ok()
+        .map(|out| String::from_utf8_lossy(&out).trim().to_owned())
+        .filter(|s| !s.is_empty());
+    if let Err(err) = run_step(&steps[1], env, timeout_secs) {
+        return Err(format!(
+            "{err}\n\n{}",
+            recover_squash(plan, expected_tree.as_deref(), env, timeout_secs)
+        ));
+    }
+    if let Err(why) = check_squash_merged(plan, env) {
+        return Err(format!(
+            "{why}\n\n{}",
+            recover_squash(plan, expected_tree.as_deref(), env, timeout_secs)
+        ));
+    }
+    let after = git_raw(
+        &plan.base_dir,
+        ["rev-parse", "--short", "HEAD"],
+        env,
+        QUERY_TIMEOUT_SECS,
+    )
+    .map(|out| String::from_utf8_lossy(&out).trim().to_owned())
+    .unwrap_or_default();
+    Ok(Merged {
+        before: short(&plan.base_tip),
+        after,
+    })
+}
+
+fn check_squash_merged(plan: &MergePlan, env: &[(&str, &OsStr)]) -> Result<(), String> {
+    let not = |what: &str| {
+        Err(format!(
+            "git reported success, but {what}, so this is not the squash commit the preview showed."
+        ))
+    };
+    let Some(repo) = discover(&plan.base_dir).ok().flatten() else {
+        return not("the base checkout could not be read back");
+    };
+    if in_progress_op(&repo.git_dir).is_some() {
+        return not("an operation is still in progress");
+    }
+    if repo.branch.as_deref() != Some(plan.base.as_str()) {
+        return not("the base checkout is no longer on its branch");
+    }
+    if repo.head.as_deref() == Some(plan.base_tip.as_str()) {
+        return not("no squash commit was made");
+    }
+    let parents = git_raw(
+        &plan.base_dir,
+        ["rev-list", "--parents", "-n", "1", "HEAD"],
+        env,
+        QUERY_TIMEOUT_SECS,
+    )
+    .map(|out| {
+        String::from_utf8_lossy(&out)
+            .split_whitespace()
+            .skip(1)
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+    if parents != [plan.base_tip.clone()] {
+        return not("the new commit is not a single-parent squash on the base commit shown");
+    }
+    Ok(())
+}
+
+fn recover_squash(
+    plan: &MergePlan,
+    expected_tree: Option<&str>,
+    env: &[(&str, &OsStr)],
+    timeout_secs: u64,
+) -> String {
+    let dir = plan.base_dir.display();
+    let base = &plan.base;
+    let before = short(&plan.base_tip);
+    let Some(repo) = discover(&plan.base_dir).ok().flatten() else {
+        return format!(
+            "{dir} could not be read after the squash ({base} was at {before}). {}",
+            left_as_is(&plan.base_dir)
+        );
+    };
+    if index_locked(&repo.git_dir) {
+        return format!(
+            "A git was stopped while it held {dir}'s index: .git/index.lock is left behind, so the \
+             checkout cannot be trusted to be as it was ({base} was at {before}). Once no git is \
+             running there, remove .git/index.lock and check `git status`."
+        );
+    }
+    if repo.head.as_deref() == Some(plan.base_tip.as_str())
+        && repo.branch.as_deref() == Some(plan.base.as_str())
+    {
+        let squash_msg = repo.git_dir.join("SQUASH_MSG");
+        let safe_to_reset = if !squash_msg.exists() {
+            false
+        } else if let Some(expected) = expected_tree {
+            // Step 1 finished with staged tree `expected`: only reset if the index tree still
+            // equals `expected` AND there are no unstaged tracked edits made meanwhile.
+            let tree_now = git_raw(&plan.base_dir, ["write-tree"], env, QUERY_TIMEOUT_SECS)
+                .ok()
+                .map(|out| String::from_utf8_lossy(&out).trim().to_owned());
+            let unstaged_clean = git_raw(
+                &plan.base_dir,
+                ["diff", "--name-only"],
+                env,
+                QUERY_TIMEOUT_SECS,
+            )
+            .is_ok_and(|out| out.is_empty());
+            tree_now.as_deref() == Some(expected) && unstaged_clean
+        } else {
+            // Step 1 itself stopped (conflict/abort) and created SQUASH_MSG: only reset when it
+            // actually wrote unmerged conflict entries in the index.
+            git_raw(
+                &plan.base_dir,
+                ["ls-files", "--unmerged"],
+                env,
+                QUERY_TIMEOUT_SECS,
+            )
+            .is_ok_and(|out| !out.is_empty())
+        };
+        if !safe_to_reset {
+            return format!(
+                "{dir} still has its HEAD on {base} at {before}; nothing was reset automatically. {}",
+                left_as_is(&plan.base_dir)
+            );
+        }
+        let reset = git_output_in_group(&plan.base_dir, ["reset", "--merge"], env, timeout_secs);
+        let _ = std::fs::remove_file(&squash_msg);
+        if matches!(reset, Ok(out) if out.status.success())
+            && standing(plan, env).is_some_and(|s| s.at_base && !s.locked && s.changed.is_empty())
+        {
+            return format!(
+                "Nothing was committed: undone with `git reset --merge`. {dir} is back on \
+                 {base} at {before}."
+            );
+        }
+    }
+    format!(
+        "{dir} could not be automatically reset after the failed squash ({base} was at {before}). {}",
+        left_as_is(&plan.base_dir)
+    )
+}
+
+fn execute_rebase(
+    plan: &MergePlan,
+    env: &[(&str, &OsStr)],
+    timeout_secs: u64,
+) -> Result<Merged, String> {
+    let Some(wt_repo) = discover(&plan.info.path).ok().flatten() else {
+        return Err(
+            "The worktree could not be read before rebasing. Nothing was merged.".to_owned(),
+        );
+    };
+    if let Some(op) = in_progress_op(&wt_repo.git_dir) {
+        return Err(format!("{}\n\nNothing was merged.", op.reason()));
+    }
+    if wt_repo.branch.as_deref() != Some(plan.branch.as_str())
+        || wt_repo.head.as_deref() != Some(plan.branch_tip.as_str())
+    {
+        return Err(format!(
+            "{} changed since the preview. Nothing was merged.",
+            plan.branch
+        ));
+    }
+
+    let rebase_step = GitStep {
+        dir: plan.info.path.clone(),
+        args: rebase_args(&plan.base_tip),
+        config: rebase_config(),
+    };
+    if let Err(err) = run_step(&rebase_step, env, timeout_secs) {
+        return Err(format!(
+            "{err}\n\n{}",
+            recover_rebase_worktree(plan, env, timeout_secs)
+        ));
+    }
+
+    let Some(wt_after) = discover(&plan.info.path).ok().flatten() else {
+        return Err(
+            "The worktree could not be read after rebasing. The base checkout was not changed."
+                .to_owned(),
+        );
+    };
+    if in_progress_op(&wt_after.git_dir).is_some()
+        || wt_after.branch.as_deref() != Some(plan.branch.as_str())
+    {
+        return Err(format!(
+            "The rebase stopped before finishing, so {} was not fast-forwarded. Check `git status` in {}.",
+            plan.base,
+            plan.info.path.display()
+        ));
+    }
+    let Some(rebased_tip) = wt_after.head else {
+        return Err(
+            "The worktree has no HEAD after rebase. The base checkout was not changed.".to_owned(),
+        );
+    };
+    let ancestor = git_output(
+        &plan.info.path,
+        ["merge-base", "--is-ancestor", &plan.base_tip, &rebased_tip],
+        env,
+        QUERY_TIMEOUT_SECS,
+    );
+    if !matches!(ancestor, Ok(out) if out.status.success()) {
+        return Err(format!(
+            "Rebased {} is not based on {} ({}). {} was not moved.",
+            plan.branch,
+            plan.base,
+            short(&plan.base_tip),
+            plan.base
+        ));
+    }
+
+    // Re-validate base checkout immediately before fast-forwarding: another process may have
+    // switched branch, committed, dirtied files, or changed hooks while rebase ran.
+    let Some(base_now) = discover(&plan.base_dir).ok().flatten() else {
+        return Err(format!(
+            "{} was rebased in {}, while {} could not be read back; nothing was fast-forwarded.",
+            plan.branch,
+            plan.info.path.display(),
+            plan.base
+        ));
+    };
+    let base_clean = git_raw(
+        &plan.base_dir,
+        ["status", "--porcelain", "--untracked-files=no"],
+        env,
+        QUERY_TIMEOUT_SECS,
+    )
+    .is_ok_and(|out| out.is_empty());
+    let (base_hooks_dir_now, base_hooks_now) =
+        hooks_for_dir(&plan.base_dir, &REBASE_BASE_HOOKS, env);
+    if in_progress_op(&base_now.git_dir).is_some()
+        || base_now.branch.as_deref() != Some(plan.base.as_str())
+        || base_now.head.as_deref() != Some(plan.base_tip.as_str())
+        || !base_clean
+        || base_hooks_dir_now != plan.hooks_dir
+        || base_hooks_now != plan.rebase_base_hooks
+    {
+        return Err(format!(
+            "{} or {}'s state changed while rebasing. {} was rebased in {}, while {} was not moved.",
+            plan.base,
+            plan.base_dir.display(),
+            plan.branch,
+            plan.info.path.display(),
+            plan.base
+        ));
+    }
+
+    let ff_step = GitStep {
+        dir: plan.base_dir.clone(),
+        args: ff_only_args(&rebased_tip),
+        config: ff_only_config(&plan.base),
+    };
+    if let Err(err) = run_step(&ff_step, env, timeout_secs) {
+        let base_state = match discover(&plan.base_dir).ok().flatten() {
+            Some(repo)
+                if repo.branch.as_deref() == Some(plan.base.as_str())
+                    && repo.head.as_deref() == Some(rebased_tip.as_str()) =>
+            {
+                format!(
+                    "{} DID advance to {} (likely a post-merge hook failed or timed out).",
+                    plan.base,
+                    short(&rebased_tip)
+                )
+            }
+            Some(repo)
+                if repo.branch.as_deref() == Some(plan.base.as_str())
+                    && repo.head.as_deref() == Some(plan.base_tip.as_str()) =>
+            {
+                format!(
+                    "{} stayed untouched at {}.",
+                    plan.base,
+                    short(&plan.base_tip)
+                )
+            }
+            Some(repo) => format!(
+                "{} is now at {} (unexpected state — check git status in {}).",
+                plan.base_dir.display(),
+                repo.head
+                    .as_deref()
+                    .map(short)
+                    .unwrap_or_else(|| "detached".into()),
+                plan.base_dir.display()
+            ),
+            None => format!(
+                "{} could not be verified after the fast-forward failed.",
+                plan.base_dir.display()
+            ),
+        };
+        return Err(format!(
+            "{err}\n\n{} was rebased in {}. {base_state}",
+            plan.branch,
+            plan.info.path.display(),
+        ));
+    }
+    check_rebase_merged(plan, &rebased_tip, env)
+        .map_err(|why| format!("{why}\n\n{}", left_as_is(&plan.base_dir)))?;
+    Ok(Merged {
+        before: short(&plan.base_tip),
+        after: short(&rebased_tip),
+    })
+}
+
+fn check_rebase_merged(
+    plan: &MergePlan,
+    rebased_tip: &str,
+    _env: &[(&str, &OsStr)],
+) -> Result<(), String> {
+    let not = |what: &str| {
+        Err(format!(
+            "git reported success, but {what}, so the fast-forward did not complete as shown."
+        ))
+    };
+    let Some(repo) = discover(&plan.base_dir).ok().flatten() else {
+        return not("the base checkout could not be read back");
+    };
+    if in_progress_op(&repo.git_dir).is_some() {
+        return not("an operation is still in progress in the base checkout");
+    }
+    if repo.branch.as_deref() != Some(plan.base.as_str()) {
+        return not("the base checkout is no longer on its branch");
+    }
+    if repo.head.as_deref() != Some(rebased_tip) {
+        return not("the base branch did not advance to the rebased commit");
+    }
+    Ok(())
+}
+
+fn recover_rebase_worktree(plan: &MergePlan, env: &[(&str, &OsStr)], timeout_secs: u64) -> String {
+    let wt_dir = plan.info.path.display();
+    let Some(repo) = discover(&plan.info.path).ok().flatten() else {
+        return format!(
+            "{wt_dir} could not be read after the rebase failed. {} was not touched.",
+            plan.base
+        );
+    };
+    if index_locked(&repo.git_dir) {
+        return format!(
+            "A git was stopped while holding {wt_dir}'s index: remove .git/index.lock once git \
+             exits, then run `git rebase --abort`. {} was not touched.",
+            plan.base
+        );
+    }
+    if in_progress_op(&repo.git_dir) == Some(InProgress::Rebase) {
+        let abort = git_output_in_group(&plan.info.path, ["rebase", "--abort"], env, timeout_secs);
+        if matches!(abort, Ok(out) if out.status.success()) {
+            return format!(
+                "Rebase aborted with `git rebase --abort`. {wt_dir} is back at {}, and {} was not touched.",
+                short(&plan.branch_tip),
+                plan.base
+            );
+        }
+    }
+    format!(
+        "The rebase stopped without completing; {} was not touched. {}",
+        plan.base,
+        left_as_is(&plan.info.path)
+    )
 }
 
 /// Runs [`commands`], undoing the merge if it stops part-way.
@@ -835,11 +1531,16 @@ mod tests {
             base_dir: PathBuf::from("/r/main"),
             base_tip: "a".repeat(40),
             branch_tip: "b".repeat(40),
+            squash_message: "feat/x".into(),
             ahead: 1,
             behind: 0,
             prediction: Prediction::Clean,
             hooks: Vec::new(),
             hooks_dir: None,
+            squash_hooks: Vec::new(),
+            rebase_worktree_hooks: Vec::new(),
+            rebase_worktree_hooks_dir: None,
+            rebase_base_hooks: Vec::new(),
             worktrees: Vec::new(),
             refusals: Vec::new(),
         }
@@ -1556,6 +2257,249 @@ mod tests {
             assert!(!before.is_empty());
             run(&plan_of(&f)).unwrap();
             assert_eq!(refs(), before);
+        }
+
+        #[test]
+        fn base_checked_out_in_linked_worktree_is_found_without_refusal() {
+            let Some(f) = fixture() else { return };
+            let other_base = f.wt.parent().unwrap().join("main-wt");
+            // Move main checkout away from `main` and check `main` out in a linked worktree.
+            sh(&f.main, &["checkout", "-q", "-b", "other"]);
+            sh(
+                &f.main,
+                &[
+                    "worktree",
+                    "add",
+                    "--",
+                    &other_base.to_string_lossy(),
+                    "main",
+                ],
+            );
+            let p = plan_of(&f);
+            assert!(p.refusals.is_empty(), "{:?}", p.refusals);
+            assert_eq!(
+                p.base_dir.canonicalize().unwrap(),
+                other_base.canonicalize().unwrap()
+            );
+            merge_method_with(&p, MergeMethod::Merge, None, &env(), MERGE_TIMEOUT_SECS).unwrap();
+            assert!(other_base.join("a.txt").exists());
+        }
+
+        #[test]
+        fn squash_merges_into_single_parent_commit_with_chosen_message() {
+            let Some(f) = fixture() else { return };
+            fs::write(f.wt.join("second.txt"), "two\n").unwrap();
+            sh(&f.wt, &["add", "second.txt"]);
+            sh(&f.wt, &["commit", "-q", "-m", "second change"]);
+            let p = plan_of(&f);
+            assert!(
+                p.squash_message.contains("second change"),
+                "{}",
+                p.squash_message
+            );
+
+            let steps = commands_for(&p, MergeMethod::Squash, Some("feat: combined"));
+            assert_eq!(steps.len(), 2);
+            assert_eq!(steps[0].args, squash_args(&p.branch_tip));
+            assert_eq!(steps[1].args, squash_commit_args("feat: combined"));
+
+            let merged = merge_method_with(
+                &p,
+                MergeMethod::Squash,
+                Some("feat: combined"),
+                &env(),
+                MERGE_TIMEOUT_SECS,
+            )
+            .unwrap();
+            assert_ne!(merged.before, merged.after);
+            let parents = sh(&f.main, &["rev-list", "--parents", "-n", "1", "HEAD"]);
+            let parts: Vec<&str> = parents.split_whitespace().collect();
+            assert_eq!(parts.len(), 2, "single parent expected: {parents}");
+            assert_eq!(parts[1], p.base_tip);
+            assert_eq!(sh(&f.main, &["log", "-1", "--format=%s"]), "feat: combined");
+            assert!(f.main.join("second.txt").exists());
+        }
+
+        #[test]
+        fn conflicted_squash_resets_to_exact_prior_state_and_keeps_untracked_files() {
+            let Some(f) = fixture() else { return };
+            conflict_on_base(&f);
+            fs::write(f.main.join("mine.txt"), "untracked\n").unwrap();
+            let before = state(&f.main);
+            let mut p = plan_of(&f);
+            p.refusals.clear();
+            let err = execute_squash(&p, "feat: squash", &env(), MERGE_TIMEOUT_SECS).unwrap_err();
+            assert!(err.contains("git reset --merge"), "{err}");
+            assert_eq!(state(&f.main), before);
+            assert!(!f.main.join(".git/SQUASH_MSG").exists());
+            assert_eq!(
+                fs::read_to_string(f.main.join("mine.txt")).unwrap(),
+                "untracked\n"
+            );
+        }
+
+        #[test]
+        fn rebase_replays_commits_and_fast_forwards_base() {
+            let Some(f) = fixture() else { return };
+            fs::write(f.main.join("base.txt"), "upstream\n").unwrap();
+            sh(&f.main, &["add", "base.txt"]);
+            sh(&f.main, &["commit", "-q", "-m", "upstream"]);
+
+            let p = plan_of(&f);
+            let steps = commands_for(&p, MergeMethod::Rebase, None);
+            assert_eq!(steps.len(), 2);
+            assert_eq!(steps[0].dir, p.info.path);
+            assert_eq!(steps[1].dir, p.base_dir);
+            assert!(steps[1].args.contains(&"--ff-only".to_owned()));
+            assert!(!steps[1]
+                .config
+                .iter()
+                .any(|(k, v)| k == "merge.ff" && v == "false"));
+
+            let merged =
+                merge_method_with(&p, MergeMethod::Rebase, None, &env(), MERGE_TIMEOUT_SECS)
+                    .unwrap();
+            assert_eq!(head(&f.main), head(&f.wt));
+            assert_eq!(short(&head(&f.main)), merged.after);
+            let parents = sh(&f.main, &["rev-list", "--parents", "-n", "1", "HEAD"]);
+            let parts: Vec<&str> = parents.split_whitespace().collect();
+            assert_eq!(
+                parts.len(),
+                2,
+                "fast-forward commit must not be a merge commit"
+            );
+            assert!(f.main.join("a.txt").exists());
+            assert!(f.main.join("base.txt").exists());
+        }
+
+        #[test]
+        fn conflicted_rebase_aborts_worktree_leaving_base_untouched() {
+            let Some(f) = fixture() else { return };
+            conflict_on_base(&f);
+            let base_before = state(&f.main);
+            let wt_before = state(&f.wt);
+            let mut p = plan_of(&f);
+            p.refusals.clear();
+            let err = execute_rebase(&p, &env(), MERGE_TIMEOUT_SECS).unwrap_err();
+            assert!(err.contains("rebase --abort"), "{err}");
+            assert_eq!(state(&f.main), base_before);
+            assert_eq!(state(&f.wt), wt_before);
+            assert_eq!(in_progress_op(&f.wt.join(".git")), None);
+        }
+
+        #[test]
+        fn failed_squash_never_discards_concurrently_staged_user_file() {
+            let Some(f) = fixture() else { return };
+            let p = plan_of(&f);
+            // User creates and stages `new.txt` (touched by `feat`) AFTER preflight:
+            // `git merge --squash` refuses without creating SQUASH_MSG, so recovery must leave
+            // the staged user file completely intact.
+            fs::write(f.main.join("new.txt"), "important\n").unwrap();
+            sh(&f.main, &["add", "new.txt"]);
+            let err = execute_squash(&p, "feat: squash", &env(), MERGE_TIMEOUT_SECS).unwrap_err();
+            assert!(!err.contains("undone with `git reset --merge`"), "{err}");
+            assert_eq!(
+                fs::read_to_string(f.main.join("new.txt")).unwrap(),
+                "important\n"
+            );
+            let status = sh(&f.main, &["status", "--porcelain"]);
+            assert!(status.contains("A  new.txt"), "{status}");
+        }
+
+        #[test]
+        fn squash_neutralizes_repo_merge_ff_false_and_only_and_rejects_secrets() {
+            let Some(f) = fixture() else { return };
+            sh(&f.main, &["config", "merge.ff", "false"]);
+            let p = plan_of(&f);
+            let secret_err = merge_method_with(
+                &p,
+                MergeMethod::Squash,
+                Some("token ghp_1234567890abcdefghijklmnopqrstuvwx"),
+                &env(),
+                MERGE_TIMEOUT_SECS,
+            )
+            .unwrap_err();
+            assert!(secret_err.contains("secret or token"), "{secret_err}");
+
+            merge_method_with(
+                &p,
+                MergeMethod::Squash,
+                Some("feat: works under merge.ff=false"),
+                &env(),
+                MERGE_TIMEOUT_SECS,
+            )
+            .unwrap();
+            assert_eq!(
+                sh(&f.main, &["log", "-1", "--format=%s"]),
+                "feat: works under merge.ff=false"
+            );
+        }
+
+        #[test]
+        fn rebase_detects_worktree_hookspath_and_reports_post_merge_timeout_truthfully() {
+            let Some(f) = fixture() else { return };
+            // Worktree-specific hooksPath overrides repo hooks during rebase.
+            let wt_hooks = f.tmp.path().join("wt-hooks");
+            fs::create_dir_all(&wt_hooks).unwrap();
+            let post_checkout = wt_hooks.join("post-checkout");
+            fs::write(&post_checkout, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&post_checkout, fs::Permissions::from_mode(0o755)).unwrap();
+            sh(&f.wt, &["config", "extensions.worktreeConfig", "true"]);
+            sh(
+                &f.wt,
+                &[
+                    "config",
+                    "--worktree",
+                    "core.hooksPath",
+                    &wt_hooks.to_string_lossy(),
+                ],
+            );
+            let p = plan_of(&f);
+            assert!(
+                p.rebase_worktree_hooks
+                    .contains(&"post-checkout".to_owned()),
+                "{:?}",
+                p.rebase_worktree_hooks
+            );
+            assert_eq!(
+                p.rebase_worktree_hooks_dir
+                    .as_ref()
+                    .and_then(|d| d.canonicalize().ok()),
+                wt_hooks.canonicalize().ok()
+            );
+
+            // A slow post-merge hook in base_dir times out AFTER fast-forward already moved HEAD:
+            // error must report that base DID advance, never falsely claim it stayed untouched.
+            hook(&f.main, "post-merge", "sleep 5\n");
+            let p = plan_of(&f);
+            let err = merge_method_with(&p, MergeMethod::Rebase, None, &env(), 1).unwrap_err();
+            assert!(!err.contains("stayed untouched"), "{err}");
+            assert!(err.contains("DID advance"), "{err}");
+            assert_eq!(head(&f.main), head(&f.wt));
+        }
+
+        #[test]
+        fn failed_commit_hook_never_discards_concurrently_staged_user_edit() {
+            let Some(f) = fixture() else { return };
+            // Install a pre-commit hook that edits & stages an unrelated file (`b.txt`) AFTER
+            // `git merge --squash` has already succeeded and created SQUASH_MSG, then aborts commit.
+            let p = plan_of(&f);
+            hook(
+                &f.main,
+                "pre-commit",
+                "echo 'concurrent user edit' > b.txt\ngit add b.txt\nexit 1\n",
+            );
+            let err = execute_squash(&p, "feat: squash", &env(), MERGE_TIMEOUT_SECS).unwrap_err();
+            assert!(
+                err.contains("nothing was reset automatically"),
+                "concurrent staged edit should stop reset --merge: {err}"
+            );
+            assert_eq!(
+                fs::read_to_string(f.main.join("b.txt")).unwrap(),
+                "concurrent user edit\n"
+            );
+            let status = sh(&f.main, &["status", "--porcelain"]);
+            assert!(status.contains("M  b.txt"), "{status}");
         }
     }
 }

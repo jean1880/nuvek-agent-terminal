@@ -2,6 +2,7 @@
 // `agent-kit` and re-exported so config and the app keep their old path.
 pub use agent_kit::difftool::DiffTool;
 pub use agent_kit::editor::EditorTool;
+pub use agent_kit::merge::MergeMethod;
 pub use agent_kit::sessions::SessionFormat;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -980,6 +981,9 @@ pub struct TerminalConfig {
     /// Blank means a hidden sibling of the repository,
     /// `<parent>/.<repo>.worktrees/<branch>`.
     pub worktree_root: String,
+    /// Default merge strategy used by "Merge into …" for worktree threads.
+    #[serde(default)]
+    pub default_merge_method: MergeMethod,
     /// Header-bar status lights. Empty by default: this is an extension point,
     /// not a feature every user wants.
     pub indicators: Vec<Indicator>,
@@ -1437,6 +1441,7 @@ impl Default for TerminalConfig {
             diff_panel_visible: false,
             diff_panel_width: 520,
             worktree_root: String::new(),
+            default_merge_method: MergeMethod::default(),
             indicators: Vec::new(),
             turn_command: None,
             diff_tool: None,

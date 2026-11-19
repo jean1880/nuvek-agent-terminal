@@ -3,6 +3,7 @@
 mod agents_prefs;
 mod animated_menu;
 mod announce;
+mod ask_several;
 mod closing;
 mod commit;
 mod diff_prefs;
@@ -9590,6 +9591,7 @@ mod tests {
         crate::chat::view::tests::reasoning_ui_checks();
         crate::chat::view::tests::subagent_ui_checks();
         thread_menu::tests::gtk_checks();
+        ask_several::tests::gtk_checks(&window);
         animated_menu::tests::gtk_checks();
         let menu = window.imp().build_new_menu();
         assert_eq!(

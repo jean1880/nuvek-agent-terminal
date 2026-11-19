@@ -89,6 +89,8 @@ pub enum BuiltinAction {
     Fork,
     /// `/compare`: read this thread beside a fork of it (or its source) in a window.
     CompareForks,
+    /// `/ask`: ask 2–4 agents the same prompt side by side.
+    AskSeveral,
     /// `/mode plan|default|accept-edits`; the UI parses the argument.
     SetMode,
     OpenUsage,
@@ -133,6 +135,7 @@ impl Builtin {
             | BuiltinAction::Handoff
             | BuiltinAction::Fork
             | BuiltinAction::CompareForks
+            | BuiltinAction::AskSeveral
             | BuiltinAction::SetMode
             | BuiltinAction::Rewind
             | BuiltinAction::NewThread
@@ -141,7 +144,7 @@ impl Builtin {
     }
 }
 
-static BUILTINS: [Builtin; 13] = [
+static BUILTINS: [Builtin; 14] = [
     Builtin {
         name: "model",
         aliases: &[],
@@ -190,6 +193,13 @@ static BUILTINS: [Builtin; 13] = [
         description: "Compare this thread with a fork, side by side",
         hint: None,
         action: BuiltinAction::CompareForks,
+    },
+    Builtin {
+        name: "ask",
+        aliases: &[],
+        description: "Ask several agents the same prompt side by side",
+        hint: Some("[prompt]"),
+        action: BuiltinAction::AskSeveral,
     },
     Builtin {
         name: "mode",
@@ -725,8 +735,8 @@ mod tests {
         assert_eq!(
             all,
             [
-                "model", "mcp", "config", "compact", "handoff", "fork", "compare", "mode", "usage",
-                "context", "rewind", "clear", "help"
+                "model", "mcp", "config", "compact", "handoff", "fork", "compare", "ask", "mode",
+                "usage", "context", "rewind", "clear", "help"
             ]
         );
     }

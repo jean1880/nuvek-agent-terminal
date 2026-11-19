@@ -1391,6 +1391,23 @@ impl StoreHandle {
             Ok(())
         });
     }
+
+    pub fn save_compare_group(&self, group: &agent_core::ask_several::CompareGroup) -> Result<()> {
+        let g = group.clone();
+        let src = g.source_thread.clone();
+        self.write("save a comparison group", Some(&src), move |s| {
+            s.save_compare_group(&g)
+        })
+    }
+
+    pub fn mark_compare_group_kept(&self, group_id: &str, kept_thread: &str) -> Result<()> {
+        let (gid, kt) = (group_id.to_owned(), kept_thread.to_owned());
+        self.write(
+            "record kept comparison answer",
+            Some(kept_thread),
+            move |s| s.mark_compare_group_kept(&gid, &kt),
+        )
+    }
 }
 
 /// Test access to the writer's batch logic without its thread: runs `jobs` as the writer would

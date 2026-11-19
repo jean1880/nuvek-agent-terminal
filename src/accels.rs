@@ -39,6 +39,7 @@ const COMMON: &[Binding] = &[
     ("win.new-tab-folder", &["<Primary><Shift>O"]),
     ("win.checkpoint-now", &["<Primary><Shift>S"]),
     ("win.resume-session", &["<Primary><Shift>E"]),
+    ("win.schedule", &["<Primary><Shift>L"]),
     ("win.toggle-pin", &["<Primary><Shift>P"]),
     ("win.toggle-drawer", &["<Ctrl>grave", "<Primary>J"]),
     ("win.preferences", &["<Primary>comma"]),

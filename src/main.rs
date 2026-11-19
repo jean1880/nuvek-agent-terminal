@@ -164,6 +164,7 @@ fn main() -> glib::ExitCode {
         icons::register();
         load_css();
         window::watch_config_file(app);
+        window::start_scheduler(app);
         diff_tool::sweep_stale();
         agent_proc::sweep_stale_key_files();
 

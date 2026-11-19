@@ -35,6 +35,7 @@ pub enum Body {
     User {
         text: String,
         queued: bool,
+        scheduled: bool,
         /// The images sent with it, by ref.
         attachments: Vec<AttachmentRef>,
     },
@@ -2168,9 +2169,14 @@ impl Transcript {
                                 .and_then(|v| v.get("queued"))
                                 .and_then(Value::as_bool)
                                 == Some(true);
+                        let scheduled = input
+                            .as_ref()
+                            .and_then(agent_core::schedule::parse_scheduled_input)
+                            .is_some();
                         Body::User {
                             text: String::new(),
                             queued,
+                            scheduled,
                             attachments: agent_core::attachment::refs_in(input.as_ref()),
                         }
                     }

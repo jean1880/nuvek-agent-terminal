@@ -91,6 +91,8 @@ pub enum BuiltinAction {
     CompareForks,
     /// `/ask`: ask 2–4 agents the same prompt side by side.
     AskSeveral,
+    /// `/schedule`: create or view scheduled/repeating prompts.
+    Schedule,
     /// `/mode plan|default|accept-edits`; the UI parses the argument.
     SetMode,
     OpenUsage,
@@ -136,6 +138,7 @@ impl Builtin {
             | BuiltinAction::Fork
             | BuiltinAction::CompareForks
             | BuiltinAction::AskSeveral
+            | BuiltinAction::Schedule
             | BuiltinAction::SetMode
             | BuiltinAction::Rewind
             | BuiltinAction::NewThread
@@ -144,7 +147,7 @@ impl Builtin {
     }
 }
 
-static BUILTINS: [Builtin; 14] = [
+static BUILTINS: [Builtin; 15] = [
     Builtin {
         name: "model",
         aliases: &[],
@@ -200,6 +203,13 @@ static BUILTINS: [Builtin; 14] = [
         description: "Ask several agents the same prompt side by side",
         hint: Some("[prompt]"),
         action: BuiltinAction::AskSeveral,
+    },
+    Builtin {
+        name: "schedule",
+        aliases: &[],
+        description: "Schedule a prompt to run once or on a repeat timer",
+        hint: Some("[prompt]"),
+        action: BuiltinAction::Schedule,
     },
     Builtin {
         name: "mode",
@@ -735,8 +745,8 @@ mod tests {
         assert_eq!(
             all,
             [
-                "model", "mcp", "config", "compact", "handoff", "fork", "compare", "ask", "mode",
-                "usage", "context", "rewind", "clear", "help"
+                "model", "mcp", "config", "compact", "handoff", "fork", "compare", "ask",
+                "schedule", "mode", "usage", "context", "rewind", "clear", "help"
             ]
         );
     }

@@ -1048,6 +1048,8 @@ pub enum ThreadAction {
     EditTags(String),
     /// Removes every tag of the thread (with Undo).
     ClearTags(String),
+    /// Opens schedules for this thread (create or manage).
+    Schedules(String),
 }
 
 /// Separates the fields of an encoded [`ThreadAction`] (never part of an id, model or effort).
@@ -1101,6 +1103,7 @@ impl ThreadAction {
             Self::PinMove(t, delta) => format!("pin-move{SEP}{t}{SEP}{delta}"),
             Self::EditTags(t) => simple("tags", t),
             Self::ClearTags(t) => simple("clear-tags", t),
+            Self::Schedules(t) => simple("schedules", t),
         }
     }
 
@@ -1157,6 +1160,7 @@ impl ThreadAction {
             },
             "tags" => simple(Self::EditTags(thread)),
             "clear-tags" => simple(Self::ClearTags(thread)),
+            "schedules" => simple(Self::Schedules(thread)),
             _ => None,
         }
     }
@@ -1425,6 +1429,11 @@ pub fn thread_menu(input: &ThreadMenuInput) -> Vec<MenuEntry> {
                 label: "Export…".to_owned(),
                 action: ThreadAction::Export(thread.clone()),
                 enabled: input.has_messages,
+            },
+            MenuEntry::Item {
+                label: "Schedules…".to_owned(),
+                action: ThreadAction::Schedules(thread.clone()),
+                enabled: local,
             },
             MenuEntry::Item {
                 label: "Review Multi-Agent Environment…".to_owned(),
@@ -2201,6 +2210,7 @@ mod tests {
                 "Delete…",
                 "Open folder",
                 "Export…",
+                "Schedules…",
                 "Review Multi-Agent Environment…",
                 "Copy thread id"
             ]
@@ -2218,6 +2228,7 @@ mod tests {
                 "Delete…",
                 "Open folder",
                 "Export…",
+                "Schedules…",
                 "Review Multi-Agent Environment…",
                 "Copy thread id"
             ]
@@ -2281,6 +2292,7 @@ mod tests {
             ThreadAction::Delete("t".into()),
             ThreadAction::OpenFolder("t".into()),
             ThreadAction::Export("t".into()),
+            ThreadAction::Schedules("t".into()),
             ThreadAction::ReviewEnvironment("t".into()),
             ThreadAction::CopyId("t".into()),
         ];

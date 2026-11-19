@@ -2411,7 +2411,7 @@ mod tests {
             let Some(f) = fixture() else { return };
             sh(&f.main, &["config", "merge.ff", "false"]);
             let p = plan_of(&f);
-            let secret_err = merge_method_with(
+            let refusal = merge_method_with(
                 &p,
                 MergeMethod::Squash,
                 Some("token ghp_1234567890abcdefghijklmnopqrstuvwx"),
@@ -2419,7 +2419,7 @@ mod tests {
                 MERGE_TIMEOUT_SECS,
             )
             .unwrap_err();
-            assert!(secret_err.contains("secret or token"), "{secret_err}");
+            assert!(refusal.contains("secret or token"));
 
             merge_method_with(
                 &p,

@@ -69,6 +69,9 @@ pub(super) enum TurnPurpose {
     /// The thread continuing once its usage limit reset: the one turn the limit wait is for. It
     /// carries a pending handoff itself, and starts a process that exited meanwhile again.
     LimitContinue,
+    /// A scheduled or repeating prompt firing: like `LimitContinue`, it restarts a process that
+    /// exited and carries any pending handoff itself, though it waits while `limit_waiting` holds.
+    Scheduled,
 }
 
 /// What became of sub-agent news offered to a root session ([`ChatSession::wake_with`]).
@@ -281,6 +284,9 @@ impl Inner {
     pub(super) fn user_spoke(&self) {
         self.auto_wakes.set(0);
         self.wakes_held.set(false);
+        let _ = self
+            .store
+            .reset_schedule_unattended_for_thread(&self.thread);
     }
 
     /// Whether a wake turn must wait: anything the user's own prompt would queue behind or
@@ -302,11 +308,12 @@ impl Inner {
     /// or the continuation's.
     pub(super) fn turn_blocker(&self, purpose: TurnPurpose) -> Option<&'static str> {
         let wake = purpose == TurnPurpose::Wake;
+        let scheduled = purpose == TurnPurpose::Scheduled;
         let state = self.state.borrow();
         let process_gone = !state.alive && !self.suspended.get() && wake;
         let reasons = [
             (
-                wake && self.limit_waiting.get(),
+                (wake || scheduled) && self.limit_waiting.get(),
                 "the thread waits for its usage limit",
             ),
             (state.running_turn, "a turn is running"),

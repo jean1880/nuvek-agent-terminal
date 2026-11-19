@@ -634,6 +634,10 @@ impl Adapter for AgyAdapter {
         Vec::new()
     }
 
+    fn discard_queued_prompts(&mut self) {
+        self.prompt_pending = false;
+    }
+
     fn prompt_starts_turn(&self, text: &str) -> bool {
         let first = text.split_whitespace().next().unwrap_or_default();
         !SIDE_COMMANDS.contains(&first.to_ascii_lowercase().as_str())

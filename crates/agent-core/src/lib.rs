@@ -43,6 +43,7 @@ pub mod redact;
 pub mod remote;
 pub mod review;
 pub mod saved_prompts;
+pub mod schedule;
 pub mod search_query;
 pub mod sensitive;
 pub mod serde_name;

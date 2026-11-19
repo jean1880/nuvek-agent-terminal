@@ -40,9 +40,15 @@ mod codex_policy;
 mod delegated;
 mod limit;
 mod reply_questions;
+mod scheduled;
 
 pub(crate) use delegated::{HeldNews, TakenNews, WakeOutcome};
 pub(crate) use limit::ContinueOutcome;
+#[cfg_attr(
+    not(test),
+    expect(unused_imports, reason = "wired by F6 scheduler slice")
+)]
+pub(crate) use scheduled::ScheduledOutcome;
 
 use super::{ChatBackend, EnvelopeSink, PromptImage, PromptInput, SessionStatus};
 use crate::agent_proc::{
@@ -168,6 +174,9 @@ struct PendingStart {
     /// Sub-agent news riding on those messages: settled once the writes reach a process, given
     /// back (by being dropped) when they never do.
     news: Vec<TakenNews>,
+    /// A scheduled prompt rode in `writes`: if the hook check fails, cancel it rather than
+    /// sending an unattended turn into a hookless process.
+    has_scheduled: bool,
 }
 
 fn delegation_redirect_names(spec: &SpawnSpec) -> Vec<String> {
@@ -428,6 +437,10 @@ struct Inner {
     launch_facts: RefCell<Option<DelegationLaunchFacts>>,
     weak_self: RefCell<Option<std::rc::Weak<Inner>>>,
     prompt_in_flight: Cell<bool>,
+    /// Schedule id of the active scheduled-prompt turn, if any.
+    active_schedule: RefCell<Option<String>>,
+    /// Schedule ids interrupted by Stop, preserved until taken by the scheduler.
+    stopped_schedules: RefCell<Vec<String>>,
     /// Last step index enriched with thinking from Antigravity transcript, avoiding repeated disk reads,
     /// and whether that read was an image read's final one ([`AgyEnrichJob::media`]).
     last_enriched_step: Cell<Option<(u64, bool)>>,
@@ -1289,6 +1302,8 @@ impl ChatSession {
             launch_facts: RefCell::new(None),
             weak_self: RefCell::new(None),
             prompt_in_flight: Cell::new(false),
+            active_schedule: RefCell::new(None),
+            stopped_schedules: RefCell::new(Vec::new()),
             last_enriched_step: Cell::new(None),
             provisional_native: RefCell::new(None),
             agy_reading: Cell::new(None),
@@ -2006,6 +2021,7 @@ impl Inner {
             Event::TurnCompleted { state, .. } => {
                 self.prompt_in_flight.set(false);
                 self.state.borrow_mut().running_turn = false;
+                *self.active_schedule.borrow_mut() = None;
                 self.last_enriched_step.set(None);
                 *self.native_turn.borrow_mut() = None;
                 if let Some(hooks) = &self.hooks {
@@ -2613,6 +2629,7 @@ impl Inner {
             writes: Vec::new(),
             prompts: Vec::new(),
             news: Vec::new(),
+            has_scheduled: false,
         });
         self.state.borrow_mut().alive = true;
         self.notify_lifecycle();
@@ -2643,25 +2660,48 @@ impl Inner {
         // A sink can re-enter while the refusal is said (stop the session, or replace it with a
         // new start whose own proof is still out). So the hookless launch is fixed before
         // anything is emitted, and spawned only if this start is still the session's afterwards.
-        let spec = match verdict {
-            Ok(()) => self.launch_spec(),
+        let (writes, prompts, news, spec) = match verdict {
+            Ok(()) => (
+                pending.writes,
+                pending.prompts,
+                pending.news,
+                self.launch_spec(),
+            ),
             Err(reason) => {
                 let refused = self.refuse_unproven_hook(reason);
+                let scheduled = pending.has_scheduled;
+                if scheduled {
+                    self.prompt_in_flight.set(false);
+                    self.state.borrow_mut().running_turn = false;
+                    self.handoff_in_flight.set(false);
+                    *self.active_schedule.borrow_mut() = None;
+                    self.adapter.borrow_mut().discard_queued_prompts();
+                }
                 let spec = self.launch_spec();
+                if self.generation.get() != generation || self.stopping.get() {
+                    return;
+                }
                 self.announce_refused_hook(generation, refused);
-                spec
+                if self.generation.get() != generation || self.stopping.get() {
+                    return;
+                }
+                if scheduled {
+                    self.notice(
+                        "Scheduled prompt cancelled: agy could not verify its approval hook.",
+                    );
+                    if self.generation.get() != generation || self.stopping.get() {
+                        return;
+                    }
+                    (Vec::new(), Vec::new(), Vec::new(), spec)
+                } else {
+                    (pending.writes, pending.prompts, pending.news, spec)
+                }
             }
         };
         if self.generation.get() != generation || self.stopping.get() {
             return;
         }
-        self.spawn_spec_with_writes(
-            generation,
-            spec,
-            pending.writes,
-            pending.prompts,
-            pending.news,
-        );
+        self.spawn_spec_with_writes(generation, spec, writes, prompts, news);
     }
 
     /// The hook could not be proven right before a start: agy runs without the skip flag and
@@ -2781,6 +2821,7 @@ impl Inner {
             writes,
             prompts,
             news,
+            has_scheduled: false,
         });
         self.state.borrow_mut().alive = true;
         let cwd = spec.cwd.clone();
@@ -2881,6 +2922,7 @@ impl Inner {
             writes,
             prompts,
             news,
+            has_scheduled: false,
         });
         self.state.borrow_mut().alive = true;
         let weak = Rc::downgrade(self);
@@ -3077,6 +3119,7 @@ impl Inner {
             state.alive = false;
             state.running_turn = false;
         }
+        *self.active_schedule.borrow_mut() = None;
         self.abandon_unspawned_binding();
         // Nothing will complete a turn: a pending handoff goes out with the next prompt.
         self.handoff_in_flight.set(false);
@@ -4195,6 +4238,7 @@ impl Inner {
             state.running_turn = false;
         }
         self.prompt_in_flight.set(false);
+        *self.active_schedule.borrow_mut() = None;
         self.pre_init_prompts.borrow_mut().clear();
         // A dead process completed nothing: a pending handoff goes out with the next prompt,
         // even when the exit raised no turn of its own (it died before one opened).
@@ -7907,9 +7951,15 @@ impl ChatBackend for ChatSession {
 
     fn interrupt(&self) {
         // The user stopped this root, delegation or not: nothing continues it on its own (a
-        // usage-limit continuation, sub-agent news) until the user speaks again.
+        // usage-limit continuation, sub-agent news, scheduled runs) until the user speaks again.
         if self.inner.child.is_none() {
             self.inner.wakes_held.set(true);
+        }
+        if let Some(schedule_id) = self.inner.active_schedule.borrow_mut().take() {
+            let mut stopped = self.inner.stopped_schedules.borrow_mut();
+            if !stopped.iter().any(|s| s == &schedule_id) {
+                stopped.push(schedule_id);
+            }
         }
         // The Stop wins over a switch's continuation still armed (one a rebind holds, say):
         // nothing carries the task on, and what that switch took over is queued again, held as
@@ -8033,6 +8083,7 @@ mod tests {
     mod delegated_tests;
     mod handoff_tests;
     mod remote_tests;
+    mod scheduled_tests;
     mod switch_tests;
     mod teardown_tests;
 

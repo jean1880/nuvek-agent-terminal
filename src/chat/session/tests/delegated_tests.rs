@@ -1054,6 +1054,7 @@ fn shutdown_cancels_a_pending_proof_even_if_the_process_is_already_dead() {
             writes: vec!["must not reach a replacement process".to_owned()],
             prompts: Vec::new(),
             news: Vec::new(),
+            has_scheduled: false,
         });
         let process_generation = session.process_generation();
         session.shutdown(false);

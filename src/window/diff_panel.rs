@@ -475,12 +475,13 @@ impl CommitFile {
     }
 }
 
-/// What "Commit…" hands the window: the repository whose diff is on show, the files chosen in
-/// it, and how many were listed.
+/// What "Commit…" hands the window: the repository whose diff is on show, the whole files and
+/// partial-hunk patches chosen in it, and how many files were listed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitAsk {
     pub repo: PathBuf,
     pub files: Vec<CommitFile>,
+    pub patches: Vec<agent_kit::commit::HunkPatch>,
     pub listed: usize,
 }
 
@@ -579,6 +580,17 @@ pub fn chosen_words(chosen: usize, listed: usize) -> String {
     }
 }
 
+/// The words beside a usable Commit button when partial-hunk selections may be present.
+pub fn chosen_words_with_hunks(chosen: usize, listed: usize, partial: bool) -> String {
+    if !partial {
+        return chosen_words(chosen, listed);
+    }
+    match (chosen, listed) {
+        (1, 1) => "1 file (selected hunks) to commit".to_owned(),
+        (c, l) => format!("{c} of {l} files (selected hunks) to commit"),
+    }
+}
+
 type OpenHandler = Rc<dyn Fn(OpenFile)>;
 type EditHandler = Rc<dyn Fn(EditFile)>;
 type PrHandler = Rc<dyn Fn(PrState)>;
@@ -586,9 +598,31 @@ type CommitHandler = Rc<dyn Fn(CommitAsk)>;
 type MergeHandler = Rc<dyn Fn()>;
 /// A row's tick box, held weakly (its row owns it), with the row's path.
 type Tick = (glib::WeakRef<gtk4::CheckButton>, String);
+/// A hunk's tick box (held weakly: its row's expander owns it), with its file path and identity key.
+type HunkTick = (glib::WeakRef<gtk4::CheckButton>, String, HunkKey);
+type HunkKey = String;
 type PopHandler = Rc<dyn Fn()>;
 /// A popped-out panel's parent window and its destroy handler.
 type ParentWatch = (glib::WeakRef<gtk4::Window>, glib::SignalHandlerId);
+
+/// Coordinate-free identity for a hunk so refresh keeps exclusions matched to the same hunk even
+/// when earlier hunks are added or reverted and line numbers shift.
+fn hunk_key(hunk: &agent_kit::diff::DiffHunk) -> HunkKey {
+    let heading = hunk
+        .header
+        .splitn(3, "@@")
+        .nth(2)
+        .map(str::trim)
+        .unwrap_or_default();
+    format!("{heading}\n{}", hunk.body)
+}
+
+/// Per-file hunk split for uncommitted modified files with at least two hunks.
+#[derive(Clone)]
+struct HunkFile {
+    chunk: String,
+    hunks: Vec<agent_kit::diff::DiffHunk>,
+}
 
 /// The diff on show: its left side, and its right side when that is a checkpoint.
 type Sides = (String, Option<String>);
@@ -620,8 +654,14 @@ struct CommitData {
     /// Paths the user unticked. Kept across refreshes, so a file that appears starts ticked
     /// and one the user left out stays out.
     unticked: Rc<RefCell<BTreeSet<String>>>,
+    /// Per-file hunk identities the user unticked (for files with 2+ hunks). Kept across refreshes.
+    unticked_hunks: Rc<RefCell<HashMap<String, BTreeSet<HunkKey>>>>,
+    /// Hunk splits for multi-hunk modified files in the current uncommitted diff.
+    hunk_groups: Rc<RefCell<HashMap<String, HunkFile>>>,
     /// Each listed row's tick box (held weakly: its row owns it), with its path.
     ticks: Rc<RefCell<Vec<Tick>>>,
+    /// Each expanded hunk's tick box (held weakly: its row owns it).
+    hunk_ticks: Rc<RefCell<Vec<HunkTick>>>,
     /// The repository the diff on show was read from.
     repo: Rc<RefCell<Option<PathBuf>>>,
     /// The operation git has half done there, as the last refresh read it.
@@ -637,15 +677,96 @@ struct CommitData {
 }
 
 impl CommitData {
-    /// The listed files still ticked, in the diff's order.
-    fn chosen(&self) -> Vec<CommitFile> {
+    /// Splits ticked choices into whole-file commits and partial-hunk patches, in diff order.
+    fn chosen_split(&self) -> (Vec<CommitFile>, Vec<agent_kit::commit::HunkPatch>) {
         let unticked = self.unticked.borrow();
-        self.listed
-            .borrow()
-            .iter()
-            .filter(|f| !unticked.contains(&f.path))
-            .cloned()
-            .collect()
+        let unticked_hunks = self.unticked_hunks.borrow();
+        let groups = self.hunk_groups.borrow();
+        let mut whole = Vec::new();
+        let mut patches = Vec::new();
+        for file in self.listed.borrow().iter() {
+            if unticked.contains(&file.path) {
+                continue;
+            }
+            if let Some(group) = groups.get(&file.path) {
+                let off = unticked_hunks.get(&file.path);
+                let selected: Vec<usize> = group
+                    .hunks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, h)| off.is_none_or(|s| !s.contains(&hunk_key(h))))
+                    .map(|(i, _)| i)
+                    .collect();
+                if selected.is_empty() {
+                    continue;
+                }
+                if selected.len() == group.hunks.len() {
+                    whole.push(file.clone());
+                } else if let Some(patch) =
+                    agent_kit::diff::build_hunk_patch(&group.chunk, &selected)
+                {
+                    patches.push(agent_kit::commit::HunkPatch {
+                        path: file.path.clone(),
+                        patch,
+                        chosen: selected.len(),
+                        total: group.hunks.len(),
+                    });
+                } else {
+                    whole.push(file.clone());
+                }
+            } else {
+                whole.push(file.clone());
+            }
+        }
+        (whole, patches)
+    }
+
+    /// `(active, inconsistent)` state of `path`'s row checkbox.
+    fn chosen_file_state(&self, path: &str) -> (bool, bool) {
+        if self.unticked.borrow().contains(path) {
+            return (false, false);
+        }
+        if let Some(group) = self.hunk_groups.borrow().get(path) {
+            let total = group.hunks.len();
+            let off = self.unticked_hunks.borrow().get(path).map_or(0, |s| {
+                group
+                    .hunks
+                    .iter()
+                    .filter(|h| s.contains(&hunk_key(h)))
+                    .count()
+            });
+            if off == 0 {
+                (true, false)
+            } else if off >= total {
+                (false, false)
+            } else {
+                (false, true)
+            }
+        } else {
+            (true, false)
+        }
+    }
+
+    /// Drops stale hunk choices after a refresh, promoting all-unticked to whole-file unticked.
+    fn prune_hunk_choices(&self) {
+        let groups = self.hunk_groups.borrow();
+        let mut unticked_hunks = self.unticked_hunks.borrow_mut();
+        let mut unticked = self.unticked.borrow_mut();
+        unticked_hunks.retain(|path, set| {
+            let Some(group) = groups.get(path) else {
+                return false;
+            };
+            let current: BTreeSet<HunkKey> = group.hunks.iter().map(hunk_key).collect();
+            set.retain(|k| current.contains(k));
+            if set.is_empty() {
+                return false;
+            }
+            if set.len() >= current.len() {
+                unticked.insert(path.clone());
+                return false;
+            }
+            true
+        });
     }
 }
 
@@ -658,6 +779,7 @@ impl std::ops::Deref for CommitBar {
 
 /// A [`CommitBar`] for its own widgets' handlers: the widgets held weakly, so no handler keeps
 /// the widget it is connected to alive.
+#[derive(Clone)]
 struct WeakCommitBar {
     bar: glib::WeakRef<gtk4::Box>,
     all: glib::WeakRef<gtk4::CheckButton>,
@@ -744,7 +866,10 @@ impl CommitBar {
                 preparing: Rc::new(Cell::new(false)),
                 listed: Rc::new(RefCell::new(Vec::new())),
                 unticked: Rc::new(RefCell::new(BTreeSet::new())),
+                unticked_hunks: Rc::new(RefCell::new(HashMap::new())),
+                hunk_groups: Rc::new(RefCell::new(HashMap::new())),
                 ticks: Rc::new(RefCell::new(Vec::new())),
+                hunk_ticks: Rc::new(RefCell::new(Vec::new())),
                 repo: Rc::new(RefCell::new(None)),
                 op: Rc::new(Cell::new(None)),
                 uncommitted: Rc::new(Cell::new(false)),
@@ -772,7 +897,9 @@ impl CommitBar {
     /// Redraws the bar for the diff on show, the ticks and what is running.
     fn sync(&self, pushing: bool) {
         let listed = self.listed.borrow().len();
-        let chosen = self.chosen().len();
+        let (whole, patches) = self.chosen_split();
+        let chosen = whole.len() + patches.len();
+        let partial = !patches.is_empty();
         let off = commit_off(
             self.uncommitted.get() && self.repo.borrow().is_some(),
             listed,
@@ -787,7 +914,7 @@ impl CommitBar {
         let words = match off {
             _ if committing => "Committing the chosen files…".to_owned(),
             Some(off) => off.reason().to_owned(),
-            None => chosen_words(chosen, listed),
+            None => chosen_words_with_hunks(chosen, listed, partial),
         };
         self.status.set_text(&words);
         self.button
@@ -796,8 +923,9 @@ impl CommitBar {
         self.all.set_visible(
             !committing && !off.is_some_and(|o| matches!(o, CommitOff::InProgress(_))),
         );
-        self.all.set_active(listed > 0 && chosen == listed);
-        self.all.set_inconsistent(chosen > 0 && chosen < listed);
+        let all_ticked = listed > 0 && chosen == listed && !partial;
+        self.all.set_active(all_ticked);
+        self.all.set_inconsistent(chosen > 0 && !all_ticked);
         self.syncing.set(false);
     }
 }
@@ -1215,8 +1343,11 @@ impl DiffPanel {
             else {
                 return;
             };
-            let files = bar.chosen();
-            if files.is_empty() || bar.committing.get() || bar.preparing.get() {
+            let (files, patches) = bar.chosen_split();
+            if (files.is_empty() && patches.is_empty())
+                || bar.committing.get()
+                || bar.preparing.get()
+            {
                 return;
             }
             // Off until the window has its dialog up (or has said why not): `set_preparing`.
@@ -1226,6 +1357,7 @@ impl DiffPanel {
             handler(CommitAsk {
                 repo,
                 files,
+                patches,
                 listed,
             });
         });
@@ -1243,16 +1375,25 @@ impl DiffPanel {
             let tick = all.is_active();
             {
                 let mut unticked = bar.unticked.borrow_mut();
+                let mut unticked_hunks = bar.unticked_hunks.borrow_mut();
                 for file in bar.listed.borrow().iter() {
                     if tick {
                         unticked.remove(&file.path);
                     } else {
                         unticked.insert(file.path.clone());
                     }
+                    unticked_hunks.remove(&file.path);
                 }
             }
             bar.syncing.set(true);
+            all.set_inconsistent(false);
             for (check, _) in bar.ticks.borrow().iter() {
+                if let Some(check) = check.upgrade() {
+                    check.set_inconsistent(false);
+                    check.set_active(tick);
+                }
+            }
+            for (check, _, _) in bar.hunk_ticks.borrow().iter() {
                 if let Some(check) = check.upgrade() {
                     check.set_active(tick);
                 }
@@ -1810,7 +1951,9 @@ impl DiffPanel {
             .uncommitted
             .set(self.begun_base.get() == DiffBase::Uncommitted);
         self.commit.listed.borrow_mut().clear();
+        self.commit.hunk_groups.borrow_mut().clear();
         self.commit.ticks.borrow_mut().clear();
+        self.commit.hunk_ticks.borrow_mut().clear();
         match result {
             Err(err) => self.show_status("at-dialog-warning-symbolic", "Git failed", &err, true),
             Ok(DiffOutcome::NotRepo) => self.show_status(
@@ -1947,9 +2090,11 @@ impl DiffPanel {
 
     /// A row's "include in the commit" tick box: ticked unless the user unticked this path.
     fn commit_tick(&self, path: &str) -> gtk4::CheckButton {
+        let (active, inconsistent) = self.commit.chosen_file_state(path);
         let check = gtk4::CheckButton::builder()
             .valign(gtk4::Align::Center)
-            .active(!self.commit.unticked.borrow().contains(path))
+            .active(active)
+            .inconsistent(inconsistent)
             .tooltip_text("Include in the commit")
             .build();
         check.add_css_class("diff-commit-tick");
@@ -1966,17 +2111,124 @@ impl DiffPanel {
             if bar.syncing.get() {
                 return;
             }
-            if check.is_active() {
+            let tick = check.is_active();
+            if tick {
                 bar.unticked.borrow_mut().remove(&owned);
             } else {
                 bar.unticked.borrow_mut().insert(owned.clone());
             }
+            bar.unticked_hunks.borrow_mut().remove(&owned);
+            bar.syncing.set(true);
+            check.set_inconsistent(false);
+            for (hcheck, p, _) in bar.hunk_ticks.borrow().iter() {
+                if p == &owned {
+                    if let Some(hcheck) = hcheck.upgrade() {
+                        hcheck.set_active(tick);
+                    }
+                }
+            }
+            bar.syncing.set(false);
             bar.sync(pushing.get());
         });
         self.commit
             .ticks
             .borrow_mut()
             .push((check.downgrade(), path.to_owned()));
+        check
+    }
+
+    /// One hunk's "include in the commit" tick box inside an expanded multi-hunk file row.
+    fn hunk_tick(
+        commit: &CommitData,
+        weak: WeakCommitBar,
+        pushing: &Rc<Cell<bool>>,
+        path: &str,
+        hunk: &agent_kit::diff::DiffHunk,
+    ) -> gtk4::CheckButton {
+        let key = hunk_key(hunk);
+        let unticked_file = commit.unticked.borrow().contains(path);
+        let unticked_hunk = commit
+            .unticked_hunks
+            .borrow()
+            .get(path)
+            .is_some_and(|s| s.contains(&key));
+        let label_text = format!("Hunk {}: {}", hunk.index + 1, hunk.header.trim());
+        let label = gtk4::Label::builder()
+            .label(&label_text)
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk4::pango::EllipsizeMode::End)
+            .css_classes(["monospace", "caption"])
+            .build();
+        let check = gtk4::CheckButton::builder()
+            .valign(gtk4::Align::Center)
+            .active(!unticked_file && !unticked_hunk)
+            .child(&label)
+            .tooltip_text(format!("Include hunk {} of {path}", hunk.index + 1))
+            .build();
+        check.add_css_class("diff-hunk-tick");
+        check.update_property(&[gtk4::accessible::Property::Label(&format!(
+            "Include hunk {} of {path} in the commit",
+            hunk.index + 1
+        ))]);
+        let pushing = Rc::clone(pushing);
+        let owned = path.to_owned();
+        let key_cb = key.clone();
+        check.connect_toggled(move |check| {
+            let Some(bar) = weak.upgrade() else {
+                return;
+            };
+            if bar.syncing.get() {
+                return;
+            }
+            let tick = check.is_active();
+            let keys: Vec<HunkKey> = bar
+                .hunk_groups
+                .borrow()
+                .get(&owned)
+                .map(|g| g.hunks.iter().map(hunk_key).collect())
+                .unwrap_or_default();
+            if tick {
+                let was_unticked = bar.unticked.borrow_mut().remove(&owned);
+                let mut map = bar.unticked_hunks.borrow_mut();
+                if was_unticked && keys.len() > 1 {
+                    let rest: BTreeSet<HunkKey> =
+                        keys.into_iter().filter(|k| k != &key_cb).collect();
+                    if !rest.is_empty() {
+                        map.insert(owned.clone(), rest);
+                    }
+                } else if let Some(set) = map.get_mut(&owned) {
+                    set.remove(&key_cb);
+                    if set.is_empty() {
+                        map.remove(&owned);
+                    }
+                }
+            } else {
+                let mut map = bar.unticked_hunks.borrow_mut();
+                let set = map.entry(owned.clone()).or_default();
+                set.insert(key_cb.clone());
+                if !keys.is_empty() && keys.iter().all(|k| set.contains(k)) {
+                    map.remove(&owned);
+                    bar.unticked.borrow_mut().insert(owned.clone());
+                }
+            }
+            let (active, inconsistent) = bar.chosen_file_state(&owned);
+            bar.syncing.set(true);
+            for (fcheck, p) in bar.ticks.borrow().iter() {
+                if p == &owned {
+                    if let Some(fcheck) = fcheck.upgrade() {
+                        fcheck.set_inconsistent(inconsistent);
+                        fcheck.set_active(active);
+                    }
+                }
+            }
+            bar.syncing.set(false);
+            bar.sync(pushing.get());
+        });
+        commit
+            .hunk_ticks
+            .borrow_mut()
+            .push((check.downgrade(), path.to_owned(), key));
         check
     }
 
@@ -2043,17 +2295,47 @@ impl DiffPanel {
             self.files.append(&folder_header(&folder, rows == 0));
             for index in files {
                 let stat = &diff.stats[index];
+                let (text, why_hidden) = texts[index].clone();
                 if self.commit.uncommitted.get() && committable(stat) {
                     self.commit.listed.borrow_mut().push(CommitFile {
                         path: stat.path.clone(),
                         old_path: stat.old_path.clone(),
                     });
+                    if why_hidden.is_none() && stat.old_path.is_none() {
+                        if let Some((header, hunks)) = agent_kit::diff::split_hunks(&text) {
+                            if !header.contains("\nnew file mode ")
+                                && !header.contains("\ndeleted file mode ")
+                            {
+                                if hunks.len() >= 2 {
+                                    self.commit.hunk_groups.borrow_mut().insert(
+                                        stat.path.clone(),
+                                        HunkFile {
+                                            chunk: text.clone(),
+                                            hunks,
+                                        },
+                                    );
+                                } else if let [only] = hunks.as_slice() {
+                                    // Two hunks shrunk to one: if that remaining hunk had been
+                                    // excluded, keep it excluded as a whole-file untick.
+                                    let excluded = self
+                                        .commit
+                                        .unticked_hunks
+                                        .borrow()
+                                        .get(&stat.path)
+                                        .is_some_and(|s| s.contains(&hunk_key(only)));
+                                    if excluded {
+                                        self.commit.unticked.borrow_mut().insert(stat.path.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-                let (text, why_hidden) = texts[index].clone();
                 self.files.append(&self.file_row(stat, text, why_hidden));
                 rows += 1;
             }
         }
+        self.commit.prune_hunk_choices();
         self.file_rows.set(rows);
         *self.chunks.borrow_mut() = by_stat;
 
@@ -2112,6 +2394,9 @@ impl DiffPanel {
         let colours = Rc::clone(&self.colours);
         let (edit, path) = (Rc::clone(&self.edit_handler), stat.path.clone());
         let review = self.review.clone();
+        let hunks = self.commit.hunk_groups.borrow().get(&stat.path).cloned();
+        let commit_weak = self.commit.downgrade();
+        let pushing = Rc::clone(&self.pr_pushing);
         expander.connect_expanded_notify(move |expander| {
             if !expander.is_expanded() || expander.child().is_some() {
                 return;
@@ -2129,7 +2414,34 @@ impl DiffPanel {
                     let view = file_view(&text, &colours.borrow());
                     open_at_ctrl_click(&view, &text, &path, &edit);
                     views.borrow_mut().push(view.clone());
-                    review.decorate(&path, &text, &view)
+                    let decorated = review.decorate(&path, &text, &view);
+                    if let Some(group) = &hunks {
+                        if let Some(bar) = commit_weak.upgrade() {
+                            let container = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+                            let list = gtk4::Box::builder()
+                                .orientation(gtk4::Orientation::Vertical)
+                                .spacing(2)
+                                .margin_start(6)
+                                .css_classes(["diff-hunks"])
+                                .build();
+                            for hunk in &group.hunks {
+                                list.append(&Self::hunk_tick(
+                                    &bar,
+                                    commit_weak.clone(),
+                                    &pushing,
+                                    &path,
+                                    hunk,
+                                ));
+                            }
+                            container.append(&list);
+                            container.append(&decorated);
+                            container.upcast()
+                        } else {
+                            decorated
+                        }
+                    } else {
+                        decorated
+                    }
                 }
             };
             expander.set_child(Some(&child));
@@ -2505,6 +2817,199 @@ pub(crate) mod tests {
         // The message draft is kept for the tab.
         panel.set_commit_draft("Half written");
         assert_eq!(panel.commit_draft(), "Half written");
+
+        per_hunk_ticks_build_patches_and_update_parent();
+    }
+
+    fn per_hunk_ticks_build_patches_and_update_parent() {
+        let panel = DiffPanel::new(&crate::theme::Theme::diff_colours(Default::default()));
+        let asked = Rc::new(RefCell::new(None));
+        let seen = Rc::clone(&asked);
+        panel.connect_commit(move |ask| *seen.borrow_mut() = Some(ask));
+        let repo = PathBuf::from("/repo");
+
+        let diff_text = "\
+diff --git a/multi.rs b/multi.rs
+index 1111111..2222222 100644
+--- a/multi.rs
++++ b/multi.rs
+@@ -1,3 +1,4 @@ fn one()
+ a
++b
+ c
+ d
+@@ -20,3 +21,2 @@ fn two()
+ x
+-y
+ z
+diff --git a/whole.rs b/whole.rs
+index 3333333..4444444 100644
+--- a/whole.rs
++++ b/whole.rs
+@@ -1,2 +1,3 @@
+ p
++q
+ r
+";
+        let numstat = b"1\t1\tmulti.rs\x001\t0\twhole.rs\0";
+        let generation = panel.begin();
+        panel.show(
+            generation,
+            Ok(DiffOutcome::Ready(TabDiff {
+                stats: crate::diff::parse_numstat(numstat),
+                text: diff_text.to_owned(),
+                omitted_lines: 0,
+                too_large: false,
+                undo_to: None,
+                from: "HEAD".into(),
+                to_checkpoint: None,
+            })),
+        );
+        panel.show_commit(generation, Some(repo), None);
+
+        assert_eq!(
+            panel
+                .commit
+                .hunk_groups
+                .borrow()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["multi.rs"]
+        );
+
+        let mut child = panel.files.first_child();
+        while let Some(widget) = child {
+            if let Ok(expander) = widget.clone().downcast::<gtk4::Expander>() {
+                expander.set_expanded(true);
+            }
+            child = widget.next_sibling();
+        }
+        let hticks = panel.commit.hunk_ticks.borrow().clone();
+        assert_eq!(hticks.len(), 2);
+        let h0 = hticks[0].0.upgrade().expect("hunk 0");
+        let h1 = hticks[1].0.upgrade().expect("hunk 1");
+        assert!(h0.is_active() && h1.is_active());
+
+        // Untick hunk 0: parent file checkbox turns inconsistent, partial patch is built.
+        h0.set_active(false);
+        let f_multi = panel.commit.ticks.borrow()[0]
+            .0
+            .upgrade()
+            .expect("file tick");
+        assert!(f_multi.is_inconsistent() && !f_multi.is_active());
+        assert!(panel.commit.all.is_inconsistent());
+        assert_eq!(
+            panel.commit_view().map(|v| v.0),
+            Some("2 of 2 files (selected hunks) to commit".to_owned())
+        );
+
+        panel.commit.button.emit_clicked();
+        let ask = asked.borrow_mut().take().expect("partial commit ask");
+        panel.set_preparing(false);
+        assert_eq!(
+            ask.files
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["whole.rs"]
+        );
+        assert_eq!(ask.patches.len(), 1);
+        assert_eq!(ask.patches[0].path, "multi.rs");
+        assert_eq!((ask.patches[0].chosen, ask.patches[0].total), (1, 2));
+        assert!(ask.patches[0].patch.contains("fn two()"));
+        assert!(!ask.patches[0].patch.contains("fn one()"));
+
+        // Untick hunk 1 too: multi.rs is excluded completely.
+        h1.set_active(false);
+        assert!(!f_multi.is_inconsistent() && !f_multi.is_active());
+        assert_eq!(
+            panel.commit_view().map(|v| v.0),
+            Some("1 of 2 files to commit".to_owned())
+        );
+
+        // Re-tick hunk 0 alone while whole file was unticked: hunk 1 stays off.
+        h0.set_active(true);
+        assert!(!h1.is_active());
+        assert!(f_multi.is_inconsistent());
+
+        // Re-tick whole file checkbox: both hunks re-tick and partial patches disappear.
+        f_multi.set_active(true);
+        assert!(h0.is_active() && h1.is_active());
+        assert!(!f_multi.is_inconsistent());
+        assert_eq!(
+            panel.commit_view().map(|v| v.0),
+            Some("All 2 files to commit".to_owned())
+        );
+
+        // Exclude hunk two by identity, then refresh with hunk one reverted (shifting +21 -> +20)
+        // and introducing a third hunk: exclusion stays on two even after its coordinates shift.
+        h1.set_active(false);
+        let diff_reverted = "\
+diff --git a/multi.rs b/multi.rs
+index 1111111..2222222 100644
+--- a/multi.rs
++++ b/multi.rs
+@@ -20,3 +20,2 @@ fn two()
+ x
+-y
+ z
+@@ -40,2 +39,3 @@ fn three()
+ m
++n
+ o
+";
+        let g2 = panel.begin();
+        panel.show(
+            g2,
+            Ok(DiffOutcome::Ready(TabDiff {
+                stats: crate::diff::parse_numstat(b"1\t1\tmulti.rs\0"),
+                text: diff_reverted.to_owned(),
+                omitted_lines: 0,
+                too_large: false,
+                undo_to: None,
+                from: "HEAD".into(),
+                to_checkpoint: None,
+            })),
+        );
+        panel.show_commit(g2, Some(PathBuf::from("/repo")), None);
+        panel.commit.button.emit_clicked();
+        let ask2 = asked.borrow_mut().take().expect("identity-preserved ask");
+        panel.set_preparing(false);
+        assert_eq!(ask2.patches.len(), 1);
+        assert!(ask2.patches[0].patch.contains("fn three()"));
+        assert!(!ask2.patches[0].patch.contains("fn two()"));
+
+        // Two hunks shrink to one while hunk two is still excluded: the remaining excluded hunk
+        // keeps the whole file unticked rather than silently re-selecting it.
+        let diff_single = "\
+diff --git a/multi.rs b/multi.rs
+index 1111111..2222222 100644
+--- a/multi.rs
++++ b/multi.rs
+@@ -20,3 +20,2 @@ fn two()
+ x
+-y
+ z
+";
+        let g3 = panel.begin();
+        panel.show(
+            g3,
+            Ok(DiffOutcome::Ready(TabDiff {
+                stats: crate::diff::parse_numstat(b"0\t1\tmulti.rs\0"),
+                text: diff_single.to_owned(),
+                omitted_lines: 0,
+                too_large: false,
+                undo_to: None,
+                from: "HEAD".into(),
+                to_checkpoint: None,
+            })),
+        );
+        panel.show_commit(g3, Some(PathBuf::from("/repo")), None);
+        assert_eq!(
+            panel.commit_view(),
+            Some((CommitOff::NothingChosen.reason().to_owned(), false, false))
+        );
     }
 
     /// A one-file diff of `path` whose hunk starts at `at` (rows: four header rows, the hunk,

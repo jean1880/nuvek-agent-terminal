@@ -9,7 +9,7 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use agent_core::commit_message::{self, MessageCheck};
 use agent_core::redact::redact;
-use agent_kit::commit::{CommitContext, CommitRequest};
+use agent_kit::commit::{CommitContext, CommitRequest, HunkPatch, PartialCommitRequest};
 use gtk4::glib;
 use tracing::{info, warn};
 
@@ -20,8 +20,25 @@ use crate::window::diff_panel::{CommitAsk, DiffPanel};
 /// At most this many files are named in the dialog; the rest are counted.
 const LISTED_FILES: usize = 12;
 
-/// Every path `ask` commits, renames' old paths included, each once and in the diff's order.
+/// Every path `ask` commits (whole files, renames' old paths, and partial-hunk files), each once
+/// and in the diff's order.
 pub(super) fn ask_paths(ask: &CommitAsk) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    for path in ask
+        .files
+        .iter()
+        .flat_map(|f| f.paths())
+        .chain(ask.patches.iter().map(|p| p.path.as_str()))
+    {
+        if !paths.iter().any(|p| p == path) {
+            paths.push(path.to_owned());
+        }
+    }
+    paths
+}
+
+/// Whole-file paths `ask` commits, renames' old paths included, each once and in the diff's order.
+pub(super) fn whole_paths(ask: &CommitAsk) -> Vec<String> {
     let mut paths: Vec<String> = Vec::new();
     for path in ask.files.iter().flat_map(|f| f.paths()) {
         if !paths.iter().any(|p| p == path) {
@@ -31,18 +48,23 @@ pub(super) fn ask_paths(ask: &CommitAsk) -> Vec<String> {
     paths
 }
 
-/// The dialog's file list: the chosen files, the first [`LISTED_FILES`] named.
+/// The dialog's file list: the chosen files (whole and partial-hunk), the first [`LISTED_FILES`] named.
 fn file_lines(ask: &CommitAsk) -> String {
-    let mut lines: Vec<String> = ask
+    let entries = ask
         .files
         .iter()
-        .take(LISTED_FILES)
         .map(|f| match &f.old_path {
             Some(old) => format!("{old} → {}", f.path),
             None => f.path.clone(),
         })
-        .collect();
-    let more = ask.files.len().saturating_sub(LISTED_FILES);
+        .chain(
+            ask.patches
+                .iter()
+                .map(|p| format!("{} ({} of {} hunks)", p.path, p.chosen, p.total)),
+        );
+    let total = ask.files.len() + ask.patches.len();
+    let mut lines: Vec<String> = entries.take(LISTED_FILES).collect();
+    let more = total.saturating_sub(LISTED_FILES);
     if more > 0 {
         lines.push(format!("… and {more} more"));
     }
@@ -52,7 +74,7 @@ fn file_lines(ask: &CommitAsk) -> String {
 /// What the dialog says about where the commit goes, what it leaves out and what stays staged.
 pub(super) fn context_lines(ctx: &CommitContext, ask: &CommitAsk) -> Vec<String> {
     let mut lines = Vec::new();
-    let chosen = ask.files.len();
+    let chosen = ask.files.len() + ask.patches.len();
     lines.push(match (&ctx.branch, ctx.unborn) {
         (Some(branch), true) => format!("The first commit on {branch}."),
         (Some(branch), false) => format!("On {branch}."),
@@ -64,6 +86,9 @@ pub(super) fn context_lines(ctx: &CommitContext, ask: &CommitAsk) -> Vec<String>
             "{chosen} of {} files; the {left} left unticked stay as they are.",
             ask.listed
         ));
+    }
+    if !ask.patches.is_empty() {
+        lines.push("Unselected hunks stay unstaged in your working tree.".into());
     }
     match ctx.staged_elsewhere.len() {
         0 => {}
@@ -99,44 +124,96 @@ pub(super) fn check_words(check: &MessageCheck) -> String {
     words.join(" ")
 }
 
-/// The two commands a commit runs, as the confirmation shows them, built from the very argument
+/// The commands a commit runs, as the confirmation shows them, built from the very argument
 /// lists the commit runs. Everything but the message depends on the paths alone, so it is
 /// written once; each keystroke only quotes the message.
 pub(super) struct ShownCommit {
-    add: String,
+    before_commit: Vec<String>,
     before_message: String,
     after_message: String,
+    after_commit: Option<String>,
 }
 
 impl ShownCommit {
-    pub(super) fn new(paths: &[String]) -> Self {
-        use agent_kit::commit::{add_args, commit_args, Expected, MESSAGE_ARG};
-        let args = commit_args(&CommitRequest {
-            message: String::new(),
-            paths: paths.to_vec(),
-            expected: Expected {
-                branch: None,
-                head: None,
-            },
-        });
+    pub(super) fn new(whole_paths: &[String], patches: &[HunkPatch]) -> Self {
+        use agent_kit::commit::{
+            add_args, apply_cached_args, commit_args, index_commit_args, Expected, MESSAGE_ARG,
+        };
+        if patches.is_empty() {
+            let args = commit_args(&CommitRequest {
+                message: String::new(),
+                paths: whole_paths.to_vec(),
+                expected: Expected {
+                    branch: None,
+                    head: None,
+                },
+            });
+            return Self {
+                before_commit: vec![commit_message::shown_command(&add_args(whole_paths))],
+                before_message: commit_message::shown_command(&args[..MESSAGE_ARG]),
+                after_message: args[MESSAGE_ARG + 1..]
+                    .iter()
+                    .map(|arg| format!(" {}", commit_message::shown_arg(arg)))
+                    .collect(),
+                after_commit: None,
+            };
+        }
+        let mut before_commit = vec![format!(
+            "{}  # in a temporary GIT_INDEX_FILE",
+            commit_message::shown_command(&[
+                "--literal-pathspecs".to_owned(),
+                "read-tree".to_owned(),
+                "HEAD".to_owned(),
+            ])
+        )];
+        if !whole_paths.is_empty() {
+            before_commit.push(commit_message::shown_command(&add_args(whole_paths)));
+        }
+        let apply_cmd = commit_message::shown_command(&apply_cached_args());
+        for patch in patches {
+            before_commit.push(format!(
+                "{apply_cmd}  # {} ({} of {} hunks)",
+                patch.path, patch.chosen, patch.total
+            ));
+        }
+        let mut reset_args = vec![
+            "--literal-pathspecs".to_owned(),
+            "reset".to_owned(),
+            "-q".to_owned(),
+            "HEAD".to_owned(),
+            "--".to_owned(),
+        ];
+        reset_args.extend(whole_paths.iter().cloned());
+        for patch in patches {
+            if !whole_paths.iter().any(|p| p == &patch.path) {
+                reset_args.push(patch.path.clone());
+            }
+        }
+        let args = index_commit_args("");
         Self {
-            add: commit_message::shown_command(&add_args(paths)),
+            before_commit,
             before_message: commit_message::shown_command(&args[..MESSAGE_ARG]),
             after_message: args[MESSAGE_ARG + 1..]
                 .iter()
                 .map(|arg| format!(" {}", commit_message::shown_arg(arg)))
                 .collect(),
+            after_commit: Some(commit_message::shown_command(&reset_args)),
         }
     }
 
     pub(super) fn text(&self, message: &str) -> String {
-        format!(
-            "{}\n{} {}{}",
-            self.add,
+        let commit_line = format!(
+            "{} {}{}",
             self.before_message,
             commit_message::shown_arg(message),
             self.after_message
-        )
+        );
+        let mut parts = self.before_commit.clone();
+        parts.push(commit_line);
+        if let Some(after) = &self.after_commit {
+            parts.push(after.clone());
+        }
+        parts.join("\n")
     }
 }
 
@@ -156,7 +233,6 @@ pub(super) struct CommitDialog {
 pub(super) fn commit_dialog(
     ctx: &CommitContext,
     ask: &CommitAsk,
-    paths: &[String],
     draft: &str,
     can_draft: bool,
 ) -> CommitDialog {
@@ -224,7 +300,8 @@ pub(super) fn commit_dialog(
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
 
-    let shown = ShownCommit::new(paths);
+    let whole = whole_paths(ask);
+    let shown = ShownCommit::new(&whole, &ask.patches);
     let update = glib::clone!(
         #[weak]
         dialog,
@@ -312,7 +389,10 @@ impl AgentTerminalWindow {
                 return;
             }
             let expected = ctx.expected();
-            let parts = commit_dialog(&ctx, &ask, &paths, &panel.commit_draft(), view.is_some());
+            let parts = commit_dialog(&ctx, &ask, &panel.commit_draft(), view.is_some());
+            let whole = whole_paths(&ask);
+            let patches = ask.patches.clone();
+            let repo = ask.repo.clone();
             let message = parts.message.clone();
             parts.dialog.present(Some(&parent));
             message.grab_focus();
@@ -332,18 +412,14 @@ impl AgentTerminalWindow {
                         }
                     }
                     "commit" => {
-                        let request = CommitRequest {
+                        let request = PartialCommitRequest {
                             message: text,
-                            paths: paths.clone(),
+                            paths: whole.clone(),
+                            patches: patches.clone(),
                             expected: expected.clone(),
                         };
-                        obj.imp().confirm_and_commit(
-                            &page,
-                            &panel,
-                            &parent,
-                            ask.repo.clone(),
-                            request,
-                        );
+                        obj.imp()
+                            .confirm_and_commit(&page, &panel, &parent, repo.clone(), request);
                     }
                     _ => {}
                 }
@@ -359,7 +435,7 @@ impl AgentTerminalWindow {
         panel: &DiffPanel,
         parent: &gtk4::Widget,
         repo: std::path::PathBuf,
-        request: CommitRequest,
+        request: PartialCommitRequest,
     ) {
         let (page, panel, parent) = (page.clone(), panel.clone(), parent.clone());
         let obj = self.obj().downgrade();
@@ -380,7 +456,7 @@ impl AgentTerminalWindow {
             }
             panel.set_committing(true);
             let done = off_main("the commit", move || {
-                agent_kit::commit::commit_paths(&repo, &request)
+                agent_kit::commit::commit_partial(&repo, &request)
             })
             .await;
             panel.set_committing(false);
@@ -421,6 +497,7 @@ pub(super) mod tests {
                     old_path: o.map(str::to_owned),
                 })
                 .collect(),
+            patches: Vec::new(),
             listed,
         }
     }
@@ -466,9 +543,9 @@ pub(super) mod tests {
 
     #[test]
     fn the_shown_commands_are_the_ones_that_run() {
-        use agent_kit::commit::{add_args, commit_args};
+        use agent_kit::commit::{add_args, apply_cached_args, commit_args, index_commit_args};
         let paths: Vec<String> = vec!["a.rs".into(), "-odd".into(), "it's *".into()];
-        let shown = ShownCommit::new(&paths);
+        let shown = ShownCommit::new(&paths, &[]);
         for message in ["Fix it\n\nWhy.", "-n", "it's $HOME", ""] {
             let request = CommitRequest {
                 message: message.into(),
@@ -486,16 +563,53 @@ pub(super) mod tests {
                 "{message:?}"
             );
         }
+        let patches = vec![HunkPatch {
+            path: "b.rs".into(),
+            patch: "--- a/b.rs\n+++ b/b.rs\n@@ -1 +1 @@\n-a\n+b\n".into(),
+            chosen: 1,
+            total: 2,
+        }];
+        let shown_partial = ShownCommit::new(&paths, &patches);
+        let text = shown_partial.text("Partial fix");
+        assert!(text.contains("read-tree HEAD"));
+        assert!(text.contains(&commit_message::shown_command(&add_args(&paths))));
+        assert!(text.contains(&commit_message::shown_command(&apply_cached_args())));
+        assert!(text.contains("b.rs (1 of 2 hunks)"));
+        assert!(
+            text.contains(&commit_message::shown_command(&index_commit_args(
+                "Partial fix"
+            )))
+        );
+        assert!(text.contains("reset -q HEAD --"));
+
         assert!(check_words(&commit_message::check("ok")).is_empty());
         assert!(check_words(&commit_message::check("")).contains("Write a message"));
+    }
+
+    #[test]
+    fn partial_hunk_ask_lists_hunk_counts_and_paths() {
+        let mut a = ask(&[("whole.rs", None)], 2);
+        a.patches.push(HunkPatch {
+            path: "part.rs".into(),
+            patch: "p".into(),
+            chosen: 2,
+            total: 3,
+        });
+        assert_eq!(whole_paths(&a), vec!["whole.rs"]);
+        assert_eq!(ask_paths(&a), vec!["whole.rs", "part.rs"]);
+        assert_eq!(file_lines(&a), "whole.rs\npart.rs (2 of 3 hunks)");
+        let lines = context_lines(&ctx(Some("feat/x"), &[]), &a);
+        assert!(lines
+            .iter()
+            .any(|l| l == "Unselected hunks stay unstaged in your working tree."));
     }
 
     /// GTK: run from the window's construction test. Commit is off while the message is empty
     /// and the commands follow what is typed; the draft comes back; the branch warning shows.
     pub(crate) fn the_commit_dialog_follows_its_message() {
         let a = ask(&[("a.rs", None)], 1);
-        let paths = ask_paths(&a);
-        let parts = commit_dialog(&ctx(Some("main"), &[]), &a, &paths, "", true);
+        let paths = whole_paths(&a);
+        let parts = commit_dialog(&ctx(Some("main"), &[]), &a, "", true);
         assert!(!parts.dialog.is_response_enabled("commit"));
         assert!(parts.dialog.has_response("draft"));
         assert!(parts.check.text().contains("Write a message"));
@@ -503,11 +617,11 @@ pub(super) mod tests {
         assert!(parts.dialog.is_response_enabled("commit"));
         assert_eq!(
             parts.commands.text().as_str(),
-            ShownCommit::new(&paths).text("Fix it")
+            ShownCommit::new(&paths, &[]).text("Fix it")
         );
         assert!(!parts.check.is_visible());
 
-        let parts = commit_dialog(&ctx(None, &[]), &a, &paths, "Kept draft", false);
+        let parts = commit_dialog(&ctx(None, &[]), &a, "Kept draft", false);
         assert_eq!(text_of(&parts.message), "Kept draft");
         assert!(parts.dialog.is_response_enabled("commit"));
         assert!(!parts.dialog.has_response("draft"), "no thread, no draft");

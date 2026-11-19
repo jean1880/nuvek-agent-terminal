@@ -338,6 +338,34 @@ fn listed_worktree(porcelain: &str, path: &Path, branch: &str) -> bool {
     })
 }
 
+fn worktree_for_branch(porcelain: &str, branch: &str) -> Option<PathBuf> {
+    let wanted_ref = format!("refs/heads/{}", branch.trim());
+    porcelain.split("\n\n").find_map(|record| {
+        let mut path = None;
+        let mut matched = false;
+        for line in record.lines() {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                path = Some(PathBuf::from(p));
+            } else if let Some(b) = line.strip_prefix("branch ") {
+                matched = b == wanted_ref;
+            }
+        }
+        matched.then_some(path).flatten()
+    })
+}
+
+/// Returns the working-tree path that currently has `branch` checked out, if any checkout in the
+/// repository holds it. `Err` if `git worktree list` fails.
+pub fn checkout_of(main_toplevel: &Path, branch: &str) -> Result<Option<PathBuf>, String> {
+    let out = git_raw(
+        main_toplevel,
+        ["worktree", "list", "--porcelain"],
+        &[],
+        QUERY_TIMEOUT_SECS,
+    )?;
+    Ok(worktree_for_branch(&String::from_utf8_lossy(&out), branch))
+}
+
 /// Why removing the worktree `info` would not be offered, or `None` when it may be: it must still
 /// be registered on its branch ([`is_registered`]) and hold nothing that removing it would lose
 /// ([`is_clean`]). A question git cannot answer is a reason too, never taken as clean. Whether a

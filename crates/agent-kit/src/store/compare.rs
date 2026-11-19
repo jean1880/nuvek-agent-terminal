@@ -37,6 +37,20 @@ pub enum KeepOutcome {
     Refused(String),
 }
 
+/// What [`Store::keep_compare_group`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeptGroup {
+    pub archived: Vec<String>,
+    pub worktrees: Vec<(String, crate::worktree::WorktreeInfo)>,
+}
+
+/// [`Store::keep_compare_group`]'s answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeepGroupOutcome {
+    Kept(KeptGroup),
+    Refused(String),
+}
+
 /// The notice Keep This One writes into the kept thread, naming the archived one by its stored
 /// (already scrubbed) title.
 pub fn kept_notice(other_title: &str) -> String {
@@ -133,17 +147,22 @@ impl Store {
         }))
     }
 
+    /// The sequence number of `thread`'s last stored event (`0` if empty).
+    pub fn max_seq(&self, thread: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM events WHERE thread_id = ?1",
+            params![thread],
+            |r| r.get(0),
+        )?)
+    }
+
     /// `thread`'s transcript (what a fork's hand-off is built from) and the sequence number of
     /// its last stored event, read together: the fork point is exactly where the transcript
     /// ends.
     pub fn transcript_at_fork(&self, thread: &str) -> Result<(Vec<TranscriptMessage>, i64)> {
         let snapshot = self.scope(rusqlite::TransactionBehavior::Deferred)?;
         let messages = self.transcript_messages(thread)?;
-        let last: i64 = self.conn.query_row(
-            "SELECT COALESCE(MAX(seq), 0) FROM events WHERE thread_id = ?1",
-            params![thread],
-            |r| r.get(0),
-        )?;
+        let last = self.max_seq(thread)?;
         snapshot.commit()?;
         Ok((messages, last))
     }
@@ -309,6 +328,217 @@ impl Store {
                 })
             })
             .collect())
+    }
+
+    /// Saves `group` under `compare_group:<id>` (redacted on write) and links every participant
+    /// thread via `compare_of:<thread_id>` in a single transaction.
+    pub fn save_compare_group(&self, group: &agent_core::ask_several::CompareGroup) -> Result<()> {
+        let mut scrubbed = group.clone();
+        scrubbed.prompt_preview = agent_core::redact::redact(&scrubbed.prompt_preview);
+        let json = scrubbed.to_json();
+        self.atomically(|s| {
+            s.set_meta(
+                &agent_core::ask_several::group_meta_key(&scrubbed.id),
+                &json,
+            )?;
+            for p in &scrubbed.participants {
+                s.set_meta(
+                    &agent_core::ask_several::participant_meta_key(&p.thread_id),
+                    &scrubbed.id,
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Reads the [`agent_core::ask_several::CompareGroup`] recorded under `group_id`, if valid.
+    pub fn compare_group(
+        &self,
+        group_id: &str,
+    ) -> Result<Option<agent_core::ask_several::CompareGroup>> {
+        Ok(self
+            .meta(&agent_core::ask_several::group_meta_key(group_id))?
+            .and_then(|json| agent_core::ask_several::CompareGroup::from_json(&json)))
+    }
+
+    /// Returns the compare group that participant `thread` belongs to, if any.
+    pub fn compare_group_for_thread(
+        &self,
+        thread: &str,
+    ) -> Result<Option<agent_core::ask_several::CompareGroup>> {
+        let Some(group_id) = self.meta(&agent_core::ask_several::participant_meta_key(thread))?
+        else {
+            return Ok(None);
+        };
+        self.compare_group(&group_id)
+    }
+
+    /// Returns all compare groups whose `source_thread` matches `source`, newest first.
+    pub fn compare_groups_for_source(
+        &self,
+        source: &str,
+    ) -> Result<Vec<agent_core::ask_several::CompareGroup>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value FROM meta WHERE key LIKE 'compare_group:%'")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut groups = Vec::new();
+        for row in rows {
+            if let Some(group) = agent_core::ask_several::CompareGroup::from_json(&row?) {
+                if group.source_thread == source {
+                    groups.push(group);
+                }
+            }
+        }
+        groups.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        Ok(groups)
+    }
+
+    /// Records `kept_thread` as the chosen participant of `group_id`. Refuses if already settled.
+    pub fn mark_compare_group_kept(&self, group_id: &str, kept_thread: &str) -> Result<()> {
+        let key = agent_core::ask_several::group_meta_key(group_id);
+        self.atomically(|s| {
+            let Some(mut group) = s
+                .meta(&key)?
+                .and_then(|json| agent_core::ask_several::CompareGroup::from_json(&json))
+            else {
+                return Err(StoreError::NotFound(format!("compare group {group_id}")));
+            };
+            if group.kept_thread.is_some() {
+                return Err(StoreError::Failed(
+                    "another participant has already been kept".to_owned(),
+                ));
+            }
+            if !group
+                .participants
+                .iter()
+                .any(|p| p.thread_id == kept_thread)
+            {
+                return Err(StoreError::Failed(format!(
+                    "thread {kept_thread} is not a participant of {group_id}"
+                )));
+            }
+            group.kept_thread = Some(kept_thread.to_owned());
+            s.set_meta(&key, &group.to_json())
+        })
+    }
+
+    /// Atomically keeps `kept_thread` in `group_id`: verifies the group is still unsettled, the
+    /// winner exists and is not archived, archives every remaining live non-archived participant,
+    /// records `kept_thread`, and appends `notice_text` to `source_thread` when
+    /// `write_source_notice` is set.
+    pub fn keep_compare_group(
+        &self,
+        group_id: &str,
+        kept_thread: &str,
+        notice_text: &str,
+        write_source_notice: bool,
+    ) -> Result<KeepGroupOutcome> {
+        let key = agent_core::ask_several::group_meta_key(group_id);
+        self.atomically(|s| {
+            let Some(mut group) = s
+                .meta(&key)?
+                .and_then(|json| agent_core::ask_several::CompareGroup::from_json(&json))
+            else {
+                return Ok(KeepGroupOutcome::Refused(
+                    "This comparison group no longer exists".to_owned(),
+                ));
+            };
+            if group.kept_thread.is_some() {
+                return Ok(KeepGroupOutcome::Refused(
+                    "Another answer in this group was already kept".to_owned(),
+                ));
+            }
+            if !group
+                .participants
+                .iter()
+                .any(|p| p.thread_id == kept_thread)
+            {
+                return Ok(KeepGroupOutcome::Refused(
+                    "That thread is not part of this comparison group".to_owned(),
+                ));
+            }
+            let Some(kept_summary) = s
+                .thread_summary(kept_thread)?
+                .filter(|_| !s.is_hidden_child_thread(kept_thread).unwrap_or(true))
+            else {
+                return Ok(KeepGroupOutcome::Refused(
+                    "The chosen participant thread no longer exists".to_owned(),
+                ));
+            };
+            if kept_summary.archived {
+                return Ok(KeepGroupOutcome::Refused(
+                    "The chosen participant is already archived".to_owned(),
+                ));
+            }
+
+            let mut archived = Vec::new();
+            let mut worktrees = Vec::new();
+            for p in &group.participants {
+                if p.thread_id == kept_thread {
+                    continue;
+                }
+                let Some(summary) = s
+                    .thread_summary(&p.thread_id)?
+                    .filter(|_| !s.is_hidden_child_thread(&p.thread_id).unwrap_or(true))
+                else {
+                    continue;
+                };
+                if summary.archived {
+                    continue;
+                }
+                let wt = s.thread_attributes(&p.thread_id)?.worktree;
+                s.set_archived(&p.thread_id, true)?;
+                archived.push(p.thread_id.clone());
+                if let Some(info) = wt {
+                    worktrees.push((p.thread_id.clone(), info));
+                }
+            }
+
+            group.kept_thread = Some(kept_thread.to_owned());
+            s.set_meta(&key, &group.to_json())?;
+
+            if write_source_notice && s.thread_summary(&group.source_thread)?.is_some() {
+                let pt = s.active_provider_thread(&group.source_thread)?;
+                s.append_event(
+                    &group.source_thread,
+                    pt.as_deref(),
+                    &Envelope::new(Event::Notice {
+                        text: notice_text.to_owned(),
+                    }),
+                )?;
+            }
+
+            Ok(KeepGroupOutcome::Kept(KeptGroup {
+                archived,
+                worktrees,
+            }))
+        })
+    }
+
+    /// Reverses [`Self::keep_compare_group`]: unarchives `archived` participants and clears
+    /// `kept_thread` on `group_id`.
+    pub fn undo_keep_compare_group(&self, group_id: &str, archived: &[String]) -> Result<()> {
+        let key = agent_core::ask_several::group_meta_key(group_id);
+        self.atomically(|s| {
+            if let Some(mut group) = s
+                .meta(&key)?
+                .and_then(|json| agent_core::ask_several::CompareGroup::from_json(&json))
+            {
+                group.kept_thread = None;
+                s.set_meta(&key, &group.to_json())?;
+            }
+            for id in archived {
+                if s.thread_summary(id)?.is_some() {
+                    s.set_archived(id, false)?;
+                }
+            }
+            Ok(())
+        })
     }
 }
 
@@ -742,5 +972,87 @@ mod tests {
                 entries: Vec::new()
             }]
         );
+    }
+
+    #[test]
+    fn compare_group_persists_redacted_and_links_participants() {
+        use agent_core::adapter::Driver;
+        use agent_core::ask_several::{participant_meta_key, CompareGroup, CompareParticipant};
+        let s = Store::open_in_memory().expect("store");
+        thread(&s, "src", None);
+        thread(&s, "p1", Some(link("src", 1)));
+        thread(&s, "p2", Some(link("src", 1)));
+        let group = CompareGroup {
+            id: "g1".into(),
+            source_thread: "src".into(),
+            prompt_preview: "Inspect ghp_1234567890abcdefghijklmnopqrstuvwx".into(),
+            created_at: 100,
+            participants: vec![
+                CompareParticipant {
+                    thread_id: "p1".into(),
+                    label: "Claude".into(),
+                    driver: Driver::Claude,
+                    profile_id: None,
+                    model: None,
+                    after_seq: 1,
+                },
+                CompareParticipant {
+                    thread_id: "p2".into(),
+                    label: "Codex".into(),
+                    driver: Driver::Codex,
+                    profile_id: None,
+                    model: None,
+                    after_seq: 1,
+                },
+            ],
+            kept_thread: None,
+        };
+        s.save_compare_group(&group).expect("save");
+        let by_thread = s
+            .compare_group_for_thread("p1")
+            .expect("lookup")
+            .expect("present");
+        assert!(!by_thread.prompt_preview.contains("ghp_"));
+        assert_eq!(s.compare_groups_for_source("src").expect("list").len(), 1);
+        let KeepGroupOutcome::Kept(done) = s
+            .keep_compare_group("g1", "p2", "Kept Codex answer", true)
+            .expect("keep")
+        else {
+            panic!("expected Kept");
+        };
+        assert_eq!(done.archived, vec!["p1".to_owned()]);
+        assert_eq!(
+            s.compare_group("g1")
+                .expect("read")
+                .and_then(|g| g.kept_thread),
+            Some("p2".to_owned())
+        );
+        // Concurrent second keep is refused without mutating kept_thread or archiving p2.
+        assert!(matches!(
+            s.keep_compare_group("g1", "p1", "Other", true)
+                .expect("second"),
+            KeepGroupOutcome::Refused(_)
+        ));
+        assert!(
+            !s.thread_summary("p2").unwrap().unwrap().archived,
+            "winner must not be archived by a stale concurrent keep"
+        );
+        s.undo_keep_compare_group("g1", &done.archived)
+            .expect("undo");
+        assert!(
+            s.compare_group("g1")
+                .unwrap()
+                .unwrap()
+                .kept_thread
+                .is_none(),
+            "undo clears kept_thread"
+        );
+        assert!(
+            !s.thread_summary("p1").unwrap().unwrap().archived,
+            "undo restores archived participant"
+        );
+
+        s.delete_thread("p1").expect("delete participant");
+        assert!(s.meta(&participant_meta_key("p1")).expect("meta").is_none());
     }
 }

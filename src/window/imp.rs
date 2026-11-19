@@ -3,6 +3,7 @@
 mod agents_prefs;
 mod animated_menu;
 mod announce;
+mod ask_several;
 mod closing;
 mod commit;
 mod diff_prefs;
@@ -5513,6 +5514,27 @@ impl AgentTerminalWindow {
             |c| &c.worktree_root,
             |c, dir| c.worktree_root = dir,
         );
+        let merge_method_row = self.choice_row(
+            "Default Merge Method",
+            "How Merge into Base combines a worktree branch by default; you can still change \
+             it per merge in the confirmation dialog",
+            agent_kit::merge::MergeMethod::ALL
+                .iter()
+                .map(|m| (*m, m.label().to_owned()))
+                .collect(),
+            config.default_merge_method,
+            |imp, choice| {
+                let Some(method) = choice else {
+                    return;
+                };
+                if imp.config.borrow().default_merge_method == method {
+                    return;
+                }
+                imp.config.borrow_mut().default_merge_method = method;
+                imp.schedule_config_save();
+            },
+        );
+        Self::keep_value_whole(&merge_method_row);
 
         // Pages by what a setting touches: the app as a whole, the agents (added below), git, and
         // the terminal pages and drawer.
@@ -5638,6 +5660,7 @@ impl AgentTerminalWindow {
             .build();
         history.add(&checkpoints_row);
         history.add(&worktree_root_row);
+        history.add(&merge_method_row);
         git.add(&history);
         self.add_diff_tool_group(&git);
         self.add_editor_group(&git);
@@ -9602,6 +9625,7 @@ mod tests {
         crate::chat::view::tests::reasoning_ui_checks();
         crate::chat::view::tests::subagent_ui_checks();
         thread_menu::tests::gtk_checks();
+        ask_several::tests::gtk_checks(&window);
         animated_menu::tests::gtk_checks();
         let menu = window.imp().build_new_menu();
         assert_eq!(

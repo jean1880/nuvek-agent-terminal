@@ -92,6 +92,8 @@ pub enum ViewAction {
     ForkInWorktree,
     /// `/compare`: this thread beside a fork of it (or its source).
     CompareForks,
+    /// `/ask`: ask several agents at once in parallel forks.
+    AskSeveral(Option<String>),
     /// `/rewind`.
     Rewind,
     /// `/compact` on an agent with no compaction command: continue in a fresh thread of the same
@@ -1832,6 +1834,11 @@ impl Inner {
                 }
             },
             BuiltinAction::CompareForks => self.emit(ViewAction::CompareForks),
+            BuiltinAction::AskSeveral => {
+                let draft = args.trim();
+                let initial = (!draft.is_empty()).then(|| draft.to_owned());
+                self.emit(ViewAction::AskSeveral(initial));
+            }
             BuiltinAction::Rewind => self.emit(ViewAction::Rewind),
             BuiltinAction::NewThread => self.emit(ViewAction::NewThread),
             BuiltinAction::Schedule => {
@@ -1976,6 +1983,14 @@ fn help_text(caps: &agent_core::caps::Capabilities, agent: &str) -> String {
 }
 
 impl ComposerHost for Inner {
+    fn ask_several(&self, draft: &str) {
+        if let Some(me) = self.view().and_then(|v| v.inner()) {
+            let trimmed = draft.trim();
+            let initial = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+            me.emit(ViewAction::AskSeveral(initial));
+        }
+    }
+
     fn submit(&self, text: &str) {
         self.submit_input(crate::chat::PromptInput::text(text));
     }
@@ -7032,6 +7047,19 @@ pub(crate) mod tests {
                 BuiltinAction::CompareForks,
                 "{driver:?}"
             );
+        }
+    }
+
+    /// `/ask` is a built-in for every agent, run locally, never sent as plain text.
+    #[test]
+    fn slash_ask_is_a_local_builtin_for_every_agent() {
+        use agent_core::adapter::Driver;
+        for driver in Driver::ALL {
+            let caps = agent_core::caps::Capabilities::of(driver);
+            let line =
+                typeahead::parse_command_line("/ask Review diff", &caps).expect("a built-in");
+            assert_eq!(line.builtin.action, BuiltinAction::AskSeveral, "{driver:?}");
+            assert_eq!(line.args.trim(), "Review diff");
         }
     }
 

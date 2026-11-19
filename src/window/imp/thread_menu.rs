@@ -250,7 +250,7 @@ impl AgentTerminalWindow {
         };
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
-            let (has_messages, forks) = store_job({
+            let (has_messages, forks, compare_group) = store_job({
                 let thread = thread.clone();
                 move |store| {
                     (
@@ -258,11 +258,20 @@ impl AgentTerminalWindow {
                         store
                             .fork_pairings(&thread)
                             .is_ok_and(|pairings| !pairings.is_empty()),
+                        store
+                            .compare_group_for_thread(&thread)
+                            .ok()
+                            .flatten()
+                            .is_some()
+                            || !store
+                                .compare_groups_for_source(&thread)
+                                .unwrap_or_default()
+                                .is_empty(),
                     )
                 }
             })
             .await
-            .unwrap_or((false, false));
+            .unwrap_or((false, false, false));
             let Some(obj) = obj.upgrade() else { return };
             let imp = obj.imp();
             let Some(summary) = imp.summary_of(&thread) else {
@@ -276,6 +285,7 @@ impl AgentTerminalWindow {
                 tagged: !summary.tags.is_empty(),
                 has_messages,
                 forks,
+                compare_group,
                 agents: imp.menu_agents(),
                 remote,
             };
@@ -345,6 +355,7 @@ impl AgentTerminalWindow {
                 }
             }
             ThreadAction::CompareForks(thread) => self.compare_with_fork(&thread),
+            ThreadAction::CompareGroup(thread) => self.open_compare_group_for(&thread),
             ThreadAction::Rename(thread) => self.prompt_rename(&thread),
             ThreadAction::Pin(thread) => self.change_pin(&thread, PinChange::Pin { at: None }),
             ThreadAction::Unpin(thread) => self.change_pin(&thread, PinChange::Unpin),
@@ -1385,6 +1396,7 @@ pub(super) mod tests {
             tagged: false,
             has_messages: false,
             forks: false,
+            compare_group: false,
             remote: false,
             agents: vec![MenuAgent {
                 driver: Driver::Claude,
@@ -1492,6 +1504,7 @@ pub(super) mod tests {
         // A fork (or a thread that was forked) offers Compare with Fork… beside the fork entries.
         let forked = ThreadMenuInput {
             forks: true,
+            compare_group: true,
             ..none
         };
         let menu = to_gio_menu(&thread_menu(&forked));
@@ -1499,6 +1512,8 @@ pub(super) mod tests {
         let section = model.item_link(0, "section").expect("first section");
         assert_eq!(gio_menu_labels_of(&section)[4], "Compare with Fork…");
         assert_eq!(action_of(&section, 4).as_deref(), Some(ACTION));
+        assert_eq!(gio_menu_labels_of(&section)[5], "Compare Group…");
+        assert_eq!(action_of(&section, 5).as_deref(), Some(ACTION));
     }
 
     /// Each menu choice, carried out on a real window and store, does what its label says and

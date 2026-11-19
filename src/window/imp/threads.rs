@@ -215,7 +215,11 @@ pub(super) fn thread_owner(thread: &str) -> Option<super::super::AgentTerminalWi
     })
 }
 
-fn save_pending_prompt(store: &Store, thread: &str, prompt: &str) -> agent_kit::store::Result<()> {
+pub(super) fn save_pending_prompt(
+    store: &Store,
+    thread: &str,
+    prompt: &str,
+) -> agent_kit::store::Result<()> {
     store.set_pending_prompt(thread, prompt)
 }
 
@@ -1366,10 +1370,10 @@ impl ChatBackend for SessionSlot {
 
 /// Settings carried to a new thread. Bypass is always reduced to its safe mode.
 #[derive(Debug, PartialEq, Eq)]
-struct CarriedSettings {
-    model: Option<String>,
-    effort: Option<String>,
-    mode: Option<Mode>,
+pub(super) struct CarriedSettings {
+    pub(super) model: Option<String>,
+    pub(super) effort: Option<String>,
+    pub(super) mode: Option<Mode>,
 }
 
 fn carried_settings(
@@ -1386,7 +1390,7 @@ fn carried_settings(
 
 /// [`carried_settings`] with what the live thread did not say taken from its store: the provider
 /// thread's model and the mode last chosen in its history.
-fn carried_with_stored(
+pub(super) fn carried_with_stored(
     model: Option<String>,
     effort: Option<String>,
     mode: Option<Mode>,
@@ -1922,18 +1926,18 @@ pub(super) enum CreationNotice {
     Compact(String),
 }
 
-struct CreatedThread {
-    notice: Option<CreationNotice>,
-    driver: Driver,
-    prompt: Option<String>,
-    effort: Option<String>,
+pub(super) struct CreatedThread {
+    pub(super) notice: Option<CreationNotice>,
+    pub(super) driver: Driver,
+    pub(super) prompt: Option<String>,
+    pub(super) effort: Option<String>,
     /// It carries a handoff (stored with it): the page is not blank before its session starts.
-    handoff: bool,
-    title: Option<String>,
-    profile_id: Option<String>,
-    worktree: Option<crate::worktree::WorktreeInfo>,
+    pub(super) handoff: bool,
+    pub(super) title: Option<String>,
+    pub(super) profile_id: Option<String>,
+    pub(super) worktree: Option<crate::worktree::WorktreeInfo>,
     /// The mode it was created in (stored as its choice), known before its page is built.
-    mode: Option<Mode>,
+    pub(super) mode: Option<Mode>,
 }
 
 /// Stores a NEW thread from `spec` under ids made beforehand (what the store writer runs): the
@@ -2156,7 +2160,7 @@ fn decide_live_model(
 /// [`decide_live_model`] against the list of `source`, the model server (or, `None`, the vendor)
 /// the thread's profile runs `driver` on ([`profile_source`]): a thread is only ever judged by a
 /// list it can use.
-fn live_model(
+pub(super) fn live_model(
     driver: Driver,
     source: Option<&crate::model_catalog::ServerSource>,
     model: Option<String>,
@@ -2408,7 +2412,7 @@ fn remote_agent_launch(
 
 /// What a thread page needs from the store to be built, read in one off-thread job.
 #[derive(Default)]
-struct LoadedThread {
+pub(super) struct LoadedThread {
     pending_prompt: Option<String>,
     /// Stored events, each with the agent that produced it when the store knows.
     history: Vec<(Option<Driver>, Envelope)>,
@@ -2438,7 +2442,7 @@ fn load_provider(
 /// A store error fails the whole load: a thread read as empty with no provider would start a
 /// fresh session and re-point the thread at it, losing the one it had.
 #[cfg_attr(not(test), allow(dead_code))] // the app goes through `load_thread_with`
-fn load_thread(
+pub(super) fn load_thread(
     store: &Store,
     thread: &str,
     home: Option<&std::path::Path>,
@@ -8503,6 +8507,7 @@ impl AgentTerminalWindow {
                 None => self.show_toast("This thread has no folder to fork from"),
             },
             ViewAction::CompareForks => self.compare_with_fork(thread),
+            ViewAction::AskSeveral(initial) => self.ask_several_from(thread, initial.clone()),
             ViewAction::CompactByHandoff => self.fork_thread(thread, slot.driver(), dir, true),
             ViewAction::Rewind => {
                 if let Some(page) = self.page_of_thread(thread) {
@@ -8606,7 +8611,7 @@ impl AgentTerminalWindow {
         });
     }
 
-    fn thread_carry_settings(&self, thread: &str) -> CarriedSettings {
+    pub(super) fn thread_carry_settings(&self, thread: &str) -> CarriedSettings {
         self.with_chat(thread, |chat| {
             let session = chat.slot.get();
             carried_settings(
@@ -9242,7 +9247,30 @@ impl AgentTerminalWindow {
 
     /// Opens and shows a thread just stored by [`Self::create_chat_thread`], with what it
     /// carries for its first start. Returns its page.
-    fn open_created(&self, thread: &str, created: CreatedThread) -> Option<adw::TabPage> {
+    pub(super) fn open_created(
+        &self,
+        thread: &str,
+        created: CreatedThread,
+    ) -> Option<adw::TabPage> {
+        self.open_created_with(thread, created, true)
+    }
+
+    /// Opens and starts a thread in the background without selecting its tab or showing individual
+    /// creation toasts (used when launching several parallel forks or scheduled turns).
+    pub(super) fn open_created_quiet(
+        &self,
+        thread: &str,
+        created: CreatedThread,
+    ) -> Option<adw::TabPage> {
+        self.open_created_with(thread, created, false)
+    }
+
+    fn open_created_with(
+        &self,
+        thread: &str,
+        created: CreatedThread,
+        select: bool,
+    ) -> Option<adw::TabPage> {
         let CreatedThread {
             notice,
             driver,
@@ -9279,34 +9307,40 @@ impl AgentTerminalWindow {
             // Its first refresh ran before it knew its worktree: the merge bar follows it.
             self.refresh_diff(&page);
         }
-        self.open_thread(thread, true);
+        if select {
+            self.open_thread(thread, true);
+        } else {
+            self.ensure_built(&page);
+        }
         match notice {
-            Some(CreationNotice::New) => {
+            Some(CreationNotice::New) if select => {
                 self.show_toast("New thread: kept the model and safe mode")
             }
             Some(CreationNotice::Fork { link, baseline_in }) => {
                 if let (Some(dir), Some(commit)) = (baseline_in, link.base_commit.clone()) {
                     super::fork_compare::keep_fork_baseline(dir, thread.to_owned(), commit);
                 }
-                let fork = thread.to_owned();
-                self.action_toast(
-                    "Forked thread: kept the model, effort and safe mode",
-                    "Compare",
-                    10,
-                    adw::ToastPriority::Normal,
-                    move |imp| {
-                        imp.open_fork_compare(
-                            &fork,
-                            agent_core::fork_compare::Pairing {
-                                other: link.source_thread.clone(),
-                                relation: agent_core::fork_compare::Relation::Source,
-                                fork_seq: link.fork_seq,
-                            },
-                        );
-                    },
-                );
+                if select {
+                    let fork = thread.to_owned();
+                    self.action_toast(
+                        "Forked thread: kept the model, effort and safe mode",
+                        "Compare",
+                        10,
+                        adw::ToastPriority::Normal,
+                        move |imp| {
+                            imp.open_fork_compare(
+                                &fork,
+                                agent_core::fork_compare::Pairing {
+                                    other: link.source_thread.clone(),
+                                    relation: agent_core::fork_compare::Relation::Source,
+                                    fork_seq: link.fork_seq,
+                                },
+                            );
+                        },
+                    );
+                }
             }
-            Some(CreationNotice::Compact(source)) => {
+            Some(CreationNotice::Compact(source)) if select => {
                 self.action_toast(
                     "Compacted into a new thread; kept the model, effort and safe mode",
                     "Archive the original",
@@ -9315,7 +9349,7 @@ impl AgentTerminalWindow {
                     move |imp| imp.set_thread_archived(&source, true),
                 );
             }
-            None => {}
+            Some(CreationNotice::New | CreationNotice::Compact(_)) | None => {}
         }
         Some(page)
     }

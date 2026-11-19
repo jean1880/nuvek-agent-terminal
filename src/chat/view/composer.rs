@@ -212,6 +212,8 @@ pub trait ComposerHost {
     fn saved_branch_reader(&self, _name: &str) -> Option<BranchReader> {
         None
     }
+    /// Launches Ask Several Agents pre-filled with the current draft text.
+    fn ask_several(&self, _draft: &str) {}
     /// Opens the schedule creation dialog seeded with the composer's current draft.
     fn schedule(&self, _draft: &str, _has_images: bool) {}
 }
@@ -224,6 +226,7 @@ pub struct Composer {
     view: sourceview5::View,
     buffer: sourceview5::Buffer,
     send: gtk4::Button,
+    ask_several_btn: gtk4::Button,
     schedule_btn: gtk4::Button,
     send_popover: gtk4::Popover,
     placeholder: gtk4::Label,
@@ -323,11 +326,16 @@ impl Composer {
         send.update_property(&[gtk4::accessible::Property::Label("Send message")]);
         row.append(&send);
 
+        let ask_several_btn = gtk4::Button::builder()
+            .label("Ask Several Agents…")
+            .css_classes(["flat"])
+            .build();
         let schedule_btn = gtk4::Button::builder()
             .label("Schedule…")
             .css_classes(["flat"])
             .build();
         let menu_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+        menu_box.append(&ask_several_btn);
         menu_box.append(&schedule_btn);
         let send_popover = gtk4::Popover::builder()
             .child(&menu_box)
@@ -376,6 +384,7 @@ impl Composer {
             view,
             buffer,
             send,
+            ask_several_btn,
             schedule_btn,
             send_popover,
             placeholder,
@@ -653,6 +662,19 @@ impl Composer {
                 c.submit();
             }
             c.view.grab_focus();
+        });
+
+        let weak = Rc::downgrade(self);
+        let popover = self.send_popover.clone();
+        self.ask_several_btn.connect_clicked(move |_| {
+            popover.popdown();
+            let Some(c) = weak.upgrade() else {
+                return;
+            };
+            let draft = c.text();
+            if let Some(host) = c.host() {
+                host.ask_several(&draft);
+            }
         });
 
         let weak = Rc::downgrade(self);

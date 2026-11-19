@@ -719,6 +719,13 @@ impl Supervisor {
             .filter(|w| w.row.parent_id.is_some())
             .map(|w| w.cwd.clone())
     }
+    pub(crate) fn child_lease(&self, worker: &WorkerId) -> Option<super::workspace::WorktreeLease> {
+        self.state
+            .borrow()
+            .child_specs
+            .get(worker)
+            .and_then(|s| s.lease.clone())
+    }
     pub(crate) fn cancel_human(self: &Rc<Self>, scope: &agent_core::delegation::scope::Scope) {
         if !self.scope_is_current(scope) {
             return;

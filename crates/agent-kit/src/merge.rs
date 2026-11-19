@@ -212,6 +212,9 @@ pub struct MergePlan {
     /// Every linked worktree of the repository (this one included), as git lists them: a folder
     /// inside one of them is not in the base checkout even when it is inside its folder.
     pub worktrees: Vec<PathBuf>,
+    /// Whether `branch` still has a registered worktree at `info.path` (false when merging a
+    /// branch whose clean worktree was already removed, e.g. a closed delegated worker).
+    pub has_worktree: bool,
     /// Every reason the merge cannot run; empty when it can.
     pub refusals: Vec<Refusal>,
 }
@@ -451,7 +454,41 @@ pub fn preflight(info: &WorktreeInfo) -> Result<MergePlan, String> {
     preflight_with(info, &[])
 }
 
+/// Preflight for merging `branch` into `base` (or `main_toplevel`'s current branch when `None`),
+/// using `worktree` when it is still registered and falling back to branch-only preflight if the
+/// worktree was already cleaned up.
+pub fn preflight_branch(
+    main_toplevel: &Path,
+    branch: &str,
+    base: Option<&str>,
+    worktree: Option<&Path>,
+) -> Result<MergePlan, String> {
+    let info = WorktreeInfo {
+        path: worktree.unwrap_or(main_toplevel).to_path_buf(),
+        branch: branch.to_owned(),
+        main_toplevel: main_toplevel.to_path_buf(),
+        base: base.map(str::to_owned),
+    };
+    if worktree.is_some() && is_registered(&info).unwrap_or(false) {
+        preflight_with(&info, &[])
+    } else {
+        preflight_branch_with(&info, &[])
+    }
+}
+
 fn preflight_with(info: &WorktreeInfo, env: &[(&str, &OsStr)]) -> Result<MergePlan, String> {
+    preflight_core(info, true, env)
+}
+
+fn preflight_branch_with(info: &WorktreeInfo, env: &[(&str, &OsStr)]) -> Result<MergePlan, String> {
+    preflight_core(info, false, env)
+}
+
+fn preflight_core(
+    info: &WorktreeInfo,
+    require_worktree: bool,
+    env: &[(&str, &OsStr)],
+) -> Result<MergePlan, String> {
     let branch = info.branch.trim().to_owned();
     precheck_name(&branch, "branch name")?;
     let main = info.main_toplevel.as_path();
@@ -469,24 +506,31 @@ fn preflight_with(info: &WorktreeInfo, env: &[(&str, &OsStr)]) -> Result<MergePl
     if base == branch {
         return Err(format!("{branch} is the base branch itself"));
     }
-    if !is_registered(info)? {
-        return Err(format!(
-            "{} is no longer a worktree on {branch}",
-            info.path.display()
-        ));
-    }
+    let has_worktree = if require_worktree {
+        if !is_registered(info)? {
+            return Err(format!(
+                "{} is no longer a worktree on {branch}",
+                info.path.display()
+            ));
+        }
+        true
+    } else {
+        false
+    };
     let branch_tip = tip(main, &branch, env)?;
     let base_tip = tip(main, &base, env)?;
     let mut refusals = Vec::new();
 
-    let worktree_status = git_raw(
-        &info.path,
-        ["status", "--porcelain", "--untracked-files=normal"],
-        env,
-        QUERY_TIMEOUT_SECS,
-    )?;
-    if !worktree_status.is_empty() {
-        refusals.push(Refusal::WorktreeChanges);
+    if has_worktree {
+        let worktree_status = git_raw(
+            &info.path,
+            ["status", "--porcelain", "--untracked-files=normal"],
+            env,
+            QUERY_TIMEOUT_SECS,
+        )?;
+        if !worktree_status.is_empty() {
+            refusals.push(Refusal::WorktreeChanges);
+        }
     }
 
     let base_dir = match crate::worktree::checkout_of(main, &base)? {
@@ -539,8 +583,11 @@ fn preflight_with(info: &WorktreeInfo, env: &[(&str, &OsStr)]) -> Result<MergePl
     let squash_message = default_squash_message(main, &base_tip, &branch_tip, &branch, env);
     let (hooks_dir, hooks) = hooks_for_dir(&base_dir, &MERGE_HOOKS, env);
     let (_, squash_hooks) = hooks_for_dir(&base_dir, &SQUASH_HOOKS, env);
-    let (rebase_worktree_hooks_dir, rebase_worktree_hooks) =
-        hooks_for_dir(&info.path, &REBASE_WORKTREE_HOOKS, env);
+    let (rebase_worktree_hooks_dir, rebase_worktree_hooks) = if has_worktree {
+        hooks_for_dir(&info.path, &REBASE_WORKTREE_HOOKS, env)
+    } else {
+        (None, Vec::new())
+    };
     let (_, rebase_base_hooks) = hooks_for_dir(&base_dir, &REBASE_BASE_HOOKS, env);
     let worktrees = git_raw(
         main,
@@ -567,6 +614,7 @@ fn preflight_with(info: &WorktreeInfo, env: &[(&str, &OsStr)]) -> Result<MergePl
         rebase_worktree_hooks_dir,
         rebase_base_hooks,
         worktrees,
+        has_worktree,
         refusals,
     })
 }
@@ -785,7 +833,19 @@ fn merge_method_with(
             );
         }
     }
-    let now = preflight_with(&plan.info, env).map_err(|why| {
+    if !plan.has_worktree && method == MergeMethod::Rebase {
+        return Err(
+            "The branch has no active worktree to rebase in; choose Merge commit or Squash and \
+             commit.\n\nNothing was merged."
+                .to_owned(),
+        );
+    }
+    let now = if plan.has_worktree {
+        preflight_with(&plan.info, env)
+    } else {
+        preflight_branch_with(&plan.info, env)
+    }
+    .map_err(|why| {
         format!(
             "{}\n\nNothing was merged.",
             agent_core::redact::redact(&why)
@@ -1542,6 +1602,7 @@ mod tests {
             rebase_worktree_hooks_dir: None,
             rebase_base_hooks: Vec::new(),
             worktrees: Vec::new(),
+            has_worktree: true,
             refusals: Vec::new(),
         }
     }
@@ -2500,6 +2561,29 @@ mod tests {
             );
             let status = sh(&f.main, &["status", "--porcelain"]);
             assert!(status.contains("M  b.txt"), "{status}");
+        }
+
+        #[test]
+        fn preflight_branch_merges_after_clean_worktree_removal() {
+            let Some(f) = fixture() else { return };
+            // Commit on the feature branch, then remove its clean worktree while keeping branch.
+            crate::worktree::remove(&f.main, &f.wt).unwrap();
+            assert!(!f.wt.exists());
+            // Regular preflight requires the worktree, whereas preflight_branch falls back.
+            assert!(preflight_with(&f.info, &env()).is_err());
+            let p = preflight_branch_with(&f.info, &env()).unwrap();
+            assert!(!p.has_worktree);
+            assert!(p.refusals.is_empty());
+            assert!(p.ahead >= 1);
+            // Rebase is refused without a checked-out worktree, whereas Merge succeeds.
+            let rebase_err =
+                merge_method_with(&p, MergeMethod::Rebase, None, &env(), MERGE_TIMEOUT_SECS)
+                    .unwrap_err();
+            assert!(rebase_err.contains("no active worktree"), "{rebase_err}");
+            let done = merge_method_with(&p, MergeMethod::Merge, None, &env(), MERGE_TIMEOUT_SECS)
+                .unwrap();
+            assert!(!done.after.is_empty());
+            assert!(branch_exists(&f.main, &f.info.branch));
         }
     }
 }

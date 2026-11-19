@@ -1023,6 +1023,8 @@ pub enum ThreadAction {
     Fork(String),
     /// Forks the thread into a new worktree made from a snapshot of its folder.
     ForkInWorktree(String),
+    /// Merges a worktree thread's branch back into its base branch.
+    MergeWorktree(String),
     /// Opens a window reading the thread beside a fork of it, its source or a sibling fork.
     CompareForks(String),
     /// Opens a window comparing a multi-agent Ask Several group for this thread.
@@ -1082,6 +1084,7 @@ impl ThreadAction {
             } => full("switch", thread, *driver, model, effort),
             Self::Fork(t) => simple("fork", t),
             Self::ForkInWorktree(t) => simple("fork-worktree", t),
+            Self::MergeWorktree(t) => simple("merge-worktree", t),
             Self::CompareForks(t) => simple("compare-forks", t),
             Self::CompareGroup(t) => simple("compare-group", t),
             Self::Compact(t) => simple("compact", t),
@@ -1134,6 +1137,7 @@ impl ThreadAction {
             }),
             "fork" => simple(Self::Fork(thread)),
             "fork-worktree" => simple(Self::ForkInWorktree(thread)),
+            "merge-worktree" => simple(Self::MergeWorktree(thread)),
             "compare-forks" => simple(Self::CompareForks(thread)),
             "compare-group" => simple(Self::CompareGroup(thread)),
             "compact" => simple(Self::Compact(thread)),
@@ -1203,6 +1207,9 @@ pub struct ThreadMenuInput {
     /// The thread's folder is on another machine: it keeps its agent (no switch or continuing in
     /// another), and has no local folder to open or review. Fork and Compact keep the folder.
     pub remote: bool,
+    /// `Some(base)` when the thread lives in an isolated git worktree (`base` is the recorded
+    /// base branch name, if known); `None` for normal non-worktree threads.
+    pub worktree_base: Option<Option<String>>,
 }
 
 /// The popover tooltip of a remote thread's menu: why its greyed entries are greyed.
@@ -1357,6 +1364,14 @@ pub fn thread_menu(input: &ThreadMenuInput) -> Vec<MenuEntry> {
                 },
             ]
             .into_iter()
+            .chain(input.worktree_base.as_ref().map(|base| MenuEntry::Item {
+                label: match base.as_deref() {
+                    Some(b) if !b.trim().is_empty() => format!("Merge into {b}…"),
+                    _ => "Merge Back…".to_owned(),
+                },
+                action: ThreadAction::MergeWorktree(thread.clone()),
+                enabled: local,
+            }))
             .chain(input.forks.then(|| {
                 item(
                     "Compare with Fork…",
@@ -1971,6 +1986,7 @@ mod tests {
                 },
             ],
             remote: false,
+            worktree_base: None,
         }
     }
 
@@ -2206,6 +2222,37 @@ mod tests {
                 "Copy thread id"
             ]
         );
+        // A worktree thread shows "Merge into <base>…" (or "Merge Back…") beside Fork.
+        let section_labels = |input: &ThreadMenuInput| -> Vec<String> {
+            match thread_menu(input).first() {
+                Some(MenuEntry::Section(items)) => items
+                    .iter()
+                    .filter_map(|e| match e {
+                        MenuEntry::Item { label, .. } => Some(label.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+        let named_wt = ThreadMenuInput {
+            thread: "t".into(),
+            archived: false,
+            pinned: false,
+            tagged: false,
+            has_messages: false,
+            forks: false,
+            compare_group: false,
+            agents: Vec::new(),
+            remote: false,
+            worktree_base: Some(Some("main".into())),
+        };
+        assert!(section_labels(&named_wt).contains(&"Merge into main…".to_owned()));
+        let unnamed_wt = ThreadMenuInput {
+            worktree_base: Some(None),
+            ..named_wt
+        };
+        assert!(section_labels(&unnamed_wt).contains(&"Merge Back…".to_owned()));
     }
 
     #[test]
@@ -2225,6 +2272,7 @@ mod tests {
             },
             ThreadAction::Fork("t".into()),
             ThreadAction::ForkInWorktree("t".into()),
+            ThreadAction::MergeWorktree("t".into()),
             ThreadAction::CompareForks("t".into()),
             ThreadAction::Compact("t".into()),
             ThreadAction::Rename("t".into()),

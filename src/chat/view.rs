@@ -108,6 +108,8 @@ pub enum ViewAction {
     /// A comment written on one of this thread's file-change cards: the window adds it to the
     /// thread's review, the one its diff panel's "Send Review" sends.
     ReviewComment(CardComment),
+    /// Opens the merge preview for a delegated child's isolated worktree branch.
+    MergeWorker(String),
 }
 
 /// A comment written on a file-change card.

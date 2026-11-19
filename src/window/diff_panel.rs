@@ -1710,6 +1710,16 @@ impl DiffPanel {
             .unwrap_or_default()
     }
 
+    /// Selects [`DiffBase::Uncommitted`] in the dropdown.
+    pub fn select_uncommitted(&self) {
+        if let Some(pos) = DiffBase::ALL
+            .iter()
+            .position(|b| *b == DiffBase::Uncommitted)
+        {
+            self.base.set_selected(pos as u32);
+        }
+    }
+
     /// Calls `refresh` when the user asks for one: the refresh button, the
     /// retry button, or a change of base.
     pub fn connect_refresh(&self, refresh: impl Fn() + Clone + 'static) {

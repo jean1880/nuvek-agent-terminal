@@ -14,12 +14,12 @@ thread_local! {
     static LAST_WORKER_NOTICE: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
+use adw::prelude::*;
 use agent_core::adapter::{Driver, Mode};
 use agent_core::delegation::scope::{Scope, ScopedEnvelope};
 use agent_core::delegation::wire::WorkerSummary;
 use agent_core::delegation::WorkerId;
 use agent_core::event::{Decision, Envelope, Event, WorkerDelegation, WorkerOrigin, WorkerState};
-use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 
 use super::cards::{RowEvent, RowSink};
@@ -500,6 +500,7 @@ pub(super) struct Inspector {
     send: gtk4::Button,
     cancel: gtk4::Button,
     close: gtk4::Button,
+    merge_branch: gtk4::Button,
     state: gtk4::Label,
 }
 
@@ -542,12 +543,18 @@ impl Inspector {
             "End this worker and everything it started; its queued work is dropped",
         ));
         close.add_css_class("destructive-action");
+        let merge_branch = gtk4::Button::with_label("Merge Branch…");
+        merge_branch.set_tooltip_text(Some(
+            "Merge this worker's isolated branch back into the thread's branch",
+        ));
+        merge_branch.set_visible(false);
         let actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
         actions.append(&entry);
         actions.append(&send);
         let controls = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
         controls.append(&cancel);
         controls.append(&close);
+        controls.append(&merge_branch);
         panel.add_controls(&history);
         panel.add_controls(&state);
         panel.add_controls(&actions);
@@ -565,6 +572,7 @@ impl Inspector {
             send,
             cancel,
             close,
+            merge_branch,
             state,
         });
         let weak = Rc::downgrade(inner);
@@ -607,6 +615,23 @@ impl Inspector {
                 };
                 if inner.backend.worker_action(action) { if kind == 0 { inspector.entry.set_text(""); } }
                 else { inner.worker_notice("The worker has moved on, or this action is not available now. Pick its latest run in the history list and try again."); }
+            });
+        }
+        {
+            let weak = Rc::downgrade(inner);
+            let worker_id = worker.to_owned();
+            let dlg_w = inspector.panel.dialog().downgrade();
+            inspector.merge_branch.connect_clicked(move |_| {
+                if let Some(dialog) = dlg_w.upgrade() {
+                    adw::prelude::AdwDialogExt::close(&dialog);
+                }
+                if let Some(view) = weak
+                    .upgrade()
+                    .and_then(|i| i.view())
+                    .and_then(|v| v.inner())
+                {
+                    view.emit(super::ViewAction::MergeWorker(worker_id.clone()));
+                }
             });
         }
         inspector
@@ -886,6 +911,12 @@ impl Inner {
         inspector
             .close
             .set_sensitive(current && worker.summary.controls.close);
+        let is_worktree = worker.summary.workspace.kind
+            == agent_core::delegation::wire::WorkspaceKind::IsolatedWorktree;
+        inspector.merge_branch.set_visible(is_worktree);
+        inspector
+            .merge_branch
+            .set_sensitive(is_worktree && worker.summary.run_id.is_none());
         inspector
             .entry
             .set_sensitive(current && worker.summary.controls.send);

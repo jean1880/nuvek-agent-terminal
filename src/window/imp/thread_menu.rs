@@ -250,7 +250,7 @@ impl AgentTerminalWindow {
         };
         let obj = self.obj().downgrade();
         glib::MainContext::default().spawn_local(async move {
-            let (has_messages, forks, compare_group) = store_job({
+            let (has_messages, forks, compare_group, worktree_base) = store_job({
                 let thread = thread.clone();
                 move |store| {
                     (
@@ -267,11 +267,16 @@ impl AgentTerminalWindow {
                                 .compare_groups_for_source(&thread)
                                 .unwrap_or_default()
                                 .is_empty(),
+                        store
+                            .thread_attributes(&thread)
+                            .ok()
+                            .and_then(|attrs| attrs.worktree)
+                            .map(|info| info.base),
                     )
                 }
             })
             .await
-            .unwrap_or((false, false, false));
+            .unwrap_or((false, false, false, None));
             let Some(obj) = obj.upgrade() else { return };
             let imp = obj.imp();
             let Some(summary) = imp.summary_of(&thread) else {
@@ -288,6 +293,7 @@ impl AgentTerminalWindow {
                 compare_group,
                 agents: imp.menu_agents(),
                 remote,
+                worktree_base,
             };
             let menu = to_gio_menu(&thread_menu(&input));
             let popover = gtk4::PopoverMenu::from_model(Some(&menu));
@@ -317,6 +323,7 @@ impl AgentTerminalWindow {
         let local_only = match &action {
             ThreadAction::ContinueIn { thread, .. }
             | ThreadAction::SwitchTo { thread, .. }
+            | ThreadAction::MergeWorktree(thread)
             | ThreadAction::OpenFolder(thread)
             | ThreadAction::ReviewEnvironment(thread) => Some(thread.clone()),
             _ => None,
@@ -353,6 +360,7 @@ impl AgentTerminalWindow {
                     }
                 }
             }
+            ThreadAction::MergeWorktree(thread) => self.merge_worktree_thread(&thread),
             ThreadAction::CompareForks(thread) => self.compare_with_fork(&thread),
             ThreadAction::CompareGroup(thread) => self.open_compare_group_for(&thread),
             ThreadAction::Rename(thread) => self.prompt_rename(&thread),
@@ -1396,6 +1404,7 @@ pub(super) mod tests {
             forks: false,
             compare_group: false,
             remote: false,
+            worktree_base: None,
             agents: vec![MenuAgent {
                 driver: Driver::Claude,
                 models: Vec::new(),

@@ -32,6 +32,7 @@ mod workspace;
 
 pub(crate) use services::AppServices;
 pub(crate) use supervisor::Supervisor;
+pub(crate) use workspace::WorktreeLease;
 
 thread_local! {
     /// The app's one supervisor, on the GTK main thread. No window holds it strongly.

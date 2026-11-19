@@ -89,6 +89,8 @@ pub enum BuiltinAction {
     Fork,
     /// `/compare`: read this thread beside a fork of it (or its source) in a window.
     CompareForks,
+    /// `/schedule`: create or view scheduled/repeating prompts.
+    Schedule,
     /// `/mode plan|default|accept-edits`; the UI parses the argument.
     SetMode,
     OpenUsage,
@@ -133,6 +135,7 @@ impl Builtin {
             | BuiltinAction::Handoff
             | BuiltinAction::Fork
             | BuiltinAction::CompareForks
+            | BuiltinAction::Schedule
             | BuiltinAction::SetMode
             | BuiltinAction::Rewind
             | BuiltinAction::NewThread
@@ -141,7 +144,7 @@ impl Builtin {
     }
 }
 
-static BUILTINS: [Builtin; 13] = [
+static BUILTINS: [Builtin; 14] = [
     Builtin {
         name: "model",
         aliases: &[],
@@ -190,6 +193,13 @@ static BUILTINS: [Builtin; 13] = [
         description: "Compare this thread with a fork, side by side",
         hint: None,
         action: BuiltinAction::CompareForks,
+    },
+    Builtin {
+        name: "schedule",
+        aliases: &[],
+        description: "Schedule a prompt to run once or on a repeat timer",
+        hint: Some("[prompt]"),
+        action: BuiltinAction::Schedule,
     },
     Builtin {
         name: "mode",
@@ -725,8 +735,8 @@ mod tests {
         assert_eq!(
             all,
             [
-                "model", "mcp", "config", "compact", "handoff", "fork", "compare", "mode", "usage",
-                "context", "rewind", "clear", "help"
+                "model", "mcp", "config", "compact", "handoff", "fork", "compare", "schedule",
+                "mode", "usage", "context", "rewind", "clear", "help"
             ]
         );
     }

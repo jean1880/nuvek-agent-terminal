@@ -19,7 +19,6 @@ use super::{ChatSession, Inner};
 
 /// Outcome of attempting to start a scheduled prompt turn via [`ChatSession::send_scheduled`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by F6 scheduler slice"))]
 pub(crate) enum ScheduledOutcome {
     /// The scheduled turn started and its marked user message was recorded.
     Started,
@@ -29,7 +28,6 @@ pub(crate) enum ScheduledOutcome {
     Refused(&'static str),
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by F6 scheduler slice"))]
 impl ChatSession {
     /// Dispatches a scheduled prompt if permitted and the session is idle, restarting a stopped or
     /// suspended local process when needed.
@@ -72,7 +70,6 @@ impl ChatSession {
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by F6 scheduler slice"))]
 impl Inner {
     fn send_scheduled(
         self: &Rc<Self>,

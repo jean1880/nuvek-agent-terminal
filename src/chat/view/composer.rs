@@ -212,6 +212,8 @@ pub trait ComposerHost {
     fn saved_branch_reader(&self, _name: &str) -> Option<BranchReader> {
         None
     }
+    /// Opens the schedule creation dialog seeded with the composer's current draft.
+    fn schedule(&self, _draft: &str, _has_images: bool) {}
 }
 
 pub struct Composer {
@@ -222,6 +224,8 @@ pub struct Composer {
     view: sourceview5::View,
     buffer: sourceview5::Buffer,
     send: gtk4::Button,
+    schedule_btn: gtk4::Button,
+    send_popover: gtk4::Popover,
     placeholder: gtk4::Label,
     popover: gtk4::Popover,
     pop_scroller: gtk4::ScrolledWindow,
@@ -319,6 +323,26 @@ impl Composer {
         send.update_property(&[gtk4::accessible::Property::Label("Send message")]);
         row.append(&send);
 
+        let schedule_btn = gtk4::Button::builder()
+            .label("Schedule…")
+            .css_classes(["flat"])
+            .build();
+        let menu_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+        menu_box.append(&schedule_btn);
+        let send_popover = gtk4::Popover::builder()
+            .child(&menu_box)
+            .position(gtk4::PositionType::Top)
+            .build();
+        let send_menu = gtk4::MenuButton::builder()
+            .icon_name("at-pan-down-symbolic")
+            .popover(&send_popover)
+            .tooltip_text("More send options")
+            .valign(gtk4::Align::End)
+            .css_classes(["flat", "circular"])
+            .build();
+        send_menu.update_property(&[gtk4::accessible::Property::Label("More send options")]);
+        row.append(&send_menu);
+
         let list = gtk4::ListBox::new();
         list.set_selection_mode(gtk4::SelectionMode::Single);
         list.add_css_class("typeahead-list");
@@ -352,6 +376,8 @@ impl Composer {
             view,
             buffer,
             send,
+            schedule_btn,
+            send_popover,
             placeholder,
             popover,
             pop_scroller,
@@ -462,6 +488,10 @@ impl Composer {
     pub fn clear(&self) {
         self.set_text("");
         self.close_popup();
+    }
+
+    pub fn has_images(&self) -> bool {
+        !self.tray.images().is_empty()
     }
 
     /// Seeds recall from a thread reopened from its persisted transcript.
@@ -623,6 +653,19 @@ impl Composer {
                 c.submit();
             }
             c.view.grab_focus();
+        });
+
+        let weak = Rc::downgrade(self);
+        self.schedule_btn.connect_clicked(move |_| {
+            let Some(c) = weak.upgrade() else {
+                return;
+            };
+            c.send_popover.popdown();
+            if let Some(host) = c.host() {
+                let text = c.text();
+                let has_images = !c.tray.images().is_empty();
+                host.schedule(&text, has_images);
+            }
         });
 
         let weak = Rc::downgrade(self);

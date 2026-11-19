@@ -932,6 +932,12 @@ pub struct TerminalConfig {
     /// runs out of quota. On by default, unlike the bell: it is rare, and it
     /// means work has stopped.
     pub notify_on_quota: bool,
+    /// Allow scheduled and repeating prompts to run automatically while Agent Terminal is open.
+    #[serde(default = "default_true")]
+    pub schedules_enabled: bool,
+    /// Send a desktop notification when a scheduled prompt runs in a background tab.
+    #[serde(default = "default_true")]
+    pub notify_scheduled: bool,
     /// Tell a screen reader, through the window's live regions, when a turn finishes or fails,
     /// a thread asks for approval, or an error arrives (`agent_core::a11y_announce`). On by
     /// default (an older config opts in): with no screen reader running nothing is heard.
@@ -1424,6 +1430,8 @@ impl Default for TerminalConfig {
             cursor_blink: true,
             notify_on_bell: false,
             notify_on_quota: true,
+            schedules_enabled: true,
+            notify_scheduled: true,
             announce_events: true,
             check_updates_on_startup: true,
             idle_suspend_minutes: 15,

@@ -781,6 +781,9 @@ fn plan_title(
 pub fn row_label(body: &Body) -> String {
     match body {
         Body::User { queued: true, .. } => "You (queued)".to_owned(),
+        Body::User {
+            scheduled: true, ..
+        } => "You (scheduled)".to_owned(),
         Body::User { .. } => "You".to_owned(),
         Body::Assistant { driver, .. } => driver.info().label.to_owned(),
         Body::Reasoning { .. } => "Reasoning".to_owned(),
@@ -824,6 +827,7 @@ pub enum Row {
         images: gtk4::Box,
         shown: RefCell<Vec<String>>,
         text: gtk4::Label,
+        scheduled_badge: gtk4::Label,
     },
     Assistant {
         root: gtk4::Box,
@@ -883,6 +887,8 @@ impl Row {
                 text.set_selectable(true);
                 text.set_max_width_chars(72);
                 bubble.append(&text);
+                let scheduled_badge = label("Scheduled", &["dim-label", "caption"]);
+                scheduled_badge.set_halign(gtk4::Align::End);
                 root.append(&bubble);
                 Self::User {
                     root,
@@ -890,6 +896,7 @@ impl Row {
                     images,
                     shown: RefCell::default(),
                     text,
+                    scheduled_badge,
                 }
             }
             Body::Assistant { driver, .. } => {
@@ -1053,10 +1060,12 @@ impl Row {
                     images,
                     shown,
                     text: l,
+                    scheduled_badge,
                 },
                 Body::User {
                     text,
                     queued,
+                    scheduled,
                     attachments,
                 },
             ) => {
@@ -1121,6 +1130,19 @@ impl Row {
                     root.add_css_class("queued");
                 } else {
                     root.remove_css_class("queued");
+                }
+                let is_scheduled = *scheduled && !continuation;
+                if is_scheduled {
+                    if scheduled_badge.parent().is_none() {
+                        bubble.append(scheduled_badge);
+                    }
+                    scheduled_badge.set_visible(true);
+                    root.add_css_class("scheduled-user");
+                } else {
+                    if scheduled_badge.parent().is_some() {
+                        bubble.remove(scheduled_badge);
+                    }
+                    root.remove_css_class("scheduled-user");
                 }
             }
             (
@@ -3842,6 +3864,7 @@ pub(crate) mod tests {
         let user = Body::User {
             text: "Fix it".into(),
             queued: false,
+            scheduled: false,
             attachments: Vec::new(),
         };
         assert_eq!(row_label(&user), "You");

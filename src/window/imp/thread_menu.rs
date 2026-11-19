@@ -308,7 +308,8 @@ impl AgentTerminalWindow {
             ThreadAction::ContinueIn { thread, .. }
             | ThreadAction::SwitchTo { thread, .. }
             | ThreadAction::OpenFolder(thread)
-            | ThreadAction::ReviewEnvironment(thread) => Some(thread.clone()),
+            | ThreadAction::ReviewEnvironment(thread)
+            | ThreadAction::Schedules(thread) => Some(thread.clone()),
             _ => None,
         };
         if local_only.is_some_and(|thread| self.thread_is_remote(&thread)) {
@@ -357,6 +358,7 @@ impl AgentTerminalWindow {
             ThreadAction::Delete(thread) => self.confirm_delete(&thread),
             ThreadAction::OpenFolder(thread) => self.open_thread_folder(&thread),
             ThreadAction::Export(thread) => self.confirm_export(&thread),
+            ThreadAction::Schedules(thread) => self.open_schedules_for_thread(&thread),
             ThreadAction::ReviewEnvironment(thread) => {
                 if let Some(summary) = self.summary_of(&thread) {
                     let driver = self.thread_driver(&thread, &summary);
@@ -1417,6 +1419,7 @@ pub(super) mod tests {
             [
                 "Open folder",
                 "Export…",
+                "Schedules…",
                 "Review Multi-Agent Environment…",
                 "Copy thread id"
             ]

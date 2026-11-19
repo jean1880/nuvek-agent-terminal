@@ -5,6 +5,7 @@ mod diff_panel;
 mod imp;
 mod loading;
 pub(crate) use loading::demo as loading_demo;
+pub(crate) mod schedule_model;
 pub(crate) mod sidebar_model;
 
 use gtk4::gio;
@@ -48,6 +49,11 @@ impl Generation {
 /// process, from the application's `startup`.
 pub fn watch_config_file(app: &adw::Application) {
     imp::AgentTerminalWindow::watch_config_file(app);
+}
+
+/// Starts the background schedule-check loop (once per process, from application `startup`).
+pub fn start_scheduler(app: &adw::Application) {
+    imp::schedules::start_scheduler(app);
 }
 
 /// Drains the thread store's writer and closes its connection, waiting at most `wait`. Once per

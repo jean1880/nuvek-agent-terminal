@@ -863,6 +863,8 @@ pub(super) struct ChatTab {
     /// Sent once the session exists (Continue In from a terminal page); also saved as redacted
     /// unsent metadata so closing during a build does not lose it.
     pending_prompt: Option<String>,
+    /// Queued scheduled prompt waiting for this page's session to start.
+    pub(super) pending_scheduled: Option<super::schedules::PendingScheduled>,
     /// A message-search hit opened before the thread was built: the item its build brings into
     /// view once the history is replayed.
     pending_jump: Option<String>,
@@ -1872,29 +1874,29 @@ fn record_new_thread(
 
 /// The ids a new thread and its provider thread are created under, made before the write is
 /// queued (so the page can open on the thread at once).
-struct NewThreadIds {
-    thread: String,
-    provider: String,
+pub(super) struct NewThreadIds {
+    pub(super) thread: String,
+    pub(super) provider: String,
 }
 
 /// What a new chat thread is stored with ([`record_new_thread_as`]).
-struct NewThreadSpec {
-    cwd: String,
-    title: Option<String>,
-    driver: Driver,
+pub(super) struct NewThreadSpec {
+    pub(super) cwd: String,
+    pub(super) title: Option<String>,
+    pub(super) driver: Driver,
     /// `None`: the agent's own default.
-    model: Option<String>,
+    pub(super) model: Option<String>,
     /// Recorded as the user's choice when one is carried over (a continued or forked thread
     /// keeps its source's mode rather than the profile's).
-    mode: Option<Mode>,
+    pub(super) mode: Option<Mode>,
     /// A budgeted, fenced and redacted handoff, with where it came from: stored as the thread's
     /// first events, so the session re-arms it from history whenever it starts.
-    handoff: Option<(crate::chat::session::Handoff, String)>,
-    attributes: agent_kit::store::ThreadAttributes,
+    pub(super) handoff: Option<(crate::chat::session::Handoff, String)>,
+    pub(super) attributes: agent_kit::store::ThreadAttributes,
 }
 
 impl NewThreadSpec {
-    fn new(cwd: &str, driver: Driver) -> Self {
+    pub(super) fn new(cwd: &str, driver: Driver) -> Self {
         Self {
             cwd: cwd.to_owned(),
             title: None,
@@ -1939,7 +1941,7 @@ struct CreatedThread {
 /// profile and worktree it was opened with, all through [`Store::create_thread_record`]. Only the
 /// new thread is written: the source of a fork is never touched. All or nothing: a thread
 /// without its agent would start a session on whatever the profile says, not on what was chosen.
-fn record_new_thread_as(
+pub(super) fn record_new_thread_as(
     store: &Store,
     ids: &NewThreadIds,
     spec: &NewThreadSpec,
@@ -6308,6 +6310,7 @@ impl AgentTerminalWindow {
                 title_item: None,
                 title_provisional: false,
                 pending_prompt: None,
+                pending_scheduled: None,
                 pending_jump: None,
                 pending_handoff: false,
                 profile_id: None,
@@ -6337,7 +6340,7 @@ impl AgentTerminalWindow {
     }
 
     /// Builds a thread's view and starts its session, the first time its page is shown.
-    fn ensure_built(&self, page: &adw::TabPage) {
+    pub(super) fn ensure_built(&self, page: &adw::TabPage) {
         if self.is_closing() {
             return;
         }
@@ -6483,15 +6486,21 @@ impl AgentTerminalWindow {
 
     /// A thread's page whose store read failed: left unbuilt, so showing it again retries.
     fn thread_load_failed(&self, page: &adw::TabPage) {
-        self.with_page_chat_mut(page, |chat| {
-            chat.building = false;
-            chat.pending_switch = None;
-            chat.pending_jump = None;
-            // Not loading any more: the skeleton holds still until a retry.
-            if let Some(skeleton) = chat.holder.first_child() {
-                loading::settle(&skeleton);
-            }
-        });
+        let sched = self
+            .with_page_chat_mut(page, |chat| {
+                chat.building = false;
+                chat.pending_switch = None;
+                chat.pending_jump = None;
+                // Not loading any more: the skeleton holds still until a retry.
+                if let Some(skeleton) = chat.holder.first_child() {
+                    loading::settle(&skeleton);
+                }
+                chat.pending_scheduled.take()
+            })
+            .flatten();
+        if let Some(sched) = sched {
+            super::schedules::mark_dispatch_failed(&self.obj(), sched);
+        }
         // Not starting any more: the row stops spinning.
         self.refresh_sidebar();
         self.show_toast("Could not read this thread from the store. Select it again to retry.");
@@ -6692,6 +6701,12 @@ impl AgentTerminalWindow {
                 "Thread {thread} opened without a session: {} is not ready",
                 driver.info().label
             );
+            if let Some(sched) = self
+                .with_page_chat_mut(page, |chat| chat.pending_scheduled.take())
+                .flatten()
+            {
+                super::schedules::mark_dispatch_failed(&self.obj(), sched);
+            }
             // A switch parked while the thread was being built: its own agent will not start
             // it (still being detected excepted), so the thread moves to the new agent now.
             let parked = self
@@ -6981,17 +6996,18 @@ impl AgentTerminalWindow {
             }
         }
 
-        let (prompt, switch, stored) = self
+        let (prompt, scheduled, switch, stored) = self
             .with_page_chat_mut(page, |chat| {
                 // A new thread's own handoff was stored with it: it is in `stored_handoff`.
                 chat.pending_handoff = false;
                 (
                     chat.pending_prompt.take(),
+                    chat.pending_scheduled.take(),
                     chat.pending_switch.take(),
                     chat.stored_handoff.take(),
                 )
             })
-            .unwrap_or((None, None, None));
+            .unwrap_or((None, None, None, None));
         if let Some(stored) = stored {
             session.restore_handoff(stored);
         }
@@ -7000,6 +7016,9 @@ impl AgentTerminalWindow {
         }
         if let Some(prompt) = prompt.filter(|_| self.session_start_allowed()) {
             session.send_prompt(&prompt);
+        }
+        if let Some(sched) = scheduled.filter(|_| self.session_start_allowed()) {
+            super::schedules::dispatch_on_session(&self.obj(), &session, sched);
         }
         // The thread is built: judge its model against the current catalogue too.
         self.evaluate_models();
@@ -8498,6 +8517,12 @@ impl AgentTerminalWindow {
                 );
             }
             ViewAction::ReviewComment(comment) => self.add_card_comment(thread, comment.clone()),
+            ViewAction::Schedule {
+                initial,
+                has_images,
+            } => {
+                self.open_schedule_dialog_for(Some(thread), initial.as_deref(), *has_images);
+            }
         }
     }
 
@@ -9292,6 +9317,89 @@ impl AgentTerminalWindow {
             }
             None => {}
         }
+        Some(page)
+    }
+
+    /// Opens `thread` without selecting its tab or stealing focus, and queues or runs `pending`
+    /// once its session is ready. Returns `false` if another window owns the thread and handled
+    /// it (`None`), or `Some(false)` when this window could not open the page.
+    pub(super) fn dispatch_scheduled_on_thread(
+        &self,
+        thread: &str,
+        pending: super::schedules::PendingScheduled,
+    ) -> bool {
+        if let Some(owner) = thread_owner(thread).filter(|w| w != &*self.obj()) {
+            return owner.imp().dispatch_scheduled_on_thread(thread, pending);
+        }
+        if self.is_closing() {
+            super::schedules::mark_dispatch_failed(&self.obj(), pending);
+            return false;
+        }
+        let Some(page) = self.open_thread(thread, false) else {
+            super::schedules::mark_dispatch_failed(&self.obj(), pending);
+            return false;
+        };
+        enum Ready {
+            Session(Rc<crate::chat::session::ChatSession>),
+            Build,
+            Failed,
+        }
+        let state = self.with_page_chat_mut(&page, |chat| {
+            if let Some(session) = chat.slot.get() {
+                Ready::Session(session)
+            } else if chat.view.is_some() && !chat.building && !chat.starting {
+                Ready::Failed
+            } else {
+                chat.pending_scheduled = Some(pending.clone());
+                Ready::Build
+            }
+        });
+        match state {
+            Some(Ready::Session(session)) => {
+                super::schedules::dispatch_on_session(&self.obj(), &session, pending);
+                true
+            }
+            Some(Ready::Build) => {
+                self.ensure_built(&page);
+                true
+            }
+            _ => {
+                super::schedules::mark_dispatch_failed(&self.obj(), pending);
+                false
+            }
+        }
+    }
+
+    /// Opens a newly created scheduled thread in the background without stealing focus and queues
+    /// `pending` for its first session start.
+    pub(super) fn open_scheduled_created(
+        &self,
+        thread: &str,
+        driver: Driver,
+        profile_id: Option<String>,
+        worktree: Option<crate::worktree::WorktreeInfo>,
+        mode: Mode,
+        pending: super::schedules::PendingScheduled,
+    ) -> Option<adw::TabPage> {
+        self.reload_summaries();
+        let page = self.open_thread(thread, false)?;
+        let branch = worktree.as_ref().map(|w| w.branch.clone());
+        if let Some(tab) = self.tabs.borrow_mut().iter_mut().find(|t| t.page == page) {
+            if worktree.is_some() {
+                tab.worktree = worktree;
+            }
+            if let Some(chat) = tab.chat.as_mut() {
+                chat.driver = driver;
+                chat.profile_id = profile_id;
+                chat.chosen_mode = Some(Mode::session_safe(mode));
+                chat.pending_scheduled = Some(pending);
+            }
+        }
+        if let Some(branch) = branch {
+            page.set_tooltip(&tab_tooltip(Some(&branch), None));
+            self.refresh_diff(&page);
+        }
+        self.ensure_built(&page);
         Some(page)
     }
 

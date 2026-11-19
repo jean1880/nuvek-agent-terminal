@@ -15,6 +15,7 @@ mod pack_animation;
 mod prompts_prefs;
 mod regions;
 mod remote;
+pub(super) mod schedules;
 mod setup;
 mod spending;
 mod thread_menu;
@@ -158,6 +159,12 @@ const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
               <object class="GtkShortcutsShortcut">
                 <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;E</property>
                 <property name="title">Resume Session</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkShortcutsShortcut">
+                <property name="accelerator">&lt;Primary&gt;&lt;Shift&gt;L</property>
+                <property name="title">Schedule Prompt</property>
               </object>
             </child>
             <child>
@@ -2380,6 +2387,14 @@ impl AgentTerminalWindow {
             debug!("Action: Spending");
             imp.show_spending();
         });
+        self.add_win_action("schedules", |imp| {
+            debug!("Action: Scheduled Prompts");
+            imp.show_schedules_manager();
+        });
+        self.add_win_action("schedule", |imp| {
+            debug!("Action: Schedule Prompt");
+            imp.open_active_schedule_dialog();
+        });
         self.add_win_action("shortcuts", |imp| {
             debug!("Action: Keyboard Shortcuts");
             imp.show_shortcuts();
@@ -3342,6 +3357,7 @@ impl AgentTerminalWindow {
         let app = gtk4::gio::Menu::new();
         app.append(Some(&update_menu_label()), Some("win.check-updates"));
         app.append(Some("Spending…"), Some("win.spending"));
+        app.append(Some("Scheduled Prompts…"), Some("win.schedules"));
         app.append(Some("Settings"), Some("win.preferences"));
         app.append(Some("Keyboard Shortcuts"), Some("win.shortcuts"));
         app.append(Some("About Agent Terminal"), Some("win.about"));
@@ -5570,12 +5586,30 @@ impl AgentTerminalWindow {
             Self::set_list_outside_sessions,
         );
         threads.add(&outside_row);
+        let schedules_row = self.config_switch(
+            "Run Scheduled Prompts",
+            "Check due one-shot and repeating prompts on a minute timer and run them \
+             when the target thread is idle. Bypass-mode turns and non-worktree \
+             Antigravity runs are never scheduled",
+            |c| c.schedules_enabled,
+            SaveWhen::Debounced(|c, on| c.schedules_enabled = on),
+            |_, _| {},
+        );
+        threads.add(&schedules_row);
         general.add(&threads);
         let notifications = adw::PreferencesGroup::builder()
             .title("Notifications")
             .build();
         notifications.add(&notify_row);
         notifications.add(&notify_quota_row);
+        let notify_scheduled_row = self.config_switch(
+            "Notify When a Scheduled Prompt Starts",
+            "Raise a desktop notification when a scheduled prompt starts on its own",
+            |c| c.notify_scheduled,
+            SaveWhen::Debounced(|c, on| c.notify_scheduled = on),
+            |_, _| {},
+        );
+        notifications.add(&notify_scheduled_row);
         notifications.add(&announce_row);
         general.add(&notifications);
         let replies = adw::PreferencesGroup::builder().title("Replies").build();
@@ -9590,6 +9624,7 @@ mod tests {
             [
                 "win.check-updates",
                 "win.spending",
+                "win.schedules",
                 "win.preferences",
                 "win.shortcuts",
                 "win.about"
@@ -10594,6 +10629,7 @@ mod tests {
         spending::tests::the_spending_dialog_shows_and_keeps_what_turns_cost(window);
         spending::tests::the_spending_group_saves_only_valid_amounts(window);
         spending::tests::a_metered_turn_warns_once_through_the_window(window);
+        schedules::tests::gtk_checks(window);
         fork_compare::tests::a_fork_is_linked_and_compared_side_by_side(window);
         fork_compare::tests::a_forks_files_are_compared_against_its_baseline(window);
         fork_compare::tests::a_fork_in_a_worktree_is_kept_and_its_pair_archived(window);

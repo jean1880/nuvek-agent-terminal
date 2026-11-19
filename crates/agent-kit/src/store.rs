@@ -33,6 +33,7 @@ pub mod delegation;
 pub mod delegation_typed;
 mod preflight;
 mod review;
+mod schedules;
 mod schema_v11;
 mod schema_v8;
 mod search;
@@ -41,6 +42,7 @@ mod spend;
 pub use compare::{kept_notice, CompareColumn, ForkColumns, KeepOutcome, KeptFork};
 pub use preflight::{BACKUP_DIR, PRE_V4_BACKUP_KEY};
 pub use review::ReviewDraft;
+pub use schedules::{NewSchedule, ScheduleRecord, ScheduleRunUpdate};
 pub use search::{
     IndexProgress, SearchHit, SearchResults, INDEX_BUDGET, ITEM_CAP, SNIPPET_CLOSE, SNIPPET_OPEN,
 };
@@ -3745,10 +3747,67 @@ impl Store {
         text: &str,
         refs: &[AttachmentRef],
     ) -> Result<()> {
+        self.append_user_input_with_marker(
+            thread,
+            provider_thread,
+            item,
+            text,
+            agent_core::attachment::user_message_input(false, refs),
+        )
+    }
+
+    /// Stores a scheduled prompt as a user message carrying `{"scheduled":{"schedule","due"}}`.
+    pub fn append_scheduled_user_input(
+        &self,
+        thread: &str,
+        provider_thread: Option<&str>,
+        text: &str,
+        schedule_id: &str,
+        due: i64,
+    ) -> Result<String> {
+        let item = self.new_id()?;
+        self.append_scheduled_user_input_with_id(
+            thread,
+            provider_thread,
+            &item,
+            text,
+            schedule_id,
+            due,
+        )?;
+        Ok(item)
+    }
+
+    /// [`Store::append_scheduled_user_input`] under an item id the caller made ([`Store::new_id`]).
+    pub fn append_scheduled_user_input_with_id(
+        &self,
+        thread: &str,
+        provider_thread: Option<&str>,
+        item: &str,
+        text: &str,
+        schedule_id: &str,
+        due: i64,
+    ) -> Result<()> {
+        self.append_user_input_with_marker(
+            thread,
+            provider_thread,
+            item,
+            text,
+            Some(agent_core::schedule::scheduled_input(schedule_id, due)),
+        )
+    }
+
+    fn append_user_input_with_marker(
+        &self,
+        thread: &str,
+        provider_thread: Option<&str>,
+        item: &str,
+        text: &str,
+        input: Option<Value>,
+    ) -> Result<()> {
         let started = Envelope::new(Event::ItemStarted {
             kind: ItemKind::UserMessage,
             title: String::new(),
-            input: agent_core::attachment::user_message_input(false, refs),
+            input,
             parent: None,
         })
         .item(item);

@@ -1243,6 +1243,88 @@ impl StoreHandle {
         Ok(())
     }
 
+    /// [`Store::append_scheduled_user_input`], returning the item id once admitted.
+    pub fn append_scheduled_user_input(
+        &self,
+        thread: &str,
+        provider_thread: Option<&str>,
+        text: &str,
+        schedule_id: &str,
+        due: i64,
+    ) -> Result<String> {
+        if let Self::Inline(store) = self {
+            let item = store.append_scheduled_user_input(
+                thread,
+                provider_thread,
+                text,
+                schedule_id,
+                due,
+            )?;
+            self.index_for_search(thread);
+            return Ok(item);
+        }
+        let item = self.new_id()?;
+        let (t, pt, i, text, sid) = (
+            thread.to_owned(),
+            provider_thread.map(str::to_owned),
+            item.clone(),
+            text.to_owned(),
+            schedule_id.to_owned(),
+        );
+        self.write("store a scheduled prompt", Some(thread), move |s| {
+            s.append_scheduled_user_input_with_id(&t, pt.as_deref(), &i, &text, &sid, due)
+        })?;
+        self.index_for_search(thread);
+        Ok(item)
+    }
+
+    pub fn create_schedule(&self, new: &crate::store::NewSchedule) -> Result<String> {
+        let id = self.new_id()?;
+        let (i, n) = (id.clone(), new.clone());
+        let thread = match &new.target {
+            agent_core::schedule::Target::ExistingThread { thread_id } => Some(thread_id.as_str()),
+            agent_core::schedule::Target::NewThread { .. } => None,
+        };
+        self.write("create a schedule", thread, move |s| {
+            s.create_schedule_with_id(&i, &n)
+        })?;
+        Ok(id)
+    }
+
+    pub fn record_schedule_run(&self, update: &crate::store::ScheduleRunUpdate) -> Result<()> {
+        let u = update.clone();
+        self.write("record schedule run", None, move |s| {
+            s.record_schedule_run(&u)
+        })
+    }
+
+    pub fn set_schedule_paused(
+        &self,
+        id: &str,
+        paused: Option<agent_core::schedule::PausedReason>,
+        next_due: Option<i64>,
+    ) -> Result<()> {
+        let id = id.to_owned();
+        self.write("update schedule pause state", None, move |s| {
+            s.set_schedule_paused(&id, paused, next_due)
+        })
+    }
+
+    pub fn reset_schedule_unattended_for_thread(&self, thread: &str) -> Result<()> {
+        let t = thread.to_owned();
+        self.write("reset unattended schedule count", Some(thread), move |s| {
+            s.reset_schedule_unattended_for_thread(&t)
+        })
+    }
+
+    pub fn delete_schedule(&self, id: &str) -> Result<()> {
+        let id = id.to_owned();
+        self.write("delete a schedule", None, move |s| {
+            s.delete_schedule(&id)?;
+            Ok(())
+        })
+    }
+
     pub fn mark_read(&self, thread: &str) -> Result<()> {
         let t = thread.to_owned();
         self.write("mark the thread read", Some(thread), move |s| {

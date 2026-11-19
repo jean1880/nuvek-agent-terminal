@@ -115,6 +115,7 @@ fn plant_unspawned(
             for_switch: false,
         }],
         news: Vec::new(),
+        has_scheduled: false,
     });
 }
 

@@ -280,6 +280,35 @@ impl Store {
         })
     }
 
+    /// Current warning state, independent of the once-per-period notification latch. Schedules
+    /// must still see an exceeded warning after a restart or after a warning was delivered.
+    pub fn spend_budget_reached(
+        &self,
+        now_ms: i64,
+        day_of: &dyn Fn(i64) -> DayKey,
+        budget: &Budget,
+    ) -> Result<bool> {
+        if BudgetPeriod::ALL
+            .into_iter()
+            .all(|p| budget.limit(p).is_none())
+        {
+            return Ok(false);
+        }
+        let today = day_of(now_ms);
+        let rows = self
+            .spend_rows(now_ms.saturating_sub(32 * 86_400_000), day_of)?
+            .rows;
+        Ok(BudgetPeriod::ALL.into_iter().any(|period| {
+            warning_due(
+                period,
+                real_money(&rows, period.first_day(today)),
+                budget,
+                None,
+            )
+            .is_some()
+        }))
+    }
+
     /// The backing threads of the delegation tree `thread` belongs to, with their root thread's
     /// folder and their own profile: read before a delete releases those rows.
     pub(super) fn spend_delegated_before_delete(&self, thread: &str) -> Result<Delegated> {
@@ -626,6 +655,9 @@ mod tests {
             let first = s.spend_budget_check(NOON, &utc, &budget).expect("check");
             assert_eq!(levels(first), [(BudgetPeriod::Day, BudgetLevel::Near)]);
             assert!(s
+                .spend_budget_reached(NOON, &utc, &budget)
+                .expect("current warning"));
+            assert!(s
                 .spend_budget_check(NOON, &utc, &budget)
                 .expect("again")
                 .is_empty());
@@ -633,6 +665,9 @@ mod tests {
         };
         // A new start of the app: nothing is warned of again.
         let s = Store::open(&path).expect("reopen");
+        assert!(s
+            .spend_budget_reached(NOON + 1, &utc, &budget)
+            .expect("warning survives notification latch and restart"));
         assert!(s
             .spend_budget_check(NOON + 1, &utc, &budget)
             .expect("after a restart")

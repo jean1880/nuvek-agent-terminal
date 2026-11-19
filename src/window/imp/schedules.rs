@@ -24,7 +24,8 @@ use super::present_message_over;
 #[cfg(test)]
 use super::threads::app_store;
 use super::threads::{
-    app_handle, off_main, record_new_thread_as, store_job, write_job, NewThreadIds, NewThreadSpec,
+    app_handle, off_main, record_new_thread_as, store_job, store_writer, write_job, NewThreadIds,
+    NewThreadSpec,
 };
 use crate::chat::session::{ChatSession, ScheduledOutcome};
 use crate::window::schedule_model::{
@@ -39,6 +40,7 @@ const PROMPT_PREVIEW_CHARS: usize = 80;
 
 thread_local! {
     static SCHEDULER_STARTED: Cell<bool> = const { Cell::new(false) };
+    static STATUS_GENERATION: crate::window::Generation = const { crate::window::Generation::new() };
     static IN_FLIGHT: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 }
 
@@ -46,6 +48,8 @@ thread_local! {
 #[derive(Debug, Clone)]
 pub(super) struct PendingScheduled {
     pub schedule_id: String,
+    /// Revision checked again after asynchronous target preparation, before automatic delivery.
+    pub revision: i64,
     pub due: i64,
     pub prompt: String,
     pub in_worktree: bool,
@@ -145,14 +149,24 @@ fn harvest_stopped_schedules(app: &adw::Application) {
     }
     stopped_ids.sort();
     stopped_ids.dedup();
+    let window = first_window(app);
     glib::MainContext::default().spawn_local(async move {
-        let _ = write_job("pause stopped schedule", move |store: &Store| {
+        let result = write_job("pause stopped schedule", move |store: &Store| {
+            let mut paused = Vec::new();
             for id in &stopped_ids {
-                let _ = store.set_schedule_paused(id, Some(PausedReason::StoppedRun), None);
+                store.set_schedule_paused(id, Some(PausedReason::StoppedRun), None)?;
+                if let Some(record) = store.get_schedule(id)? {
+                    paused.push(record);
+                }
             }
-            Ok(())
+            Ok(paused)
         })
         .await;
+        if let (Some(window), Some(Ok(records))) = (window, result) {
+            for record in records {
+                schedule_feedback(&window, &record, PausedReason::StoppedRun.label()).await;
+            }
+        }
     });
 }
 
@@ -172,6 +186,11 @@ fn tick(app: &adw::Application) {
     let weak_win = window.downgrade();
     glib::MainContext::default().spawn_local(async move {
         let now = now_unix();
+        if !check_schedule_budget(&window).await {
+            window.imp().refresh_schedule_status();
+            return;
+        }
+        window.imp().refresh_schedule_status();
         let due = store_job(move |store| store.due_schedules(now))
             .await
             .and_then(Result::ok)
@@ -192,6 +211,133 @@ fn tick(app: &adw::Application) {
             }
         }
     });
+}
+
+/// Re-check the current warning state rather than the notification latch. A restarted app or
+/// an explicitly resumed schedule must not silently bypass a still-reached spending warning.
+async fn check_schedule_budget(window: &AgentTerminalWindow) -> bool {
+    let budget = window.imp().config.borrow().spend_budget();
+    let result = write_job("check scheduled prompt spending", move |store: &Store| {
+        store.ensure_spend_index()?;
+        let reached = store.spend_budget_reached(
+            now_unix().saturating_mul(1000),
+            &agent_kit::store::local_day,
+            &budget,
+        )?;
+        let paused = if reached {
+            store.pause_schedules_for_budget()?
+        } else {
+            Vec::new()
+        };
+        Ok((reached, paused))
+    })
+    .await;
+    match result {
+        Some(Ok((reached, paused))) => {
+            budget_paused_feedback(window, paused).await;
+            !reached
+        }
+        _ => {
+            warn!("scheduled prompt spending state unavailable; holding automatic runs");
+            false
+        }
+    }
+}
+
+async fn budget_allows_resume(window: &AgentTerminalWindow) -> bool {
+    let budget = window.imp().config.borrow().spend_budget();
+    let result = write_job(
+        "check spending before resuming schedule",
+        move |store: &Store| {
+            store.ensure_spend_index()?;
+            store.spend_budget_reached(
+                now_unix().saturating_mul(1000),
+                &agent_kit::store::local_day,
+                &budget,
+            )
+        },
+    )
+    .await;
+    match result {
+        Some(Ok(false)) => true,
+        Some(Ok(true)) => {
+            window.imp().show_toast(
+                "Cannot resume while a spending warning is reached. Change the warning amount or wait for the period to reset. Run Now starts one manual run.",
+            );
+            false
+        }
+        _ => {
+            window
+                .imp()
+                .show_toast("Cannot resume: spending state could not be checked");
+            false
+        }
+    }
+}
+
+/// Automatic outcomes are app notices, never user messages. Unopened targets retain the
+/// notice in the store; live sessions deliver and persist it through their ordinary sink.
+async fn schedule_feedback(window: &AgentTerminalWindow, record: &ScheduleRecord, text: &str) {
+    schedule_feedback_inner(window, record, text, false).await;
+}
+
+async fn schedule_feedback_inner(
+    window: &AgentTerminalWindow,
+    record: &ScheduleRecord,
+    text: &str,
+    stored: bool,
+) {
+    let text = redact(&format!("Scheduled prompt: {text}"));
+    if let Target::ExistingThread { thread_id } = &record.target {
+        let owner = super::threads::thread_owner(thread_id).unwrap_or_else(|| window.clone());
+        let mut delivered = false;
+        let target = owner
+            .imp()
+            .with_chat(thread_id, |chat| (chat.slot.get(), chat.view.clone()));
+        if let Some((session, view)) = target {
+            if stored {
+                if let Some(view) = &view {
+                    view.sink()(&agent_core::event::Envelope::new(
+                        agent_core::event::Event::Notice { text: text.clone() },
+                    ));
+                    delivered = true;
+                }
+            } else if let Some(session) = session {
+                session.note(text.clone());
+                delivered = true;
+            }
+        }
+        if !delivered && !stored {
+            let tid = thread_id.clone();
+            let notice = agent_core::event::Envelope::new(agent_core::event::Event::Notice {
+                text: text.clone(),
+            });
+            let _ = write_job("record schedule notice", move |store: &Store| {
+                store.append_event(&tid, None, &notice).map(|_| ())
+            })
+            .await;
+        }
+    }
+    window.imp().show_toast(&text);
+    if record.paused_reason != Some(PausedReason::User)
+        && window.imp().config.borrow().notify_scheduled
+    {
+        if let Some(app) = window.application() {
+            let note = gtk4::gio::Notification::new("Scheduled prompt");
+            note.set_body(Some(&text));
+            app.send_notification(Some(&format!("schedule-state-{}", record.id)), &note);
+        }
+    }
+    window.imp().refresh_schedule_status();
+}
+
+pub(super) async fn budget_paused_feedback(
+    window: &AgentTerminalWindow,
+    records: Vec<ScheduleRecord>,
+) {
+    for record in records {
+        schedule_feedback_inner(window, &record, PausedReason::Budget.label(), true).await;
+    }
 }
 
 fn after_fire_schedule(
@@ -246,7 +392,7 @@ async fn evaluate_and_maybe_fire(
             next_due,
         } => {
             let id = record.id.clone();
-            let _ = write_job("record missed schedule", move |store: &Store| {
+            let result = write_job("record missed schedule", move |store: &Store| {
                 store.record_schedule_run(&ScheduleRunUpdate {
                     id,
                     next_due,
@@ -258,6 +404,9 @@ async fn evaluate_and_maybe_fire(
                 })
             })
             .await;
+            if matches!(result, Some(Ok(()))) {
+                schedule_feedback(window, &record, LastOutcome::Missed.label()).await;
+            }
             clear_in_flight(&record.id);
             return false;
         }
@@ -381,16 +530,35 @@ async fn dispatch_checked_due(
     notify: bool,
     manual: bool,
 ) -> bool {
+    let record = if !manual {
+        if !check_schedule_budget(window).await {
+            return false;
+        }
+        let id = record.id.clone();
+        match store_job(move |s| s.get_schedule(&id)).await {
+            Some(Ok(Some(fresh)))
+                if fresh.paused_reason.is_none() && fresh.next_due == record.next_due =>
+            {
+                fresh
+            }
+            _ => return false,
+        }
+    } else {
+        record
+    };
     let target_state = match &record.target {
         Target::ExistingThread { thread_id } => {
             match inspect_existing_thread(window, thread_id).await {
                 Ok(s) => s,
                 Err(pause) => {
                     let id = record.id.clone();
-                    let _ = write_job("pause stale schedule", move |store: &Store| {
+                    let result = write_job("pause stale schedule", move |store: &Store| {
                         store.set_schedule_paused(&id, Some(pause), None)
                     })
                     .await;
+                    if matches!(result, Some(Ok(()))) {
+                        schedule_feedback(window, &record, pause.label()).await;
+                    }
                     if manual {
                         window
                             .imp()
@@ -441,7 +609,7 @@ async fn dispatch_checked_due(
             ScheduleDecision::Skip(outcome) => {
                 let (next_due, paused_reason) = after_skip_schedule(&record, now.max(due));
                 let id = record.id.clone();
-                let _ = write_job("record skipped schedule run", move |store: &Store| {
+                let result = write_job("record skipped schedule run", move |store: &Store| {
                     store.record_schedule_run(&ScheduleRunUpdate {
                         id,
                         next_due,
@@ -453,14 +621,20 @@ async fn dispatch_checked_due(
                     })
                 })
                 .await;
+                if matches!(result, Some(Ok(()))) {
+                    schedule_feedback(window, &record, outcome.label()).await;
+                }
                 return false;
             }
             ScheduleDecision::Pause(reason) => {
                 let id = record.id.clone();
-                let _ = write_job("pause schedule", move |store: &Store| {
+                let result = write_job("pause schedule", move |store: &Store| {
                     store.set_schedule_paused(&id, Some(reason), None)
                 })
                 .await;
+                if matches!(result, Some(Ok(()))) {
+                    schedule_feedback(window, &record, reason.label()).await;
+                }
                 return false;
             }
         }
@@ -473,6 +647,7 @@ async fn dispatch_checked_due(
     };
     let pending = PendingScheduled {
         schedule_id: record.id.clone(),
+        revision: record.updated_at,
         due,
         prompt: record.prompt.clone(),
         in_worktree: target_state.in_worktree,
@@ -635,7 +810,7 @@ async fn spawn_new_scheduled_thread(
         thread: thread_id.clone(),
         provider: provider_id,
     };
-    let stored = write_job("create scheduled thread", move |store: &Store| {
+    let stored = schedule_write_receipt("create scheduled thread", move |store: &Store| {
         record_new_thread_as(store, &ids, &spec)
     })
     .await;
@@ -664,6 +839,101 @@ pub(super) fn dispatch_on_session(
     session: &Rc<ChatSession>,
     pending: PendingScheduled,
 ) {
+    let weak = window.downgrade();
+    let session = session.clone();
+    glib::spawn_future_local(async move {
+        let Some(window) = weak.upgrade() else {
+            clear_in_flight(&pending.schedule_id);
+            return;
+        };
+        // This is the common boundary for ready sessions and pending prompts drained after
+        // asynchronous folder/worktree/session startup. Never rely on the earlier tick check.
+        if !pending.manual && !automatic_delivery_allowed(&window, &pending).await {
+            clear_in_flight(&pending.schedule_id);
+            window.imp().refresh_schedule_status();
+            return;
+        }
+        if window.imp().is_closing() {
+            clear_in_flight(&pending.schedule_id);
+            return;
+        }
+        deliver_on_session(&window, &session, pending);
+    });
+}
+
+async fn automatic_delivery_allowed(
+    window: &AgentTerminalWindow,
+    pending: &PendingScheduled,
+) -> bool {
+    if !window.imp().config.borrow().schedules_enabled {
+        return false;
+    }
+    let budget = window.imp().config.borrow().spend_budget();
+    let id = pending.schedule_id.clone();
+    let result =
+        schedule_write_receipt("revalidate scheduled prompt delivery", move |s: &Store| {
+            s.atomically(|s| {
+                s.ensure_spend_index()?;
+                let reached = s.spend_budget_reached(
+                    now_unix().saturating_mul(1000),
+                    &agent_kit::store::local_day,
+                    &budget,
+                )?;
+                let paused = if reached {
+                    s.pause_schedules_for_budget()?
+                } else {
+                    Vec::new()
+                };
+                Ok((reached, s.get_schedule(&id)?, paused))
+            })
+        })
+        .await;
+    match result {
+        Some(Ok((false, Some(record), _))) => {
+            // No await or callback between this final check and send_scheduled. A pause,
+            // deletion or edit made while the target was starting cancels the old delivery.
+            window.imp().config.borrow().schedules_enabled
+                && record.paused_reason.is_none()
+                && record.prompt == pending.prompt
+                && record.updated_at == pending.revision
+        }
+        Some(Ok((_, _, paused))) => {
+            budget_paused_feedback(window, paused).await;
+            false
+        }
+        _ => {
+            warn!("could not revalidate scheduled prompt delivery; holding run");
+            false
+        }
+    }
+}
+
+/// Waits for the actual committed writer receipt, without a UI timeout dropping the receiver.
+/// The wait is blocking only on a GIO worker; the in-flight guard remains until it answers.
+async fn schedule_write_receipt<T: Send + 'static>(
+    what: &'static str,
+    job: impl FnOnce(&Store) -> agent_kit::store::Result<T> + Send + 'static,
+) -> Option<agent_kit::store::Result<T>> {
+    let Some(writer) = store_writer() else {
+        return store_job(move |s| s.atomically(job)).await;
+    };
+    await_schedule_receipt(writer.call_result(what, job)).await
+}
+
+async fn await_schedule_receipt<T: Send + 'static>(
+    receipt: std::sync::mpsc::Receiver<agent_kit::store::Result<T>>,
+) -> Option<agent_kit::store::Result<T>> {
+    gtk4::gio::spawn_blocking(move || receipt.recv().ok())
+        .await
+        .ok()
+        .flatten()
+}
+
+fn deliver_on_session(
+    window: &AgentTerminalWindow,
+    session: &Rc<ChatSession>,
+    pending: PendingScheduled,
+) {
     let outcome = session.send_scheduled(
         &pending.schedule_id,
         pending.due,
@@ -680,28 +950,22 @@ pub(super) fn dispatch_on_session(
             if pending.manual {
                 window.imp().show_toast("Scheduled prompt started");
             }
+            let weak = window.downgrade();
             glib::MainContext::default().spawn_local(async move {
                 let id_copy = sched_id.clone();
-                let res = write_job("record scheduled run", move |store: &Store| {
-                    store.record_schedule_run(&ScheduleRunUpdate {
-                        id: id_copy,
-                        next_due: pending.next_due,
-                        last_due: Some(pending.due),
-                        last_outcome: Some(LastOutcome::Ran),
-                        increment_run_count: true,
-                        increment_unattended: pending.count_unattended,
-                        paused_reason: pending.new_paused,
-                    })
-                })
-                .await;
-                if matches!(res, Some(Ok(()))) {
-                    clear_in_flight(&sched_id);
-                } else {
-                    tracing::warn!(
-                        schedule = %sched_id,
-                        "failed to record scheduled run; keeping in-flight guard to prevent duplicate firing"
-                    );
-                }
+                let receipt =
+                    schedule_write_receipt("record scheduled run", move |store: &Store| {
+                        store.record_schedule_run(&ScheduleRunUpdate {
+                            id: id_copy,
+                            next_due: pending.next_due,
+                            last_due: Some(pending.due),
+                            last_outcome: Some(LastOutcome::Ran),
+                            increment_run_count: true,
+                            increment_unattended: pending.count_unattended,
+                            paused_reason: pending.new_paused,
+                        })
+                    });
+                finish_run(weak, pending, receipt).await;
             });
         }
         ScheduledOutcome::Busy(why) => {
@@ -721,12 +985,39 @@ pub(super) fn dispatch_on_session(
     }
 }
 
+async fn finish_run(
+    weak: glib::WeakRef<AgentTerminalWindow>,
+    pending: PendingScheduled,
+    receipt: impl std::future::Future<Output = Option<agent_kit::store::Result<()>>>,
+) {
+    let sched_id = pending.schedule_id.clone();
+    let res = receipt.await;
+    if matches!(res, Some(Ok(()))) {
+        clear_in_flight(&sched_id);
+        if let Some(window) = weak.upgrade() {
+            window.imp().refresh_schedule_status();
+            if let Some(reason) = pending.new_paused.filter(|_| !pending.manual) {
+                let id = sched_id.clone();
+                if let Some(Ok(Some(record))) = store_job(move |s| s.get_schedule(&id)).await {
+                    schedule_feedback(&window, &record, reason.label()).await;
+                }
+            }
+        }
+    } else {
+        tracing::warn!(
+            schedule = %sched_id,
+            "failed to record scheduled run; keeping in-flight guard to prevent duplicate firing"
+        );
+    }
+}
+
 /// Marks a failed/refused scheduled attempt without incrementing run counters.
 pub(super) fn mark_dispatch_failed(_window: &AgentTerminalWindow, pending: PendingScheduled) {
     let sched_id = pending.schedule_id.clone();
+    let weak = _window.downgrade();
     glib::MainContext::default().spawn_local(async move {
         let id_copy = sched_id.clone();
-        let _ = write_job("record failed scheduled run", move |store: &Store| {
+        let result = schedule_write_receipt("record failed scheduled run", move |store: &Store| {
             store.record_schedule_run(&ScheduleRunUpdate {
                 id: id_copy,
                 next_due: pending.next_due,
@@ -738,6 +1029,13 @@ pub(super) fn mark_dispatch_failed(_window: &AgentTerminalWindow, pending: Pendi
             })
         })
         .await;
+        if matches!(result, Some(Ok(()))) {
+            let id = sched_id.clone();
+            let record = store_job(move |s| s.get_schedule(&id)).await;
+            if let (Some(window), Some(Ok(Some(record)))) = (weak.upgrade(), record) {
+                schedule_feedback(&window, &record, LastOutcome::Failed.label()).await;
+            }
+        }
         clear_in_flight(&sched_id);
     });
 }
@@ -798,7 +1096,208 @@ fn target_summary(target: &Target) -> String {
     }
 }
 
+fn preferred_schedule<'a>(
+    records: impl Iterator<Item = &'a ScheduleRecord>,
+) -> Option<&'a ScheduleRecord> {
+    records.min_by_key(|r| {
+        let priority = match r.paused_reason {
+            Some(PausedReason::Ended) => 2,
+            Some(_) => 0,
+            None => 1,
+        };
+        (priority, r.next_due.unwrap_or(i64::MAX))
+    })
+}
+
 impl super::AgentTerminalWindow {
+    /// Reload header state through the store barrier. Errors remain visibly unknown rather
+    /// than clearing a previously shown clock. Also called when a thread is first built.
+    pub(super) fn refresh_schedule_status(&self) {
+        let generation = STATUS_GENERATION.with(crate::window::Generation::next);
+        let weak = self.obj().downgrade();
+        glib::spawn_future_local(async move {
+            let records = store_job(|s| s.list_schedules()).await;
+            if !STATUS_GENERATION.with(|g| g.is_current(generation)) {
+                return;
+            }
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            let groups = match &records {
+                Some(Ok(records)) => {
+                    let mut groups: std::collections::HashMap<&str, Vec<&ScheduleRecord>> =
+                        std::collections::HashMap::new();
+                    for record in records {
+                        if let Target::ExistingThread { thread_id } = &record.target {
+                            groups.entry(thread_id.as_str()).or_default().push(record);
+                        }
+                    }
+                    Some(groups)
+                }
+                _ => None,
+            };
+            let windows = window
+                .application()
+                .map(|app| app.windows())
+                .unwrap_or_else(|| vec![window.upcast::<gtk4::Window>()]);
+            for window in windows {
+                if !STATUS_GENERATION.with(|g| g.is_current(generation)) {
+                    return;
+                }
+                let Ok(window) = window.downcast::<AgentTerminalWindow>() else {
+                    continue;
+                };
+                let imp = window.imp();
+                let enabled = imp.config.borrow().schedules_enabled;
+                use crate::window::sidebar_model::ScheduleBadge;
+                let badge_for = |r: &ScheduleRecord| {
+                    if !enabled {
+                        ScheduleBadge::Paused(PausedReason::SettingOff)
+                    } else if let Some(reason) = r.paused_reason {
+                        ScheduleBadge::Paused(reason)
+                    } else {
+                        r.next_due
+                            .map(ScheduleBadge::Next)
+                            .unwrap_or(ScheduleBadge::Unknown)
+                    }
+                };
+                *imp.schedule_badges.borrow_mut() = groups.as_ref().map(|groups| {
+                    groups
+                        .iter()
+                        .filter_map(|(thread, records)| {
+                            preferred_schedule(records.iter().copied())
+                                .map(|r| ((*thread).to_owned(), badge_for(r)))
+                        })
+                        .collect()
+                });
+                // Clone the views and thread ids, then release the registry before any GTK
+                // setter or action can call back into the window and borrow its tabs again.
+                let views = imp
+                    .tabs
+                    .borrow()
+                    .iter()
+                    .filter_map(|tab| {
+                        let chat = tab.chat.as_ref()?;
+                        Some((
+                            chat.thread.clone(),
+                            chat.view.clone()?,
+                            tab.remote.is_some(),
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                for (thread, view, remote) in views {
+                    if !STATUS_GENERATION.with(|g| g.is_current(generation)) {
+                        return;
+                    }
+                    let record = groups
+                        .as_ref()
+                        .and_then(|groups| groups.get(thread.as_str()))
+                        .and_then(|records| preferred_schedule(records.iter().copied()));
+                    let status = if remote {
+                        None
+                    } else {
+                        match (&groups, record) {
+                            (None, _) => Some(ScheduleBadge::Unknown),
+                            (_, Some(r)) => Some(badge_for(r)),
+                            _ => None,
+                        }
+                    };
+                    let text = status.map(|badge| {
+                        crate::window::schedule_model::schedule_badge_description(badge, now_unix())
+                    });
+                    let paused = matches!(status, Some(ScheduleBadge::Paused(_)));
+                    let id = record.map(|r| r.id.clone());
+                    let weak = window.downgrade();
+                    view.set_schedule_status(
+                        text.as_deref(),
+                        paused,
+                        Rc::new(move |action| {
+                            let Some(window) = weak.upgrade() else {
+                                return;
+                            };
+                            if let Some(id) = &id {
+                                window.imp().schedule_action(id, action);
+                            } else {
+                                window.imp().open_schedules_for_thread(&thread);
+                            }
+                        }),
+                    );
+                }
+                if !STATUS_GENERATION.with(|g| g.is_current(generation)) {
+                    return;
+                }
+                if imp.summaries.borrow().is_some() {
+                    imp.refresh_sidebar();
+                }
+            }
+        });
+    }
+
+    fn schedule_action(&self, id: &str, action: &str) {
+        if action == "Schedules…" {
+            self.show_schedules_manager();
+            return;
+        }
+        let id = id.to_owned();
+        let action = action.to_owned();
+        let weak = self.obj().downgrade();
+        glib::spawn_future_local(async move {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            let query_id = id.clone();
+            let record = store_job(move |s| s.get_schedule(&query_id)).await;
+            let Some(Ok(Some(record))) = record else {
+                window
+                    .imp()
+                    .show_toast("Could not read this schedule; refresh and try again");
+                window.imp().refresh_schedule_status();
+                return;
+            };
+            if action == "Run Now" {
+                if !mark_in_flight(&id) {
+                    window.imp().show_toast("Already running this schedule");
+                    return;
+                }
+                let now = now_unix();
+                if !dispatch_checked_due(&window, record, now, now, false, true).await {
+                    clear_in_flight(&id);
+                }
+                return;
+            }
+            let result = if action == "Delete" {
+                write_job("delete schedule", move |s: &Store| {
+                    s.delete_schedule(&id).map(|_| ())
+                })
+                .await
+            } else {
+                if !budget_allows_resume(&window).await {
+                    return;
+                }
+                let due = next_due(&record.rule, now_unix(), &GlibLocalClock);
+                if due.is_none()
+                    || matches!(record.ends, Ends::OnDate { at } if due.is_some_and(|d| d > at))
+                    || matches!(record.ends, Ends::AfterRuns { max } if record.run_count >= max)
+                {
+                    window.imp().show_toast(
+                        "This schedule has ended. Edit its time or end condition to resume.",
+                    );
+                    return;
+                }
+                write_job("resume schedule", move |s: &Store| {
+                    s.set_schedule_paused(&id, None, due)
+                })
+                .await
+            };
+            window.imp().show_toast(match result {
+                Some(Ok(())) if action == "Delete" => "Schedule deleted",
+                Some(Ok(())) => "Schedule resumed",
+                _ => "Could not update the schedule; refresh and try again",
+            });
+            window.imp().refresh_schedule_status();
+        });
+    }
+
     pub(super) fn active_chat_thread(&self) -> Option<(String, Option<String>, bool, bool)> {
         let tv = self.tab_view.borrow().clone()?;
         let page = tv.selected_page()?;
@@ -902,6 +1401,7 @@ impl super::AgentTerminalWindow {
             let dialog_w = dialog.downgrade();
             let list_w = list.downgrade();
             let stack_w = stack.downgrade();
+            let empty_w = empty.downgrade();
             let filter = filter.clone();
             let self_refresh_w = Rc::downgrade(&refresh);
             move || {
@@ -911,15 +1411,22 @@ impl super::AgentTerminalWindow {
                 let filter_id = filter.borrow().clone();
                 let list_w = list_w.clone();
                 let stack_w = stack_w.clone();
+                let empty_w = empty_w.clone();
                 let obj_c = obj.clone();
                 let dialog_c = dialog_w.clone();
                 let refresh_w = self_refresh_w.clone();
                 glib::MainContext::default().spawn_local(async move {
-                    let schedules = store_job(|store| store.list_schedules().unwrap_or_default())
-                        .await
-                        .unwrap_or_default();
+                    let schedules = store_job(|store| store.list_schedules()).await;
                     let (Some(list_c), Some(stack_c)) = (list_w.upgrade(), stack_w.upgrade())
                     else {
+                        return;
+                    };
+                    let Some(Ok(schedules)) = schedules else {
+                        if let Some(empty) = empty_w.upgrade() {
+                            empty.set_title("Schedule State Unknown");
+                            empty.set_description(Some("The thread store could not be read. Close and reopen this list to try again."));
+                        }
+                        stack_c.set_visible_child_name("empty");
                         return;
                     };
                     let filtered: Vec<ScheduleRecord> = schedules
@@ -1015,6 +1522,8 @@ impl super::AgentTerminalWindow {
                             .build();
                         let id_p = record.id.clone();
                         let rule_p = record.rule.clone();
+                        let ends_p = record.ends;
+                        let run_count_p = record.run_count;
                         let obj_p = obj_c.downgrade();
                         let dlg_p = dialog_c.clone();
                         let refresh_p = refresh_w.clone();
@@ -1033,10 +1542,27 @@ impl super::AgentTerminalWindow {
                                 } else {
                                     (Some(PausedReason::User), None)
                                 };
-                                let _ = write_job("toggle schedule pause", move |store: &Store| {
-                                    store.set_schedule_paused(&id, paused, next_due_val)
-                                })
-                                .await;
+                                if is_paused && !budget_allows_resume(&w).await { return; }
+                                if is_paused && (next_due_val.is_none()
+                                    || matches!(ends_p, Ends::OnDate { at } if next_due_val.is_some_and(|due| due > at))
+                                    || matches!(ends_p, Ends::AfterRuns { max } if run_count_p >= max)) {
+                                    w.imp().show_toast(
+                                        "This schedule has ended. Edit its time to resume.",
+                                    );
+                                    return;
+                                }
+                                let result =
+                                    write_job("toggle schedule pause", move |store: &Store| {
+                                        store.set_schedule_paused(&id, paused, next_due_val)
+                                    })
+                                    .await;
+                                if !matches!(result, Some(Ok(()))) {
+                                    w.imp().show_toast(
+                                        "Could not update the schedule; refresh and try again",
+                                    );
+                                    return;
+                                }
+                                w.imp().refresh_schedule_status();
                                 if dlg.upgrade().is_some() {
                                     w.imp().show_toast(if paused.is_some() {
                                         "Schedule paused"
@@ -1084,17 +1610,29 @@ impl super::AgentTerminalWindow {
                         let row_w = row.downgrade();
                         let list_w = list_c.downgrade();
                         let stack_w = stack_c.downgrade();
+                        let obj_d = obj_c.downgrade();
                         del_btn.connect_clicked(move |_| {
                             let id = id_d.clone();
                             let row_w = row_w.clone();
                             let list_w = list_w.clone();
                             let stack_w = stack_w.clone();
+                            let obj_d = obj_d.clone();
                             glib::MainContext::default().spawn_local(async move {
-                                let _ = write_job("delete schedule", move |store: &Store| {
+                                let result = write_job("delete schedule", move |store: &Store| {
                                     let _ = store.delete_schedule(&id)?;
                                     Ok(())
                                 })
                                 .await;
+                                if let Some(window) = obj_d.upgrade() {
+                                    if !matches!(result, Some(Ok(()))) {
+                                        window.imp().show_toast(
+                                            "Could not delete the schedule; refresh and try again",
+                                        );
+                                        return;
+                                    }
+                                    window.imp().show_toast("Schedule deleted");
+                                    window.imp().refresh_schedule_status();
+                                }
                                 if let (Some(r), Some(l)) = (row_w.upgrade(), list_w.upgrade()) {
                                     l.remove(&r);
                                     if l.first_child().is_none() {
@@ -1327,6 +1865,42 @@ impl super::AgentTerminalWindow {
         }
         target_group.add(&driver_row);
 
+        let profiles = self
+            .config
+            .borrow()
+            .profiles
+            .iter()
+            .filter(|p| !p.disabled && crate::config::profile_driver(p).is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        let profile_names = std::iter::once("Agent default")
+            .chain(profiles.iter().map(|p| p.name.as_str()))
+            .collect::<Vec<_>>();
+        let profile_row = adw::ComboRow::builder()
+            .title("Profile")
+            .model(&gtk4::StringList::new(&profile_names))
+            .build();
+        if let Some(Target::NewThread {
+            profile_id: Some(id),
+            ..
+        }) = seed.existing.as_ref().map(|r| &r.target)
+        {
+            if let Some(index) = profiles.iter().position(|p| &p.id == id) {
+                profile_row.set_selected(index as u32 + 1);
+            }
+        }
+        target_group.add(&profile_row);
+        let model_row = adw::EntryRow::builder()
+            .title("Model (blank uses profile default)")
+            .text(match seed.existing.as_ref().map(|r| &r.target) {
+                Some(Target::NewThread {
+                    model: Some(model), ..
+                }) => model,
+                _ => "",
+            })
+            .build();
+        target_group.add(&model_row);
+
         let mode_list = gtk4::StringList::new(&["Plan", "Ask", "Accept Edits"]);
         let mode_row = adw::ComboRow::builder()
             .title("Mode")
@@ -1348,6 +1922,11 @@ impl super::AgentTerminalWindow {
             })
             .build();
         target_group.add(&worktree_row);
+        let agy_ack = adw::SwitchRow::builder()
+            .title("Allow Antigravity unattended in isolation")
+            .subtitle("Antigravity acts without asking. Its worktree isolates files, but it retains session grants and network access.")
+            .build();
+        target_group.add(&agy_ack);
         page.add(&target_group);
 
         let sync_target_fields = {
@@ -1356,6 +1935,9 @@ impl super::AgentTerminalWindow {
             let mode_w = mode_row.downgrade();
             let worktree_w = worktree_row.downgrade();
             let target_w = target_row.downgrade();
+            let profile_w = profile_row.downgrade();
+            let model_w = model_row.downgrade();
+            let agy_w = agy_ack.downgrade();
             move || {
                 let (
                     Some(folder_entry),
@@ -1378,6 +1960,15 @@ impl super::AgentTerminalWindow {
                 driver_row.set_visible(is_new);
                 mode_row.set_visible(is_new);
                 worktree_row.set_visible(is_new);
+                if let Some(row) = profile_w.upgrade() {
+                    row.set_visible(is_new);
+                }
+                if let Some(row) = model_w.upgrade() {
+                    row.set_visible(is_new);
+                }
+                if let Some(row) = agy_w.upgrade() {
+                    row.set_visible(is_new);
+                }
             }
         };
         sync_target_fields();
@@ -1495,12 +2086,13 @@ impl super::AgentTerminalWindow {
             .build();
         when_group.add(&missed_row);
 
-        let ends_list = gtk4::StringList::new(&["Never", "After a number of runs"]);
+        let ends_list = gtk4::StringList::new(&["Never", "After a number of runs", "On a date"]);
         let ends_row = adw::ComboRow::builder()
             .title("Ends")
             .model(&ends_list)
             .selected(match seed.existing.as_ref().map(|e| e.ends) {
                 Some(Ends::AfterRuns { .. }) => 1,
+                Some(Ends::OnDate { .. }) => 2,
                 _ => 0,
             })
             .build();
@@ -1523,6 +2115,18 @@ impl super::AgentTerminalWindow {
             .digits(0)
             .build();
         when_group.add(&max_runs_row);
+        let end_date = match seed.existing.as_ref().map(|r| r.ends) {
+            Some(Ends::OnDate { at }) => GlibLocalClock
+                .civil_at(at)
+                .map(|c| format!("{:04}-{:02}-{:02}", c.year, c.month, c.day)),
+            _ => None,
+        }
+        .unwrap_or_else(|| default_once_inputs().0);
+        let end_date_row = adw::EntryRow::builder()
+            .title("End date (YYYY-MM-DD)")
+            .text(end_date)
+            .build();
+        when_group.add(&end_date_row);
         page.add(&when_group);
 
         let sync_when_fields = {
@@ -1534,6 +2138,7 @@ impl super::AgentTerminalWindow {
             let missed_w = missed_row.downgrade();
             let ends_w = ends_row.downgrade();
             let max_runs_w = max_runs_row.downgrade();
+            let end_date_w = end_date_row.downgrade();
             move || {
                 let (
                     Some(kind_row),
@@ -1565,6 +2170,9 @@ impl super::AgentTerminalWindow {
                 missed_row.set_visible(k != 0);
                 ends_row.set_visible(k != 0);
                 max_runs_row.set_visible(k != 0 && ends_row.selected() == 1);
+                if let Some(row) = end_date_w.upgrade() {
+                    row.set_visible(k != 0 && ends_row.selected() == 2);
+                }
             }
         };
         sync_when_fields();
@@ -1591,12 +2199,302 @@ impl super::AgentTerminalWindow {
             }
         });
 
+        let gather: Rc<dyn Fn() -> Result<FormInput, &'static str>> = Rc::new({
+            let buffer = buffer.clone();
+            let target_row = target_row.clone();
+            let folder_entry = folder_entry.clone();
+            let driver_row = driver_row.clone();
+            let profile_row = profile_row.clone();
+            let model_row = model_row.clone();
+            let mode_row = mode_row.clone();
+            let worktree_row = worktree_row.clone();
+            let kind_row = kind_row.clone();
+            let date_row = date_row.clone();
+            let time_row = time_row.clone();
+            let day_buttons = day_buttons.clone();
+            let hours_adj = hours_adj.clone();
+            let missed_row = missed_row.clone();
+            let ends_row = ends_row.clone();
+            let max_runs_adj = max_runs_adj.clone();
+            let end_date_row = end_date_row.clone();
+            let thread_id = seed.thread_id.clone();
+            let has_images = seed.has_images;
+            let agy_ack = agy_ack.clone();
+            move || {
+                let now = now_unix();
+                let prompt = buffer
+                    .text(&buffer.start_iter(), &buffer.end_iter(), false)
+                    .to_string();
+
+                let is_new_thread = !has_existing_thread || target_row.selected() == 1;
+                let folder = folder_entry.text().trim().to_owned();
+                let driver = Driver::ALL
+                    .get(driver_row.selected() as usize)
+                    .copied()
+                    .unwrap_or(Driver::Claude);
+                let mode = safe_mode_at(mode_row.selected());
+                let use_wt = worktree_row.is_active();
+                if is_new_thread && driver == Driver::Agy && !agy_ack.is_active() {
+                    return Err(
+                        "Acknowledge Antigravity’s unattended authority before scheduling.",
+                    );
+                }
+
+                let target = if is_new_thread {
+                    Target::NewThread {
+                        folder: folder.clone(),
+                        driver,
+                        profile_id: profile_row
+                            .selected()
+                            .checked_sub(1)
+                            .and_then(|i| profiles.get(i as usize))
+                            .map(|p| p.id.clone()),
+                        mode,
+                        model: (!model_row.text().trim().is_empty())
+                            .then(|| model_row.text().trim().to_owned()),
+                        worktree: use_wt,
+                    }
+                } else if let Some(tid) = thread_id.as_ref() {
+                    Target::ExistingThread {
+                        thread_id: tid.clone(),
+                    }
+                } else {
+                    return Err("Choose a target thread or folder.");
+                };
+
+                let rule = match kind_row.selected() {
+                    0 => {
+                        let Some((y, m, d)) = parse_ymd(&date_row.text()) else {
+                            return Err("Enter a valid date (YYYY-MM-DD).");
+                        };
+                        let Some((hh, mm)) = parse_hhmm(&time_row.text()) else {
+                            return Err("Enter a valid time (HH:MM).");
+                        };
+                        match GlibLocalClock.resolve_local(y, m, d, hh, mm) {
+                            agent_core::schedule::ResolveLocal::Exact(at)
+                            | agent_core::schedule::ResolveLocal::SkippedSpringForward(at)
+                            | agent_core::schedule::ResolveLocal::AmbiguousFallBack {
+                                first: at,
+                                ..
+                            } => Rule::Once { at },
+                            agent_core::schedule::ResolveLocal::Invalid => {
+                                return Err("That date and time is invalid.");
+                            }
+                        }
+                    }
+                    1 => {
+                        let Some((hh, mm)) = parse_hhmm(&time_row.text()) else {
+                            return Err("Enter a valid time (HH:MM).");
+                        };
+                        let mut weekdays = [false; 7];
+                        for (i, b) in day_buttons.iter().enumerate() {
+                            weekdays[i] = b.is_active();
+                        }
+                        Rule::Days {
+                            weekdays,
+                            hour: hh,
+                            minute: mm,
+                        }
+                    }
+                    _ => {
+                        let secs = interval_secs_from_hours(hours_adj.value() as u32);
+                        Rule::Interval {
+                            every_secs: secs,
+                            anchor: now,
+                        }
+                    }
+                };
+
+                let missed_policy = if missed_row.selected() == 1 {
+                    MissedPolicy::Skip
+                } else {
+                    MissedPolicy::RunOnce
+                };
+                let ends = match (kind_row.selected(), ends_row.selected()) {
+                    (0, _) | (_, 0) => Ends::Never,
+                    (_, 1) => Ends::AfterRuns {
+                        max: max_runs_adj.value() as u32,
+                    },
+                    _ => {
+                        let (y, m, d) = parse_ymd(&end_date_row.text())
+                            .ok_or("Enter a valid end date (YYYY-MM-DD).")?;
+                        let at = match GlibLocalClock.resolve_local(y, m, d, 23, 59) {
+                            agent_core::schedule::ResolveLocal::Exact(at)
+                            | agent_core::schedule::ResolveLocal::SkippedSpringForward(at)
+                            | agent_core::schedule::ResolveLocal::AmbiguousFallBack {
+                                first: at,
+                                ..
+                            } => at,
+                            _ => return Err("That end date is invalid."),
+                        };
+                        Ends::OnDate { at }
+                    }
+                };
+                if let Some(profile) = profile_row
+                    .selected()
+                    .checked_sub(1)
+                    .and_then(|i| profiles.get(i as usize))
+                {
+                    if is_new_thread && crate::config::profile_driver(profile) != Some(driver) {
+                        return Err("Choose a profile for the selected agent.");
+                    }
+                }
+                Ok(FormInput {
+                    prompt,
+                    has_images,
+                    target,
+                    in_git_repo: true,
+                    rule,
+                    missed_policy,
+                    ends,
+                    now,
+                })
+            }
+        });
+        let saving = Rc::new(Cell::new(false));
+        let validation_generation = Rc::new(Cell::new(0u64));
+        let validate_live: Rc<dyn Fn()> = Rc::new({
+            let gather = gather.clone();
+            let save = save_btn.downgrade();
+            let error = error_label.downgrade();
+            let saving = saving.clone();
+            let generation = validation_generation.clone();
+            move || {
+                if saving.get() {
+                    return;
+                }
+                let current = generation.get().wrapping_add(1);
+                generation.set(current);
+                let result = gather().and_then(|form| validate_form(&form, &GlibLocalClock));
+                if let Some(save) = save.upgrade() {
+                    save.set_sensitive(result.is_ok());
+                }
+                if let Some(error) = error.upgrade() {
+                    error.set_visible(result.is_err());
+                    if let Err(message) = result {
+                        error.set_text(message);
+                    }
+                }
+                if let Ok(mut form) = gather() {
+                    if let Target::NewThread {
+                        folder, worktree, ..
+                    } = &form.target
+                    {
+                        let folder = folder.clone();
+                        let worktree = *worktree;
+                        if let Some(save) = save.upgrade() {
+                            save.set_sensitive(false);
+                        }
+                        let save = save.clone();
+                        let error = error.clone();
+                        let generation = generation.clone();
+                        let saving = saving.clone();
+                        glib::spawn_future_local(async move {
+                            let valid_folder = off_main("checking schedule folder", move || {
+                                let path = PathBuf::from(folder);
+                                Ok((
+                                    path.is_dir(),
+                                    !worktree || crate::worktree::main_toplevel(&path).is_ok(),
+                                ))
+                            })
+                            .await;
+                            if generation.get() != current || saving.get() {
+                                return;
+                            }
+                            let result = match valid_folder {
+                                Ok((true, git)) => {
+                                    form.in_git_repo = git;
+                                    validate_form(&form, &GlibLocalClock).map(|_| ())
+                                }
+                                _ => Err("Choose an existing folder for this schedule."),
+                            };
+                            if let Some(save) = save.upgrade() {
+                                save.set_sensitive(result.is_ok());
+                            }
+                            if let Some(error) = error.upgrade() {
+                                error.set_visible(result.is_err());
+                                if let Err(message) = result {
+                                    error.set_text(message);
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        });
+        for row in [
+            &folder_entry,
+            &model_row,
+            &date_row,
+            &time_row,
+            &end_date_row,
+        ] {
+            let weak = Rc::downgrade(&validate_live);
+            row.connect_changed(move |_| {
+                if let Some(check) = weak.upgrade() {
+                    check();
+                }
+            });
+        }
+        for row in [
+            &target_row,
+            &driver_row,
+            &profile_row,
+            &mode_row,
+            &kind_row,
+            &missed_row,
+            &ends_row,
+        ] {
+            let weak = Rc::downgrade(&validate_live);
+            row.connect_selected_notify(move |_| {
+                if let Some(check) = weak.upgrade() {
+                    check();
+                }
+            });
+        }
+        for button in &day_buttons {
+            let weak = Rc::downgrade(&validate_live);
+            button.connect_toggled(move |_| {
+                if let Some(check) = weak.upgrade() {
+                    check();
+                }
+            });
+        }
+        for adj in [&hours_adj, &max_runs_adj] {
+            let weak = Rc::downgrade(&validate_live);
+            adj.connect_value_changed(move |_| {
+                if let Some(check) = weak.upgrade() {
+                    check();
+                }
+            });
+        }
+        let weak = Rc::downgrade(&validate_live);
+        buffer.connect_changed(move |_| {
+            if let Some(check) = weak.upgrade() {
+                check();
+            }
+        });
+        let weak = Rc::downgrade(&validate_live);
+        worktree_row.connect_active_notify(move |_| {
+            if let Some(check) = weak.upgrade() {
+                check();
+            }
+        });
+        let weak = Rc::downgrade(&validate_live);
+        agy_ack.connect_active_notify(move |_| {
+            if let Some(check) = weak.upgrade() {
+                check();
+            }
+        });
+        validate_live();
+
         let obj_w = self.obj().downgrade();
         let dlg_w = dialog.downgrade();
         let save_w = save_btn.downgrade();
         let clear_composer = seed.clear_composer;
         let on_saved = seed.on_saved.clone();
         save_btn.connect_clicked(move |btn| {
+            let _keep_validation_alive = &validate_live;
             if !btn.is_sensitive() {
                 return;
             }
@@ -1607,109 +2505,19 @@ impl super::AgentTerminalWindow {
                 return;
             };
             let now = now_unix();
-            let prompt = buffer
-                .text(&buffer.start_iter(), &buffer.end_iter(), false)
-                .to_string();
-
-            let is_new_thread = !has_existing_thread || target_row.selected() == 1;
-            let folder = folder_entry.text().trim().to_owned();
-            let driver = Driver::ALL
-                .get(driver_row.selected() as usize)
-                .copied()
-                .unwrap_or(Driver::Claude);
-            let mode = safe_mode_at(mode_row.selected());
-            let use_wt = worktree_row.is_active();
-
-            let target = if is_new_thread {
-                Target::NewThread {
-                    folder: folder.clone(),
-                    driver,
-                    profile_id: None,
-                    mode,
-                    model: None,
-                    worktree: use_wt,
-                }
-            } else if let Some(tid) = seed.thread_id.as_ref() {
-                Target::ExistingThread {
-                    thread_id: tid.clone(),
-                }
-            } else {
-                error_label.set_text("Choose a target thread or folder.");
-                error_label.set_visible(true);
-                return;
+            let mut form = match gather() {
+                Ok(form) => form,
+                Err(message) => { error_label.set_text(message); error_label.set_visible(true); return; }
             };
-
-            let rule = match kind_row.selected() {
-                0 => {
-                    let Some((y, m, d)) = parse_ymd(&date_row.text()) else {
-                        error_label.set_text("Enter a valid date (YYYY-MM-DD).");
-                        error_label.set_visible(true);
-                        return;
-                    };
-                    let Some((hh, mm)) = parse_hhmm(&time_row.text()) else {
-                        error_label.set_text("Enter a valid time (HH:MM).");
-                        error_label.set_visible(true);
-                        return;
-                    };
-                    match GlibLocalClock.resolve_local(y, m, d, hh, mm) {
-                        agent_core::schedule::ResolveLocal::Exact(at)
-                        | agent_core::schedule::ResolveLocal::SkippedSpringForward(at)
-                        | agent_core::schedule::ResolveLocal::AmbiguousFallBack {
-                            first: at, ..
-                        } => Rule::Once { at },
-                        agent_core::schedule::ResolveLocal::Invalid => {
-                            error_label.set_text("That date and time is invalid.");
-                            error_label.set_visible(true);
-                            return;
-                        }
-                    }
-                }
-                1 => {
-                    let Some((hh, mm)) = parse_hhmm(&time_row.text()) else {
-                        error_label.set_text("Enter a valid time (HH:MM).");
-                        error_label.set_visible(true);
-                        return;
-                    };
-                    let mut weekdays = [false; 7];
-                    for (i, b) in day_buttons.iter().enumerate() {
-                        weekdays[i] = b.is_active();
-                    }
-                    Rule::Days {
-                        weekdays,
-                        hour: hh,
-                        minute: mm,
-                    }
-                }
-                _ => {
-                    let secs = interval_secs_from_hours(hours_adj.value() as u32);
-                    Rule::Interval {
-                        every_secs: secs,
-                        anchor: now,
-                    }
-                }
-            };
-
-            let missed_policy = if missed_row.selected() == 1 {
-                MissedPolicy::Skip
-            } else {
-                MissedPolicy::RunOnce
-            };
-            let ends = if kind_row.selected() != 0 && ends_row.selected() == 1 {
-                Ends::AfterRuns {
-                    max: max_runs_adj.value() as u32,
-                }
-            } else {
-                Ends::Never
-            };
-
+            let folder_check = match &form.target { Target::NewThread { folder, .. } => Some(folder.clone()), _ => None };
             let err_lbl = error_label.clone();
             let clear_tid = clear_composer.then(|| seed.thread_id.clone()).flatten();
             let edit_id = seed.editing_id.clone();
-            let had_images = seed.has_images;
             let on_saved = on_saved.clone();
             let save_w = save_w.clone();
             btn.set_sensitive(false);
-            let folder_check = is_new_thread.then_some(folder);
+            saving.set(true);
+            let saving = saving.clone();
             glib::MainContext::default().spawn_local(async move {
                 let in_git_repo = match folder_check {
                     Some(dir) if !dir.is_empty() => {
@@ -1722,21 +2530,11 @@ impl super::AgentTerminalWindow {
                     }
                     _ => true,
                 };
-                let validated = match validate_form(
-                    &FormInput {
-                        prompt,
-                        has_images: had_images,
-                        target,
-                        in_git_repo,
-                        rule,
-                        missed_policy,
-                        ends,
-                        now,
-                    },
-                    &GlibLocalClock,
-                ) {
+                form.in_git_repo = in_git_repo;
+                let validated = match validate_form(&form, &GlibLocalClock) {
                     Ok(v) => v,
                     Err(msg) => {
+                        saving.set(false);
                         err_lbl.set_text(msg);
                         err_lbl.set_visible(true);
                         if let Some(b) = save_w.upgrade() {
@@ -1755,14 +2553,17 @@ impl super::AgentTerminalWindow {
                 let target_due = validated.next_due;
                 let res = write_job("save schedule", move |store: &Store| {
                     if let Some(id) = edit_id {
-                        store.update_schedule(
+                        store.atomically(|store| {
+                            store.update_schedule_target(&id, &validated.target)?;
+                            store.update_schedule(
                             &id,
                             &validated.prompt,
                             &validated.rule,
                             validated.missed_policy,
                             validated.ends,
                             validated.next_due,
-                        )?;
+                            )
+                        })?;
                     } else {
                         let _ = store.create_schedule(&NewSchedule {
                             target: validated.target,
@@ -1778,12 +2579,10 @@ impl super::AgentTerminalWindow {
                 .await;
                 match res {
                     Some(Ok(())) => {
+                        window.imp().refresh_schedule_status();
                         if let Some(tid) = clear_tid {
-                            window.imp().with_chat(&tid, |chat| {
-                                if let Some(view) = &chat.view {
-                                    view.clear_composer_draft();
-                                }
-                            });
+                            let view = window.imp().with_chat(&tid, |chat| chat.view.clone()).flatten();
+                            if let Some(view) = view { view.clear_composer_draft(); }
                         }
                         if let Some(cb) = on_saved {
                             cb();
@@ -1795,6 +2594,7 @@ impl super::AgentTerminalWindow {
                         dlg.close();
                     }
                     Some(Err(e)) => {
+                        saving.set(false);
                         if let Some(b) = save_w.upgrade() {
                             b.set_sensitive(true);
                         }
@@ -1832,6 +2632,625 @@ struct ScheduleEditorSeed {
 pub(super) mod tests {
     use super::*;
     use crate::testutil::pump_until;
+
+    fn pending_for_test(id: &str, now: i64, revision: i64) -> PendingScheduled {
+        PendingScheduled {
+            schedule_id: id.to_owned(),
+            revision,
+            due: now,
+            prompt: "Check tests".into(),
+            in_worktree: false,
+            next_due: Some(now + 3600),
+            new_paused: None,
+            count_unattended: true,
+            notify: false,
+            manual: false,
+        }
+    }
+
+    #[test]
+    fn scheduled_finish_keeps_guard_until_late_committed_writer_receipt() {
+        crate::testutil::in_loop(|ctx| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("threads.db");
+            let store = Store::open(&path).expect("store");
+            let thread = store.create_thread("/tmp", None).expect("thread");
+            let id = store
+                .create_schedule(&NewSchedule {
+                    target: Target::ExistingThread { thread_id: thread },
+                    prompt: "Check tests".into(),
+                    rule: Rule::Interval {
+                        every_secs: 3600,
+                        anchor: 1000,
+                    },
+                    missed_policy: MissedPolicy::Skip,
+                    ends: Ends::Never,
+                    next_due: Some(1000),
+                })
+                .expect("schedule");
+            let writer = agent_kit::store_writer::StoreWriter::spawn(&path).expect("writer");
+            let (release, held) = std::sync::mpsc::channel();
+            let (started, waiting) = std::sync::mpsc::channel();
+            let _hold_receipt = writer.call_result("hold scheduled receipt", move |_| {
+                let _ = started.send(());
+                held.recv()
+                    .map_err(|e| agent_kit::store::StoreError::Failed(e.to_string()))?;
+                Ok(())
+            });
+            waiting
+                .recv_timeout(Duration::from_secs(5))
+                .expect("writer held");
+            let run_id = id.clone();
+            let receipt = writer.call_result("record delayed scheduled run", move |s| {
+                s.record_schedule_run(&ScheduleRunUpdate {
+                    id: run_id,
+                    next_due: Some(4600),
+                    last_due: Some(1000),
+                    last_outcome: Some(LastOutcome::Ran),
+                    increment_run_count: true,
+                    increment_unattended: true,
+                    paused_reason: None,
+                })
+            });
+            assert!(mark_in_flight(&id));
+            let finished = Rc::new(Cell::new(false));
+            let done = finished.clone();
+            let pending = pending_for_test(&id, 1000, 0);
+            ctx.spawn_local(async move {
+                finish_run(
+                    glib::WeakRef::new(),
+                    pending,
+                    await_schedule_receipt(receipt),
+                )
+                .await;
+                done.set(true);
+            });
+            let until = std::time::Instant::now() + Duration::from_millis(50);
+            assert!(pump_until(ctx, 2, || std::time::Instant::now() >= until));
+            assert!(!finished.get());
+            assert!(!mark_in_flight(&id), "pending receipt still owns its guard");
+            release.send(()).expect("release writer");
+            assert!(pump_until(ctx, 5, || finished.get()));
+            assert_eq!(
+                store
+                    .get_schedule(&id)
+                    .expect("read")
+                    .expect("record")
+                    .run_count,
+                1
+            );
+            assert!(mark_in_flight(&id), "actual late commit released the guard");
+            clear_in_flight(&id);
+            assert_eq!(
+                writer.shutdown(Duration::from_secs(5)),
+                agent_kit::store_writer::Shutdown::Drained
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a display; run through make test-one"]
+    fn scheduled_delivery_rechecks_budget_and_pause_after_startup() {
+        use crate::chat::ChatBackend;
+        use agent_core::event::{Envelope, Event, ItemKind, TurnState};
+        crate::testutil::gtk_init().expect("GTK");
+        let app = super::super::test_support::test_app("org.test.ScheduleDelivery", true);
+        let ctx = glib::MainContext::default();
+        let window = super::super::test_support::test_window(&app, &ctx);
+        window.imp().config.borrow_mut().notify_scheduled = false;
+        let dir = tempfile::tempdir().expect("fixture folder");
+        let store = app_store();
+        let thread = store
+            .create_thread(&dir.path().to_string_lossy(), Some("Delivery"))
+            .expect("thread");
+        let seen = Rc::new(RefCell::new(Vec::<Envelope>::new()));
+        let sink = seen.clone();
+        let session = ChatSession::new(
+            Box::new(agent_core::claude::ClaudeAdapter::new()),
+            crate::testutil::open_session(
+                "/usr/bin/python3",
+                vec![
+                    "-I".into(),
+                    format!(
+                        "{}/tests/support/scripted_claude.py",
+                        env!("CARGO_MANIFEST_DIR")
+                    ),
+                    dir.path().to_string_lossy().into_owned(),
+                ],
+                dir.path().to_string_lossy(),
+            ),
+            store.clone(),
+            thread.clone(),
+            Rc::new(move |env| sink.borrow_mut().push(env.clone())),
+            None,
+        );
+        session.send_prompt("startup check");
+        assert!(pump_until(&ctx, 10, || seen
+            .borrow()
+            .iter()
+            .any(|e| matches!(e.event, Event::TurnCompleted { .. }))
+            && !session.status().running_turn));
+        let now = now_unix();
+        let id = store
+            .create_schedule(&NewSchedule {
+                target: Target::ExistingThread {
+                    thread_id: thread.clone(),
+                },
+                prompt: "Check tests".into(),
+                rule: Rule::Interval {
+                    every_secs: 3600,
+                    anchor: now,
+                },
+                missed_policy: MissedPolicy::Skip,
+                ends: Ends::Never,
+                next_due: Some(now),
+            })
+            .expect("schedule");
+        let mut pending = pending_for_test(
+            &id,
+            now,
+            store
+                .get_schedule(&id)
+                .expect("read")
+                .expect("record")
+                .updated_at,
+        );
+        assert!(
+            ctx.block_on(automatic_delivery_allowed(&window, &pending)),
+            "initial tick allowed it"
+        );
+        // Startup happened between the initial tick and this pending prompt being drained.
+        // Another turn now crosses the warning threshold before actual delivery.
+        let provider = store.provider_threads(&thread).expect("providers")[0]
+            .id
+            .clone();
+        store
+            .append_event(
+                &thread,
+                Some(&provider),
+                &Envelope::new(Event::TurnCompleted {
+                    state: TurnState::Completed,
+                    usage: None,
+                    cost_usd: Some(0.8),
+                    error: None,
+                    model: None,
+                    billing: Some(agent_core::spend::Billing::Metered),
+                }),
+            )
+            .expect("other turn cost");
+        {
+            let mut cfg = window.imp().config.borrow_mut();
+            cfg.spend_warn_enabled = true;
+            cfg.spend_warn_daily = Some(1.0);
+        }
+        let marked = || {
+            store.events(&thread, None, 100).expect("events").into_iter().filter(|(_, env)| matches!(&env.event, Event::ItemStarted { kind: ItemKind::UserMessage, input: Some(input), .. } if agent_core::schedule::parse_scheduled_input(input).is_some())).count()
+        };
+        assert!(mark_in_flight(&id));
+        dispatch_on_session(&window, &session, pending.clone());
+        assert!(pump_until(&ctx, 10, || IN_FLIGHT.with(|s| !s.borrow().contains(&id))));
+        assert_eq!(
+            marked(),
+            0,
+            "pending automatic prompt never reached the session"
+        );
+        assert_eq!(
+            store
+                .get_schedule(&id)
+                .expect("read")
+                .expect("record")
+                .paused_reason,
+            Some(PausedReason::Budget)
+        );
+        let mut manual = pending.clone();
+        manual.manual = true;
+        manual.count_unattended = false;
+        manual.new_paused = Some(PausedReason::Budget);
+        assert!(mark_in_flight(&id));
+        dispatch_on_session(&window, &session, manual);
+        assert!(pump_until(&ctx, 10, || marked() == 1
+            && IN_FLIGHT.with(|s| !s.borrow().contains(&id))));
+        assert_eq!(
+            store
+                .get_schedule(&id)
+                .expect("read")
+                .expect("record")
+                .paused_reason,
+            Some(PausedReason::Budget),
+            "manual delivery retains future pause"
+        );
+        assert!(pump_until(&ctx, 10, || !session.status().running_turn));
+        window.imp().config.borrow_mut().spend_warn_enabled = false;
+        store
+            .set_schedule_paused(&id, None, Some(now))
+            .expect("resume for next case");
+        pending.revision = store
+            .get_schedule(&id)
+            .expect("read")
+            .expect("record")
+            .updated_at;
+        assert!(ctx.block_on(automatic_delivery_allowed(&window, &pending)));
+        store
+            .set_schedule_paused(&id, Some(PausedReason::User), None)
+            .expect("pause during startup");
+        assert!(mark_in_flight(&id));
+        dispatch_on_session(&window, &session, pending.clone());
+        assert!(pump_until(&ctx, 10, || IN_FLIGHT.with(|s| !s.borrow().contains(&id))));
+        assert_eq!(
+            marked(),
+            1,
+            "a pause during startup cancels the pending automatic delivery"
+        );
+        store
+            .set_schedule_paused(&id, None, Some(now))
+            .expect("resume for edit case");
+        pending.revision = store
+            .get_schedule(&id)
+            .expect("read")
+            .expect("record")
+            .updated_at;
+        assert!(ctx.block_on(automatic_delivery_allowed(&window, &pending)));
+        let other = store
+            .create_thread("/tmp", Some("Changed target"))
+            .expect("other target");
+        store
+            .update_schedule_target(
+                &id,
+                &Target::ExistingThread {
+                    thread_id: other.clone(),
+                },
+            )
+            .expect("edit target without changing prompt");
+        assert!(mark_in_flight(&id));
+        dispatch_on_session(&window, &session, pending);
+        assert!(pump_until(&ctx, 10, || IN_FLIGHT.with(|s| !s.borrow().contains(&id))));
+        assert_eq!(
+            marked(),
+            1,
+            "a same-prompt target edit cancels the stale delivery"
+        );
+        session.shutdown(false);
+        assert!(pump_until(&ctx, 10, || !session.status().alive));
+        window.destroy();
+        store.delete_thread(&thread).expect("cleanup");
+        store.delete_thread(&other).expect("cleanup changed target");
+    }
+
+    #[test]
+    fn schedule_status_generation_rejects_older_responses() {
+        let old = STATUS_GENERATION.with(crate::window::Generation::next);
+        let current = STATUS_GENERATION.with(crate::window::Generation::next);
+        assert!(!STATUS_GENERATION.with(|g| g.is_current(old)));
+        assert!(STATUS_GENERATION.with(|g| g.is_current(current)));
+    }
+
+    #[test]
+    #[ignore = "needs a display; run through make test-one"]
+    fn schedule_status_actions_preserve_budget_pause_and_update_background_badges() {
+        use crate::window::sidebar_model::ScheduleBadge;
+        use agent_core::event::{Envelope, Event, TurnState};
+        crate::testutil::gtk_init().expect("GTK");
+        let app = super::super::test_support::test_app("org.test.ScheduleStatus", true);
+        let ctx = glib::MainContext::default();
+        let window = super::super::test_support::test_window(&app, &ctx);
+        let imp = window.imp();
+        for profile in &mut imp.config.borrow_mut().profiles {
+            profile.disabled = true;
+            profile.command = "/nonexistent/schedule-test-agent".into();
+        }
+        imp.finish_shell(None);
+        imp.reveal_shell();
+        imp.config.borrow_mut().notify_scheduled = false;
+        let store = app_store();
+        let now = now_unix();
+        let mut threads = Vec::new();
+        let mut ids = Vec::new();
+        let mut views = Vec::new();
+        let mut provider = String::new();
+        for name in ["Selected schedule", "Background schedule"] {
+            let thread = store.create_thread("/tmp", Some(name)).expect("thread");
+            provider = store
+                .add_provider_thread(&thread, "claude", "default")
+                .expect("provider");
+            store
+                .set_active_provider_thread(&thread, &provider)
+                .expect("active provider");
+            let id = store
+                .create_schedule(&NewSchedule {
+                    target: Target::ExistingThread {
+                        thread_id: thread.clone(),
+                    },
+                    prompt: "Check tests".into(),
+                    rule: Rule::Once { at: now + 3600 },
+                    missed_policy: MissedPolicy::Skip,
+                    ends: Ends::Never,
+                    next_due: Some(now + 3600),
+                })
+                .expect("schedule");
+            imp.reload_summaries();
+            let page = imp.open_thread(&thread, views.is_empty()).expect("page");
+            imp.ensure_built(&page);
+            assert!(pump_until(&ctx, 10, || imp
+                .with_chat(&thread, |c| c.view.is_some())
+                .unwrap_or(false)));
+            views.push(
+                imp.with_chat(&thread, |c| c.view.clone())
+                    .flatten()
+                    .expect("view"),
+            );
+            threads.push(thread);
+            ids.push(id);
+        }
+        window.present();
+        imp.refresh_schedule_status();
+        assert!(pump_until(&ctx, 10, || imp
+            .schedule_badges
+            .borrow()
+            .as_ref()
+            .is_some_and(|b| threads
+                .iter()
+                .all(|t| matches!(b.get(t), Some(ScheduleBadge::Next(_)))))));
+        for view in &views {
+            assert!(
+                pump_until(&ctx, 10, || crate::testutil::label_texts(view.upcast_ref())
+                    .iter()
+                    .any(|t| t.contains("Next:"))),
+                "both selected and background headers show their next run"
+            );
+        }
+        {
+            let mut config = imp.config.borrow_mut();
+            config.spend_warn_enabled = true;
+            config.spend_warn_daily = Some(1.0);
+            config.spend_warn_monthly = None;
+        }
+        let cost = |value| {
+            store
+                .append_event(
+                    &threads[1],
+                    Some(&provider),
+                    &Envelope::new(Event::TurnCompleted {
+                        state: TurnState::Completed,
+                        usage: None,
+                        cost_usd: Some(value),
+                        error: None,
+                        model: None,
+                        billing: Some(agent_core::spend::Billing::Metered),
+                    }),
+                )
+                .expect("metered turn");
+        };
+        cost(0.79);
+        assert!(
+            ctx.block_on(check_schedule_budget(&window)),
+            "below 80% remains active"
+        );
+        cost(0.01);
+        assert!(
+            !ctx.block_on(check_schedule_budget(&window)),
+            "80% pauses schedules"
+        );
+        assert!(pump_until(&ctx, 10, || imp
+            .schedule_badges
+            .borrow()
+            .as_ref()
+            .is_some_and(|b| threads.iter().all(
+                |t| b.get(t) == Some(&ScheduleBadge::Paused(PausedReason::Budget))
+            ))));
+        for view in &views {
+            assert!(pump_until(&ctx, 10, || crate::testutil::label_texts(
+                view.upcast_ref()
+            )
+            .iter()
+            .any(|t| t.contains(PausedReason::Budget.label()))));
+        }
+        for title in ["Resume", "Run Now", "Delete"] {
+            let control = crate::testutil::find_all::<gtk4::Button>(views[0].upcast_ref())
+                .into_iter()
+                .find(|b| b.label().as_deref() == Some(title))
+                .expect("status control");
+            assert!(control.grab_focus());
+            imp.refresh_schedule_status();
+            crate::testutil::settle(&ctx);
+            let current = crate::testutil::find_all::<gtk4::Button>(views[0].upcast_ref())
+                .into_iter()
+                .find(|b| b.label().as_deref() == Some(title))
+                .expect("refreshed control");
+            assert_eq!(
+                current, control,
+                "{title} is reused on an unchanged refresh"
+            );
+            assert!(control.has_focus(), "{title} retains keyboard focus");
+        }
+        let resume = crate::testutil::find_all::<gtk4::Button>(views[0].upcast_ref())
+            .into_iter()
+            .find(|b| b.label().as_deref() == Some("Resume"))
+            .expect("Resume action");
+        resume.emit_clicked();
+        assert!(pump_until(&ctx, 10, || imp
+            .test_toasts
+            .borrow()
+            .iter()
+            .any(|t| t
+                .title()
+                .is_some_and(|t| t.contains("Cannot resume while")))));
+        assert_eq!(
+            store
+                .get_schedule(&ids[0])
+                .expect("schedule")
+                .expect("present")
+                .paused_reason,
+            Some(PausedReason::Budget)
+        );
+        // The manual dispatcher bypasses the budget gate but retains the pause. A disabled
+        // agent may refuse the attempt; it must never be rejected by the budget gate itself.
+        let record = store.get_schedule(&ids[0]).expect("read").expect("record");
+        assert_eq!(record.paused_reason, Some(PausedReason::Budget));
+        let run_now = crate::testutil::find_all::<gtk4::Button>(views[0].upcast_ref())
+            .into_iter()
+            .find(|b| b.label().as_deref() == Some("Run Now"))
+            .expect("Run Now action");
+        let before = imp.test_toasts.borrow().len();
+        run_now.emit_clicked();
+        assert!(pump_until(&ctx, 10, || imp.test_toasts.borrow().len() > before));
+        assert!(!imp.test_toasts.borrow()[before..]
+            .iter()
+            .any(|t| t.title().is_some_and(|t| t.contains("Cannot resume while"))));
+        assert_eq!(
+            store
+                .get_schedule(&ids[0])
+                .expect("read")
+                .expect("record")
+                .paused_reason,
+            Some(PausedReason::Budget)
+        );
+        let delete = crate::testutil::find_all::<gtk4::Button>(views[0].upcast_ref())
+            .into_iter()
+            .find(|b| b.label().as_deref() == Some("Delete"))
+            .expect("Delete action");
+        delete.emit_clicked();
+        assert!(pump_until(&ctx, 10, || store
+            .get_schedule(&ids[0])
+            .expect("read")
+            .is_none()));
+        assert!(pump_until(&ctx, 10, || imp
+            .schedule_badges
+            .borrow()
+            .as_ref()
+            .is_some_and(|b| !b.contains_key(&threads[0]))));
+        // Unknown and known-empty are distinct cache states in the drawn sidebar model.
+        *imp.schedule_badges.borrow_mut() = None;
+        assert!(imp.sidebar_rows().iter().filter(|r| matches!(&r.key, crate::window::sidebar_model::RowKey::Thread(t) if threads.contains(t))).all(|r| r.schedule == Some(ScheduleBadge::Unknown)));
+        window.destroy();
+        for thread in threads {
+            store.delete_thread(&thread).expect("cleanup");
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a display; run through make test-one"]
+    fn schedule_editor_validates_before_save_and_offers_profile_model_and_end_date() {
+        crate::testutil::gtk_init().expect("GTK");
+        let app = adw::Application::builder()
+            .application_id("org.test.ScheduleEditor")
+            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk4::gio::Cancellable>)
+            .expect("register");
+        let window = AgentTerminalWindow::new(&app);
+        window.present();
+        window.imp().open_schedule_editor(ScheduleEditorSeed {
+            editing_id: None,
+            thread_id: None,
+            initial_prompt: "Check tests".into(),
+            has_images: false,
+            clear_composer: false,
+            on_saved: None,
+            existing: None,
+        });
+        let ctx = glib::MainContext::default();
+        assert!(pump_until(&ctx, 5, || window.visible_dialog().is_some()));
+        let dialog = window.visible_dialog().expect("editor");
+        assert!(crate::testutil::pump_until_dialog_open(&ctx, &dialog, 10));
+        let root = dialog.upcast_ref::<gtk4::Widget>();
+        let save = crate::testutil::find_all::<gtk4::Button>(root)
+            .into_iter()
+            .find(|b| b.label().as_deref() == Some("Schedule"))
+            .expect("Schedule button");
+        let entries = crate::testutil::find_all::<adw::EntryRow>(root);
+        let date = entries
+            .iter()
+            .find(|e| e.title() == "Date (YYYY-MM-DD)")
+            .expect("date");
+        let model = entries
+            .iter()
+            .find(|e| e.title() == "Model (blank uses profile default)")
+            .expect("model");
+        assert!(model.is_visible());
+        assert!(crate::testutil::find_all::<adw::ComboRow>(root)
+            .iter()
+            .any(|r| r.title() == "Profile"));
+        assert!(pump_until(&ctx, 10, || save.is_sensitive()));
+        date.set_text("invalid");
+        assert!(
+            !save.is_sensitive(),
+            "invalid date disables Save immediately"
+        );
+        date.set_text(default_once_inputs().0.as_str());
+        assert!(pump_until(&ctx, 10, || save.is_sensitive()));
+        let text = crate::testutil::find_first::<gtk4::TextView>(root).expect("prompt");
+        text.buffer().set_text("Inspect {branch}");
+        assert!(!save.is_sensitive(), "unfilled placeholders disable Save");
+        text.buffer().set_text("Check tests");
+        let combos = crate::testutil::find_all::<adw::ComboRow>(root);
+        combos
+            .iter()
+            .find(|r| r.title() == "Repeat")
+            .expect("repeat")
+            .set_selected(2);
+        combos
+            .iter()
+            .find(|r| r.title() == "Ends")
+            .expect("ends")
+            .set_selected(2);
+        let end_date = entries
+            .iter()
+            .find(|e| e.title() == "End date (YYYY-MM-DD)")
+            .expect("end date");
+        assert!(end_date.is_visible());
+        end_date.set_text("bad");
+        assert!(!save.is_sensitive());
+        end_date.set_text("2099-12-31");
+        assert!(pump_until(&ctx, 10, || save.is_sensitive()));
+        crate::testutil::settle(&ctx);
+        crate::testutil::capture_window(window.upcast_ref(), "schedule-editor");
+        dialog.force_close();
+        window.imp().config.borrow_mut().notify_scheduled = false;
+        let store = app_store();
+        let thread = store
+            .create_thread("/tmp", Some("Missed schedule"))
+            .expect("thread");
+        let now = now_unix();
+        let id = store
+            .create_schedule(&NewSchedule {
+                target: Target::ExistingThread {
+                    thread_id: thread.clone(),
+                },
+                prompt: "Check tests".into(),
+                rule: Rule::Interval {
+                    every_secs: 3600,
+                    anchor: now - 7200,
+                },
+                missed_policy: MissedPolicy::Skip,
+                ends: Ends::Never,
+                next_due: Some(now - 7200),
+            })
+            .expect("schedule");
+        let record = store.get_schedule(&id).expect("read").expect("record");
+        assert!(!ctx.block_on(evaluate_and_maybe_fire(&app, &window, record, now, false)));
+        assert_eq!(
+            store
+                .get_schedule(&id)
+                .expect("read")
+                .expect("record")
+                .last_outcome,
+            Some(LastOutcome::Missed)
+        );
+        let events = store.events(&thread, None, 100).expect("events");
+        assert!(events.iter().any(|(_, e)| matches!(&e.event, agent_core::event::Event::Notice { text } if text.contains(LastOutcome::Missed.label()))), "a missed run leaves an app notice");
+        assert!(
+            !events.iter().any(|(_, e)| matches!(
+                &e.event,
+                agent_core::event::Event::ItemStarted {
+                    kind: agent_core::event::ItemKind::UserMessage,
+                    ..
+                }
+            )),
+            "skipping never creates a user message"
+        );
+        store.delete_thread(&thread).expect("cleanup");
+        window.destroy();
+    }
 
     pub(in super::super) fn gtk_checks(window: &AgentTerminalWindow) {
         let imp = window.imp();

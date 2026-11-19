@@ -150,12 +150,12 @@ fn row_to_record(r: &rusqlite::Row<'_>) -> rusqlite::Result<Option<ScheduleRecor
         (Some(thread_id), None) => Target::ExistingThread { thread_id },
         (None, Some(folder)) => {
             let Some(driver) = driver.as_deref().and_then(parse_driver) else {
-                tracing::warn!(%id, "skipped schedule with unknown driver");
-                return Ok(None);
+                tracing::warn!(%id, "unreadable schedule with unknown driver");
+                return Err(rusqlite::Error::InvalidQuery);
             };
             let Some(mode) = mode.as_deref().and_then(parse_mode) else {
-                tracing::warn!(%id, "skipped schedule with unreadable mode");
-                return Ok(None);
+                tracing::warn!(%id, "unreadable schedule with unreadable mode");
+                return Err(rusqlite::Error::InvalidQuery);
             };
             Target::NewThread {
                 folder,
@@ -167,25 +167,25 @@ fn row_to_record(r: &rusqlite::Row<'_>) -> rusqlite::Result<Option<ScheduleRecor
             }
         }
         _ => {
-            tracing::warn!(%id, "skipped schedule with ambiguous target");
-            return Ok(None);
+            tracing::warn!(%id, "unreadable schedule with ambiguous target");
+            return Err(rusqlite::Error::InvalidQuery);
         }
     };
     let Ok(rule) = serde_json::from_str::<Rule>(&rule_raw) else {
-        tracing::warn!(%id, "skipped schedule with unreadable rule JSON");
-        return Ok(None);
+        tracing::warn!(%id, "unreadable schedule with unreadable rule JSON");
+        return Err(rusqlite::Error::InvalidQuery);
     };
     let Some(missed_policy) = MissedPolicy::parse(&missed_raw) else {
-        tracing::warn!(%id, "skipped schedule with unknown missed_policy");
-        return Ok(None);
+        tracing::warn!(%id, "unreadable schedule with unknown missed_policy");
+        return Err(rusqlite::Error::InvalidQuery);
     };
     let ends = match ends_raw {
         None => Ends::Never,
         Some(raw) => match serde_json::from_str::<Ends>(&raw) {
             Ok(ends) => ends,
             Err(_) => {
-                tracing::warn!(%id, "skipped schedule with unreadable ends JSON");
-                return Ok(None);
+                tracing::warn!(%id, "unreadable schedule with unreadable ends JSON");
+                return Err(rusqlite::Error::InvalidQuery);
             }
         },
     };
@@ -326,6 +326,54 @@ impl Store {
         self.query_schedules(&sql, params![now])
     }
 
+    /// Pause active schedules when a real-money spending warning is reached. Existing user,
+    /// ended and safety pauses are retained. Returns only transitions, for visible feedback.
+    pub fn pause_schedules_for_budget(&self) -> Result<Vec<ScheduleRecord>> {
+        self.atomically(|s| {
+            let records = s
+                .list_schedules()?
+                .into_iter()
+                .filter(|r| r.paused_reason.is_none())
+                .collect::<Vec<_>>();
+            for record in &records {
+                s.set_schedule_paused(&record.id, Some(PausedReason::Budget), None)?;
+                if let Target::ExistingThread { thread_id } = &record.target {
+                    s.append_event(
+                        thread_id,
+                        None,
+                        &agent_core::event::Envelope::new(agent_core::event::Event::Notice {
+                            text: format!("Scheduled prompt: {}", PausedReason::Budget.label()),
+                        }),
+                    )?;
+                }
+            }
+            Ok(records)
+        })
+    }
+
+    /// Update a new-thread target alongside its editable timing fields. Validation is shared
+    /// with creation; an invalid target leaves every stored field unchanged.
+    pub fn update_schedule_target(&self, id: &str, target: &Target) -> Result<()> {
+        let (thread, folder, driver, profile, mode, model, worktree) = target_columns(target)?;
+        let tx = self.write_txn()?;
+        self.conn.execute(
+            "UPDATE schedules SET thread_id=?2, target_folder=?3, driver=?4, profile_id=?5,
+             mode=?6, model=?7, worktree=?8, updated_at=MAX(updated_at + 1, ?9) WHERE id=?1",
+            params![
+                id,
+                thread,
+                folder,
+                driver,
+                profile,
+                mode,
+                model,
+                worktree,
+                self.now()
+            ],
+        )?;
+        tx.commit()
+    }
+
     fn query_schedules<P: rusqlite::Params>(
         &self,
         sql: &str,
@@ -358,7 +406,7 @@ impl Store {
         let tx = self.write_txn()?;
         self.conn.execute(
             "UPDATE schedules
-             SET updated_at = ?2, prompt = ?3, rule = ?4, missed_policy = ?5, ends = ?6,
+             SET updated_at = MAX(updated_at + 1, ?2), prompt = ?3, rule = ?4, missed_policy = ?5, ends = ?6,
                  next_due = ?7, unattended_runs = 0, paused_reason = NULL
              WHERE id = ?1",
             params![
@@ -386,7 +434,7 @@ impl Store {
                  last_outcome = COALESCE(?5, last_outcome),
                  run_count = run_count + ?6,
                  unattended_runs = unattended_runs + ?7,
-                 paused_reason = ?8
+                 paused_reason = COALESCE(paused_reason, ?8)
              WHERE id = ?1",
             params![
                 update.id,
@@ -457,6 +505,30 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreadable_schedule_is_an_error_instead_of_an_empty_list() {
+        let s = Store::open_in_memory().expect("store");
+        let thread = s.create_thread("/example", None).expect("thread");
+        let id = s
+            .create_schedule(&NewSchedule {
+                target: Target::ExistingThread { thread_id: thread },
+                prompt: "Run tests".into(),
+                rule: Rule::Once { at: 1000 },
+                missed_policy: MissedPolicy::Skip,
+                ends: Ends::Never,
+                next_due: Some(1000),
+            })
+            .expect("schedule");
+        s.conn
+            .execute(
+                "UPDATE schedules SET rule = 'unreadable' WHERE id = ?1",
+                [&id],
+            )
+            .expect("corrupt fixture");
+        assert!(s.list_schedules().is_err());
+        assert!(s.due_schedules(2000).is_err());
+    }
     use rusqlite::Connection;
 
     const SECRET: &str = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
@@ -643,6 +715,50 @@ mod tests {
         let due_at_5000 = s.due_schedules(5_000).expect("due at 5000");
         assert_eq!(due_at_5000.len(), 1);
         assert_eq!(due_at_5000[0].id, early);
+        let paused = s.pause_schedules_for_budget().expect("budget pause");
+        assert_eq!(paused.len(), 1, "only active schedules transition");
+        assert_eq!(paused[0].id, early);
+        assert!(s
+            .due_schedules(5_000)
+            .expect("budget holds runs")
+            .is_empty());
+        assert_eq!(
+            s.get_schedule(&later)
+                .expect("read user pause")
+                .expect("present")
+                .paused_reason,
+            Some(PausedReason::User)
+        );
+        assert!(s
+            .pause_schedules_for_budget()
+            .expect("no repeated transitions")
+            .is_empty());
+        s.record_schedule_run(&ScheduleRunUpdate {
+            id: early.clone(),
+            next_due: Some(8_600),
+            last_due: Some(5_000),
+            last_outcome: Some(LastOutcome::Ran),
+            increment_run_count: true,
+            increment_unattended: true,
+            paused_reason: None,
+        })
+        .expect("run already in flight records its outcome");
+        assert_eq!(
+            s.get_schedule(&early)
+                .expect("read budget pause")
+                .expect("present")
+                .paused_reason,
+            Some(PausedReason::Budget),
+            "recording a run cannot undo a concurrent budget pause"
+        );
+        s.set_schedule_paused(&early, None, Some(5_000))
+            .expect("resume");
+        assert_eq!(
+            s.pause_schedules_for_budget()
+                .expect("resumed schedule rechecked")
+                .len(),
+            1
+        );
         assert!(s.delete_schedule(&early).expect("delete"));
         assert!(!s.delete_schedule(&early).expect("delete again"));
     }

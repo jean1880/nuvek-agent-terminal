@@ -109,8 +109,14 @@ Fields are only ever added within a version; removing or renaming one raises `ve
 A fork (**Fork thread** or **Fork in Isolated Worktree…** in a thread's context menu, or `/fork`)
 remembers the thread it came from
 and where that thread was at the fork: the last event stored. Only a fork does; a compaction, a
-**Continue in** and an agent switch do not. Threads forked before this was recorded have no link
-and cannot be compared.
+**Continue in** and an agent switch do not. Threads forked before this was recorded have no link;
+use **Compare with…** to compare their full conversations.
+
+**Compare with…** is available on every thread's context menu. Its searchable picker offers
+other threads, including archived ones, with their folders. It opens both complete conversations
+lined up by turn, including threads that were never forked. This comparison is read-only:
+there is no file baseline or **Keep This One** action. **Refresh** reads the conversations again;
+if either thread has been deleted, its column says so.
 
 **Compare with Fork…** appears in the first section of the context menu, after the fork entries,
 for a fork whose source still exists, a thread that has a fork, and a fork with sibling forks of
@@ -227,6 +233,52 @@ one step with the removal: the thread must still be archived, no other thread in
 (folders compared with links resolved), and git must still find it clean. The **Remove** offered
 when any worktree tab closes checks the same, except the archiving. Removal is `git worktree
 remove` without `--force`, and the branch is never deleted.
+
+### Asking several agents
+
+Choose **Ask Several Agents…** in the composer menu or type `/ask`. Select two to four
+agents, profiles or models and review the prompt. The dialog shows which targets are free or
+metered, their available quota/headroom and the estimated history sent to each. An exhausted
+account needs a separate acknowledgement. In a shared folder, participants run in Plan;
+isolated worktrees use the source's safe mode. Antigravity always needs an isolated worktree
+and an explicit acknowledgement that its forced permissive mode can edit without asking.
+A worktree separates repository edits; it does not restrict access to your home or network.
+
+The source's comparison panel shows each participant's status and **Open**, **Keep** and
+**Discard**. Open a participant to answer its own approvals. **Compare** reads the replies
+and file changes side by side. Participants carry a **Compare** marker in the sidebar and
+sit beneath their source when listed together; pinned and active work retain their priority.
+**Keep this thread instead** detaches a participant so it becomes an ordinary thread.
+
+**Keep** requires a completed answer and an idle source without another undelivered handoff.
+The chosen participant's own history is redacted and fitted to the usual handoff budget,
+then saved with the decision. It goes with your next message, including after a restart;
+Keep sends no prompt by itself. Edits stay in the participant's worktree for the usual merge
+flow. Other participants are archived, and the result offers restoration and clean-worktree
+removal. Undo withdraws the chosen context only while it remains unsent and the source is
+idle. Context already sent, consumed or being prepared remains in the source, and the
+result message explains this.
+
+### Scheduled prompts
+
+Choose **Schedule…** from the composer send menu, type `/schedule`, or press `Ctrl+Shift+L`.
+Pick a one-time, daily, weekly or interval rule, a destination (this thread, a new thread or
+an isolated worktree), and the profile/model. Repeating rules can end after a count or on a
+date. Invalid fields disable Save and explain what needs changing. Antigravity requires the
+worktree destination and acknowledgement of its forced permission mode.
+
+The sidebar clock and the thread's schedule status show the next run or pause reason.
+**Scheduled Prompts…** in the window or thread menu lets you edit, pause, resume, run now or
+delete a schedule. An unreadable schedule is shown as unavailable, rather than as no schedule.
+Automatic skips, failures and pauses add feedback to the thread.
+
+Scheduled runs happen only while Agent Terminal is open. The selected missed-run policy
+controls overdue work after reopening. Repeating schedules pause after ten unattended runs;
+a daily or monthly real-money spending warning also pauses automatic runs at 80% or above.
+Resume explains when a budget warning still prevents automatic work. **Run Now** is an
+explicit manual run and leaves future automatic runs paused. Running turns and ordinary
+messages are not stopped by these warnings. Disable automatic scheduling with Settings →
+General → Threads → **Run Scheduled Prompts**.
 
 ### Pinning threads
 
@@ -601,7 +653,10 @@ git --literal-pathspecs commit -m '<message>' -- <files>
   5 MiB) are never part of a commit made here.
 - **Draft Message** (in a thread) closes the dialog and puts a prompt in the composer asking
   the agent for a message for the ticked files. It names the files and sends no diff; you
-  review it and send it like any message. Paste the reply into the dialog when you reopen it.
+  review it and send it like any message. **Use Last Reply** becomes available for a completed
+  reply of at most 2,000 characters to that draft prompt, while the same files and hunks remain
+  selected. Click it to copy the reply into the message box, then review or edit before committing.
+  A changed reply or selection, or a failed read, leaves your typed message alone.
   The message you were writing is kept for the thread while it is open, and cleared by a
   commit.
 
@@ -817,6 +872,12 @@ Adwaita, and the rest are your desktop's own. No state is shown by colour alone:
 print their figures beside them, and a diff's lines keep their `+` and `-`.
 
 ### Accessibility
+
+**Contrast and motion.** Enabling the desktop's high-contrast setting temporarily uses the
+desktop colours throughout the app, including new terminal and diff panes. Turning it off
+restores your chosen theme. Secondary text keeps the full foreground contrast in that mode.
+Keyboard focus rings remain visible on the thread list, diff controls and Settings. The
+desktop's reduced-motion preference also stops a menu transition already in progress.
 
 **Announcements.** With a screen reader such as Orca running, the window tells it when something
 happens in a thread that you would otherwise have to look for:

@@ -3998,6 +3998,28 @@ impl Store {
         }
         Ok(fold.finish(self.held_of(thread)))
     }
+
+    /// Fold a caller-bounded event suffix, without reading earlier transcript rows.
+    /// Items already open before the suffix may be incomplete; callers must reject them when
+    /// their start is required. Held stream tails are included as in `transcript_items`.
+    pub fn transcript_suffix(
+        &self,
+        thread: &str,
+        events: &[(i64, Envelope)],
+    ) -> Vec<TranscriptItem> {
+        let mut fold = TranscriptFold::new(FoldOptions::default());
+        fold.feed(
+            events
+                .iter()
+                .map(|(seq, envelope)| StoredEvent {
+                    seq: *seq,
+                    driver: None,
+                    envelope: envelope.clone(),
+                })
+                .collect(),
+        );
+        fold.finish(self.held_of(thread))
+    }
 }
 
 /// The fold behind [`Store::transcript_items`], fed stored events in order, a batch at a time.

@@ -168,12 +168,16 @@ impl Store {
     }
 
     /// Each side's thread summary and its items after the side's point, all read in one
-    /// snapshot. A thread that is gone has no summary and no items.
+    /// snapshot. A thread that is gone or hidden has no summary and no items.
     pub fn compare_columns(&self, sides: &[Side]) -> Result<Vec<CompareColumn>> {
         let snapshot = self.scope(rusqlite::TransactionBehavior::Deferred)?;
         let mut out = Vec::with_capacity(sides.len());
         for side in sides {
-            let summary = self.thread_summary(&side.thread)?;
+            let summary = if self.is_hidden_child_thread(&side.thread)? {
+                None
+            } else {
+                self.thread_summary(&side.thread)?
+            };
             let entries = match summary {
                 Some(_) => self.compare_entries(&side.thread, side.after)?,
                 None => Vec::new(),
@@ -335,6 +339,9 @@ impl Store {
     pub fn save_compare_group(&self, group: &agent_core::ask_several::CompareGroup) -> Result<()> {
         let mut scrubbed = group.clone();
         scrubbed.prompt_preview = agent_core::redact::redact(&scrubbed.prompt_preview);
+        for p in &mut scrubbed.participants {
+            p.label = agent_core::redact::redact(&p.label);
+        }
         let json = scrubbed.to_json();
         self.atomically(|s| {
             s.set_meta(
@@ -373,6 +380,28 @@ impl Store {
         self.compare_group(&group_id)
     }
 
+    /// Leave an answer as an ordinary thread. Historical comparisons keep their other sides.
+    pub fn detach_compare_participant(&self, group_id: &str, thread: &str) -> Result<()> {
+        self.atomically(|s| {
+            let Some(mut group) = s.compare_group(group_id)? else {
+                return Ok(());
+            };
+            group.participants.retain(|p| p.thread_id != thread);
+            if group.kept_thread.as_deref() == Some(thread) {
+                group.kept_thread = None;
+            }
+            s.delete_meta(&agent_core::ask_several::participant_meta_key(thread))?;
+            if group.participants.is_empty() {
+                s.delete_meta(&agent_core::ask_several::group_meta_key(group_id))
+            } else {
+                s.set_meta(
+                    &agent_core::ask_several::group_meta_key(group_id),
+                    &group.to_json(),
+                )
+            }
+        })
+    }
+
     /// Returns all compare groups whose `source_thread` matches `source`, newest first.
     pub fn compare_groups_for_source(
         &self,
@@ -396,6 +425,28 @@ impl Store {
                 .then_with(|| b.id.cmp(&a.id))
         });
         Ok(groups)
+    }
+
+    /// Sidebar comparison parents in one bounded meta scan, with no query per thread.
+    /// Ceiling: the newest 4096 stored group rows; malformed rows are ignored.
+    pub fn compare_sources(&self) -> Result<std::collections::HashMap<String, String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT value FROM meta WHERE key LIKE 'compare_group:%' ORDER BY rowid DESC LIMIT 4096"
+        )?;
+        let mut groups = Vec::new();
+        for row in statement.query_map([], |r| r.get::<_, String>(0))? {
+            if let Some(group) = agent_core::ask_several::CompareGroup::from_json(&row?) {
+                groups.push(group);
+            }
+        }
+        groups.sort_by_key(|g| g.created_at);
+        let mut parents = std::collections::HashMap::new();
+        for group in groups {
+            for participant in group.participants {
+                parents.insert(participant.thread_id, group.source_thread.clone());
+            }
+        }
+        Ok(parents)
     }
 
     /// Records `kept_thread` as the chosen participant of `group_id`. Refuses if already settled.
@@ -424,6 +475,55 @@ impl Store {
             }
             group.kept_thread = Some(kept_thread.to_owned());
             s.set_meta(&key, &group.to_json())
+        })
+    }
+
+    /// Keep and persist the source's next-prompt handoff together. A source that changed
+    /// during preparation, or still owes a handoff, leaves the entire group untouched.
+    pub fn keep_compare_group_answer(
+        &self,
+        group_id: &str,
+        kept_thread: &str,
+        source_seq: i64,
+        handoff_events: &[Envelope],
+    ) -> Result<KeepGroupOutcome> {
+        self.atomically(|s| {
+            if !matches!(handoff_events.first().map(|e| &e.event),
+                Some(Event::HandoffSeeded { carried, fence, .. }) if *carried > 0 && agent_core::handoff_budget::is_valid_fence(fence)) {
+                return Ok(KeepGroupOutcome::Refused("The chosen answer has no valid handoff".into()));
+            }
+            let Some(group) = s.compare_group(group_id)? else {
+                return Ok(KeepGroupOutcome::Refused("Comparison group no longer exists".into()));
+            };
+            if s.thread_summary(&group.source_thread)?.is_none()
+                || s.is_hidden_child_thread(&group.source_thread)?
+                || s.max_seq(&group.source_thread)? != source_seq {
+                return Ok(KeepGroupOutcome::Refused("The source changed; try Keep again".into()));
+            }
+            let mut after = None;
+            let mut owes = false;
+            let mut legacy = false;
+            loop {
+                let batch = s.events(&group.source_thread, after, 1000)?;
+                if batch.is_empty() { break; }
+                for (seq, env) in batch {
+                    match env.event {
+                        Event::HandoffSeeded { carried, acknowledged, .. } => { owes = carried > 0; legacy = !acknowledged; }
+                        Event::TurnCompleted { state: agent_core::event::TurnState::Completed, .. } if legacy => owes = false,
+                        _ => {}
+                    }
+                    after = Some(seq);
+                }
+            }
+            if owes {
+                return Ok(KeepGroupOutcome::Refused("The source already holds an undelivered handoff".into()));
+            }
+            let outcome = s.keep_compare_group(group_id, kept_thread, "", false)?;
+            if matches!(outcome, KeepGroupOutcome::Kept(_)) {
+                let pt = s.active_provider_thread(&group.source_thread)?;
+                for event in handoff_events { s.append_event(&group.source_thread, pt.as_deref(), event)?; }
+            }
+            Ok(outcome)
         })
     }
 
@@ -517,6 +617,93 @@ impl Store {
                 archived,
                 worktrees,
             }))
+        })
+    }
+
+    /// Undo a specific Keep, withdrawing its handoff only if it still waits unsent under the
+    /// same fence. A newer handoff, a prompt already sent, or a different settled choice wins.
+    /// `withdraw` is false when a live source could not be reserved for withdrawal.
+    pub fn undo_compare_group_answer(
+        &self,
+        group_id: &str,
+        archived: &[String],
+        kept: &str,
+        source: &str,
+        fence: &str,
+        withdraw: bool,
+    ) -> Result<bool> {
+        self.atomically(|s| {
+            if s.compare_group(group_id)?
+                .and_then(|g| g.kept_thread)
+                .as_deref()
+                .is_some_and(|id| id != kept)
+            {
+                return Err(StoreError::Failed(
+                    "A newer choice replaced this Keep".into(),
+                ));
+            }
+            let mut pending = None;
+            let mut legacy = false;
+            let mut sent = false;
+            let mut after = None;
+            if withdraw {
+                loop {
+                    let events = s.events(source, after, 1000)?;
+                    if events.is_empty() {
+                        break;
+                    }
+                    for (seq, env) in events {
+                        match env.event {
+                            Event::HandoffSeeded {
+                                carried,
+                                fence,
+                                acknowledged,
+                                ..
+                            } => {
+                                pending = (carried > 0).then_some(fence);
+                                legacy = !acknowledged;
+                                sent = false;
+                            }
+                            Event::ItemStarted {
+                                kind: agent_core::event::ItemKind::UserMessage,
+                                ..
+                            } => sent = true,
+                            Event::TurnCompleted {
+                                state: agent_core::event::TurnState::Completed,
+                                ..
+                            } if legacy => pending = None,
+                            _ => {}
+                        }
+                        after = Some(seq);
+                    }
+                }
+            }
+            let cleared = withdraw && !sent && pending.as_deref() == Some(fence);
+            if cleared {
+                let pt = s.active_provider_thread(source)?;
+                s.append_event(
+                    source,
+                    pt.as_deref(),
+                    &Envelope::new(Event::HandoffSeeded {
+                        summary: String::new(),
+                        fence: String::new(),
+                        carried: 0,
+                        total: 0,
+                        acknowledged: true,
+                    }),
+                )?;
+                s.append_event(
+                    source,
+                    pt.as_deref(),
+                    &Envelope::new(Event::Notice {
+                        text:
+                            "The chosen comparison context was withdrawn before delivery by Undo."
+                                .into(),
+                    }),
+                )?;
+            }
+            s.undo_keep_compare_group(group_id, archived)?;
+            Ok(cleared)
         })
     }
 
@@ -1054,5 +1241,188 @@ mod tests {
 
         s.delete_thread("p1").expect("delete participant");
         assert!(s.meta(&participant_meta_key("p1")).expect("meta").is_none());
+    }
+
+    #[test]
+    fn ask_several_keep_is_atomic_persistent_and_refuses_pending_or_changed_source() {
+        use agent_core::adapter::Driver;
+        use agent_core::ask_several::{CompareGroup, CompareParticipant};
+        let s = Store::open_in_memory().unwrap();
+        for id in ["src", "p1", "p2"] {
+            thread(&s, id, None);
+        }
+        let group = CompareGroup {
+            id: "group".into(),
+            source_thread: "src".into(),
+            prompt_preview: "Question".into(),
+            created_at: 1,
+            kept_thread: None,
+            participants: ["p1", "p2"]
+                .into_iter()
+                .map(|id| CompareParticipant {
+                    thread_id: id.into(),
+                    label: id.into(),
+                    driver: Driver::Claude,
+                    profile_id: None,
+                    model: None,
+                    after_seq: 0,
+                })
+                .collect(),
+        };
+        s.save_compare_group(&group).unwrap();
+        let seed = Envelope::new(Event::HandoffSeeded {
+            summary: "Chosen answer".into(),
+            fence: "0123456789abcdef0123456789abcdef".into(),
+            carried: 1,
+            total: 1,
+            acknowledged: true,
+        });
+        assert!(matches!(
+            s.keep_compare_group_answer("group", "p1", -1, std::slice::from_ref(&seed))
+                .unwrap(),
+            KeepGroupOutcome::Refused(_)
+        ));
+        assert!(!s.thread_summary("p2").unwrap().unwrap().archived);
+        s.append_event("src", None, &seed).unwrap();
+        assert!(matches!(
+            s.keep_compare_group_answer(
+                "group",
+                "p1",
+                s.max_seq("src").unwrap(),
+                std::slice::from_ref(&seed)
+            )
+            .unwrap(),
+            KeepGroupOutcome::Refused(_)
+        ));
+        assert!(s
+            .compare_group("group")
+            .unwrap()
+            .unwrap()
+            .kept_thread
+            .is_none());
+        s.append_event(
+            "src",
+            None,
+            &Envelope::new(Event::HandoffSeeded {
+                summary: String::new(),
+                fence: String::new(),
+                carried: 0,
+                total: 0,
+                acknowledged: true,
+            }),
+        )
+        .unwrap();
+        let outcome = s
+            .keep_compare_group_answer(
+                "group",
+                "p1",
+                s.max_seq("src").unwrap(),
+                std::slice::from_ref(&seed),
+            )
+            .unwrap();
+        assert!(matches!(outcome, KeepGroupOutcome::Kept(_)));
+        assert!(s.thread_summary("p2").unwrap().unwrap().archived);
+        assert!(
+            matches!(&s.events("src", None, 100).unwrap().last().unwrap().1.event, Event::HandoffSeeded { summary, carried: 1, .. } if summary == "Chosen answer")
+        );
+        assert_eq!(
+            s.compare_sources().unwrap().get("p1").map(String::as_str),
+            Some("src")
+        );
+        s.set_meta("compare_group:malformed", "not-json").unwrap();
+        assert_eq!(s.compare_sources().unwrap().len(), 2);
+        let fence = "0123456789abcdef0123456789abcdef";
+        assert!(s
+            .undo_compare_group_answer("group", &["p2".into()], "p1", "src", fence, true)
+            .unwrap());
+        assert!(!s.thread_summary("p2").unwrap().unwrap().archived);
+        assert_eq!(
+            s.events("src", None, 100)
+                .unwrap()
+                .iter()
+                .rev()
+                .find_map(|(_, e)| match e.event {
+                    Event::HandoffSeeded { carried, .. } => Some(carried),
+                    _ => None,
+                }),
+            Some(0)
+        );
+        assert!(matches!(
+            s.keep_compare_group_answer(
+                "group",
+                "p1",
+                s.max_seq("src").unwrap(),
+                std::slice::from_ref(&seed)
+            )
+            .unwrap(),
+            KeepGroupOutcome::Kept(_)
+        ));
+        s.append_user_message("src", None, "User has sent a message")
+            .unwrap();
+        assert!(
+            !s.undo_compare_group_answer("group", &["p2".into()], "p1", "src", fence, true)
+                .unwrap(),
+            "cannot retract after prompt delivery"
+        );
+        assert!(
+            !s.thread_summary("p2").unwrap().unwrap().archived,
+            "sent context still permits restoring participants"
+        );
+        let spent = Envelope::new(Event::HandoffSeeded {
+            summary: String::new(),
+            fence: String::new(),
+            carried: 0,
+            total: 0,
+            acknowledged: true,
+        });
+        s.append_event("src", None, &spent).unwrap();
+        assert!(matches!(
+            s.keep_compare_group_answer(
+                "group",
+                "p1",
+                s.max_seq("src").unwrap(),
+                std::slice::from_ref(&seed)
+            )
+            .unwrap(),
+            KeepGroupOutcome::Kept(_)
+        ));
+        let newer_fence = "abcdef0123456789abcdef0123456789";
+        let newer = Envelope::new(Event::HandoffSeeded {
+            summary: "Newer unrelated handoff".into(),
+            fence: newer_fence.into(),
+            carried: 1,
+            total: 1,
+            acknowledged: true,
+        });
+        s.append_event("src", None, &newer).unwrap();
+        assert!(!s
+            .undo_compare_group_answer("group", &["p2".into()], "p1", "src", fence, true)
+            .unwrap());
+        assert!(
+            matches!(&s.events("src", None, 100).unwrap().last().unwrap().1.event, Event::HandoffSeeded { fence, carried: 1, .. } if fence == newer_fence),
+            "a newer handoff is untouched"
+        );
+        s.mark_compare_group_kept("group", "p1").unwrap();
+        s.detach_compare_participant("group", "p1").unwrap();
+        assert!(s.compare_group_for_thread("p1").unwrap().is_none());
+        assert!(
+            s.compare_group("group")
+                .unwrap()
+                .unwrap()
+                .kept_thread
+                .is_none(),
+            "detaching the chosen thread clears its choice"
+        );
+        assert!(!s.compare_sources().unwrap().contains_key("p1"));
+        assert_eq!(
+            s.compare_group("group")
+                .unwrap()
+                .unwrap()
+                .participants
+                .len(),
+            1
+        );
+        s.detach_compare_participant("group", "p2").unwrap();
+        assert!(s.compare_group("group").unwrap().is_none());
     }
 }

@@ -674,6 +674,7 @@ struct CommitData {
     /// The message being written, kept while the dialog is closed; cleared by a commit. Never
     /// stored anywhere else: it goes with the tab.
     draft: Rc<RefCell<String>>,
+    draft_request: Rc<RefCell<Option<(CommitAsk, i64)>>>,
 }
 
 impl CommitData {
@@ -876,6 +877,7 @@ impl CommitBar {
                 syncing: Rc::new(Cell::new(false)),
                 handler: Rc::new(RefCell::new(None)),
                 draft: Rc::new(RefCell::new(String::new())),
+                draft_request: Rc::new(RefCell::new(None)),
             },
         }
     }
@@ -1778,6 +1780,27 @@ impl DiffPanel {
     /// Keeps (or, with an empty text, clears) the commit message being written.
     pub fn set_commit_draft(&self, text: &str) {
         *self.commit.draft.borrow_mut() = text.to_owned();
+    }
+
+    pub(super) fn set_draft_request(&self, ask: CommitAsk, seq: i64) {
+        *self.commit.draft_request.borrow_mut() = Some((ask, seq));
+    }
+
+    pub(super) fn clear_draft_request(&self) {
+        *self.commit.draft_request.borrow_mut() = None;
+    }
+
+    pub(super) fn draft_request(&self, ask: &CommitAsk) -> Option<i64> {
+        let (files, patches) = self.commit.chosen_split();
+        let saved = self.commit.draft_request.borrow();
+        let (original, seq) = saved.as_ref()?;
+        (original.repo == ask.repo
+            && original.files == ask.files
+            && original.patches == ask.patches
+            && files == ask.files
+            && patches == ask.patches
+            && self.commit.repo.borrow().as_ref() == Some(&ask.repo))
+        .then_some(*seq)
     }
 
     /// The commit bar's words, whether it can be pressed and whether a commit is running, when
@@ -2687,6 +2710,29 @@ pub(crate) mod tests {
         assert_eq!(presses.get(), 1, "not while a merge runs");
         panel.set_merging(false);
         assert_eq!(panel.merge_view().map(|v| (v.2, v.3)), Some((true, false)));
+    }
+
+    #[test]
+    fn draft_request_requires_the_selected_files() {
+        crate::testutil::adw_init().unwrap();
+        let panel = DiffPanel::new(&crate::theme::Theme::diff_colours(Default::default()));
+        let generation = panel.begin();
+        panel.show(generation, ready(&["a.rs", "b.rs"]));
+        panel.show_commit(generation, Some(PathBuf::from("/repo")), None);
+        let (files, patches) = panel.commit.chosen_split();
+        let ask = CommitAsk {
+            repo: PathBuf::from("/repo"),
+            files,
+            patches,
+            listed: 2,
+        };
+        panel.set_draft_request(ask.clone(), 42);
+        assert_eq!(panel.draft_request(&ask), Some(42));
+        let tick = panel.commit.ticks.borrow()[0].0.upgrade().unwrap();
+        tick.set_active(false);
+        assert_eq!(panel.draft_request(&ask), None);
+        tick.set_active(true);
+        assert_eq!(panel.draft_request(&ask), Some(42));
     }
 
     pub(crate) fn the_commit_bar_follows_the_view_and_the_ticks() {

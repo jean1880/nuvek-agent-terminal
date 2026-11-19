@@ -364,6 +364,7 @@ struct Inner {
     /// A rendered, redacted handoff the new agent has not confirmed yet. Stored as
     /// `Event::HandoffSeeded` too, so a restart re-arms it; spent only by a completed turn.
     pending_handoff: RefCell<Option<Handoff>>,
+    answer_adopting: Cell<bool>,
     /// The pending handoff went out with the prompt now running: not sent again unless that turn
     /// ends without completing.
     handoff_in_flight: Cell<bool>,
@@ -1269,6 +1270,7 @@ impl ChatSession {
             proc: RefCell::new(None),
             state: RefCell::new(state),
             pending_handoff: RefCell::new(None),
+            answer_adopting: Cell::new(false),
             handoff_in_flight: Cell::new(false),
             handoff_turn: Cell::new(HandoffTurn::Waiting),
             turn_from_task: Cell::new(false),
@@ -1404,6 +1406,11 @@ impl ChatSession {
         model: Option<String>,
         effort: Option<String>,
     ) {
+        if self.inner.answer_adopting.get() {
+            self.inner
+                .error("Wait for the chosen answer to be saved before switching agents");
+            return;
+        }
         *self.inner.switch_target.borrow_mut() = Some(target);
         self.inner.switch(driver, model, effort);
     }
@@ -1576,10 +1583,51 @@ impl ChatSession {
         self.inner.limit_waiting.set(waiting);
     }
 
-    /// Re-arms a handoff found stored and undelivered in the thread's history (see
-    /// [`undelivered_handoff`]), as the thread opens: a new thread's own handoff too (stored with
-    /// it by [`seeded_handoff_events`]), which rides on the next real prompt exactly like a
-    /// cross-agent switch's. Already stored and announced, so neither is done again. A stored fence that is not one this app draws is not trusted: dropped.
+    /// Reserve an idle source until its atomic answer/group write has actually committed.
+    pub(crate) fn reserve_answer(&self) -> Result<AnswerAdoption, &'static str> {
+        let i = &self.inner;
+        if i.answer_adopting.get() || i.pending_handoff.borrow().is_some() {
+            return Err("The source already holds an undelivered handoff");
+        }
+        if i.state.borrow().running_turn
+            || i.work_in_flight().is_some()
+            || i.prompt_in_flight.get()
+            || i.rebinding.get()
+            || !i.queued_prompts.borrow().is_empty()
+            || !i.held_retries.borrow().is_empty()
+            || !i.pre_init_prompts.borrow().is_empty()
+        {
+            return Err("Wait for the source thread to finish its work before keeping an answer");
+        }
+        i.answer_adopting.set(true);
+        Ok(AnswerAdoption {
+            inner: self.inner.clone(),
+        })
+    }
+
+    /// Undo may retract only this idle, unsent answer. The reservation keeps a newly typed
+    /// message queued until the withdrawal has committed, exactly as adoption does.
+    pub(crate) fn reserve_answer_withdrawal(&self, fence: &str) -> Option<AnswerAdoption> {
+        let i = &self.inner;
+        if i.answer_adopting.get()
+            || i.handoff_in_flight.get()
+            || i.prompt_in_flight.get()
+            || i.rebinding.get()
+            || i.switch_reading.get()
+            || !i
+                .pending_handoff
+                .borrow()
+                .as_ref()
+                .is_some_and(|h| h.fence == fence)
+        {
+            return None;
+        }
+        i.answer_adopting.set(true);
+        Some(AnswerAdoption { inner: i.clone() })
+    }
+
+    /// Re-arms a stored undelivered handoff on opening, without storing or announcing it again.
+    /// An invalid fence is never trusted.
     pub fn restore_handoff(&self, handoff: Handoff) {
         if !agent_core::handoff_budget::is_valid_fence(&handoff.fence) {
             warn!("ignoring a stored handoff with an invalid fence");
@@ -4515,6 +4563,10 @@ impl Inner {
 
     /// Encodes and carries out one command. False when the adapter refused it.
     fn command(self: &Rc<Self>, command: Command) -> bool {
+        if self.answer_adopting.get() {
+            self.error("Wait for the chosen answer to be saved before changing this session");
+            return false;
+        }
         let model_change = matches!(command, Command::SetModel { .. });
         // What the user asks of a stopped agent starts it (as a message does), and is written to
         // the new process once it is up. Answers to the old process's requests never do: they
@@ -4827,6 +4879,9 @@ impl Inner {
     }
 
     fn steer_input(self: &Rc<Self>, input: &PromptInput) {
+        if self.answer_adopting.get() {
+            return self.queue_input(input);
+        }
         let text = input.text.as_str();
         // Images an agent on another machine would read from this machine's paths: refused
         // mid-turn as at a turn's start, never steered in.
@@ -4914,6 +4969,9 @@ impl Inner {
     }
 
     fn send_input(self: &Rc<Self>, input: &PromptInput) {
+        if self.answer_adopting.get() {
+            return self.queue_input(input);
+        }
         // The user wrote before a "Continue in" switch was made: that message is what goes on.
         self.continue_on_switch_to.set(None);
         if self.rebinding.get() || self.switch_reading.get() {
@@ -4944,6 +5002,9 @@ impl Inner {
     }
 
     fn send_input_now(self: &Rc<Self>, input: &PromptInput) {
+        if self.answer_adopting.get() {
+            return self.queue_input(input);
+        }
         let text = input.text.as_str();
         if !self.root_prompt_allowed() {
             self.queue_input(input);
@@ -5202,6 +5263,9 @@ impl Inner {
     }
 
     fn dispatch_queued_prompt(self: &Rc<Self>) {
+        if self.answer_adopting.get() {
+            return;
+        }
         if self.stopping.get()
             || self.dispatching_queue.get()
             || self.switch_reading.get()
@@ -5838,6 +5902,10 @@ impl Inner {
     }
 
     fn switch(self: &Rc<Self>, driver: Driver, model: Option<String>, effort: Option<String>) {
+        if self.answer_adopting.get() {
+            self.error("Wait for the chosen answer to be saved before switching agents");
+            return;
+        }
         // Another profile (`switch_to`): a new process there, whatever the agent.
         let target = self.switch_target.borrow_mut().take();
         // An agent on another machine is never switched to another agent or profile: the probe
@@ -6697,6 +6765,59 @@ struct Installed {
     effort: Option<String>,
     /// The native session to resume; `None` starts a new one.
     native_id: Option<String>,
+}
+
+/// Holds prompt delivery during the atomic group/handoff write; failures release it too.
+pub(crate) struct AnswerAdoption {
+    inner: Rc<Inner>,
+}
+impl AnswerAdoption {
+    pub(crate) fn withdraw(&self, fence: &str) {
+        if !self.inner.handoff_in_flight.get()
+            && self
+                .inner
+                .pending_handoff
+                .borrow()
+                .as_ref()
+                .is_some_and(|h| h.fence == fence)
+        {
+            self.inner.pending_handoff.borrow_mut().take();
+            self.inner.deliver(&Envelope::new(Event::Notice {
+                text: "The chosen comparison context was withdrawn before delivery by Undo.".into(),
+            }));
+        }
+    }
+    pub(crate) fn adopt(&self, handoff: Handoff, notice: &str) {
+        self.inner.handoff_in_flight.set(false);
+        *self.inner.pending_handoff.borrow_mut() = Some(handoff);
+        self.inner.deliver(&Envelope::new(Event::Notice {
+            text: notice.to_owned(),
+        }));
+    }
+}
+impl Drop for AnswerAdoption {
+    fn drop(&mut self) {
+        self.inner.answer_adopting.set(false);
+        if !self.inner.closing.get() {
+            self.inner.dispatch_queued_prompt();
+        }
+    }
+}
+
+/// Only the participant's own turns go back through the ordinary redaction and budget.
+pub(crate) fn build_answer_handoff(messages: &[TranscriptMessage], source: &str) -> Handoff {
+    if !messages
+        .iter()
+        .any(|m| m.role == "assistant" && m.status == "completed" && !m.text.trim().is_empty())
+    {
+        return build_handoff(&[], source);
+    }
+    let own: Vec<_> = messages
+        .iter()
+        .filter(|m| m.role != agent_kit::store::INHERITED_ROLE)
+        .cloned()
+        .collect();
+    build_handoff(&own, source)
 }
 
 /// A handoff ready to ride on the next prompt.
@@ -9265,6 +9386,142 @@ mod tests {
                 pump_until(ctx, 10, || undelivered_handoff(&history()).is_none()),
                 "the delivery was not stored"
             );
+        });
+    }
+
+    #[test]
+    fn ask_several_answer_handoff_is_own_history_redacted_and_budgeted() {
+        let message = |role: &str, text: String, item_id: String| TranscriptMessage {
+            role: role.into(),
+            kind: "assistant_message".into(),
+            text,
+            item_id,
+            status: "completed".into(),
+            title: String::new(),
+        };
+        let prompt_only = [message("user", "No answer yet".into(), "prompt".into())];
+        assert_eq!(build_answer_handoff(&prompt_only, "participant").carried, 0);
+        let mut messages = vec![message(
+            agent_kit::store::INHERITED_ROLE,
+            "INHERITED MUST NOT RETURN".into(),
+            "seed".into(),
+        )];
+        messages.push(message("user", "FIRST question".into(), "first".into()));
+        for i in 0..120 {
+            messages.push(message(
+                "assistant",
+                format!("middle {i} {}", "界".repeat(4000)),
+                format!("m{i}"),
+            ));
+        }
+        messages.push(message(
+            "assistant",
+            "LATEST answer ghp_1234567890abcdefghijklmnopqrstuvwx".into(),
+            "latest".into(),
+        ));
+        let answer = build_answer_handoff(&messages, "participant");
+        assert!(!answer.summary.contains("INHERITED MUST NOT RETURN"));
+        assert!(!answer.summary.contains("ghp_"));
+        assert!(answer.summary.contains("FIRST question"));
+        assert!(answer.summary.contains("LATEST answer"));
+        assert!(answer.carried < answer.total);
+        assert!(agent_core::handoff_budget::is_valid_fence(&answer.fence));
+    }
+
+    #[test]
+    fn ask_several_adoption_guards_and_next_prompt_delivery() {
+        in_loop(|ctx| {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let store = Rc::new(Store::open_in_memory().expect("store"));
+            let thread = fresh(&store, &tmp.path().to_string_lossy());
+            let (session, _) = harness(
+                Box::new(agent_core::claude::ClaudeAdapter::new()),
+                answering_claude(tmp.path()),
+                &store,
+                &thread,
+            );
+            session.inner.state.borrow_mut().running_turn = true;
+            assert!(session.reserve_answer().is_err());
+            session.inner.state.borrow_mut().running_turn = false;
+            let reserved = session.reserve_answer().expect("idle source");
+            assert!(session.reserve_answer().is_err(), "one adoption at a time");
+            session.switch_to(
+                Driver::Codex,
+                SwitchTarget {
+                    profile: "refused-profile".into(),
+                    label: "Refused".into(),
+                },
+                None,
+                None,
+            );
+            assert!(
+                session.inner.switch_target.borrow().is_none(),
+                "a refused profile switch cannot poison a later switch"
+            );
+            let answer = Handoff {
+                summary: "CHOSEN ANSWER".into(),
+                fence: "0123456789abcdef0123456789abcdef".into(),
+                carried: 1,
+                total: 1,
+            };
+            for env in seeded_handoff_events(&answer, "participant") {
+                store.append_event(&thread, None, &env).unwrap();
+            }
+            session.send_prompt("use it");
+            assert!(
+                !tmp.path().join("prompts.log").exists(),
+                "a message during the save waits"
+            );
+            reserved.adopt(answer.clone(), "Kept answer; goes with next message");
+            drop(reserved);
+            assert!(
+                session.reserve_answer().is_err(),
+                "pending handoff must not be overwritten"
+            );
+            let history = store.events(&thread, None, 1000).unwrap();
+            assert_eq!(
+                undelivered_handoff(history.iter().map(|(_, e)| e)),
+                Some(answer)
+            );
+            assert!(pump_until(ctx, 10, || lines(
+                tmp.path().join("prompts.log")
+            )
+            .iter()
+            .any(|l| l.contains("CHOSEN ANSWER") && l.contains("use it"))));
+            session.shutdown(true);
+        });
+    }
+
+    #[test]
+    fn ask_several_withdrawal_is_precise_and_refuses_in_flight() {
+        in_loop(|_| {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = Rc::new(Store::open_in_memory().unwrap());
+            let thread = fresh(&store, &tmp.path().to_string_lossy());
+            let (session, _) = harness(
+                Box::new(agent_core::claude::ClaudeAdapter::new()),
+                answering_claude(tmp.path()),
+                &store,
+                &thread,
+            );
+            let answer = Handoff {
+                summary: "chosen".into(),
+                fence: "0123456789abcdef0123456789abcdef".into(),
+                carried: 1,
+                total: 1,
+            };
+            session.restore_handoff(answer.clone());
+            assert!(session.reserve_answer_withdrawal("other").is_none());
+            let reservation = session.reserve_answer_withdrawal(&answer.fence).unwrap();
+            reservation.withdraw("other");
+            assert!(session.inner.pending_handoff.borrow().is_some());
+            reservation.withdraw(&answer.fence);
+            assert!(session.inner.pending_handoff.borrow().is_none());
+            drop(reservation);
+            session.restore_handoff(answer.clone());
+            session.inner.handoff_in_flight.set(true);
+            assert!(session.reserve_answer_withdrawal(&answer.fence).is_none());
+            session.shutdown(true);
         });
     }
 

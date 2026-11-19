@@ -77,7 +77,7 @@ pub struct Theme {
 impl Theme {
     /// Builds the requested theme and applies it to a terminal.
     pub fn apply(terminal: &Terminal, choice: ThemeChoice) {
-        match Self::for_choice(choice) {
+        match Self::for_choice(crate::palette::concrete(choice)) {
             Some(theme) => theme.apply_to(terminal),
             None => Self::apply_system(terminal),
         }

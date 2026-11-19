@@ -42,6 +42,9 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   of its own, with the source folder's uncommitted work copied in, still uncommitted (never a
   file whose name looks like a secret), so the two never edit the same files. Plain `/fork`
   still forks in place.
+- **Compare any two threads**: **Compare with…** in a thread's context menu opens a searchable
+  picker, including archived threads and older forks without a recorded link. Read both full
+  conversations side by side and refresh them as they grow.
 - **Compare forks side by side**: **Compare with Fork…** in a thread's context menu, `/compare`,
   or **Compare** on the toast after a fork opens a window with both conversations since the
   fork, lined up turn by turn, and, in a git repository, a **Changes** tab with what changed in
@@ -54,14 +57,19 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
 - **Ask several agents at once**: **Ask Several Agents…** in the composer menu, or `/ask`, sends
   the same prompt to 2–4 agents, models or profiles in parallel and opens **Compare Group…** to
   read their replies and diffs side by side. Choosing **Keep This One** archives the rest,
-  records the outcome in a redacted brief on the source thread, offers **Undo**, and offers to
-  clean up finished participant worktrees.
+  carries the chosen answer into the source's next message and offers to restore the archived
+  participants or clean up finished participant worktrees. The source shows each participant's
+  status with Open, Keep and Discard controls; a participant can also become an ordinary thread.
+  The launch dialog shows cost/headroom and asks you to acknowledge exhausted accounts and
+  Antigravity's forced permission mode.
 - **Scheduled and repeating prompts**: **Schedule…** in the composer send menu, `/schedule`,
   or `Ctrl+Shift+L` schedules a prompt once, daily, weekly or at an interval, targeting the
   current thread or a new thread/worktree. **Scheduled Prompts…** in the window menu (and
   thread context menu) lists upcoming runs and lets you pause, resume, edit, run now or delete.
   Repeating schedules pause automatically after 10 unattended runs until you reply, or when a
-  spending warning fires; disable all scheduled runs in Settings → General → Threads
+  spending warning is reached. A clock on the thread row and a status row above its composer
+  show the next run or pause reason. Choose a profile, model and optional end date in the editor;
+  disable all scheduled runs in Settings → General → Threads
   (**Run Scheduled Prompts**).
 
 ### Multi-agent environment review
@@ -337,4 +345,3 @@ A thread belongs to the work, not to an agent. At any point you can hand it to a
   notes, with a Download button. The same check runs once a few seconds after startup (turn
   it off in Settings → Startup); a newer release puts a dot on the menu button. It is the
   app's only connection to the internet.
-

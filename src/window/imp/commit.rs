@@ -13,12 +13,122 @@ use agent_kit::commit::{CommitContext, CommitRequest, HunkPatch, PartialCommitRe
 use gtk4::glib;
 use tracing::{info, warn};
 
-use super::threads::off_main;
+use super::threads::{off_main, store_job};
 use super::{present_message_over, AgentTerminalWindow};
 use crate::window::diff_panel::{CommitAsk, DiffPanel};
 
 /// At most this many files are named in the dialog; the rest are counted.
 const LISTED_FILES: usize = 12;
+const REPLY_LIMIT: usize = 2_000;
+const EVENT_LIMIT: usize = 10_000;
+
+/// Read a bounded suffix and refuse an incomplete or superseded turn.
+fn draft_reply(
+    store: &agent_kit::store::Store,
+    thread: &str,
+    baseline: i64,
+    prompt: &str,
+) -> agent_kit::store::Result<Option<(i64, String)>> {
+    use agent_core::event::{Event, TurnState};
+    let events = store.events(thread, Some(baseline), EVENT_LIMIT + 1)?;
+    if events.len() > EVENT_LIMIT {
+        return Ok(None);
+    }
+    let items = store.transcript_suffix(thread, &events);
+    if last_seq(store, thread)? != events.last().map_or(baseline, |(seq, _)| *seq) {
+        return Ok(None);
+    }
+    let Some(user) = items.iter().rev().find(|i| i.message.role == "user") else {
+        return Ok(None);
+    };
+    if user.first_seq <= baseline || user.message.text != prompt {
+        return Ok(None);
+    }
+    let Some(reply) = items.iter().rev().find(|i| i.message.role == "assistant") else {
+        return Ok(None);
+    };
+    if reply.first_seq <= user.first_seq
+        || reply.message.status != "completed"
+        || reply.message.text.trim().is_empty()
+        || reply.message.text.chars().count() > REPLY_LIMIT
+    {
+        return Ok(None);
+    }
+    let mut completion = None;
+    let mut started = None;
+    for (seq, env) in &events {
+        if *seq <= user.first_seq {
+            continue;
+        }
+        // A message queued during another turn predates that turn's end. Its next reply may
+        // belong to an earlier queued message, so its turn cannot be identified safely here.
+        if started.is_none()
+            && completion.is_none()
+            && matches!(env.event, Event::TurnCompleted { .. })
+        {
+            return Ok(None);
+        }
+        match &env.event {
+            Event::TurnStarted { .. } => {
+                started = Some(*seq);
+                completion = None;
+            }
+            Event::TurnCompleted {
+                state: TurnState::Completed,
+                error: None,
+                ..
+            } if started.is_some() => completion = started.take().map(|start| (start, *seq)),
+            Event::TurnCompleted { .. } => {
+                started = None;
+                completion = None;
+            }
+            _ => {}
+        }
+    }
+    let Some((start, end)) = completion else {
+        return Ok(None);
+    };
+    if end <= reply.first_seq
+        || reply.first_seq <= start
+        || !events.iter().any(|(seq, env)| {
+            *seq == reply.first_seq
+                && env.item.as_deref() == Some(&reply.message.item_id)
+                && matches!(
+                    env.event,
+                    Event::ItemStarted {
+                        kind: agent_core::event::ItemKind::AssistantMessage,
+                        parent: None,
+                        ..
+                    }
+                )
+        })
+        || !events.iter().any(|(seq, env)| {
+            *seq < end
+                && env.item.as_deref() == Some(&reply.message.item_id)
+                && matches!(
+                    env.event,
+                    Event::ItemCompleted {
+                        status: agent_core::event::ItemStatus::Completed,
+                        ..
+                    }
+                )
+        })
+        || events
+            .iter()
+            .any(|(seq, env)| *seq > end && env.item.as_deref() == Some(&reply.message.item_id))
+    {
+        return Ok(None);
+    }
+    Ok(Some((reply.first_seq, reply.message.text.clone())))
+}
+
+fn last_seq(store: &agent_kit::store::Store, thread: &str) -> agent_kit::store::Result<i64> {
+    let after = store.tail_after(thread, 1)?;
+    Ok(store
+        .events(thread, after, 1)?
+        .last()
+        .map_or(0, |(seq, _)| *seq))
+}
 
 /// Every path `ask` commits (whole files, renames' old paths, and partial-hunk files), each once
 /// and in the diff's order.
@@ -225,6 +335,8 @@ pub(super) struct CommitDialog {
     pub commands: gtk4::Label,
     #[cfg_attr(not(test), expect(dead_code, reason = "read by the dialog test"))]
     pub check: gtk4::Label,
+    pub use_reply: gtk4::Button,
+    pub reply_hint: gtk4::Label,
 }
 
 /// Builds the dialog for committing `ask` with `ctx`, its message box holding `draft`. Commit is
@@ -281,6 +393,15 @@ pub(super) fn commit_dialog(
     check.add_css_class("caption");
     column.append(&check);
 
+    let use_reply = gtk4::Button::with_label("Use Last Reply");
+    use_reply.set_sensitive(false);
+    let reply_hint = wrapped("Send the draft prompt and wait for a short completed reply.");
+    reply_hint.add_css_class("dim-label");
+    if can_draft {
+        column.append(&use_reply);
+        column.append(&reply_hint);
+    }
+
     let commands = wrapped("");
     commands.add_css_class("monospace");
     commands.set_selectable(true);
@@ -326,6 +447,8 @@ pub(super) fn commit_dialog(
         message,
         commands,
         check,
+        use_reply,
+        reply_hint,
     }
 }
 
@@ -345,16 +468,108 @@ fn text_of(view: &gtk4::TextView) -> String {
         .to_string()
 }
 
+fn apply_draft_reply(
+    message: &gtk4::TextView,
+    hint: &gtk4::Label,
+    selection_matches: bool,
+    typed: &str,
+    candidate: &(i64, String),
+    found: Option<agent_kit::store::Result<Option<(i64, String)>>>,
+) {
+    if selection_matches
+        && text_of(message) == typed
+        && matches!(&found, Some(Ok(Some(reply))) if reply == candidate)
+    {
+        message.buffer().set_text(&candidate.1);
+        hint.set_text("Reply copied; review and edit it before committing.");
+    } else {
+        hint.set_text("The reply or selection changed, or the thread could not be read. Your message was kept.");
+    }
+}
+
+type ReplyRead = Option<agent_kit::store::Result<Option<(i64, String)>>>;
+type ReplyFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ReplyRead>>>;
+
+fn update_reply_candidate(
+    button: &gtk4::Button,
+    hint: &gtk4::Label,
+    candidate: &std::cell::RefCell<Option<(i64, String)>>,
+    selection_matches: bool,
+    found: ReplyRead,
+) {
+    let reply = if selection_matches {
+        match found {
+            Some(Ok(Some(reply))) => {
+                hint.set_text("Copy the completed reply into the message box for review.");
+                Some(reply)
+            }
+            Some(Ok(None)) => {
+                hint.set_text("Send the draft prompt and wait for a short completed reply.");
+                None
+            }
+            _ => {
+                hint.set_text("Could not read the thread. Retrying; your message was kept.");
+                None
+            }
+        }
+    } else {
+        hint.set_text("The selection changed. Draft a new message for these files.");
+        None
+    };
+    button.set_sensitive(reply.is_some());
+    *candidate.borrow_mut() = reply;
+}
+
+fn connect_reply_button(
+    button: &gtk4::Button,
+    message: &gtk4::TextView,
+    hint: &gtk4::Label,
+    candidate: std::rc::Rc<std::cell::RefCell<Option<(i64, String)>>>,
+    busy: std::rc::Rc<std::cell::Cell<bool>>,
+    selection_matches: std::rc::Rc<dyn Fn() -> bool>,
+    read: std::rc::Rc<dyn Fn() -> ReplyFuture>,
+) {
+    let (message, hint) = (message.clone(), hint.clone());
+    button.connect_clicked(move |button| {
+        let Some(candidate) = candidate.borrow().clone() else {
+            return;
+        };
+        busy.set(true);
+        button.set_sensitive(false);
+        let (message, hint, selection_matches, read, busy) = (
+            message.clone(),
+            hint.clone(),
+            selection_matches.clone(),
+            read.clone(),
+            busy.clone(),
+        );
+        let typed = text_of(&message);
+        glib::MainContext::default().spawn_local(async move {
+            let found = read().await;
+            apply_draft_reply(
+                &message,
+                &hint,
+                selection_matches(),
+                &typed,
+                &candidate,
+                found,
+            );
+            busy.set(false);
+        });
+    });
+}
+
 impl AgentTerminalWindow {
     /// "Commit…" in the diff panel behind `panel_root`: reads the repository off the main thread,
     /// then asks with the dialog. Too many files, a half-done merge or rebase, or a repository
     /// that cannot be read, is said instead. The panel's button stays off until one or the other.
     pub(super) fn commit_from_panel(&self, panel_root: &gtk4::Box, ask: CommitAsk) {
-        let Some((page, panel, view)) = self.tab_by_panel(panel_root, |t| {
+        let Some((page, panel, view, thread)) = self.tab_by_panel(panel_root, |t| {
             (
                 t.page.clone(),
                 t.diff_panel.clone(),
                 t.chat.as_ref().and_then(|c| c.view.clone()),
+                t.chat.as_ref().map(|c| c.thread.clone()),
             )
         }) else {
             return;
@@ -394,6 +609,44 @@ impl AgentTerminalWindow {
             let patches = ask.patches.clone();
             let repo = ask.repo.clone();
             let message = parts.message.clone();
+            if let (Some(thread), Some(baseline)) = (thread.clone(), panel.draft_request(&ask)) {
+                let reply_message = message.clone();
+                let button = parts.use_reply.clone();
+                let hint = parts.reply_hint.clone();
+                let panel_check = panel.clone();
+                let ask_check = ask.clone();
+                let prompt = commit_message::draft_prompt(&paths);
+                let dialog = parts.dialog.downgrade();
+                let candidate = std::rc::Rc::new(std::cell::RefCell::new(None));
+                let busy = std::rc::Rc::new(std::cell::Cell::new(false));
+                let selection = {
+                    let (panel, ask) = (panel_check.clone(), ask_check.clone());
+                    std::rc::Rc::new(move || panel.draft_request(&ask) == Some(baseline))
+                };
+                let read = {
+                    let (thread, prompt) = (thread.clone(), prompt.clone());
+                    std::rc::Rc::new(move || {
+                        let (thread, prompt) = (thread.clone(), prompt.clone());
+                        Box::pin(async move { store_job(move |s| draft_reply(s, &thread, baseline, &prompt)).await }) as ReplyFuture
+                    })
+                };
+                connect_reply_button(&button, &reply_message, &hint, candidate.clone(), busy.clone(), selection, read);
+                glib::MainContext::default().spawn_local(async move {
+                    loop {
+                        if dialog.upgrade().is_none_or(|d| !d.is_visible()) { return; }
+                        if busy.get() {
+                            glib::timeout_future_seconds(2).await;
+                            continue;
+                        }
+                        let (thread_read, prompt_read) = (thread.clone(), prompt.clone());
+                        let found = store_job(move |s| draft_reply(s, &thread_read, baseline, &prompt_read)).await;
+                        if dialog.upgrade().is_none_or(|d| !d.is_visible()) { return; }
+                        if busy.get() { continue; }
+                        update_reply_candidate(&button, &hint, &candidate, panel_check.draft_request(&ask_check) == Some(baseline), found);
+                        glib::timeout_future_seconds(2).await;
+                    }
+                });
+            }
             parts.dialog.present(Some(&parent));
             message.grab_focus();
             let obj = obj.downgrade();
@@ -404,11 +657,20 @@ impl AgentTerminalWindow {
                 let Some(obj) = obj.upgrade() else { return };
                 match response {
                     "draft" => {
-                        if let Some(view) = &view {
-                            view.insert_attachment_text(&commit_message::draft_prompt(&paths));
-                            obj.imp().show_toast(
-                                "A prompt to draft the message is in the thread's composer",
-                            );
+                        if let (Some(view), Some(thread)) = (view.clone(), thread.clone()) {
+                            panel.clear_draft_request();
+                            let (panel, ask, paths, parent) = (panel.clone(), ask.clone(), paths.clone(), parent.clone());
+                            let obj = obj.downgrade();
+                            glib::MainContext::default().spawn_local(async move {
+                                match store_job(move |s| last_seq(s, &thread)).await {
+                                    Some(Ok(seq)) => {
+                                        panel.set_draft_request(ask, seq);
+                                        view.insert_attachment_text(&commit_message::draft_prompt(&paths));
+                                        if let Some(obj) = obj.upgrade() { obj.imp().show_toast("A prompt to draft the message is in the thread's composer"); }
+                                    }
+                                    _ => present_message_over(&parent, "Could Not Read the Thread", "The draft prompt was not inserted. Try again."),
+                                }
+                            });
                         }
                     }
                     "commit" => {
@@ -465,6 +727,7 @@ impl AgentTerminalWindow {
                 Ok(done) => {
                     info!("committed from the diff panel");
                     panel.set_commit_draft("");
+                    panel.clear_draft_request();
                     obj.imp().show_toast(&if done.short.is_empty() {
                         "Committed".to_owned()
                     } else {
@@ -485,7 +748,222 @@ impl AgentTerminalWindow {
 pub(super) mod tests {
     use super::*;
     use crate::window::diff_panel::CommitFile;
+    use agent_core::event::{Envelope, Event, ItemKind, ItemStatus, StreamKind, TurnState};
     use std::path::PathBuf;
+
+    #[test]
+    fn use_reply_rechecks_store_and_selection_after_click() {
+        use std::{cell::Cell, rc::Rc, time::Duration};
+        crate::testutil::adw_init().unwrap();
+        let store = Rc::new(agent_kit::store::Store::open_in_memory().unwrap());
+        let thread = store.create_thread("/tmp", None).unwrap();
+        let prompt = commit_message::draft_prompt(&["a.rs".into()]);
+        let append = |event: Envelope| store.append_event(&thread, None, &event).unwrap();
+        let start = |id: &str, kind| {
+            Envelope::new(Event::ItemStarted {
+                kind,
+                title: String::new(),
+                input: None,
+                parent: None,
+            })
+            .item(id)
+        };
+        let text = |id: &str, value: &str| {
+            Envelope::new(Event::ContentSnapshot {
+                stream: StreamKind::Assistant,
+                text: value.into(),
+            })
+            .item(id)
+        };
+        let end = |id: &str| {
+            Envelope::new(Event::ItemCompleted {
+                status: ItemStatus::Completed,
+                output: None,
+                error: None,
+            })
+            .item(id)
+        };
+        append(start("u", ItemKind::UserMessage));
+        append(text("u", &prompt));
+        append(end("u"));
+        append(Envelope::new(Event::TurnStarted { model: None }));
+        append(start("a", ItemKind::AssistantMessage));
+        append(text("a", "Fix the issue"));
+        append(end("a"));
+        append(Envelope::turn_completed(TurnState::Completed, None));
+        let candidate = draft_reply(&store, &thread, 0, &prompt).unwrap().unwrap();
+        let context = glib::MainContext::default();
+
+        for scenario in ["success", "selection", "typed", "error", "reply"] {
+            let button = gtk4::Button::with_label("Use Last Reply");
+            let message = gtk4::TextView::new();
+            message.buffer().set_text("My draft");
+            let hint = gtk4::Label::new(None);
+            let selected = Rc::new(Cell::new(true));
+            let failing = Rc::new(Cell::new(scenario == "error"));
+            let available = Rc::new(std::cell::RefCell::new(Some(candidate.clone())));
+            let busy = Rc::new(Cell::new(false));
+            let selection = {
+                let selected = selected.clone();
+                Rc::new(move || selected.get())
+            };
+            let read = {
+                let (store, thread, prompt, failing) = (
+                    store.clone(),
+                    thread.clone(),
+                    prompt.clone(),
+                    failing.clone(),
+                );
+                Rc::new(move || {
+                    let (store, thread, prompt, failing) = (
+                        store.clone(),
+                        thread.clone(),
+                        prompt.clone(),
+                        failing.clone(),
+                    );
+                    Box::pin(async move {
+                        glib::timeout_future(Duration::from_millis(10)).await;
+                        if failing.get() {
+                            None
+                        } else {
+                            Some(draft_reply(&store, &thread, 0, &prompt))
+                        }
+                    }) as ReplyFuture
+                })
+            };
+            connect_reply_button(
+                &button,
+                &message,
+                &hint,
+                available.clone(),
+                busy.clone(),
+                selection,
+                read,
+            );
+            button.emit_clicked();
+            match scenario {
+                "selection" => selected.set(false),
+                "reply" => {
+                    append(text("a", "Changed after the first read"));
+                }
+                "typed" => message.buffer().set_text("Edited during read"),
+                _ => {}
+            }
+            assert!(crate::testutil::pump_until(&context, 2, || !hint
+                .text()
+                .is_empty()));
+            let expected = match scenario {
+                "success" => "Fix the issue",
+                "typed" => "Edited during read",
+                _ => "My draft",
+            };
+            assert_eq!(text_of(&message), expected, "{scenario}");
+            if scenario == "error" {
+                failing.set(false);
+                update_reply_candidate(
+                    &button,
+                    &hint,
+                    &available,
+                    true,
+                    Some(Ok(Some(candidate.clone()))),
+                );
+                assert!(button.is_sensitive());
+                button.emit_clicked();
+                assert!(crate::testutil::pump_until(&context, 2, || !busy.get()));
+                assert_eq!(
+                    text_of(&message),
+                    "Fix the issue",
+                    "retry after a failed read"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn draft_reply_requires_the_latest_completed_matching_turn() {
+        let store = agent_kit::store::Store::open_in_memory().unwrap();
+        let thread = store.create_thread("/tmp", None).unwrap();
+        let append = |event: Envelope| store.append_event(&thread, None, &event).unwrap();
+        let prompt = commit_message::draft_prompt(&["a.rs".into()]);
+        let start = |id: &str, kind| {
+            Envelope::new(Event::ItemStarted {
+                kind,
+                title: String::new(),
+                input: None,
+                parent: None,
+            })
+            .item(id)
+        };
+        let text = |id: &str, text: &str| {
+            Envelope::new(Event::ContentSnapshot {
+                stream: StreamKind::Assistant,
+                text: text.into(),
+            })
+            .item(id)
+        };
+        let end = |id: &str, status| {
+            Envelope::new(Event::ItemCompleted {
+                status,
+                output: None,
+                error: None,
+            })
+            .item(id)
+        };
+        let turn = |state| {
+            Envelope::new(Event::TurnCompleted {
+                state,
+                usage: None,
+                cost_usd: None,
+                error: None,
+                model: None,
+                billing: None,
+            })
+        };
+        append(start("u", ItemKind::UserMessage));
+        append(text("u", &prompt));
+        append(end("u", ItemStatus::Completed));
+        append(Envelope::new(Event::TurnStarted { model: None }));
+        append(start("a", ItemKind::AssistantMessage));
+        append(text("a", "Fix the issue"));
+        assert!(draft_reply(&store, &thread, 0, &prompt).unwrap().is_none());
+        append(end("a", ItemStatus::Completed));
+        append(turn(TurnState::Interrupted));
+        assert!(draft_reply(&store, &thread, 0, &prompt).unwrap().is_none());
+        append(Envelope::new(Event::TurnStarted { model: None }));
+        append(start("b", ItemKind::AssistantMessage));
+        append(text("b", "Fix the issue"));
+        append(end("b", ItemStatus::Completed));
+        append(turn(TurnState::Completed));
+        assert_eq!(
+            draft_reply(&store, &thread, 0, &prompt).unwrap().unwrap().1,
+            "Fix the issue"
+        );
+        assert!(draft_reply(&store, &thread, 0, "another prompt")
+            .unwrap()
+            .is_none());
+        let after = last_seq(&store, &thread).unwrap();
+        assert!(draft_reply(&store, &thread, after, &prompt)
+            .unwrap()
+            .is_none());
+        append(text("b", &"é".repeat(REPLY_LIMIT + 1)));
+        assert!(draft_reply(&store, &thread, 0, &prompt).unwrap().is_none());
+        append(start("u2", ItemKind::UserMessage));
+        append(text("u2", "Something else"));
+        assert!(draft_reply(&store, &thread, 0, &prompt).unwrap().is_none());
+        let baseline = last_seq(&store, &thread).unwrap();
+        append(start("queued", ItemKind::UserMessage));
+        append(text("queued", &prompt));
+        append(end("queued", ItemStatus::Completed));
+        append(turn(TurnState::Completed));
+        append(Envelope::new(Event::TurnStarted { model: None }));
+        append(start("earlier", ItemKind::AssistantMessage));
+        append(text("earlier", "An earlier queued answer"));
+        append(end("earlier", ItemStatus::Completed));
+        append(turn(TurnState::Completed));
+        assert!(draft_reply(&store, &thread, baseline, &prompt)
+            .unwrap()
+            .is_none());
+    }
 
     fn ask(files: &[(&str, Option<&str>)], listed: usize) -> CommitAsk {
         CommitAsk {
@@ -612,6 +1090,46 @@ pub(super) mod tests {
         let parts = commit_dialog(&ctx(Some("main"), &[]), &a, "", true);
         assert!(!parts.dialog.is_response_enabled("commit"));
         assert!(parts.dialog.has_response("draft"));
+        assert!(!parts.use_reply.is_sensitive());
+        assert!(parts.reply_hint.text().contains("completed reply"));
+        let candidate = (1, "Original reply".to_owned());
+        parts.message.buffer().set_text("My typed draft");
+        apply_draft_reply(
+            &parts.message,
+            &parts.reply_hint,
+            true,
+            "My typed draft",
+            &candidate,
+            Some(Ok(Some((1, "Changed reply".into())))),
+        );
+        assert_eq!(
+            text_of(&parts.message),
+            "My typed draft",
+            "a changed reply cannot replace a draft"
+        );
+        apply_draft_reply(
+            &parts.message,
+            &parts.reply_hint,
+            false,
+            "My typed draft",
+            &candidate,
+            Some(Ok(Some(candidate.clone()))),
+        );
+        assert_eq!(
+            text_of(&parts.message),
+            "My typed draft",
+            "a changed selection cannot replace a draft"
+        );
+        apply_draft_reply(
+            &parts.message,
+            &parts.reply_hint,
+            true,
+            "My typed draft",
+            &candidate,
+            Some(Ok(Some(candidate.clone()))),
+        );
+        assert_eq!(text_of(&parts.message), "Original reply");
+        parts.message.buffer().set_text("");
         assert!(parts.check.text().contains("Write a message"));
         parts.message.buffer().set_text("Fix it");
         assert!(parts.dialog.is_response_enabled("commit"));

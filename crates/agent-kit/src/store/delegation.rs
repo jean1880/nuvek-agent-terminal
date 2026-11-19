@@ -1981,6 +1981,19 @@ mod tests {
         }
         assert!(s.is_hidden_child_thread(&child_thread).expect("q"));
         assert!(!s.is_hidden_child_thread(&root_thread).expect("q"));
+        s.append_user_message(&child_thread, Some(&pt), "private worker transcript")
+            .expect("message");
+        let columns = s
+            .compare_columns(&[agent_core::compare::Side {
+                thread: child_thread.clone(),
+                after: 0,
+            }])
+            .expect("comparison");
+        assert!(
+            columns[0].summary.is_none(),
+            "hidden workers cannot be compared"
+        );
+        assert!(columns[0].entries.is_empty());
         // The native import skips a held session: the child's is held by its hidden thread, so
         // it is never imported as a visible thread.
         assert_eq!(

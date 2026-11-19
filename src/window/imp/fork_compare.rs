@@ -313,6 +313,81 @@ fn fork_content(
 }
 
 impl AgentTerminalWindow {
+    /// A transcript-only comparison, including older threads with no recorded fork link.
+    pub(super) fn compare_with_thread(&self, thread: &str) {
+        let obj = self.obj().downgrade();
+        let thread = thread.to_owned();
+        glib::MainContext::default().spawn_local(async move {
+            let found = store_job(|store| store.list_threads(true)).await;
+            let Some(obj) = obj.upgrade() else { return };
+            let imp = obj.imp();
+            let candidates = match found {
+                Some(Ok(threads)) => threads,
+                Some(Err(e)) => {
+                    present_message(&obj, "Cannot Compare the Thread", &e.to_string());
+                    return;
+                }
+                None => {
+                    imp.show_toast("Cannot read the threads");
+                    return;
+                }
+            };
+            let Some(own) = candidates.iter().find(|s| s.id == thread) else {
+                imp.show_toast("This thread no longer exists");
+                return;
+            };
+            let title = display_title(&own.title).to_owned();
+            let candidates: Vec<_> = candidates.into_iter().filter(|s| s.id != thread).collect();
+            if candidates.is_empty() {
+                imp.show_toast("There is no other thread to compare with");
+                return;
+            }
+            let dialog = confirm_dialog(
+                "Compare with Another Thread",
+                &format!("Read “{title}” beside another conversation, from the beginning. This compares messages only; it does not compare files or keep an answer."),
+                ("cancel", "Cancel"),
+                ("compare", "Compare"),
+                adw::ResponseAppearance::Suggested,
+                true,
+            );
+            let labels: Vec<String> = candidates.iter().map(|s| {
+                format!("{} · {}{}", display_title(&s.title), s.cwd,
+                    if s.archived { " (archived)" } else { "" })
+            }).collect();
+            let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+            let choice = adw::ComboRow::builder()
+                .title("Thread")
+                .enable_search(true)
+                .model(&gtk4::StringList::new(&labels))
+                .build();
+            let list = gtk4::ListBox::builder()
+                .selection_mode(gtk4::SelectionMode::None)
+                .css_classes(["boxed-list"])
+                .build();
+            list.append(&choice);
+            dialog.set_extra_child(Some(&list));
+            imp.ask(dialog, "compare", move |imp, go| {
+                if go {
+                    if let Some(other) = usize::try_from(choice.selected()).ok()
+                        .and_then(|i| candidates.get(i)) {
+                        imp.open_thread_compare(&thread, &other.id);
+                    }
+                }
+            });
+        });
+    }
+
+    fn open_thread_compare(&self, thread: &str, other: &str) {
+        let window = CompareWindow::new(self.obj().upcast_ref(), "Compare Threads");
+        let sides = [thread, other].map(|thread| agent_core::compare::Side {
+            thread: thread.to_owned(),
+            after: 0,
+        });
+        load_thread_compare(&window, sides.clone());
+        window.connect_refresh(move |window| load_thread_compare(window, sides.clone()));
+        window.window().present();
+    }
+
     /// Compare with Fork… and `/compare` on `thread`: opens the comparison at once when there is
     /// one thread to compare it with, asks which when there are several, and says so when there
     /// is none.
@@ -861,6 +936,25 @@ fn load_fork_compare(window: &CompareWindow, thread: String, pairing: Pairing) {
     });
 }
 
+/// No baseline and no Keep action: unrelated conversations only share a display.
+fn load_thread_compare(window: &CompareWindow, sides: [agent_core::compare::Side; 2]) {
+    let generation = window.begin();
+    let weak = window.downgrade();
+    glib::MainContext::default().spawn_local(async move {
+        let read = store_job(move |store| store.compare_columns(&sides)).await;
+        let Some(window) = weak.upgrade() else { return };
+        match read {
+            Some(Ok(columns)) => window.show(generation, &CompareContent {
+                subtitle: "Complete conversations, lined up by turn. Messages only; no shared fork point.".to_owned(),
+                columns: columns.into_iter().map(column_view).collect(),
+                empty: "Neither thread has messages yet.".to_owned(),
+            }),
+            Some(Err(e)) => window.show_error(generation, &e.to_string()),
+            None => window.show_error(generation, "The thread store could not be read."),
+        }
+    });
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use agent_core::compare::{Entry, Role};
@@ -1332,6 +1426,94 @@ pub(super) mod tests {
                     .any(|t| t == "a second try")
             }),
             "Refresh draws the new message"
+        );
+        compare.close();
+        assert!(crate::testutil::pump_until(&ctx, 10, || !compare.is_visible()));
+
+        // A compaction has no fork link, but the manual picker can compare its whole
+        // conversation with the source without offering a destructive Keep action.
+        store
+            .append_user_message(&compacted, None, "unlinked conversation")
+            .expect("prompt");
+        imp.run_thread_action(crate::window::sidebar_model::ThreadAction::CompareThreads(
+            source.clone(),
+        ));
+        assert!(crate::testutil::pump_until(&ctx, 10, || window
+            .visible_dialog()
+            .is_some()));
+        let dialog = window
+            .visible_dialog()
+            .expect("picker")
+            .downcast::<adw::AlertDialog>()
+            .expect("alert");
+        let choice = crate::testutil::find_all::<adw::ComboRow>(dialog.upcast_ref())
+            .into_iter()
+            .next()
+            .expect("thread choice");
+        let candidates = store.list_threads(true).expect("candidates");
+        let index = candidates
+            .iter()
+            .filter(|s| s.id != source)
+            .position(|s| s.id == compacted)
+            .expect("unlinked thread is offered");
+        choice.set_selected(index as u32);
+        assert!(crate::testutil::pump_until_dialog_open(
+            &ctx,
+            dialog.upcast_ref(),
+            10
+        ));
+        crate::testutil::find_all::<gtk4::Button>(dialog.upcast_ref())
+            .into_iter()
+            .find(|b| b.label().as_deref() == Some("Compare"))
+            .expect("Compare button")
+            .emit_clicked();
+        assert!(crate::testutil::pump_until(&ctx, 10, || window
+            .visible_dialog()
+            .is_none()));
+        assert!(
+            crate::testutil::pump_until(&ctx, 10, || {
+                gtk4::Window::list_toplevels()
+                    .into_iter()
+                    .filter_map(|w| w.downcast::<gtk4::Window>().ok())
+                    .any(|w| w.title().as_deref() == Some("Compare Threads") && w.is_visible())
+            }),
+            "the asynchronous choice opens the comparison"
+        );
+        let compare = gtk4::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk4::Window>().ok())
+            .find(|w| w.title().as_deref() == Some("Compare Threads") && w.is_visible())
+            .expect("manual comparison");
+        let root: gtk4::Widget = compare.clone().upcast();
+        assert!(
+            crate::testutil::pump_until(&ctx, 10, || {
+                let texts = crate::testutil::label_texts(&root);
+                texts.iter().any(|t| t == "before the fork")
+                    && texts.iter().any(|t| t == "unlinked conversation")
+            }),
+            "both full transcripts, including pre-fork messages"
+        );
+        assert!(
+            crate::testutil::find_all_by_class::<gtk4::Button>(&root, "compare-keep").is_empty()
+        );
+        assert!(crate::testutil::find_all::<adw::ViewSwitcher>(&root)
+            .iter()
+            .all(|s| !s.is_visible()));
+        store
+            .delete_thread(&compacted)
+            .expect("delete compared thread");
+        let refresh = crate::testutil::find_all::<gtk4::Button>(&root)
+            .into_iter()
+            .find(|b| b.icon_name().as_deref() == Some("at-view-refresh-symbolic"))
+            .expect("refresh");
+        refresh.emit_clicked();
+        assert!(
+            crate::testutil::pump_until(&ctx, 10, || {
+                crate::testutil::label_texts(&root)
+                    .iter()
+                    .any(|t| t == "Deleted thread")
+            }),
+            "Refresh handles a deleted participant"
         );
         compare.close();
         assert!(crate::testutil::pump_until(&ctx, 10, || !compare.is_visible()));

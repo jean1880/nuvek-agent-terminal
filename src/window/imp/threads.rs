@@ -759,6 +759,16 @@ fn suspension_due(minutes: u32, idle: std::time::Duration, shown: bool, held: bo
 }
 
 impl ChatTab {
+    pub(super) fn answer_preparing(&self) -> bool {
+        self.building
+            || self.starting
+            || self.rebinding
+            || self.slot.get().is_some_and(|s| s.lifecycle().starting)
+    }
+
+    pub(super) fn answer_source_blocked(&self) -> bool {
+        self.holds_suspension()
+    }
     /// Whether closing this thread would cut work short. The one place the close question
     /// (the row's X, archive, the window) decides; extend it for background work.
     pub(super) fn busy(&self) -> bool {
@@ -1419,6 +1429,7 @@ pub(super) struct ResolvedAgent {
 }
 
 thread_local! {
+    static ANSWER_SOURCES: RefCell<std::collections::HashSet<String>> = RefCell::new(std::collections::HashSet::new());
     static STORE: RefCell<Option<Rc<Store>>> = const { RefCell::new(None) };
     /// Where the app's store lives, once it opened a file one. `None` (memory only, tests): there
     /// is nothing a second connection could open, so store jobs run in place.
@@ -1455,6 +1466,35 @@ thread_local! {
     /// opened, while the empty state offers to reopen them. `None` once reopened or when there
     /// is nothing to offer.
     static LAST_SESSION: RefCell<Option<LastSession>> = const { RefCell::new(None) };
+}
+
+/// A source identity, including a closed thread, cannot acquire a new session while a Keep
+/// or its Undo reads and commits. Live sessions additionally reserve prompt delivery.
+pub(super) struct AnswerSourceReservation {
+    thread: String,
+}
+pub(super) fn reserve_answer_source(thread: &str) -> Option<AnswerSourceReservation> {
+    ANSWER_SOURCES
+        .with(|sources| sources.borrow_mut().insert(thread.to_owned()))
+        .then(|| AnswerSourceReservation {
+            thread: thread.to_owned(),
+        })
+}
+pub(super) fn answer_source_reserved(thread: &str) -> bool {
+    ANSWER_SOURCES.with(|sources| sources.borrow().contains(thread))
+}
+impl Drop for AnswerSourceReservation {
+    fn drop(&mut self) {
+        ANSWER_SOURCES.with(|sources| sources.borrow_mut().remove(&self.thread));
+        if let Some(owner) = thread_owner(&self.thread).filter(|w| !w.imp().is_closing()) {
+            if owner.imp().current_thread().as_deref() == Some(&self.thread) {
+                if let Some(page) = owner.imp().page_of_thread(&self.thread) {
+                    owner.imp().ensure_built(&page);
+                }
+            }
+            owner.imp().start_pending_sessions();
+        }
+    }
 }
 
 /// The scan that may still link its sessions. Read on the writer too, so a scan waiting in its
@@ -3771,7 +3811,9 @@ impl AgentTerminalWindow {
         let mut paused = false;
         for (thread, session, view) in due {
             if session.suspend_if_idle() {
-                info!("Stopped the idle agent of thread {thread} ({minutes} min out of sight); it resumes with the next prompt");
+                info!(
+                    "Stopped the idle agent of thread {thread} ({minutes} min out of sight); it resumes with the next prompt"
+                );
                 paused = true;
                 // The suspension is silent (no event reaches the view): its header is told.
                 if let Some(view) = view {
@@ -4375,6 +4417,15 @@ impl AgentTerminalWindow {
                         .map(|c| c.driver)
                         .or_else(|| s.driver.as_deref().and_then(parse_driver)),
                     badge,
+                    schedule: if remote {
+                        None
+                    } else {
+                        self.schedule_badges
+                            .borrow()
+                            .as_ref()
+                            .map(|badges| badges.get(&s.id).copied())
+                            .unwrap_or(Some(crate::window::sidebar_model::ScheduleBadge::Unknown))
+                    },
                     activity: chat.and_then(ChatTab::activity),
                     background: chat
                         .map(|c| {
@@ -4395,6 +4446,7 @@ impl AgentTerminalWindow {
                     pin_rank: s.pin_rank,
                     remote,
                     tags: row_tags(&s.tags, &colours),
+                    compare_source: self.compare_sources.borrow().get(&s.id).cloned(),
                 }
             })
             .collect();
@@ -4414,6 +4466,7 @@ impl AgentTerminalWindow {
                     .unwrap_or(0),
                 driver: None,
                 badge: tab.page.needs_attention().then_some(Badge::Unread),
+                schedule: None,
                 activity: None,
                 background: Vec::new(),
                 open: OpenState::Here,
@@ -4421,6 +4474,7 @@ impl AgentTerminalWindow {
                 pin_rank: None,
                 remote: tab.remote.is_some(),
                 tags: Vec::new(),
+                compare_source: None,
             });
         }
         rows
@@ -4441,8 +4495,13 @@ impl AgentTerminalWindow {
                 Default::default()
             });
             *self.summaries.borrow_mut() = Some(list);
+            *self.compare_sources.borrow_mut() = store.compare_sources().unwrap_or_else(|e| {
+                warn!("Cannot read comparison groups: {e}");
+                Default::default()
+            });
             self.refresh_sidebar();
             self.message_search_threads_changed();
+            self.refresh_schedule_status();
             return;
         }
         if self.summaries_loading.replace(true) {
@@ -4459,15 +4518,20 @@ impl AgentTerminalWindow {
                         warn!("Cannot read the tag colours: {e}");
                         Default::default()
                     });
-                    Ok((list, colours))
+                    let comparisons = store.compare_sources().unwrap_or_else(|e| {
+                        warn!("Cannot read comparison groups: {e}");
+                        Default::default()
+                    });
+                    Ok((list, colours, comparisons))
                 })
                 .await;
                 let Some(obj) = obj.upgrade() else { return };
                 let imp = obj.imp();
                 match loaded {
-                    Some(Ok((list, colours))) => {
+                    Some(Ok((list, colours, comparisons))) => {
                         *imp.tag_colours.borrow_mut() = colours;
                         *imp.summaries.borrow_mut() = Some(list);
+                        *imp.compare_sources.borrow_mut() = comparisons;
                     }
                     Some(Err(e)) => {
                         warn!("Cannot list threads: {e}");
@@ -4484,6 +4548,7 @@ impl AgentTerminalWindow {
                 imp.summaries_loading.set(false);
                 imp.refresh_sidebar();
                 imp.message_search_threads_changed();
+                imp.refresh_schedule_status();
                 return;
             }
         });
@@ -5053,6 +5118,37 @@ impl AgentTerminalWindow {
             .tooltip_text(&row.title)
             .build();
         line.append(&title);
+        if let Some(source) = &row.compare_source {
+            line.set_margin_start(12);
+            let marker = Label::builder()
+                .label("Compare")
+                .css_classes(["caption", "dim-label"])
+                .tooltip_text("Participant in an agent comparison")
+                .build();
+            marker.update_property(&[gtk4::accessible::Property::Label("Comparison participant")]);
+            line.append(&marker);
+            if let Some(summary) = self
+                .summaries
+                .borrow()
+                .as_ref()
+                .and_then(|rows| rows.iter().find(|s| &s.id == source))
+            {
+                marker.set_tooltip_text(Some(&format!(
+                    "Comparison for {}",
+                    display_title(&summary.title)
+                )));
+            }
+        }
+        if let Some(schedule) = row.schedule {
+            let description =
+                crate::window::schedule_model::schedule_badge_description(schedule, now / 1000);
+            let clock = Image::from_icon_name("at-document-open-recent-symbolic");
+            clock.set_pixel_size(14);
+            clock.add_css_class("thread-schedule");
+            clock.set_tooltip_text(Some(&description));
+            clock.update_property(&[gtk4::accessible::Property::Label(&description)]);
+            line.append(&clock);
+        }
         if row.pin_rank.is_some() {
             let pin = Image::from_icon_name(crate::icons::PIN_ICON);
             pin.set_pixel_size(12);
@@ -5173,6 +5269,15 @@ impl AgentTerminalWindow {
         }
         if !row.tags.is_empty() {
             state = format!("{state}, tagged {}", tags_text(&row.tags));
+        }
+        if row.compare_source.is_some() {
+            state.push_str(", comparison participant");
+        }
+        if let Some(schedule) = row.schedule {
+            state = format!(
+                "{state}, {}",
+                crate::window::schedule_model::schedule_badge_description(schedule, now / 1000)
+            );
         }
         widget.update_property(&[
             gtk4::accessible::Property::Label(&row.title),
@@ -5658,6 +5763,7 @@ impl AgentTerminalWindow {
     /// A page came into view: build a thread on first show, clear its unread state, and put
     /// its title and folder in the header.
     pub(super) fn page_shown(&self, page: &adw::TabPage) {
+        self.refresh_schedule_status();
         let Some(info) = self.with_page_tab_mut(page, |tab| {
             let dir = tab.dir.clone();
             let key = tab.key;
@@ -5998,6 +6104,12 @@ impl AgentTerminalWindow {
     /// Shows the thread's page, adding it if it is not open. `select` brings it into view (and
     /// so builds it).
     pub(super) fn open_thread(&self, thread: &str, select: bool) -> Option<adw::TabPage> {
+        if answer_source_reserved(thread) {
+            self.show_toast(
+                "Wait for the comparison answer to finish saving before opening its source",
+            );
+            return None;
+        }
         if let Some(owner) = thread_owner(thread).filter(|w| w != &*self.obj()) {
             if owner.imp().is_closing() {
                 self.show_toast("This thread is closing in another window");
@@ -6345,6 +6457,12 @@ impl AgentTerminalWindow {
 
     /// Builds a thread's view and starts its session, the first time its page is shown.
     pub(super) fn ensure_built(&self, page: &adw::TabPage) {
+        if self
+            .with_page_chat(page, |c| answer_source_reserved(&c.thread))
+            .unwrap_or(false)
+        {
+            return;
+        }
         if self.is_closing() {
             return;
         }
@@ -6520,6 +6638,10 @@ impl AgentTerminalWindow {
     }
 
     fn build_thread(&self, page: &adw::TabPage, job: BuildJob) {
+        if answer_source_reserved(&job.thread) {
+            self.release_answer_preparation(page, &job.thread, job.driver, true);
+            return;
+        }
         if !self.session_start_allowed() {
             return;
         }
@@ -6599,6 +6721,7 @@ impl AgentTerminalWindow {
             }),
         ));
         view.set_account_status(AccountStatus::shared());
+        self.attach_compare_strip(&thread, &view);
         view.set_diff_source(diffs);
         view.set_prompt_source(Rc::new(ThreadPrompts {
             thread: thread.clone(),
@@ -6670,6 +6793,7 @@ impl AgentTerminalWindow {
             chat.chosen_mode =
                 crate::chat::session::chosen_mode(history.iter().map(|(_, env)| env));
         });
+        self.refresh_schedule_status();
 
         // The demo window starts no agent session (see `start_session`): the script plays.
         if let Some(demo) = demo {
@@ -6759,8 +6883,32 @@ impl AgentTerminalWindow {
         delegation::PendingStart::new(slot)
     }
 
+    /// A comparison invalidates this preparation's snapshot. Release only its page/driver's
+    /// spinner so release of the reservation can re-read and retry; never clear a replacement.
+    fn release_answer_preparation(
+        &self,
+        page: &adw::TabPage,
+        thread: &str,
+        driver: Driver,
+        building: bool,
+    ) {
+        self.with_page_chat_mut(page, |chat| {
+            if chat.thread == thread && chat.slot.driver() == driver && chat.slot.get().is_none() {
+                if building {
+                    chat.building = false;
+                } else {
+                    chat.starting = false;
+                }
+            }
+        });
+    }
+
     /// Starts the session of a thread whose view is built, and applies what was waiting for it.
     fn start_session(&self, page: &adw::TabPage, job: StartJob) {
+        if answer_source_reserved(&job.thread) {
+            self.release_answer_preparation(page, &job.thread, job.driver, false);
+            return;
+        }
         // A page on another machine never starts this machine's agent, whatever asked (an agent
         // becoming ready here included): only its own remote start does.
         if self.page_is_remote(page) {
@@ -6812,6 +6960,10 @@ impl AgentTerminalWindow {
                 return;
             }
             if let Some(obj) = weak.upgrade() {
+                if answer_source_reserved(&job.thread) {
+                    pending.clear_cancelled(obj.imp(), &job.thread);
+                    return;
+                }
                 obj.imp().start_session_bound(&page, job, hooks);
                 if let (Some(reason), Some(session)) = (problem, slot.get()) {
                     session.note(delegation::unbound_notice(&reason));
@@ -6826,6 +6978,10 @@ impl AgentTerminalWindow {
         job: StartJob,
         hooks: Option<Rc<dyn crate::delegation::seam::DelegationHooks>>,
     ) {
+        if answer_source_reserved(&job.thread) {
+            self.release_answer_preparation(page, &job.thread, job.driver, false);
+            return;
+        }
         if !self.session_start_allowed() || self.page_is_remote(page) {
             return;
         }
@@ -8110,6 +8266,58 @@ impl AgentTerminalWindow {
             .filter_map(|t| t.chat.as_mut())
             .find(|c| c.thread == thread)
             .map(f)
+    }
+
+    /// A source built without a session still needs its committed answer when it starts.
+    pub(super) fn restore_saved_answer(
+        &self,
+        thread: &str,
+        handoff: crate::chat::session::Handoff,
+        notice: &str,
+    ) {
+        let session = self.slot_of(thread).and_then(|s| s.get());
+        let view = self
+            .with_chat_mut(thread, |chat| {
+                if session.is_none() {
+                    chat.stored_handoff = Some(handoff.clone());
+                    chat.pending_handoff = true;
+                }
+                chat.view.clone()
+            })
+            .flatten();
+        if let Some(session) = session {
+            session.restore_handoff(handoff);
+        }
+        if let Some(view) = view {
+            view.sink()(&Envelope::new(Event::Notice {
+                text: notice.to_owned(),
+            }));
+        }
+    }
+
+    /// Clear only the same still-unstarted answer on a page whose session has not started.
+    pub(super) fn withdraw_saved_answer(&self, thread: &str, fence: &str) {
+        if self.slot_of(thread).and_then(|s| s.get()).is_some() {
+            return;
+        }
+        let view = self
+            .with_chat_mut(thread, |chat| {
+                if chat
+                    .stored_handoff
+                    .as_ref()
+                    .is_some_and(|h| h.fence == fence)
+                {
+                    chat.stored_handoff = None;
+                    chat.pending_handoff = false;
+                }
+                chat.view.clone()
+            })
+            .flatten();
+        if let Some(view) = view {
+            view.sink()(&Envelope::new(Event::Notice {
+                text: "The chosen comparison context was withdrawn before delivery by Undo.".into(),
+            }));
+        }
     }
 
     /// [`Self::with_chat`] on the whole registry entry of `thread`'s page.
@@ -10371,6 +10579,123 @@ fn is_interruption(event: &Event) -> bool {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    /// Hold a real build snapshot across an Undo, then finish it after the lock is gone.
+    pub(in crate::window) fn pause_answer_build(
+        window: &crate::window::AgentTerminalWindow,
+        source: &str,
+    ) -> impl FnOnce() {
+        let imp = window.imp();
+        let lock = reserve_answer_source(source).unwrap();
+        let page = imp.add_thread_page(source).unwrap();
+        imp.with_chat_mut(source, |c| c.building = true);
+        let job = BuildJob {
+            thread: source.to_owned(),
+            driver: Driver::Claude,
+            dir: "/tmp".into(),
+            profile: crate::config::new_agent_profile(Driver::Claude),
+            resolved: ResolvedAgent {
+                program: None,
+                env: Vec::new(),
+                env_failed: false,
+            },
+            loaded: load_thread(&app_store(), source, None).unwrap(),
+            hook: Ok(()),
+        };
+        drop(lock);
+        let window = window.clone();
+        move || {
+            assert!(!answer_source_reserved(&job.thread));
+            let thread = job.thread.clone();
+            window.imp().build_thread(&page, job);
+            assert_eq!(
+                window
+                    .imp()
+                    .with_chat(&thread, |c| c.stored_handoff.is_some()),
+                Some(true)
+            );
+            window.imp().close_row_for_keep(&thread);
+        }
+    }
+
+    pub(in crate::window) fn ask_several_preparation_reservations(
+        window: &crate::window::AgentTerminalWindow,
+    ) {
+        let imp = window.imp();
+        let store = app_store();
+        let source = store.new_id().unwrap();
+        store
+            .create_thread_record(&agent_kit::store::ThreadRecord {
+                title: Some("Reserved preparation"),
+                provider: Some(agent_kit::store::ProviderRecord {
+                    id: None,
+                    driver: "claude",
+                    model: None,
+                    native_id: None,
+                }),
+                ..agent_kit::store::ThreadRecord::new(&source, "/tmp")
+            })
+            .unwrap();
+        let lock = reserve_answer_source(&source).unwrap();
+        let page = imp.add_thread_page(&source).unwrap();
+        let profile = crate::config::new_agent_profile(Driver::Claude);
+        let resolved = ResolvedAgent {
+            program: None,
+            env: Vec::new(),
+            env_failed: false,
+        };
+        imp.with_chat_mut(&source, |c| c.building = true);
+        imp.build_thread(
+            &page,
+            BuildJob {
+                thread: source.clone(),
+                driver: Driver::Claude,
+                dir: "/tmp".into(),
+                profile: profile.clone(),
+                resolved: resolved.clone(),
+                loaded: load_thread(&store, &source, None).unwrap(),
+                hook: Ok(()),
+            },
+        );
+        assert_eq!(
+            imp.with_chat(&source, |c| c.building),
+            Some(false),
+            "Undo overlapping a build releases its spinner for a fresh read"
+        );
+        let job = || StartJob {
+            thread: source.clone(),
+            driver: Driver::Claude,
+            dir: "/tmp".into(),
+            profile: profile.clone(),
+            resolved: resolved.clone(),
+            provider: None,
+            hook: Ok(()),
+        };
+        imp.with_chat_mut(&source, |c| c.starting = true);
+        imp.start_session(&page, job());
+        assert_eq!(imp.with_chat(&source, |c| c.starting), Some(false));
+        let slot = imp.slot_of(&source).unwrap();
+        let _preparing = imp.prepare_session_start(&source, &slot);
+        imp.start_session_bound(&page, job(), None);
+        assert_eq!(
+            imp.with_chat(&source, |c| c.starting),
+            Some(false),
+            "Undo overlapping asynchronous start preparation leaves a retryable page"
+        );
+        slot.driver.set(Driver::Codex);
+        imp.with_chat_mut(&source, |c| c.starting = true);
+        imp.release_answer_preparation(&page, &source, Driver::Claude, false);
+        assert_eq!(
+            imp.with_chat(&source, |c| c.starting),
+            Some(true),
+            "an old driver's preparation cannot clear a replacement"
+        );
+        slot.driver.set(Driver::Claude);
+        imp.with_chat_mut(&source, |c| c.starting = false);
+        imp.close_row_for_keep(&source);
+        drop(lock);
+        store.delete_thread(&source).unwrap();
+    }
 
     /// A remote thread groups under `alias:/path`, a bad `ssh://` one is still remote (never a
     /// local folder), and a local one keeps its folder.

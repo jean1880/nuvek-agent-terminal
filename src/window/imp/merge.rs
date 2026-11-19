@@ -500,10 +500,11 @@ pub(super) fn merge_dialog_full(
         .refusals
         .iter()
         .any(|r| !matches!(r, Refusal::Conflicts(_)));
-    if options.can_commit_first && has_dirty_worktree {
+    if options.can_commit_first && plan.has_worktree && has_dirty_worktree {
         dialog.add_response("commit-first", "Commit First…");
     }
     if options.can_ask_agent
+        && plan.has_worktree
         && has_conflicts
         && !has_dirty_worktree
         && !has_other_plan_refusal
@@ -680,6 +681,13 @@ enum PreflightSpec {
 }
 
 impl MergeTarget {
+    fn worktree_info(&self) -> Option<&agent_kit::worktree::WorktreeInfo> {
+        match self {
+            Self::WorktreeTab { info, .. } | Self::ThreadMenu { info, .. } => Some(info),
+            Self::WorkerBranch { .. } => None,
+        }
+    }
+
     fn spec(&self) -> PreflightSpec {
         match self {
             Self::WorktreeTab { info, .. } => PreflightSpec::Worktree(info.clone()),
@@ -921,14 +929,21 @@ impl AgentTerminalWindow {
                 MergeTarget::ThreadMenu { thread, .. } => imp.seen_for_merge(None, Some(thread)),
                 MergeTarget::WorkerBranch { .. } => imp.seen_for_merge(None, None),
             };
-            let lines = {
+            let expected_info = target.worktree_info().cloned();
+            let check = {
                 let plan = plan.clone();
                 off_main("reading what is open", move || {
-                    Ok::<_, String>(blockers(&plan, &seen, own_busy))
+                    let lines = blockers(&plan, &seen, own_busy);
+                    let matches_thread_wt = plan.has_worktree
+                        && expected_info.as_ref().is_some_and(|i| {
+                            i.branch == plan.branch
+                                && agent_kit::worktree::is_registered(i).unwrap_or(false)
+                        });
+                    Ok::<_, String>((lines, matches_thread_wt))
                 })
                 .await
             };
-            let Ok(lines) = lines else {
+            let Ok((lines, matches_thread_wt)) = check else {
                 done_preparing(&target);
                 return;
             };
@@ -954,8 +969,8 @@ impl AgentTerminalWindow {
             };
             let options = MergeDialogOptions {
                 initial,
-                can_ask_agent: thread_for_actions.is_some(),
-                can_commit_first: !matches!(target, MergeTarget::WorkerBranch { .. }),
+                can_ask_agent: thread_for_actions.is_some() && matches_thread_wt,
+                can_commit_first: matches_thread_wt,
             };
             let parts = merge_dialog_full(&plan, &lines, options);
             parts.dialog.present(Some(&parent));
@@ -1024,7 +1039,10 @@ impl AgentTerminalWindow {
             MergeTarget::ThreadMenu { thread, .. } => self.seen_for_merge(None, Some(thread)),
             MergeTarget::WorkerBranch { .. } => return,
         };
-        let spec = target.spec();
+        let Some(expected_info) = target.worktree_info().cloned() else {
+            return;
+        };
+        let spec = PreflightSpec::Worktree(expected_info);
         let panel_root = match target {
             MergeTarget::WorktreeTab { panel_root, .. } => Some(panel_root.clone()),
             _ => None,
@@ -1782,6 +1800,19 @@ pub(super) mod tests {
             },
         );
         assert!(!blocked_parts.dialog.has_response("ask-agent"));
+        let mut detached_wt = conflicted.clone();
+        detached_wt.has_worktree = false;
+        let detached_parts = merge_dialog_full(
+            &detached_wt,
+            &TabLines::default(),
+            MergeDialogOptions {
+                initial: agent_kit::merge::MergeMethod::Merge,
+                can_ask_agent: true,
+                can_commit_first: true,
+            },
+        );
+        assert!(!detached_parts.dialog.has_response("ask-agent"));
+        assert!(!detached_parts.dialog.has_response("commit-first"));
         let mut odd_base = conflicted.clone();
         odd_base.base = "release candidate".into();
         assert!(

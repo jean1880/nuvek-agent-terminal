@@ -363,6 +363,7 @@ impl AgentTerminalWindow {
             }
             ThreadAction::MergeWorktree(thread) => self.merge_worktree_thread(&thread),
             ThreadAction::CompareForks(thread) => self.compare_with_fork(&thread),
+            ThreadAction::CompareThreads(thread) => self.compare_with_thread(&thread),
             ThreadAction::CompareGroup(thread) => self.open_compare_group_for(&thread),
             ThreadAction::Rename(thread) => self.prompt_rename(&thread),
             ThreadAction::Pin(thread) => self.change_pin(&thread, PinChange::Pin { at: None }),
@@ -1426,6 +1427,7 @@ pub(super) mod tests {
                 "Switch agent (stops the current turn)",
                 "Fork thread",
                 "Fork in Isolated Worktree…",
+                "Compare with…",
                 "Compact into a new thread"
             ]
         );
@@ -1500,6 +1502,7 @@ pub(super) mod tests {
                 "Switch agent (stops the current turn)",
                 "Fork thread",
                 "Fork in Isolated Worktree…",
+                "Compare with…",
                 "Compact into a new thread"
             ]
         );

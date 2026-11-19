@@ -514,7 +514,8 @@ impl AgentTerminalWindow {
             .description(
                 "A warning counts real money only: turns on an API key or a metered model \
                  server. A plan's list price and Claude's extra usage are never counted. It \
-                 warns once a day or month at each level, and never stops a turn.",
+                 warns once a day or month at each level. Scheduled prompts pause when a \
+                 warning is reached; a running turn continues.",
             )
             .build();
         let switch = self.config_switch(
@@ -625,7 +626,15 @@ impl AgentTerminalWindow {
         glib::spawn_future_local(async move {
             let result = write_job("check the spending warnings", move |s| {
                 s.ensure_spend_index()?;
-                s.spend_budget_check(now, &local_day, &budget)
+                s.atomically(|s| {
+                    let warnings = s.spend_budget_check(now, &local_day, &budget)?;
+                    let paused = if s.spend_budget_reached(now, &local_day, &budget)? {
+                        s.pause_schedules_for_budget()?
+                    } else {
+                        Vec::new()
+                    };
+                    Ok((warnings, paused))
+                })
             })
             .await;
             // The window that asked while it is still open (still the application's), else
@@ -636,7 +645,12 @@ impl AgentTerminalWindow {
                 other => another_window(other.as_ref()).or(other),
             };
             match result {
-                Some(Ok(warnings)) => deliver_spending_warnings(shown.as_ref(), warnings),
+                Some(Ok((warnings, paused))) => {
+                    deliver_spending_warnings(shown.as_ref(), warnings);
+                    if let Some(window) = shown.as_ref() {
+                        super::schedules::budget_paused_feedback(window, paused).await;
+                    }
+                }
                 Some(Err(e)) => tracing::warn!(error = %e, "could not check the spending warnings"),
                 None => tracing::warn!("the spending warnings were not checked"),
             }

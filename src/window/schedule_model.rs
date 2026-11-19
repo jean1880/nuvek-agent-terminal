@@ -1,6 +1,6 @@
 //! Pure view-model logic, local-clock GLib adapter, and form validation for scheduled prompts (F6).
 
-use agent_core::adapter::{Driver, Mode};
+use agent_core::adapter::Mode;
 use agent_core::redact::redact;
 use agent_core::schedule::{
     next_due, validate_ends, validate_prompt, validate_rule, validate_target, CivilDateTime, Ends,
@@ -11,6 +11,19 @@ use gtk4::glib;
 
 /// Modes offered for scheduled new-thread targets (`Mode::Bypass` is never allowed).
 pub const SAFE_MODES: [Mode; 3] = [Mode::Plan, Mode::Ask, Mode::AcceptEdits];
+
+/// Text shared by a sidebar clock's tooltip and the row's screen-reader description.
+pub fn schedule_badge_description(badge: super::sidebar_model::ScheduleBadge, now: i64) -> String {
+    use super::sidebar_model::ScheduleBadge;
+    match badge {
+        ScheduleBadge::Next(due) => format!(
+            "Scheduled prompt. Next: {}",
+            format_due(due, now, &GlibLocalClock)
+        ),
+        ScheduleBadge::Paused(reason) => format!("Scheduled prompt. {}", reason.label()),
+        ScheduleBadge::Unknown => "Schedule state unknown: the store could not be read".to_owned(),
+    }
+}
 
 pub fn safe_mode_index(mode: Mode) -> u32 {
     match mode {
@@ -128,13 +141,16 @@ pub fn validate_form(
     }
     validate_target(&input.target)?;
     if let Target::NewThread {
-        driver: Driver::Agy,
-        worktree: true,
-        ..
+        model: Some(model), ..
     } = &input.target
     {
+        if model.chars().any(char::is_control) {
+            return Err("Enter a model name without control characters.");
+        }
+    }
+    if let Target::NewThread { worktree: true, .. } = &input.target {
         if !input.in_git_repo {
-            return Err("Antigravity schedules need a git repository for worktree isolation.");
+            return Err("Isolated schedules need a git repository for worktree isolation.");
         }
     }
     validate_rule(&input.rule)?;
@@ -147,8 +163,8 @@ pub fn validate_form(
         return Err("Choose a future time for this schedule.");
     }
     if let Ends::OnDate { at } = input.ends {
-        if at <= input.now {
-            return Err("Choose a future end date.");
+        if at <= input.now || computed_next.is_some_and(|next| next > at) {
+            return Err("Choose an end date on or after the first run.");
         }
     }
     let trimmed = input.prompt.trim().to_owned();
@@ -197,6 +213,9 @@ pub fn schedule_row_subtitle(
     } else if let Some(due) = next_due {
         parts.push(format!("Next: {}", format_due(due, now, clock)));
     }
+    if paused.is_none() && next_due.is_none() {
+        parts.push("Next run unknown".to_owned());
+    }
     if let Some(outcome) = last_outcome {
         parts.push(outcome.label().to_owned());
     }
@@ -213,6 +232,21 @@ pub fn interval_secs_from_hours(hours: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_core::adapter::Driver;
+
+    #[test]
+    fn schedule_badges_name_next_paused_and_unknown_for_screen_readers() {
+        use super::super::sidebar_model::ScheduleBadge;
+        assert!(
+            schedule_badge_description(ScheduleBadge::Next(1_795_000_000), 1_795_000_000)
+                .contains("Next:")
+        );
+        assert!(
+            schedule_badge_description(ScheduleBadge::Paused(PausedReason::Budget), 0)
+                .contains(PausedReason::Budget.label())
+        );
+        assert!(schedule_badge_description(ScheduleBadge::Unknown, 0).contains("unknown"));
+    }
 
     #[test]
     fn safe_modes_cover_all_non_bypass_modes() {
@@ -265,6 +299,23 @@ mod tests {
             ..base.clone()
         };
         assert!(validate_form(&past_once, &clock).is_err());
+
+        assert!(validate_form(
+            &FormInput {
+                ends: Ends::OnDate { at: now + 300 },
+                ..base.clone()
+            },
+            &clock
+        )
+        .is_err());
+        assert!(validate_form(
+            &FormInput {
+                ends: Ends::OnDate { at: now + 600 },
+                ..base.clone()
+            },
+            &clock
+        )
+        .is_ok());
 
         let agy_no_git = FormInput {
             in_git_repo: false,

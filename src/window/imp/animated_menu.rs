@@ -16,7 +16,38 @@ use gtk4::prelude::*;
 
 const ANIMATION_DURATION_MS: f64 = 200.0;
 
+fn stop_for_reduced_motion(
+    enabled: bool,
+    progress: &Cell<f64>,
+    target: &Cell<f64>,
+    animating: &Cell<bool>,
+) -> bool {
+    if enabled {
+        return false;
+    }
+    progress.set(target.get());
+    animating.set(false);
+    true
+}
+
 use super::pack_animation::ease_in_out;
+
+#[cfg(test)]
+#[test]
+fn reduced_motion_finishes_an_active_menu_transition() {
+    let progress = Cell::new(0.4);
+    let target = Cell::new(1.0);
+    let animating = Cell::new(true);
+    assert!(!stop_for_reduced_motion(
+        true, &progress, &target, &animating
+    ));
+    assert_eq!(progress.get(), 0.4);
+    assert!(stop_for_reduced_motion(
+        false, &progress, &target, &animating
+    ));
+    assert_eq!(progress.get(), 1.0);
+    assert!(!animating.get());
+}
 
 /// Builds a menu button containing the animated hamburger/vertical-lines icon.
 pub fn build_animated_menu_button(menu_model: &impl IsA<gio::MenuModel>) -> gtk4::MenuButton {
@@ -128,6 +159,17 @@ pub fn build_animated_menu_button(menu_model: &impl IsA<gio::MenuModel>) -> gtk4
                     animating.set(false);
                     return glib::ControlFlow::Break;
                 };
+
+                // The desktop preference can change while this transition is running.
+                if stop_for_reduced_motion(
+                    crate::brand::animations_enabled(),
+                    &progress,
+                    &target,
+                    &animating,
+                ) {
+                    area.queue_draw();
+                    return glib::ControlFlow::Break;
+                }
 
                 let now = clock.frame_time();
                 let last = last_frame_time.get();

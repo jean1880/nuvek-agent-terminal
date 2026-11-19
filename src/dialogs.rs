@@ -156,4 +156,56 @@ mod tests {
         window.destroy();
         settings.set_gtk_enable_animations(animations);
     }
+
+    #[test]
+    #[ignore = "native GTK; run alone in an isolated display"]
+    #[cfg(target_os = "linux")]
+    fn alert_focus_and_escape_return_to_trigger() {
+        let ctx = crate::testutil::native_init();
+        let settings = gtk4::Settings::default().expect("GTK settings");
+        let animations = settings.is_gtk_enable_animations();
+        settings.set_gtk_enable_animations(false);
+        let window = adw::Window::new();
+        let trigger = gtk4::Button::with_label("Open");
+        window.set_content(Some(&trigger));
+        window.present();
+        trigger.grab_focus();
+        crate::testutil::settle(&ctx);
+        let keyboard = match crate::testutil::XKeyboard::open(&window) {
+            Ok(keyboard) => keyboard,
+            Err(reason) => {
+                assert!(
+                    std::env::var_os("CI").is_none(),
+                    "XTest unavailable: {reason}"
+                );
+                eprintln!("Skipping XTest: {reason}");
+                window.destroy();
+                settings.set_gtk_enable_animations(animations);
+                return;
+            }
+        };
+        let dialog = confirm_dialog(
+            "Remove?",
+            "",
+            ("cancel", "Cancel"),
+            ("remove", "Remove"),
+            adw::ResponseAppearance::Destructive,
+            false,
+        );
+        let answer = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+        dialog.connect_response(None, {
+            let answer = answer.clone();
+            move |_, response| *answer.borrow_mut() = Some(response.to_owned())
+        });
+        dialog.present(Some(&window));
+        crate::testutil::settle(&ctx);
+        let focus = gtk4::prelude::GtkWindowExt::focus(&window).expect("dialog has initial focus");
+        assert!(focus.is_ancestor(&dialog));
+        keyboard.tap(0xff1b, false); // Escape
+        crate::testutil::settle(&ctx);
+        assert_eq!(answer.borrow().as_deref(), Some("cancel"));
+        assert!(trigger.has_focus(), "focus returns to the trigger");
+        window.destroy();
+        settings.set_gtk_enable_animations(animations);
+    }
 }

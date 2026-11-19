@@ -13,8 +13,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use agent_core::adapter::Driver;
 use agent_core::ask_several::{
-    keep_handoff_brief, validate_choices, CompareGroup, CompareParticipant, TargetSpec,
-    MAX_CHOICES, MIN_CHOICES,
+    validate_choices, CompareGroup, CompareParticipant, TargetSpec, MAX_CHOICES, MIN_CHOICES,
 };
 use agent_core::event::{Envelope, Event};
 use agent_core::fork_compare::ForkLink;
@@ -30,7 +29,7 @@ use super::threads::{
     NewThreadSpec,
 };
 use super::*;
-use crate::chat::session::build_handoff;
+use crate::chat::session::{build_answer_handoff, build_handoff, seeded_handoff_events};
 use crate::git::{ForkBaseline, ForkChanges};
 use crate::model_catalog::ModelCatalog;
 use crate::window::compare::{
@@ -64,6 +63,9 @@ struct ParticipantRow {
 struct GroupKeepDone {
     group_id: String,
     kept: String,
+    kept_thread: String,
+    source_thread: String,
+    handoff_fence: String,
     archived: Vec<String>,
     undone: Cell<bool>,
     removal: RefCell<Vec<adw::Toast>>,
@@ -128,6 +130,31 @@ fn target_options(
     out
 }
 
+fn target_cost(
+    config: &crate::config::TerminalConfig,
+    driver: Driver,
+    profile: Option<&str>,
+) -> (bool, agent_core::model_tags::Headroom) {
+    use agent_core::model_tags::Headroom;
+    let p = config.thread_profile(profile, driver);
+    let free = p.is_some_and(|p| crate::config::profile_is_free(p, driver));
+    let server = p.and_then(|p| crate::config::profile_provider(p, driver));
+    let headroom = if server.is_some() {
+        p.and_then(|p| {
+            crate::local_headroom::LocalHeadroom::shared()
+                .usage_of(p, crate::freshness::now_epoch())
+        })
+        .map(|u| u.headroom)
+        .unwrap_or(Headroom::Unknown)
+    } else {
+        crate::usage_file::headroom_of(
+            &crate::account_status::AccountStatus::shared().snapshot(driver),
+            crate::freshness::now_epoch(),
+        )
+    };
+    (free, headroom)
+}
+
 /// Ensures two participant columns picking the same target option get distinct readable headings.
 fn disambiguate_labels(choices: &mut [TargetSpec]) {
     let mut counts: HashMap<String, usize> = HashMap::new();
@@ -182,6 +209,130 @@ fn participant_column_view(
 }
 
 impl AgentTerminalWindow {
+    /// A source's live comparison shelf. Weak widgets stop the timer when the page closes;
+    /// at most one bounded store read is in flight for this page.
+    pub(super) fn attach_compare_strip(&self, thread: &str, view: &crate::chat::view::ChatView) {
+        let weak = view.downgrade();
+        let obj = self.obj().downgrade();
+        let source = thread.to_owned();
+        let reading = Rc::new(Cell::new(false));
+        let signature = Rc::new(RefCell::new(String::new()));
+        glib::timeout_add_local(std::time::Duration::from_millis(1000), move || {
+            let (Some(view), Some(obj)) = (weak.upgrade(), obj.upgrade()) else {
+                return glib::ControlFlow::Break;
+            };
+            if obj.imp().is_closing() {
+                return glib::ControlFlow::Break;
+            }
+            if !view.is_mapped() {
+                return glib::ControlFlow::Continue;
+            }
+            if reading.replace(true) {
+                return glib::ControlFlow::Continue;
+            }
+            let (weak, obj, source, reading, signature) = (
+                view.downgrade(),
+                obj.downgrade(),
+                source.clone(),
+                reading.clone(),
+                signature.clone(),
+            );
+            glib::MainContext::default().spawn_local(async move {
+                let groups = store_job(move |s| -> agent_kit::store::Result<_> {
+                    // The latest run fits above the composer; the picker retains older runs.
+                    let groups: Vec<_> = s.compare_groups_for_source(&source)?.into_iter().take(1).collect();
+                    let mut outcomes = HashMap::new();
+                    for p in groups.iter().flat_map(|g| &g.participants) {
+                        let max = s.max_seq(&p.thread_id)?;
+                        let events = s.events(&p.thread_id, Some(max.saturating_sub(512).max(p.after_seq)), 512)?;
+                        let state = events.iter().rev().find_map(|(_, e)| match e.event {
+                            Event::TurnCompleted { state, .. } => Some(state),
+                            _ => None,
+                        });
+                        outcomes.insert(p.thread_id.clone(), state);
+                    }
+                    Ok((groups, outcomes))
+                }).await;
+                reading.set(false);
+                let (Some(view), Some(obj), Some(Ok((groups, outcomes)))) = (weak.upgrade(), obj.upgrade(), groups) else { return };
+                let imp = obj.imp();
+                let states: Vec<_> = groups.iter().flat_map(|g| g.participants.iter()).map(|p| {
+                    let owner = super::threads::thread_owner(&p.thread_id);
+                    let rows = owner.as_ref().map(|w| w.imp().sidebar_rows()).unwrap_or_else(|| imp.sidebar_rows());
+                    let row = rows.iter().find(|r| r.key == RowKey::Thread(p.thread_id.clone()));
+                    use crate::window::sidebar_model::Badge;
+                    let badge = row.and_then(|r| r.badge);
+                    let status = if row.is_none() { "Unavailable" } else if row.is_some_and(|r| r.archived) { "Discarded" } else {
+                        agent_core::ask_several::participant_status(
+                            badge == Some(Badge::NeedsApproval), badge == Some(Badge::RateLimited),
+                            matches!(badge, Some(Badge::Running | Badge::Background))
+                                || row.is_some_and(|r| r.activity == Some(crate::window::sidebar_model::ThreadActivity::Starting)),
+                            outcomes.get(&p.thread_id).copied().flatten())
+                    };
+                    (p.thread_id.clone(), status)
+                }).collect();
+                let next = format!("{groups:?}{states:?}");
+                if *signature.borrow() == next { return; }
+                *signature.borrow_mut() = next;
+                let strip = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+                for group in groups {
+                    let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+                    let all_discarded = group.participants.iter().all(|p| states.iter().any(|(id, status)| id == &p.thread_id && *status == "Discarded"));
+                    let title = gtk4::Label::builder().label(if group.kept_thread.is_some() { "Agent comparison · answer kept" } else if all_discarded { "Agent comparison · all participants discarded" } else { "Agent comparison" }).hexpand(true).xalign(0.0).build();
+                    header.append(&title);
+                    let compare = gtk4::Button::with_label("Compare");
+                    let (weak, gid) = (obj.downgrade(), group.id.clone());
+                    compare.connect_clicked(move |_| { if let Some(obj) = weak.upgrade() { obj.imp().open_group_compare(&gid); } });
+                    header.append(&compare);
+                    strip.append(&header);
+                    for (index, p) in group.participants.iter().enumerate() {
+                        let row = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+                        let state = states.iter().find(|(id, _)| id == &p.thread_id).map_or("Unavailable", |(_, s)| *s);
+                        let state = if group.kept_thread.as_deref() == Some(&p.thread_id) { "Kept" } else { state };
+                        let label = gtk4::Label::builder().label(format!("{} · {state}", p.label)).hexpand(true).xalign(0.0).wrap(true).build();
+                        row.append(&label);
+                        let actions = gtk4::FlowBox::builder().selection_mode(gtk4::SelectionMode::None).column_spacing(6).row_spacing(6).max_children_per_line(4).build();
+                        for action in ["Open", "Keep", "Discard", "Keep this thread instead"] {
+                            let button = gtk4::Button::with_label(action);
+                            button.update_property(&[gtk4::accessible::Property::Label(&format!("{action}: {}", p.label))]);
+                            button.set_sensitive(match action {
+                                "Keep" => group.kept_thread.is_none() && !matches!(state, "Discarded" | "Unavailable" | "Working" | "Needs approval" | "Waiting for limit"),
+                                "Discard" => state != "Discarded" && group.kept_thread.as_deref() != Some(&p.thread_id),
+                                _ => true,
+                            });
+                            let (weak, gid, id) = (obj.downgrade(), group.id.clone(), p.thread_id.clone());
+                            button.connect_clicked(move |_| {
+                                let Some(obj) = weak.upgrade() else { return };
+                                match action {
+                                    "Open" => { obj.imp().open_thread(&id, true); }
+                                    "Keep" => {
+                                        let over = CompareWindow::new(obj.upcast_ref(), "Compare Agents");
+                                        load_group_compare(&over, gid.clone());
+                                        let (weak, gid_r) = (over.downgrade(), gid.clone());
+                                        obj.imp().confirm_keep_group(&over, gid.clone(), index, Reread::new(move || {
+                                            if let Some(over) = weak.upgrade() { load_group_compare(&over, gid_r); }
+                                        }));
+                                        over.window().present();
+                                    }
+                                    "Discard" => obj.imp().set_thread_archived(&id, true),
+                                    _ => {
+                                        let (gid, id) = (gid.clone(), id.clone());
+                                        obj.imp().write_store("detach comparison participant", move |s| s.detach_compare_participant(&gid, &id));
+                                    }
+                                }
+                            });
+                            actions.insert(&button, -1);
+                        }
+                        row.append(&actions);
+                        strip.append(&row);
+                    }
+                }
+                view.set_compare_strip(strip.first_child().is_some().then_some(&strip));
+            });
+            glib::ControlFlow::Continue
+        });
+    }
+
     /// Entry point for `/ask [prompt]` and the composer's "Ask Several Agents…" action.
     pub(super) fn ask_several_from(&self, thread: &str, initial_prompt: Option<String>) {
         if self.is_closing() {
@@ -223,17 +374,29 @@ impl AgentTerminalWindow {
             })
             .await
             .unwrap_or((false, false));
+            let history_tokens = store_job({
+                let source = thread.clone();
+                move |s| -> agent_kit::store::Result<usize> {
+                    let handoff = build_handoff(&s.transcript_messages(&source)?, "source thread");
+                    Ok(agent_core::local_context::estimated_tokens(
+                        handoff.summary.len(),
+                        handoff.carried,
+                    ))
+                }
+            })
+            .await
+            .and_then(Result::ok);
             let Some(obj) = obj.upgrade() else { return };
             if obj.imp().is_closing() {
                 return;
             }
             obj.imp().present_ask_several_dialog(
                 thread,
-                dir,
                 options,
                 initial_prompt,
                 git_ok,
                 in_repo,
+                history_tokens,
             );
         });
     }
@@ -241,11 +404,11 @@ impl AgentTerminalWindow {
     fn present_ask_several_dialog(
         &self,
         source_thread: String,
-        _source_dir: String,
         options: Vec<TargetOption>,
         initial_prompt: Option<String>,
         git_ok: bool,
         in_repo: bool,
+        history_tokens: Option<usize>,
     ) {
         let dialog = adw::AlertDialog::builder()
             .heading("Ask Several Agents")
@@ -323,11 +486,37 @@ impl AgentTerminalWindow {
         outer.append(&prompt_scroll);
         outer.append(&rows_header);
         outer.append(&rows_box);
+        let agy_ack = gtk4::CheckButton::with_label(
+            "I accept Antigravity's forced permissive mode: it can edit without asking, including outside its worktree, and access the network.",
+        );
+        if let Some(label) = agy_ack.child().and_downcast::<gtk4::Label>() {
+            label.set_wrap(true);
+        }
+        agy_ack.set_visible(false);
+        let exhausted_ack = gtk4::CheckButton::with_label("Ask exhausted accounts anyway");
+        exhausted_ack.set_visible(false);
+        let summary = gtk4::Label::builder().xalign(0.0).wrap(true).build();
+        outer.append(&summary);
+        outer.append(&agy_ack);
+        outer.append(&exhausted_ack);
         outer.append(&status);
         dialog.set_extra_child(Some(&outer));
 
         let rows: Rc<RefCell<Vec<ParticipantRow>>> = Rc::new(RefCell::new(Vec::new()));
-        let labels_storage: Vec<&str> = options.iter().map(|o| o.label.as_str()).collect();
+        let cost_labels: Vec<String> = options
+            .iter()
+            .map(|o| {
+                let (free, headroom) =
+                    target_cost(&self.config.borrow(), o.driver, o.profile_id.as_deref());
+                format!(
+                    "{} · {} · headroom {}",
+                    o.label,
+                    if free { "Free" } else { "Metered" },
+                    headroom.as_str()
+                )
+            })
+            .collect();
+        let labels_storage: Vec<&str> = cost_labels.iter().map(String::as_str).collect();
         let model_list = gtk4::StringList::new(&labels_storage);
         let options = Rc::new(options);
 
@@ -369,6 +558,10 @@ impl AgentTerminalWindow {
             let add_weak = add_btn.downgrade();
             let status_weak = status.downgrade();
             let collect_specs = collect_specs.clone();
+            let agy_ack = agy_ack.downgrade();
+            let exhausted_ack = exhausted_ack.downgrade();
+            let summary = summary.downgrade();
+            let config = self.config.clone();
             Rc::new(move || {
                 let (Some(dialog), Some(buffer), Some(rows), Some(add_btn), Some(status)) = (
                     dialog_weak.upgrade(),
@@ -395,21 +588,53 @@ impl AgentTerminalWindow {
                         .ok()
                         .and_then(|i| options.get(i));
                     let is_agy = opt.is_some_and(|o| o.driver == Driver::Agy);
+                    let cost_note = opt
+                        .map(|o| {
+                            let (free, h) =
+                                target_cost(&config.borrow(), o.driver, o.profile_id.as_deref());
+                            format!(
+                                "{} · headroom {}",
+                                if free { "Free" } else { "Metered" },
+                                h.as_str()
+                            )
+                        })
+                        .unwrap_or_default();
                     if is_agy {
                         if !worktree.is_active() {
                             worktree.set_active(true);
                         }
                         worktree.set_sensitive(false);
-                        note.set_label(
-                            "Antigravity runs in an isolated git worktree (hook isolation).",
-                        );
+                        note.set_label(&format!("{cost_note}. Antigravity runs in forced dangerous permissive mode in an isolated worktree. Plan cannot prevent its edits."));
                         note.set_visible(true);
                     } else {
                         worktree.set_sensitive(in_repo);
-                        note.set_visible(false);
+                        note.set_label(&cost_note);
+                        note.set_visible(true);
                     }
                 }
                 let specs = collect_specs();
+                let (Some(agy_ack), Some(exhausted_ack), Some(summary)) = (
+                    agy_ack.upgrade(),
+                    exhausted_ack.upgrade(),
+                    summary.upgrade(),
+                ) else {
+                    return;
+                };
+                let agy = specs.iter().any(|c| c.driver == Driver::Agy);
+                let costs: Vec<_> = specs
+                    .iter()
+                    .map(|c| target_cost(&config.borrow(), c.driver, c.profile_id.as_deref()))
+                    .collect();
+                let exhausted = costs
+                    .iter()
+                    .any(|(_, h)| *h == agent_core::model_tags::Headroom::Exhausted);
+                agy_ack.set_visible(agy);
+                exhausted_ack.set_visible(exhausted);
+                let history = history_tokens.map_or_else(
+                    || "budgeted history (size unavailable)".to_owned(),
+                    |n| format!("budgeted history (~{n} estimated tokens)"),
+                );
+                summary.set_label(&format!("Sends this thread's {history} and your prompt to {} agents, {} metered. Shared folders run in Plan; worktrees carry the source's safe mode.", specs.len(), costs.iter().filter(|(free, _)| !free).count()));
                 let needs_wt = specs.iter().any(|c| c.worktree);
                 let prompt_empty = buffer
                     .text(&buffer.start_iter(), &buffer.end_iter(), false)
@@ -423,6 +648,10 @@ impl AgentTerminalWindow {
                     })
                 } else if let Err(why) = validate_choices(&specs, false) {
                     Some(why)
+                } else if agy && !agy_ack.is_active() {
+                    Some("Accept Antigravity's forced mode before asking.")
+                } else if exhausted && !exhausted_ack.is_active() {
+                    Some("Confirm asking exhausted accounts before continuing.")
                 } else if prompt_empty {
                     Some("Enter a prompt to send to all participants.")
                 } else {
@@ -438,6 +667,14 @@ impl AgentTerminalWindow {
                 }
             })
         };
+        for ack in [&agy_ack, &exhausted_ack] {
+            let revalidate = revalidate.clone();
+            ack.connect_toggled(move |_| revalidate());
+        }
+        let accounts = crate::account_status::AccountStatus::shared();
+        let refresh = revalidate.clone();
+        let listener = accounts.connect_changed(move || refresh());
+        dialog.connect_closed(move |_| accounts.disconnect(listener));
 
         let add_row = {
             let rows_weak = Rc::downgrade(&rows);
@@ -637,6 +874,11 @@ impl AgentTerminalWindow {
             (!root.is_empty()).then(|| PathBuf::from(crate::utils::expand_tilde(&root)))
         };
         let checkpoints = self.config.borrow().checkpoints;
+        let source_draft = self
+            .with_chat(&source_thread, |c| {
+                c.view.as_ref().map(|v| v.composer_schedule_draft())
+            })
+            .flatten();
         let carry = self.thread_carry_settings(&source_thread);
         let needs_shared_baseline = checkpoints && choices.iter().any(|c| !c.worktree);
         let obj = self.obj().downgrade();
@@ -833,7 +1075,9 @@ impl AgentTerminalWindow {
                 let mut spec = NewThreadSpec::new(&cwd, choice.driver);
                 spec.title = thread_title.clone();
                 spec.model = choice.model.clone();
-                spec.mode = settings.mode;
+                // A shared checkout is answer-only. Isolated worktrees carry the safe mode.
+                let mode = if choice.worktree { settings.mode } else { Some(agent_core::adapter::Mode::Plan) };
+                spec.mode = mode;
                 spec.handoff = handoff_spec;
                 spec.attributes = agent_kit::store::ThreadAttributes {
                     profile_id: choice.profile_id.clone(),
@@ -864,7 +1108,7 @@ impl AgentTerminalWindow {
                         title: thread_title,
                         profile_id: choice.profile_id,
                         worktree: worktree_info,
-                        mode: settings.mode,
+                        mode,
                     },
                     guard,
                 ));
@@ -904,6 +1148,13 @@ impl AgentTerminalWindow {
                     let _ = &guards;
                     match outcome {
                         Some(Ok(())) => {
+                            if let Some(owner) = super::threads::thread_owner(&source_thread) {
+                                if let Some(view) = owner.imp().with_chat(&source_thread, |c| c.view.clone()).flatten() {
+                                    if source_draft.as_ref().is_some_and(|draft| !draft.1 && *draft == view.composer_schedule_draft()) {
+                                        view.clear_composer_draft();
+                                    }
+                                }
+                            }
                             info!(
                                 "Started Ask Several group {group_id_for_done} with {count} participant(s)"
                             );
@@ -1156,49 +1407,164 @@ impl AgentTerminalWindow {
         &self,
         group: CompareGroup,
         kept: CompareParticipant,
-        reply_text: String,
+        _reply_text: String,
         reread: Reread,
     ) {
-        let brief = keep_handoff_brief(&kept.label, &reply_text, &group.prompt_preview);
         let source_owner = super::threads::thread_owner(&group.source_thread);
+        if super::threads::thread_owner(&kept.thread_id)
+            .is_some_and(|w| w.imp().row_is_busy(&RowKey::Thread(kept.thread_id.clone())))
+        {
+            self.show_toast("Wait for the chosen participant to finish before keeping its answer");
+            reread.now();
+            return;
+        }
+        if source_owner.as_ref().is_some_and(|w| {
+            w.imp()
+                .with_chat(
+                    &group.source_thread,
+                    super::threads::ChatTab::answer_source_blocked,
+                )
+                .unwrap_or(false)
+        }) {
+            self.show_toast("Wait for the source thread to finish before keeping an answer");
+            reread.now();
+            return;
+        }
         let source_session = source_owner
             .as_ref()
             .and_then(|w| w.imp().slot_of(&group.source_thread))
             .and_then(|slot| slot.get());
-        let source_view = source_owner
+        let Some(source_lock) = super::threads::reserve_answer_source(&group.source_thread) else {
+            self.show_toast("Another comparison action is already saving for this source");
+            reread.now();
+            return;
+        };
+        let reservation = match source_session
             .as_ref()
-            .and_then(|w| w.imp().with_chat(&group.source_thread, |c| c.view.clone()))
-            .flatten();
-        let write_source_notice = source_session.is_none();
-
-        let gid = group.id.clone();
-        let kept_id = kept.thread_id.clone();
-        let brief_for_store = brief.clone();
-
-        self.write_store_then(
-            "keep answer from group",
-            move |s| s.keep_compare_group(&gid, &kept_id, &brief_for_store, write_source_notice),
-            move |imp, outcome| match outcome {
+            .map(|s| s.reserve_answer())
+            .transpose()
+        {
+            Ok(r) => r,
+            Err(why) => {
+                self.show_toast(why);
+                reread.now();
+                return;
+            }
+        };
+        let weak = self.obj().downgrade();
+        glib::MainContext::default().spawn_local(async move {
+            let _source_lock = source_lock;
+            let read = store_job({
+                let source = group.source_thread.clone();
+                let part = kept.clone();
+                move |s| -> agent_kit::store::Result<_> {
+                    let own = s
+                        .transcript_items(&part.thread_id, Default::default())?
+                        .into_iter()
+                        .filter(|i| i.first_seq > part.after_seq)
+                        .map(|i| i.message)
+                        .collect::<Vec<_>>();
+                    let handoff = build_answer_handoff(&own, &part.label);
+                    let branch = s
+                        .thread_attributes(&part.thread_id)?
+                        .worktree
+                        .map(|w| w.branch);
+                    Ok((handoff, s.max_seq(&source)?, branch))
+                }
+            })
+            .await;
+            let Some(obj) = weak.upgrade() else { return };
+            let imp = obj.imp();
+            let Some(Ok((handoff, source_seq, branch))) = read else {
+                imp.show_toast("Could not read the chosen answer");
+                reread.now();
+                return;
+            };
+            if handoff.carried == 0 {
+                imp.show_toast("This participant has no answer to keep yet");
+                reread.now();
+                return;
+            }
+            // Recheck the current identity immediately before queueing the write. The
+            // identity lock prevents a closed source from opening during either await.
+            let reservation = if reservation.is_none() {
+                let current = super::threads::thread_owner(&group.source_thread)
+                    .and_then(|w| w.imp().slot_of(&group.source_thread))
+                    .and_then(|s| s.get());
+                match current.as_ref().map(|s| s.reserve_answer()).transpose() {
+                    Ok(reservation) => reservation,
+                    Err(why) => {
+                        imp.show_toast(why);
+                        reread.now();
+                        return;
+                    }
+                }
+            } else {
+                reservation
+            };
+            let mut brief = format!(
+                "Kept {}'s answer ({} of {} messages); it goes with your next message.",
+                kept.label, handoff.carried, handoff.total
+            );
+            if let Some(branch) = branch {
+                brief.push_str(&format!(" Edits remain on branch {branch}."));
+            }
+            let brief = redact(&brief);
+            let mut events = seeded_handoff_events(&handoff, &kept.label);
+            if let Some(last) = events.last_mut() {
+                *last = Envelope::new(Event::Notice {
+                    text: brief.clone(),
+                });
+            }
+            let gid = group.id.clone();
+            let kept_id = kept.thread_id.clone();
+            let job = move |s: &agent_kit::store::Store| {
+                s.keep_compare_group_answer(&gid, &kept_id, source_seq, &events)
+            };
+            // A Keep must use the actual receipt: releasing the source on a timeout could
+            // send its next prompt without the handoff that commits a moment later.
+            drop(obj);
+            let store = app_handle();
+            let outcome = if let Some(writer) = store.writer() {
+                let receipt = writer.call_result("keep answer from group", job);
+                gtk4::gio::spawn_blocking(move || receipt.recv().ok())
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                store_job(job).await
+            };
+            // The committed source/session state belongs to the source window, even when
+            // the window that initiated Keep disappeared while the writer was busy.
+            if let Some(Ok(KeepGroupOutcome::Kept(done))) = &outcome {
+                if let Some(reservation) = &reservation {
+                    reservation.adopt(handoff.clone(), &brief);
+                } else if let Some(owner) = super::threads::thread_owner(&group.source_thread) {
+                    owner
+                        .imp()
+                        .restore_saved_answer(&group.source_thread, handoff.clone(), &brief);
+                }
+                for other in &done.archived {
+                    if let Some(owner) = super::threads::thread_owner(other) {
+                        owner.imp().close_row_for_keep(other);
+                    }
+                }
+            }
+            let Some(obj) = weak.upgrade() else {
+                reread.now();
+                return;
+            };
+            let imp = obj.imp();
+            match outcome {
                 Some(Ok(KeepGroupOutcome::Kept(done))) => {
-                    for other in &done.archived {
-                        if let Some(owner) = super::threads::thread_owner(other) {
-                            owner.imp().close_row_for_keep(other);
-                        } else {
-                            imp.close_row_for_keep(other);
-                        }
-                    }
-                    match (&source_session, &source_view) {
-                        (Some(session), _) => session.note(brief.clone()),
-                        (None, Some(view)) => view.sink()(&Envelope::new(Event::Notice {
-                            text: brief.clone(),
-                        })),
-                        (None, None) => {}
-                    }
                     imp.reload_summaries();
                     reread.now();
                     let keep_done = Rc::new(GroupKeepDone {
                         group_id: group.id,
                         kept: kept.label.clone(),
+                        kept_thread: kept.thread_id,
+                        source_thread: group.source_thread,
+                        handoff_fence: handoff.fence.clone(),
                         archived: done.archived,
                         undone: Cell::new(false),
                         removal: RefCell::new(Vec::new()),
@@ -1239,37 +1605,74 @@ impl AgentTerminalWindow {
                         "The thread store did not answer in time.",
                     );
                 }
-            },
-        );
+            }
+        });
     }
 
-    fn undo_keep_group(&self, keep: &GroupKeepDone) {
-        keep.undone.set(true);
+    fn undo_keep_group(&self, keep: &Rc<GroupKeepDone>) {
+        if keep.undone.replace(true) {
+            return;
+        }
         for offer in keep.removal.borrow_mut().drain(..) {
             offer.dismiss();
         }
         let gid = keep.group_id.clone();
         let archived = keep.archived.clone();
-        self.write_store_then(
-            "restore the comparison group",
-            move |s| s.undo_keep_compare_group(&gid, &archived),
-            |imp, outcome| match outcome {
-                Some(Ok(())) => {
-                    imp.reload_summaries();
-                    imp.show_toast("Comparison group restored");
+        let kept = keep.kept_thread.clone();
+        let source = keep.source_thread.clone();
+        let fence = keep.handoff_fence.clone();
+        let Some(source_lock) = super::threads::reserve_answer_source(&source) else {
+            keep.undone.set(false);
+            self.show_toast("Another comparison action is saving; try again once it finishes");
+            return;
+        };
+        let preparing = super::threads::thread_owner(&source).is_some_and(|w| {
+            w.imp()
+                .with_chat(&source, super::threads::ChatTab::answer_preparing)
+                .unwrap_or(false)
+        });
+        let session = super::threads::thread_owner(&source)
+            .and_then(|w| w.imp().slot_of(&source))
+            .and_then(|s| s.get());
+        // A preparation may already hold an older history snapshot. Retain its source
+        // context rather than withdraw it only to have that snapshot restore it later.
+        let reservation = session
+            .as_ref()
+            .filter(|_| !preparing)
+            .and_then(|s| s.reserve_answer_withdrawal(&fence));
+        let withdraw = !preparing && (session.is_none() || reservation.is_some());
+        let keep = keep.clone();
+        let weak = self.obj().downgrade();
+        glib::MainContext::default().spawn_local(async move {
+            let _source_lock = source_lock;
+            let (source_write, fence_write) = (source.clone(), fence.clone());
+            let job = move |s: &agent_kit::store::Store| s.undo_compare_group_answer(
+                &gid, &archived, &kept, &source_write, &fence_write, withdraw);
+            let store = app_handle();
+            let outcome = if let Some(writer) = store.writer() {
+                let receipt = writer.call_result("undo comparison choice", job);
+                gtk4::gio::spawn_blocking(move || receipt.recv().ok()).await.ok().flatten()
+            } else { store_job(job).await };
+            if !matches!(outcome, Some(Ok(_))) { keep.undone.set(false); }
+            // Withdrawal is receipt-dependent, not dependent on the initiating window.
+            if matches!(outcome, Some(Ok(true))) {
+                if let Some(reserved) = &reservation { reserved.withdraw(&fence); }
+                if let Some(owner) = super::threads::thread_owner(&source) {
+                    owner.imp().withdraw_saved_answer(&source, &fence);
                 }
-                Some(Err(e)) => present_message(
-                    &imp.obj(),
-                    "Could Not Restore Group",
-                    &redact(&e.to_string()),
-                ),
-                None => present_message(
-                    &imp.obj(),
-                    "Could Not Restore Group",
-                    "The thread store did not answer in time.",
-                ),
-            },
-        );
+            }
+            let Some(obj) = weak.upgrade() else { return };
+            let imp = obj.imp();
+            match outcome {
+                Some(Ok(cleared)) => {
+                    imp.reload_summaries();
+                    imp.show_toast(if cleared { "Comparison restored; the unsent chosen context was withdrawn" }
+                        else { "Participants restored; context already sent, consumed, preparing or busy remains in the source" });
+                }
+                Some(Err(e)) => present_message(&imp.obj(), "Could Not Restore Group", &redact(&e.to_string())),
+                None => present_message(&imp.obj(), "Could Not Restore Group", "The thread store stopped before answering."),
+            }
+        });
     }
 
     fn offer_archived_group_worktree_removal(
@@ -1497,6 +1900,126 @@ fn load_group_compare(window: &CompareWindow, group_id: String) {
 pub(super) mod tests {
     use super::*;
 
+    struct NoAgent;
+    impl crate::chat::ChatBackend for NoAgent {
+        fn send_prompt(&self, _: &str) {
+            panic!("comparison UI must not send");
+        }
+        fn interrupt(&self) {}
+        fn respond_approval(&self, _: &str, _: agent_core::event::Decision) {}
+        fn answer_questions(&self, _: &str, _: serde_json::Value) {}
+        fn switch(&self, _: Driver, _: Option<String>, _: Option<String>) {}
+        fn reload_session(&self) {}
+        fn set_mode(&self, _: agent_core::adapter::Mode) {}
+        fn control(&self, _: agent_core::adapter::Control) -> String {
+            String::new()
+        }
+        fn status(&self) -> crate::chat::SessionStatus {
+            use agent_core::adapter::Adapter;
+            crate::chat::SessionStatus {
+                driver: Driver::Claude,
+                model: None,
+                pending_model: None,
+                effort: None,
+                mode: agent_core::adapter::Mode::Plan,
+                running_turn: false,
+                alive: false,
+                capabilities: agent_core::claude::ClaudeAdapter::new()
+                    .capabilities()
+                    .clone(),
+                commands: Vec::new(),
+                images_refused: None,
+                remote: false,
+            }
+        }
+    }
+
+    #[test]
+    fn ask_several_gtk_source_strip_and_persisted_keep() {
+        crate::testutil::gtk_init().expect("GTK");
+        let app = adw::Application::builder()
+            .application_id("org.test.AskSeveral")
+            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
+        let window = crate::window::AgentTerminalWindow::new(&app);
+        super::super::threads::tests::ask_several_preparation_reservations(&window);
+        gtk_checks(&window);
+        window.present();
+        let imp = window.imp();
+        let options: Vec<_> = [Driver::Claude, Driver::Agy]
+            .into_iter()
+            .map(|driver| TargetOption {
+                label: driver.info().label.into(),
+                driver,
+                profile_id: None,
+                model: None,
+                effort: None,
+            })
+            .collect();
+        imp.present_ask_several_dialog(
+            "source".into(),
+            options,
+            Some("Compare approaches".into()),
+            true,
+            true,
+            Some(100),
+        );
+        let ctx = glib::MainContext::default();
+        assert!(crate::testutil::pump_until(&ctx, 5, || window
+            .visible_dialog()
+            .is_some()));
+        let dialog = window
+            .visible_dialog()
+            .unwrap()
+            .downcast::<adw::AlertDialog>()
+            .unwrap();
+        assert!(crate::testutil::pump_until_dialog_open(
+            &ctx,
+            dialog.upcast_ref(),
+            5
+        ));
+        assert!(
+            !dialog.is_response_enabled("ask"),
+            "agy needs explicit acknowledgement"
+        );
+        let checks: Vec<gtk4::CheckButton> = crate::testutil::find_all(dialog.upcast_ref());
+        let ack = checks
+            .iter()
+            .find(|c| c.label().is_some_and(|s| s.contains("forced permissive")))
+            .unwrap();
+        ack.set_active(true);
+        assert!(
+            dialog.is_response_enabled("ask"),
+            "acknowledged agy in its worktree is allowed"
+        );
+        crate::account_status::AccountStatus::shared().observe(
+            Driver::Claude,
+            &Envelope::new(Event::QuotaUpdated {
+                account: None,
+                windows: vec![agent_core::event::QuotaWindow {
+                    group: None,
+                    label: "5-hour".into(),
+                    used: 1.0,
+                    resets_at: None,
+                }],
+            }),
+        );
+        assert!(
+            !dialog.is_response_enabled("ask"),
+            "a fresh exhausted reading needs confirmation"
+        );
+        checks
+            .iter()
+            .find(|c| c.label().as_deref() == Some("Ask exhausted accounts anyway"))
+            .unwrap()
+            .set_active(true);
+        assert!(dialog.is_response_enabled("ask"));
+        dialog.close();
+        crate::testutil::settle(&ctx);
+        window.destroy();
+    }
+
     #[test]
     fn prompt_preview_redacts_before_truncation() {
         // Put a token starting before char 120 and spanning across char 120.
@@ -1663,10 +2186,88 @@ pub(super) mod tests {
         store.save_compare_group(&group).expect("save group");
         imp.reload_summaries();
 
+        let view = crate::chat::view::ChatView::new(Rc::new(NoAgent));
+        let preview = gtk4::Window::builder()
+            .default_width(640)
+            .default_height(600)
+            .child(&view)
+            .build();
+        imp.attach_compare_strip(&src, &view);
+        preview.present();
+        fn find_button(widget: &gtk4::Widget, text: &str) -> Option<gtk4::Button> {
+            if let Some(button) = widget
+                .downcast_ref::<gtk4::Button>()
+                .filter(|b| b.label().as_deref() == Some(text))
+            {
+                return Some(button.clone());
+            }
+            let mut child = widget.first_child();
+            while let Some(w) = child {
+                if let Some(b) = find_button(&w, text) {
+                    return Some(b);
+                }
+                child = w.next_sibling();
+            }
+            None
+        }
+        let ctx = glib::MainContext::default();
+        assert!(
+            pump_until(&ctx, 5, || find_button(
+                view.upcast_ref(),
+                "Keep this thread instead"
+            )
+            .is_some()),
+            "source shelf offers detach"
+        );
+        for label in ["Open", "Keep", "Discard", "Compare"] {
+            assert!(
+                find_button(view.upcast_ref(), label).is_some(),
+                "shelf has {label}"
+            );
+        }
+        crate::testutil::settle(&ctx);
+        crate::testutil::capture_window(&preview, "ask-several-source-strip");
+
         let cols = store.compare_columns(&group.sides()).expect("cols");
         assert_eq!(cols.len(), 2);
         assert_eq!(last_reply_text(&cols[0]), "Claude solution");
         assert_eq!(last_reply_text(&cols[1]), "Codex solution");
+
+        // No completed assistant output after the comparison point: the prompt alone is
+        // history, never an answer, and must not settle or archive anything.
+        let mut empty = group.clone();
+        empty.id = store.new_id().unwrap();
+        for p in &mut empty.participants {
+            p.after_seq = store.max_seq(&p.thread_id).unwrap();
+        }
+        store
+            .append_user_message(&p1, None, "Prompt with no answer")
+            .unwrap();
+        store.save_compare_group(&empty).unwrap();
+        let refused = Rc::new(Cell::new(false));
+        let flag = refused.clone();
+        imp.apply_keep_group(
+            empty.clone(),
+            empty.participants[0].clone(),
+            String::new(),
+            Reread::new(move || flag.set(true)),
+        );
+        assert!(
+            imp.open_thread(&src, true).is_none(),
+            "a closed source is reserved through the preparation read"
+        );
+        assert!(pump_until(&ctx, 5, || refused.get()));
+        assert!(store
+            .compare_group(&empty.id)
+            .unwrap()
+            .unwrap()
+            .kept_thread
+            .is_none());
+        assert!(!store.thread_summary(&p2).unwrap().unwrap().archived);
+        store
+            .delete_meta(&agent_core::ask_several::group_meta_key(&empty.id))
+            .unwrap();
+        store.save_compare_group(&group).unwrap();
 
         let reread_ran = Rc::new(Cell::new(false));
         let flag = reread_ran.clone();
@@ -1676,6 +2277,10 @@ pub(super) mod tests {
             group.participants[0].clone(),
             "Claude solution".into(),
             reread,
+        );
+        assert!(
+            imp.open_thread(&src, true).is_none(),
+            "source stays closed while Keep is pending"
         );
         let ctx = glib::MainContext::default();
         assert!(pump_until(&ctx, 5, || {
@@ -1707,10 +2312,83 @@ pub(super) mod tests {
         assert!(
             src_events.iter().any(|(_, e)| matches!(
                 &e.event,
-                Event::Notice { text } if text.contains("Claude solution")
+                Event::HandoffSeeded { summary, .. } if summary.contains("Claude solution")
             )),
             "kept brief must be returned to source thread"
         );
+        assert!(
+            crate::chat::session::undelivered_handoff(src_events.iter().map(|(_, e)| e)).is_some(),
+            "closed source re-arms the kept handoff after a restart"
+        );
+        let chosen =
+            crate::chat::session::undelivered_handoff(src_events.iter().map(|(_, e)| e)).unwrap();
+        let undo = Rc::new(GroupKeepDone {
+            group_id: group.id.clone(),
+            kept: "Claude".into(),
+            kept_thread: p1.clone(),
+            source_thread: src.clone(),
+            handoff_fence: chosen.fence,
+            archived: vec![p2.clone()],
+            undone: Cell::new(false),
+            removal: RefCell::new(Vec::new()),
+        });
+        let occupied = super::super::threads::reserve_answer_source(&src).unwrap();
+        imp.undo_keep_group(&undo);
+        assert!(!undo.undone.get(), "a refused Undo remains retryable");
+        drop(occupied);
+        imp.undo_keep_group(&undo);
+        assert!(pump_until(&ctx, 5, || store
+            .compare_group(&group.id)
+            .unwrap()
+            .unwrap()
+            .kept_thread
+            .is_none()));
+        let undone_events = store.events(&src, None, 100).unwrap();
+        assert!(
+            crate::chat::session::undelivered_handoff(undone_events.iter().map(|(_, e)| e))
+                .is_none(),
+            "Undo withdraws a closed source's exact unsent handoff"
+        );
+        assert!(!store.thread_summary(&p2).unwrap().unwrap().archived);
+
+        imp.apply_keep_group(
+            group.clone(),
+            group.participants[0].clone(),
+            String::new(),
+            Reread::new(|| {}),
+        );
+        assert!(pump_until(&ctx, 5, || store
+            .compare_group(&group.id)
+            .unwrap()
+            .unwrap()
+            .kept_thread
+            .is_some()));
+        let events = store.events(&src, None, 100).unwrap();
+        let chosen =
+            crate::chat::session::undelivered_handoff(events.iter().map(|(_, e)| e)).unwrap();
+        let finish_old_build = super::super::threads::tests::pause_answer_build(&imp.obj(), &src);
+        let preparing_undo = Rc::new(GroupKeepDone {
+            group_id: group.id.clone(),
+            kept: "Claude".into(),
+            kept_thread: p1.clone(),
+            source_thread: src.clone(),
+            handoff_fence: chosen.fence,
+            archived: vec![p2.clone()],
+            undone: Cell::new(false),
+            removal: RefCell::new(Vec::new()),
+        });
+        imp.undo_keep_group(&preparing_undo);
+        assert!(pump_until(&ctx, 5, || {
+            !super::super::threads::answer_source_reserved(&src)
+        }));
+        assert!(!store.thread_summary(&p2).unwrap().unwrap().archived);
+        let retained = store.events(&src, None, 100).unwrap();
+        assert!(
+            crate::chat::session::undelivered_handoff(retained.iter().map(|(_, e)| e)).is_some(),
+            "Undo retains context already read by an unfinished build"
+        );
+        finish_old_build();
+        preview.destroy();
 
         // Clean up temporary test threads so callers inspecting store counts see no residue.
         store.delete_thread(&p1).expect("cleanup p1");

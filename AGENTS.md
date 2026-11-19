@@ -28,7 +28,11 @@ Architectural mandates, standards, and workflows for this codebase.
   (every `Body` variant has a name) and busy per `cards::row_busy`; a new `Body` variant must
   name itself there. A filled `button.suggested-action` rings outside its fill
   (`outline-offset: 2px`), in the global stylesheet (`main.rs`'s `GLOBAL_CSS`), so every dialog
-  and page has it.
+  and page has it. Custom sidebar, diff and Settings controls keep explicit focus rings.
+  Desktop high contrast temporarily uses System colours without changing the saved theme;
+  `palette::concrete` resolves that override for terminal and diff consumers too. Secondary
+  text uses the desktop foreground in high contrast, with light/dark 7:1 regression checks.
+  A running menu animation stops at its target when reduced motion is enabled.
 - **Native GTK4/Libadwaita**: a native Rust binary. Minimum system libraries are
   set by the Cargo version features, currently GTK 4.10 (`v4_10`, for
   `FileDialog`), libadwaita 1.5 (`v1_5`, for `AlertDialog`/`PreferencesDialog`)
@@ -337,14 +341,21 @@ Architectural mandates, standards, and workflows for this codebase.
     `sidebar_model::snippet_markup`, which escapes every character and makes only the match
     markers bold), `window/sidebar_model.rs` (pure sidebar logic: sections, the `SearchQuery`
     filter on titles, folders and tags, tag chips and the Tags dialog's choices),
-    `window/imp/commit.rs` (the diff panel's commit dialog and partial/whole staging flow),
+    `window/imp/commit.rs` (the diff panel's commit dialog and partial/whole staging flow;
+    Use Last Reply records the original selection and transcript baseline, folds a bounded
+    suffix through the store, requires a completed matching reply, and rechecks it on click),
     `window/imp/merge.rs` (worktree-tab, thread-menu and delegated worker-branch merge previews,
     base-checkout and worktree blockers, Ask Agent / Commit First follow-ups, method choice and
     result dialogs), `window/imp/ask_several.rs` (Ask Several parallel group creation,
-    Compare Group view, Keep This One with Undo and redacted hand-off brief),
+    Compare Group view, participant status/actions and persisted budgeted answer adoption;
+    Keep reserves the source through its committed write, and unsent answer withdrawal only
+    clears the same fence. Sidebar comparison parents are loaded with summaries, while
+    pinned and active rows keep their priority),
     `window/schedule_model.rs` / `window/imp/schedules.rs` (Scheduled Prompts editor, manager
     dialog and 60-second background tick scheduler with safe-mode gating and unattended/budget
-    pauses), `window/compare.rs` (the
+    pauses; cached header/sidebar status distinguishes unreadable from absent schedules,
+    current real-money warnings pause automatic work, and explicit Run Now leaves that
+    pause intact), `window/compare.rs` (the
     compare window: an `adw::Window` of its own, never a page or a `TabState`, that only reads;
     it holds itself until closed or destroyed with its parent, so no caller keeps it;
     a spinner until its first read, a generation so only the newest read draws, Refresh, replies
@@ -353,7 +364,10 @@ Architectural mandates, standards, and workflows for this codebase.
     `diff_panel::read_only_files`; a footer under the columns shows each one's `KeepState`, its
     Keep This One calling the caller back with the column, `connect_keep`; it knows nothing of
     forks), `window/imp/fork_compare.rs`
-    (Compare with Fork…, `/compare` and the fork toast's Compare: the pairings and the picker,
+    (Compare with… reads any two visible threads, including archived ones, from their first
+    message; it offers neither fork changes nor Keep, and hidden delegated backing threads
+    never enter its picker or columns. Compare with Fork…, `/compare` and the fork toast's
+    Compare: the pairings and the picker,
     then each column read through `store_job` and each side's changes since its baseline through
     `off_main`; two sides in one folder are one diff under a note saying their changes cannot be
     told apart; and the fork's baseline: taken by Fork thread off the main thread, unless

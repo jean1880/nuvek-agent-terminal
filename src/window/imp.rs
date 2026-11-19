@@ -1572,6 +1572,8 @@ pub struct AgentTerminalWindow {
     summaries: RefCell<Option<Vec<agent_kit::store::ThreadSummary>>>,
     /// The tags' colours, loaded with `summaries`.
     tag_colours: RefCell<std::collections::BTreeMap<String, agent_core::thread_tag::TagColour>>,
+    /// Ask Several participant → source, loaded with the thread summaries.
+    compare_sources: RefCell<std::collections::HashMap<String, String>>,
     summaries_loading: std::cell::Cell<bool>,
     /// The "stop running threads and close?" question is on screen.
     close_prompt_open: std::cell::Cell<bool>,
@@ -1605,6 +1607,10 @@ pub struct AgentTerminalWindow {
     /// The thread sidebar beside the pages.
     split_view: RefCell<Option<adw::OverlaySplitView>>,
     sidebar: RefCell<Option<std::rc::Rc<threads::Sidebar>>>,
+    /// Last schedule read for every thread. `None` is unreadable or not loaded; an empty map
+    /// is a successful read with no schedules. Sidebar drawing never performs store I/O.
+    schedule_badges:
+        RefCell<Option<std::collections::HashMap<String, super::sidebar_model::ScheduleBadge>>>,
     /// The toggle button in the header bar controlling the sidebar.
     pub(super) sidebar_toggle: RefCell<Option<gtk4::ToggleButton>>,
     /// The header's Changes toggle, in a holder of its own: hidden while the page on show has
@@ -5615,7 +5621,7 @@ impl AgentTerminalWindow {
              Antigravity runs are never scheduled",
             |c| c.schedules_enabled,
             SaveWhen::Debounced(|c, on| c.schedules_enabled = on),
-            |_, _| {},
+            |imp, _| imp.refresh_schedule_status(),
         );
         threads.add(&schedules_row);
         general.add(&threads);

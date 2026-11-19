@@ -13,6 +13,30 @@ use serde::{Deserialize, Serialize};
 pub const MIN_CHOICES: usize = MIN_COLUMNS;
 /// Most participants that can be compared side by side.
 pub const MAX_CHOICES: usize = MAX_COLUMNS;
+
+/// Live attention and work take precedence over the last persisted turn outcome.
+pub fn participant_status(
+    approval: bool,
+    limited: bool,
+    working: bool,
+    last_turn: Option<crate::event::TurnState>,
+) -> &'static str {
+    use crate::event::TurnState;
+    if approval {
+        "Needs approval"
+    } else if limited {
+        "Waiting for limit"
+    } else if working {
+        "Working"
+    } else {
+        match last_turn {
+            Some(TurnState::Completed) => "Done",
+            Some(TurnState::Failed) => "Failed",
+            Some(_) => "Stopped",
+            None => "Waiting",
+        }
+    }
+}
 /// Maximum characters retained from a kept answer when building the return brief for the source thread.
 const MAX_KEPT_BRIEF_CHARS: usize = 6_000;
 
@@ -89,11 +113,30 @@ impl CompareGroup {
         let mut parsed: Self = serde_json::from_str(raw).ok()?;
         if parsed.id.trim().is_empty()
             || parsed.source_thread.trim().is_empty()
-            || parsed.participants.len() < MIN_CHOICES
+            || parsed.participants.is_empty()
+            || parsed.participants.len() > MAX_CHOICES
         {
             return None;
         }
+        let mut participants = std::collections::HashSet::new();
+        if parsed.participants.iter().any(|p| {
+            p.thread_id.trim().is_empty()
+                || p.thread_id == parsed.source_thread
+                || !participants.insert(p.thread_id.clone())
+        }) {
+            return None;
+        }
+        if parsed
+            .kept_thread
+            .as_ref()
+            .is_some_and(|kept| !parsed.participants.iter().any(|p| &p.thread_id == kept))
+        {
+            parsed.kept_thread = None;
+        }
         parsed.prompt_preview = redact(&parsed.prompt_preview);
+        for p in &mut parsed.participants {
+            p.label = redact(&p.label);
+        }
         Some(parsed)
     }
 
@@ -138,6 +181,32 @@ pub fn keep_handoff_brief(kept_label: &str, kept_answer: &str, prompt_preview: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn participant_status_prefers_live_work_and_never_calls_unknown_done() {
+        use crate::event::TurnState;
+        assert_eq!(
+            participant_status(true, true, true, Some(TurnState::Failed)),
+            "Needs approval"
+        );
+        assert_eq!(
+            participant_status(false, true, true, None),
+            "Waiting for limit"
+        );
+        assert_eq!(
+            participant_status(false, false, true, Some(TurnState::Completed)),
+            "Working"
+        );
+        assert_eq!(
+            participant_status(false, false, false, Some(TurnState::Failed)),
+            "Failed"
+        );
+        assert_eq!(
+            participant_status(false, false, false, Some(TurnState::Completed)),
+            "Done"
+        );
+        assert_eq!(participant_status(false, false, false, None), "Waiting");
+    }
 
     fn spec(driver: Driver, worktree: bool) -> TargetSpec {
         TargetSpec {

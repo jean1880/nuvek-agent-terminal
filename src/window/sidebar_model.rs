@@ -633,6 +633,15 @@ pub fn react(event: Attention, shown: bool, focused: bool, notify_on_bell: bool)
     }
 }
 
+/// A schedule's independent clock badge; it never replaces an approval or activity badge.
+/// `None` on a row means no schedule, while `Unknown` means the store could not be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduleBadge {
+    Next(i64),
+    Paused(agent_core::schedule::PausedReason),
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarRow {
     pub key: RowKey,
@@ -644,6 +653,7 @@ pub struct SidebarRow {
     /// `None`: a terminal page.
     pub driver: Option<Driver>,
     pub badge: Option<Badge>,
+    pub schedule: Option<ScheduleBadge>,
     /// Where an open thread's agent process is ([`thread_activity`]); `None` for the rest.
     pub activity: Option<ThreadActivity>,
     /// What runs in the background (sub-agents, background commands), for the row's tooltip.
@@ -658,6 +668,8 @@ pub struct SidebarRow {
     pub remote: bool,
     /// The thread's tags, sorted, with their colours.
     pub tags: Vec<RowTag>,
+    /// Ask Several source; separate from the user's searchable tags.
+    pub compare_source: Option<String>,
 }
 
 /// Whether `row` passes `query`: its plain text (case-insensitive) is in the title, the folder
@@ -683,23 +695,99 @@ pub fn group_rows(
 ) -> Vec<(String, Vec<SidebarRow>)> {
     let text = query.text().to_lowercase();
     let mut groups: Vec<(String, Vec<SidebarRow>)> = Vec::new();
-    for row in rows.into_iter().filter(|r| {
-        (show_archived || !r.archived || r.open != OpenState::Closed)
-            && row_matches(r, &text, &query.tags)
-    }) {
-        match groups.iter_mut().find(|(f, _)| *f == row.folder) {
+    let rows: Vec<_> = rows
+        .into_iter()
+        .filter(|r| {
+            (show_archived || !r.archived || r.open != OpenState::Closed)
+                && row_matches(r, &text, &query.tags)
+        })
+        .collect();
+    let positions: std::collections::HashMap<_, _> = rows
+        .iter()
+        .enumerate()
+        .map(|(at, row)| (row.key.clone(), at))
+        .collect();
+    let folders: Vec<_> = rows
+        .iter()
+        .enumerate()
+        .map(|(at, _)| {
+            let mut root = at;
+            let mut seen = std::collections::HashSet::new();
+            while seen.insert(root) {
+                let Some(parent) = rows[root]
+                    .compare_source
+                    .as_ref()
+                    .and_then(|id| positions.get(&RowKey::Thread(id.clone())))
+                else {
+                    break;
+                };
+                root = *parent;
+            }
+            // Corrupt cycles never move a row away from its own folder.
+            if rows[root].compare_source.as_ref().is_some_and(|id| {
+                positions
+                    .get(&RowKey::Thread(id.clone()))
+                    .is_some_and(|p| seen.contains(p))
+            }) {
+                root = at;
+            }
+            rows[root].folder.clone()
+        })
+        .collect();
+    for (row, folder) in rows.into_iter().zip(folders) {
+        match groups.iter_mut().find(|(f, _)| *f == folder) {
             Some((_, list)) => list.push(row),
-            None => groups.push((row.folder.clone(), vec![row])),
+            None => groups.push((folder, vec![row])),
         }
     }
     for (_, list) in &mut groups {
         list.sort_by_key(|r| std::cmp::Reverse(r.updated_ms));
+        order_comparisons(list);
     }
     groups.sort_by(|a, b| {
-        let newest = |g: &[SidebarRow]| g.first().map_or(i64::MIN, |r| r.updated_ms);
+        let newest = |g: &[SidebarRow]| g.iter().map(|r| r.updated_ms).max().unwrap_or(i64::MIN);
         newest(&b.1).cmp(&newest(&a.1))
     });
     groups
+}
+
+/// Keep comparison children beside their source without losing rows to corrupt cycles.
+fn order_comparisons(rows: &mut Vec<SidebarRow>) {
+    let positions: std::collections::HashMap<_, _> = rows
+        .iter()
+        .enumerate()
+        .map(|(at, row)| (row.key.clone(), at))
+        .collect();
+    let mut children = vec![Vec::new(); rows.len()];
+    let mut roots = Vec::new();
+    for (at, row) in rows.iter().enumerate() {
+        if let Some(parent) = row
+            .compare_source
+            .as_ref()
+            .and_then(|id| positions.get(&RowKey::Thread(id.clone())))
+        {
+            children[*parent].push(at);
+        } else {
+            roots.push(at);
+        }
+    }
+    let mut visited = vec![false; rows.len()];
+    let mut order = Vec::with_capacity(rows.len());
+    for root in roots.into_iter().chain(0..rows.len()) {
+        let mut stack = vec![root];
+        while let Some(at) = stack.pop() {
+            if std::mem::replace(&mut visited[at], true) {
+                continue;
+            }
+            order.push(at);
+            stack.extend(children[at].iter().rev().copied());
+        }
+    }
+    let mut owned: Vec<_> = std::mem::take(rows).into_iter().map(Some).collect();
+    *rows = order
+        .into_iter()
+        .filter_map(|at| owned[at].take())
+        .collect();
 }
 
 /// Whether a row is live work: a turn running, background work going, an approval waiting or a
@@ -757,7 +845,7 @@ pub fn sidebar_sections(
         .collect();
     // A row that left a group may have been what put it on top.
     groups.sort_by_key(|(_, list)| {
-        std::cmp::Reverse(list.first().map_or(i64::MIN, |r| r.updated_ms))
+        std::cmp::Reverse(list.iter().map(|r| r.updated_ms).max().unwrap_or(i64::MIN))
     });
     active.sort_by(|a, b| a.badge.cmp(&b.badge).then(b.updated_ms.cmp(&a.updated_ms)));
     pinned.sort_by_key(|r| (r.pin_rank, std::cmp::Reverse(r.updated_ms)));
@@ -1027,6 +1115,8 @@ pub enum ThreadAction {
     MergeWorktree(String),
     /// Opens a window reading the thread beside a fork of it, its source or a sibling fork.
     CompareForks(String),
+    /// Reads this thread beside any other visible thread, without a fork baseline.
+    CompareThreads(String),
     /// Opens a window comparing a multi-agent Ask Several group for this thread.
     CompareGroup(String),
     Compact(String),
@@ -1088,6 +1178,7 @@ impl ThreadAction {
             Self::ForkInWorktree(t) => simple("fork-worktree", t),
             Self::MergeWorktree(t) => simple("merge-worktree", t),
             Self::CompareForks(t) => simple("compare-forks", t),
+            Self::CompareThreads(t) => simple("compare-threads", t),
             Self::CompareGroup(t) => simple("compare-group", t),
             Self::Compact(t) => simple("compact", t),
             Self::Rename(t) => simple("rename", t),
@@ -1142,6 +1233,7 @@ impl ThreadAction {
             "fork-worktree" => simple(Self::ForkInWorktree(thread)),
             "merge-worktree" => simple(Self::MergeWorktree(thread)),
             "compare-forks" => simple(Self::CompareForks(thread)),
+            "compare-threads" => simple(Self::CompareThreads(thread)),
             "compare-group" => simple(Self::CompareGroup(thread)),
             "compact" => simple(Self::Compact(thread)),
             "rename" => simple(Self::Rename(thread)),
@@ -1387,6 +1479,10 @@ pub fn thread_menu(input: &ThreadMenuInput) -> Vec<MenuEntry> {
                     .compare_group
                     .then(|| item("Compare Group…", ThreadAction::CompareGroup(thread.clone()))),
             )
+            .chain([item(
+                "Compare with…",
+                ThreadAction::CompareThreads(thread.clone()),
+            )])
             .chain([MenuEntry::Item {
                 label: "Compact into a new thread".to_owned(),
                 action: ThreadAction::Compact(thread.clone()),
@@ -1510,6 +1606,7 @@ mod tests {
             updated_ms: 1_000,
             driver: None,
             badge,
+            schedule: None,
             activity: None,
             background: Vec::new(),
             open: OpenState::Here,
@@ -1517,7 +1614,25 @@ mod tests {
             pin_rank: None,
             remote: false,
             tags: Vec::new(),
+            compare_source: None,
         }
+    }
+
+    #[test]
+    fn schedule_badges_distinguish_unknown_none_and_active_without_replacing_activity() {
+        let plain = model_of(
+            vec![model_row("t", Some(Badge::NeedsApproval))],
+            None,
+            false,
+        );
+        let mut scheduled_row = model_row("t", Some(Badge::NeedsApproval));
+        scheduled_row.schedule = Some(ScheduleBadge::Unknown);
+        let unknown = model_of(vec![scheduled_row.clone()], None, false);
+        assert_eq!(redraw_for(Some(&plain), &unknown), Redraw::Rebuild);
+        scheduled_row.schedule = Some(ScheduleBadge::Next(1000));
+        assert_eq!(scheduled_row.badge, Some(Badge::NeedsApproval));
+        let active = model_of(vec![scheduled_row], None, false);
+        assert_eq!(redraw_for(Some(&unknown), &active), Redraw::Rebuild);
     }
 
     #[test]
@@ -1748,6 +1863,7 @@ mod tests {
             updated_ms: at,
             driver: Some(Driver::Claude),
             badge: None,
+            schedule: None,
             activity: None,
             background: Vec::new(),
             open: OpenState::Closed,
@@ -1755,7 +1871,53 @@ mod tests {
             pin_rank: None,
             remote: false,
             tags: Vec::new(),
+            compare_source: None,
         }
+    }
+
+    #[test]
+    fn comparisons_group_under_their_source_but_keep_active_and_pinned_priority() {
+        let source = row("source", "/source", 10);
+        let mut child = row("child", "/worktree", 30);
+        child.compare_source = Some("source".into());
+        let other = row("other", "/source", 20);
+        let group = group_rows(
+            vec![child.clone(), other.clone(), source.clone()],
+            &q(""),
+            false,
+        );
+        assert_eq!(group.len(), 1);
+        assert_eq!(group[0].0, "/source");
+        assert_eq!(
+            group[0].1.iter().map(|r| r.key.clone()).collect::<Vec<_>>(),
+            [
+                RowKey::Thread("other".into()),
+                RowKey::Thread("source".into()),
+                RowKey::Thread("child".into())
+            ]
+        );
+        assert_eq!(
+            group[0].1[2].folder, "/worktree",
+            "actual folder stays available"
+        );
+        child.badge = Some(Badge::NeedsApproval);
+        let sections = sidebar_sections(vec![source.clone(), child.clone()], &q(""), false);
+        assert_eq!(sections.active[0].key, child.key);
+        child.pin_rank = Some(0);
+        let sections = sidebar_sections(vec![source, child.clone()], &q(""), false);
+        assert_eq!(sections.pinned[0].key, child.key);
+        assert!(sections.active.is_empty());
+        let alone = group_rows(vec![child], &q(""), false);
+        assert_eq!(
+            alone[0].0, "/worktree",
+            "missing source never hides a participant"
+        );
+        let mut a = row("a", "/cycle", 1);
+        let mut b = row("b", "/cycle", 2);
+        a.compare_source = Some("b".into());
+        b.compare_source = Some("a".into());
+        let cycle = group_rows(vec![a, b], &q(""), false);
+        assert_eq!(cycle[0].1.len(), 2, "cycles retain each row once");
     }
 
     #[test]
@@ -2202,6 +2364,7 @@ mod tests {
             [
                 "Fork thread",
                 "Fork in Isolated Worktree…",
+                "Compare with…",
                 "Compact into a new thread",
                 "Rename…",
                 "Pin to Top",
@@ -2220,6 +2383,7 @@ mod tests {
             [
                 "Fork thread",
                 "Fork in Isolated Worktree…",
+                "Compare with…",
                 "Compact into a new thread",
                 "Rename…",
                 "Pin to Top",
@@ -2285,6 +2449,7 @@ mod tests {
             ThreadAction::ForkInWorktree("t".into()),
             ThreadAction::MergeWorktree("t".into()),
             ThreadAction::CompareForks("t".into()),
+            ThreadAction::CompareThreads("t".into()),
             ThreadAction::Compact("t".into()),
             ThreadAction::Rename("t".into()),
             ThreadAction::Archive("t".into()),
@@ -2766,6 +2931,18 @@ mod tests {
                 .expect("an Export entry");
             assert_eq!(entry.0, "Export…");
             assert_eq!(entry.2, expected);
+        }
+    }
+
+    #[test]
+    fn manual_comparison_is_available_without_fork_links() {
+        for has_messages in [false, true] {
+            let menu = thread_menu(&input(has_messages, false));
+            assert!(items(&menu).contains(&(
+                "Compare with…".to_owned(),
+                ThreadAction::CompareThreads("t1".into()),
+                true,
+            )));
         }
     }
 

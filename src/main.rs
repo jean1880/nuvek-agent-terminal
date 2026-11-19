@@ -475,6 +475,21 @@ pub(crate) const GLOBAL_CSS: &str = "
         :focus-visible {
             outline-color: @at_focus;
         }
+        /* Custom sidebar and diff controls use an inset ring so list clipping cannot hide it.
+           Settings uses standard Adwaita controls, with the same explicit ring. */
+        .thread-list row:focus-visible,
+        .thread-list button:focus-visible,
+        .diff-files row:focus-visible,
+        .diff-files button:focus-visible,
+        .diff-files checkbutton:focus-visible,
+        button.diff-commit:focus-visible,
+        button.diff-merge:focus-visible,
+        preferencespage button:focus-visible,
+        preferencespage entry:focus-visible,
+        preferencespage switch:focus-visible {
+            outline: 2px solid @at_focus;
+            outline-offset: -2px;
+        }
         headerbar {
             background-color: @at_bg_deep;
             color: @at_fg;
@@ -678,6 +693,7 @@ pub(crate) const GLOBAL_CSS: &str = "
         .thread-delete { opacity: 0; }
         .thread-row:hover .thread-close,
         .thread-row:hover .thread-delete,
+        .thread-close:focus-visible,
         .thread-delete:focus-visible {
             opacity: 0.85;
         }

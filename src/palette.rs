@@ -311,9 +311,14 @@ fn probe_class(name: &str) -> String {
 
 /// The system theme's stylesheet: the [`SYSTEM_COLOURS`] aliases, and a probe rule per name
 /// ([`resolve_system`] reads them). Nothing of libadwaita's is redefined.
-fn system_css() -> String {
+fn system_css(high_contrast: bool) -> String {
     let mut css = String::new();
     for (name, value) in SYSTEM_COLOURS {
+        let value = if high_contrast && matches!(name, "at_fg_soft" | "at_fg_dim" | "at_fg_faint") {
+            "@window_fg_color"
+        } else {
+            value
+        };
         css.push_str(&format!("@define-color {name} {value};\n"));
     }
     css.push_str(&format!("@define-color {SHADOW_NAME} {SYSTEM_SHADOW};\n"));
@@ -724,6 +729,9 @@ thread_local! {
     static SYSTEM_ACTIVE: Cell<bool> = const { Cell::new(false) };
     /// The pair while Automatic is the one applied, so a desktop change picks its member again.
     static AUTOMATIC: Cell<Option<ThemePair>> = const { Cell::new(None) };
+    /// The user's choice stays intact while desktop high contrast temporarily takes precedence.
+    static CONFIGURED: Cell<(ThemeChoice, ThemePair)> = const { Cell::new((ThemeChoice::AgentTerminal, ThemePair { dark: ThemeChoice::AgentTerminal, light: ThemeChoice::AgentTerminalLight })) };
+    static HIGH_CONTRAST_OVERRIDE: Cell<bool> = const { Cell::new(false) };
     /// The choice whose colours are in use: never Automatic, which is resolved to its member.
     static IN_EFFECT: Cell<ThemeChoice> = const { Cell::new(ThemeChoice::AgentTerminal) };
     /// Whether the desktop's style is being watched (connected once per process).
@@ -769,8 +777,12 @@ pub fn in_effect() -> ThemeChoice {
     IN_EFFECT.with(Cell::get)
 }
 
-/// `choice` as a lookup takes it: Automatic is the member in effect, every other choice itself.
+/// `choice` as a lookup takes it: desktop high contrast overrides every choice temporarily;
+/// otherwise Automatic is the member in effect and every other choice is itself.
 pub fn concrete(choice: ThemeChoice) -> ThemeChoice {
+    if HIGH_CONTRAST_OVERRIDE.with(Cell::get) {
+        return ThemeChoice::System;
+    }
     match choice {
         ThemeChoice::Automatic => match in_effect() {
             // Never stored, but a lookup must not resolve to itself.
@@ -820,8 +832,23 @@ fn forced_scheme(choice: ThemeChoice) -> adw::ColorScheme {
 /// every named colour for it, replacing the last theme's. Above the app's own stylesheets, so
 /// the names resolve however they load.
 pub fn apply(choice: ThemeChoice, pair: ThemePair) {
+    CONFIGURED.with(|c| c.set((choice, pair)));
     SYSTEM_ACTIVE.with(|s| s.set(choice == ThemeChoice::System));
     AUTOMATIC.with(|a| a.set((choice == ThemeChoice::Automatic).then_some(pair)));
+    let high_contrast =
+        gdk::Display::default().is_some() && adw::StyleManager::default().is_high_contrast();
+    HIGH_CONTRAST_OVERRIDE.with(|h| h.set(high_contrast && choice != ThemeChoice::System));
+    if high_contrast {
+        apply_system();
+        return;
+    }
+    apply_configured(choice, pair);
+    if gdk::Display::default().is_some() {
+        watch_system();
+    }
+}
+
+fn apply_configured(choice: ThemeChoice, pair: ThemePair) {
     match choice {
         ThemeChoice::System => apply_system(),
         ThemeChoice::Automatic => apply_automatic(pair),
@@ -854,7 +881,7 @@ fn apply_system() {
         return;
     }
     adw::StyleManager::default().set_color_scheme(forced_scheme(ThemeChoice::System));
-    load(&system_css());
+    load(&system_css(adw::StyleManager::default().is_high_contrast()));
     set_current(resolve_system());
     watch_system();
 }
@@ -876,7 +903,38 @@ fn apply_automatic(pair: ThemePair) {
 /// resolves its colours again, Automatic takes the member that matches, and what holds colours
 /// as values is recoloured when anything changed. Nothing for a bundled scheme.
 fn desktop_changed(desktop_dark: bool) {
+    if gdk::Display::default().is_some() {
+        desktop_changed_with_contrast(
+            desktop_dark,
+            adw::StyleManager::default().is_high_contrast(),
+        );
+        return;
+    }
     if SYSTEM_ACTIVE.with(Cell::get) {
+        set_current(resolve_system());
+    } else if !follow_desktop(desktop_dark) {
+        return;
+    }
+    if let Some(f) = ON_SYSTEM_CHANGE.with(Cell::get) {
+        f();
+    }
+}
+
+fn desktop_changed_with_contrast(desktop_dark: bool, high_contrast: bool) {
+    let (choice, pair) = CONFIGURED.with(Cell::get);
+    let was_override = HIGH_CONTRAST_OVERRIDE.with(Cell::get);
+    if high_contrast && choice != ThemeChoice::System {
+        HIGH_CONTRAST_OVERRIDE.with(|h| h.set(true));
+        if was_override {
+            set_current(resolve_system());
+        } else {
+            apply_system();
+        }
+    } else if was_override {
+        HIGH_CONTRAST_OVERRIDE.with(|h| h.set(false));
+        apply_configured(choice, pair);
+    } else if SYSTEM_ACTIVE.with(Cell::get) {
+        load(&system_css(high_contrast));
         set_current(resolve_system());
     } else if !follow_desktop(desktop_dark) {
         return;
@@ -1072,7 +1130,7 @@ mod tests {
             assert!(!value.contains('#'), "{name}: a colour of its own");
             assert!(value.contains('@'), "{name}: not from the desktop");
         }
-        let css = system_css();
+        let css = system_css(false);
         assert!(!css.contains("define-color window_bg_color"));
         assert!(!css.contains("--window-bg-color"));
         assert!(css.contains("label.at-probe-at-bg { color: @at_bg; }"));
@@ -1131,7 +1189,7 @@ mod tests {
                 assert!(chrome.css().contains(&line), "{choice}: no shadow");
             }
         }
-        assert!(system_css().contains(&format!("{line}{SYSTEM_SHADOW};")));
+        assert!(system_css(false).contains(&format!("{line}{SYSTEM_SHADOW};")));
         assert!(SYSTEM_SHADOW.starts_with('@') && !SYSTEM_SHADOW.contains('#'));
     }
 
@@ -1797,6 +1855,80 @@ mod tests {
 
     fn is_light_chrome(c: &Chrome) -> bool {
         c.bg.luminance() > 0.179
+    }
+
+    #[test]
+    #[ignore = "native GTK; run alone in an isolated display"]
+    fn high_contrast_temporarily_follows_system_and_restores_choice() {
+        use vte4::prelude::TerminalExt;
+        crate::testutil::native_init();
+        let pair = ThemePair::default();
+        apply(ThemeChoice::Nord, pair);
+        assert_eq!(in_effect(), ThemeChoice::Nord);
+        desktop_changed_with_contrast(true, true);
+        assert_eq!(in_effect(), ThemeChoice::System);
+        assert_eq!(concrete(ThemeChoice::Nord), ThemeChoice::System);
+        assert_eq!(concrete(ThemeChoice::Automatic), ThemeChoice::System);
+        assert_eq!(CONFIGURED.with(Cell::get), (ThemeChoice::Nord, pair));
+        // Newly created panes and settings reloads pass the saved choice. Both must still
+        // draw the effective high-contrast palette without rewriting that saved choice.
+        let terminal = vte4::Terminal::new();
+        crate::theme::Theme::apply(&terminal, ThemeChoice::Nord);
+        assert_eq!(terminal.color_background_for_draw(), current().bg.to_rgba());
+        assert_eq!(
+            crate::theme::Theme::diff_colours(ThemeChoice::Nord).background,
+            current().bg.to_rgba()
+        );
+        crate::theme::Theme::apply(&terminal, ThemeChoice::Nord);
+        assert_eq!(terminal.color_background_for_draw(), current().bg.to_rgba());
+        desktop_changed_with_contrast(true, false);
+        assert_eq!(in_effect(), ThemeChoice::Nord);
+        assert_eq!(concrete(ThemeChoice::Nord), ThemeChoice::Nord);
+        assert_eq!(
+            current().bg,
+            Chrome::for_choice(ThemeChoice::Nord).unwrap().bg
+        );
+    }
+
+    #[test]
+    #[ignore = "native GTK; run alone in an isolated display"]
+    fn high_contrast_desktop_text_meets_seven_to_one() {
+        std::env::set_var("ADW_DEBUG_HIGH_CONTRAST", "1");
+        let ctx = crate::testutil::native_init();
+        let style = adw::StyleManager::default();
+        assert!(style.is_high_contrast());
+        apply(ThemeChoice::Nord, ThemePair::default());
+        for scheme in [adw::ColorScheme::ForceLight, adw::ColorScheme::ForceDark] {
+            style.set_color_scheme(scheme);
+            crate::testutil::settle(&ctx);
+            let chrome = resolve_system();
+            for (name, text) in [
+                ("fg", chrome.fg),
+                ("soft", chrome.fg_soft),
+                ("dim", chrome.fg_dim),
+                ("faint", chrome.fg_faint),
+            ] {
+                for surface in [chrome.bg, chrome.surface, chrome.surface_raised] {
+                    let ratio = text.contrast(surface);
+                    assert!(ratio >= 7.0, "{scheme:?}: {name} at {ratio:.2}:1");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "native GTK; run alone in an isolated display"]
+    fn high_contrast_updates_an_already_selected_system_theme() {
+        let ctx = crate::testutil::native_init();
+        apply(ThemeChoice::System, ThemePair::default());
+        crate::testutil::settle(&ctx);
+        let normal = current().fg_dim;
+        desktop_changed_with_contrast(false, true);
+        assert_eq!(current().fg_dim, current().fg);
+        assert_ne!(current().fg_dim, normal);
+        desktop_changed_with_contrast(false, false);
+        assert_eq!(current().fg_dim, normal);
+        assert_eq!(CONFIGURED.with(Cell::get).0, ThemeChoice::System);
     }
 
     /// Automatic applies the member for the desktop's preference without forcing libadwaita's

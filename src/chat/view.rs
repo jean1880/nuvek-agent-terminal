@@ -147,6 +147,7 @@ fn meter_dispatch(action: MeterAction) -> MeterDispatch {
 }
 
 type ActionHandler = Rc<dyn Fn(&ViewAction)>;
+type ScheduleActionHandler = Rc<dyn Fn(&str)>;
 
 const STYLE: &str = include_str!("view/style.css");
 
@@ -215,7 +216,12 @@ pub(crate) struct Inner {
     model: Rc<RefCell<Transcript>>,
     transcript: Rc<TranscriptView>,
     composer: Rc<Composer>,
+    compare_strip: gtk4::Box,
     header: Header,
+    schedule_status: gtk4::Box,
+    schedule_status_label: gtk4::Label,
+    schedule_status_paused: Cell<Option<bool>>,
+    schedule_status_action: RefCell<Option<ScheduleActionHandler>>,
     plan: PlanPanel,
     interruption: interruption::InterruptionShelf,
     /// The worker run shown on the shelf; `None` means the root transcript.
@@ -451,7 +457,16 @@ impl ChatView {
                 model: Rc::new(RefCell::new(Transcript::new())),
                 transcript: TranscriptView::new(sink.clone()),
                 composer: Composer::new(),
+                compare_strip: gtk4::Box::new(gtk4::Orientation::Vertical, 6),
                 header: Header::new(),
+                schedule_status: gtk4::Box::new(gtk4::Orientation::Horizontal, 6),
+                schedule_status_label: gtk4::Label::builder()
+                    .wrap(true)
+                    .xalign(0.0)
+                    .hexpand(true)
+                    .build(),
+                schedule_status_paused: Cell::new(None),
+                schedule_status_action: RefCell::new(None),
                 plan: PlanPanel::new(),
                 interruption,
                 interruption_scope: RefCell::new(None),
@@ -495,6 +510,12 @@ impl ChatView {
         inner.shelves.push(inner.subagent_shelf.revealer());
         inner.shelves.push(inner.background_shelf.revealer());
         view.append(&inner.header.bin);
+        inner.schedule_status.set_visible(false);
+        inner.schedule_status.set_margin_start(12);
+        inner.schedule_status.set_margin_end(12);
+        inner.schedule_status.set_margin_top(4);
+        inner.schedule_status.set_margin_bottom(4);
+        view.append(&inner.schedule_status);
         // Toasts cover the transcript only, never the shelves or the composer where the next
         // action is (see `ChatView::toast_overlay`).
         let toasts = adw::ToastOverlay::new();
@@ -512,6 +533,14 @@ impl ChatView {
         column.append(&inner.shelves.widget);
         column.append(&inner.interruption.revealer);
         column.append(&inner.context_offer.revealer);
+        inner.compare_strip.set_visible(false);
+        inner
+            .compare_strip
+            .set_accessible_role(gtk4::AccessibleRole::Group);
+        inner
+            .compare_strip
+            .update_property(&[gtk4::accessible::Property::Label("Agent comparison")]);
+        column.append(&inner.compare_strip);
         // Right above where the reply is typed: the one place the eye already is.
         column.append(&inner.thinking.revealer);
         column.append(inner.composer.widget());
@@ -534,6 +563,68 @@ impl ChatView {
 
     fn inner(&self) -> Option<Rc<Inner>> {
         self.imp().inner.borrow().clone()
+    }
+
+    /// The scheduler owns the status and actions; this view only draws the supplied state.
+    pub(crate) fn set_schedule_status(
+        &self,
+        text: Option<&str>,
+        paused: bool,
+        action: ScheduleActionHandler,
+    ) {
+        let Some(inner) = self.inner() else {
+            return;
+        };
+        let row = &inner.schedule_status;
+        *inner.schedule_status_action.borrow_mut() = Some(action);
+        row.set_visible(text.is_some());
+        let Some(text) = text else {
+            return;
+        };
+        if inner.schedule_status_label.text() != text {
+            inner.schedule_status_label.set_label(text);
+        }
+        // Refreshing the store or changing a pause reason must keep the same controls and
+        // keyboard focus. Their callback reads the latest schedule action from the slot.
+        if inner.schedule_status_paused.replace(Some(paused)) == Some(paused) {
+            return;
+        }
+        while let Some(child) = row.first_child() {
+            row.remove(&child);
+        }
+        row.append(&gtk4::Image::from_icon_name(
+            "at-document-open-recent-symbolic",
+        ));
+        row.append(&inner.schedule_status_label);
+        let labels: &[&str] = if paused {
+            &["Resume", "Run Now", "Delete"]
+        } else {
+            &["Schedules…"]
+        };
+        for &title in labels {
+            let button = gtk4::Button::with_label(title);
+            let weak = Rc::downgrade(&inner);
+            button.connect_clicked(move |_| {
+                let action = weak
+                    .upgrade()
+                    .and_then(|inner| inner.schedule_status_action.borrow().clone());
+                if let Some(action) = action {
+                    action(title);
+                }
+            });
+            row.append(&button);
+        }
+    }
+
+    pub(crate) fn set_compare_strip(&self, child: Option<&gtk4::Box>) {
+        let Some(inner) = self.inner() else { return };
+        while let Some(old) = inner.compare_strip.first_child() {
+            inner.compare_strip.remove(&old);
+        }
+        if let Some(child) = child {
+            inner.compare_strip.append(child);
+        }
+        inner.compare_strip.set_visible(child.is_some());
     }
 
     /// The thread's regions for F6: the transcript and the message box, and the box's text

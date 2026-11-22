@@ -302,6 +302,7 @@ fn plant_staged(sup: &Rc<Supervisor>, worker: &WorkerId) {
             argv_tail: Vec::new(),
         },
         overlay: None,
+        child_mcp: agent_core::delegation::launch::ChildMcpGrants::default(),
     };
     sup.state
         .borrow_mut()

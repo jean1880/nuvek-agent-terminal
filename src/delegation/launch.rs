@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use agent_core::adapter::Driver;
 use agent_core::delegation::launch::{
     claude_child_args, claude_parent_args, overlay_file_name, overlay_sweep_candidate,
+    ChildMcpGrants,
 };
 use agent_core::delegation::{CapabilityToken, DelegationBinding};
 
@@ -60,6 +61,11 @@ fn prepare_with(
     };
     let mut launch = LaunchBinding::default();
     let mut overlay = None;
+    let applied_child_mcp = if req.driver == Driver::Claude && req.role == Role::Child {
+        req.child_mcp.clone()
+    } else {
+        ChildMcpGrants::default()
+    };
     match req.driver {
         Driver::Claude => {
             let argv_for = |path: &str| -> Result<Vec<String>, String> {
@@ -76,7 +82,11 @@ fn prepare_with(
             let path_str = utf8(&path, "overlay")?;
             // Built before the file exists, so a refusal leaves nothing behind.
             let argv = argv_for(&path_str)?;
-            let body = serde_json::to_vec(&binding.claude_overlay(req.app_pid))
+            let overlay_value = match req.role {
+                Role::Root => binding.claude_overlay(req.app_pid),
+                Role::Child => binding.claude_child_overlay(req.app_pid, &applied_child_mcp),
+            };
+            let body = serde_json::to_vec(&overlay_value)
                 .map_err(|e| format!("cannot encode the overlay: {e}"))?;
             write_overlay(&req.rundir, &path, &body, rundir::effective_uid())?;
             launch.argv_tail = argv;
@@ -101,6 +111,7 @@ fn prepare_with(
         token,
         launch,
         overlay,
+        child_mcp: applied_child_mcp,
     })
 }
 
@@ -192,6 +203,7 @@ mod tests {
             endpoint: PathBuf::from("/run/user/1000/agent-terminal/delegation-4242.sock"),
             instance: InstanceNonce::from_bytes([7; 16]),
             rundir,
+            child_mcp: ChildMcpGrants::default(),
         }
     }
 
@@ -420,5 +432,58 @@ mod tests {
                 "mcp.json".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn child_mcp_grants_apply_only_to_claude_children_and_keep_token_isolated() {
+        use agent_core::delegation::launch::ChildMcpServer;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = private_rundir(tmp.path());
+        let grants = ChildMcpGrants::try_from_servers(vec![ChildMcpServer {
+            name: "discussion".into(),
+            command: "/usr/local/bin/example-mcp".into(),
+            args: vec!["--stdio".into()],
+            tools: vec!["list_topics".into()],
+        }])
+        .expect("grants");
+
+        // Claude child gets the extra server in its overlay, token only under agent_terminal.env,
+        // and no mcp__ entries in --tools.
+        let mut child_req = request(Driver::Claude, Role::Child, dir.clone());
+        child_req.child_mcp = grants.clone();
+        let child = prepare_with(&child_req, [9; 32], 11).expect("child");
+        assert_eq!(child.child_mcp, grants);
+        assert!(!child.launch.argv_tail.iter().any(|a| a.contains("mcp__")));
+        let path = child.overlay.clone().expect("overlay");
+        let json: Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
+        assert_eq!(json["mcpServers"]["discussion"]["type"], "stdio");
+        assert!(json["mcpServers"]["discussion"].get("env").is_none());
+        let mut at = Vec::new();
+        paths_of(&json, &secret_of(&child), "", &mut at);
+        assert_eq!(
+            at,
+            vec![format!("/mcpServers/agent_terminal/env/{ENV_CAP}")]
+        );
+        unlink_overlay(&path);
+
+        // Claude root never receives child_mcp grants.
+        let mut root_req = request(Driver::Claude, Role::Root, dir.clone());
+        root_req.child_mcp = grants.clone();
+        let root = prepare_with(&root_req, [10; 32], 12).expect("root");
+        assert!(root.child_mcp.is_empty());
+        let root_path = root.overlay.clone().expect("overlay");
+        let root_json: Value =
+            serde_json::from_slice(&std::fs::read(&root_path).expect("read")).expect("json");
+        assert!(root_json["mcpServers"].get("discussion").is_none());
+        unlink_overlay(&root_path);
+
+        // Codex and Agy children never receive child_mcp grants.
+        for driver in [Driver::Codex, Driver::Agy, Driver::Local] {
+            let mut req = request(driver, Role::Child, dir.clone());
+            req.child_mcp = grants.clone();
+            let prep = prepare_binding(&req).expect("other driver");
+            assert!(prep.child_mcp.is_empty(), "{driver:?}");
+        }
     }
 }

@@ -3,6 +3,7 @@
 
 use agent_core::adapter::Driver;
 use agent_core::delegation::authority::TaskMode;
+use agent_core::delegation::launch::ChildMcpGrants;
 use agent_core::delegation::{ErrorCode, ToolError};
 use agent_core::event::TurnState;
 use serde_json::Value;
@@ -22,6 +23,8 @@ pub(super) struct Readback {
     /// What a Local child's parent declared beyond reading (its read-back compares the policy
     /// the runner reports applying).
     capabilities: Option<Vec<agent_core::delegation::authority::Capability>>,
+    /// Snapshot of explicit child MCP server grants for this Claude generation.
+    child_mcp: ChildMcpGrants,
 }
 pub(super) enum Step {
     Wait,
@@ -43,6 +46,14 @@ impl Readback {
         capabilities: Option<Vec<agent_core::delegation::authority::Capability>>,
     ) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    /// The explicit child MCP server snapshot for this Claude generation.
+    pub(super) fn with_child_mcp(mut self, child_mcp: ChildMcpGrants) -> Self {
+        if self.driver == Some(Driver::Claude) {
+            self.child_mcp = child_mcp;
+        }
         self
     }
 
@@ -94,7 +105,12 @@ impl Readback {
                         .zip(tools)
                         .zip(servers)
                         .is_some_and(|((m, t), s)| {
-                            agent_core::delegation::launch::claude_child_init_ok(m, &t, &s)
+                            agent_core::delegation::launch::claude_child_init_ok_with_grants(
+                                m,
+                                &t,
+                                &s,
+                                &self.child_mcp,
+                            )
                         });
                     if !self.init {
                         return self.stop(
@@ -466,5 +482,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn claude_readback_enforces_exact_granted_server_set() {
+        use agent_core::delegation::launch::{ChildMcpServer, CLAUDE_CHILD_TOOLS_PLAN};
+        let grants = ChildMcpGrants::try_from_servers(vec![ChildMcpServer {
+            name: "discussion".into(),
+            command: "/usr/local/bin/example-mcp".into(),
+            args: Vec::new(),
+            tools: vec!["list_topics".into()],
+        }])
+        .expect("grants");
+
+        let mut tools: Vec<String> = CLAUDE_CHILD_TOOLS_PLAN
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        tools.push("mcp__agent_terminal__cross_agent_read".into());
+        tools.push("mcp__discussion__list_topics".into());
+        tools.push("mcp__discussion__unapproved_tool".into());
+
+        // Exact expected server set passes.
+        let mut ok = Readback::child(Driver::Claude, TaskMode::Plan).with_child_mcp(grants.clone());
+        let init_ok = json!({
+            "type": "system",
+            "subtype": "init",
+            "tools": tools,
+            "mcp_servers": [{"name": "agent_terminal"}, {"name": "discussion"}]
+        });
+        assert!(matches!(ok.line(&init_ok), Step::Wait));
+        ok.line(&json!({"type": "assistant", "message": {"model": "claude-test"}}));
+        assert!(matches!(ok.ended(TurnState::Completed), Step::Task));
+        assert!(ok.ready);
+
+        // Missing configured server is rejected.
+        let mut missing =
+            Readback::child(Driver::Claude, TaskMode::Plan).with_child_mcp(grants.clone());
+        let init_missing = json!({
+            "type": "system",
+            "subtype": "init",
+            "tools": tools,
+            "mcp_servers": [{"name": "agent_terminal"}]
+        });
+        assert!(matches!(missing.line(&init_missing), Step::Stop(_)));
+        assert!(!missing.ready);
+
+        // Extra unconfigured server is rejected.
+        let mut extra = Readback::child(Driver::Claude, TaskMode::Plan).with_child_mcp(grants);
+        let init_extra = json!({
+            "type": "system",
+            "subtype": "init",
+            "tools": tools,
+            "mcp_servers": [
+                {"name": "agent_terminal"},
+                {"name": "discussion"},
+                {"name": "rogue"}
+            ]
+        });
+        assert!(matches!(extra.line(&init_extra), Step::Stop(_)));
+        assert!(!extra.ready);
     }
 }

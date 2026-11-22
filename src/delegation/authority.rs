@@ -36,13 +36,19 @@ fn own_tool_effect(name: &str) -> Effect {
     }
 }
 
-/// `mcp__<server>__<tool>` as an MCP effect (our `show_image` a read); `None` for any other
-/// shape.
-fn mcp_prefixed(tool: &str) -> Option<Effect> {
+/// `mcp__<server>__<tool>` split into `(server, tool)`; `None` for any other shape.
+fn parse_mcp_tool(tool: &str) -> Option<(&str, &str)> {
     let (server, name) = tool.strip_prefix("mcp__")?.split_once("__")?;
     if server.is_empty() || name.is_empty() {
         return None;
     }
+    Some((server, name))
+}
+
+/// `mcp__<server>__<tool>` as an MCP effect (our `show_image` a read); `None` for any other
+/// shape.
+fn mcp_prefixed(tool: &str) -> Option<Effect> {
+    let (server, name) = parse_mcp_tool(tool)?;
     Some(if server == SERVER_NAME {
         own_tool_effect(name)
     } else {
@@ -209,6 +215,12 @@ impl ChildAuthority {
             .is_none_or(|declared| declared.contains(&capability))
     }
 
+    /// Whether `(server, name)` is an exact child MCP tool granted to this Claude generation.
+    fn allows_child_mcp(&self, server: &str, name: &str) -> bool {
+        self.params.driver == Driver::Claude
+            && self.params.child_mcp.borrow().allows_tool(server, name)
+    }
+
     /// What a declaration leaves out of `effect`: `None` when allowed (or nothing was
     /// declared), `Some(None)` for a tool no capability names.
     fn undeclared(&self, effect: Effect) -> Option<Option<Capability>> {
@@ -297,9 +309,20 @@ impl ChildAuthority {
                 }
             }
             Effect::Mcp { own: false } => {
+                if parse_mcp_tool(tool)
+                    .is_some_and(|(server, name)| self.allows_child_mcp(server, name))
+                {
+                    if self.params.capabilities.is_some() && !self.allows(Capability::Network) {
+                        return GateVerdict::Deny {
+                            reason: "this agent's parent did not allow it network access"
+                                .to_owned(),
+                        };
+                    }
+                    return GateVerdict::Defer;
+                }
                 return GateVerdict::Deny {
                     reason: "delegated agents use no MCP server but agent-terminal's".to_owned(),
-                }
+                };
             }
             _ => {}
         }
@@ -395,8 +418,13 @@ impl ApprovalGate for ChildAuthority {
                 let abs = absolute(path, cwd, &root);
                 read_auto_matchable(&abs, &root, self.home()) && canonically_inside(&abs, &root)
             }
-            // A child uses no MCP server but agent-terminal's, which no rule covers.
-            Action::Mcp { .. } | Action::LocalMcp { .. } => false,
+            // Only exact Claude child MCP grants (within declared network capability) may match
+            // saved/session rules; all other MCP servers and Local MCP tools remain denied.
+            Action::Mcp { server, tool } => {
+                self.allows_child_mcp(server, tool)
+                    && (self.params.capabilities.is_none() || self.allows(Capability::Network))
+            }
+            Action::LocalMcp { .. } => false,
         }
     }
 }
@@ -574,6 +602,21 @@ mod tests {
             task_mode: TaskMode,
             capabilities: Option<Vec<Capability>>,
         ) -> ChildAuthority {
+            self.gate_with_mcp(
+                driver,
+                task_mode,
+                capabilities,
+                agent_core::delegation::launch::ChildMcpGrants::default(),
+            )
+        }
+
+        fn gate_with_mcp(
+            &self,
+            driver: Driver,
+            task_mode: TaskMode,
+            capabilities: Option<Vec<Capability>>,
+            child_mcp: agent_core::delegation::launch::ChildMcpGrants,
+        ) -> ChildAuthority {
             let live = self.live.clone();
             ChildAuthority::new(AuthorityParams {
                 inherited: InheritedAuthority {
@@ -596,6 +639,7 @@ mod tests {
                 capabilities,
                 home: None,
                 live: Rc::new(move || live.get()),
+                child_mcp: Rc::new(std::cell::RefCell::new(child_mcp)),
             })
         }
 
@@ -1444,9 +1488,178 @@ mod tests {
             capabilities: None,
             home: None,
             live: Rc::new(move || live.get()),
+            child_mcp: Rc::new(std::cell::RefCell::new(
+                agent_core::delegation::launch::ChildMcpGrants::default(),
+            )),
         });
         assert!(gate.rule_may_apply(&Action::Read { path: f.outside() }, None));
         assert!(!gate.rule_may_apply(&Action::Read { path: f.inside() }, None));
         assert!(!gate.rule_may_apply(&Action::Edit { path: f.outside() }, None));
+    }
+
+    #[test]
+    fn explicit_child_mcp_grants_enforce_exact_tool_network_and_driver_scope() {
+        use agent_core::delegation::launch::{ChildMcpGrants, ChildMcpServer};
+        let f = Fixture::new();
+        let grants = ChildMcpGrants::try_from_servers(vec![ChildMcpServer {
+            name: "discussion".into(),
+            command: "/usr/local/bin/example-mcp".into(),
+            args: Vec::new(),
+            tools: vec!["list_topics".into(), "post_message".into()],
+        }])
+        .expect("grants");
+
+        // Empty grants preserve old deny behavior.
+        let empty = f.gate_with(
+            Driver::Claude,
+            TaskMode::Plan,
+            Some(vec![Capability::Network]),
+        );
+        assert!(is_deny(&empty.judge(
+            "mcp__discussion__list_topics",
+            &json!({}),
+            None
+        )));
+        assert!(!empty.rule_may_apply(
+            &Action::Mcp {
+                server: "discussion".into(),
+                tool: "list_topics".into(),
+            },
+            None
+        ));
+
+        // Plan mode with explicit Network capability: allowed tools defer and rules may apply;
+        // unknown tools on the same server, unrelated servers, shell, edit, delegate stay denied.
+        let plan_net = f.gate_with_mcp(
+            Driver::Claude,
+            TaskMode::Plan,
+            Some(vec![Capability::Network]),
+            grants.clone(),
+        );
+        for allowed in ["list_topics", "post_message"] {
+            let full = format!("mcp__discussion__{allowed}");
+            assert_eq!(plan_net.judge(&full, &json!({}), None), GateVerdict::Defer);
+            assert!(plan_net.rule_may_apply(
+                &Action::Mcp {
+                    server: "discussion".into(),
+                    tool: allowed.into(),
+                },
+                None
+            ));
+        }
+        assert!(is_deny(&plan_net.judge(
+            "mcp__discussion__delete_topic",
+            &json!({}),
+            None
+        )));
+        assert!(!plan_net.rule_may_apply(
+            &Action::Mcp {
+                server: "discussion".into(),
+                tool: "delete_topic".into(),
+            },
+            None
+        ));
+        assert!(is_deny(&plan_net.judge(
+            "mcp__other__list_topics",
+            &json!({}),
+            None
+        )));
+        assert!(!plan_net.rule_may_apply(
+            &Action::Mcp {
+                server: "other".into(),
+                tool: "list_topics".into(),
+            },
+            None
+        ));
+        assert!(is_deny(&plan_net.judge(
+            "Bash",
+            &json!({"command": "ls"}),
+            None
+        )));
+        assert!(is_deny(&plan_net.judge(
+            "Edit",
+            &json!({"file_path": f.inside()}),
+            None
+        )));
+        assert!(is_deny(&plan_net.judge("Task", &json!({}), None)));
+
+        // Plan mode with unrestricted capabilities (None): allowed tools still defer.
+        let plan_unrestricted =
+            f.gate_with_mcp(Driver::Claude, TaskMode::Plan, None, grants.clone());
+        assert_eq!(
+            plan_unrestricted.judge("mcp__discussion__post_message", &json!({}), None),
+            GateVerdict::Defer
+        );
+
+        // Declared no-network denies even explicitly granted MCP tools.
+        let no_net = f.gate_with_mcp(Driver::Claude, TaskMode::Plan, Some(vec![]), grants.clone());
+        assert!(is_deny(&no_net.judge(
+            "mcp__discussion__list_topics",
+            &json!({}),
+            None
+        )));
+        assert!(!no_net.rule_may_apply(
+            &Action::Mcp {
+                server: "discussion".into(),
+                tool: "list_topics".into(),
+            },
+            None
+        ));
+
+        // Write mode with Edit-only (no Network) denies granted MCP tools.
+        let edit_only = f.gate_with_mcp(
+            Driver::Claude,
+            TaskMode::AcceptEdits,
+            Some(vec![Capability::Edit]),
+            grants.clone(),
+        );
+        assert!(is_deny(&edit_only.judge(
+            "mcp__discussion__post_message",
+            &json!({}),
+            None
+        )));
+
+        // Revocation / bootstrap / parent ceiling still run first and deny.
+        f.live.set(fixed_live(false, false, Mode::AcceptEdits));
+        assert!(is_deny(&plan_net.judge(
+            "mcp__discussion__list_topics",
+            &json!({}),
+            None
+        )));
+        f.live.set(fixed_live(true, true, Mode::AcceptEdits));
+        assert!(is_deny(&plan_net.judge(
+            "mcp__discussion__list_topics",
+            &json!({}),
+            None
+        )));
+        f.live.set(fixed_live(true, false, Mode::AcceptEdits));
+
+        // Non-Claude drivers are unaffected even if grants are populated.
+        for driver in [Driver::Codex, Driver::Agy, Driver::Local] {
+            let other = f.gate_with_mcp(
+                driver,
+                TaskMode::AcceptEdits,
+                Some(vec![Capability::Network]),
+                grants.clone(),
+            );
+            let tool = match driver {
+                Driver::Codex => "mcp__discussion__list_topics",
+                Driver::Agy => "call_mcp_tool",
+                Driver::Local => agent_core::local_mcp::APPROVAL_TOOL,
+                Driver::Claude => unreachable!(),
+            };
+            let input = json!({"ServerName": "discussion", "ToolName": "list_topics"});
+            assert!(is_deny(&other.judge(tool, &input, None)), "{driver:?}");
+            assert!(
+                !other.rule_may_apply(
+                    &Action::Mcp {
+                        server: "discussion".into(),
+                        tool: "list_topics".into(),
+                    },
+                    None
+                ),
+                "{driver:?}"
+            );
+        }
     }
 }

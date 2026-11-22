@@ -234,8 +234,14 @@ def mcp_child():
                       "capabilities": {"tools": {}},
                       "serverInfo": {"name": "delegation-proof", "version": "1"}}
         elif method == "tools/list":
-            result = {"tools": [{"name": "echo", "description": "Return the fixed word OK.",
-                                  "inputSchema": {"type": "object", "properties": {}}}]}
+            tool = {"name": "echo", "description": "Return the fixed word OK.",
+                    "inputSchema": {"type": "object", "properties": {}}}
+            if "PROOF_READONLY" in os.environ:
+                tool["annotations"] = {"readOnlyHint": os.environ["PROOF_READONLY"] == "1"}
+            advertised = [tool]
+            if os.environ.get("PROOF_SIBLING"):
+                advertised.append({**tool, "name": "blocked"})
+            result = {"tools": advertised}
         elif method == "tools/call":
             with log.open("a") as stream:
                 stream.write(json.dumps({"event": "call", "tool": frame["params"].get("name"),
@@ -270,6 +276,8 @@ class ModelFixture:
     """Captures tool NAMES only; never stores prompts, headers or credentials."""
     def __init__(self):
         self.tools = []
+        self.anthropic_tool = "Bash"
+        self.anthropic_input = {"command": "touch proof-denied", "description": "Permission proof"}
         self.requests = []
         self.shapes = []
         self.native_probe = False
@@ -354,9 +362,9 @@ class ModelFixture:
                     "id": "msg_proof", "type": "message", "role": "assistant", "model": body.get("model"),
                     "content": [], "stop_reason": None, "stop_sequence": None,
                     "usage": {"input_tokens": 1, "output_tokens": 0}}})
-                block = {"type": "tool_use", "id": "tool_proof", "name": "Bash", "input": {}} if tool else {"type": "text", "text": ""}
+                block = {"type": "tool_use", "id": "tool_proof", "name": owner.anthropic_tool, "input": {}} if tool else {"type": "text", "text": ""}
                 self.event("content_block_start", {"type": "content_block_start", "index": 0, "content_block": block})
-                delta = {"type": "input_json_delta", "partial_json": json.dumps({"command": "touch proof-denied", "description": "Permission proof"})} if tool else {"type": "text_delta", "text": "OK"}
+                delta = {"type": "input_json_delta", "partial_json": json.dumps(owner.anthropic_input)} if tool else {"type": "text_delta", "text": "OK"}
                 self.event("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": delta})
                 self.event("content_block_stop", {"type": "content_block_stop", "index": 0})
                 self.event("message_delta", {"type": "message_delta", "delta": {
@@ -701,8 +709,99 @@ def claude_proof(base, output):
         finally:
             process.close()
     leaks = scan_canary(home, canary)
+    granted_mcp = claude_granted_mcp_proof(base, output)
     return {"G-C1": approval, "G-C3": not leaks, "token_leak_paths": leaks,
+            "selected_mcp_host_gate": granted_mcp,
             "provider": "claude", "model_transport": "local fixture; no cloud inference"}
+
+
+def claude_granted_mcp_proof(base, output):
+    """A selected server still asks the host; a deny never reaches the server.
+
+    The app's unit tests decide the exact grant. This exercises the installed CLI's
+    permission callback with the same restricted launch and an ambient allow rule.
+    """
+    for allow, read_only in ((False, False), (True, False), (False, True), (True, True)):
+        root = base / (f"selected-mcp-{'allow' if allow else 'deny'}-{'read' if read_only else 'write'}")
+        home, work, runtime = root / "home", root / "work", root / "runtime"
+        for path in (home, work, runtime):
+            path.mkdir(mode=0o700, parents=True)
+        config = home / ".claude"
+        config.mkdir()
+        server_name = "discussion-board" if read_only else "discussion"
+        tool_name = "echo" if allow else "blocked"
+        name = f"mcp__{server_name}__{tool_name}"
+        hook = runtime / "allow_hook.py"
+        hook_marker = runtime / "hook-ran"
+        hook.write_text("from pathlib import Path\nimport json\n"
+                        f"Path({str(hook_marker)!r}).write_text('ran')\n"
+                        "print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'allow'}}))\n")
+        settings = {"permissions": {"allow": [f"mcp__{server_name}__*"]},
+                    "enableAllProjectMcpServers": True,
+                    "hooks": {"PreToolUse": [{"matcher": name, "hooks": [{"type": "command",
+                               "command": shlex.join([sys.executable, str(hook)])}]}]}}
+        (config / "settings.json").write_text(json.dumps(settings))
+        project_config = work / ".claude"
+        project_config.mkdir()
+        (project_config / "settings.json").write_text(json.dumps(settings))
+        (project_config / "settings.local.json").write_text(json.dumps(settings))
+        log = runtime / "calls.jsonl"
+        overlay = runtime / "overlay.json"
+        server = {"command": sys.executable, "args": [str(HERE), "--mcp-child"],
+                  "env": {"PROOF_LOG": str(log), "PROOF_READONLY": "1" if read_only else "0", "PROOF_SIBLING": "1"}}
+        bridge = {**server, "env": {"PROOF_LOG": str(runtime / "bridge.jsonl")}}
+        ambient = {**server, "env": {"PROOF_LOG": str(runtime / "ambient.jsonl")}}
+        (work / ".mcp.json").write_text(json.dumps({"mcpServers": {"ambient": ambient}}))
+        overlay.write_text(json.dumps({"mcpServers": {"agent_terminal": bridge, server_name: server}}))
+        overlay.chmod(0o600)
+        env = environment(home)
+        env.update({"CLAUDE_CONFIG_DIR": str(config), "ANTHROPIC_API_KEY": "local-proof-placeholder",
+                    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "DISABLE_TELEMETRY": "1",
+                    "DISABLE_ERROR_REPORTING": "1", "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"})
+        with ModelFixture() as model:
+            model.anthropic_tool, model.anthropic_input = name, {}
+            env["ANTHROPIC_BASE_URL"] = model.url
+            argv = [shutil.which("claude"), "--output-format", "stream-json", "--verbose",
+                    "--input-format", "stream-json", "--permission-prompt-tool", "stdio",
+                    "--restricted", "--strict-mcp-config", "--permission-mode", "default",
+                    "--mcp-config", str(overlay), "--tools", "Read,Glob,Grep", "--model", "haiku"]
+            process = Wire(argv, work, env, output / (root.name + ".jsonl"), "synthetic-unused-canary")
+            asked = False
+            try:
+                process.send({"type": "control_request", "request_id": "init-grant-proof",
+                              "request": {"subtype": "initialize"}})
+                process.send({"type": "user", "message": {"role": "user", "content": "Run the MCP proof."},
+                              "parent_tool_use_id": None})
+                deadline = time.monotonic() + 60
+                while time.monotonic() < deadline:
+                    frame = process.wait(lambda _frame: True, timeout=max(0.1, deadline - time.monotonic()))
+                    assert frame is not None, "Claude MCP proof exited or timed out"
+                    request = frame.get("request", {})
+                    if frame.get("type") == "control_request" and request.get("subtype") == "can_use_tool":
+                        assert request.get("tool_name") == name, "unexpected permission callback"
+                        asked = True
+                        answer = ({"behavior": "allow", "updatedInput": request.get("input", {})}
+                                  if allow else {"behavior": "deny", "message": "Not granted by host"})
+                        process.send({"type": "control_response", "response": {"subtype": "success",
+                                      "request_id": frame["request_id"], "response": answer}})
+                    if frame.get("type") == "result":
+                        assert not frame.get("is_error"), "Claude MCP proof turn failed"
+                        break
+                else:
+                    raise AssertionError("Claude MCP proof deadline exceeded")
+                assert asked, "selected MCP tool bypassed the host callback"
+                init = next(f for f in process.frames if f.get("type") == "system" and f.get("subtype") == "init")
+                assert {s["name"] for s in init["mcp_servers"]} == {"agent_terminal", server_name}
+                assert "Bash" not in init["tools"] and name in init["tools"]
+            finally:
+                process.close()
+        calls = [json.loads(line) for line in log.read_text().splitlines()]
+        invoked = [call for call in calls if call.get("event") == "call"]
+        assert bool(invoked) == allow, "server invocation did not match host decision"
+        assert all(call.get("tool") == "echo" for call in invoked), "unlisted sibling tool executed"
+        assert not hook_marker.exists(), "ambient permission hook ran in restricted child"
+        assert not (runtime / "ambient.jsonl").exists(), "ambient MCP server started in strict child"
+    return True
 
 
 def agy_attested(calls, timed_frames):

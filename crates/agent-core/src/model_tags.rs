@@ -83,13 +83,41 @@ pub fn headroom(windows: &[QuotaWindow], age_s: Option<i64>, max_age_s: i64) -> 
     }
 }
 
-/// How loaded the agent's plan is, to rank agents by: the fullest window's share used, clamped to
-/// 0.0–1.0. `None` exactly when [`headroom`] is `unknown` (no finite window, no age, or a reading
-/// older than `max_age_s`).
+/// How loaded the agent's plan is, to rank agents by: the fullest window's share used (or, when
+/// windows carry distinct `group` buckets, the least-loaded group's fullest window bounded below by
+/// any ungrouped window), clamped to 0.0–1.0. `None` exactly when [`headroom`] is `unknown` (no
+/// finite window, no age, or a reading older than `max_age_s`).
 pub fn load(windows: &[QuotaWindow], age_s: Option<i64>, max_age_s: i64) -> Option<f64> {
     match age_s {
         Some(age) if (0..=max_age_s).contains(&age) => {}
         _ => return None,
+    }
+    if windows
+        .iter()
+        .any(|w| w.group.as_deref().is_some_and(|g| !g.trim().is_empty()))
+    {
+        let mut by_group: BTreeMap<&str, f64> = BTreeMap::new();
+        let mut ungrouped: Option<f64> = None;
+        for w in windows.iter().filter(|w| w.used.is_finite()) {
+            let u = w.used.clamp(0.0, 1.0);
+            match w.group.as_deref().map(str::trim).filter(|g| !g.is_empty()) {
+                Some(g) => {
+                    by_group.entry(g).and_modify(|m| *m = m.max(u)).or_insert(u);
+                }
+                None => ungrouped = Some(ungrouped.map_or(u, |a| a.max(u))),
+            }
+        }
+        let group_min = by_group
+            .values()
+            .copied()
+            .fold(None, |acc: Option<f64>, u| {
+                Some(acc.map_or(u, |a| a.min(u)))
+            });
+        return match (group_min, ungrouped) {
+            (Some(g), Some(u)) => Some(g.max(u)),
+            (Some(g), None) => Some(g),
+            (None, u) => u,
+        };
     }
     windows
         .iter()
@@ -640,6 +668,23 @@ mod tests {
         assert_eq!(at(&[]), Headroom::Unknown, "no window");
         assert_eq!(at(&[f64::NAN]), Headroom::Unknown, "nothing finite");
         assert_eq!(at(&[f64::NAN, 0.5]), Headroom::Ok);
+        // Grouped windows: an exhausted model group does not mark another available group exhausted.
+        let grouped = [
+            QuotaWindow {
+                group: Some("Gemini Models".into()),
+                label: "5-hour".into(),
+                used: 0.03,
+                resets_at: None,
+            },
+            QuotaWindow {
+                group: Some("Claude and GPT models".into()),
+                label: "Weekly".into(),
+                used: 1.0,
+                resets_at: None,
+            },
+        ];
+        assert_eq!(headroom(&grouped, Some(0), MAX_AGE), Headroom::Ok);
+        assert_eq!(load(&grouped, Some(0), MAX_AGE), Some(0.03));
     }
 
     #[test]

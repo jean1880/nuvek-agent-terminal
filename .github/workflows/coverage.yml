@@ -38,14 +38,21 @@ jobs:
       - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: cargo-nextest@0.9.148,cargo-llvm-cov@0.9.1
+      # The cached target/ is only for the compiler that built it. Test binaries built by another
+      # rustc have other file names, are left beside the new ones by `llvm-cov clean --workspace`,
+      # and are counted in the report as code that never ran. So the key, and every key it may
+      # fall back to, names the compiler.
+      - name: Name the compiler
+        id: toolchain
+        run: echo "rustc=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-coverage-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-coverage-
+          key: ${{ runner.os }}-coverage-rustc-${{ steps.toolchain.outputs.rustc }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-coverage-rustc-${{ steps.toolchain.outputs.rustc }}-
       - name: make coverage
         id: coverage
         env:

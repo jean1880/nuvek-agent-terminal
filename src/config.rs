@@ -156,6 +156,11 @@ pub struct Profile {
     /// agent meanwhile. `None`: no probe, and the server's headroom follows its cost alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headroom_probe: Option<agent_core::headroom_probe::HeadroomProbe>,
+    /// Optional explicit stdio MCP server definitions and exact tool allowlists granted to
+    /// delegated Claude children launched from this profile. Empty by default: delegated
+    /// children see only `agent_terminal`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub child_mcp_servers: Vec<agent_core::delegation::launch::ChildMcpServer>,
 }
 
 /// A blank profile with a fresh id, so the invariant holds for `..Profile::default()` too.
@@ -187,6 +192,7 @@ impl Default for Profile {
             provider: None,
             free_to_run: None,
             headroom_probe: None,
+            child_mcp_servers: Vec::new(),
         }
     }
 }
@@ -3568,6 +3574,47 @@ mod tests {
             .expect("kept through a load");
         assert_eq!(saved.low_below, 2.5);
         assert_eq!(saved.timeout_s, 9);
+    }
+
+    #[test]
+    fn child_mcp_servers_default_empty_round_trip_and_survive_duplicate() {
+        use agent_core::delegation::launch::ChildMcpServer;
+        let old: Profile =
+            serde_json::from_str(r#"{"name": "Claude", "command": "claude"}"#).unwrap();
+        assert!(old.child_mcp_servers.is_empty());
+        assert!(serde_json::to_value(&old)
+            .unwrap()
+            .get("child_mcp_servers")
+            .is_none());
+
+        let granted: Profile = serde_json::from_str(
+            r#"{"name": "Claude", "command": "claude",
+                "child_mcp_servers": [{
+                    "name": "discussion",
+                    "command": "/usr/local/bin/example-mcp",
+                    "args": ["--stdio"],
+                    "tools": ["list_topics", "post_message"]
+                }]}"#,
+        )
+        .unwrap();
+        let expected = vec![ChildMcpServer {
+            name: "discussion".into(),
+            command: "/usr/local/bin/example-mcp".into(),
+            args: vec!["--stdio".into()],
+            tools: vec!["list_topics".into(), "post_message".into()],
+        }];
+        assert_eq!(granted.child_mcp_servers, expected);
+        assert_eq!(granted.duplicate("Copy").child_mcp_servers, expected);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let config = TerminalConfig {
+            profiles: vec![granted],
+            ..TerminalConfig::default()
+        };
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let loaded = TerminalConfig::load_from(&path);
+        assert_eq!(loaded.profiles[0].child_mcp_servers, expected);
     }
 
     #[test]

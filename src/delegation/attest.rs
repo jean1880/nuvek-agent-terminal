@@ -247,6 +247,7 @@ impl DelegationHooks for Hooks {
         }
         let prep = w.staged.take()?;
         w.token = Some(TokenSlot::new(epoch, generation, prep.token.clone(), None));
+        *w.child_mcp.borrow_mut() = prep.child_mcp;
         // The watch is attached only after a successful spawn. Keep the overlay until then. One
         // still pending belongs to an earlier start that never spawned: nothing else removes it.
         let stale = std::mem::replace(&mut w.pending_overlay, prep.overlay);
@@ -277,6 +278,7 @@ impl DelegationHooks for Hooks {
                 .is_some_and(|t| t.generation == generation && t.pid.is_none())
             {
                 w.token = None;
+                w.child_mcp.borrow_mut().clear();
             }
             w.pending_overlay.take()
         };

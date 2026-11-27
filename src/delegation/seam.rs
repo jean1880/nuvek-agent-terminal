@@ -1,5 +1,6 @@
 //! Shared interfaces between the delegation supervisor, sessions and app services.
 
+use std::cell::RefCell;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -8,6 +9,7 @@ use std::rc::Rc;
 use agent_core::adapter::{Driver, Mode};
 use agent_core::delegation::authority::{InheritedAuthority, TaskMode};
 use agent_core::delegation::ipc::{Call, CallOutcome, Hello, Welcome};
+use agent_core::delegation::launch::ChildMcpGrants;
 use agent_core::delegation::mailbox::{DeliveryPlan, MessageKind};
 use agent_core::delegation::scope::ScopedEnvelope;
 use agent_core::delegation::wire::WorkerSummary;
@@ -94,6 +96,8 @@ pub(crate) struct BindingRequest {
     pub endpoint: PathBuf,
     pub instance: InstanceNonce,
     pub rundir: RuntimeDir,
+    /// Snapshot of validated explicit child MCP grants for this generation (Claude children only).
+    pub child_mcp: ChildMcpGrants,
 }
 
 /// A fully prepared, immutable binding: token minted, Claude overlay already written.
@@ -105,6 +109,8 @@ pub(crate) struct PreparedBinding {
     pub launch: LaunchBinding,
     /// The Claude overlay file, unlinked only after this generation's observed exit.
     pub overlay: Option<PathBuf>,
+    /// The exact child MCP grants written into this generation's overlay (Claude children only).
+    pub child_mcp: ChildMcpGrants,
 }
 
 /// A child profile resolved for launch (from the window's cached detection). `env.unset` already
@@ -216,6 +222,8 @@ pub(crate) struct AuthorityParams {
     pub capabilities: Option<Vec<agent_core::delegation::authority::Capability>>,
     pub home: Option<PathBuf>,
     pub live: Rc<dyn Fn() -> LiveAuthority>,
+    /// Active generation's validated child MCP grants (updated on generation bind; Claude only).
+    pub child_mcp: Rc<RefCell<ChildMcpGrants>>,
 }
 
 // ---- session seam (A implements, B calls) ------------------------------------------------------

@@ -108,6 +108,16 @@ impl Supervisor {
                     "child launch must be restored before receiving work",
                 )
             })?;
+        if let Some(live_profile) = (self.services.profiles)()
+            .into_iter()
+            .find(|p| p.id == spec.profile.id)
+        {
+            spec.profile = live_profile;
+        } else {
+            // A removed profile must not carry its old MCP grants into a new generation.
+            spec.profile.child_mcp_servers.clear();
+        }
+        let child_mcp = snapshot_child_mcp(spec.driver, &spec.profile)?;
         if spec.provider.is_empty() {
             let thread = spec.thread.clone();
             let driver = spec.driver;
@@ -122,7 +132,9 @@ impl Supervisor {
                 .child_specs
                 .insert(worker.clone(), spec.clone());
         }
-        let approval = self.prepare_launch(&spec, generation).await?;
+        let approval = self
+            .prepare_launch(&spec, generation, child_mcp.clone())
+            .await?;
         input.epoch = self
             .settled_delivery_epoch(&input.from, worker, input.epoch)
             .await?;
@@ -137,7 +149,8 @@ impl Supervisor {
                 .get_mut(worker)
                 .ok_or_else(|| error(ErrorCode::NotFound, "worker closed"))?;
             w.readback = super::readback::Readback::child(spec.driver, spec.mode)
-                .with_capabilities(spec.capabilities.clone());
+                .with_capabilities(spec.capabilities.clone())
+                .with_child_mcp(child_mcp.clone());
             Ok(())
         };
         let session = if let Some(session) = session {
@@ -225,6 +238,7 @@ impl Supervisor {
         })?;
         let driver = crate::config::profile_driver(&profile)
             .ok_or_else(|| error(ErrorCode::ProviderUnavailable, "profile has no adapter"))?;
+        let child_mcp = snapshot_child_mcp(driver, &profile)?;
         let (parent_driver, root, cwd, depth) = {
             let state = self.state.borrow();
             let w = &state.workers[caller];
@@ -528,7 +542,8 @@ impl Supervisor {
         let mut runtime = self.worker_rt(row, root, spec.cwd.clone());
         runtime.run = accepted.run.clone();
         runtime.readback = super::readback::Readback::child(driver, r.task_mode)
-            .with_capabilities(spec.capabilities.clone());
+            .with_capabilities(spec.capabilities.clone())
+            .with_child_mcp(child_mcp.clone());
         runtime.pending = Some(DelegatedInput {
             operation: accepted.operation.clone(),
             epoch,
@@ -549,7 +564,9 @@ impl Supervisor {
             self.note_run_started(run);
         }
         self.notify_registry();
-        let prepared = self.prepare_launch(&spec, ProcessGeneration(1)).await;
+        let prepared = self
+            .prepare_launch(&spec, ProcessGeneration(1), child_mcp)
+            .await;
         match prepared {
             Ok(approval) => {
                 if let Err(e) = self.dispatch_check(caller, &worker, epoch, accepted.run.as_ref()) {
@@ -578,6 +595,7 @@ impl Supervisor {
         self: &Rc<Self>,
         spec: &ChildSpec,
         generation: ProcessGeneration,
+        child_mcp: agent_core::delegation::launch::ChildMcpGrants,
     ) -> Result<Approval, ToolError> {
         #[cfg(test)]
         {
@@ -605,7 +623,8 @@ impl Supervisor {
         } else {
             Err(None)
         };
-        self.stage(&spec.worker, generation, &spec.profile).await?;
+        self.stage_with_child_mcp(&spec.worker, generation, &spec.profile, child_mcp)
+            .await?;
         Ok(approval)
     }
     pub(super) fn build_child(
@@ -671,6 +690,13 @@ impl Supervisor {
                 parent_mode: s.principal_mode(&parent),
             }
         });
+        let child_mcp = self
+            .state
+            .borrow()
+            .workers
+            .get(&worker)
+            .map(|w| w.child_mcp.clone())
+            .unwrap_or_default();
         let gate = Rc::new(super::authority::ChildAuthority::new(AuthorityParams {
             inherited,
             driver: spec.driver,
@@ -678,6 +704,7 @@ impl Supervisor {
             capabilities: spec.capabilities.clone(),
             home: authority_home(&resolved.env),
             live,
+            child_mcp,
         }));
         let publisher = Rc::new(super::publish::Publisher::new(
             self.weak.clone(),
@@ -913,6 +940,7 @@ impl Supervisor {
                 let run = w.run.take();
                 w.last_run = run.clone();
                 w.token = None;
+                w.child_mcp.borrow_mut().clear();
                 // A root's delegation failing is not its agent failing: it keeps running, without
                 // sub-agents, until it is bound again (a switch, a reopen).
                 if is_root {
@@ -975,6 +1003,21 @@ impl Supervisor {
         }
         self.notify_registry();
     }
+}
+
+/// Validates and freezes the explicit child MCP grants for one Claude child generation.
+/// Non-Claude drivers always receive an empty grant set.
+fn snapshot_child_mcp(
+    driver: Driver,
+    profile: &Profile,
+) -> Result<agent_core::delegation::launch::ChildMcpGrants, ToolError> {
+    if driver != Driver::Claude {
+        return Ok(agent_core::delegation::launch::ChildMcpGrants::default());
+    }
+    agent_core::delegation::launch::ChildMcpGrants::try_from_servers(
+        profile.child_mcp_servers.clone(),
+    )
+    .map_err(|reason| error(ErrorCode::InvalidArgument, &reason))
 }
 
 /// The home whose dotfiles a child's authority keeps out of automatic grants: the one its

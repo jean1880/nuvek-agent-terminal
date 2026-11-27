@@ -660,6 +660,13 @@ Architectural mandates, standards, and workflows for this codebase.
   approve it. With nothing declared the task mode decides, and the user's shell and edit rules
   reach a writing child within it (`rule_may_apply`); a plan child has no network unless declared.
   `authority::tests::a_declared_limit_is_refused_and_no_rule_reaches_past_it` proves these.
+  A Claude profile's optional `child_mcp_servers` (`agent_core::delegation::launch::ChildMcpServer`,
+  default empty) may grant delegated Claude children explicit stdio MCP servers and exact
+  callable tool names, snapshotted per process generation across the `--mcp-config` overlay
+  (never `--tools`, never receiving the bridge token), `system/init` server read-back, and
+  `ChildAuthority::judge`/`rule_may_apply` (operator-trusted in plan mode too, requiring
+  `Capability::Network` when capabilities are declared; unlisted tools, extra servers, and
+  other drivers remain denied).
   **Accepted exception:** every agy child runs forced into dangerous
   permissive mode like a thread does: none of its own tool calls reaches `judge` (no hook asks),
   so its task mode and declared limits are not enforced; only its `cross_agent_*` bridge calls

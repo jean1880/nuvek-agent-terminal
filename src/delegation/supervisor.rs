@@ -2491,6 +2491,8 @@ pub(super) struct WorkerRt {
     pub cwd: PathBuf,
     /// Requests put to the user and not yet settled; see [`OpenRequests`].
     pub open_requests: OpenRequests,
+    /// Active generation's validated child MCP grants (updated on generation bind; Claude only).
+    pub child_mcp: Rc<RefCell<agent_core::delegation::launch::ChildMcpGrants>>,
     /// When the worker was last seen at work (or was created): an idle worker's process is
     /// paused least recently active first, and only once idle long enough.
     pub last_active: Instant,
@@ -3163,6 +3165,9 @@ impl Supervisor {
             opened_run: None,
             cwd,
             open_requests: OpenRequests::default(),
+            child_mcp: Rc::new(RefCell::new(
+                agent_core::delegation::launch::ChildMcpGrants::default(),
+            )),
             last_active: Instant::now(),
         }
     }
@@ -3171,6 +3176,21 @@ impl Supervisor {
         worker: &WorkerId,
         generation: ProcessGeneration,
         profile: &Profile,
+    ) -> Result<(), ToolError> {
+        self.stage_with_child_mcp(
+            worker,
+            generation,
+            profile,
+            agent_core::delegation::launch::ChildMcpGrants::default(),
+        )
+        .await
+    }
+    pub(super) async fn stage_with_child_mcp(
+        self: &Rc<Self>,
+        worker: &WorkerId,
+        generation: ProcessGeneration,
+        profile: &Profile,
+        child_mcp: agent_core::delegation::launch::ChildMcpGrants,
     ) -> Result<(), ToolError> {
         // Captured once; after each await it is re-read (`settled_epoch_for`): a sibling's close
         // or exit moves it on, and only a revocation covering this worker fails the binding. One
@@ -3218,6 +3238,11 @@ impl Supervisor {
             endpoint: super::ipc::socket_path(&self.rundir, self.services.app_pid),
             instance: self.instance.clone(),
             rundir: self.rundir.clone(),
+            child_mcp: if role == Role::Child && driver == Driver::Claude {
+                child_mcp
+            } else {
+                agent_core::delegation::launch::ChildMcpGrants::default()
+            },
         };
         if !opted_in(profile) {
             return Err(error(

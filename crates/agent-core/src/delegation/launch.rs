@@ -5,6 +5,8 @@
 //! [`DelegationBinding`] is never serialised. The Local runner's [`LocalBridge`] is serialised
 //! once, into its startup frame on stdin, and nowhere else.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
@@ -13,6 +15,188 @@ use super::env::{ENV_APP_PID, ENV_CAP, ENV_ENDPOINT, ENV_INSTANCE};
 use super::ids::{ProcessGeneration, WorkerId};
 use super::token::{CapabilityToken, InstanceNonce};
 use super::{BRIDGE_ARG, SERVER_NAME};
+
+/// Maximum number of extra stdio MCP servers a profile may grant to a delegated Claude child.
+pub const MAX_CHILD_MCP_SERVERS: usize = 8;
+/// Maximum byte length of a child MCP server name.
+pub const MAX_CHILD_MCP_SERVER_NAME_LEN: usize = 64;
+/// Maximum byte length of a child MCP server command.
+pub const MAX_CHILD_MCP_COMMAND_LEN: usize = 4096;
+/// Maximum argument count for one child MCP server.
+pub const MAX_CHILD_MCP_ARGS: usize = 64;
+/// Maximum combined byte length of arguments for one child MCP server.
+pub const MAX_CHILD_MCP_ARGS_BYTES: usize = 16 * 1024;
+/// Maximum allowed tool names per child MCP server.
+pub const MAX_CHILD_MCP_TOOLS_PER_SERVER: usize = 64;
+/// Maximum total allowed tool names across all child MCP servers on a profile.
+pub const MAX_CHILD_MCP_TOTAL_TOOLS: usize = 128;
+/// Maximum byte length of one allowed tool name.
+pub const MAX_CHILD_MCP_TOOL_NAME_LEN: usize = 128;
+
+/// One explicit stdio MCP server and exact tool allowlist granted to a delegated Claude child.
+///
+/// Selected tools are operator-trusted and may carry external side effects even in plan mode.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChildMcpServer {
+    /// Server name in Claude's `--mcp-config` (`mcpServers.<name>`) and `mcp__<name>__<tool>`.
+    pub name: String,
+    /// Absolute executable path for stdio transport.
+    pub command: String,
+    /// Optional command arguments.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Exact tool names on this server callable by the child. Non-empty, no wildcards.
+    pub tools: Vec<String>,
+}
+
+impl std::fmt::Debug for ChildMcpServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChildMcpServer")
+            .field("name", &self.name)
+            .field("command", &self.command)
+            .field("args_len", &self.args.len())
+            .field("tools", &self.tools)
+            .finish()
+    }
+}
+
+impl ChildMcpServer {
+    /// Validates server identity, command/args bounds, and exact non-empty tool names.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.name.is_empty()
+            || self.name.len() > MAX_CHILD_MCP_SERVER_NAME_LEN
+            || !self.name.as_bytes()[0].is_ascii_alphanumeric()
+            || !self
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            || self.name.contains("__")
+        {
+            return Err(format!(
+                "invalid child MCP server name {:?}: use 1–{} ASCII letters, digits, '-' or '_' without '__'",
+                self.name, MAX_CHILD_MCP_SERVER_NAME_LEN
+            ));
+        }
+        if self.name.to_ascii_lowercase().replace('-', "_") == SERVER_NAME {
+            return Err(format!(
+                "child MCP server name {:?} is reserved for {SERVER_NAME}",
+                self.name
+            ));
+        }
+        if self.command.is_empty()
+            || !std::path::Path::new(&self.command).is_absolute()
+            || self.command.len() > MAX_CHILD_MCP_COMMAND_LEN
+            || self.command.trim() != self.command
+            || self.command.contains('\0')
+            || self.command.chars().any(char::is_control)
+        {
+            return Err(format!(
+                "invalid command for child MCP server {:?}",
+                self.name
+            ));
+        }
+        if self.args.len() > MAX_CHILD_MCP_ARGS
+            || self.args.iter().map(String::len).sum::<usize>() > MAX_CHILD_MCP_ARGS_BYTES
+            || self
+                .args
+                .iter()
+                .any(|a| a.contains('\0') || a.chars().any(char::is_control))
+            || self.args.iter().any(|a| a.trim() == BRIDGE_ARG)
+        {
+            return Err(format!(
+                "invalid arguments for child MCP server {:?}",
+                self.name
+            ));
+        }
+        if self.tools.is_empty() || self.tools.len() > MAX_CHILD_MCP_TOOLS_PER_SERVER {
+            return Err(format!(
+                "child MCP server {:?} must list 1–{} exact tool names",
+                self.name, MAX_CHILD_MCP_TOOLS_PER_SERVER
+            ));
+        }
+        let mut seen_tools = BTreeSet::new();
+        for tool in &self.tools {
+            if tool.is_empty()
+                || tool.len() > MAX_CHILD_MCP_TOOL_NAME_LEN
+                || !(tool.as_bytes()[0].is_ascii_alphanumeric() || tool.as_bytes()[0] == b'_')
+                || !tool
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                || tool.starts_with("mcp__")
+            {
+                return Err(format!(
+                    "invalid tool name {:?} for child MCP server {:?}: exact names only, no wildcards",
+                    tool, self.name
+                ));
+            }
+            if !seen_tools.insert(tool.as_str()) {
+                return Err(format!(
+                    "duplicate tool name {:?} for child MCP server {:?}",
+                    tool, self.name
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Validated, immutable snapshot of extra child MCP server grants for one process generation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChildMcpGrants {
+    servers: Vec<ChildMcpServer>,
+}
+
+impl ChildMcpGrants {
+    /// Validates and freezes a list of child MCP server definitions.
+    pub fn try_from_servers(servers: Vec<ChildMcpServer>) -> Result<Self, String> {
+        if servers.len() > MAX_CHILD_MCP_SERVERS {
+            return Err(format!(
+                "at most {MAX_CHILD_MCP_SERVERS} child MCP servers may be configured"
+            ));
+        }
+        let mut seen_names = BTreeSet::new();
+        let mut total_tools = 0usize;
+        for server in &servers {
+            server.validate()?;
+            let key = server.name.to_ascii_lowercase();
+            if !seen_names.insert(key) {
+                return Err(format!("duplicate child MCP server name {:?}", server.name));
+            }
+            total_tools = total_tools.saturating_add(server.tools.len());
+            if total_tools > MAX_CHILD_MCP_TOTAL_TOOLS {
+                return Err(format!(
+                    "at most {MAX_CHILD_MCP_TOTAL_TOOLS} total child MCP tools may be configured"
+                ));
+            }
+        }
+        Ok(Self { servers })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.servers.is_empty()
+    }
+
+    pub fn servers(&self) -> &[ChildMcpServer] {
+        &self.servers
+    }
+
+    pub fn has_server(&self, name: &str) -> bool {
+        self.servers.iter().any(|s| s.name == name)
+    }
+
+    /// Whether exact `(server, tool)` is explicitly allowed by this snapshot.
+    pub fn allows_tool(&self, server: &str, tool: &str) -> bool {
+        self.servers
+            .iter()
+            .find(|s| s.name == server)
+            .is_some_and(|s| s.tools.iter().any(|t| t == tool))
+    }
+
+    pub fn clear(&mut self) {
+        self.servers.clear();
+    }
+}
 
 /// What one process generation of a principal needs to reach the supervisor. `Debug` hides
 /// the token; there is deliberately no `Serialize`.
@@ -110,16 +294,40 @@ impl DelegationBinding {
     /// The bridge reads `APP_PID` from this `env` (the provider's own env never has it), so
     /// it takes the app pid like [`DelegationBinding::env`].
     pub fn claude_overlay(&self, app_pid: u32) -> Value {
-        json!({
-            "mcpServers": {
-                SERVER_NAME: {
-                    "type": "stdio",
-                    "command": self.command,
-                    "args": [BRIDGE_ARG],
-                    "env": self.env_object(app_pid)
-                }
+        self.claude_child_overlay(app_pid, &ChildMcpGrants::default())
+    }
+
+    /// The Claude child `--mcp-config` overlay: `agent_terminal` (with the bridge `env`) plus
+    /// any validated explicit stdio servers in `grants`. Extra servers never receive `env` or
+    /// the delegation capability token.
+    pub fn claude_child_overlay(&self, app_pid: u32, grants: &ChildMcpGrants) -> Value {
+        let mut servers = Map::new();
+        servers.insert(
+            SERVER_NAME.to_owned(),
+            json!({
+                "type": "stdio",
+                "command": self.command,
+                "args": [BRIDGE_ARG],
+                "env": self.env_object(app_pid),
+            }),
+        );
+        for extra in grants.servers() {
+            if extra.name == SERVER_NAME {
+                continue;
             }
-        })
+            servers.insert(
+                extra.name.clone(),
+                json!({
+                    "type": "stdio",
+                    "command": extra.command,
+                    "args": extra.args,
+                }),
+            );
+        }
+        Value::Object(Map::from_iter([(
+            "mcpServers".to_owned(),
+            Value::Object(servers),
+        )]))
     }
 
     /// The Codex `thread/start` / `thread/resume` config: exactly the dotted keys
@@ -217,12 +425,52 @@ pub fn claude_child_init_ok(
     init_tools: &[String],
     init_mcp_servers: &[String],
 ) -> bool {
+    claude_child_init_ok_with_grants(
+        mode,
+        init_tools,
+        init_mcp_servers,
+        &ChildMcpGrants::default(),
+    )
+}
+
+/// Claude child read-back with optional explicit child MCP grants: `system/init.tools` must
+/// contain every expected built-in for `mode` and no unexpected built-ins, plus only MCP tools
+/// from `agent_terminal` or an explicitly granted server (an allowed server may advertise all of
+/// its tools; exact callable tool filtering is enforced by host authority on `can_use_tool`).
+/// `init_mcp_servers` must match `{agent_terminal} ∪ grants` exactly, with no missing, extra,
+/// or duplicate entries.
+pub fn claude_child_init_ok_with_grants(
+    mode: TaskMode,
+    init_tools: &[String],
+    init_mcp_servers: &[String],
+    grants: &ChildMcpGrants,
+) -> bool {
     let expected = child_tools(mode);
-    let tools_ok = init_tools
-        .iter()
-        .all(|t| expected.contains(&t.as_str()) || t.starts_with(CLAUDE_OWN_TOOL_PREFIX))
+    let tool_allowed = |t: &str| {
+        if expected.contains(&t) {
+            return true;
+        }
+        if let Some(rest) = t.strip_prefix(CLAUDE_OWN_TOOL_PREFIX) {
+            return !rest.is_empty();
+        }
+        if let Some((server, name)) = t.strip_prefix("mcp__").and_then(|r| r.split_once("__")) {
+            return !server.is_empty() && !name.is_empty() && grants.has_server(server);
+        }
+        false
+    };
+    let tools_ok = init_tools.iter().all(|t| tool_allowed(t))
         && expected.iter().all(|e| init_tools.iter().any(|t| t == e));
-    let servers_ok = init_mcp_servers.len() == 1 && init_mcp_servers[0] == SERVER_NAME;
+
+    let expected_server_count = 1 + grants.servers().len();
+    let unique_servers: BTreeSet<&str> = init_mcp_servers.iter().map(String::as_str).collect();
+    let servers_ok = init_mcp_servers.len() == expected_server_count
+        && unique_servers.len() == expected_server_count
+        && unique_servers.contains(SERVER_NAME)
+        && grants
+            .servers()
+            .iter()
+            .all(|s| unique_servers.contains(s.name.as_str()));
+
     tools_ok && servers_ok
 }
 
@@ -505,6 +753,212 @@ mod tests {
             "other-4242-w_abcdefgh-3-1.json",
         ] {
             assert_eq!(overlay_sweep_candidate(foreign), None, "{foreign}");
+        }
+    }
+
+    fn sample_server(name: &str, tools: &[&str]) -> ChildMcpServer {
+        ChildMcpServer {
+            name: name.to_owned(),
+            command: "/usr/local/bin/example-mcp".to_owned(),
+            args: vec!["--stdio".to_owned()],
+            tools: tools.iter().map(|t| (*t).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn child_mcp_grants_validation_rejects_reserved_duplicates_wildcards_and_bounds() {
+        assert!(ChildMcpGrants::try_from_servers(Vec::new())
+            .expect("empty")
+            .is_empty());
+
+        let valid = ChildMcpGrants::try_from_servers(vec![sample_server(
+            "discussion-board",
+            &["list_topics", "post_message"],
+        )])
+        .expect("valid");
+        assert!(valid.has_server("discussion-board"));
+        assert!(valid.allows_tool("discussion-board", "list_topics"));
+        assert!(valid.allows_tool("discussion-board", "post_message"));
+        assert!(!valid.allows_tool("discussion-board", "delete_topic"));
+        assert!(!valid.allows_tool("other-server", "list_topics"));
+
+        for bad in [
+            // Reserved server name (exact, uppercase, hyphenated)
+            vec![sample_server("agent_terminal", &["t1"])],
+            vec![sample_server("AGENT-TERMINAL", &["t1"])],
+            vec![sample_server("agent-terminal", &["t1"])],
+            // Duplicate server names (exact and case-insensitive)
+            vec![
+                sample_server("board", &["t1"]),
+                sample_server("board", &["t2"]),
+            ],
+            vec![
+                sample_server("Board", &["t1"]),
+                sample_server("board", &["t2"]),
+            ],
+            // Invalid server names (empty, double underscore, bad chars, leading dash, too long)
+            vec![sample_server("", &["t1"])],
+            vec![sample_server("bad__name", &["t1"])],
+            vec![sample_server("bad name", &["t1"])],
+            vec![sample_server("-leading", &["t1"])],
+            vec![sample_server(
+                &"a".repeat(MAX_CHILD_MCP_SERVER_NAME_LEN + 1),
+                &["t1"],
+            )],
+            // Empty / wildcard / duplicate / prefixed / invalid tool names
+            vec![sample_server("board", &[])],
+            vec![sample_server("board", &["*"])],
+            vec![sample_server("board", &["board_*"])],
+            vec![sample_server("board", &["t1", "t1"])],
+            vec![sample_server("board", &["mcp__board__t1"])],
+            vec![sample_server("board", &[""])],
+            vec![sample_server("board", &["bad tool"])],
+            // Invalid command / bridge arg / control chars
+            vec![ChildMcpServer {
+                command: "./example-mcp".into(),
+                ..sample_server("board", &["t1"])
+            }],
+            vec![ChildMcpServer {
+                command: "example-mcp".into(),
+                ..sample_server("board", &["t1"])
+            }],
+            vec![ChildMcpServer {
+                command: "".into(),
+                ..sample_server("board", &["t1"])
+            }],
+            vec![ChildMcpServer {
+                command: " /usr/bin/mcp ".into(),
+                ..sample_server("board", &["t1"])
+            }],
+            vec![ChildMcpServer {
+                command: "/usr/bin/mcp\0".into(),
+                ..sample_server("board", &["t1"])
+            }],
+            vec![ChildMcpServer {
+                args: vec![BRIDGE_ARG.into()],
+                ..sample_server("board", &["t1"])
+            }],
+            vec![ChildMcpServer {
+                args: vec!["bad\narg".into()],
+                ..sample_server("board", &["t1"])
+            }],
+        ] {
+            assert!(
+                ChildMcpGrants::try_from_servers(bad.clone()).is_err(),
+                "should reject {bad:?}"
+            );
+        }
+
+        // Server count bound
+        let too_many_servers: Vec<_> = (0..=MAX_CHILD_MCP_SERVERS)
+            .map(|i| sample_server(&format!("srv-{i}"), &["t1"]))
+            .collect();
+        assert!(ChildMcpGrants::try_from_servers(too_many_servers).is_err());
+
+        // Total tool count bound
+        let tools_40: Vec<String> = (0..40).map(|i| format!("tool_{i}")).collect();
+        let too_many_total: Vec<_> = (0..4)
+            .map(|i| ChildMcpServer {
+                name: format!("srv-{i}"),
+                command: "/usr/local/bin/example-mcp".into(),
+                args: Vec::new(),
+                tools: tools_40.clone(),
+            })
+            .collect();
+        assert!(ChildMcpGrants::try_from_servers(too_many_total).is_err());
+    }
+
+    #[test]
+    fn claude_child_overlay_adds_configured_server_and_keeps_token_only_under_bridge_env() {
+        let grants = ChildMcpGrants::try_from_servers(vec![sample_server(
+            "discussion",
+            &["list_topics", "post_message"],
+        )])
+        .expect("valid");
+        let overlay = binding().claude_child_overlay(7, &grants);
+        assert_eq!(overlay["mcpServers"]["discussion"]["type"], "stdio");
+        assert_eq!(
+            overlay["mcpServers"]["discussion"]["command"],
+            "/usr/local/bin/example-mcp"
+        );
+        assert_eq!(
+            overlay["mcpServers"]["discussion"]["args"],
+            json!(["--stdio"])
+        );
+        assert!(overlay["mcpServers"]["discussion"].get("env").is_none());
+        let mut paths = Vec::new();
+        token_paths(&overlay, "", &mut paths);
+        assert_eq!(
+            paths,
+            vec![format!("/mcpServers/agent_terminal/env/{ENV_CAP}")]
+        );
+    }
+
+    #[test]
+    fn claude_child_readback_with_grants_verifies_exact_server_set_and_builtins() {
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
+        let grants =
+            ChildMcpGrants::try_from_servers(vec![sample_server("discussion", &["list_topics"])])
+                .expect("valid");
+
+        // Configured server may advertise more tools than the allowlist; host authority filters.
+        let mut tools = s(CLAUDE_CHILD_TOOLS_PLAN);
+        tools.push("mcp__agent_terminal__cross_agent_read".into());
+        tools.push("mcp__discussion__list_topics".into());
+        tools.push("mcp__discussion__admin_delete".into());
+        let servers = s(&["agent_terminal", "discussion"]);
+        assert!(claude_child_init_ok_with_grants(
+            TaskMode::Plan,
+            &tools,
+            &servers,
+            &grants
+        ));
+        // Order of mcp_servers does not matter.
+        assert!(claude_child_init_ok_with_grants(
+            TaskMode::Plan,
+            &tools,
+            &s(&["discussion", "agent_terminal"]),
+            &grants
+        ));
+
+        // Missing configured server is refused.
+        assert!(!claude_child_init_ok_with_grants(
+            TaskMode::Plan,
+            &tools,
+            &s(&["agent_terminal"]),
+            &grants
+        ));
+        // Unexpected extra server is refused.
+        assert!(!claude_child_init_ok_with_grants(
+            TaskMode::Plan,
+            &tools,
+            &s(&["agent_terminal", "discussion", "rogue"]),
+            &grants
+        ));
+        // Duplicate server entry is refused.
+        assert!(!claude_child_init_ok_with_grants(
+            TaskMode::Plan,
+            &tools,
+            &s(&["agent_terminal", "discussion", "discussion"]),
+            &grants
+        ));
+        // Tool from an unconfigured server is refused.
+        let mut rogue_tool = tools.clone();
+        rogue_tool.push("mcp__rogue__ping".into());
+        assert!(!claude_child_init_ok_with_grants(
+            TaskMode::Plan,
+            &rogue_tool,
+            &servers,
+            &grants
+        ));
+        // Unexpected builtin (e.g. ToolSearch or Bash in plan mode) is refused.
+        for extra in ["ToolSearch", "Bash", "Task"] {
+            let mut bad_tools = tools.clone();
+            bad_tools.push(extra.into());
+            assert!(
+                !claude_child_init_ok_with_grants(TaskMode::Plan, &bad_tools, &servers, &grants),
+                "{extra}"
+            );
         }
     }
 }

@@ -180,6 +180,37 @@ environment file, default model, mode and effort, and whether it is enabled.
 `available_for_delegation` defaults to `false`; the corresponding Settings switch
 opts a profile in as a parent and child target. Route support remains a separate check.
 
+A Claude profile may also carry an optional `child_mcp_servers` list to grant delegated
+Claude children access to explicit stdio MCP servers and an exact allowlist of tool names
+(default empty, so delegated children see only `agent_terminal`):
+
+```jsonc
+"child_mcp_servers": [
+  {
+    "name": "discussion",
+    "command": "/usr/local/bin/example-mcp",
+    "args": ["--stdio"],
+    "tools": ["list_topics", "post_message"]
+  }
+]
+```
+
+Each entry is validated before launch (`agent_terminal` is reserved; duplicate server or
+tool names, wildcards, empty tool lists and out-of-bounds definitions are refused). Tools
+listed here are operator-trusted and may have external side effects even in plan mode; when
+a parent restricts a child's `capabilities`, calling them requires `network`. Host
+authority enforces the exact tool allowlist on every call, regardless of what the server
+advertises, and never grants shell, file edit, delegation or unrelated MCP access. This
+setting affects delegated Claude children only (never roots, Codex, Antigravity or Local).
+
+Use an absolute executable path. Arguments are trusted launch configuration: use absolute
+paths for scripts and configuration files, outside any workspace the child can edit.
+Servers inherit the child's ordinary environment; there is no per-server `env` field,
+and the delegation bridge token is supplied only to `agent_terminal`. A server requiring
+additional authentication should load it through its existing trusted launcher or config.
+Changes take effect when a new child process generation starts; existing processes retain
+their validated snapshot.
+
 ### Local model servers (the Local agent)
 
 The **Local** agent runs a model on your own server, with no vendor CLI involved: Agent
@@ -489,4 +520,3 @@ asking. Its threads say so, and the mode picker is locked on **Dangerous permiss
 (forced)**; the mode you pick is kept, but does not change what agy may do. Delegated agy
 sub-agents run the same way, and their declared limits are not enforced. No approval
 hook needs installing.
-

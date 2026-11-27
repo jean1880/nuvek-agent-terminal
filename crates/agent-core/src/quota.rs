@@ -128,7 +128,9 @@ pub fn claude_extra_usage(v: &Value) -> Option<ExtraUsage> {
 }
 
 /// agy's `-p /usage --output-format json`: `command.data.groups[].buckets[]
-/// {window weekly|5h, remaining_fraction, reset_time}`; used is `1 - remaining`.
+/// {window weekly|5h, remaining_fraction, reset_time}`; used is `1 - remaining`. A group not yet
+/// used reports its reset as the zero time (`1970-01-01T00:00:00Z`): that is no reset time, never
+/// one long past, so it reads as `None`.
 pub fn agy_usage(usage: &Value) -> Vec<QuotaWindow> {
     let Some(groups) = usage
         .pointer("/command/data/groups")
@@ -154,7 +156,8 @@ pub fn agy_usage(usage: &Value) -> Vec<QuotaWindow> {
                         group: group.clone(),
                         label: label.to_owned(),
                         used: clamp01(1.0 - b.get("remaining_fraction")?.as_f64()?),
-                        resets_at: text(b, "reset_time"),
+                        resets_at: text(b, "reset_time")
+                            .filter(|t| parse_rfc3339(t).is_none_or(|secs| secs > 0)),
                     })
                 })
         })
@@ -698,6 +701,19 @@ mod tests {
         assert_eq!(w[2].used, 0.0);
         assert_eq!(w[2].resets_at.as_deref(), Some("2026-10-13T13:13:52Z"));
         assert!(agy_usage(&json!("not json usage")).is_empty());
+    }
+
+    #[test]
+    fn agy_usage_reads_the_zero_reset_time_as_none() {
+        let reply = json!({"command": {"name": "usage", "data": {"groups": [
+            {"name": "Claude and GPT models", "buckets": [
+                {"window": "weekly", "remaining_fraction": 1, "reset_time": "1970-01-01T00:00:00Z"},
+                {"window": "5h", "remaining_fraction": 0, "reset_time": "1970-01-01T00:00:00Z"}]}
+        ]}}});
+        let w = agy_usage(&reply);
+        assert_eq!(w.len(), 2);
+        assert!(w.iter().all(|w| w.resets_at.is_none()));
+        assert_eq!(w[1].used, 1.0, "the window itself is kept");
     }
 
     #[test]
